@@ -17,7 +17,8 @@ class KISClient:
         }
         async with httpx.AsyncClient(base_url=self.base_url, timeout=15.0) as client:
             response = await client.post('/oauth2/tokenP', json=payload)
-            response.raise_for_status()
+                        if response.status_code >= 400:
+                raise RuntimeError(f'KIS token issue failed [{response.status_code}]: {response.text}')
             return response.json()
 
     async def healthcheck(self) -> dict:
