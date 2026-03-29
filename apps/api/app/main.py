@@ -1,0 +1,16 @@
+from fastapi import FastAPI
+
+from app.api.routes_kis import router as kis_router
+from app.core.settings import settings
+
+app = FastAPI(title=settings.app_name, debug=settings.app_debug)
+app.include_router(kis_router)
+
+
+@app.get('/health')
+async def health() -> dict:
+    return {
+        'status': 'ok',
+        'app': settings.app_name,
+        'env': settings.app_env,
+    }
