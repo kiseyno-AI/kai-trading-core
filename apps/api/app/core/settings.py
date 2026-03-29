@@ -19,5 +19,11 @@ class Settings(BaseSettings):
     kis_mock_base_url: str = 'https://openapivts.koreainvestment.com:29443'
     kis_use_mock: bool = True
 
+    bok_api_key: str = ''
+    bok_base_url: str = 'https://ecos.bok.or.kr/api/StatisticSearch'
+
+    koreaexim_api_key: str = ''
+    koreaexim_base_url: str = 'https://www.koreaexim.go.kr/site/program/financial/exchangeJSON'
+
 
 settings = Settings()
