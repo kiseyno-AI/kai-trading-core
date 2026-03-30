@@ -3,6 +3,7 @@ from __future__ import annotations
 from app.brokers.kis.client import KISClient
 from app.market.clock import get_market_state
 from app.quotes.cache import quote_cache
+from app.quotes.names import SymbolNameService
 from app.scanner.state import scanner_state
 
 
@@ -34,6 +35,7 @@ def normalize_kis_quote(symbol: str, raw: dict, market_state: str) -> dict:
 class QuoteService:
     def __init__(self) -> None:
         self.client = KISClient()
+        self.name_service = SymbolNameService()
 
     async def get_quote(self, symbol: str) -> dict:
         market = get_market_state()
@@ -49,6 +51,7 @@ class QuoteService:
 
         raw = await self.client.fetch_domestic_quote(symbol=symbol)
         normalized = normalize_kis_quote(symbol=symbol, raw=raw, market_state=market.state)
+        normalized['company_name'] = await self.name_service.resolve(symbol)
         quote_cache.set(symbol, normalized)
         return normalized
 
