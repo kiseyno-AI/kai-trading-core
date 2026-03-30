@@ -47,12 +47,14 @@ class QuoteService:
                 cached['source'] = 'cache'
                 cached['fallback'] = True
                 cached['is_live'] = False
+                cached['cached_at'] = quote_cache.get_updated_at(symbol)
                 return cached
 
         raw = await self.client.fetch_domestic_quote(symbol=symbol)
         normalized = normalize_kis_quote(symbol=symbol, raw=raw, market_state=market.state)
         normalized['company_name'] = await self.name_service.resolve(symbol)
         quote_cache.set(symbol, normalized)
+        normalized['cached_at'] = quote_cache.get_updated_at(symbol)
         return normalized
 
     async def get_tracked_quotes(self) -> dict:
@@ -70,6 +72,7 @@ class QuoteService:
                     fallback['source'] = 'cache'
                     fallback['fallback'] = True
                     fallback['is_live'] = False
+                    fallback['cached_at'] = quote_cache.get_updated_at(symbol)
                     items.append(fallback)
         return {
             'market_state': market.state,
