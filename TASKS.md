@@ -9,5 +9,5 @@
 
 ## TODO
 - Add market-close detection and EOD capture workflow for all symbols.
-- Replace scanner-state universe fallback with full KRX/KOSDAQ/KONEX master universe loader.
+- Extend domestic master universe loader from KOSPI/KOSDAQ to KRX/KONEX coverage as needed.
 - Persist EOD OHLCV snapshots into the market database once DB schema/repository is ready.
