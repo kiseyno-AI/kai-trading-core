@@ -112,3 +112,26 @@ class KISClient:
                 'PRDT_TYPE_CD': product_type_code,
             },
         )
+
+    async def fetch_domestic_daily_chart(
+        self,
+        symbol: str,
+        *,
+        market_code: str = 'J',
+        start_date: str,
+        end_date: str,
+        period_code: str = 'D',
+        adjusted_price: str = '0',
+    ) -> dict:
+        return await self._get(
+            '/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice',
+            tr_id='FHKST03010100',
+            params={
+                'FID_COND_MRKT_DIV_CODE': market_code,
+                'FID_INPUT_ISCD': symbol,
+                'FID_INPUT_DATE_1': start_date,
+                'FID_INPUT_DATE_2': end_date,
+                'FID_PERIOD_DIV_CODE': period_code,
+                'FID_ORG_ADJ_PRC': adjusted_price,
+            },
+        )

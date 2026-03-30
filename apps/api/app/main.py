@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 
+from app.api.routes_eod import router as eod_router
 from app.api.routes_kis import router as kis_router
 from app.api.routes_macro import router as macro_router
 from app.api.routes_fx import router as fx_router
@@ -15,6 +16,7 @@ app.include_router(fx_router)
 app.include_router(scanner_router)
 app.include_router(market_router)
 app.include_router(quotes_router)
+app.include_router(eod_router)
 
 
 @app.get('/health')
