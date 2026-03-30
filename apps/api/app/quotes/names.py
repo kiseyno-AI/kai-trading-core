@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 
-from app.brokers.kis.client import KISClient
+from app.brokers.kis.provider import kis_client
 
 
 def _extract_company_name(raw: dict, symbol: str) -> Optional[str]:
@@ -39,7 +39,7 @@ symbol_name_cache = SymbolNameCache()
 
 class SymbolNameService:
     def __init__(self) -> None:
-        self.client = KISClient()
+        self.client = kis_client
 
     async def resolve(self, symbol: str) -> str:
         cached = symbol_name_cache.get(symbol)
