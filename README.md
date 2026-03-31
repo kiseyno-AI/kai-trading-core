@@ -13,6 +13,7 @@ Core trading platform repository.
 - `apps/api` contains the initial FastAPI-based broker integration skeleton.
 - KIS credentials are loaded from environment variables, not hardcoded.
 - `apps/api/start-api.sh` starts the API with `.env` loaded.
+- Set `UPSTREAM_BEARER_TOKEN` to a non-empty value to require `Authorization: Bearer <token>` on incoming API requests; leave it unset/empty for local development.
 
 ## Runtime direction
 - The core API is intended to run 24/7.

@@ -1,3 +1,5 @@
+from typing import Optional
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -12,6 +14,7 @@ class Settings(BaseSettings):
     app_name: str = 'kai-trading-core-api'
     app_env: str = 'development'
     app_debug: bool = True
+    upstream_bearer_token: Optional[str] = None
 
     kis_app_key: str = ''
     kis_app_secret: str = ''

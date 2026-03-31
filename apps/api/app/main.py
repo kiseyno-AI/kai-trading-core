@@ -1,7 +1,9 @@
 from contextlib import asynccontextmanager
+from secrets import compare_digest
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from app.api.routes_eod import router as eod_router
 from app.api.routes_kis import router as kis_router
@@ -32,6 +34,25 @@ app.add_middleware(
     allow_methods=['*'],
     allow_headers=['*'],
 )
+
+
+@app.middleware('http')
+async def require_upstream_bearer_token(request: Request, call_next):
+    configured_token = settings.upstream_bearer_token
+    if not configured_token or request.method == 'OPTIONS':
+        return await call_next(request)
+
+    scheme, _, credentials = request.headers.get('Authorization', '').partition(' ')
+    if scheme != 'Bearer' or not credentials or not compare_digest(credentials, configured_token):
+        return JSONResponse(
+            status_code=401,
+            content={'detail': 'Unauthorized'},
+            headers={'WWW-Authenticate': 'Bearer'},
+        )
+
+    return await call_next(request)
+
+
 app.include_router(kis_router)
 app.include_router(macro_router)
 app.include_router(fx_router)

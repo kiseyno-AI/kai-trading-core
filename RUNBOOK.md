@@ -14,6 +14,7 @@ What it does:
 - installs Python requirements
 - loads `apps/api/.env`
 - starts FastAPI via uvicorn on `127.0.0.1:8000` by default
+- if `UPSTREAM_BEARER_TOKEN` is set, all incoming API requests require `Authorization: Bearer <token>`
 
 ## Health checks
 - `GET /health`
