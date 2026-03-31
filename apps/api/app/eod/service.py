@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
 
 from app.brokers.kis.provider import kis_client
+from app.eod.sink import snapshot_sink
 from app.eod.state import job_state
 from app.eod.universe import UniverseSymbol, universe_service
 from app.market.clock import get_market_state
@@ -29,6 +31,9 @@ class EODSnapshot:
 
 
 class EODService:
+    batch_size = 50
+    batch_pause_seconds = 0.2
+
     async def capture_if_due(self, now: Optional[datetime] = None) -> dict:
         market = get_market_state(now)
         market_date = market.server_time[:10]
@@ -57,11 +62,19 @@ class EODService:
         items: list[dict] = []
 
         try:
-            for item in symbols:
-                snapshot = await self.fetch_symbol_eod(item=item, market_date=market_date)
-                items.append(snapshot.to_dict())
-                self.persist_snapshot(snapshot)
-                job_state.tick()
+            for offset in range(0, len(symbols), self.batch_size):
+                batch = symbols[offset: offset + self.batch_size]
+                for item in batch:
+                    try:
+                        snapshot = await self.fetch_symbol_eod(item=item, market_date=market_date)
+                        payload = snapshot.to_dict()
+                        items.append(payload)
+                        self.persist_snapshot(payload)
+                        job_state.mark_success()
+                    except Exception:
+                        job_state.mark_failure(item.symbol)
+                if offset + self.batch_size < len(symbols):
+                    await asyncio.sleep(self.batch_pause_seconds)
         except Exception as exc:
             job_state.fail(exc)
             raise
@@ -95,9 +108,8 @@ class EODService:
             turnover=int(latest.get('acml_tr_pbmn', 0) or 0),
         )
 
-    def persist_snapshot(self, snapshot: EODSnapshot) -> None:
-        # TODO: persist EODSnapshot into the market database once DB schema/repository is ready.
-        return None
+    def persist_snapshot(self, snapshot: dict) -> None:
+        snapshot_sink.persist(snapshot)
 
 
 EOD_SERVICE = EODService()

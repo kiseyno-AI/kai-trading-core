@@ -14,6 +14,9 @@ class EODJobState:
     last_error: Optional[str] = None
     symbols_total: int = 0
     symbols_processed: int = 0
+    symbols_succeeded: int = 0
+    symbols_failed: int = 0
+    last_failed_symbols: list[str] = field(default_factory=list)
 
     def snapshot(self) -> dict:
         return {
@@ -24,6 +27,9 @@ class EODJobState:
             'last_error': self.last_error,
             'symbols_total': self.symbols_total,
             'symbols_processed': self.symbols_processed,
+            'symbols_succeeded': self.symbols_succeeded,
+            'symbols_failed': self.symbols_failed,
+            'last_failed_symbols': self.last_failed_symbols,
         }
 
     def start(self, market_date: str, symbols_total: int) -> None:
@@ -34,9 +40,19 @@ class EODJobState:
         self.last_error = None
         self.symbols_total = symbols_total
         self.symbols_processed = 0
+        self.symbols_succeeded = 0
+        self.symbols_failed = 0
+        self.last_failed_symbols = []
 
-    def tick(self) -> None:
+    def mark_success(self) -> None:
         self.symbols_processed += 1
+        self.symbols_succeeded += 1
+
+    def mark_failure(self, symbol: str) -> None:
+        self.symbols_processed += 1
+        self.symbols_failed += 1
+        if len(self.last_failed_symbols) < 50:
+            self.last_failed_symbols.append(symbol)
 
     def fail(self, error: Exception) -> None:
         self.last_status = 'failed'
@@ -44,7 +60,7 @@ class EODJobState:
         self.last_completed_at = datetime.now(timezone.utc).isoformat()
 
     def complete(self) -> None:
-        self.last_status = 'completed'
+        self.last_status = 'completed' if self.symbols_failed == 0 else 'completed_with_errors'
         self.last_completed_at = datetime.now(timezone.utc).isoformat()
         self.last_error = None
 
