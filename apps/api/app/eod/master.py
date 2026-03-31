@@ -3,9 +3,12 @@ from __future__ import annotations
 import io
 import zipfile
 from dataclasses import dataclass
-from typing import Iterable
+from datetime import datetime
+from typing import Iterable, Optional
 from urllib.request import urlopen
 
+from app.eod.master_state import master_refresh_state
+from app.market.clock import get_market_state
 
 KOSPI_MASTER_URL = 'https://new.real.download.dws.co.kr/common/master/kospi_code.mst.zip'
 KOSDAQ_MASTER_URL = 'https://new.real.download.dws.co.kr/common/master/kosdaq_code.mst.zip'
@@ -63,5 +66,30 @@ def load_all_domestic_masters() -> list[MasterSymbol]:
     return [*load_kospi_master(), *load_kosdaq_master()]
 
 
+def refresh_master_if_due(now: Optional[datetime] = None, *, force: bool = False) -> list[MasterSymbol]:
+    market = get_market_state(now)
+    market_date = market.server_time[:10]
+
+    if not force and master_refresh_state.market_date == market_date and master_refresh_state.last_status == 'completed':
+        return master_refresh_state.symbols
+
+    master_refresh_state.start(market_date)
+    try:
+        symbols = load_all_domestic_masters()
+        master_refresh_state.complete(symbols)
+        return symbols
+    except Exception as exc:
+        master_refresh_state.fail(exc)
+        raise
+
+
+def get_master_symbols(now: Optional[datetime] = None) -> list[MasterSymbol]:
+    market = get_market_state(now)
+    market_date = market.server_time[:10]
+    if master_refresh_state.market_date == market_date and master_refresh_state.last_status == 'completed':
+        return master_refresh_state.symbols
+    return refresh_master_if_due(now)
+
+
 def iter_all_domestic_masters() -> Iterable[MasterSymbol]:
-    return iter(load_all_domestic_masters())
+    return iter(get_master_symbols())

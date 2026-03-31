@@ -1,5 +1,7 @@
 from fastapi import APIRouter, HTTPException
 
+from app.eod.master import refresh_master_if_due
+from app.eod.master_state import master_refresh_state
 from app.eod.service import EOD_SERVICE
 from app.eod.state import job_state
 
@@ -8,7 +10,23 @@ router = APIRouter(prefix='/eod', tags=['eod'])
 
 @router.get('/status')
 async def get_eod_status() -> dict:
-    return job_state.snapshot()
+    return {
+        'job': job_state.snapshot(),
+        'master': master_refresh_state.snapshot(),
+    }
+
+
+@router.post('/master/refresh-if-due')
+async def refresh_eod_master_if_due(force: bool = False) -> dict:
+    try:
+        symbols = refresh_master_if_due(force=force)
+        return {
+            'refreshed': True,
+            'symbol_count': len(symbols),
+            'master': master_refresh_state.snapshot(),
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f'Master refresh failed: {exc}') from exc
 
 
 @router.post('/capture-if-due')

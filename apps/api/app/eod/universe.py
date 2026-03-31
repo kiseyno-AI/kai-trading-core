@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable
 
-from app.eod.master import load_all_domestic_masters
+from app.eod.master import get_master_symbols
 from app.scanner.state import scanner_state
 
 
@@ -28,7 +28,7 @@ class UniverseService:
                         standard_code=item.standard_code,
                         name_ko=item.name_ko,
                     )
-                    for item in load_all_domestic_masters()
+                    for item in get_master_symbols()
                     if item.symbol.isdigit() and len(item.symbol) == 6
                 ]
             except Exception:
