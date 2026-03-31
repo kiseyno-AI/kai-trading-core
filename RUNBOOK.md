@@ -23,7 +23,9 @@ What it does:
 ## Current runtime expectations
 - Core server should stay up 24/7.
 - Pre-market master refresh uses the KIS master zip files.
-- EOD capture uses the daily universe built from the refreshed master.
+- A background runner checks market state every 60 seconds while the API process is alive.
+- During `PREOPEN`, it refreshes the daily master if needed.
+- During `CLOSED`, it attempts EOD capture if needed.
 - Database persistence is not wired yet.
 
 ## Next ops step

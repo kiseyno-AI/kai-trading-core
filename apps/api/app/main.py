@@ -1,3 +1,5 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 
 from app.api.routes_eod import router as eod_router
@@ -8,8 +10,19 @@ from app.api.routes_scanner import router as scanner_router
 from app.api.routes_market import router as market_router
 from app.api.routes_quotes import router as quotes_router
 from app.core.settings import settings
+from app.eod.runner import background_runner
 
-app = FastAPI(title=settings.app_name, debug=settings.app_debug)
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    await background_runner.start()
+    try:
+        yield
+    finally:
+        await background_runner.stop()
+
+
+app = FastAPI(title=settings.app_name, debug=settings.app_debug, lifespan=lifespan)
 app.include_router(kis_router)
 app.include_router(macro_router)
 app.include_router(fx_router)

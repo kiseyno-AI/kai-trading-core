@@ -17,5 +17,6 @@ Core trading platform repository.
 ## Runtime direction
 - The core API is intended to run 24/7.
 - Pre-market master refresh prepares the daily symbol universe.
+- A background runner inside the API process handles pre-market refresh and after-close EOD checks.
 - After market close, EOD capture can use that universe for OHLCV collection.
 - Database persistence will be connected after the DB layer is ready.
