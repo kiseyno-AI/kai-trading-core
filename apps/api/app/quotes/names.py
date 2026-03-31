@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from app.brokers.kis.provider import kis_client
+from app.eod.master import find_master_symbol
 
 
 def _extract_company_name(raw: dict, symbol: str) -> Optional[str]:
@@ -45,6 +46,11 @@ class SymbolNameService:
         cached = symbol_name_cache.get(symbol)
         if cached:
             return cached
+
+        master_symbol = find_master_symbol(symbol)
+        if master_symbol and master_symbol.name_ko:
+            symbol_name_cache.set(symbol, master_symbol.name_ko)
+            return master_symbol.name_ko
 
         for fetcher in (
             self.client.fetch_domestic_stock_info,

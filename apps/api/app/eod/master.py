@@ -91,5 +91,12 @@ def get_master_symbols(now: Optional[datetime] = None) -> list[MasterSymbol]:
     return refresh_master_if_due(now)
 
 
+def find_master_symbol(symbol: str, now: Optional[datetime] = None) -> Optional[MasterSymbol]:
+    for item in get_master_symbols(now):
+        if item.symbol == symbol:
+            return item
+    return None
+
+
 def iter_all_domestic_masters() -> Iterable[MasterSymbol]:
     return iter(get_master_symbols())

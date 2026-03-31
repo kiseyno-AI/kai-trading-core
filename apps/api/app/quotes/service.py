@@ -9,16 +9,9 @@ from app.scanner.state import scanner_state
 
 def normalize_kis_quote(symbol: str, raw: dict, market_state: str) -> dict:
     output = raw.get('output', {}) if isinstance(raw, dict) else {}
-    company_name = (
-        output.get('hts_kor_isnm')
-        or output.get('prdt_abrv_name')
-        or output.get('prdt_name')
-        or output.get('stck_shrn_iscd_name')
-        or symbol
-    )
     return {
         'symbol': symbol,
-        'company_name': company_name,
+        'company_name': symbol,
         'price': int(output.get('stck_prpr', 0) or 0),
         'change': int(output.get('prdy_vrss', 0) or 0),
         'change_pct': float(output.get('prdy_ctrt', 0) or 0),
