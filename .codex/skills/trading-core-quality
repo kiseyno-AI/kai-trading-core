@@ -1,0 +1,27 @@
+---
+name: trading-core-quality
+description: Verification, docs sync, and ops checks for kai-trading-core. Use when the user asks about tests, CI, health checks, RUNBOOK, or before merging API changes.
+---
+
+# Trading core quality
+
+## Smoke checks (from `apps/api`)
+
+```bash
+pip install -r requirements.txt
+python -c "from app.main import app"
+```
+
+## Runtime
+
+- `GET /health` — process up.
+- `GET /eod/status`, `POST /eod/master/refresh-if-due` — per `RUNBOOK.md`.
+
+## Documentation
+
+- Keep **`docs/API_BUILD_ORDER.md`** in sync with implemented routes.
+- When behavior affects the Next.js BFF, note alignment with the consumer’s API contract.
+
+## CI
+
+If `.github/workflows/ci.yml` is present, it should install requirements under `apps/api` and run the import smoke command. Add pytest later under `apps/api/tests/` when the suite exists.
