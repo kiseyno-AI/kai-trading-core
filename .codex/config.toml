@@ -1,0 +1,28 @@
+#:schema https://developers.openai.com/codex/config-schema.json
+#
+# Project-scoped Codex layer (loaded when the project is trusted).
+# See https://developers.openai.com/codex/config-reference/
+
+[agents]
+max_threads = 6
+max_depth = 1
+
+developer_instructions = """
+This workspace is KAI trading-web (Next.js App Router, TypeScript).
+
+Before substantial edits, read AGENTS.md, RULES.md, and ARCHITECTURE.md at the repository root.
+
+Layout: src/app (routes), src/features (domain composition), src/components (ui, navigation, layout, dashboard), src/lib (hooks, trading-api adapter, trading-upstream), src/data (mock/demo). Do not call brokers from the browser; use the Next BFF under src/app/api/trading/** or the configured API base URL.
+
+Environment: TRADING_API_UPSTREAM_BASE_URL / TRADING_API_INTERNAL_BASE_URL and TRADING_API_UPSTREAM_BEARER_TOKEN are server-only. NEXT_PUBLIC_TRADING_API_BASE_URL is for the client adapter in src/lib/trading-api.ts. Never put secrets in NEXT_PUBLIC_*.
+
+When changing API shapes or routes, keep docs/API_CONTRACT.md and src/types/trading-api.ts aligned with implementation. Do not add live-trading behavior without explicit approval. Use English for code and technical documentation.
+"""
+
+[[skills.config]]
+path = ".codex/skills/trading-api-wiring"
+enabled = true
+
+[[skills.config]]
+path = ".codex/skills/trading-web-quality"
+enabled = true
