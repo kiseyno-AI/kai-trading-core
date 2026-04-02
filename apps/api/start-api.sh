@@ -9,8 +9,8 @@ if [ ! -f .env ]; then
   exit 1
 fi
 
-PYTHON_BIN="${PYTHON_BIN:-python3}"
-HOST="${HOST:-127.0.0.1}"
+PYTHON_BIN="${PYTHON_BIN:-/opt/homebrew/bin/python3.11}"
+HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8000}"
 
 if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
