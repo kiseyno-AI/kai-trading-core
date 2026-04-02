@@ -1,3 +1,4 @@
+import logging
 from contextlib import asynccontextmanager
 from secrets import compare_digest
 
@@ -17,10 +18,15 @@ from app.core.settings import settings
 from app.eod.runner import background_runner
 from app.db import check_database, init_database
 
+logger = logging.getLogger(__name__)
+
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    init_database()
+    try:
+        init_database()
+    except Exception as exc:
+        logger.warning('Database initialization failed; starting in degraded mode: %s', exc)
     await background_runner.start()
     try:
         yield
