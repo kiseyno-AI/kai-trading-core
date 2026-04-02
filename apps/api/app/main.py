@@ -15,10 +15,12 @@ from app.api.routes_quotes import router as quotes_router
 from app.api.routes_symbols import router as symbols_router
 from app.core.settings import settings
 from app.eod.runner import background_runner
+from app.db import check_database, init_database
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    init_database()
     await background_runner.start()
     try:
         yield
@@ -65,8 +67,13 @@ app.include_router(eod_router)
 
 @app.get('/health')
 async def health() -> dict:
+    db_ok, db_error = check_database()
     return {
-        'status': 'ok',
+        'status': 'ok' if db_ok else 'degraded',
         'app': settings.app_name,
         'env': settings.app_env,
+        'database': {
+            'connected': db_ok,
+            'error': db_error,
+        },
     }

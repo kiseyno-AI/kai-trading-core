@@ -16,6 +16,13 @@ class Settings(BaseSettings):
     app_debug: bool = True
     upstream_bearer_token: Optional[str] = None
 
+    database_url: Optional[str] = None
+    postgres_host: str = 'localhost'
+    postgres_port: int = 5432
+    postgres_db: str = 'kai_trading'
+    postgres_user: str = 'kai_trading_app'
+    postgres_password: str = 'kai_trading_dev'
+
     kis_app_key: str = ''
     kis_app_secret: str = ''
     kis_base_url: str = 'https://openapi.koreainvestment.com:9443'
