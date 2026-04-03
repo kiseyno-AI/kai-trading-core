@@ -5,11 +5,14 @@ This repository is part of the KAI trading system — **backend / core API** (Fa
 
 ## Working Rules
 - Read this file before making changes.
+- Before doing task work, create and switch to a dedicated branch for that task.
 - Prefer simple, practical architecture over premature complexity.
 - Keep modules loosely coupled and clearly named.
 - Update docs when structure or design changes.
 - Do not add live-trading or order-execution behavior without explicit approval.
 - Commit clear, scoped changes.
+- After finishing task work, restore the main workspace checkout to `main`.
+- After the PR is merged or the work is cancelled, delete the task branch locally and remotely unless there is a specific reason to keep it.
 - **Python service root is `apps/api/`** — run installs, uvicorn, and `python -c "from app.main import app"` there (import path is `app`, not `apps.api`).
 
 ## OpenAI Codex

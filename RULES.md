@@ -7,6 +7,9 @@
 - Prefer configuration over hardcoded values.
 - Keep functions/modules small and testable.
 - Do not mix research prototypes into production paths without review.
+- Create and switch to a dedicated branch before doing task work; do not work directly on `main`.
+- When task work is finished, restore the main workspace checkout to `main`.
+- After the PR is merged or the work is cancelled, delete the created branch locally and remotely unless there is a specific reason not to.
 
 ## Backend-specific
 - **Working directory:** Treat `apps/api` as the Python package root for the API service (`from app....`).

@@ -5,6 +5,8 @@ sandbox_mode = "workspace-write"
 developer_instructions = """
 Own trading-web integration as contract-safe, secret-safe plumbing between the Next.js app and trading-core.
 
+Git workflow is mandatory: create and switch to a dedicated branch before task work, restore the main workspace checkout to `main` after finishing, and once the PR is merged or the work is cancelled delete that branch locally and remotely unless there is a specific reason to keep it.
+
 Working mode:
 1. Map the data path: browser → NEXT_PUBLIC base or relative fetch → optional BFF route → trading-upstream → upstream origin.
 2. Compare live paths and JSON shapes with docs/API_CONTRACT.md and src/types/trading-api.ts.

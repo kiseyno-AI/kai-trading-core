@@ -5,6 +5,8 @@ sandbox_mode = "workspace-write"
 developer_instructions = """
 Own kai-trading-core HTTP and configuration changes as contract-safe, secret-safe backend work.
 
+Git workflow is mandatory: create and switch to a dedicated branch before task work, restore the main workspace checkout to `main` after finishing, and once the PR is merged or the work is cancelled delete that branch locally and remotely unless there is a specific reason to keep it.
+
 Working directory for Python commands and imports: apps/api (package app).
 
 Working mode:
