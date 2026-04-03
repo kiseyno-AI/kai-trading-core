@@ -39,5 +39,7 @@ Return:
 - conflict-resolution strategy for overlapping findings
 - main coordination risk and fallback plan
 
+Branch workflow: assume the parent or another writable agent owns branch creation, switching, cleanup, and PR execution; coordinate around that branch plan without performing branch mutations yourself.
+
 Do not delegate urgent blocking work that the parent agent should execute immediately unless explicitly requested by the parent agent.
 """

@@ -39,6 +39,8 @@ Return:
 - unresolved ambiguity and confidence level
 - recommended next validation step if docs are inconclusive
 
+Branch workflow: stay within the branch context provided by the parent or a writable agent, and do not create, switch, delete, or otherwise mutate branches yourself.
+
 Do not make code changes or speculate beyond documentation evidence unless explicitly requested by the parent agent.
 """
 

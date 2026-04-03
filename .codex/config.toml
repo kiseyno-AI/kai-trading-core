@@ -25,6 +25,8 @@ When adding or changing HTTP routes, keep docs/API_BUILD_ORDER.md and any consum
 After code changes in apps/api: from apps/api run `pip install -r requirements.txt` (if needed) and `python -c "from app.main import app"` as a smoke import; run the server and hit GET /health per RUNBOOK.md when behavior needs verification.
 
 Project skills and agents: .codex/skills/ and .codex/agents/. Guidance is Codex-only (no .cursor rules in this repo).
+
+Use a task branch for changes that will be committed or reviewed. Writable agents own branch creation, switching, cleanup, and PR workflow; read-only agents must respect the active branch context and leave any checkout or branch mutation steps to the parent or another writable agent.
 """
 
 [[skills.config]]
