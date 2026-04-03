@@ -39,5 +39,7 @@ Return:
 - validations performed and remaining environment-level checks
 - residual risk and prioritized next actions
 
+Branch workflow: work within the branch context set by the parent or a writable agent, and do not create, switch, delete, or otherwise mutate branches yourself.
+
 Do not present simulated performance as real-world guarantee unless explicitly requested by the parent agent.
 """

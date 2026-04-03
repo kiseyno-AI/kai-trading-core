@@ -5,7 +5,7 @@ This repository is part of the KAI trading system — **backend / core API** (Fa
 
 ## Working Rules
 - Read this file before making changes.
-- Before doing task work, create and switch to a dedicated branch for that task.
+- Before doing task work, create and switch to a dedicated branch for that task. Writable agents own branch creation, switching, cleanup, and PR workflow; read-only agents must stay within the provided branch context without performing checkout or branch mutation steps themselves.
 - Prefer simple, practical architecture over premature complexity.
 - Keep modules loosely coupled and clearly named.
 - Update docs when structure or design changes.
