@@ -14,5 +14,8 @@
 
 ## Tooling (Codex)
 - Trust this repo in **Codex** so `.codex/config.toml` and skills load.
+- Before task work, create and switch to a dedicated branch for the task.
 - After API edits: from `apps/api`, run `python -c "from app.main import app"`; see `.codex/skills/trading-core-quality`.
 - Keep **`docs/API_BUILD_ORDER.md`** updated when routes change.
+- After finishing, restore the main workspace checkout to `main`.
+- After the PR is merged or the work is cancelled, delete the task branch locally and remotely unless there is a specific reason to keep it.

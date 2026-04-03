@@ -12,6 +12,8 @@ This workspace is kai-trading-core: backend for the KAI trading system. The runn
 
 Before substantial edits, read AGENTS.md, RULES.md, ARCHITECTURE.md, TASKS.md, and RUNBOOK.md at the repository root. For API surface and build order, read docs/API_BUILD_ORDER.md; for scanner/EOD details see docs/ when relevant.
 
+Git workflow is mandatory for every task: create and switch to a dedicated branch before task work, restore the main workspace checkout to `main` after finishing, and once the PR is merged or the work is cancelled delete that branch locally and remotely unless there is a specific reason to keep it.
+
 Stack: FastAPI, Pydantic Settings (app/core/settings.py), httpx for outbound calls, lifespan hooks and background_runner in app/main.py. Incoming requests can require Authorization: Bearer when UPSTREAM_BEARER_TOKEN is set (see main.py middleware). Never log or commit secrets (KIS_APP_KEY, KIS_APP_SECRET, API keys).
 
 Broker and data: KIS integration under app/brokers/kis/; KIS_USE_MOCK, KIS_MOCK_BASE_URL vs production URLs in settings. BOK and Korea Exim under app/integrations/. Quotes, market clock, scanner, EOD in app/quotes, app/market, app/scanner, app/eod.

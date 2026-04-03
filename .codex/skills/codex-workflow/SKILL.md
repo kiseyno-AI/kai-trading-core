@@ -14,12 +14,15 @@ description: Default Codex workflow for kai-trading-core—monorepo layout, apps
 
 1. Read `AGENTS.md`, `RULES.md`, `ARCHITECTURE.md`, `TASKS.md`, `RUNBOOK.md`.
 2. Trust the project in Codex so `.codex/config.toml` loads ([Codex config](https://developers.openai.com/codex/config-reference)).
+3. Create and switch to a dedicated branch before doing task work.
 
 ## Safety
 
 - No live trading or order placement without explicit approval.
 - Do not commit credentials; use `apps/api/.env` locally (see `.env.example`).
 - When `UPSTREAM_BEARER_TOKEN` is set, document that clients must send `Authorization: Bearer`.
+- After finishing task work, restore the main workspace checkout to `main`.
+- After the PR is merged or the work is cancelled, delete the task branch locally and remotely unless there is a specific reason to keep it.
 
 ## Quick verification (from `apps/api`)
 
