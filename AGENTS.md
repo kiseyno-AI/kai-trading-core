@@ -19,6 +19,7 @@ This repository is part of the KAI trading system — **backend / core API** (Fa
 - **Project layer:** [`.codex/config.toml`](./.codex/config.toml) loads when the workspace is **trusted**. See [Codex configuration](https://developers.openai.com/codex/config-reference).
 - **Skills:** [`.codex/skills/*/SKILL.md`](./.codex/skills/) — `codex-workflow`, `fastapi-trading-api`, `kis-broker-integration`, `trading-core-quality`.
 - **Subagents:** [`.codex/agents/*.toml`](./.codex/agents/) — includes `trading_core_api_specialist`, `backend-developer`, `fintech-engineer`, and others.
+- **ACP sessions:** Default ACP coding work to fresh thread-spawned ACP sessions. Treat `acpx exited with code 1`, empty spawned-session messages, and gateway errors such as `queue owner unavailable`, `Resource not found`, or `repairing dead named session` as dead-session symptoms. Silent run fallback is forbidden. Required recovery is stale ACP session cleanup, gateway restart if needed, then a fresh spawned ACP session retry.
 - **Quality loop:** From `apps/api`: install requirements if needed, then `python -c "from app.main import app"`; use `GET /health` and [RUNBOOK.md](./RUNBOOK.md) for runtime checks.
 - **Secrets:** Use `apps/api/.env` (see `.env.example`); never commit keys. `UPSTREAM_BEARER_TOKEN` enables bearer auth on incoming API requests.
 

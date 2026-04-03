@@ -27,6 +27,8 @@ After code changes in apps/api: from apps/api run `pip install -r requirements.t
 Project skills and agents: .codex/skills/ and .codex/agents/. Guidance is Codex-only (no .cursor rules in this repo).
 
 Use a task branch for changes that will be committed or reviewed. Writable agents own branch creation, switching, cleanup, and PR workflow; read-only agents must respect the active branch context and leave any checkout or branch mutation steps to the parent or another writable agent.
+
+For ACP coding work, default to fresh thread-spawned ACP sessions. Treat `acpx exited with code 1`, empty spawned-session messages, and gateway errors such as `queue owner unavailable`, `Resource not found`, or `repairing dead named session` as dead-session symptoms. Silent run fallback is forbidden. Required recovery is stale ACP session cleanup, gateway restart if needed, then a fresh spawned ACP session retry.
 """
 
 [[skills.config]]
