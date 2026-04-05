@@ -28,8 +28,7 @@ async def lifespan(_: FastAPI):
     try:
         init_database()
         tracked_symbols = load_tracked_symbols()
-        if tracked_symbols:
-            scanner_state.hydrate(tracked_symbols)
+        scanner_state.hydrate(tracked_symbols)
     except Exception as exc:
         logger.warning('Database initialization failed; starting in degraded mode: %s', exc)
     await background_runner.start()
