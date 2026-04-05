@@ -61,14 +61,15 @@ class EODService:
         symbols = list(universe_service.iter_symbols())
         job_state.start(market_date=market_date, symbols_total=len(symbols))
         items: list[dict] = []
-        run_id = create_eod_collection_run(
-            market='KRX',
-            trade_date=market_date,
-            symbols_total=len(symbols),
-            trigger=trigger,
-        )
+        run_id: int | None = None
 
         try:
+            run_id = create_eod_collection_run(
+                market='KRX',
+                trade_date=market_date,
+                symbols_total=len(symbols),
+                trigger=trigger,
+            )
             for offset in range(0, len(symbols), self.batch_size):
                 batch = symbols[offset: offset + self.batch_size]
                 for item in batch:
@@ -84,22 +85,24 @@ class EODService:
                     await asyncio.sleep(self.batch_pause_seconds)
         except Exception as exc:
             job_state.fail(exc)
-            complete_eod_collection_run(
-                run_id,
-                status='failed',
-                symbols_succeeded=job_state.symbols_succeeded,
-                symbols_failed=job_state.symbols_failed,
-                error_message=str(exc),
-            )
+            if run_id is not None:
+                complete_eod_collection_run(
+                    run_id,
+                    status='failed',
+                    symbols_succeeded=job_state.symbols_succeeded,
+                    symbols_failed=job_state.symbols_failed,
+                    error_message=str(exc),
+                )
             raise
 
         job_state.complete()
-        complete_eod_collection_run(
-            run_id,
-            status=job_state.last_status,
-            symbols_succeeded=job_state.symbols_succeeded,
-            symbols_failed=job_state.symbols_failed,
-        )
+        if run_id is not None:
+            complete_eod_collection_run(
+                run_id,
+                status=job_state.last_status,
+                symbols_succeeded=job_state.symbols_succeeded,
+                symbols_failed=job_state.symbols_failed,
+            )
         return {
             'triggered': True,
             'market_date': market_date,
