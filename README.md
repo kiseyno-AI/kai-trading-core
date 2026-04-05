@@ -118,19 +118,17 @@ pip install -r requirements.txt
 
 ---
 
-## Database bootstrap and current local state
+## Database bootstrap and schema overview
 
 The project now uses **Alembic-backed schema bootstrap** for the market-data database. The source of truth is the migration set under `apps/api/db_migrations/`, and startup can apply pending revisions automatically when `DB_AUTO_UPGRADE=true`.
 
 At a high level, the current core tables cover:
 
-- `symbols` for the normalized instrument master
-- `tracked_symbols` for the scanner/watchlist set
-- `quote_snapshots` and `current_quote_cache` for quote history plus the latest cached quote per symbol
-- `market_status_snapshots` for persisted market-clock observations
-- `eod_collection_runs` and `daily_price_bars` for end-of-day collection tracking and OHLCV bars
-
-If you are working on this machine, the local Postgres instance has already been migrated to Alembic revision `20260405_0001` (the initial market-data schema).
+- `symbols` for the normalized instrument master: symbol/code identity, Korean display name, market, instrument type, source, active flag, and refresh timestamps
+- `tracked_symbols` for the scanner/watchlist set: a foreign-key link to `symbols` plus stable sort order
+- `quote_snapshots` and `current_quote_cache` for quote history plus the latest cached quote per symbol: market state, price/change fields, volume/turnover, source flags, capture timestamps, and raw payloads
+- `market_status_snapshots` for persisted market-clock observations: market/state values, trading-day and open flags, reason text, and server/session timestamps
+- `eod_collection_runs` and `daily_price_bars` for end-of-day collection tracking and OHLCV bars: run status/counters/metadata plus per-symbol trade-date open, high, low, close, volume, and turnover values
 
 For a fresh machine or a reset local database, use this bootstrap flow from `apps/api`:
 
@@ -145,10 +143,11 @@ python -c "from app.main import app"
 
 Practical notes for newcomers:
 
+- To see what your environment is currently on before changing anything, run `alembic current` from `apps/api`.
 - `alembic upgrade head` is the explicit, predictable way to apply the schema before first startup.
 - If `DB_AUTO_UPGRADE=true`, `./start-api.sh` will also run Alembic upgrades during API startup.
 - The database name and credentials can differ per machine; what matters is that `.env` points at a reachable Postgres instance and Alembic reaches `head`.
-- To confirm your local revision later, run `alembic current` from `apps/api`.
+- After bootstrapping, rerun `alembic current` to confirm your database revision matches the repo's current head.
 
 ---
 
