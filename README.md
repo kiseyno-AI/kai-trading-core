@@ -15,7 +15,8 @@ Core trading platform repository — **backend API and services** for the KAI sy
 | **EOD pipeline** | Active | Master refresh, scheduled capture hooks, status endpoints |
 | **Macro (BOK ECOS)** | Integrated | Statistic series proxy |
 | **FX (Korea Exim)** | Integrated | Exchange rate lookup |
-| **Execution engine / DB persistence** | Roadmap | Described in `ARCHITECTURE.md`; DB not fully wired yet |
+| **Market-data persistence** | Active | Alembic-backed Postgres schema for symbols, tracking, quotes, market status, and EOD bars |
+| **Execution engine / order persistence** | Roadmap | Trading and execution boundaries remain future work in `ARCHITECTURE.md` |
 
 **Tech stack:** Python 3, FastAPI, Uvicorn, Pydantic Settings, HTTPX for outbound calls. Configuration via `apps/api/.env` (see `apps/api/.env.example`).
 
@@ -114,6 +115,40 @@ pip install -r requirements.txt
 ./start-api.sh
 # or: uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 ```
+
+---
+
+## Database bootstrap and current local state
+
+The project now uses **Alembic-backed schema bootstrap** for the market-data database. The source of truth is the migration set under `apps/api/db_migrations/`, and startup can apply pending revisions automatically when `DB_AUTO_UPGRADE=true`.
+
+At a high level, the current core tables cover:
+
+- `symbols` for the normalized instrument master
+- `tracked_symbols` for the scanner/watchlist set
+- `quote_snapshots` and `current_quote_cache` for quote history plus the latest cached quote per symbol
+- `market_status_snapshots` for persisted market-clock observations
+- `eod_collection_runs` and `daily_price_bars` for end-of-day collection tracking and OHLCV bars
+
+If you are working on this machine, the local Postgres instance has already been migrated to Alembic revision `20260405_0001` (the initial market-data schema).
+
+For a fresh machine or a reset local database, use this bootstrap flow from `apps/api`:
+
+```bash
+pip install -r requirements.txt
+cp .env.example .env
+# update .env with the local Postgres database/user/password you want to use
+createdb kai_trading            # or create the database with your preferred Postgres workflow
+alembic upgrade head
+python -c "from app.main import app"
+```
+
+Practical notes for newcomers:
+
+- `alembic upgrade head` is the explicit, predictable way to apply the schema before first startup.
+- If `DB_AUTO_UPGRADE=true`, `./start-api.sh` will also run Alembic upgrades during API startup.
+- The database name and credentials can differ per machine; what matters is that `.env` points at a reachable Postgres instance and Alembic reaches `head`.
+- To confirm your local revision later, run `alembic current` from `apps/api`.
 
 ---
 
