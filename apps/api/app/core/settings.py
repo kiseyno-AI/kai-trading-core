@@ -37,5 +37,11 @@ class Settings(BaseSettings):
     koreaexim_api_key: str = ''
     koreaexim_base_url: str = 'https://www.koreaexim.go.kr/site/program/financial/exchangeJSON'
 
+    eod_auto_pykrx_enabled: bool = True
+    eod_auto_pykrx_poll_seconds: int = 60
+    eod_auto_pykrx_after_close_minutes: int = 10
+    eod_auto_pykrx_markets: str = 'KOSPI,KOSDAQ,KONEX'
+    eod_auto_pykrx_refresh_universe: bool = True
+
 
 settings = Settings()

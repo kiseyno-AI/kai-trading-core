@@ -2,11 +2,14 @@ import asyncio
 
 from fastapi import APIRouter, HTTPException
 
+from app.core.settings import settings
+from app.eod.auto_pykrx import auto_pykrx_eod_scheduler
 from app.eod.master import refresh_master_if_due
 from app.eod.pykrx_backfill import DEFAULT_MARKETS, PYKRX_BACKFILL_SERVICE
 from app.eod.master_state import master_refresh_state
 from app.eod.service import EOD_SERVICE
 from app.eod.state import job_state
+from app.market.clock import get_market_state
 
 router = APIRouter(prefix='/eod', tags=['eod'])
 
@@ -16,6 +19,7 @@ async def get_eod_status() -> dict:
     return {
         'job': job_state.snapshot(),
         'master': master_refresh_state.snapshot(),
+        'pykrx_auto': auto_pykrx_eod_scheduler.snapshot(),
     }
 
 
@@ -85,3 +89,24 @@ async def backfill_pykrx_eod(
         )
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f'pykrx backfill failed: {exc}') from exc
+
+
+@router.post('/pykrx/daily/run-if-due')
+async def run_pykrx_daily_if_due(
+    market_date: str | None = None,
+    markets: str | None = None,
+    force: bool = False,
+    refresh_universe: bool | None = None,
+) -> dict:
+    try:
+        parsed_markets = tuple(item.strip().upper() for item in (markets or settings.eod_auto_pykrx_markets).split(',') if item.strip())
+        return await asyncio.to_thread(
+            PYKRX_BACKFILL_SERVICE.run_daily_collection_if_due,
+            market_date=market_date or get_market_state().server_time[:10],
+            markets=parsed_markets or DEFAULT_MARKETS,
+            trigger='manual_daily_api',
+            refresh_universe=settings.eod_auto_pykrx_refresh_universe if refresh_universe is None else refresh_universe,
+            force=force,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f'pykrx daily EOD run failed: {exc}') from exc

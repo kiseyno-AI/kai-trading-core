@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import date, datetime
 from decimal import Decimal
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from app.db import session_scope
+from app.db import engine, session_scope
 from app.db_models import CurrentQuoteCache, DailyPriceBar, EODCollectionRun, MarketStatusSnapshot, QuoteSnapshot, Symbol, TrackedSymbol
 from app.market.clock import MarketState
 
@@ -323,6 +324,43 @@ def create_eod_collection_run(
         return run.id
 
 
+def load_latest_eod_collection_run(
+    *,
+    market: str,
+    trade_date: str,
+    source: str | None = None,
+    statuses: list[str] | None = None,
+) -> dict | None:
+    with session_scope() as session:
+        stmt = select(EODCollectionRun).where(
+            EODCollectionRun.market == market,
+            EODCollectionRun.trade_date == _parse_trade_date(trade_date),
+        )
+        if source:
+            stmt = stmt.where(EODCollectionRun.source == source)
+        if statuses:
+            stmt = stmt.where(EODCollectionRun.status.in_(statuses))
+        stmt = stmt.order_by(EODCollectionRun.started_at.desc(), EODCollectionRun.id.desc()).limit(1)
+        row = session.execute(stmt).scalars().first()
+        if row is None:
+            return None
+        return {
+            'id': row.id,
+            'market': row.market,
+            'trade_date': row.trade_date.isoformat(),
+            'source': row.source,
+            'trigger': row.trigger,
+            'status': row.status,
+            'symbols_total': row.symbols_total,
+            'symbols_succeeded': row.symbols_succeeded,
+            'symbols_failed': row.symbols_failed,
+            'error_message': row.error_message,
+            'started_at': row.started_at.isoformat() if row.started_at else None,
+            'completed_at': row.completed_at.isoformat() if row.completed_at else None,
+            'run_metadata': row.run_metadata,
+        }
+
+
 def complete_eod_collection_run(
     run_id: int,
     *,
@@ -340,6 +378,37 @@ def complete_eod_collection_run(
         run.symbols_failed = symbols_failed
         run.error_message = error_message
         run.completed_at = datetime.utcnow()
+
+
+@contextmanager
+def advisory_eod_collection_lock(*, market: str, trade_date: str, source: str):
+    trade_key = int(trade_date.replace('-', ''))
+    source_key = {
+        ('KRX', 'pykrx'): 10_001,
+        ('KRX', 'kis'): 10_002,
+    }.get((market, source), 19_999)
+
+    with engine.connect() as connection:
+        acquired = bool(
+            connection.execute(
+                text('SELECT pg_try_advisory_lock(:source_key, :trade_key)'),
+                {
+                    'source_key': source_key,
+                    'trade_key': trade_key,
+                },
+            ).scalar()
+        )
+        try:
+            yield acquired
+        finally:
+            if acquired:
+                connection.execute(
+                    text('SELECT pg_advisory_unlock(:source_key, :trade_key)'),
+                    {
+                        'source_key': source_key,
+                        'trade_key': trade_key,
+                    },
+                )
 
 
 def persist_daily_price_bar(snapshot: dict, *, run_id: int | None = None) -> None:
