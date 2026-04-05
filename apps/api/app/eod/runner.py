@@ -4,8 +4,9 @@ import asyncio
 import logging
 from contextlib import suppress
 
+from app.core.settings import settings
+from app.eod.auto_pykrx import auto_pykrx_eod_scheduler
 from app.eod.master import refresh_master_if_due
-from app.eod.service import EOD_SERVICE
 from app.market.clock import get_market_state
 
 logger = logging.getLogger(__name__)
@@ -25,6 +26,7 @@ class EODBackgroundRunner:
 
     async def stop(self) -> None:
         self._running = False
+        await auto_pykrx_eod_scheduler.stop()
         if self._task:
             self._task.cancel()
             with suppress(asyncio.CancelledError):
@@ -38,10 +40,10 @@ class EODBackgroundRunner:
                 if market.state == 'PREOPEN':
                     refresh_master_if_due()
                 elif market.state == 'CLOSED':
-                    await EOD_SERVICE.capture_if_due(trigger='background')
+                    await auto_pykrx_eod_scheduler.maybe_schedule()
             except Exception as exc:
                 logger.exception('Background runner loop failed: %s', exc)
             await asyncio.sleep(self.interval_seconds)
 
 
-background_runner = EODBackgroundRunner()
+background_runner = EODBackgroundRunner(interval_seconds=settings.eod_auto_pykrx_poll_seconds)

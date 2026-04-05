@@ -11,9 +11,11 @@ from pykrx import stock
 
 from app.eod.master import get_master_symbols
 from app.market_data_store import (
+    advisory_eod_collection_lock,
     complete_eod_collection_run,
     create_eod_collection_run,
     load_symbols,
+    load_latest_eod_collection_run,
     persist_daily_price_bars,
     upsert_symbol_universe,
 )
@@ -47,6 +49,10 @@ def _to_iso_date(value: object) -> str:
     if isinstance(value, date):
         return value.isoformat()
     return str(value)[:10]
+
+
+def _normalize_iso_date(value: str) -> str:
+    return datetime.strptime(value, '%Y%m%d').date().isoformat()
 
 
 def _get_market_ohlcv_by_date(start_date: str, end_date: str, symbol: str):
@@ -249,6 +255,103 @@ class PykrxBackfillService:
     ) -> dict:
         normalized_start = _normalize_yyyymmdd(start_date)
         normalized_end = _normalize_yyyymmdd(end_date, default=date.today().strftime('%Y%m%d'))
+        return self._run_collection(
+            start_date=normalized_start,
+            end_date=normalized_end,
+            markets=markets,
+            trigger=trigger,
+            refresh_universe=refresh_universe,
+            limit=limit,
+            symbol=symbol,
+            mode='historical_backfill',
+        )
+
+    def run_daily_collection_if_due(
+        self,
+        *,
+        market_date: str,
+        markets: Sequence[str] = DEFAULT_MARKETS,
+        trigger: str = 'auto_close',
+        refresh_universe: bool = True,
+        force: bool = False,
+    ) -> dict:
+        normalized_market_date = _normalize_yyyymmdd(market_date)
+        market_date_iso = _normalize_iso_date(normalized_market_date)
+        latest_trade_date = self.resolve_latest_trade_date(end_date=normalized_market_date)
+
+        if latest_trade_date != market_date_iso:
+            return {
+                'triggered': False,
+                'reason': 'trade_date_not_available_yet',
+                'market_date': market_date_iso,
+                'latest_available_trade_date': latest_trade_date,
+                'source': 'pykrx',
+            }
+
+        with advisory_eod_collection_lock(market='KRX', trade_date=market_date_iso, source='pykrx') as lock_acquired:
+            if not lock_acquired:
+                return {
+                    'triggered': False,
+                    'reason': 'already_running',
+                    'market_date': market_date_iso,
+                    'latest_available_trade_date': latest_trade_date,
+                    'source': 'pykrx',
+                }
+
+            latest_run = load_latest_eod_collection_run(
+                market='KRX',
+                trade_date=market_date_iso,
+                source='pykrx',
+            )
+            if latest_run and latest_run['status'] == 'running':
+                return {
+                    'triggered': False,
+                    'reason': 'already_running',
+                    'market_date': market_date_iso,
+                    'latest_available_trade_date': latest_trade_date,
+                    'source': 'pykrx',
+                    'existing_run': latest_run,
+                }
+            if (
+                not force
+                and latest_run
+                and latest_run['status'] == 'completed'
+                and latest_run['symbols_failed'] == 0
+            ):
+                return {
+                    'triggered': False,
+                    'reason': 'already_completed',
+                    'market_date': market_date_iso,
+                    'latest_available_trade_date': latest_trade_date,
+                    'source': 'pykrx',
+                    'existing_run': latest_run,
+                }
+
+            result = self._run_collection(
+                start_date=normalized_market_date,
+                end_date=normalized_market_date,
+                markets=markets,
+                trigger=trigger,
+                refresh_universe=refresh_universe,
+                mode='daily_auto',
+            )
+            result['triggered'] = True
+            return result
+
+    def _run_collection(
+        self,
+        *,
+        start_date: str,
+        end_date: str,
+        markets: Sequence[str],
+        trigger: str,
+        refresh_universe: bool,
+        mode: str,
+        limit: int | None = None,
+        symbol: str | None = None,
+    ) -> dict:
+        normalized_start = _normalize_yyyymmdd(start_date)
+        normalized_end = _normalize_yyyymmdd(end_date)
 
         if refresh_universe:
             snapshot = self.fetch_recent_universe_snapshot(markets=markets, limit=limit)
@@ -279,7 +382,7 @@ class PykrxBackfillService:
 
         latest_trade_date = self.resolve_latest_trade_date(end_date=normalized_end)
         run_metadata = {
-            'mode': 'historical_backfill',
+            'mode': mode,
             'requested_start_date': normalized_start,
             'requested_end_date': normalized_end,
             'latest_available_trade_date': latest_trade_date,

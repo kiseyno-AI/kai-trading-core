@@ -18,6 +18,7 @@
 - `POST /eod/capture?market_date=YYYY-MM-DD`
 - `POST /eod/pykrx/universe/refresh?markets=KOSPI,KOSDAQ,KONEX`
 - `POST /eod/pykrx/backfill?start_date=19560101&end_date=YYYYMMDD`
+- `POST /eod/pykrx/daily/run-if-due?market_date=YYYY-MM-DD`
 
 ## Next routes
 - KIS balance inquiry

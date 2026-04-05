@@ -5,4 +5,4 @@ pydantic-settings>=2.10.0
 sqlalchemy>=2.0.36
 psycopg[binary]>=3.2.9
 alembic>=1.16.0
-pykrx>=1.2.4
+pykrx>=1.0.51
