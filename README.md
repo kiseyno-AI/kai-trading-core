@@ -149,6 +149,26 @@ Practical notes for newcomers:
 - The database name and credentials can differ per machine; what matters is that `.env` points at a reachable Postgres instance and Alembic reaches `head`.
 - After bootstrapping, rerun `alembic current` to confirm your database revision matches the repo's current head.
 
+### Core tables in practical terms
+
+Use this as the quick mental model:
+
+- `symbols` is the master list of instruments.
+- `tracked_symbols` is the subset the scanner/watchlist currently cares about.
+- `quote_snapshots` and `current_quote_cache` store intraday quotes.
+- `market_status_snapshots` stores what the app believed the market clock was.
+- `eod_collection_runs` and `daily_price_bars` store end-of-day collection history and the resulting daily bars.
+
+| Table | What it is for | Key attributes and why they matter |
+|------|-----------------|------------------------------------|
+| `symbols` | Canonical instrument master used by the rest of the schema. Other tables reference `symbol_id` here instead of repeating symbol text everywhere. | `symbol` is the actual trading code such as `005930`. `name_ko` is the Korean display name. `market` tells you which market bucket it belongs to. `standard_code` keeps the upstream reference code when available. `instrument_type` is the asset class label. `source` tells you whether the row came from the KIS master refresh, scanner, or quote flow. `is_active` marks whether the master entry is still current. `last_refreshed_at` shows when the metadata was last refreshed. |
+| `tracked_symbols` | Persisted watchlist/scanner membership. This is the small set returned by `/scanner/tracked-symbols` and used by tracked-quote flows. | `symbol_id` points to the instrument in `symbols`. `sort_order` preserves the caller-facing order. `created_at` tells you when that tracked row was added. |
+| `quote_snapshots` | Append-only intraday quote history. Each persisted quote event creates a new row. | `symbol_id` ties the quote to an instrument. `market_state` captures the market session context. `price`, `change`, `change_pct`, `volume`, and `turnover` are the normalized quote fields most downstream code will read first. `as_of` stores the upstream quote time string. `source` records which provider or app path supplied the data. `is_live` distinguishes a live quote from a non-live path. `fallback` marks restart-safe fallback data. `payload` keeps the raw normalized quote payload for debugging and later reprocessing. `captured_at` is when the snapshot was written. |
+| `current_quote_cache` | The latest known quote per symbol. Use this when you want current state, not history. | It intentionally mirrors the main quote fields from `quote_snapshots`, but `symbol_id` is unique so there is only one current row per symbol. `captured_at` tells you when the cached quote was observed. `updated_at` tells you when that cache row was last rewritten. |
+| `market_status_snapshots` | Persisted market-clock observations over time. This is the history behind "what market state did the app think we were in?" | `market` names the market scope. `state` stores values like pre-open, open, or closed. `is_trading_day` and `is_open` are the first booleans most callers care about. `reason` explains special cases such as holidays. `server_time` is the reference timestamp used to evaluate the state. `session_open_at` and `session_close_at` are the expected trading-session bounds. `source` identifies the writer. `captured_at` is when the row was persisted. |
+| `eod_collection_runs` | Audit trail for EOD collection jobs. One row represents one attempt to collect a market day's daily bars. | `trade_date` is the market date being collected. `market`, `source`, and `trigger` explain what was collected and why the run started. `status` shows whether the run is still running, completed, or completed with errors. `symbols_total`, `symbols_succeeded`, and `symbols_failed` are the main progress counters. `error_message` stores a run-level failure summary. `started_at` and `completed_at` tell you how long the run took. `run_metadata` is JSON for extra context that does not justify a dedicated column yet. |
+| `daily_price_bars` | One daily OHLCV row per symbol per trade date. This is the durable end-of-day price history table. | `symbol_id` identifies the instrument. `trade_date` is the date of the bar. `open_price`, `high_price`, `low_price`, and `close_price` are the daily OHLC values. `volume` and `turnover` capture activity for that day. `eod_run_id` links the bar back to the collection run that produced or associated it. `source` records the upstream provider. `captured_at` shows when the row was stored. |
+
 ---
 
 ## Runtime direction
