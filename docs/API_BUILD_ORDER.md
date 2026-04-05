@@ -12,6 +12,12 @@
 - `GET /broker/kis/quote?symbol=005930`
 - `GET /macro/bok/series?series_id=...&start_period=...&end_period=...`
 - `GET /fx/koreaexim/rates?search_date=YYYYMMDD`
+- `GET /eod/status`
+- `POST /eod/master/refresh-if-due`
+- `POST /eod/capture-if-due`
+- `POST /eod/capture?market_date=YYYY-MM-DD`
+- `POST /eod/pykrx/universe/refresh?markets=KOSPI,KOSDAQ,KONEX`
+- `POST /eod/pykrx/backfill?start_date=19560101&end_date=YYYYMMDD`
 
 ## Next routes
 - KIS balance inquiry

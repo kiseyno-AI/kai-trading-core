@@ -3,7 +3,8 @@ from __future__ import annotations
 from datetime import date, datetime
 from decimal import Decimal
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.db import session_scope
 from app.db_models import CurrentQuoteCache, DailyPriceBar, EODCollectionRun, MarketStatusSnapshot, QuoteSnapshot, Symbol, TrackedSymbol
@@ -12,6 +13,12 @@ from app.market.clock import MarketState
 
 def _parse_trade_date(value: str) -> date:
     return date.fromisoformat(value)
+
+
+def _normalize_trade_date(value: str | date) -> date:
+    if isinstance(value, date):
+        return value
+    return _parse_trade_date(value)
 
 
 def _parse_datetime(value: str | None) -> datetime | None:
@@ -67,45 +74,91 @@ def ensure_symbol(
         return record.id
 
 
-def upsert_master_symbols(items: list) -> int:
-    refreshed_at = datetime.utcnow()
-    with session_scope() as session:
-        existing = {
-            item.symbol: item
-            for item in session.execute(select(Symbol).where(Symbol.symbol.in_([entry.symbol for entry in items]))).scalars()
-        }
-        seen_symbols: set[str] = set()
-        for entry in items:
-            seen_symbols.add(entry.symbol)
-            record = existing.get(entry.symbol)
-            if record is None:
-                session.add(
-                    Symbol(
-                        symbol=entry.symbol,
-                        standard_code=entry.standard_code,
-                        name_ko=entry.name_ko,
-                        market=entry.market,
-                        instrument_type='equity',
-                        source='kis_master',
-                        is_active=True,
-                        last_refreshed_at=refreshed_at,
-                    )
-                )
-                continue
+def upsert_symbol_universe(
+    items: list,
+    *,
+    source: str,
+    stale_sources: list[str] | None = None,
+    instrument_type: str = 'equity',
+) -> int:
+    if not items:
+        return 0
 
-            record.standard_code = entry.standard_code
-            record.name_ko = entry.name_ko
-            record.market = entry.market
-            record.instrument_type = 'equity'
-            record.source = 'kis_master'
-            record.is_active = True
-            record.last_refreshed_at = refreshed_at
-        if seen_symbols:
-            for stale in session.execute(select(Symbol).where(Symbol.source == 'kis_master')).scalars():
-                if stale.symbol not in seen_symbols:
-                    stale.is_active = False
-                    stale.last_refreshed_at = refreshed_at
-        return len(items)
+    refreshed_at = datetime.utcnow()
+    symbol_rows = [
+        {
+            'symbol': entry.symbol,
+            'standard_code': getattr(entry, 'standard_code', None),
+            'name_ko': entry.name_ko,
+            'market': entry.market,
+            'instrument_type': instrument_type,
+            'source': source,
+            'is_active': True,
+            'last_refreshed_at': refreshed_at,
+        }
+        for entry in items
+    ]
+
+    with session_scope() as session:
+        statement = pg_insert(Symbol).values(symbol_rows)
+        session.execute(
+            statement.on_conflict_do_update(
+                index_elements=[Symbol.symbol],
+                set_={
+                    'standard_code': statement.excluded.standard_code,
+                    'name_ko': statement.excluded.name_ko,
+                    'market': statement.excluded.market,
+                    'instrument_type': statement.excluded.instrument_type,
+                    'source': statement.excluded.source,
+                    'is_active': statement.excluded.is_active,
+                    'last_refreshed_at': statement.excluded.last_refreshed_at,
+                    'updated_at': refreshed_at,
+                },
+            )
+        )
+        stale_source_names = [source] if stale_sources is None else stale_sources
+        if stale_source_names:
+            session.execute(
+                update(Symbol)
+                .where(Symbol.source.in_(stale_source_names), ~Symbol.symbol.in_([entry.symbol for entry in items]))
+                .values(is_active=False, last_refreshed_at=refreshed_at, updated_at=refreshed_at)
+            )
+    return len(items)
+
+
+def upsert_master_symbols(items: list) -> int:
+    return upsert_symbol_universe(items, source='kis_master')
+
+
+def load_symbols(
+    *,
+    is_active: bool | None = None,
+    source: str | None = None,
+    markets: list[str] | None = None,
+    limit: int | None = None,
+) -> list[dict]:
+    with session_scope() as session:
+        stmt = select(
+            Symbol.id,
+            Symbol.symbol,
+            Symbol.standard_code,
+            Symbol.name_ko,
+            Symbol.market,
+            Symbol.instrument_type,
+            Symbol.source,
+            Symbol.is_active,
+            Symbol.last_refreshed_at,
+        ).order_by(Symbol.market.asc(), Symbol.symbol.asc())
+        if is_active is not None:
+            stmt = stmt.where(Symbol.is_active == is_active)
+        if source:
+            stmt = stmt.where(Symbol.source == source)
+        if markets:
+            stmt = stmt.where(Symbol.market.in_(markets))
+        if limit:
+            stmt = stmt.limit(limit)
+        rows = session.execute(stmt).all()
+        return [dict(row._mapping) for row in rows]
 
 
 def load_tracked_symbols() -> list[str]:
@@ -248,6 +301,7 @@ def create_eod_collection_run(
     symbols_total: int,
     trigger: str,
     source: str = 'kis',
+    run_metadata: dict | None = None,
 ) -> int:
     with session_scope() as session:
         run = EODCollectionRun(
@@ -257,7 +311,7 @@ def create_eod_collection_run(
             trigger=trigger,
             status='running',
             symbols_total=symbols_total,
-            run_metadata=None,
+            run_metadata=run_metadata,
         )
         session.add(run)
         session.flush()
@@ -330,3 +384,78 @@ def persist_daily_price_bar(snapshot: dict, *, run_id: int | None = None) -> Non
         row.turnover = snapshot['turnover']
         row.source = snapshot.get('source', 'kis')
         row.captured_at = datetime.utcnow()
+
+
+def persist_daily_price_bars(
+    symbol: str,
+    bars: list[dict],
+    *,
+    market: str,
+    source: str,
+    run_id: int | None = None,
+    name_ko: str | None = None,
+    standard_code: str | None = None,
+) -> int:
+    if not bars:
+        return 0
+
+    refreshed_at = datetime.utcnow()
+    with session_scope() as session:
+        record = _get_symbol(session, symbol)
+        if record is None:
+            record = Symbol(
+                symbol=symbol,
+                market=market,
+                name_ko=name_ko or symbol,
+                standard_code=standard_code,
+                instrument_type='equity',
+                source=source,
+                is_active=True,
+                last_refreshed_at=refreshed_at,
+            )
+            session.add(record)
+            session.flush()
+        else:
+            if name_ko:
+                record.name_ko = name_ko
+            if standard_code:
+                record.standard_code = standard_code
+            record.market = market
+            record.instrument_type = 'equity'
+            record.source = source
+            record.is_active = True
+            record.last_refreshed_at = refreshed_at
+
+        values = [
+            {
+                'symbol_id': record.id,
+                'eod_run_id': run_id,
+                'trade_date': _normalize_trade_date(item['trade_date']),
+                'open_price': int(item['open_price']),
+                'high_price': int(item['high_price']),
+                'low_price': int(item['low_price']),
+                'close_price': int(item['close_price']),
+                'volume': int(item['volume']),
+                'turnover': int(item['turnover']),
+                'source': source,
+            }
+            for item in bars
+        ]
+        statement = pg_insert(DailyPriceBar).values(values)
+        session.execute(
+            statement.on_conflict_do_update(
+                index_elements=[DailyPriceBar.symbol_id, DailyPriceBar.trade_date],
+                set_={
+                    'eod_run_id': statement.excluded.eod_run_id,
+                    'open_price': statement.excluded.open_price,
+                    'high_price': statement.excluded.high_price,
+                    'low_price': statement.excluded.low_price,
+                    'close_price': statement.excluded.close_price,
+                    'volume': statement.excluded.volume,
+                    'turnover': statement.excluded.turnover,
+                    'source': statement.excluded.source,
+                    'captured_at': refreshed_at,
+                },
+            )
+        )
+    return len(values)

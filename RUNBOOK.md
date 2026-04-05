@@ -21,6 +21,8 @@ What it does:
 - `GET /health`
 - `GET /eod/status`
 - `POST /eod/master/refresh-if-due`
+- `POST /eod/pykrx/universe/refresh`
+- `POST /eod/pykrx/backfill`
 
 ## Current runtime expectations
 - Core server should stay up 24/7.
@@ -38,6 +40,29 @@ Before first startup on a fresh machine, from `apps/api`:
 2. Create the Postgres database and user referenced by `.env`
 3. `alembic upgrade head`
 4. `python -c "from app.main import app"`
+
+## pykrx EOD backfill
+
+From `apps/api` on this machine:
+
+1. `python3.11 -m pip install -r requirements.txt`
+2. `alembic upgrade head`
+3. `python3.11 -m app.eod.pykrx_backfill refresh-universe`
+4. `python3.11 -m app.eod.pykrx_backfill backfill --start-date 19560101`
+
+Useful limited-scope runs:
+
+- One-symbol verification: `python3.11 -m app.eod.pykrx_backfill backfill --symbol 005930 --limit 1`
+- API-triggered universe refresh: `curl -X POST http://127.0.0.1:8000/eod/pykrx/universe/refresh`
+- API-triggered backfill: `curl -X POST "http://127.0.0.1:8000/eod/pykrx/backfill?start_date=19560101"`
+
+Notes:
+
+- The pykrx path refreshes the active listed universe first, then backfills only those active symbols.
+- When pykrx market-wide universe endpoints are empty, the command falls back to the existing KIS master universe so delisted names are still excluded.
+- Historical bars use pykrx's default adjusted OHLCV series because long-range `adjusted=False` calls returned empty data during local verification.
+- `--limit` runs do not deactivate missing symbols in the DB, so they are safe for small smoke tests.
+- The backfill writes into `symbols`, `daily_price_bars`, and `eod_collection_runs` without adding new schema.
 
 ## Next ops step
 Set this up under a long-running process manager (LaunchAgent, systemd, pm2, or equivalent).

@@ -1,6 +1,9 @@
+import asyncio
+
 from fastapi import APIRouter, HTTPException
 
 from app.eod.master import refresh_master_if_due
+from app.eod.pykrx_backfill import DEFAULT_MARKETS, PYKRX_BACKFILL_SERVICE
 from app.eod.master_state import master_refresh_state
 from app.eod.service import EOD_SERVICE
 from app.eod.state import job_state
@@ -43,3 +46,42 @@ async def capture_eod(market_date: str) -> dict:
         return await EOD_SERVICE.capture_market_date(market_date, trigger='manual')
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f'EOD capture failed: {exc}') from exc
+
+
+@router.post('/pykrx/universe/refresh')
+async def refresh_pykrx_universe(markets: str = ','.join(DEFAULT_MARKETS), limit: int | None = None) -> dict:
+    try:
+        parsed_markets = tuple(item.strip().upper() for item in markets.split(',') if item.strip())
+        return await asyncio.to_thread(
+            PYKRX_BACKFILL_SERVICE.refresh_recent_universe,
+            markets=parsed_markets or DEFAULT_MARKETS,
+            limit=limit,
+            deactivate_missing=limit is None,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f'pykrx universe refresh failed: {exc}') from exc
+
+
+@router.post('/pykrx/backfill')
+async def backfill_pykrx_eod(
+    start_date: str = '19560101',
+    end_date: str | None = None,
+    markets: str = ','.join(DEFAULT_MARKETS),
+    limit: int | None = None,
+    symbol: str | None = None,
+    refresh_universe: bool = True,
+) -> dict:
+    try:
+        parsed_markets = tuple(item.strip().upper() for item in markets.split(',') if item.strip())
+        return await asyncio.to_thread(
+            PYKRX_BACKFILL_SERVICE.run_backfill,
+            start_date=start_date,
+            end_date=end_date,
+            markets=parsed_markets or DEFAULT_MARKETS,
+            trigger='manual_api',
+            refresh_universe=refresh_universe,
+            limit=limit,
+            symbol=symbol,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f'pykrx backfill failed: {exc}') from exc
