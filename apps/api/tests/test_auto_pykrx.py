@@ -41,6 +41,40 @@ class PykrxBackfillServiceTests(TestCase):
         self.assertEqual(result['reason'], 'already_completed')
         run_collection.assert_not_called()
 
+    def test_run_daily_collection_force_bypasses_stale_running_row(self) -> None:
+        service = PykrxBackfillService()
+
+        with (
+            patch.object(service, 'resolve_latest_trade_date', return_value='2026-04-03'),
+            patch('app.eod.pykrx_backfill.advisory_eod_collection_lock', return_value=_lock()),
+            patch(
+                'app.eod.pykrx_backfill.load_latest_eod_collection_run',
+                return_value={
+                    'id': 8,
+                    'status': 'running',
+                    'symbols_failed': 0,
+                },
+            ),
+            patch.object(
+                service,
+                '_run_collection',
+                return_value={
+                    'run_id': 9,
+                    'source': 'pykrx',
+                    'status': 'completed',
+                },
+            ) as run_collection,
+        ):
+            result = service.run_daily_collection_if_due(
+                market_date='2026-04-03',
+                trigger='manual_daily_api',
+                force=True,
+            )
+
+        self.assertTrue(result['triggered'])
+        self.assertEqual(result['run_id'], 9)
+        run_collection.assert_called_once()
+
 
 class AutoPykrxEODSchedulerTests(IsolatedAsyncioTestCase):
     async def test_maybe_schedule_waits_for_close_buffer(self) -> None:

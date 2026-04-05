@@ -303,7 +303,7 @@ class PykrxBackfillService:
                 trade_date=market_date_iso,
                 source='pykrx',
             )
-            if latest_run and latest_run['status'] == 'running':
+            if latest_run and latest_run['status'] == 'running' and not force:
                 return {
                     'triggered': False,
                     'reason': 'already_running',
