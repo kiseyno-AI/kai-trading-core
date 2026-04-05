@@ -15,6 +15,7 @@ description: Default Codex workflow for kai-trading-core—monorepo layout, apps
 1. Read `AGENTS.md`, `RULES.md`, `ARCHITECTURE.md`, `TASKS.md`, `RUNBOOK.md`.
 2. Trust the project in Codex so `.codex/config.toml` loads ([Codex config](https://developers.openai.com/codex/config-reference)).
 3. Create and switch to a dedicated branch before doing task work.
+4. For ACP coding work, start from a fresh thread-spawned ACP session. Treat `acpx exited with code 1`, empty spawned-session messages, and gateway errors such as `queue owner unavailable`, `Resource not found`, or `repairing dead named session` as dead-session symptoms. Do not silently fall back to non-ACP runs; clean up stale ACP sessions, restart the gateway if needed, then retry with a fresh spawned ACP session.
 
 ## Safety
 
