@@ -83,6 +83,7 @@ class PykrxBackfillService:
             symbols,
             source='pykrx',
             stale_sources=['pykrx', 'kis_master'] if deactivate_missing else [],
+            stale_markets=list({item.market for item in symbols}),
         )
 
     def fetch_recent_universe(
@@ -123,10 +124,12 @@ class PykrxBackfillService:
         for market in markets:
             try:
                 frame = stock.get_market_ohlcv_by_ticker(as_of_date, market=market)
-            except Exception:
-                continue
+            except Exception as exc:
+                logger.warning('pykrx market universe fetch failed for %s on %s: %s', market, as_of_date, exc)
+                return []
             if frame.empty or '시가' not in frame.columns:
-                continue
+                logger.warning('pykrx market universe returned no usable rows for %s on %s', market, as_of_date)
+                return []
             tickers = [str(ticker).zfill(6) for ticker in frame.index.tolist()]
             for ticker in tickers:
                 if not ticker.isdigit() or len(ticker) != 6:

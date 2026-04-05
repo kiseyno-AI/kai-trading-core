@@ -79,6 +79,7 @@ def upsert_symbol_universe(
     *,
     source: str,
     stale_sources: list[str] | None = None,
+    stale_markets: list[str] | None = None,
     instrument_type: str = 'equity',
 ) -> int:
     if not items:
@@ -118,11 +119,15 @@ def upsert_symbol_universe(
         )
         stale_source_names = [source] if stale_sources is None else stale_sources
         if stale_source_names:
-            session.execute(
+            target_markets = stale_markets or list({entry.market for entry in items if getattr(entry, 'market', None)})
+            stale_stmt = (
                 update(Symbol)
                 .where(Symbol.source.in_(stale_source_names), ~Symbol.symbol.in_([entry.symbol for entry in items]))
                 .values(is_active=False, last_refreshed_at=refreshed_at, updated_at=refreshed_at)
             )
+            if target_markets:
+                stale_stmt = stale_stmt.where(Symbol.market.in_(target_markets))
+            session.execute(stale_stmt)
     return len(items)
 
 
