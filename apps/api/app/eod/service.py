@@ -9,6 +9,7 @@ from app.brokers.kis.provider import kis_client
 from app.eod.sink import snapshot_sink
 from app.eod.state import job_state
 from app.eod.universe import UniverseSymbol, universe_service
+from app.market_data_store import complete_eod_collection_run, create_eod_collection_run
 from app.market.clock import get_market_state
 
 
@@ -34,7 +35,7 @@ class EODService:
     batch_size = 50
     batch_pause_seconds = 0.2
 
-    async def capture_if_due(self, now: Optional[datetime] = None) -> dict:
+    async def capture_if_due(self, now: Optional[datetime] = None, *, trigger: str = 'manual') -> dict:
         market = get_market_state(now)
         market_date = market.server_time[:10]
 
@@ -54,12 +55,18 @@ class EODService:
                 'job': job_state.snapshot(),
             }
 
-        return await self.capture_market_date(market_date)
+        return await self.capture_market_date(market_date, trigger=trigger)
 
-    async def capture_market_date(self, market_date: str) -> dict:
+    async def capture_market_date(self, market_date: str, *, trigger: str = 'manual') -> dict:
         symbols = list(universe_service.iter_symbols())
         job_state.start(market_date=market_date, symbols_total=len(symbols))
         items: list[dict] = []
+        run_id = create_eod_collection_run(
+            market='KRX',
+            trade_date=market_date,
+            symbols_total=len(symbols),
+            trigger=trigger,
+        )
 
         try:
             for offset in range(0, len(symbols), self.batch_size):
@@ -69,7 +76,7 @@ class EODService:
                         snapshot = await self.fetch_symbol_eod(item=item, market_date=market_date)
                         payload = snapshot.to_dict()
                         items.append(payload)
-                        self.persist_snapshot(payload)
+                        self.persist_snapshot(payload, run_id=run_id)
                         job_state.mark_success()
                     except Exception:
                         job_state.mark_failure(item.symbol)
@@ -77,9 +84,22 @@ class EODService:
                     await asyncio.sleep(self.batch_pause_seconds)
         except Exception as exc:
             job_state.fail(exc)
+            complete_eod_collection_run(
+                run_id,
+                status='failed',
+                symbols_succeeded=job_state.symbols_succeeded,
+                symbols_failed=job_state.symbols_failed,
+                error_message=str(exc),
+            )
             raise
 
         job_state.complete()
+        complete_eod_collection_run(
+            run_id,
+            status=job_state.last_status,
+            symbols_succeeded=job_state.symbols_succeeded,
+            symbols_failed=job_state.symbols_failed,
+        )
         return {
             'triggered': True,
             'market_date': market_date,
@@ -108,8 +128,8 @@ class EODService:
             turnover=int(latest.get('acml_tr_pbmn', 0) or 0),
         )
 
-    def persist_snapshot(self, snapshot: dict) -> None:
-        snapshot_sink.persist(snapshot)
+    def persist_snapshot(self, snapshot: dict, *, run_id: int | None = None) -> None:
+        snapshot_sink.persist(snapshot, run_id=run_id)
 
 
 EOD_SERVICE = EODService()

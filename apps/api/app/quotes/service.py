@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import logging
+
 from app.brokers.kis.provider import kis_client
+from app.market_data_store import load_current_quote, persist_quote_snapshot
 from app.market.clock import get_market_state
 from app.quotes.cache import quote_cache
 from app.quotes.names import SymbolNameService
 from app.scanner.state import scanner_state
+
+logger = logging.getLogger(__name__)
 
 
 def normalize_kis_quote(symbol: str, raw: dict, market_state: str) -> dict:
@@ -42,11 +47,26 @@ class QuoteService:
                 cached['is_live'] = False
                 cached['cached_at'] = quote_cache.get_updated_at(symbol)
                 return cached
+            try:
+                persisted = load_current_quote(symbol)
+            except Exception as exc:
+                logger.warning('Quote cache lookup failed for %s: %s', symbol, exc)
+            else:
+                if persisted:
+                    persisted['market_state'] = market.state
+                    persisted['source'] = 'db_cache'
+                    persisted['fallback'] = True
+                    persisted['is_live'] = False
+                    return persisted
 
         raw = await self.client.fetch_domestic_quote(symbol=symbol)
         normalized = normalize_kis_quote(symbol=symbol, raw=raw, market_state=market.state)
         normalized['company_name'] = await self.name_service.resolve(symbol)
         quote_cache.set(symbol, normalized)
+        try:
+            persist_quote_snapshot(normalized)
+        except Exception as exc:
+            logger.warning('Quote persistence failed for %s: %s', symbol, exc)
         normalized['cached_at'] = quote_cache.get_updated_at(symbol)
         return normalized
 

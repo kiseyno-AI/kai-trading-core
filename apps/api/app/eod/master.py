@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import logging
 import zipfile
 from dataclasses import dataclass
 from datetime import datetime
@@ -8,10 +9,12 @@ from typing import Iterable, Optional
 from urllib.request import urlopen
 
 from app.eod.master_state import master_refresh_state
+from app.market_data_store import upsert_master_symbols
 from app.market.clock import get_market_state
 
 KOSPI_MASTER_URL = 'https://new.real.download.dws.co.kr/common/master/kospi_code.mst.zip'
 KOSDAQ_MASTER_URL = 'https://new.real.download.dws.co.kr/common/master/kosdaq_code.mst.zip'
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -77,6 +80,10 @@ def refresh_master_if_due(now: Optional[datetime] = None, *, force: bool = False
     try:
         symbols = load_all_domestic_masters()
         master_refresh_state.complete(symbols)
+        try:
+            upsert_master_symbols(symbols)
+        except Exception as exc:
+            logger.warning('Symbol master persistence failed: %s', exc)
         return symbols
     except Exception as exc:
         master_refresh_state.fail(exc)

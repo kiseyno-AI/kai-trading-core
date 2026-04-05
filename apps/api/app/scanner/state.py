@@ -21,5 +21,10 @@ class ScannerState:
         self.last_updated_at = datetime.utcnow().isoformat() + 'Z'
         return self.snapshot()
 
+    def hydrate(self, symbols: list[str], *, last_updated_at: str | None = None) -> dict:
+        self.tracked_symbols = symbols
+        self.last_updated_at = last_updated_at
+        return self.snapshot()
+
 
 scanner_state = ScannerState()

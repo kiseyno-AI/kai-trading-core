@@ -15,8 +15,10 @@ from app.api.routes_market import router as market_router
 from app.api.routes_quotes import router as quotes_router
 from app.api.routes_symbols import router as symbols_router
 from app.core.settings import settings
-from app.eod.runner import background_runner
 from app.db import check_database, init_database
+from app.eod.runner import background_runner
+from app.market_data_store import load_tracked_symbols
+from app.scanner.state import scanner_state
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +27,9 @@ logger = logging.getLogger(__name__)
 async def lifespan(_: FastAPI):
     try:
         init_database()
+        tracked_symbols = load_tracked_symbols()
+        if tracked_symbols:
+            scanner_state.hydrate(tracked_symbols)
     except Exception as exc:
         logger.warning('Database initialization failed; starting in degraded mode: %s', exc)
     await background_runner.start()
