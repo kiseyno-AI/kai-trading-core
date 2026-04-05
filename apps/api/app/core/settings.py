@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     app_debug: bool = True
     upstream_bearer_token: Optional[str] = None
 
+    db_auto_upgrade: bool = True
     database_url: Optional[str] = None
     postgres_host: str = 'localhost'
     postgres_port: int = 5432

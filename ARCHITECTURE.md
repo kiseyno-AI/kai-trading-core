@@ -11,6 +11,7 @@
 ## API service layout (`apps/api`)
 - **`app/main.py`** — FastAPI app, CORS, bearer middleware, router registration, lifespan (`background_runner`).
 - **`app/core/settings.py`** — Pydantic Settings / `.env` (KIS, BOK, Korea Exim, `UPSTREAM_BEARER_TOKEN`, etc.).
+- **`app/db.py` + `alembic/`** — SQLAlchemy engine/session helpers and Alembic schema migrations.
 - **`app/api/routes_*.py`** — HTTP routers (KIS, macro, FX, scanner, market, quotes, symbols, EOD).
 - **`app/brokers/kis/`** — KIS client/provider/schemas.
 - **`app/integrations/`** — BOK, FX (Korea Exim), etc.

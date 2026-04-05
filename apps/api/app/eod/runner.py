@@ -38,7 +38,7 @@ class EODBackgroundRunner:
                 if market.state == 'PREOPEN':
                     refresh_master_if_due()
                 elif market.state == 'CLOSED':
-                    await EOD_SERVICE.capture_if_due()
+                    await EOD_SERVICE.capture_if_due(trigger='background')
             except Exception as exc:
                 logger.exception('Background runner loop failed: %s', exc)
             await asyncio.sleep(self.interval_seconds)

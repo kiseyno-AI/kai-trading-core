@@ -10,7 +10,7 @@
 ## TODO
 - Add pre-market master refresh workflow and operational scheduling.
 - Extend domestic master universe loader from KOSPI/KOSDAQ to KRX/KONEX coverage as needed.
-- Persist EOD OHLCV snapshots into the market database once DB schema/repository is ready.
+- Refine database repositories and retention policies now that the initial market-data schema is in place.
 
 ## Tooling (Codex)
 - Trust this repo in **Codex** so `.codex/config.toml` and skills load.

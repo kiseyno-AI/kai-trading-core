@@ -40,6 +40,6 @@ async def capture_eod_if_due() -> dict:
 @router.post('/capture')
 async def capture_eod(market_date: str) -> dict:
     try:
-        return await EOD_SERVICE.capture_market_date(market_date)
+        return await EOD_SERVICE.capture_market_date(market_date, trigger='manual')
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f'EOD capture failed: {exc}') from exc
