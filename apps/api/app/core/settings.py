@@ -42,7 +42,8 @@ class Settings(BaseSettings):
     )
 
     koreaexim_api_key: str = ''
-    koreaexim_base_url: str = 'https://www.koreaexim.go.kr/site/program/financial/exchangeJSON'
+    koreaexim_base_url: str = 'https://oapi.koreaexim.go.kr/site/program/financial/exchangeJSON'
+    koreaexim_fallback_days: int = 2
 
     dart_api_key: str = ''
     dart_base_url: str = 'https://opendart.fss.or.kr/api'

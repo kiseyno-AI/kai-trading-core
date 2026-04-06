@@ -15,6 +15,7 @@
 - **`app/api/routes_*.py`** — HTTP routers (KIS, macro, FX, scanner, market, quotes, symbols, EOD).
 - **`app/brokers/kis/`** — KIS client/provider/schemas.
 - **`app/integrations/`** — BOK, FX (Korea Exim), etc.
+- **`app/fx/`** — Korea Exim FX service-level normalization, filtering, and date fallback behavior.
 - **`app/quotes/`**, **`app/market/`**, **`app/scanner/`**, **`app/eod/`** — domain services and background behavior, including pykrx-based historical EOD backfill.
 
 ## Documentation

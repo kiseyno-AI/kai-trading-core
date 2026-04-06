@@ -21,6 +21,7 @@ What it does:
 - `GET /health`
 - `GET /macro/ecos/series?stat_code=722Y001&cycle=M&start_period=202401&end_period=202403&item_code_1=0101000`
 - `GET /disclosures/dart/company-snapshot?stock_code=005930`
+- `GET /fx/koreaexim/rates?search_date=20260406&currency=USD`
 - `GET /eod/status`
 - `POST /eod/master/refresh-if-due`
 - `POST /eod/pykrx/universe/refresh`
@@ -85,6 +86,13 @@ Set this up under a long-running process manager (LaunchAgent, systemd, pm2, or 
 
 - Set `DART_API_KEY` in `apps/api/.env` before calling DART-backed endpoints.
 - `DART_CORP_CODE_CACHE_TTL_SECONDS` controls how long the in-memory corp-code mapping is reused before refreshing from Open DART.
+
+## Korea Exim FX notes
+
+- Set `KOREAEXIM_API_KEY` in `apps/api/.env` before calling the Korea Exim FX route.
+- `GET /fx/koreaexim/rates` currently targets the Korea Exim `AP01` daily exchange-rate slice only.
+- Optional query parameters: `search_date=YYYYMMDD`, `currency=USD`, and `fallback_days=0..10`.
+- `KOREAEXIM_FALLBACK_DAYS` controls how many prior days the service searches when the requested date is a weekend or holiday.
 
 ## ECOS notes
 

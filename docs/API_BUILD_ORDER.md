@@ -4,7 +4,7 @@
 1. KIS auth token issuance
 2. KIS domestic quote route
 3. BOK/ECOS macro series route
-4. Korea Exim FX rates route
+4. Korea Exim FX daily exchange-rate snapshot route
 5. DART company snapshot route
 
 ## Current routes
@@ -13,7 +13,7 @@
 - `GET /broker/kis/quote?symbol=005930`
 - `GET /macro/ecos/series?stat_code=...&cycle=...&start_period=...&end_period=...&item_code_1=...`
 - `GET /macro/bok/series?series_id=...&cycle=...&start_period=...&end_period=...&item_code_1=...`
-- `GET /fx/koreaexim/rates?search_date=YYYYMMDD`
+- `GET /fx/koreaexim/rates?search_date=YYYYMMDD&currency=USD&fallback_days=2`
 - `GET /disclosures/dart/company-snapshot?stock_code=005930`
 - `GET /eod/status`
 - `POST /eod/master/refresh-if-due`
