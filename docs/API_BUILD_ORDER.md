@@ -3,7 +3,7 @@
 ## Implemented order
 1. KIS auth token issuance
 2. KIS domestic quote route
-3. BOK macro series route
+3. BOK/ECOS macro series route
 4. Korea Exim FX rates route
 5. DART company snapshot route
 
@@ -11,7 +11,8 @@
 - `POST /broker/kis/token`
 - `GET /broker/kis/health`
 - `GET /broker/kis/quote?symbol=005930`
-- `GET /macro/bok/series?series_id=...&start_period=...&end_period=...`
+- `GET /macro/ecos/series?stat_code=...&cycle=...&start_period=...&end_period=...&item_code_1=...`
+- `GET /macro/bok/series?series_id=...&cycle=...&start_period=...&end_period=...&item_code_1=...`
 - `GET /fx/koreaexim/rates?search_date=YYYYMMDD`
 - `GET /disclosures/dart/company-snapshot?stock_code=005930`
 - `GET /eod/status`

@@ -1,5 +1,6 @@
 from typing import Optional
 
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -31,8 +32,14 @@ class Settings(BaseSettings):
     kis_use_mock: bool = True
     kis_token_refresh_margin_seconds: int = 300
 
-    bok_api_key: str = ''
-    bok_base_url: str = 'https://ecos.bok.or.kr/api/StatisticSearch'
+    bok_ecos_api_key: str = Field(
+        default='',
+        validation_alias=AliasChoices('BOK_ECOS_API_KEY', 'BOK_API_KEY'),
+    )
+    bok_ecos_base_url: str = Field(
+        default='https://ecos.bok.or.kr/api',
+        validation_alias=AliasChoices('BOK_ECOS_BASE_URL', 'BOK_BASE_URL'),
+    )
 
     koreaexim_api_key: str = ''
     koreaexim_base_url: str = 'https://www.koreaexim.go.kr/site/program/financial/exchangeJSON'
