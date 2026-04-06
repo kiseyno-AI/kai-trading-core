@@ -40,7 +40,7 @@ class DartClient:
         page_count: int = 10,
         last_reprt_at: str = 'Y',
     ) -> dict[str, Any]:
-        return await self._get_json(
+        payload = await self._get_json(
             '/list.json',
             {
                 'corp_code': corp_code,
@@ -51,7 +51,18 @@ class DartClient:
                 'sort': 'date',
                 'sort_mth': 'desc',
             },
+            allowed_statuses={'013'},
         )
+        if payload.get('status') == '013':
+            return {
+                'status': '013',
+                'message': payload.get('message'),
+                'page_no': '1',
+                'page_count': '0',
+                'total_count': '0',
+                'list': [],
+            }
+        return payload
 
     async def lookup_corp_code(
         self,
@@ -106,11 +117,17 @@ class DartClient:
             self._corp_codes_loaded_at = now
             return corp_codes
 
-    async def _get_json(self, path: str, params: dict[str, str]) -> dict[str, Any]:
+    async def _get_json(
+        self,
+        path: str,
+        params: dict[str, str],
+        *,
+        allowed_statuses: set[str] | None = None,
+    ) -> dict[str, Any]:
         response = await self._request(path, params)
         payload = response.json()
         status = payload.get('status')
-        if status and status != '000':
+        if status and status != '000' and (allowed_statuses is None or status not in allowed_statuses):
             raise DartAPIError(f"DART request failed [{status}]: {payload.get('message', 'Unknown error')}")
         return payload
 
