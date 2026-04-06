@@ -6,7 +6,7 @@ from unittest import IsolatedAsyncioTestCase, TestCase
 from unittest.mock import AsyncMock, patch
 
 from app.eod.auto_pykrx import AutoPykrxEODScheduler
-from app.eod.pykrx_backfill import PykrxBackfillService
+from app.eod.pykrx_backfill import PykrxBackfillService, PykrxSymbol
 from app.market.clock import KST, MarketState
 
 
@@ -129,6 +129,47 @@ class PykrxBackfillServiceTests(TestCase):
             error_message='Marked stale after 30 minutes without completion.',
         )
         run_collection.assert_called_once()
+
+    def test_run_collection_continues_when_progress_update_fails(self) -> None:
+        service = PykrxBackfillService()
+
+        with (
+            patch.object(
+                service,
+                'load_active_universe',
+                return_value=[PykrxSymbol(symbol='005930', market='KOSPI', name_ko='Samsung Electronics')],
+            ),
+            patch.object(service, 'resolve_latest_trade_date', return_value='2026-04-03'),
+            patch.object(service, '_map_symbol_bars', return_value=[{
+                'trade_date': '2026-04-03',
+                'open_price': 1,
+                'high_price': 2,
+                'low_price': 1,
+                'close_price': 2,
+                'volume': 3,
+                'turnover': 4,
+            }]),
+            patch('app.eod.pykrx_backfill.create_eod_collection_run', return_value=12),
+            patch('app.eod.pykrx_backfill._get_market_ohlcv_by_date', return_value=type('Frame', (), {'empty': False})()),
+            patch('app.eod.pykrx_backfill.persist_daily_price_bars', return_value=1),
+            patch('app.eod.pykrx_backfill.update_eod_collection_run_progress', side_effect=RuntimeError('progress write failed')),
+            patch('app.eod.pykrx_backfill.complete_eod_collection_run') as complete_run,
+        ):
+            result = service.run_backfill(
+                start_date='20260403',
+                end_date='20260403',
+                refresh_universe=False,
+            )
+
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['symbols_succeeded'], 1)
+        complete_run.assert_called_once_with(
+            12,
+            status='completed',
+            symbols_succeeded=1,
+            symbols_failed=0,
+            error_message=None,
+        )
 
 
 class AutoPykrxEODSchedulerTests(IsolatedAsyncioTestCase):

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -26,6 +27,7 @@ from app.market_data_store import (
 )
 
 logger = logging.getLogger(__name__)
+_PYKRX_REQUEST_TIMEOUT_LOCK = threading.RLock()
 
 DEFAULT_START_DATE = '19560101'
 DEFAULT_MARKETS = ('KOSPI', 'KOSDAQ', 'KONEX')
@@ -66,23 +68,24 @@ def _pykrx_request_timeout(timeout_seconds: int):
         yield
         return
 
-    original_get = webio.requests.get
-    original_post = webio.requests.post
+    with _PYKRX_REQUEST_TIMEOUT_LOCK:
+        original_get = webio.requests.get
+        original_post = webio.requests.post
 
-    def _wrap_with_timeout(func):
-        def _wrapped(*args, **kwargs):
-            kwargs.setdefault('timeout', timeout_seconds)
-            return func(*args, **kwargs)
+        def _wrap_with_timeout(func):
+            def _wrapped(*args, **kwargs):
+                kwargs.setdefault('timeout', timeout_seconds)
+                return func(*args, **kwargs)
 
-        return _wrapped
+            return _wrapped
 
-    webio.requests.get = _wrap_with_timeout(original_get)
-    webio.requests.post = _wrap_with_timeout(original_post)
-    try:
-        yield
-    finally:
-        webio.requests.get = original_get
-        webio.requests.post = original_post
+        webio.requests.get = _wrap_with_timeout(original_get)
+        webio.requests.post = _wrap_with_timeout(original_post)
+        try:
+            yield
+        finally:
+            webio.requests.get = original_get
+            webio.requests.post = original_post
 
 
 def _call_pykrx(func, *args, **kwargs):
@@ -507,11 +510,14 @@ class PykrxBackfillService:
                     symbols_failed += 1
                     failed_symbols.append(item.symbol)
                     logger.warning('pykrx backfill failed for %s: %s', item.symbol, exc)
-                update_eod_collection_run_progress(
-                    run_id,
-                    symbols_succeeded=symbols_succeeded,
-                    symbols_failed=symbols_failed,
-                )
+                try:
+                    update_eod_collection_run_progress(
+                        run_id,
+                        symbols_succeeded=symbols_succeeded,
+                        symbols_failed=symbols_failed,
+                    )
+                except Exception as exc:
+                    logger.warning('pykrx progress update failed for run %s after %s: %s', run_id, item.symbol, exc)
                 if self.symbol_pause_seconds:
                     time.sleep(self.symbol_pause_seconds)
         except Exception as exc:
