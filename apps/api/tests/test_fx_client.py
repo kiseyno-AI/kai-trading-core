@@ -1,5 +1,7 @@
 import unittest
 
+import httpx
+
 from app.integrations.fx.client import KoreaEximAPIError, KoreaEximClient, KoreaEximConfigurationError
 from app.core.settings import settings
 
@@ -23,6 +25,11 @@ class TestableKoreaEximClient(KoreaEximClient):
     async def _get(self, params):
         self.last_params = params
         return self.response
+
+
+class TransportErrorKoreaEximClient(KoreaEximClient):
+    async def _get(self, params):
+        raise httpx.ConnectError('network down', request=httpx.Request('GET', self.base_url))
 
 
 class KoreaEximClientTests(unittest.IsolatedAsyncioTestCase):
@@ -53,6 +60,16 @@ class KoreaEximClientTests(unittest.IsolatedAsyncioTestCase):
         original_api_key = settings.koreaexim_api_key
         settings.koreaexim_api_key = 'test-key'
         client = TestableKoreaEximClient(FakeResponse([{'result': 4}]))
+        try:
+            with self.assertRaises(KoreaEximAPIError):
+                await client.fetch_exchange_rates(search_date='20260406')
+        finally:
+            settings.koreaexim_api_key = original_api_key
+
+    async def test_fetch_exchange_rates_wraps_transport_errors(self):
+        original_api_key = settings.koreaexim_api_key
+        settings.koreaexim_api_key = 'test-key'
+        client = TransportErrorKoreaEximClient()
         try:
             with self.assertRaises(KoreaEximAPIError):
                 await client.fetch_exchange_rates(search_date='20260406')

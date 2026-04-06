@@ -32,7 +32,10 @@ class KoreaEximClient:
             'searchdate': search_date,
             'data': data,
         }
-        response = await self._get(params)
+        try:
+            response = await self._get(params)
+        except httpx.HTTPError as exc:
+            raise KoreaEximAPIError(f'Korea Exim transport error: {exc}') from exc
         if response.status_code >= 400:
             raise KoreaEximAPIError(f'Korea Exim request failed [{response.status_code}]: {response.text}')
 

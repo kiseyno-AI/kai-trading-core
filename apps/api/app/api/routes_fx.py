@@ -2,7 +2,7 @@ from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query
 
-from app.fx.service import KoreaEximRateNotFoundError, fx_service
+from app.fx.service import KoreaEximInvalidSearchDateError, KoreaEximRateNotFoundError, fx_service
 from app.integrations.fx.client import KoreaEximAPIError, KoreaEximConfigurationError
 
 router = APIRouter(prefix='/fx/koreaexim', tags=['fx:koreaexim'])
@@ -20,8 +20,8 @@ async def get_exchange_rates(
             currency=currency,
             fallback_days=fallback_days,
         )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=f'Invalid search_date: {exc}') from exc
+    except KoreaEximInvalidSearchDateError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except KoreaEximConfigurationError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except KoreaEximRateNotFoundError as exc:

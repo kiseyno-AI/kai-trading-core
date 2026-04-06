@@ -4,13 +4,16 @@ from datetime import date, datetime, timedelta
 from typing import Any
 
 from app.core.settings import settings
-from app.integrations.fx.client import KoreaEximClient
+from app.integrations.fx.client import KoreaEximAPIError, KoreaEximClient
 
 
 def _normalize_numeric(value: str | None) -> float | None:
     if value in (None, ''):
         return None
-    return float(value.replace(',', ''))
+    try:
+        return float(value.replace(',', ''))
+    except ValueError as exc:
+        raise KoreaEximAPIError(f'Korea Exim returned invalid numeric value: {value}') from exc
 
 
 def _split_currency_unit(cur_unit: str | None) -> tuple[str | None, int]:
@@ -31,6 +34,10 @@ class KoreaEximRateNotFoundError(RuntimeError):
     pass
 
 
+class KoreaEximInvalidSearchDateError(ValueError):
+    pass
+
+
 class KoreaEximService:
     def __init__(self, client: KoreaEximClient | None = None) -> None:
         self.client = client or KoreaEximClient()
@@ -46,7 +53,10 @@ class KoreaEximService:
         requested_date = search_date or date.today().strftime('%Y%m%d')
         normalized_currency = currency.upper() if currency else None
         effective_fallback_days = settings.koreaexim_fallback_days if fallback_days is None else max(fallback_days, 0)
-        requested_day = datetime.strptime(requested_date, '%Y%m%d').date()
+        try:
+            requested_day = datetime.strptime(requested_date, '%Y%m%d').date()
+        except ValueError as exc:
+            raise KoreaEximInvalidSearchDateError(f'Invalid search_date: {requested_date}') from exc
 
         for day_offset in range(effective_fallback_days + 1):
             effective_date = (requested_day - timedelta(days=day_offset)).strftime('%Y%m%d')
