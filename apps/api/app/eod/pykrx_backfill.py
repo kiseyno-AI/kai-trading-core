@@ -2,25 +2,32 @@ from __future__ import annotations
 
 import argparse
 import logging
+import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Iterable, Sequence
 
 from pykrx import stock
+from pykrx.website.comm import webio
 
+from app.core.settings import settings
 from app.eod.master import get_master_symbols
 from app.market_data_store import (
     advisory_eod_collection_lock,
+    count_eod_run_persisted_symbols,
     complete_eod_collection_run,
     create_eod_collection_run,
     load_symbols,
     load_latest_eod_collection_run,
     persist_daily_price_bars,
+    update_eod_collection_run_progress,
     upsert_symbol_universe,
 )
 
 logger = logging.getLogger(__name__)
+_PYKRX_REQUEST_TIMEOUT_LOCK = threading.RLock()
 
 DEFAULT_START_DATE = '19560101'
 DEFAULT_MARKETS = ('KOSPI', 'KOSDAQ', 'KONEX')
@@ -55,9 +62,40 @@ def _normalize_iso_date(value: str) -> str:
     return datetime.strptime(value, '%Y%m%d').date().isoformat()
 
 
+@contextmanager
+def _pykrx_request_timeout(timeout_seconds: int):
+    if timeout_seconds <= 0:
+        yield
+        return
+
+    with _PYKRX_REQUEST_TIMEOUT_LOCK:
+        original_get = webio.requests.get
+        original_post = webio.requests.post
+
+        def _wrap_with_timeout(func):
+            def _wrapped(*args, **kwargs):
+                kwargs.setdefault('timeout', timeout_seconds)
+                return func(*args, **kwargs)
+
+            return _wrapped
+
+        webio.requests.get = _wrap_with_timeout(original_get)
+        webio.requests.post = _wrap_with_timeout(original_post)
+        try:
+            yield
+        finally:
+            webio.requests.get = original_get
+            webio.requests.post = original_post
+
+
+def _call_pykrx(func, *args, **kwargs):
+    with _pykrx_request_timeout(settings.eod_pykrx_request_timeout_seconds):
+        return func(*args, **kwargs)
+
+
 def _get_market_ohlcv_by_date(start_date: str, end_date: str, symbol: str):
     getter = getattr(stock, 'get_market_ohlcv_by_date', None) or getattr(stock, 'get_market_ohlcv')
-    return getter(start_date, end_date, symbol)
+    return _call_pykrx(getter, start_date, end_date, symbol)
 
 
 class PykrxBackfillService:
@@ -129,7 +167,7 @@ class PykrxBackfillService:
         items: list[PykrxSymbol] = []
         for market in markets:
             try:
-                frame = stock.get_market_ohlcv_by_ticker(as_of_date, market=market)
+                frame = _call_pykrx(stock.get_market_ohlcv_by_ticker, as_of_date, market=market)
             except Exception as exc:
                 logger.warning('pykrx market universe fetch failed for %s on %s: %s', market, as_of_date, exc)
                 return []
@@ -141,7 +179,7 @@ class PykrxBackfillService:
                 if not ticker.isdigit() or len(ticker) != 6:
                     continue
                 try:
-                    name_ko = stock.get_market_ticker_name(ticker)
+                    name_ko = _call_pykrx(stock.get_market_ticker_name, ticker)
                 except Exception:
                     logger.warning('Falling back to ticker as name for %s', ticker)
                     name_ko = ticker
@@ -304,6 +342,23 @@ class PykrxBackfillService:
                 source='pykrx',
             )
             if latest_run and latest_run['status'] == 'running' and not force:
+                if self._is_stale_running_run(latest_run):
+                    self._fail_stale_running_run(latest_run)
+                else:
+                    return {
+                        'triggered': False,
+                        'reason': 'already_running',
+                        'market_date': market_date_iso,
+                        'latest_available_trade_date': latest_trade_date,
+                        'source': 'pykrx',
+                        'existing_run': latest_run,
+                    }
+                latest_run = load_latest_eod_collection_run(
+                    market='KRX',
+                    trade_date=market_date_iso,
+                    source='pykrx',
+                )
+            if latest_run and latest_run['status'] == 'running' and not force:
                 return {
                     'triggered': False,
                     'reason': 'already_running',
@@ -337,6 +392,34 @@ class PykrxBackfillService:
             )
             result['triggered'] = True
             return result
+
+    def _is_stale_running_run(self, run: dict) -> bool:
+        stale_minutes = settings.eod_auto_pykrx_stale_run_minutes
+        started_at = run.get('started_at')
+        if run.get('status') != 'running' or stale_minutes <= 0 or not started_at:
+            return False
+        started = datetime.fromisoformat(started_at)
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=timezone.utc)
+        age = datetime.now(timezone.utc) - started.astimezone(timezone.utc)
+        return age >= timedelta(minutes=stale_minutes)
+
+    def _fail_stale_running_run(self, run: dict) -> None:
+        persisted_symbols = count_eod_run_persisted_symbols(run['id'])
+        symbols_total = int(run.get('symbols_total') or 0)
+        symbols_succeeded = max(int(run.get('symbols_succeeded') or 0), persisted_symbols)
+        symbols_failed = max(int(run.get('symbols_failed') or 0), max(symbols_total - symbols_succeeded, 0))
+        error_message = (
+            f"Marked stale after {settings.eod_auto_pykrx_stale_run_minutes} minutes without completion."
+        )
+        logger.warning('Marking stale pykrx EOD run %s as failed: %s', run['id'], error_message)
+        complete_eod_collection_run(
+            run['id'],
+            status='failed',
+            symbols_succeeded=symbols_succeeded,
+            symbols_failed=symbols_failed,
+            error_message=error_message,
+        )
 
     def _run_collection(
         self,
@@ -427,6 +510,14 @@ class PykrxBackfillService:
                     symbols_failed += 1
                     failed_symbols.append(item.symbol)
                     logger.warning('pykrx backfill failed for %s: %s', item.symbol, exc)
+                try:
+                    update_eod_collection_run_progress(
+                        run_id,
+                        symbols_succeeded=symbols_succeeded,
+                        symbols_failed=symbols_failed,
+                    )
+                except Exception as exc:
+                    logger.warning('pykrx progress update failed for run %s after %s: %s', run_id, item.symbol, exc)
                 if self.symbol_pause_seconds:
                     time.sleep(self.symbol_pause_seconds)
         except Exception as exc:

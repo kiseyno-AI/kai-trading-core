@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from unittest import IsolatedAsyncioTestCase, TestCase
 from unittest.mock import AsyncMock, patch
 
 from app.eod.auto_pykrx import AutoPykrxEODScheduler
-from app.eod.pykrx_backfill import PykrxBackfillService
+from app.eod.pykrx_backfill import PykrxBackfillService, PykrxSymbol
 from app.market.clock import KST, MarketState
 
 
@@ -74,6 +74,102 @@ class PykrxBackfillServiceTests(TestCase):
         self.assertTrue(result['triggered'])
         self.assertEqual(result['run_id'], 9)
         run_collection.assert_called_once()
+
+    def test_run_daily_collection_marks_stale_running_row_failed_and_retries(self) -> None:
+        service = PykrxBackfillService()
+        stale_started_at = (datetime.now(timezone.utc) - timedelta(minutes=45)).isoformat()
+
+        with (
+            patch.object(service, 'resolve_latest_trade_date', return_value='2026-04-03'),
+            patch('app.eod.pykrx_backfill.advisory_eod_collection_lock', return_value=_lock()),
+            patch(
+                'app.eod.pykrx_backfill.load_latest_eod_collection_run',
+                side_effect=[
+                    {
+                        'id': 8,
+                        'status': 'running',
+                        'symbols_total': 10,
+                        'symbols_succeeded': 0,
+                        'symbols_failed': 0,
+                        'started_at': stale_started_at,
+                    },
+                    {
+                        'id': 8,
+                        'status': 'failed',
+                        'symbols_total': 10,
+                        'symbols_succeeded': 3,
+                        'symbols_failed': 7,
+                        'started_at': stale_started_at,
+                    },
+                ],
+            ),
+            patch('app.eod.pykrx_backfill.count_eod_run_persisted_symbols', return_value=3),
+            patch('app.eod.pykrx_backfill.complete_eod_collection_run') as complete_run,
+            patch.object(
+                service,
+                '_run_collection',
+                return_value={
+                    'run_id': 9,
+                    'source': 'pykrx',
+                    'status': 'completed',
+                },
+            ) as run_collection,
+        ):
+            result = service.run_daily_collection_if_due(
+                market_date='2026-04-03',
+                trigger='auto_close_scheduler',
+            )
+
+        self.assertTrue(result['triggered'])
+        complete_run.assert_called_once_with(
+            8,
+            status='failed',
+            symbols_succeeded=3,
+            symbols_failed=7,
+            error_message='Marked stale after 30 minutes without completion.',
+        )
+        run_collection.assert_called_once()
+
+    def test_run_collection_continues_when_progress_update_fails(self) -> None:
+        service = PykrxBackfillService()
+
+        with (
+            patch.object(
+                service,
+                'load_active_universe',
+                return_value=[PykrxSymbol(symbol='005930', market='KOSPI', name_ko='Samsung Electronics')],
+            ),
+            patch.object(service, 'resolve_latest_trade_date', return_value='2026-04-03'),
+            patch.object(service, '_map_symbol_bars', return_value=[{
+                'trade_date': '2026-04-03',
+                'open_price': 1,
+                'high_price': 2,
+                'low_price': 1,
+                'close_price': 2,
+                'volume': 3,
+                'turnover': 4,
+            }]),
+            patch('app.eod.pykrx_backfill.create_eod_collection_run', return_value=12),
+            patch('app.eod.pykrx_backfill._get_market_ohlcv_by_date', return_value=type('Frame', (), {'empty': False})()),
+            patch('app.eod.pykrx_backfill.persist_daily_price_bars', return_value=1),
+            patch('app.eod.pykrx_backfill.update_eod_collection_run_progress', side_effect=RuntimeError('progress write failed')),
+            patch('app.eod.pykrx_backfill.complete_eod_collection_run') as complete_run,
+        ):
+            result = service.run_backfill(
+                start_date='20260403',
+                end_date='20260403',
+                refresh_universe=False,
+            )
+
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['symbols_succeeded'], 1)
+        complete_run.assert_called_once_with(
+            12,
+            status='completed',
+            symbols_succeeded=1,
+            symbols_failed=0,
+            error_message=None,
+        )
 
 
 class AutoPykrxEODSchedulerTests(IsolatedAsyncioTestCase):

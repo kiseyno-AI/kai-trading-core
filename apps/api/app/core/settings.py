@@ -54,6 +54,8 @@ class Settings(BaseSettings):
     eod_auto_pykrx_after_close_minutes: int = 10
     eod_auto_pykrx_markets: str = 'KOSPI,KOSDAQ,KONEX'
     eod_auto_pykrx_refresh_universe: bool = True
+    eod_auto_pykrx_stale_run_minutes: int = 30
+    eod_pykrx_request_timeout_seconds: int = 20
 
 
 settings = Settings()
