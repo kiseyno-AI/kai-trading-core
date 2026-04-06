@@ -49,9 +49,11 @@ class ECOSClient:
             quote(start_period, safe=''),
             quote(end_period, safe=''),
         ]
-        for item_code in (item_code_1, item_code_2, item_code_3, item_code_4):
-            if item_code:
-                path_parts.append(quote(item_code, safe=''))
+        item_codes = [item_code_1, item_code_2, item_code_3, item_code_4]
+        while item_codes and not item_codes[-1]:
+            item_codes.pop()
+        for item_code in item_codes:
+            path_parts.append(quote(item_code or '', safe=''))
 
         url = f"{self.base_url}/{'/'.join(path_parts)}"
         async with httpx.AsyncClient(timeout=20.0) as client:
