@@ -37,5 +37,9 @@ class Settings(BaseSettings):
     koreaexim_api_key: str = ''
     koreaexim_base_url: str = 'https://www.koreaexim.go.kr/site/program/financial/exchangeJSON'
 
+    dart_api_key: str = ''
+    dart_base_url: str = 'https://opendart.fss.or.kr/api'
+    dart_corp_code_cache_ttl_seconds: int = 86400
+
 
 settings = Settings()

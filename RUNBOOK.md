@@ -19,6 +19,7 @@ What it does:
 
 ## Health checks
 - `GET /health`
+- `GET /disclosures/dart/company-snapshot?stock_code=005930`
 - `GET /eod/status`
 - `POST /eod/master/refresh-if-due`
 - `POST /eod/pykrx/universe/refresh`
@@ -55,6 +56,7 @@ Useful limited-scope runs:
 - One-symbol verification: `python3.11 -m app.eod.pykrx_backfill backfill --symbol 005930 --limit 1`
 - API-triggered universe refresh: `curl -X POST http://127.0.0.1:8000/eod/pykrx/universe/refresh`
 - API-triggered backfill: `curl -X POST "http://127.0.0.1:8000/eod/pykrx/backfill?start_date=19560101"`
+- DART company snapshot smoke test: `curl "http://127.0.0.1:8000/disclosures/dart/company-snapshot?stock_code=005930"`
 
 Notes:
 
@@ -66,3 +68,8 @@ Notes:
 
 ## Next ops step
 Set this up under a long-running process manager (LaunchAgent, systemd, pm2, or equivalent).
+
+## DART notes
+
+- Set `DART_API_KEY` in `apps/api/.env` before calling DART-backed endpoints.
+- `DART_CORP_CODE_CACHE_TTL_SECONDS` controls how long the in-memory corp-code mapping is reused before refreshing from Open DART.
