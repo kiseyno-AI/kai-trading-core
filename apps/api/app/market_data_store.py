@@ -4,7 +4,7 @@ from contextlib import contextmanager
 from datetime import date, datetime
 from decimal import Decimal
 
-from sqlalchemy import delete, select, text, update
+from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.db import engine, session_scope
@@ -378,6 +378,31 @@ def complete_eod_collection_run(
         run.symbols_failed = symbols_failed
         run.error_message = error_message
         run.completed_at = datetime.utcnow()
+
+
+def update_eod_collection_run_progress(
+    run_id: int,
+    *,
+    symbols_succeeded: int,
+    symbols_failed: int,
+) -> None:
+    with session_scope() as session:
+        run = session.get(EODCollectionRun, run_id)
+        if run is None:
+            return
+        run.symbols_succeeded = symbols_succeeded
+        run.symbols_failed = symbols_failed
+
+
+def count_eod_run_persisted_symbols(run_id: int) -> int:
+    with session_scope() as session:
+        return int(
+            session.execute(
+                select(func.count(func.distinct(DailyPriceBar.symbol_id)))
+                .select_from(DailyPriceBar)
+                .where(DailyPriceBar.eod_run_id == run_id)
+            ).scalar_one()
+        )
 
 
 @contextmanager
