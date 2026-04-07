@@ -42,6 +42,7 @@
 - Practical lower bound for `fnlttSinglAcntAll` and `list.json` in this pipeline is 2015 onward. Open DART documents both the filing-search date range and the financial-statement `bsns_year` support as 2015 and later, so the DB `daily_price_bars` minimum of `2007-06-05` does not expand the usable fundamentals backfill window.
 - Ongoing machine-DB sync now persists only periodic financial-report events (`사업보고서`, `반기보고서`, `분기보고서`). Non-financial disclosures are still fetched from Open DART during polling, but they are not inserted into `dart_disclosure_events`.
 - The current-universe backfill operator is intentionally batch-oriented. Use the current active symbol universe only, slice with `symbol_limit` and `symbol_offset`, sync only financial report events for that slice, then capture only those symbols' pending/failed fundamentals.
+- For operator-driven continuation batches, prefer `python3.11 -m app.dart.backfill_current_universe ...` or a quoted `curl` URL. Unquoted shell query strings can turn `?` and `&` into zsh parsing/job-control issues before the request reaches the API.
 
 ## DART prioritization
 
