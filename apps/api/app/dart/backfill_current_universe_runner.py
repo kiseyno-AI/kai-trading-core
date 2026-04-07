@@ -4,7 +4,7 @@ import argparse
 import asyncio
 import json
 import sys
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -13,14 +13,14 @@ from app.dart.fundamentals_capture_service import dart_fundamentals_capture_serv
 
 
 def _default_log_path() -> Path:
-    timestamp = datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')
+    timestamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
     return Path('var/log') / f'dart-backfill-runner-{timestamp}.log'
 
 
 def _append_log(log_path: Path, *, event: str, **fields: Any) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        'timestamp': datetime.now(UTC).isoformat(),
+        'timestamp': datetime.now(timezone.utc).isoformat(),
         'event': event,
         **fields,
     }
