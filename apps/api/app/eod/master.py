@@ -6,8 +6,8 @@ import zipfile
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Iterable, Optional
-from urllib.request import urlopen
 
+from app.core.audit_logging import download_bytes_with_audit
 from app.eod.master_state import master_refresh_state
 from app.market_data_store import upsert_master_symbols
 from app.market.clock import get_market_state
@@ -26,8 +26,7 @@ class MasterSymbol:
 
 
 def _download_zip_bytes(url: str) -> bytes:
-    with urlopen(url, timeout=30) as response:
-        return response.read()
+    return download_bytes_with_audit(service='kis_master', url=url, timeout=30)
 
 
 def _read_zip_member_bytes(payload: bytes, member_suffix: str) -> bytes:

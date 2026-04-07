@@ -4,6 +4,7 @@ from typing import Any
 
 import httpx
 
+from app.core.audit_logging import request_with_audit
 from app.core.settings import settings
 
 
@@ -21,7 +22,13 @@ class KoreaEximClient:
 
     async def _get(self, params: dict[str, str]) -> httpx.Response:
         async with httpx.AsyncClient(timeout=20.0) as client:
-            return await client.get(self.base_url, params=params)
+            return await request_with_audit(
+                client,
+                'koreaexim',
+                'GET',
+                self.base_url,
+                params=params,
+            )
 
     async def fetch_exchange_rates(self, *, search_date: str, data: str = 'AP01') -> list[dict[str, Any]]:
         if not settings.koreaexim_api_key:

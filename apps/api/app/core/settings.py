@@ -16,6 +16,13 @@ class Settings(BaseSettings):
     app_env: str = 'development'
     app_debug: bool = True
     upstream_bearer_token: Optional[str] = None
+    api_request_logging_enabled: bool = True
+    upstream_http_logging_enabled: bool = True
+    api_log_directory: str = 'var/log'
+    api_request_log_file_name: str = 'api-requests.log'
+    upstream_http_log_file_name: str = 'upstream-http.log'
+    api_log_rotation_max_bytes: int = 20 * 1024 * 1024
+    api_log_rotation_backup_count: int = 10
 
     db_auto_upgrade: bool = True
     database_url: Optional[str] = None

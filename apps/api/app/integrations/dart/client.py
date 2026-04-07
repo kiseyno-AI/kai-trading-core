@@ -9,6 +9,7 @@ from xml.etree import ElementTree
 
 import httpx
 
+from app.core.audit_logging import request_with_audit
 from app.core.settings import settings
 
 
@@ -141,7 +142,13 @@ class DartClient:
 
         request_params = {'crtfc_key': self.api_key, **params}
         async with httpx.AsyncClient(timeout=20.0) as client:
-            response = await client.get(f'{self.base_url}{path}', params=request_params)
+            response = await request_with_audit(
+                client,
+                'dart',
+                'GET',
+                f'{self.base_url}{path}',
+                params=request_params,
+            )
             if response.status_code >= 400:
                 raise DartAPIError(f'DART request failed [{response.status_code}]: {response.text}')
             return response
