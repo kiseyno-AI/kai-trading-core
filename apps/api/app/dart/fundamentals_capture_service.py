@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import re
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -93,15 +94,9 @@ def _month_after(base_month: int, months_forward: int) -> int:
 
 def build_row_payloads(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     payloads = []
+    row_key_counts: dict[str, int] = {}
     for item in items:
-        row_key = '|'.join(
-            [
-                item.get('statement_type') or '',
-                item.get('account_id') or '',
-                item.get('account_name') or '',
-                str(item.get('order') or ''),
-            ]
-        )
+        row_key = _build_row_key(item, row_key_counts=row_key_counts)
         payloads.append(
             {
                 'row_key': row_key,
@@ -129,6 +124,27 @@ def build_row_payloads(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
             }
         )
     return payloads
+
+
+def _build_row_key(item: dict[str, Any], *, row_key_counts: dict[str, int]) -> str:
+    identity = (
+        item.get('statement_type') or '',
+        item.get('statement_name') or '',
+        item.get('account_id') or '',
+        item.get('account_name') or '',
+        item.get('account_detail') or '',
+        item.get('current_period_name') or '',
+        item.get('prior_period_name') or '',
+        item.get('prior_quarter_name') or '',
+        item.get('pre_prior_period_name') or '',
+        str(item.get('order') or ''),
+    )
+    digest = hashlib.sha1('|'.join(identity).encode('utf-8')).hexdigest()
+    occurrence = row_key_counts.get(digest, 0) + 1
+    row_key_counts[digest] = occurrence
+    if occurrence == 1:
+        return digest
+    return f'{digest}:{occurrence}'
 
 
 def build_highlight_payloads(highlights: dict[str, Any]) -> list[dict[str, Any]]:
