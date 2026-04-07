@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import re
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Callable
 
@@ -28,6 +29,10 @@ _FILING_CATEGORY_TO_REPORT_CODE = {
 }
 
 DART_FUNDAMENTALS_MIN_START_DATE = date(settings.dart_fundamentals_min_business_year, 1, 1)
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
 def infer_fundamentals_request(
     event: dict[str, Any],
@@ -233,6 +238,8 @@ class DartFundamentalsCaptureService:
         self.repository = repository or dart_fundamentals_repository
         self.active_symbol_loader = active_symbol_loader or _load_active_symbols
         self.daily_price_bar_bounds_loader = daily_price_bar_bounds_loader or _load_daily_price_bar_bounds
+        self.event_timeout_seconds = settings.dart_fundamentals_event_timeout_seconds
+        self.stale_run_minutes = settings.dart_fundamentals_stale_run_minutes
 
     async def capture_recent_fundamentals(
         self,
@@ -262,6 +269,21 @@ class DartFundamentalsCaptureService:
             trigger=trigger,
             fs_div=resolved_fs_div,
         )
+        stale_run_ids = self.repository.fail_stale_capture_runs(
+            stale_before=_utcnow() - timedelta(minutes=self.stale_run_minutes),
+            error_message=(
+                'Marked failed after exceeding the stale running threshold before a new capture run started'
+            ),
+        )
+        if stale_run_ids:
+            log_fetch_event(
+                service='dart',
+                operation='capture_recent_fundamentals',
+                status='stale_runs_failed',
+                stale_run_ids=stale_run_ids,
+                stale_run_count=len(stale_run_ids),
+                stale_run_minutes=self.stale_run_minutes,
+            )
         run_id = self.repository.create_capture_run(
             trigger=trigger,
             limit_requested=limit,
@@ -283,57 +305,78 @@ class DartFundamentalsCaptureService:
                 receipt_date_from=receipt_date_from,
                 receipt_date_to=receipt_date_to,
             )
+            run_metadata_with_progress = {**run_metadata, 'candidate_count': len(events)}
+            self.repository.update_capture_run_progress(
+                run_id,
+                events_seen=events_seen,
+                events_captured=events_captured,
+                events_failed=events_failed,
+                events_skipped=events_skipped,
+                run_metadata=run_metadata_with_progress,
+            )
             for event in events:
                 events_seen += 1
+                run_metadata_with_progress = {
+                    **run_metadata,
+                    'candidate_count': len(events),
+                    'current_event': {
+                        'event_id': event['id'],
+                        'rcept_no': event['rcept_no'],
+                        'corp_code': event['corp_code'],
+                        'stock_code': event['stock_code'],
+                        'report_nm': event['report_nm'],
+                    },
+                    'last_progress_at': _utcnow().isoformat(),
+                }
+                self.repository.update_capture_run_progress(
+                    run_id,
+                    events_seen=events_seen,
+                    events_captured=events_captured,
+                    events_failed=events_failed,
+                    events_skipped=events_skipped,
+                    run_metadata=run_metadata_with_progress,
+                )
+                log_fetch_event(
+                    service='dart',
+                    operation='capture_fundamentals_event',
+                    status='started',
+                    run_id=run_id,
+                    event_id=event['id'],
+                    rcept_no=event['rcept_no'],
+                    corp_code=event['corp_code'],
+                    stock_code=event['stock_code'],
+                    fs_div=resolved_fs_div,
+                    timeout_seconds=self.event_timeout_seconds,
+                )
                 try:
-                    company_overview = await self.client.fetch_company_overview(event['corp_code'])
-                    request = infer_fundamentals_request(
-                        event,
-                        fs_div=resolved_fs_div,
-                        fiscal_year_end_month=company_overview.get('acc_mt'),
+                    request, dataset = await asyncio.wait_for(
+                        self._capture_event(
+                            event=event,
+                            run_id=run_id,
+                            fs_div=resolved_fs_div,
+                        ),
+                        timeout=self.event_timeout_seconds,
                     )
-                    source_payload = await self.client.fetch_financial_statements(
-                        corp_code=event['corp_code'],
-                        bsns_year=str(request['business_year']),
-                        reprt_code=request['report_code'],
-                        fs_div=resolved_fs_div,
-                    )
-                    dataset = build_fundamentals_dataset(source_payload)
-                    self.repository.replace_snapshot_dataset(
-                        event_id=event['id'],
-                        capture_run_id=run_id,
-                        snapshot_payload={
-                            'rcept_no': event['rcept_no'],
-                            'corp_code': event['corp_code'],
-                            'stock_code': event['stock_code'],
-                            'corp_name': event['corp_name'],
-                            'business_year': request['business_year'],
-                            'report_code': request['report_code'],
-                            'filing_category': event['filing_category'],
-                            'fs_div': resolved_fs_div,
-                            'statement_type': request['statement_type'],
-                            'period_type': request['period_type'],
-                            'period_end_month': request['period_end_month'],
-                            'currency': dataset['currency'],
-                            'source_status': source_payload.get('status'),
-                            'source_message': source_payload.get('message'),
-                            'request_payload': {
-                                'corp_code': event['corp_code'],
-                                'business_year': request['business_year'],
-                                'report_code': request['report_code'],
-                                'fs_div': resolved_fs_div,
-                                'rcept_no': event['rcept_no'],
-                                'fiscal_year_end_month': company_overview.get('acc_mt'),
-                            },
-                            'response_payload': source_payload,
-                        },
-                        row_payloads=build_row_payloads(dataset['items']),
-                        highlight_payloads=build_highlight_payloads(dataset['highlights']),
-                    )
-                    if source_payload.get('status') != '000':
-                        raise ValueError(f"DART fundamentals returned [{source_payload.get('status')}]: {source_payload.get('message')}")
                     self.repository.mark_event_capture_success(event['id'])
                     events_captured += 1
+                    run_metadata_with_progress = {
+                        **run_metadata,
+                        'candidate_count': len(events),
+                        'last_event': {
+                            'event_id': event['id'],
+                            'rcept_no': event['rcept_no'],
+                            'status': 'captured',
+                        },
+                        'last_progress_at': _utcnow().isoformat(),
+                    }
+                    self.repository.update_capture_run_progress(
+                        run_id,
+                        events_seen=events_seen,
+                        events_captured=events_captured,
+                        events_failed=events_failed,
+                        events_skipped=events_skipped,
+                        run_metadata=run_metadata_with_progress,
+                    )
                     log_fetch_event(
                         service='dart',
                         operation='capture_fundamentals_event',
@@ -359,9 +402,75 @@ class DartFundamentalsCaptureService:
                             'row_count': len(dataset['items']),
                         }
                     )
+                except asyncio.TimeoutError:
+                    timeout_message = (
+                        f'Capture timed out after {self.event_timeout_seconds}s '
+                        f'for event_id={event["id"]} rcept_no={event["rcept_no"]}'
+                    )
+                    self.repository.mark_event_capture_failed(event['id'], error_message=timeout_message)
+                    events_failed += 1
+                    run_metadata_with_progress = {
+                        **run_metadata,
+                        'candidate_count': len(events),
+                        'last_event': {
+                            'event_id': event['id'],
+                            'rcept_no': event['rcept_no'],
+                            'status': 'failed',
+                            'error': timeout_message,
+                        },
+                        'last_progress_at': _utcnow().isoformat(),
+                    }
+                    self.repository.update_capture_run_progress(
+                        run_id,
+                        events_seen=events_seen,
+                        events_captured=events_captured,
+                        events_failed=events_failed,
+                        events_skipped=events_skipped,
+                        run_metadata=run_metadata_with_progress,
+                    )
+                    log_fetch_event(
+                        service='dart',
+                        operation='capture_fundamentals_event',
+                        status='failed',
+                        run_id=run_id,
+                        event_id=event['id'],
+                        rcept_no=event['rcept_no'],
+                        corp_code=event['corp_code'],
+                        stock_code=event['stock_code'],
+                        fs_div=resolved_fs_div,
+                        error_type='TimeoutError',
+                        error_message=timeout_message,
+                    )
+                    results.append(
+                        {
+                            'event_id': event['id'],
+                            'rcept_no': event['rcept_no'],
+                            'status': 'failed',
+                            'error': timeout_message,
+                        }
+                    )
                 except Exception as exc:
                     self.repository.mark_event_capture_failed(event['id'], error_message=str(exc))
                     events_failed += 1
+                    run_metadata_with_progress = {
+                        **run_metadata,
+                        'candidate_count': len(events),
+                        'last_event': {
+                            'event_id': event['id'],
+                            'rcept_no': event['rcept_no'],
+                            'status': 'failed',
+                            'error': str(exc),
+                        },
+                        'last_progress_at': _utcnow().isoformat(),
+                    }
+                    self.repository.update_capture_run_progress(
+                        run_id,
+                        events_seen=events_seen,
+                        events_captured=events_captured,
+                        events_failed=events_failed,
+                        events_skipped=events_skipped,
+                        run_metadata=run_metadata_with_progress,
+                    )
                     log_fetch_event(
                         service='dart',
                         operation='capture_fundamentals_event',
@@ -407,7 +516,11 @@ class DartFundamentalsCaptureService:
                 events_captured=events_captured,
                 events_failed=events_failed,
                 events_skipped=events_skipped,
-                run_metadata=run_metadata,
+                run_metadata={
+                    **run_metadata,
+                    'candidate_count': len(events),
+                    'last_progress_at': _utcnow().isoformat(),
+                },
             )
             return result
         except Exception as exc:
@@ -432,9 +545,67 @@ class DartFundamentalsCaptureService:
                 events_failed=events_failed,
                 events_skipped=events_skipped,
                 error_message=str(exc),
-                run_metadata=run_metadata,
+                run_metadata={
+                    **run_metadata,
+                    'last_progress_at': _utcnow().isoformat(),
+                },
             )
             raise
+
+    async def _capture_event(
+        self,
+        *,
+        event: dict[str, Any],
+        run_id: int,
+        fs_div: str,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        company_overview = await self.client.fetch_company_overview(event['corp_code'])
+        request = infer_fundamentals_request(
+            event,
+            fs_div=fs_div,
+            fiscal_year_end_month=company_overview.get('acc_mt'),
+        )
+        source_payload = await self.client.fetch_financial_statements(
+            corp_code=event['corp_code'],
+            bsns_year=str(request['business_year']),
+            reprt_code=request['report_code'],
+            fs_div=fs_div,
+        )
+        dataset = build_fundamentals_dataset(source_payload)
+        self.repository.replace_snapshot_dataset(
+            event_id=event['id'],
+            capture_run_id=run_id,
+            snapshot_payload={
+                'rcept_no': event['rcept_no'],
+                'corp_code': event['corp_code'],
+                'stock_code': event['stock_code'],
+                'corp_name': event['corp_name'],
+                'business_year': request['business_year'],
+                'report_code': request['report_code'],
+                'filing_category': event['filing_category'],
+                'fs_div': fs_div,
+                'statement_type': request['statement_type'],
+                'period_type': request['period_type'],
+                'period_end_month': request['period_end_month'],
+                'currency': dataset['currency'],
+                'source_status': source_payload.get('status'),
+                'source_message': source_payload.get('message'),
+                'request_payload': {
+                    'corp_code': event['corp_code'],
+                    'business_year': request['business_year'],
+                    'report_code': request['report_code'],
+                    'fs_div': fs_div,
+                    'rcept_no': event['rcept_no'],
+                    'fiscal_year_end_month': company_overview.get('acc_mt'),
+                },
+                'response_payload': source_payload,
+            },
+            row_payloads=build_row_payloads(dataset['items']),
+            highlight_payloads=build_highlight_payloads(dataset['highlights']),
+        )
+        if source_payload.get('status') != '000':
+            raise ValueError(f"DART fundamentals returned [{source_payload.get('status')}]: {source_payload.get('message')}")
+        return request, dataset
 
     async def backfill_current_universe_fundamentals(
         self,
