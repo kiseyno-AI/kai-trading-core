@@ -87,6 +87,47 @@ class DartFundamentalsRepository:
             row.run_metadata = run_metadata
             row.completed_at = _utcnow()
 
+    def update_capture_run_progress(
+        self,
+        run_id: int,
+        *,
+        events_seen: int,
+        events_captured: int,
+        events_failed: int,
+        events_skipped: int,
+        run_metadata: dict[str, Any] | None = None,
+    ) -> None:
+        with session_scope() as session:
+            row = session.get(DartFundamentalsCaptureRun, run_id)
+            if row is None:
+                return
+            row.events_seen = events_seen
+            row.events_captured = events_captured
+            row.events_failed = events_failed
+            row.events_skipped = events_skipped
+            row.run_metadata = run_metadata
+
+    def fail_stale_capture_runs(
+        self,
+        *,
+        stale_before: datetime,
+        error_message: str,
+    ) -> list[int]:
+        with session_scope() as session:
+            rows = session.execute(
+                select(DartFundamentalsCaptureRun).where(
+                    DartFundamentalsCaptureRun.status == 'running',
+                    DartFundamentalsCaptureRun.started_at < stale_before,
+                )
+            ).scalars().all()
+            failed_run_ids: list[int] = []
+            for row in rows:
+                row.status = 'failed'
+                row.error_message = error_message
+                row.completed_at = _utcnow()
+                failed_run_ids.append(row.id)
+            return failed_run_ids
+
     def list_capture_runs(self, *, limit: int = 10) -> list[dict[str, Any]]:
         with session_scope() as session:
             rows = session.execute(

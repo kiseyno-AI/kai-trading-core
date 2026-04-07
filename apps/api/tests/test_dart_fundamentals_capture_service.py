@@ -1,4 +1,5 @@
 import unittest
+import asyncio
 from datetime import date
 from unittest.mock import patch
 
@@ -61,6 +62,8 @@ class FakeCaptureRepository:
     def __init__(self):
         self.created_runs = []
         self.completed_runs = []
+        self.progress_updates = []
+        self.stale_run_failures = []
         self.successes = []
         self.failures = []
         self.snapshots = []
@@ -71,6 +74,13 @@ class FakeCaptureRepository:
 
     def complete_capture_run(self, run_id, **kwargs):
         self.completed_runs.append((run_id, kwargs))
+
+    def update_capture_run_progress(self, run_id, **kwargs):
+        self.progress_updates.append((run_id, kwargs))
+
+    def fail_stale_capture_runs(self, *, stale_before, error_message):
+        self.stale_run_failures.append((stale_before, error_message))
+        return []
 
     def list_capture_candidates(self, *, limit=20, force=False, stock_codes=None, receipt_date_from=None, receipt_date_to=None):
         events = [
@@ -160,6 +170,7 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(repository.snapshots), 2)
         self.assertEqual(repository.snapshots[1]['snapshot_payload']['report_code'], '11014')
         self.assertEqual(repository.completed_runs[-1][1]['status'], 'completed')
+        self.assertGreaterEqual(len(repository.progress_updates), 4)
         self.assertTrue(
             any(
                 call.kwargs.get('operation') == 'capture_fundamentals_event'
@@ -178,6 +189,34 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result['events_seen'], 1)
         self.assertEqual(repository.successes, [1])
+
+    async def test_capture_recent_fundamentals_times_out_event_and_marks_failure(self):
+        class SlowCaptureClient(FakeCaptureClient):
+            async def fetch_company_overview(self, corp_code):
+                await asyncio.sleep(0.02)
+                return await super().fetch_company_overview(corp_code)
+
+        client = SlowCaptureClient()
+        repository = FakeCaptureRepository()
+        service = DartFundamentalsCaptureService(client=client, repository=repository)
+        service.event_timeout_seconds = 0.001
+
+        result = await service.capture_recent_fundamentals(limit=1, force=False, trigger='test', fs_div='CFS')
+
+        self.assertEqual(result['events_seen'], 1)
+        self.assertEqual(result['events_failed'], 1)
+        self.assertEqual(repository.failures[0][0], 1)
+        self.assertIn('timed out', repository.failures[0][1])
+
+    async def test_capture_recent_fundamentals_fails_stale_runs_before_new_run(self):
+        client = FakeCaptureClient()
+        repository = FakeCaptureRepository()
+        service = DartFundamentalsCaptureService(client=client, repository=repository)
+
+        with patch.object(repository, 'fail_stale_capture_runs', return_value=[41]) as fail_stale_capture_runs:
+            await service.capture_recent_fundamentals(limit=1, force=False, trigger='test', fs_div='CFS')
+
+        fail_stale_capture_runs.assert_called_once()
 
     async def test_inspect_capture_status_returns_repository_views(self):
         service = DartFundamentalsCaptureService(
