@@ -2,7 +2,9 @@ from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query
 
+from app.core.settings import settings
 from app.dart.service import dart_service
+from app.dart.sync_service import dart_disclosure_sync_service
 from app.integrations.dart.client import DartAPIError, DartLookupError
 
 router = APIRouter(prefix='/disclosures/dart', tags=['disclosures:dart'])
@@ -33,3 +35,31 @@ async def get_dart_company_snapshot(
         raise HTTPException(status_code=502, detail=f'DART request failed: {exc}') from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f'DART snapshot failed: {exc}') from exc
+
+
+@router.post('/sync/events')
+async def run_dart_disclosure_event_sync(
+    days: int = Query(default=settings.dart_sync_recent_days, ge=1, le=30),
+) -> dict:
+    try:
+        return await dart_disclosure_sync_service.sync_recent_disclosures(days=days, trigger='manual_api')
+    except DartAPIError as exc:
+        raise HTTPException(status_code=502, detail=f'DART request failed: {exc}') from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'DART disclosure sync failed: {exc}') from exc
+
+
+@router.get('/sync/inspect')
+async def inspect_dart_disclosure_event_sync(
+    runs_limit: int = Query(default=10, ge=1, le=50),
+    events_limit: int = Query(default=25, ge=1, le=100),
+    financial_only: bool = False,
+) -> dict:
+    try:
+        return dart_disclosure_sync_service.inspect_sync(
+            limit=runs_limit,
+            events_limit=events_limit,
+            financial_only=financial_only,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'DART disclosure sync inspect failed: {exc}') from exc

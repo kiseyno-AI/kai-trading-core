@@ -36,12 +36,27 @@ class DartClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['status'], '013')
         self.assertEqual(result['total_count'], '0')
         self.assertEqual(result['list'], [])
+        self.assertEqual(result['page_no'], '1')
 
     async def test_fetch_company_overview_still_raises_for_non_success_status(self):
         client = TestableDartClient({'status': '014', 'message': 'File does not exist'})
 
         with self.assertRaises(DartAPIError):
             await client.fetch_company_overview('00126380')
+
+    async def test_fetch_disclosure_list_uses_requested_page_number_for_no_data_status(self):
+        client = TestableDartClient({'status': '013', 'message': 'No data'})
+
+        result = await client.fetch_disclosure_list(
+            bgn_de='20260101',
+            end_de='20260131',
+            page_no=3,
+            page_count=100,
+        )
+
+        self.assertEqual(result['status'], '013')
+        self.assertEqual(result['page_no'], '3')
+        self.assertEqual(result['list'], [])
 
 
 if __name__ == '__main__':

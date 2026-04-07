@@ -139,3 +139,49 @@ class DailyPriceBar(Base):
     turnover: Mapped[int] = mapped_column(BigInteger, nullable=False)
     source: Mapped[str] = mapped_column(String(32), nullable=False, default='kis')
     captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class DartDisclosureSyncRun(Base):
+    __tablename__ = 'dart_disclosure_sync_runs'
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    trigger: Mapped[str] = mapped_column(String(32), nullable=False, default='manual')
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default='running', index=True)
+    window_start: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    window_end: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    page_size: Mapped[int] = mapped_column(Integer, nullable=False, default=100)
+    pages_fetched: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    events_seen: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    events_inserted: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    events_updated: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    financial_report_events: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    run_metadata: Mapped[dict | None] = mapped_column(JSON)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class DartDisclosureEvent(Base, TimestampMixin):
+    __tablename__ = 'dart_disclosure_events'
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    rcept_no: Mapped[str] = mapped_column(String(32), unique=True, nullable=False, index=True)
+    corp_code: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    corp_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    stock_code: Mapped[str | None] = mapped_column(String(16), index=True)
+    corp_cls: Mapped[str | None] = mapped_column(String(8))
+    report_nm: Mapped[str] = mapped_column(String(255), nullable=False)
+    filing_category: Mapped[str] = mapped_column(String(64), nullable=False, default='other', index=True)
+    is_financial_report: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, index=True)
+    filer_name: Mapped[str | None] = mapped_column(String(255))
+    receipt_date: Mapped[date | None] = mapped_column(Date, index=True)
+    remark: Mapped[str | None] = mapped_column(String(255))
+    payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    first_seen_run_id: Mapped[int | None] = mapped_column(
+        ForeignKey('dart_disclosure_sync_runs.id', ondelete='SET NULL'),
+        index=True,
+    )
+    last_seen_run_id: Mapped[int | None] = mapped_column(
+        ForeignKey('dart_disclosure_sync_runs.id', ondelete='SET NULL'),
+        index=True,
+    )

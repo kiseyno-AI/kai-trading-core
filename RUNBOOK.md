@@ -22,6 +22,8 @@ What it does:
 - `GET /health`
 - `GET /macro/ecos/series?stat_code=722Y001&cycle=M&start_period=202401&end_period=202403&item_code_1=0101000`
 - `GET /disclosures/dart/company-snapshot?stock_code=005930`
+- `POST /disclosures/dart/sync/events?days=7`
+- `GET /disclosures/dart/sync/inspect?financial_only=true`
 - `GET /fx/koreaexim/rates?search_date=20260406&currency=USD`
 - `GET /eod/status`
 - `POST /eod/master/refresh-if-due`
@@ -103,6 +105,9 @@ Set this up under a long-running process manager (LaunchAgent, systemd, pm2, or 
 
 - Set `DART_API_KEY` in `apps/api/.env` before calling DART-backed endpoints.
 - `DART_CORP_CODE_CACHE_TTL_SECONDS` controls how long the in-memory corp-code mapping is reused before refreshing from Open DART.
+- `POST /disclosures/dart/sync/events` polls `list.json` over a rolling recent window and upserts by `rcept_no` into the disclosure-event tables.
+- `GET /disclosures/dart/sync/inspect` returns the latest sync run, recent runs, aggregate counts, and recent stored events.
+- `DART_SYNC_RECENT_DAYS` sets the default rolling window size for the event sync, and `DART_SYNC_PAGE_COUNT` controls DART `list.json` page size.
 
 ## Korea Exim FX notes
 

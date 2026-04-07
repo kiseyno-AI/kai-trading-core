@@ -38,27 +38,52 @@ class DartClient:
         corp_code: str,
         bgn_de: str,
         end_de: str,
+        page_no: int = 1,
         page_count: int = 10,
         last_reprt_at: str = 'Y',
     ) -> dict[str, Any]:
+        payload = await self.fetch_disclosure_list(
+            corp_code=corp_code,
+            bgn_de=bgn_de,
+            end_de=end_de,
+            page_no=page_no,
+            page_count=page_count,
+            last_reprt_at=last_reprt_at,
+        )
+        return payload
+
+    async def fetch_disclosure_list(
+        self,
+        *,
+        corp_code: str | None = None,
+        bgn_de: str,
+        end_de: str,
+        page_no: int = 1,
+        page_count: int = 10,
+        last_reprt_at: str = 'N',
+    ) -> dict[str, Any]:
+        params = {
+            'bgn_de': bgn_de,
+            'end_de': end_de,
+            'page_no': str(page_no),
+            'page_count': str(page_count),
+            'last_reprt_at': last_reprt_at,
+            'sort': 'date',
+            'sort_mth': 'desc',
+        }
+        if corp_code:
+            params['corp_code'] = corp_code
+
         payload = await self._get_json(
             '/list.json',
-            {
-                'corp_code': corp_code,
-                'bgn_de': bgn_de,
-                'end_de': end_de,
-                'page_count': str(page_count),
-                'last_reprt_at': last_reprt_at,
-                'sort': 'date',
-                'sort_mth': 'desc',
-            },
+            params,
             allowed_statuses={'013'},
         )
         if payload.get('status') == '013':
             return {
                 'status': '013',
                 'message': payload.get('message'),
-                'page_no': '1',
+                'page_no': str(page_no),
                 'page_count': '0',
                 'total_count': '0',
                 'list': [],

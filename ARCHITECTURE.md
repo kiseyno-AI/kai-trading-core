@@ -14,6 +14,7 @@
 - **`app/core/audit_logging.py`** — rotating JSONL audit logs for inbound API requests and outbound upstream calls with request-id propagation and redaction.
 - **`app/db.py` + `alembic/`** — SQLAlchemy engine/session helpers and Alembic schema migrations.
 - **`app/api/routes_*.py`** — HTTP routers (KIS, macro, FX, scanner, market, quotes, symbols, EOD).
+- **`app/dart/`** — DART company snapshot logic plus incremental disclosure-event sync/repository code for later fundamentals refreshes.
 - **`app/brokers/kis/`** — KIS client/provider/schemas.
 - **`app/integrations/`** — BOK, FX (Korea Exim), etc.
 - **`app/fx/`** — Korea Exim FX service-level normalization, filtering, and date fallback behavior.
