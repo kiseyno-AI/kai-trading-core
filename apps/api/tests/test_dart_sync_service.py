@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 from app.core.settings import settings
 from app.dart.sync_service import DartDisclosureSyncService, classify_filing
@@ -105,7 +106,8 @@ class DartDisclosureSyncServiceTests(unittest.IsolatedAsyncioTestCase):
         original_page_count = settings.dart_sync_page_count
         settings.dart_sync_page_count = 2
         try:
-            result = await service.sync_recent_disclosures(days=3, trigger='test')
+            with patch('app.dart.sync_service.log_fetch_event') as log_fetch_event:
+                result = await service.sync_recent_disclosures(days=3, trigger='test')
         finally:
             settings.dart_sync_page_count = original_page_count
 
@@ -123,6 +125,13 @@ class DartDisclosureSyncServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(first_batch[1]['is_financial_report'])
         self.assertEqual(first_batch[1]['filing_category'], 'other')
         self.assertEqual(repository.completed_runs[-1][1]['status'], 'completed')
+        self.assertTrue(
+            any(
+                call.kwargs.get('operation') == 'sync_disclosure_page'
+                and call.kwargs.get('status') == 'completed'
+                for call in log_fetch_event.call_args_list
+            )
+        )
 
     async def test_inspect_sync_returns_repository_views(self):
         service = DartDisclosureSyncService(client=FakeSyncClient(), repository=FakeSyncRepository())

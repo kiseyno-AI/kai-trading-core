@@ -40,6 +40,8 @@ _SENSITIVE_KEYS = {
     'x-api-key',
 }
 _SAFE_HEADERS = {'accept', 'content-length', 'content-type', 'host', 'user-agent', 'x-request-id'}
+_MAX_AUDIT_STRING_LENGTH = 300
+_MAX_AUDIT_COLLECTION_ITEMS = 25
 
 
 class JsonLineFormatter(logging.Formatter):
@@ -74,6 +76,33 @@ def redact_mapping(values: Mapping[str, Any] | None) -> dict[str, Any]:
     for key, value in values.items():
         redacted[key] = '[REDACTED]' if _is_sensitive_key(key) else value
     return redacted
+
+
+def _truncate_string(value: str, *, limit: int = _MAX_AUDIT_STRING_LENGTH) -> str:
+    if len(value) <= limit:
+        return value
+    return f'{value[: limit - 3]}...'
+
+
+def _sanitize_audit_value(value: Any, *, key: str | None = None) -> Any:
+    if key and _is_sensitive_key(key):
+        return '[REDACTED]'
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return _truncate_string(value)
+    if isinstance(value, Mapping):
+        return {
+            str(item_key): _sanitize_audit_value(item_value, key=str(item_key))
+            for item_key, item_value in value.items()
+        }
+    if isinstance(value, (list, tuple, set)):
+        items = list(value)
+        sanitized = [_sanitize_audit_value(item) for item in items[:_MAX_AUDIT_COLLECTION_ITEMS]]
+        if len(items) > _MAX_AUDIT_COLLECTION_ITEMS:
+            sanitized.append(f'... ({len(items) - _MAX_AUDIT_COLLECTION_ITEMS} more)')
+        return sanitized
+    return _truncate_string(str(value))
 
 
 def redact_url(url: str, *, secret_values: Iterable[str] | None = None) -> str:
@@ -185,6 +214,27 @@ def log_upstream_event(payload: dict[str, Any]) -> None:
     if not settings.upstream_http_logging_enabled:
         return
     _emit(UPSTREAM_AUDIT_LOGGER_NAME, payload)
+
+
+def log_fetch_event(
+    *,
+    service: str,
+    operation: str,
+    status: str,
+    **fields: Any,
+) -> None:
+    payload = {
+        'event': 'fetch_operation',
+        'request_id': get_request_id(),
+        'service': service,
+        'operation': operation,
+        'status': status,
+    }
+    for key, value in fields.items():
+        if value is None:
+            continue
+        payload[key] = _sanitize_audit_value(value, key=key)
+    log_upstream_event(payload)
 
 
 def build_api_request_event(

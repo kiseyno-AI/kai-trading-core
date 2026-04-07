@@ -3,7 +3,7 @@ from __future__ import annotations
 import httpx
 from urllib.parse import quote
 
-from app.core.audit_logging import request_with_audit
+from app.core.audit_logging import log_fetch_event, request_with_audit
 from app.core.settings import settings
 
 
@@ -72,7 +72,37 @@ class ECOSClient:
         result = payload.get('RESULT')
         if isinstance(result, dict) and result.get('CODE') not in (None, 'INFO-000'):
             message = result.get('MESSAGE') or 'Unknown ECOS error'
+            log_fetch_event(
+                service='bok_ecos',
+                operation='fetch_series',
+                status='failed',
+                stat_code=stat_code,
+                cycle=cycle,
+                start_period=start_period,
+                end_period=end_period,
+                item_code_1=item_code_1,
+                item_code_2=item_code_2,
+                item_code_3=item_code_3,
+                item_code_4=item_code_4,
+                result_code=result['CODE'],
+                error_message=message,
+            )
             raise ECOSAPIError(f"ECOS error [{result['CODE']}]: {message}")
+        rows = payload.get('StatisticSearch', {}).get('row', []) if isinstance(payload.get('StatisticSearch'), dict) else []
+        log_fetch_event(
+            service='bok_ecos',
+            operation='fetch_series',
+            status='completed',
+            stat_code=stat_code,
+            cycle=cycle,
+            start_period=start_period,
+            end_period=end_period,
+            item_code_1=item_code_1,
+            item_code_2=item_code_2,
+            item_code_3=item_code_3,
+            item_code_4=item_code_4,
+            row_count=len(rows),
+        )
         return payload
 
 

@@ -5,6 +5,7 @@ import re
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from app.core.audit_logging import log_fetch_event
 from app.core.settings import settings
 from app.dart.fundamentals_store import DartFundamentalsRepository, dart_fundamentals_repository
 from app.dart.service import (
@@ -219,6 +220,15 @@ class DartFundamentalsCaptureService:
         fs_div: str | None = None,
     ) -> dict[str, Any]:
         resolved_fs_div = (fs_div or settings.dart_fundamentals_default_fs_div).strip().upper()
+        log_fetch_event(
+            service='dart',
+            operation='capture_recent_fundamentals',
+            status='started',
+            limit=limit,
+            force=force,
+            trigger=trigger,
+            fs_div=resolved_fs_div,
+        )
         run_id = self.repository.create_capture_run(
             trigger=trigger,
             limit_requested=limit,
@@ -285,6 +295,20 @@ class DartFundamentalsCaptureService:
                         raise ValueError(f"DART fundamentals returned [{source_payload.get('status')}]: {source_payload.get('message')}")
                     self.repository.mark_event_capture_success(event['id'])
                     events_captured += 1
+                    log_fetch_event(
+                        service='dart',
+                        operation='capture_fundamentals_event',
+                        status='completed',
+                        run_id=run_id,
+                        event_id=event['id'],
+                        rcept_no=event['rcept_no'],
+                        corp_code=event['corp_code'],
+                        stock_code=event['stock_code'],
+                        business_year=request['business_year'],
+                        report_code=request['report_code'],
+                        fs_div=resolved_fs_div,
+                        row_count=len(dataset['items']),
+                    )
                     results.append(
                         {
                             'event_id': event['id'],
@@ -299,6 +323,19 @@ class DartFundamentalsCaptureService:
                 except Exception as exc:
                     self.repository.mark_event_capture_failed(event['id'], error_message=str(exc))
                     events_failed += 1
+                    log_fetch_event(
+                        service='dart',
+                        operation='capture_fundamentals_event',
+                        status='failed',
+                        run_id=run_id,
+                        event_id=event['id'],
+                        rcept_no=event['rcept_no'],
+                        corp_code=event['corp_code'],
+                        stock_code=event['stock_code'],
+                        fs_div=resolved_fs_div,
+                        error_type=type(exc).__name__,
+                        error_message=str(exc),
+                    )
                     results.append(
                         {
                             'event_id': event['id'],
@@ -318,6 +355,12 @@ class DartFundamentalsCaptureService:
                 'events_skipped': events_skipped,
                 'results': results,
             }
+            log_fetch_event(
+                service='dart',
+                operation='capture_recent_fundamentals',
+                status='completed',
+                **{key: value for key, value in result.items() if key != 'status'},
+            )
             self.repository.complete_capture_run(
                 run_id,
                 status='completed',
@@ -329,6 +372,19 @@ class DartFundamentalsCaptureService:
             )
             return result
         except Exception as exc:
+            log_fetch_event(
+                service='dart',
+                operation='capture_recent_fundamentals',
+                status='failed',
+                run_id=run_id,
+                fs_div=resolved_fs_div,
+                events_seen=events_seen,
+                events_captured=events_captured,
+                events_failed=events_failed,
+                events_skipped=events_skipped,
+                error_type=type(exc).__name__,
+                error_message=str(exc),
+            )
             self.repository.complete_capture_run(
                 run_id,
                 status='failed',

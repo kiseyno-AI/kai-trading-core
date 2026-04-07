@@ -12,6 +12,7 @@ from typing import Iterable, Sequence
 from pykrx import stock
 from pykrx.website.comm import webio
 
+from app.core.audit_logging import log_fetch_event
 from app.core.settings import settings
 from app.eod.master import get_master_symbols
 from app.market_data_store import (
@@ -31,6 +32,10 @@ _PYKRX_REQUEST_TIMEOUT_LOCK = threading.RLock()
 
 DEFAULT_START_DATE = '19560101'
 DEFAULT_MARKETS = ('KOSPI', 'KOSDAQ', 'KONEX')
+
+
+def _log_pykrx_fetch(operation: str, status: str, **fields) -> None:
+    log_fetch_event(service='pykrx', operation=operation, status=status, **fields)
 
 
 @dataclass
@@ -109,10 +114,17 @@ class PykrxBackfillService:
         limit: int | None = None,
         deactivate_missing: bool = True,
     ) -> dict:
+        _log_pykrx_fetch(
+            'refresh_recent_universe',
+            'started',
+            markets=list(markets),
+            limit=limit,
+            deactivate_missing=deactivate_missing,
+        )
         snapshot = self.fetch_recent_universe_snapshot(markets=markets, limit=limit)
         symbols = snapshot['symbols']
         persisted = self._persist_universe(symbols, deactivate_missing=deactivate_missing)
-        return {
+        result = {
             'source': 'pykrx',
             'markets': list(markets),
             'symbol_count': len(symbols),
@@ -121,6 +133,8 @@ class PykrxBackfillService:
             'universe_source': snapshot['universe_source'],
             'deactivate_missing': deactivate_missing,
         }
+        _log_pykrx_fetch('refresh_recent_universe', 'completed', **result)
+        return result
 
     def _persist_universe(self, symbols: Sequence[PykrxSymbol], *, deactivate_missing: bool) -> int:
         return upsert_symbol_universe(
@@ -168,10 +182,20 @@ class PykrxBackfillService:
         items: list[PykrxSymbol] = []
         used_master_fallback = False
         for market in markets:
+            _log_pykrx_fetch('fetch_market_universe', 'started', market=market, as_of_date=as_of_date, limit=limit)
             try:
                 frame = _call_pykrx(stock.get_market_ohlcv_by_ticker, as_of_date, market=market)
             except Exception as exc:
                 logger.warning('pykrx market universe fetch failed for %s on %s: %s', market, as_of_date, exc)
+                _log_pykrx_fetch(
+                    'fetch_market_universe',
+                    'failed',
+                    market=market,
+                    as_of_date=as_of_date,
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
+                    fallback_source='kis_master',
+                )
                 fallback_items = self._fetch_master_fallback_for_market(
                     market=market,
                     as_of_date=as_of_date,
@@ -186,6 +210,13 @@ class PykrxBackfillService:
             tickers = self._extract_market_universe_tickers(frame)
             if not tickers:
                 logger.warning('pykrx market universe returned no usable tickers for %s on %s', market, as_of_date)
+                _log_pykrx_fetch(
+                    'fetch_market_universe',
+                    'empty',
+                    market=market,
+                    as_of_date=as_of_date,
+                    fallback_source='kis_master',
+                )
                 fallback_items = self._fetch_master_fallback_for_market(
                     market=market,
                     as_of_date=as_of_date,
@@ -213,6 +244,16 @@ class PykrxBackfillService:
                 if self.name_pause_seconds:
                     time.sleep(self.name_pause_seconds)
                 if limit and len(items) >= limit:
+                    _log_pykrx_fetch(
+                        'fetch_market_universe',
+                        'completed',
+                        market=market,
+                        as_of_date=as_of_date,
+                        ticker_count=len(tickers),
+                        collected_count=len(items),
+                        limit=limit,
+                        fallback_used=used_master_fallback,
+                    )
                     return {
                         'symbols': items,
                         'universe_source': (
@@ -221,6 +262,16 @@ class PykrxBackfillService:
                             else 'pykrx_market_ohlcv'
                         ),
                     }
+            _log_pykrx_fetch(
+                'fetch_market_universe',
+                'completed',
+                market=market,
+                as_of_date=as_of_date,
+                ticker_count=len(tickers),
+                collected_count=len(items),
+                limit=limit,
+                fallback_used=used_master_fallback,
+            )
         return {
             'symbols': items,
             'universe_source': (
@@ -279,7 +330,21 @@ class PykrxBackfillService:
                 )
             )
             if limit and len(items) >= limit:
+                _log_pykrx_fetch(
+                    'fetch_master_fallback_universe',
+                    'completed',
+                    markets=list(markets),
+                    symbol_count=len(items),
+                    limit=limit,
+                )
                 return items
+        _log_pykrx_fetch(
+            'fetch_master_fallback_universe',
+            'completed',
+            markets=list(markets),
+            symbol_count=len(items),
+            limit=limit,
+        )
         return items
 
     def load_active_universe(
@@ -379,23 +444,27 @@ class PykrxBackfillService:
         latest_trade_date = self.resolve_latest_trade_date(end_date=normalized_market_date)
 
         if latest_trade_date != market_date_iso:
-            return {
+            result = {
                 'triggered': False,
                 'reason': 'trade_date_not_available_yet',
                 'market_date': market_date_iso,
                 'latest_available_trade_date': latest_trade_date,
                 'source': 'pykrx',
             }
+            _log_pykrx_fetch('run_daily_collection_if_due', 'skipped', **result)
+            return result
 
         with advisory_eod_collection_lock(market='KRX', trade_date=market_date_iso, source='pykrx') as lock_acquired:
             if not lock_acquired:
-                return {
+                result = {
                     'triggered': False,
                     'reason': 'already_running',
                     'market_date': market_date_iso,
                     'latest_available_trade_date': latest_trade_date,
                     'source': 'pykrx',
                 }
+                _log_pykrx_fetch('run_daily_collection_if_due', 'skipped', **result)
+                return result
 
             latest_run = load_latest_eod_collection_run(
                 market='KRX',
@@ -406,7 +475,7 @@ class PykrxBackfillService:
                 if self._is_stale_running_run(latest_run):
                     self._fail_stale_running_run(latest_run)
                 else:
-                    return {
+                    result = {
                         'triggered': False,
                         'reason': 'already_running',
                         'market_date': market_date_iso,
@@ -414,13 +483,15 @@ class PykrxBackfillService:
                         'source': 'pykrx',
                         'existing_run': latest_run,
                     }
+                    _log_pykrx_fetch('run_daily_collection_if_due', 'skipped', **result)
+                    return result
                 latest_run = load_latest_eod_collection_run(
                     market='KRX',
                     trade_date=market_date_iso,
                     source='pykrx',
                 )
             if latest_run and latest_run['status'] == 'running' and not force:
-                return {
+                result = {
                     'triggered': False,
                     'reason': 'already_running',
                     'market_date': market_date_iso,
@@ -428,13 +499,15 @@ class PykrxBackfillService:
                     'source': 'pykrx',
                     'existing_run': latest_run,
                 }
+                _log_pykrx_fetch('run_daily_collection_if_due', 'skipped', **result)
+                return result
             if (
                 not force
                 and latest_run
                 and latest_run['status'] == 'completed'
                 and latest_run['symbols_failed'] == 0
             ):
-                return {
+                result = {
                     'triggered': False,
                     'reason': 'already_completed',
                     'market_date': market_date_iso,
@@ -442,6 +515,8 @@ class PykrxBackfillService:
                     'source': 'pykrx',
                     'existing_run': latest_run,
                 }
+                _log_pykrx_fetch('run_daily_collection_if_due', 'skipped', **result)
+                return result
 
             result = self._run_collection(
                 start_date=normalized_market_date,
@@ -452,6 +527,11 @@ class PykrxBackfillService:
                 mode='daily_auto',
             )
             result['triggered'] = True
+            _log_pykrx_fetch(
+                'run_daily_collection_if_due',
+                result['status'],
+                **{key: value for key, value in result.items() if key != 'status'},
+            )
             return result
 
     def _is_stale_running_run(self, run: dict) -> bool:
@@ -474,6 +554,16 @@ class PykrxBackfillService:
             f"Marked stale after {settings.eod_auto_pykrx_stale_run_minutes} minutes without completion."
         )
         logger.warning('Marking stale pykrx EOD run %s as failed: %s', run['id'], error_message)
+        _log_pykrx_fetch(
+            'mark_stale_collection_run',
+            'failed',
+            run_id=run['id'],
+            trade_date=run.get('trade_date'),
+            symbols_total=symbols_total,
+            symbols_succeeded=symbols_succeeded,
+            symbols_failed=symbols_failed,
+            error_message=error_message,
+        )
         complete_eod_collection_run(
             run['id'],
             status='failed',
@@ -496,6 +586,18 @@ class PykrxBackfillService:
     ) -> dict:
         normalized_start = _normalize_yyyymmdd(start_date)
         normalized_end = _normalize_yyyymmdd(end_date)
+        _log_pykrx_fetch(
+            'run_collection',
+            'started',
+            mode=mode,
+            trigger=trigger,
+            start_date=normalized_start,
+            end_date=normalized_end,
+            markets=list(markets),
+            limit=limit,
+            symbol=symbol,
+            refresh_universe=refresh_universe,
+        )
 
         if refresh_universe:
             snapshot = self.fetch_recent_universe_snapshot(markets=markets, limit=limit)
@@ -552,12 +654,13 @@ class PykrxBackfillService:
 
         try:
             for item in symbols:
+                symbol_started_at = time.perf_counter()
                 try:
                     frame = _get_market_ohlcv_by_date(normalized_start, normalized_end, item.symbol)
                     if frame.empty:
                         raise RuntimeError('No OHLCV rows returned.')
                     bars = self._map_symbol_bars(frame)
-                    bars_upserted += persist_daily_price_bars(
+                    persisted_count = persist_daily_price_bars(
                         item.symbol,
                         bars,
                         market=item.market,
@@ -566,11 +669,36 @@ class PykrxBackfillService:
                         name_ko=item.name_ko,
                         standard_code=item.standard_code,
                     )
+                    bars_upserted += persisted_count
                     symbols_succeeded += 1
+                    _log_pykrx_fetch(
+                        'fetch_symbol_ohlcv',
+                        'completed',
+                        run_id=run_id,
+                        symbol=item.symbol,
+                        market=item.market,
+                        start_date=normalized_start,
+                        end_date=normalized_end,
+                        bar_count=len(bars),
+                        persisted_count=persisted_count,
+                        duration_ms=round((time.perf_counter() - symbol_started_at) * 1000, 3),
+                    )
                 except Exception as exc:
                     symbols_failed += 1
                     failed_symbols.append(item.symbol)
                     logger.warning('pykrx backfill failed for %s: %s', item.symbol, exc)
+                    _log_pykrx_fetch(
+                        'fetch_symbol_ohlcv',
+                        'failed',
+                        run_id=run_id,
+                        symbol=item.symbol,
+                        market=item.market,
+                        start_date=normalized_start,
+                        end_date=normalized_end,
+                        duration_ms=round((time.perf_counter() - symbol_started_at) * 1000, 3),
+                        error_type=type(exc).__name__,
+                        error_message=str(exc),
+                    )
                 try:
                     update_eod_collection_run_progress(
                         run_id,
@@ -579,9 +707,35 @@ class PykrxBackfillService:
                     )
                 except Exception as exc:
                     logger.warning('pykrx progress update failed for run %s after %s: %s', run_id, item.symbol, exc)
+                    _log_pykrx_fetch(
+                        'update_collection_progress',
+                        'failed',
+                        run_id=run_id,
+                        symbol=item.symbol,
+                        symbols_succeeded=symbols_succeeded,
+                        symbols_failed=symbols_failed,
+                        error_type=type(exc).__name__,
+                        error_message=str(exc),
+                    )
                 if self.symbol_pause_seconds:
                     time.sleep(self.symbol_pause_seconds)
         except Exception as exc:
+            _log_pykrx_fetch(
+                'run_collection',
+                'failed',
+                run_id=run_id,
+                mode=mode,
+                trigger=trigger,
+                start_date=normalized_start,
+                end_date=normalized_end,
+                latest_available_trade_date=latest_trade_date,
+                symbols_total=len(symbols),
+                symbols_succeeded=symbols_succeeded,
+                symbols_failed=symbols_failed,
+                bars_upserted=bars_upserted,
+                error_type=type(exc).__name__,
+                error_message=str(exc),
+            )
             complete_eod_collection_run(
                 run_id,
                 status='failed',
@@ -599,7 +753,7 @@ class PykrxBackfillService:
             symbols_failed=symbols_failed,
             error_message=None if not failed_symbols else f'Failed symbols: {",".join(failed_symbols[:20])}',
         )
-        return {
+        result = {
             'run_id': run_id,
             'source': 'pykrx',
             'status': status,
@@ -615,6 +769,8 @@ class PykrxBackfillService:
             'refresh_universe': refresh_universe,
             'universe_snapshot': universe_snapshot,
         }
+        _log_pykrx_fetch('run_collection', status, **{key: value for key, value in result.items() if key != 'status'})
+        return result
 
     def _map_symbol_bars(self, frame) -> list[dict]:
         items: list[dict] = []

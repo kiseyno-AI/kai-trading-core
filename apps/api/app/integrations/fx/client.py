@@ -4,7 +4,7 @@ from typing import Any
 
 import httpx
 
-from app.core.audit_logging import request_with_audit
+from app.core.audit_logging import log_fetch_event, request_with_audit
 from app.core.settings import settings
 
 
@@ -48,8 +48,33 @@ class KoreaEximClient:
 
         payload = response.json()
         if not isinstance(payload, list):
+            log_fetch_event(
+                service='koreaexim',
+                operation='fetch_exchange_rates',
+                status='failed',
+                search_date=search_date,
+                data=data,
+                error_message='Korea Exim response was not a JSON list',
+            )
             raise KoreaEximAPIError('Korea Exim response was not a JSON list')
         if payload and str(payload[0].get('result')) not in {'1', ''}:
             result_code = payload[0].get('result')
+            log_fetch_event(
+                service='koreaexim',
+                operation='fetch_exchange_rates',
+                status='failed',
+                search_date=search_date,
+                data=data,
+                result_code=result_code,
+                error_message=f'Korea Exim returned result={result_code}',
+            )
             raise KoreaEximAPIError(f'Korea Exim returned result={result_code}')
+        log_fetch_event(
+            service='koreaexim',
+            operation='fetch_exchange_rates',
+            status='completed',
+            search_date=search_date,
+            data=data,
+            record_count=len(payload),
+        )
         return payload

@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 from app.integrations.dart.client import DartAPIError, DartClient
 
@@ -21,6 +22,23 @@ class TestableDartClient(DartClient):
 
     async def _request(self, path, params):
         return FakeResponse(self.payload)
+
+
+class FakeHTTPErrorResponse:
+    def __init__(self, status_code=400, text=''):
+        self.status_code = status_code
+        self.text = text
+
+
+class FakeAsyncClient:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
 
 
 class DartClientTests(unittest.IsolatedAsyncioTestCase):
@@ -82,6 +100,28 @@ class DartClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['status'], '013')
         self.assertEqual(result['page_no'], '3')
         self.assertEqual(result['list'], [])
+
+    async def test_request_http_error_logging_omits_raw_response_body(self):
+        client = DartClient()
+        client.api_key = 'test-secret-key'
+        client.base_url = 'https://dart.example.test'
+        response = FakeHTTPErrorResponse(
+            status_code=400,
+            text='echoed crtfc_key=test-secret-key',
+        )
+
+        with (
+            patch('app.integrations.dart.client.httpx.AsyncClient', FakeAsyncClient),
+            patch('app.integrations.dart.client.request_with_audit', return_value=response),
+            patch('app.integrations.dart.client.log_fetch_event') as log_fetch_event,
+        ):
+            with self.assertRaises(DartAPIError):
+                await client._request('/company.json', {'corp_code': '00126380'})
+
+        self.assertEqual(log_fetch_event.call_args.kwargs['operation'], 'request_http')
+        self.assertEqual(log_fetch_event.call_args.kwargs['status'], 'failed')
+        self.assertNotIn('test-secret-key', log_fetch_event.call_args.kwargs['error_message'])
+        self.assertIn('body omitted', log_fetch_event.call_args.kwargs['error_message'])
 
 
 if __name__ == '__main__':
