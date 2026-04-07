@@ -5,6 +5,8 @@ from datetime import datetime, timedelta, timezone
 from unittest import IsolatedAsyncioTestCase, TestCase
 from unittest.mock import AsyncMock, patch
 
+import pandas as pd
+
 from app.eod.auto_pykrx import AutoPykrxEODScheduler
 from app.eod.pykrx_backfill import PykrxBackfillService, PykrxSymbol
 from app.market.clock import KST, MarketState
@@ -16,6 +18,57 @@ def _lock(acquired: bool = True):
 
 
 class PykrxBackfillServiceTests(TestCase):
+    def test_fetch_recent_universe_uses_index_when_market_frame_columns_change(self) -> None:
+        service = PykrxBackfillService()
+        service.name_pause_seconds = 0
+        frame = pd.DataFrame({'현재가': [196500]}, index=['005930'])
+
+        def fake_call(func, *args, **kwargs):
+            if func.__name__ == 'get_market_ohlcv_by_ticker':
+                return frame
+            if func.__name__ == 'get_market_ticker_name':
+                return '삼성전자'
+            raise AssertionError(f'unexpected pykrx function: {func.__name__}')
+
+        with (
+            patch.object(service, 'resolve_latest_trade_date', return_value='2026-04-07'),
+            patch('app.eod.pykrx_backfill._call_pykrx', side_effect=fake_call),
+        ):
+            result = service.fetch_recent_universe_snapshot(markets=('KOSPI',))
+
+        self.assertEqual(result['latest_trade_date'], '2026-04-07')
+        self.assertEqual(result['universe_source'], 'pykrx_market_ohlcv')
+        self.assertEqual(
+            result['symbols'],
+            [PykrxSymbol(symbol='005930', market='KOSPI', name_ko='삼성전자')],
+        )
+
+    def test_fetch_recent_universe_falls_back_per_market_when_pykrx_market_ohlcv_breaks(self) -> None:
+        service = PykrxBackfillService()
+        service.name_pause_seconds = 0
+
+        with (
+            patch.object(service, 'resolve_latest_trade_date', return_value='2026-04-07'),
+            patch(
+                'app.eod.pykrx_backfill._call_pykrx',
+                side_effect=KeyError("None of [Index(['시가', '고가', '저가', '종가'], dtype='object')] are in the [columns]"),
+            ),
+            patch.object(
+                service,
+                '_fetch_master_fallback_universe',
+                return_value=[PykrxSymbol(symbol='000020', market='KOSPI', name_ko='동화약품')],
+            ) as fallback_universe,
+        ):
+            result = service.fetch_recent_universe_snapshot(markets=('KOSPI',))
+
+        self.assertEqual(result['latest_trade_date'], '2026-04-07')
+        self.assertEqual(result['universe_source'], 'pykrx_market_ohlcv_with_master_fallback')
+        self.assertEqual(
+            result['symbols'],
+            [PykrxSymbol(symbol='000020', market='KOSPI', name_ko='동화약품')],
+        )
+        fallback_universe.assert_called_once_with(markets=('KOSPI',), limit=None)
+
     def test_run_daily_collection_skips_completed_trade_date(self) -> None:
         service = PykrxBackfillService()
 
