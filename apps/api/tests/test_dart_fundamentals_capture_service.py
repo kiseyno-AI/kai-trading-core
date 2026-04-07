@@ -1,6 +1,10 @@
 import unittest
 
-from app.dart.fundamentals_capture_service import DartFundamentalsCaptureService, infer_fundamentals_request
+from app.dart.fundamentals_capture_service import (
+    DartFundamentalsCaptureService,
+    build_row_payloads,
+    infer_fundamentals_request,
+)
 
 
 class FakeCaptureClient:
@@ -189,6 +193,88 @@ class InferFundamentalsRequestTests(unittest.TestCase):
                 {'report_nm': '분기보고서 (2025.06)', 'filing_category': 'quarterly_report'},
                 fs_div='CFS',
             )
+
+
+class BuildRowPayloadsTests(unittest.TestCase):
+    def test_build_row_payloads_disambiguates_same_account_rows_with_distinct_details(self):
+        items = [
+            {
+                'statement_type': 'BS',
+                'statement_name': '재무상태표',
+                'account_id': 'ifrs-full_Assets',
+                'account_name': '자산총계',
+                'account_detail': '연결재무제표',
+                'current_period_name': '당기',
+                'prior_period_name': '전기',
+                'prior_quarter_name': None,
+                'pre_prior_period_name': None,
+                'order': 1,
+                'receipt_number': '20260407000003',
+                'report_code': '11011',
+                'business_year': '2025',
+                'current_amount': 100,
+                'current_cumulative_amount': None,
+                'prior_amount': 90,
+                'prior_quarter_amount': None,
+                'prior_cumulative_amount': None,
+                'pre_prior_amount': None,
+                'currency': 'KRW',
+                'raw': {'ord': '1'},
+            },
+            {
+                'statement_type': 'BS',
+                'statement_name': '재무상태표',
+                'account_id': 'ifrs-full_Assets',
+                'account_name': '자산총계',
+                'account_detail': '주석 상세',
+                'current_period_name': '당기',
+                'prior_period_name': '전기',
+                'prior_quarter_name': None,
+                'pre_prior_period_name': None,
+                'order': 1,
+                'receipt_number': '20260407000003',
+                'report_code': '11011',
+                'business_year': '2025',
+                'current_amount': 100,
+                'current_cumulative_amount': None,
+                'prior_amount': 90,
+                'prior_quarter_amount': None,
+                'prior_cumulative_amount': None,
+                'pre_prior_amount': None,
+                'currency': 'KRW',
+                'raw': {'ord': '1'},
+            },
+            {
+                'statement_type': 'BS',
+                'statement_name': '재무상태표',
+                'account_id': 'ifrs-full_Assets',
+                'account_name': '자산총계',
+                'account_detail': '주석 상세',
+                'current_period_name': '당기',
+                'prior_period_name': '전기',
+                'prior_quarter_name': None,
+                'pre_prior_period_name': None,
+                'order': 1,
+                'receipt_number': '20260407000003',
+                'report_code': '11011',
+                'business_year': '2025',
+                'current_amount': 100,
+                'current_cumulative_amount': None,
+                'prior_amount': 90,
+                'prior_quarter_amount': None,
+                'prior_cumulative_amount': None,
+                'pre_prior_amount': None,
+                'currency': 'KRW',
+                'raw': {'ord': '1'},
+            },
+        ]
+
+        payloads = build_row_payloads(items)
+
+        self.assertEqual(len(payloads), 3)
+        self.assertEqual(len({payload['row_key'] for payload in payloads}), 3)
+        self.assertNotEqual(payloads[0]['row_key'], payloads[1]['row_key'])
+        self.assertTrue(payloads[2]['row_key'].endswith(':2'))
 
 
 if __name__ == '__main__':
