@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 import httpx
 
@@ -48,13 +49,16 @@ class KoreaEximClientTests(unittest.IsolatedAsyncioTestCase):
         settings.koreaexim_api_key = 'test-key'
         client = TestableKoreaEximClient(FakeResponse([{'result': 1, 'cur_unit': 'USD'}]))
         try:
-            result = await client.fetch_exchange_rates(search_date='20260406')
+            with patch('app.integrations.fx.client.log_fetch_event') as log_fetch_event:
+                result = await client.fetch_exchange_rates(search_date='20260406')
         finally:
             settings.koreaexim_api_key = original_api_key
 
         self.assertEqual(result[0]['cur_unit'], 'USD')
         self.assertEqual(client.last_params['searchdate'], '20260406')
         self.assertEqual(client.last_params['data'], 'AP01')
+        self.assertEqual(log_fetch_event.call_args.kwargs['operation'], 'fetch_exchange_rates')
+        self.assertEqual(log_fetch_event.call_args.kwargs['status'], 'completed')
 
     async def test_fetch_exchange_rates_raises_for_upstream_result_error(self):
         original_api_key = settings.koreaexim_api_key

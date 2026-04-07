@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 from app.dart.fundamentals_capture_service import (
     DartFundamentalsCaptureService,
@@ -129,7 +130,8 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
         repository = FakeCaptureRepository()
         service = DartFundamentalsCaptureService(client=client, repository=repository)
 
-        result = await service.capture_recent_fundamentals(limit=3, force=False, trigger='test', fs_div='CFS')
+        with patch('app.dart.fundamentals_capture_service.log_fetch_event') as log_fetch_event:
+            result = await service.capture_recent_fundamentals(limit=3, force=False, trigger='test', fs_div='CFS')
 
         self.assertEqual(result['run_id'], 88)
         self.assertEqual(result['events_seen'], 3)
@@ -144,6 +146,14 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(repository.snapshots), 2)
         self.assertEqual(repository.snapshots[1]['snapshot_payload']['report_code'], '11014')
         self.assertEqual(repository.completed_runs[-1][1]['status'], 'completed')
+        self.assertTrue(
+            any(
+                call.kwargs.get('operation') == 'capture_fundamentals_event'
+                and call.kwargs.get('status') == 'failed'
+                and call.kwargs.get('event_id') == 2
+                for call in log_fetch_event.call_args_list
+            )
+        )
 
     async def test_inspect_capture_status_returns_repository_views(self):
         service = DartFundamentalsCaptureService(

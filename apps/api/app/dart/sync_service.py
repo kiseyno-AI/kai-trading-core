@@ -5,6 +5,7 @@ import re
 from datetime import date, timedelta
 from typing import Any
 
+from app.core.audit_logging import log_fetch_event
 from app.core.settings import settings
 from app.dart.store import DartSyncRepository, dart_sync_repository
 from app.integrations.dart.client import DartClient, dart_client
@@ -70,6 +71,16 @@ class DartDisclosureSyncService:
         window_end = date.today()
         window_start = window_end - timedelta(days=window_days - 1)
         page_size = max(min(settings.dart_sync_page_count, 100), 1)
+        log_fetch_event(
+            service='dart',
+            operation='sync_recent_disclosures',
+            status='started',
+            trigger=trigger,
+            window_days=window_days,
+            window_start=window_start.isoformat(),
+            window_end=window_end.isoformat(),
+            page_size=page_size,
+        )
         run_id = self.repository.create_sync_run(
             window_start=window_start,
             window_end=window_end,
@@ -109,6 +120,21 @@ class DartDisclosureSyncService:
                     page_items.append(self._build_event_record(raw_item, run_id=run_id))
 
                 counts = self.repository.upsert_events(page_items, run_id=run_id)
+                log_fetch_event(
+                    service='dart',
+                    operation='sync_disclosure_page',
+                    status='completed',
+                    run_id=run_id,
+                    page_no=page_no,
+                    page_size=page_size,
+                    total_pages=total_pages,
+                    payload_total_count=total_count,
+                    item_count=len(page_items),
+                    events_seen=counts['seen'],
+                    events_inserted=counts['inserted'],
+                    events_updated=counts['updated'],
+                    financial_report_events=counts['financial_report_events'],
+                )
                 events_seen += counts['seen']
                 events_inserted += counts['inserted']
                 events_updated += counts['updated']
@@ -127,6 +153,12 @@ class DartDisclosureSyncService:
                 'events_updated': events_updated,
                 'financial_report_events': financial_report_events,
             }
+            log_fetch_event(
+                service='dart',
+                operation='sync_recent_disclosures',
+                status='completed',
+                **{key: value for key, value in result.items() if key != 'status'},
+            )
             self.repository.complete_sync_run(
                 run_id,
                 status='completed',
@@ -139,6 +171,22 @@ class DartDisclosureSyncService:
             )
             return result
         except Exception as exc:
+            log_fetch_event(
+                service='dart',
+                operation='sync_recent_disclosures',
+                status='failed',
+                run_id=run_id,
+                window_start=window_start.isoformat(),
+                window_end=window_end.isoformat(),
+                page_size=page_size,
+                pages_fetched=pages_fetched,
+                events_seen=events_seen,
+                events_inserted=events_inserted,
+                events_updated=events_updated,
+                financial_report_events=financial_report_events,
+                error_type=type(exc).__name__,
+                error_message=str(exc),
+            )
             self.repository.complete_sync_run(
                 run_id,
                 status='failed',

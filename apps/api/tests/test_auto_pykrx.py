@@ -134,6 +134,7 @@ class PykrxBackfillServiceTests(TestCase):
         service = PykrxBackfillService()
 
         with (
+            patch('app.eod.pykrx_backfill.log_fetch_event') as log_fetch_event,
             patch.object(
                 service,
                 'load_active_universe',
@@ -163,12 +164,54 @@ class PykrxBackfillServiceTests(TestCase):
 
         self.assertEqual(result['status'], 'completed')
         self.assertEqual(result['symbols_succeeded'], 1)
+        self.assertTrue(
+            any(
+                call.kwargs.get('operation') == 'update_collection_progress'
+                and call.kwargs.get('status') == 'failed'
+                for call in log_fetch_event.call_args_list
+            )
+        )
         complete_run.assert_called_once_with(
             12,
             status='completed',
             symbols_succeeded=1,
             symbols_failed=0,
             error_message=None,
+        )
+
+    def test_run_collection_logs_per_symbol_failures(self) -> None:
+        service = PykrxBackfillService()
+
+        with (
+            patch('app.eod.pykrx_backfill.log_fetch_event') as log_fetch_event,
+            patch.object(
+                service,
+                'load_active_universe',
+                return_value=[PykrxSymbol(symbol='005930', market='KOSPI', name_ko='Samsung Electronics')],
+            ),
+            patch.object(service, 'resolve_latest_trade_date', return_value='2026-04-03'),
+            patch('app.eod.pykrx_backfill.create_eod_collection_run', return_value=12),
+            patch(
+                'app.eod.pykrx_backfill._get_market_ohlcv_by_date',
+                side_effect=RuntimeError('pykrx timeout'),
+            ),
+            patch('app.eod.pykrx_backfill.update_eod_collection_run_progress'),
+            patch('app.eod.pykrx_backfill.complete_eod_collection_run'),
+        ):
+            result = service.run_backfill(
+                start_date='20260403',
+                end_date='20260403',
+                refresh_universe=False,
+            )
+
+        self.assertEqual(result['status'], 'completed_with_errors')
+        self.assertTrue(
+            any(
+                call.kwargs.get('operation') == 'fetch_symbol_ohlcv'
+                and call.kwargs.get('status') == 'failed'
+                and call.kwargs.get('symbol') == '005930'
+                for call in log_fetch_event.call_args_list
+            )
         )
 
 

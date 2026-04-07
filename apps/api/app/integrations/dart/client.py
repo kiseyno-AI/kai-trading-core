@@ -9,7 +9,7 @@ from xml.etree import ElementTree
 
 import httpx
 
-from app.core.audit_logging import request_with_audit
+from app.core.audit_logging import log_fetch_event, request_with_audit
 from app.core.settings import settings
 
 
@@ -30,7 +30,17 @@ class DartClient:
         self._corp_codes_lock = asyncio.Lock()
 
     async def fetch_company_overview(self, corp_code: str) -> dict[str, Any]:
-        return await self._get_json('/company.json', {'corp_code': corp_code})
+        payload = await self._get_json('/company.json', {'corp_code': corp_code})
+        log_fetch_event(
+            service='dart',
+            operation='fetch_company_overview',
+            status='completed',
+            corp_code=corp_code,
+            response_status=payload.get('status'),
+            corp_name=payload.get('corp_name'),
+            stock_code=payload.get('stock_code'),
+        )
+        return payload
 
     async def fetch_single_company_financial_statements(
         self,
@@ -49,6 +59,18 @@ class DartClient:
                 'fs_div': fs_div,
             },
             allowed_statuses={'013'},
+        )
+        log_fetch_event(
+            service='dart',
+            operation='fetch_single_company_financial_statements',
+            status='completed',
+            corp_code=corp_code,
+            business_year=bsns_year,
+            report_code=reprt_code,
+            fs_div=fs_div,
+            response_status=payload.get('status'),
+            row_count=len(payload.get('list', [])),
+            response_message=payload.get('message'),
         )
         if payload.get('status') == '013':
             return {
@@ -105,6 +127,21 @@ class DartClient:
             params,
             allowed_statuses={'013'},
         )
+        log_fetch_event(
+            service='dart',
+            operation='fetch_disclosure_list',
+            status='completed',
+            corp_code=corp_code,
+            window_start=bgn_de,
+            window_end=end_de,
+            page_no=page_no,
+            page_count=page_count,
+            last_report_only=last_reprt_at,
+            response_status=payload.get('status'),
+            total_count=payload.get('total_count'),
+            item_count=len(payload.get('list', [])),
+            response_message=payload.get('message'),
+        )
         if payload.get('status') == '013':
             return {
                 'status': '013',
@@ -133,6 +170,18 @@ class DartClient:
                 'fs_div': fs_div,
             },
             allowed_statuses={'013'},
+        )
+        log_fetch_event(
+            service='dart',
+            operation='fetch_financial_statements',
+            status='completed',
+            corp_code=corp_code,
+            business_year=bsns_year,
+            report_code=reprt_code,
+            fs_div=fs_div,
+            response_status=payload.get('status'),
+            row_count=len(payload.get('list', [])),
+            response_message=payload.get('message'),
         )
         if payload.get('status') == '013':
             return {
@@ -193,6 +242,14 @@ class DartClient:
             corp_codes = self._parse_corp_code_zip(payload)
             self._corp_codes = corp_codes
             self._corp_codes_loaded_at = now
+            log_fetch_event(
+                service='dart',
+                operation='load_corp_codes',
+                status='completed',
+                cache_ttl_seconds=settings.dart_corp_code_cache_ttl_seconds,
+                corp_code_count=len(corp_codes),
+                payload_bytes=len(payload),
+            )
             return corp_codes
 
     async def _get_json(
@@ -206,6 +263,14 @@ class DartClient:
         payload = response.json()
         status = payload.get('status')
         if status and status != '000' and (allowed_statuses is None or status not in allowed_statuses):
+            log_fetch_event(
+                service='dart',
+                operation='request_json',
+                status='failed',
+                path=path,
+                response_status=status,
+                error_message=payload.get('message'),
+            )
             raise DartAPIError(f"DART request failed [{status}]: {payload.get('message', 'Unknown error')}")
         return payload
 
@@ -227,6 +292,14 @@ class DartClient:
                 params=request_params,
             )
             if response.status_code >= 400:
+                log_fetch_event(
+                    service='dart',
+                    operation='request_http',
+                    status='failed',
+                    path=path,
+                    status_code=response.status_code,
+                    error_message=response.text,
+                )
                 raise DartAPIError(f'DART request failed [{response.status_code}]: {response.text}')
             return response
 

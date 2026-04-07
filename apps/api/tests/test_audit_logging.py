@@ -158,6 +158,27 @@ class AuditLoggingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(event['status_code'], 200)
         self.assertIn('token=%5BREDACTED%5D', event['url'])
 
+    async def test_fetch_operation_logging_redacts_and_truncates_metadata(self):
+        audit_logging.log_fetch_event(
+            service='pykrx',
+            operation='fetch_symbol_ohlcv',
+            status='failed',
+            symbol='005930',
+            auth_token='secret',
+            failed_symbols=[str(index).zfill(6) for index in range(30)],
+            error_message='x' * 400,
+        )
+
+        event = self._read_log_lines('upstream-http.log')[-1]
+        self.assertEqual(event['event'], 'fetch_operation')
+        self.assertEqual(event['service'], 'pykrx')
+        self.assertEqual(event['operation'], 'fetch_symbol_ohlcv')
+        self.assertEqual(event['status'], 'failed')
+        self.assertEqual(event['auth_token'], '[REDACTED]')
+        self.assertEqual(len(event['failed_symbols']), 26)
+        self.assertTrue(event['failed_symbols'][-1].startswith('... ('))
+        self.assertTrue(event['error_message'].endswith('...'))
+
 
 if __name__ == '__main__':
     unittest.main()

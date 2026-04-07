@@ -41,7 +41,10 @@ class ECOSClientTests(unittest.IsolatedAsyncioTestCase):
         client.base_url = 'https://ecos.example.test/api'
         client.api_key = 'test-key'
 
-        with patch('app.integrations.bok.client.httpx.AsyncClient', FakeAsyncClient):
+        with (
+            patch('app.integrations.bok.client.httpx.AsyncClient', FakeAsyncClient),
+            patch('app.integrations.bok.client.log_fetch_event') as log_fetch_event,
+        ):
             await client.fetch_series(
                 stat_code='STAT123',
                 cycle='M',
@@ -54,6 +57,8 @@ class ECOSClientTests(unittest.IsolatedAsyncioTestCase):
             FakeAsyncClient.last_url,
             'https://ecos.example.test/api/StatisticSearch/test-key/json/kr/1/100/STAT123/M/202401/202403//X',
         )
+        self.assertEqual(log_fetch_event.call_args.kwargs['operation'], 'fetch_series')
+        self.assertEqual(log_fetch_event.call_args.kwargs['status'], 'completed')
 
 
 if __name__ == '__main__':
