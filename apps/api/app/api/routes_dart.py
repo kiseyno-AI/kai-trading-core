@@ -167,6 +167,8 @@ async def backfill_dart_fundamentals_for_current_universe(
             start_date=start_date,
             end_date=end_date,
         )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except DartLookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except DartAPIError as exc:

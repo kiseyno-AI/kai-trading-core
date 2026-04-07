@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 from app.core.settings import settings
 from app.dart.sync_service import DartDisclosureSyncService, classify_filing
+from app.integrations.dart.client import DartAPIError
 
 
 class FakeSyncClient:
@@ -147,6 +148,24 @@ class DartDisclosureSyncServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['corporations_processed'], 1)
         self.assertEqual(result['financial_report_events'], 2)
         self.assertEqual(sum(len(batch) for _, batch in repository.upserted_batches), 2)
+
+    async def test_sync_disclosures_for_corporations_propagates_upstream_failures(self):
+        class FailingClient(FakeSyncClient):
+            async def fetch_disclosure_list(self, **kwargs):
+                raise DartAPIError('DART upstream unavailable')
+
+        repository = FakeSyncRepository()
+        service = DartDisclosureSyncService(client=FailingClient(), repository=repository)
+
+        with self.assertRaisesRegex(DartAPIError, 'unavailable'):
+            await service.sync_disclosures_for_corporations(
+                corporations=[{'corp_code': '00126380', 'stock_code': '005930'}],
+                start_date=date(2025, 1, 1),
+                end_date=date(2026, 4, 7),
+                trigger='active_test',
+            )
+
+        self.assertEqual(repository.completed_runs[-1][1]['status'], 'failed')
 
     async def test_inspect_sync_returns_repository_views(self):
         service = DartDisclosureSyncService(client=FakeSyncClient(), repository=FakeSyncRepository())

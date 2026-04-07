@@ -320,6 +320,22 @@ class DartRouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.json()['detail'], 'fs_div must be one of CFS or OFS')
 
+    def test_current_universe_backfill_route_rejects_reversed_date_window(self):
+        class ReversedWindowService(FakeCaptureService):
+            async def backfill_current_universe_fundamentals(self, **kwargs):
+                raise ValueError('effective_start_date must be on or before effective_end_date (2015-01-01 > 2014-12-31)')
+
+        original_service = routes_dart.dart_fundamentals_capture_service
+        routes_dart.dart_fundamentals_capture_service = ReversedWindowService()
+        try:
+            client = TestClient(self.app)
+            response = client.post('/disclosures/dart/fundamentals/backfill/current-universe')
+        finally:
+            routes_dart.dart_fundamentals_capture_service = original_service
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('effective_start_date', response.json()['detail'])
+
 
 if __name__ == '__main__':
     unittest.main()

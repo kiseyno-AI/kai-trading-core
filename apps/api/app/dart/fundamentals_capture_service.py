@@ -452,6 +452,11 @@ class DartFundamentalsCaptureService:
         resolved_end_date = end_date or max_trade_date or date.today()
         candidate_start_date = start_date or min_trade_date or DART_FUNDAMENTALS_MIN_START_DATE
         effective_start_date = max(candidate_start_date, DART_FUNDAMENTALS_MIN_START_DATE)
+        if effective_start_date > resolved_end_date:
+            raise ValueError(
+                'effective_start_date must be on or before effective_end_date '
+                f'({effective_start_date.isoformat()} > {resolved_end_date.isoformat()})'
+            )
         selected_symbols = active_symbols[symbol_offset : symbol_offset + symbol_limit]
         corp_records = []
         symbol_lookup_errors: list[dict[str, str]] = []

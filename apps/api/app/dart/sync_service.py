@@ -8,7 +8,7 @@ from typing import Any
 from app.core.audit_logging import log_fetch_event
 from app.core.settings import settings
 from app.dart.store import DartSyncRepository, dart_sync_repository
-from app.integrations.dart.client import DartClient, dart_client
+from app.integrations.dart.client import DartAPIError, DartClient, dart_client
 
 _ANNUAL_REPORT = 'annual_report'
 _SEMIANNUAL_REPORT = 'semiannual_report'
@@ -272,6 +272,8 @@ class DartDisclosureSyncService:
                         page_no += 1
 
                     corporations_processed += 1
+                except DartAPIError:
+                    raise
                 except Exception as exc:
                     corporations_failed += 1
                     corporation_errors.append(

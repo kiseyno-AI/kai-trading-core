@@ -225,6 +225,17 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['symbols_resolved'], 2)
         self.assertEqual(result['sync']['run_id'], 77)
 
+    async def test_backfill_current_universe_rejects_reversed_effective_date_window(self):
+        service = DartFundamentalsCaptureService(
+            client=FakeCaptureClient(),
+            repository=FakeCaptureRepository(),
+            active_symbol_loader=lambda: [{'symbol': '005930'}],
+            daily_price_bar_bounds_loader=lambda: (date(2007, 6, 5), date(2014, 12, 31)),
+        )
+
+        with self.assertRaisesRegex(ValueError, 'effective_start_date'):
+            await service.backfill_current_universe_fundamentals(symbol_limit=1, capture_limit=10, fs_div='CFS')
+
 
 class InferFundamentalsRequestTests(unittest.TestCase):
     def test_infer_fundamentals_request_maps_annual_and_quarterly_periods(self):
