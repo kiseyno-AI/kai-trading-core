@@ -112,6 +112,7 @@ class ECOSRouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(fake_client.calls[0]['stat_code'], '722Y001')
         self.assertEqual(fake_client.calls[0]['item_code_1'], '0101000')
+        self.assertEqual(fake_client.calls[0]['cycle'], 'M')
         self.assertEqual(response.json()['request']['series_alias'], 'kr_base_rate')
 
     def test_ecos_catalog_route_lists_aliases(self):
