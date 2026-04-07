@@ -289,6 +289,30 @@ class DartService:
             fs_div=fs_div,
         )
 
+    async def get_filing_document(self, *, rcept_no: str) -> dict[str, Any]:
+        document = await self.client.download_document(rcept_no=rcept_no)
+        return {
+            'rcept_no': rcept_no,
+            'artifact_type': 'original_document',
+            'content': document['content'],
+            'content_type': document['content_type'],
+            'filename': document['filename'],
+            'size_bytes': document['size_bytes'],
+        }
+
+    async def get_filing_xbrl(self, *, rcept_no: str, report_code: str | None = None) -> dict[str, Any]:
+        resolved_report_code = self._resolve_report_code(period=None, report_code=report_code) if report_code else None
+        document = await self.client.download_xbrl(rcept_no=rcept_no, reprt_code=resolved_report_code)
+        return {
+            'rcept_no': rcept_no,
+            'artifact_type': 'xbrl',
+            'report_code': resolved_report_code,
+            'content': document['content'],
+            'content_type': document['content_type'],
+            'filename': document['filename'],
+            'size_bytes': document['size_bytes'],
+        }
+
     @staticmethod
     def _resolve_report_code(*, period: str | None, report_code: str | None) -> str:
         normalized_report_code = (report_code or '').strip()

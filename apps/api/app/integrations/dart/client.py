@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import io
+import re
+from urllib.parse import unquote
 import zipfile
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -19,6 +21,10 @@ class DartAPIError(RuntimeError):
 
 class DartLookupError(LookupError):
     pass
+
+
+_FILENAME_STAR_PATTERN = re.compile(r"filename\*\s*=\s*([^']*)''([^;]+)")
+_FILENAME_PATTERN = re.compile(r'filename\s*=\s*"?(?P<filename>[^";]+)"?')
 
 
 class DartClient:
@@ -191,6 +197,48 @@ class DartClient:
             }
         return payload
 
+    async def download_document(self, *, rcept_no: str) -> dict[str, Any]:
+        response = await self._request('/document.xml', {'rcept_no': rcept_no})
+        self._raise_for_binary_error_envelope(response, path='/document.xml')
+        payload = self._build_binary_payload(
+            response,
+            default_filename=f'dart-document-{rcept_no}.zip',
+        )
+        log_fetch_event(
+            service='dart',
+            operation='download_document',
+            status='completed',
+            receipt_number=rcept_no,
+            content_type=payload['content_type'],
+            file_name=payload['filename'],
+            payload_bytes=payload['size_bytes'],
+        )
+        return payload
+
+    async def download_xbrl(self, *, rcept_no: str, reprt_code: str | None = None) -> dict[str, Any]:
+        params = {'rcept_no': rcept_no}
+        if reprt_code:
+            params['reprt_code'] = reprt_code
+
+        response = await self._request('/fnlttXbrl.xml', params)
+        self._raise_for_binary_error_envelope(response, path='/fnlttXbrl.xml')
+        filename_suffix = f'-{reprt_code}' if reprt_code else ''
+        payload = self._build_binary_payload(
+            response,
+            default_filename=f'dart-xbrl-{rcept_no}{filename_suffix}.zip',
+        )
+        log_fetch_event(
+            service='dart',
+            operation='download_xbrl',
+            status='completed',
+            receipt_number=rcept_no,
+            report_code=reprt_code,
+            content_type=payload['content_type'],
+            file_name=payload['filename'],
+            payload_bytes=payload['size_bytes'],
+        )
+        return payload
+
     async def lookup_corp_code(
         self,
         *,
@@ -330,6 +378,75 @@ class DartClient:
                 }
             )
         return corp_codes
+
+    @staticmethod
+    def _build_binary_payload(response: httpx.Response, *, default_filename: str) -> dict[str, Any]:
+        headers = dict(response.headers)
+        return {
+            'content': response.content,
+            'content_type': response.headers.get('content-type', 'application/octet-stream'),
+            'filename': DartClient._extract_filename(response.headers.get('content-disposition'), default_filename),
+            'size_bytes': len(response.content),
+            'headers': headers,
+        }
+
+    @staticmethod
+    def _extract_filename(content_disposition: str | None, default_filename: str) -> str:
+        if not content_disposition:
+            return default_filename
+
+        star_match = _FILENAME_STAR_PATTERN.search(content_disposition)
+        if star_match:
+            return unquote(star_match.group(2)) or default_filename
+
+        match = _FILENAME_PATTERN.search(content_disposition)
+        if match:
+            return match.group('filename')
+
+        return default_filename
+
+    @staticmethod
+    def _raise_for_binary_error_envelope(response: httpx.Response, *, path: str) -> None:
+        content = response.content or b''
+        if not content:
+            return
+
+        stripped = content.lstrip()
+        content_type = (response.headers.get('content-type') or '').lower()
+
+        if stripped.startswith(b'{') or 'json' in content_type:
+            try:
+                payload = response.json()
+            except Exception:
+                return
+            DartClient._raise_for_binary_error_payload(payload, path=path)
+            return
+
+        if stripped.startswith(b'<') or 'xml' in content_type or 'text/' in content_type:
+            try:
+                root = ElementTree.fromstring(content)
+            except ElementTree.ParseError:
+                return
+            payload = {
+                'status': (root.findtext('.//status') or '').strip(),
+                'message': (root.findtext('.//message') or '').strip(),
+            }
+            DartClient._raise_for_binary_error_payload(payload, path=path)
+
+    @staticmethod
+    def _raise_for_binary_error_payload(payload: dict[str, Any], *, path: str) -> None:
+        status = str(payload.get('status') or '').strip()
+        if status and status != '000':
+            message = payload.get('message', 'Unknown error')
+            log_fetch_event(
+                service='dart',
+                operation='request_binary',
+                status='failed',
+                path=path,
+                response_status=status,
+                error_message=message,
+            )
+            raise DartAPIError(f'DART request failed [{status}]: {message}')
 
 
 dart_client = DartClient()
