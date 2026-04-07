@@ -40,3 +40,15 @@ class DartBackfillCurrentUniverseCliTests(unittest.TestCase):
         payload = json.loads(written)
         self.assertEqual(payload['status'], 'failed')
         self.assertEqual(payload['error'], 'boom')
+
+    def test_main_rejects_negative_symbol_limit(self):
+        with self.assertRaises(SystemExit):
+            main(['--symbol-limit', '-1'])
+
+    def test_main_rejects_negative_symbol_offset(self):
+        with self.assertRaises(SystemExit):
+            main(['--symbol-offset', '-1'])
+
+    def test_main_rejects_non_positive_capture_limit(self):
+        with self.assertRaises(SystemExit):
+            main(['--capture-limit', '0'])

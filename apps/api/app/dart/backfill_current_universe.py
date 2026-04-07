@@ -16,11 +16,18 @@ def _parse_iso_date(value: str | None) -> date | None:
     return date.fromisoformat(value)
 
 
+def _parse_int_at_least(value: str, *, minimum: int, name: str) -> int:
+    parsed = int(value)
+    if parsed < minimum:
+        raise argparse.ArgumentTypeError(f'{name} must be >= {minimum}')
+    return parsed
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description='Run DART fundamentals backfill for the current active universe.')
-    parser.add_argument('--symbol-limit', type=int, default=25)
-    parser.add_argument('--symbol-offset', type=int, default=0)
-    parser.add_argument('--capture-limit', type=int, default=250)
+    parser.add_argument('--symbol-limit', type=lambda value: _parse_int_at_least(value, minimum=1, name='symbol_limit'), default=25)
+    parser.add_argument('--symbol-offset', type=lambda value: _parse_int_at_least(value, minimum=0, name='symbol_offset'), default=0)
+    parser.add_argument('--capture-limit', type=lambda value: _parse_int_at_least(value, minimum=1, name='capture_limit'), default=250)
     parser.add_argument('--force', action='store_true')
     parser.add_argument('--fs-div', default=None)
     parser.add_argument('--start-date', default=None, help='ISO date, e.g. 2015-01-01')
