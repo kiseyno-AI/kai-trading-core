@@ -24,6 +24,19 @@ class TestableDartClient(DartClient):
 
 
 class DartClientTests(unittest.IsolatedAsyncioTestCase):
+    async def test_fetch_single_company_financial_statements_returns_empty_list_for_no_data_status(self):
+        client = TestableDartClient({'status': '013', 'message': 'No data'})
+
+        result = await client.fetch_single_company_financial_statements(
+            corp_code='00126380',
+            bsns_year='2025',
+            reprt_code='11011',
+            fs_div='CFS',
+        )
+
+        self.assertEqual(result['status'], '013')
+        self.assertEqual(result['list'], [])
+
     async def test_fetch_filings_returns_empty_list_for_no_data_status(self):
         client = TestableDartClient({'status': '013', 'message': 'No data'})
 
@@ -37,6 +50,18 @@ class DartClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['total_count'], '0')
         self.assertEqual(result['list'], [])
         self.assertEqual(result['page_no'], '1')
+
+    async def test_fetch_financial_statements_returns_empty_list_for_no_data_status(self):
+        client = TestableDartClient({'status': '013', 'message': 'No data'})
+
+        result = await client.fetch_financial_statements(
+            corp_code='00126380',
+            bsns_year='2025',
+            reprt_code='11011',
+        )
+
+        self.assertEqual(result['status'], '013')
+        self.assertEqual(result['list'], [])
 
     async def test_fetch_company_overview_still_raises_for_non_success_status(self):
         client = TestableDartClient({'status': '014', 'message': 'File does not exist'})

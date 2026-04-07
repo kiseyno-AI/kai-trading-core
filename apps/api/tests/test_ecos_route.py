@@ -18,7 +18,13 @@ class FakeECOSClient:
                 'row': [
                     {
                         'STAT_CODE': kwargs['stat_code'],
+                        'STAT_NAME': 'Test Series',
                         'CYCLE': kwargs['cycle'],
+                        'TIME': kwargs['start_period'],
+                        'DATA_VALUE': '3.50',
+                        'ITEM_CODE1': kwargs.get('item_code_1'),
+                        'ITEM_NAME1': 'Test Item',
+                        'UNIT_NAME': '%',
                     }
                 ]
             }
@@ -61,6 +67,8 @@ class ECOSRouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()['StatisticSearch']['row'][0]['STAT_CODE'], '722Y001')
+        self.assertEqual(response.json()['series']['stat_code'], '722Y001')
+        self.assertEqual(response.json()['observations'][0]['value'], 3.5)
         self.assertEqual(fake_client.calls[0]['item_code_1'], '0101000')
 
     def test_bok_series_route_keeps_legacy_query_shape(self):
@@ -83,6 +91,37 @@ class ECOSRouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(fake_client.calls[0]['stat_code'], '817Y002')
+
+    def test_ecos_series_route_accepts_series_alias(self):
+        original_client = routes_macro.ecos_client
+        fake_client = FakeECOSClient()
+        routes_macro.ecos_client = fake_client
+        try:
+            client = TestClient(self.app)
+            response = client.get(
+                '/macro/ecos/series',
+                params={
+                    'series_alias': 'kr_base_rate',
+                    'start_period': '202401',
+                    'end_period': '202403',
+                },
+            )
+        finally:
+            routes_macro.ecos_client = original_client
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(fake_client.calls[0]['stat_code'], '722Y001')
+        self.assertEqual(fake_client.calls[0]['item_code_1'], '0101000')
+        self.assertEqual(fake_client.calls[0]['cycle'], 'M')
+        self.assertEqual(response.json()['request']['series_alias'], 'kr_base_rate')
+
+    def test_ecos_catalog_route_lists_aliases(self):
+        client = TestClient(self.app)
+        response = client.get('/macro/ecos/catalog')
+
+        self.assertEqual(response.status_code, 200)
+        aliases = response.json()['aliases']
+        self.assertTrue(any(item['alias'] == 'kr_base_rate' for item in aliases))
 
     def test_ecos_series_route_maps_upstream_errors_to_502(self):
         original_client = routes_macro.ecos_client
@@ -121,6 +160,22 @@ class ECOSRouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 500)
         self.assertEqual(response.json()['detail'], 'BOK_ECOS_API_KEY is not configured')
+
+    def test_ecos_series_route_requires_stat_code_or_alias(self):
+        client = TestClient(self.app)
+        response = client.get(
+            '/macro/ecos/series',
+            params={
+                'start_period': '202401',
+                'end_period': '202403',
+            },
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.json()['detail'],
+            'One of stat_code/series_id or series_alias is required',
+        )
 
 
 if __name__ == '__main__':

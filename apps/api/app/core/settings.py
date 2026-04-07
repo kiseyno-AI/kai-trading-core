@@ -57,6 +57,8 @@ class Settings(BaseSettings):
     dart_corp_code_cache_ttl_seconds: int = 86400
     dart_sync_recent_days: int = 7
     dart_sync_page_count: int = 100
+    dart_fundamentals_default_report_code: str = '11011'
+    dart_fundamentals_default_fs_div: str = 'CFS'
 
     eod_auto_pykrx_enabled: bool = True
     eod_auto_pykrx_poll_seconds: int = 60
