@@ -57,6 +57,7 @@ class Settings(BaseSettings):
     dart_corp_code_cache_ttl_seconds: int = 86400
     dart_sync_recent_days: int = 7
     dart_sync_page_count: int = 100
+    dart_fundamentals_min_business_year: int = 2015
     dart_fundamentals_default_report_code: str = '11011'
     dart_fundamentals_default_fs_div: str = 'CFS'
 

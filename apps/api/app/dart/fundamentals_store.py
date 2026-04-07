@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any
 
 from sqlalchemy import delete, func, select
@@ -107,13 +107,29 @@ class DartFundamentalsRepository:
                 return None
             return _serialize_capture_run(row)
 
-    def list_capture_candidates(self, *, limit: int = 20, force: bool = False) -> list[dict[str, Any]]:
+    def list_capture_candidates(
+        self,
+        *,
+        limit: int | None = 20,
+        force: bool = False,
+        stock_codes: list[str] | None = None,
+        receipt_date_from: date | None = None,
+        receipt_date_to: date | None = None,
+    ) -> list[dict[str, Any]]:
         with session_scope() as session:
             stmt = select(DartDisclosureEvent).where(DartDisclosureEvent.is_financial_report.is_(True))
             if not force:
                 stmt = stmt.where(DartDisclosureEvent.fundamentals_capture_status.in_(('pending', 'failed')))
+            if stock_codes:
+                stmt = stmt.where(DartDisclosureEvent.stock_code.in_(stock_codes))
+            if receipt_date_from:
+                stmt = stmt.where(DartDisclosureEvent.receipt_date >= receipt_date_from)
+            if receipt_date_to:
+                stmt = stmt.where(DartDisclosureEvent.receipt_date <= receipt_date_to)
             rows = session.execute(
-                stmt.order_by(DartDisclosureEvent.receipt_date.desc(), DartDisclosureEvent.rcept_no.desc()).limit(limit)
+                stmt.order_by(DartDisclosureEvent.receipt_date.desc(), DartDisclosureEvent.rcept_no.desc())
+                if limit is None
+                else stmt.order_by(DartDisclosureEvent.receipt_date.desc(), DartDisclosureEvent.rcept_no.desc()).limit(limit)
             ).scalars()
             return [self._serialize_event(row) for row in rows]
 

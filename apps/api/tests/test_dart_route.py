@@ -70,6 +70,17 @@ class FakeCaptureService:
             'events_failed': 1,
         }
 
+    async def backfill_current_universe_fundamentals(self, **kwargs):
+        return {
+            'scope': 'current_active_universe',
+            'active_symbols_total': 3584,
+            'symbols_selected': kwargs['symbol_limit'],
+            'symbols_resolved': kwargs['symbol_limit'],
+            'effective_start_date': '2015-01-01',
+            'sync': {'run_id': 7, 'financial_report_events': 6},
+            'capture': {'run_id': 12, 'events_captured': 4},
+        }
+
     def inspect_capture_status(self, **kwargs):
         return {
             'latest_run': {'id': 12, 'status': 'completed'},
@@ -282,6 +293,32 @@ class DartRouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()['latest_run']['id'], 12)
         self.assertEqual(response.json()['events'][0]['fundamentals_capture_status'], 'captured')
+
+    def test_current_universe_backfill_route_returns_payload(self):
+        original_service = routes_dart.dart_fundamentals_capture_service
+        routes_dart.dart_fundamentals_capture_service = FakeCaptureService()
+        try:
+            client = TestClient(self.app)
+            response = client.post(
+                '/disclosures/dart/fundamentals/backfill/current-universe',
+                params={'symbol_limit': 5, 'capture_limit': 20},
+            )
+        finally:
+            routes_dart.dart_fundamentals_capture_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['effective_start_date'], '2015-01-01')
+        self.assertEqual(response.json()['sync']['financial_report_events'], 6)
+
+    def test_current_universe_backfill_route_validates_fs_div(self):
+        client = TestClient(self.app)
+        response = client.post(
+            '/disclosures/dart/fundamentals/backfill/current-universe',
+            params={'fs_div': 'bad'},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()['detail'], 'fs_div must be one of CFS or OFS')
 
 
 if __name__ == '__main__':

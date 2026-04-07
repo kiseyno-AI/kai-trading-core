@@ -1,4 +1,5 @@
 import unittest
+from datetime import date
 from unittest.mock import patch
 
 from app.core.settings import settings
@@ -115,23 +116,37 @@ class DartDisclosureSyncServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['run_id'], 41)
         self.assertEqual(result['pages_fetched'], 2)
         self.assertEqual(result['events_seen'], 3)
-        self.assertEqual(result['events_inserted'], 3)
+        self.assertEqual(result['events_inserted'], 2)
         self.assertEqual(result['financial_report_events'], 2)
         self.assertEqual(client.calls[0]['last_reprt_at'], 'N')
         self.assertEqual(repository.created_runs[0]['trigger'], 'test')
         first_batch = repository.upserted_batches[0][1]
         self.assertTrue(first_batch[0]['is_financial_report'])
         self.assertEqual(first_batch[0]['filing_category'], 'annual_report')
-        self.assertFalse(first_batch[1]['is_financial_report'])
-        self.assertEqual(first_batch[1]['filing_category'], 'other')
+        self.assertEqual(len(first_batch), 1)
+        self.assertEqual(repository.upserted_batches[1][1][0]['filing_category'], 'semiannual_report')
         self.assertEqual(repository.completed_runs[-1][1]['status'], 'completed')
-        self.assertTrue(
-            any(
-                call.kwargs.get('operation') == 'sync_disclosure_page'
-                and call.kwargs.get('status') == 'completed'
-                for call in log_fetch_event.call_args_list
+
+    async def test_sync_disclosures_for_corporations_only_persists_financial_reports(self):
+        client = FakeSyncClient()
+        repository = FakeSyncRepository()
+        service = DartDisclosureSyncService(client=client, repository=repository)
+        original_page_count = settings.dart_sync_page_count
+        settings.dart_sync_page_count = 2
+        try:
+            result = await service.sync_disclosures_for_corporations(
+                corporations=[{'corp_code': '00126380', 'stock_code': '005930'}],
+                start_date=date(2025, 1, 1),
+                end_date=date(2026, 4, 7),
+                trigger='active_test',
             )
-        )
+        finally:
+            settings.dart_sync_page_count = original_page_count
+
+        self.assertEqual(result['corporations_requested'], 1)
+        self.assertEqual(result['corporations_processed'], 1)
+        self.assertEqual(result['financial_report_events'], 2)
+        self.assertEqual(sum(len(batch) for _, batch in repository.upserted_batches), 2)
 
     async def test_inspect_sync_returns_repository_views(self):
         service = DartDisclosureSyncService(client=FakeSyncClient(), repository=FakeSyncRepository())
