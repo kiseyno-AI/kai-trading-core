@@ -298,7 +298,7 @@ class DartClient:
                     status='failed',
                     path=path,
                     status_code=response.status_code,
-                    error_message=response.text,
+                    error_message=f'DART HTTP {response.status_code} response body omitted from audit log',
                 )
                 raise DartAPIError(f'DART request failed [{response.status_code}]: {response.text}')
             return response
