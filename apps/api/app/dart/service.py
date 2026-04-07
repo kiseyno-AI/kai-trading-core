@@ -4,6 +4,7 @@ from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from app.core.settings import settings
 from app.integrations.dart.client import DartClient, dart_client
 
 REPORT_CODE_METADATA = {
@@ -34,6 +35,11 @@ PERIOD_TO_REPORT_CODE = {
     'third-quarter': '11014',
 }
 
+FS_DIV_TO_STATEMENT_TYPE = {
+    'CFS': 'consolidated',
+    'OFS': 'separate',
+}
+
 STATEMENT_TYPE_TO_FS_DIV = {
     'consolidated': 'CFS',
     'separate': 'OFS',
@@ -42,27 +48,31 @@ STATEMENT_TYPE_TO_FS_DIV = {
 HIGHLIGHT_ACCOUNT_MATCHERS = {
     'revenue': {
         'account_ids': {'ifrs-full_Revenue', 'ifrs_Revenue', 'ifrs-full_GrossRevenue'},
-        'account_names': {'매출액', '영업수익'},
+        'account_names': {'매출액', '영업수익', 'Revenue'},
     },
     'operating_income': {
         'account_ids': {'dart_OperatingIncomeLoss'},
-        'account_names': {'영업이익', '영업손실'},
+        'account_names': {'영업이익', '영업손실', 'Operating income'},
     },
     'net_income': {
         'account_ids': {'ifrs-full_ProfitLoss', 'ifrs_ProfitLoss'},
-        'account_names': {'당기순이익', '당기순손실', '분기순이익', '반기순이익'},
+        'account_names': {'당기순이익', '당기순손실', '분기순이익', '반기순이익', 'Profit (loss)', '당기순이익(손실)'},
     },
     'total_assets': {
         'account_ids': {'ifrs-full_Assets', 'ifrs_Assets'},
-        'account_names': {'자산총계'},
+        'account_names': {'자산총계', 'Assets'},
     },
     'total_liabilities': {
         'account_ids': {'ifrs-full_Liabilities', 'ifrs_Liabilities'},
-        'account_names': {'부채총계'},
+        'account_names': {'부채총계', 'Liabilities'},
     },
     'total_equity': {
         'account_ids': {'ifrs-full_Equity', 'ifrs_Equity'},
-        'account_names': {'자본총계'},
+        'account_names': {'자본총계', 'Equity'},
+    },
+    'operating_cash_flow': {
+        'account_ids': set(),
+        'account_names': {'영업활동으로 인한 현금흐름', '영업활동현금흐름', 'Cash flows from operating activities'},
     },
 }
 
@@ -129,23 +139,24 @@ class DartService:
             },
         }
 
-    async def get_company_fundamentals(
+    async def get_fundamentals(
         self,
         *,
         corp_code: str | None = None,
         stock_code: str | None = None,
         corp_name: str | None = None,
-        fiscal_year: int,
-        period: str | None = 'annual',
+        business_year: int,
+        period: str | None = None,
         report_code: str | None = None,
-        statement_type: str = 'consolidated',
+        statement_type: str | None = None,
+        fs_div: str | None = None,
     ) -> dict[str, Any]:
         resolved_report_code = self._resolve_report_code(period=period, report_code=report_code)
-
-        normalized_statement_type = statement_type.strip().lower()
-        fs_div = STATEMENT_TYPE_TO_FS_DIV.get(normalized_statement_type)
-        if fs_div is None:
-            raise ValueError('statement_type must be one of: consolidated, separate')
+        resolved_fs_div, normalized_statement_type = self._resolve_fs_div(
+            statement_type=statement_type,
+            fs_div=fs_div,
+        )
+        report_meta = REPORT_CODE_METADATA[resolved_report_code]
 
         corp = await self.client.lookup_corp_code(
             corp_code=corp_code,
@@ -153,16 +164,14 @@ class DartService:
             corp_name=corp_name,
         )
         company = await self.client.fetch_company_overview(corp['corp_code'])
-        statements = await self.client.fetch_financial_statements(
+        statements = await self.client.fetch_single_company_financial_statements(
             corp_code=corp['corp_code'],
-            bsns_year=str(fiscal_year),
+            bsns_year=str(business_year),
             reprt_code=resolved_report_code,
-            fs_div=fs_div,
+            fs_div=resolved_fs_div,
         )
-
-        normalized_rows = [_normalize_financial_statement_row(row) for row in statements.get('list', [])]
-        highlights = _build_highlights(normalized_rows)
-        report_meta = REPORT_CODE_METADATA[resolved_report_code]
+        items = [_normalize_statement_item(item) for item in statements.get('list', [])]
+        highlights = _build_highlights(items)
 
         return {
             'lookup': {
@@ -179,19 +188,26 @@ class DartService:
                 'corp_cls': company.get('corp_cls'),
             },
             'request': {
-                'fiscal_year': str(fiscal_year),
+                'business_year': business_year,
+                'fiscal_year': str(business_year),
                 'period': report_meta['period'],
                 'report_code': resolved_report_code,
                 'report_label': report_meta['label'],
+                'report_name': report_meta['label'],
                 'period_scope': report_meta['scope'],
                 'quarter': report_meta['quarter'],
                 'statement_type': normalized_statement_type,
-                'fs_div': fs_div,
+                'fs_div': resolved_fs_div,
+                'fs_label': FS_DIV_TO_STATEMENT_TYPE[resolved_fs_div],
+                'dataset': 'fnlttSinglAcntAll',
             },
             'highlights': highlights,
             'statements': {
-                'count': len(normalized_rows),
-                'items': normalized_rows,
+                'status': statements.get('status'),
+                'message': statements.get('message'),
+                'currency': next((item['currency'] for item in items if item.get('currency')), None),
+                'count': len(items),
+                'items': items,
             },
             'source': {
                 'status': statements.get('status'),
@@ -199,70 +215,141 @@ class DartService:
             },
         }
 
+    async def get_company_fundamentals(
+        self,
+        *,
+        corp_code: str | None = None,
+        stock_code: str | None = None,
+        corp_name: str | None = None,
+        fiscal_year: int,
+        period: str | None = None,
+        report_code: str | None = None,
+        statement_type: str | None = None,
+        fs_div: str | None = None,
+    ) -> dict[str, Any]:
+        return await self.get_fundamentals(
+            corp_code=corp_code,
+            stock_code=stock_code,
+            corp_name=corp_name,
+            business_year=fiscal_year,
+            period=period,
+            report_code=report_code,
+            statement_type=statement_type,
+            fs_div=fs_div,
+        )
+
     @staticmethod
     def _resolve_report_code(*, period: str | None, report_code: str | None) -> str:
-        normalized_period = (period or 'annual').strip().lower()
-        inferred_report_code = PERIOD_TO_REPORT_CODE.get(normalized_period)
-        if inferred_report_code is None:
-            raise ValueError('period must map to one of: annual, q1, half, q3')
+        normalized_report_code = (report_code or '').strip()
+        normalized_period = (period or '').strip().lower()
 
-        if report_code is None:
+        if normalized_report_code:
+            if normalized_report_code not in REPORT_CODE_METADATA:
+                raise ValueError('report_code must be one of 11011, 11012, 11013, 11014')
+            if not normalized_period:
+                return normalized_report_code
+
+            inferred_report_code = PERIOD_TO_REPORT_CODE.get(normalized_period)
+            if inferred_report_code is None:
+                raise ValueError('period must map to one of: annual, q1, half, q3')
+            if normalized_report_code != inferred_report_code:
+                raise ValueError('period and report_code refer to different filing windows')
+            return normalized_report_code
+
+        if normalized_period:
+            inferred_report_code = PERIOD_TO_REPORT_CODE.get(normalized_period)
+            if inferred_report_code is None:
+                raise ValueError('period must map to one of: annual, q1, half, q3')
             return inferred_report_code
 
-        normalized_report_code = report_code.strip()
-        if normalized_report_code not in REPORT_CODE_METADATA:
-            raise ValueError('report_code must be one of: 11011, 11012, 11013, 11014')
-        if normalized_report_code != inferred_report_code:
-            raise ValueError('period and report_code refer to different filing windows')
-        return normalized_report_code
+        default_report_code = settings.dart_fundamentals_default_report_code.strip()
+        if default_report_code not in REPORT_CODE_METADATA:
+            raise ValueError('report_code must be one of 11011, 11012, 11013, 11014')
+        return default_report_code
+
+    @staticmethod
+    def _resolve_fs_div(*, statement_type: str | None, fs_div: str | None) -> tuple[str, str]:
+        normalized_statement_type = (statement_type or '').strip().lower()
+        normalized_fs_div = (fs_div or '').strip().upper()
+
+        if normalized_statement_type:
+            inferred_fs_div = STATEMENT_TYPE_TO_FS_DIV.get(normalized_statement_type)
+            if inferred_fs_div is None:
+                raise ValueError('statement_type must be one of: consolidated, separate')
+            if normalized_fs_div and normalized_fs_div != inferred_fs_div:
+                raise ValueError('statement_type and fs_div refer to different statement scopes')
+            return inferred_fs_div, normalized_statement_type
+
+        if normalized_fs_div:
+            if normalized_fs_div not in FS_DIV_TO_STATEMENT_TYPE:
+                raise ValueError('fs_div must be one of CFS or OFS')
+            return normalized_fs_div, FS_DIV_TO_STATEMENT_TYPE[normalized_fs_div]
+
+        default_fs_div = settings.dart_fundamentals_default_fs_div.strip().upper()
+        if default_fs_div not in FS_DIV_TO_STATEMENT_TYPE:
+            raise ValueError('fs_div must be one of CFS or OFS')
+        return default_fs_div, FS_DIV_TO_STATEMENT_TYPE[default_fs_div]
 
 
-def _normalize_financial_statement_row(row: dict[str, Any]) -> dict[str, Any]:
+def _normalize_statement_item(item: dict[str, Any]) -> dict[str, Any]:
     return {
-        'account_id': row.get('account_id'),
-        'account_name': row.get('account_nm'),
-        'statement_section': row.get('sj_nm'),
-        'statement_type': row.get('fs_nm'),
-        'currency': row.get('currency'),
-        'current_amount': _decimal_to_string(_parse_decimal(row.get('thstrm_amount'))),
-        'prior_amount': _decimal_to_string(_parse_decimal(row.get('frmtrm_amount'))),
-        'prior_prior_amount': _decimal_to_string(_parse_decimal(row.get('bfefrmtrm_amount'))),
-        'current_label': row.get('thstrm_nm'),
-        'prior_label': row.get('frmtrm_nm'),
-        'prior_prior_label': row.get('bfefrmtrm_nm'),
-        'raw': row,
+        'receipt_number': item.get('rcept_no'),
+        'report_code': item.get('reprt_code'),
+        'business_year': item.get('bsns_year'),
+        'statement_type': item.get('sj_div'),
+        'statement_name': item.get('sj_nm'),
+        'account_id': item.get('account_id'),
+        'account_name': item.get('account_nm'),
+        'account_detail': item.get('account_detail'),
+        'current_period_name': item.get('thstrm_nm'),
+        'current_amount': _parse_int(item.get('thstrm_amount')),
+        'current_cumulative_amount': _parse_int(item.get('thstrm_add_amount')),
+        'prior_period_name': item.get('frmtrm_nm'),
+        'prior_amount': _parse_int(item.get('frmtrm_amount')),
+        'prior_quarter_name': item.get('frmtrm_q_nm'),
+        'prior_quarter_amount': _parse_int(item.get('frmtrm_q_amount')),
+        'prior_cumulative_amount': _parse_int(item.get('frmtrm_add_amount')),
+        'pre_prior_period_name': item.get('bfefrmtrm_nm'),
+        'pre_prior_amount': _parse_int(item.get('bfefrmtrm_amount')),
+        'order': _parse_int(item.get('ord')),
+        'currency': item.get('currency'),
+        'raw': item,
     }
 
 
-def _build_highlights(rows: list[dict[str, Any]]) -> dict[str, Any]:
+def _build_highlights(items: list[dict[str, Any]]) -> dict[str, Any]:
     highlights: dict[str, Any] = {}
-    matched_rows: dict[str, dict[str, Any] | None] = {}
+    matched_items: dict[str, dict[str, Any] | None] = {}
 
     for key, matcher in HIGHLIGHT_ACCOUNT_MATCHERS.items():
-        matched_row = _find_statement_row(
-            rows,
+        matched_item = _find_statement_item(
+            items,
             account_ids=matcher['account_ids'],
             account_names=matcher['account_names'],
         )
-        matched_rows[key] = matched_row
-        if matched_row is None:
+        matched_items[key] = matched_item
+        if matched_item is None:
             highlights[key] = None
             continue
 
         highlights[key] = {
-            'account_id': matched_row.get('account_id'),
-            'account_name': matched_row.get('account_name'),
-            'currency': matched_row.get('currency'),
-            'current_amount': matched_row.get('current_amount'),
-            'prior_amount': matched_row.get('prior_amount'),
-            'prior_prior_amount': matched_row.get('prior_prior_amount'),
+            'statement_type': matched_item.get('statement_type'),
+            'statement_name': matched_item.get('statement_name'),
+            'account_id': matched_item.get('account_id'),
+            'account_name': matched_item.get('account_name'),
+            'current_amount': matched_item.get('current_amount'),
+            'current_cumulative_amount': matched_item.get('current_cumulative_amount'),
+            'prior_amount': matched_item.get('prior_amount'),
+            'prior_cumulative_amount': matched_item.get('prior_cumulative_amount'),
+            'pre_prior_amount': matched_item.get('pre_prior_amount'),
+            'currency': matched_item.get('currency'),
         }
 
-    revenue = _parse_decimal((matched_rows.get('revenue') or {}).get('current_amount'))
-    operating_income = _parse_decimal((matched_rows.get('operating_income') or {}).get('current_amount'))
-    net_income = _parse_decimal((matched_rows.get('net_income') or {}).get('current_amount'))
-    liabilities = _parse_decimal((matched_rows.get('total_liabilities') or {}).get('current_amount'))
-    equity = _parse_decimal((matched_rows.get('total_equity') or {}).get('current_amount'))
+    revenue = _to_decimal((matched_items.get('revenue') or {}).get('current_amount'))
+    operating_income = _to_decimal((matched_items.get('operating_income') or {}).get('current_amount'))
+    net_income = _to_decimal((matched_items.get('net_income') or {}).get('current_amount'))
+    liabilities = _to_decimal((matched_items.get('total_liabilities') or {}).get('current_amount'))
+    equity = _to_decimal((matched_items.get('total_equity') or {}).get('current_amount'))
 
     highlights['ratios'] = {
         'operating_margin': _safe_ratio(operating_income, revenue),
@@ -272,43 +359,51 @@ def _build_highlights(rows: list[dict[str, Any]]) -> dict[str, Any]:
     return highlights
 
 
-def _find_statement_row(
-    rows: list[dict[str, Any]],
+def _find_statement_item(
+    items: list[dict[str, Any]],
     *,
     account_ids: set[str],
     account_names: set[str],
 ) -> dict[str, Any] | None:
-    for row in rows:
-        if (row.get('account_id') or '').strip() in account_ids:
-            return row
-    for row in rows:
-        if (row.get('account_name') or '').strip() in account_names:
-            return row
+    for item in items:
+        if (item.get('account_id') or '').strip() in account_ids:
+            return item
+    for item in items:
+        if (item.get('account_name') or '').strip() in account_names:
+            return item
     return None
+
+
+def _parse_int(value: Any) -> int | None:
+    if value in (None, ''):
+        return None
+    if isinstance(value, int):
+        return value
+
+    normalized = str(value).replace(',', '').strip()
+    if not normalized or normalized == '-':
+        return None
+    try:
+        return int(normalized)
+    except ValueError:
+        return None
+
+
+def _to_decimal(value: Any) -> Decimal | None:
+    if value in (None, ''):
+        return None
+    if isinstance(value, Decimal):
+        return value
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
 
 
 def _safe_ratio(numerator: Decimal | None, denominator: Decimal | None) -> str | None:
     if numerator is None or denominator in (None, Decimal('0')):
         return None
-    return _decimal_to_string((numerator / denominator).quantize(Decimal('0.0001')))
-
-
-def _parse_decimal(value: Any) -> Decimal | None:
-    if value in (None, ''):
-        return None
-    normalized = str(value).replace(',', '').strip()
-    if not normalized or normalized == '-':
-        return None
-    try:
-        return Decimal(normalized)
-    except (InvalidOperation, ValueError):
-        return None
-
-
-def _decimal_to_string(value: Decimal | None) -> str | None:
-    if value is None:
-        return None
-    return format(value, 'f')
+    return format((numerator / denominator).quantize(Decimal('0.0001')), 'f')
 
 
 dart_service = DartService()

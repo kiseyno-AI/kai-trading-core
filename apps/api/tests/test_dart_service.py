@@ -47,8 +47,8 @@ class FakeDartClient:
             ],
         }
 
-    async def fetch_financial_statements(self, *, corp_code, bsns_year, reprt_code, fs_div='CFS'):
-        self.fundamentals_args = {
+    async def fetch_single_company_financial_statements(self, *, corp_code, bsns_year, reprt_code, fs_div):
+        self.financials_args = {
             'corp_code': corp_code,
             'bsns_year': bsns_year,
             'reprt_code': reprt_code,
@@ -59,54 +59,96 @@ class FakeDartClient:
             'message': 'OK',
             'list': [
                 {
+                    'rcept_no': '20260311001234',
+                    'reprt_code': reprt_code,
+                    'bsns_year': bsns_year,
+                    'sj_div': 'BS',
+                    'sj_nm': '재무상태표',
+                    'account_id': 'ifrs-full_Assets',
+                    'account_nm': '자산총계',
+                    'thstrm_nm': '제 57 기말',
+                    'thstrm_amount': '500,000',
+                    'frmtrm_nm': '제 56 기말',
+                    'frmtrm_amount': '450,000',
+                    'ord': '1',
+                    'currency': 'KRW',
+                },
+                {
+                    'rcept_no': '20260311001234',
+                    'reprt_code': reprt_code,
+                    'bsns_year': bsns_year,
+                    'sj_div': 'IS',
+                    'sj_nm': '손익계산서',
                     'account_id': 'ifrs-full_Revenue',
                     'account_nm': '매출액',
-                    'sj_nm': '손익계산서',
-                    'fs_nm': '연결재무제표',
+                    'thstrm_nm': '제 57 기',
+                    'thstrm_amount': '100,000',
+                    'thstrm_add_amount': '100,000',
+                    'frmtrm_nm': '제 56 기',
+                    'frmtrm_amount': '95,000',
+                    'frmtrm_add_amount': '95,000',
+                    'ord': '2',
                     'currency': 'KRW',
-                    'thstrm_amount': '1000',
-                    'frmtrm_amount': '900',
-                    'bfefrmtrm_amount': '800',
                 },
                 {
+                    'rcept_no': '20260311001234',
+                    'reprt_code': reprt_code,
+                    'bsns_year': bsns_year,
+                    'sj_div': 'IS',
+                    'sj_nm': '손익계산서',
                     'account_id': 'dart_OperatingIncomeLoss',
                     'account_nm': '영업이익',
-                    'sj_nm': '손익계산서',
-                    'fs_nm': '연결재무제표',
+                    'thstrm_nm': '제 57 기',
+                    'thstrm_amount': '20,000',
+                    'frmtrm_nm': '제 56 기',
+                    'frmtrm_amount': '18,000',
+                    'ord': '3',
                     'currency': 'KRW',
-                    'thstrm_amount': '200',
-                    'frmtrm_amount': '180',
-                    'bfefrmtrm_amount': '160',
                 },
                 {
+                    'rcept_no': '20260311001234',
+                    'reprt_code': reprt_code,
+                    'bsns_year': bsns_year,
+                    'sj_div': 'IS',
+                    'sj_nm': '손익계산서',
                     'account_id': 'ifrs-full_ProfitLoss',
                     'account_nm': '당기순이익',
-                    'sj_nm': '손익계산서',
-                    'fs_nm': '연결재무제표',
+                    'thstrm_nm': '제 57 기',
+                    'thstrm_amount': '15,000',
+                    'frmtrm_nm': '제 56 기',
+                    'frmtrm_amount': '14,000',
+                    'ord': '4',
                     'currency': 'KRW',
-                    'thstrm_amount': '150',
-                    'frmtrm_amount': '140',
-                    'bfefrmtrm_amount': '120',
                 },
                 {
+                    'rcept_no': '20260311001234',
+                    'reprt_code': reprt_code,
+                    'bsns_year': bsns_year,
+                    'sj_div': 'BS',
+                    'sj_nm': '재무상태표',
                     'account_id': 'ifrs-full_Liabilities',
                     'account_nm': '부채총계',
-                    'sj_nm': '재무상태표',
-                    'fs_nm': '연결재무제표',
+                    'thstrm_nm': '제 57 기말',
+                    'thstrm_amount': '300,000',
+                    'frmtrm_nm': '제 56 기말',
+                    'frmtrm_amount': '280,000',
+                    'ord': '5',
                     'currency': 'KRW',
-                    'thstrm_amount': '600',
-                    'frmtrm_amount': '550',
-                    'bfefrmtrm_amount': '500',
                 },
                 {
+                    'rcept_no': '20260311001234',
+                    'reprt_code': reprt_code,
+                    'bsns_year': bsns_year,
+                    'sj_div': 'BS',
+                    'sj_nm': '재무상태표',
                     'account_id': 'ifrs-full_Equity',
                     'account_nm': '자본총계',
-                    'sj_nm': '재무상태표',
-                    'fs_nm': '연결재무제표',
+                    'thstrm_nm': '제 57 기말',
+                    'thstrm_amount': '200,000',
+                    'frmtrm_nm': '제 56 기말',
+                    'frmtrm_amount': '170,000',
+                    'ord': '6',
                     'currency': 'KRW',
-                    'thstrm_amount': '400',
-                    'frmtrm_amount': '350',
-                    'bfefrmtrm_amount': '300',
                 },
             ],
         }
@@ -127,7 +169,24 @@ class DartServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['company']['corp_name'], '삼성전자')
         self.assertEqual(result['recent_filings']['items'][0]['rcept_no'], '20250101000001')
 
-    async def test_company_fundamentals_normalizes_highlights_and_report_semantics(self):
+    async def test_fundamentals_returns_normalized_financials_and_highlights(self):
+        client = FakeDartClient()
+        service = DartService(client=client)
+
+        result = await service.get_fundamentals(stock_code='005930', business_year=2025)
+
+        self.assertEqual(client.financials_args['corp_code'], '00126380')
+        self.assertEqual(client.financials_args['bsns_year'], '2025')
+        self.assertEqual(client.financials_args['reprt_code'], '11011')
+        self.assertEqual(client.financials_args['fs_div'], 'CFS')
+        self.assertEqual(result['request']['dataset'], 'fnlttSinglAcntAll')
+        self.assertEqual(result['statements']['count'], 6)
+        self.assertEqual(result['statements']['items'][0]['current_amount'], 500000)
+        self.assertEqual(result['highlights']['total_assets']['current_amount'], 500000)
+        self.assertEqual(result['highlights']['revenue']['current_cumulative_amount'], 100000)
+        self.assertEqual(result['highlights']['ratios']['operating_margin'], '0.2000')
+
+    async def test_fundamentals_keeps_period_and_statement_type_usability(self):
         client = FakeDartClient()
         service = DartService(client=client)
 
@@ -138,12 +197,11 @@ class DartServiceTests(unittest.IsolatedAsyncioTestCase):
             statement_type='consolidated',
         )
 
-        self.assertEqual(client.fundamentals_args['reprt_code'], '11013')
-        self.assertEqual(client.fundamentals_args['fs_div'], 'CFS')
+        self.assertEqual(client.financials_args['reprt_code'], '11013')
+        self.assertEqual(client.financials_args['fs_div'], 'CFS')
         self.assertEqual(result['request']['period'], 'q1')
         self.assertEqual(result['request']['period_scope'], 'year_to_date')
-        self.assertEqual(result['highlights']['revenue']['current_amount'], '1000')
-        self.assertEqual(result['highlights']['ratios']['operating_margin'], '0.2000')
+        self.assertEqual(result['request']['statement_type'], 'consolidated')
 
     async def test_company_fundamentals_rejects_mismatched_period_and_report_code(self):
         client = FakeDartClient()
