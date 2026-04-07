@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation
+import re
 from typing import Any
 
 from app.core.settings import settings
@@ -47,34 +48,85 @@ STATEMENT_TYPE_TO_FS_DIV = {
 
 HIGHLIGHT_ACCOUNT_MATCHERS = {
     'revenue': {
-        'account_ids': {'ifrs-full_Revenue', 'ifrs_Revenue', 'ifrs-full_GrossRevenue'},
-        'account_names': {'매출액', '영업수익', 'Revenue'},
+        'statement_types': {'IS', 'CIS'},
+        'account_ids': {
+            'ifrs-full_Revenue',
+            'ifrs_Revenue',
+            'ifrs-full_GrossRevenue',
+            'ifrs-full_RevenueFromContractsWithCustomers',
+            'ifrs-full_RevenueFromInterest',
+            'ifrs-full_InterestRevenueExpense',
+            'ifrs-full_InsuranceRevenue',
+        },
+        'account_names': {
+            '매출액',
+            '영업수익',
+            'Revenue',
+            '이자수익',
+            '순이자손익',
+            '보험영업수익',
+        },
+        'account_name_contains': {
+            '수익(매출액)',
+        },
+        'account_name_excludes': {
+            '매출원가',
+            '매출총이익',
+            '기타수익',
+            '금융수익',
+            '수수료수익',
+            '기타영업수익',
+        },
     },
     'operating_income': {
-        'account_ids': {'dart_OperatingIncomeLoss'},
-        'account_names': {'영업이익', '영업손실', 'Operating income'},
+        'statement_types': {'IS', 'CIS'},
+        'account_ids': {
+            'dart_OperatingIncomeLoss',
+            'ifrs-full_ProfitLossFromOperatingActivities',
+            'ifrs_ProfitLossFromOperatingActivities',
+        },
+        'account_names': {'영업이익', '영업손실', '영업이익(손실)', '영업손익', 'Operating income'},
     },
     'net_income': {
-        'account_ids': {'ifrs-full_ProfitLoss', 'ifrs_ProfitLoss'},
+        'statement_types': {'IS', 'CIS'},
+        'account_ids': {
+            'ifrs-full_ProfitLoss',
+            'ifrs_ProfitLoss',
+            'ifrs-full_ProfitLossAttributableToOwnersOfParent',
+        },
         'account_names': {'당기순이익', '당기순손실', '분기순이익', '반기순이익', 'Profit (loss)', '당기순이익(손실)'},
     },
     'total_assets': {
+        'statement_types': {'BS'},
         'account_ids': {'ifrs-full_Assets', 'ifrs_Assets'},
         'account_names': {'자산총계', 'Assets'},
     },
     'total_liabilities': {
+        'statement_types': {'BS'},
         'account_ids': {'ifrs-full_Liabilities', 'ifrs_Liabilities'},
         'account_names': {'부채총계', 'Liabilities'},
     },
     'total_equity': {
+        'statement_types': {'BS'},
         'account_ids': {'ifrs-full_Equity', 'ifrs_Equity'},
         'account_names': {'자본총계', 'Equity'},
     },
     'operating_cash_flow': {
-        'account_ids': set(),
-        'account_names': {'영업활동으로 인한 현금흐름', '영업활동현금흐름', 'Cash flows from operating activities'},
+        'statement_types': {'CF'},
+        'account_ids': {
+            'ifrs-full_CashFlowsFromUsedInOperatingActivities',
+            'ifrs-full_NetCashFlowsFromUsedInOperatingActivities',
+        },
+        'account_names': {
+            '영업활동으로 인한 현금흐름',
+            '영업활동현금흐름',
+            '영업활동순현금흐름',
+            'Cash flows from operating activities',
+        },
     },
 }
+
+_MATCH_NORMALIZATION_PATTERN = re.compile(r'[\s\-\_\(\)\[\]\{\}/\\,.:;]+')
 
 
 class DartService:
@@ -332,8 +384,11 @@ def _build_highlights(items: list[dict[str, Any]]) -> dict[str, Any]:
     for key, matcher in HIGHLIGHT_ACCOUNT_MATCHERS.items():
         matched_item = _find_statement_item(
             items,
+            statement_types=matcher.get('statement_types'),
             account_ids=matcher['account_ids'],
             account_names=matcher['account_names'],
+            account_name_contains=matcher.get('account_name_contains'),
+            account_name_excludes=matcher.get('account_name_excludes'),
         )
         matched_items[key] = matched_item
         if matched_item is None:
@@ -370,16 +425,101 @@ def _build_highlights(items: list[dict[str, Any]]) -> dict[str, Any]:
 def _find_statement_item(
     items: list[dict[str, Any]],
     *,
+    statement_types: set[str] | None = None,
     account_ids: set[str],
     account_names: set[str],
+    account_name_contains: set[str] | None = None,
+    account_name_excludes: set[str] | None = None,
 ) -> dict[str, Any] | None:
+    normalized_statement_types = {(value or '').strip().upper() for value in (statement_types or set()) if value}
+    normalized_account_ids = {_normalize_match_text(value) for value in account_ids if value}
+    normalized_account_names = {_normalize_match_text(value) for value in account_names if value}
+    normalized_account_name_contains = {
+        _normalize_match_text(value) for value in (account_name_contains or set()) if value
+    }
+    normalized_account_name_excludes = {
+        _normalize_match_text(value) for value in (account_name_excludes or set()) if value
+    }
+
+    best_match: dict[str, Any] | None = None
+    best_score: tuple[int, int, int, int, int] | None = None
+
     for item in items:
-        if (item.get('account_id') or '').strip() in account_ids:
-            return item
-    for item in items:
-        if (item.get('account_name') or '').strip() in account_names:
-            return item
-    return None
+        score = _score_statement_item(
+            item,
+            statement_types=normalized_statement_types,
+            account_ids=normalized_account_ids,
+            account_names=normalized_account_names,
+            account_name_contains=normalized_account_name_contains,
+            account_name_excludes=normalized_account_name_excludes,
+        )
+        if score is None:
+            continue
+        if best_score is None or score > best_score:
+            best_match = item
+            best_score = score
+    return best_match
+
+
+def _score_statement_item(
+    item: dict[str, Any],
+    *,
+    statement_types: set[str],
+    account_ids: set[str],
+    account_names: set[str],
+    account_name_contains: set[str],
+    account_name_excludes: set[str],
+) -> tuple[int, int, int, int, int] | None:
+    account_id = _normalize_match_text(item.get('account_id'))
+    account_name = _normalize_match_text(item.get('account_name'))
+    account_detail = _normalize_match_text(item.get('account_detail'))
+    statement_type = (item.get('statement_type') or '').strip().upper()
+
+    id_match = account_id in account_ids if account_id else False
+    exact_name_match = account_name in account_names if account_name else False
+    contains_name_match = bool(account_name) and any(token in account_name for token in account_name_contains)
+    excluded_name_match = bool(account_name) and any(token in account_name for token in account_name_excludes)
+
+    if not id_match and not exact_name_match and not contains_name_match:
+        return None
+
+    score = 0
+    if statement_types:
+        if statement_type in statement_types:
+            score += 40
+        else:
+            score -= 40
+    if id_match:
+        score += 120
+    if exact_name_match:
+        score += 100
+    if contains_name_match:
+        score += 70
+    if excluded_name_match:
+        score -= 80
+    if item.get('current_amount') is not None:
+        score += 10
+    if item.get('current_cumulative_amount') is not None:
+        score += 5
+    if account_detail in {'', '-', 'none'}:
+        score += 8
+    elif 'member' in account_detail or '구성요소' in account_detail:
+        score -= 12
+
+    return (
+        score,
+        1 if statement_type in statement_types else 0,
+        1 if item.get('current_amount') is not None else 0,
+        1 if account_detail in {'', '-', 'none'} else 0,
+        -((item.get('order') or 10**9)),
+    )
+
+
+def _normalize_match_text(value: Any) -> str:
+    if value in (None, ''):
+        return ''
+    normalized = _MATCH_NORMALIZATION_PATTERN.sub('', str(value)).strip().lower()
+    return normalized
 
 
 def _parse_int(value: Any) -> int | None:
