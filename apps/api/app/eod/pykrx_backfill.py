@@ -146,8 +146,9 @@ class PykrxBackfillService:
     ) -> dict:
         latest_trade_date = self.resolve_latest_trade_date()
         as_of_date = latest_trade_date.replace('-', '')
-        items = self._fetch_pykrx_market_universe(as_of_date=as_of_date, markets=markets, limit=limit)
-        universe_source = 'pykrx_market_ohlcv'
+        pykrx_snapshot = self._fetch_pykrx_market_universe(as_of_date=as_of_date, markets=markets, limit=limit)
+        items = pykrx_snapshot['symbols']
+        universe_source = pykrx_snapshot['universe_source']
         if not items:
             items = self._fetch_master_fallback_universe(markets=markets, limit=limit)
             universe_source = 'kis_master_fallback'
@@ -163,21 +164,40 @@ class PykrxBackfillService:
         as_of_date: str,
         markets: Sequence[str],
         limit: int | None = None,
-    ) -> list[PykrxSymbol]:
+    ) -> dict:
         items: list[PykrxSymbol] = []
+        used_master_fallback = False
         for market in markets:
             try:
                 frame = _call_pykrx(stock.get_market_ohlcv_by_ticker, as_of_date, market=market)
             except Exception as exc:
                 logger.warning('pykrx market universe fetch failed for %s on %s: %s', market, as_of_date, exc)
-                return []
-            if frame.empty or '시가' not in frame.columns:
-                logger.warning('pykrx market universe returned no usable rows for %s on %s', market, as_of_date)
-                return []
-            tickers = [str(ticker).zfill(6) for ticker in frame.index.tolist()]
+                fallback_items = self._fetch_master_fallback_for_market(
+                    market=market,
+                    as_of_date=as_of_date,
+                    current_count=len(items),
+                    limit=limit,
+                )
+                used_master_fallback = used_master_fallback or bool(fallback_items)
+                items.extend(fallback_items)
+                if limit and len(items) >= limit:
+                    break
+                continue
+            tickers = self._extract_market_universe_tickers(frame)
+            if not tickers:
+                logger.warning('pykrx market universe returned no usable tickers for %s on %s', market, as_of_date)
+                fallback_items = self._fetch_master_fallback_for_market(
+                    market=market,
+                    as_of_date=as_of_date,
+                    current_count=len(items),
+                    limit=limit,
+                )
+                used_master_fallback = used_master_fallback or bool(fallback_items)
+                items.extend(fallback_items)
+                if limit and len(items) >= limit:
+                    break
+                continue
             for ticker in tickers:
-                if not ticker.isdigit() or len(ticker) != 6:
-                    continue
                 try:
                     name_ko = _call_pykrx(stock.get_market_ticker_name, ticker)
                 except Exception:
@@ -193,8 +213,49 @@ class PykrxBackfillService:
                 if self.name_pause_seconds:
                     time.sleep(self.name_pause_seconds)
                 if limit and len(items) >= limit:
-                    return items
+                    return {
+                        'symbols': items,
+                        'universe_source': (
+                            'pykrx_market_ohlcv_with_master_fallback'
+                            if used_master_fallback
+                            else 'pykrx_market_ohlcv'
+                        ),
+                    }
+        return {
+            'symbols': items,
+            'universe_source': (
+                'pykrx_market_ohlcv_with_master_fallback' if used_master_fallback else 'pykrx_market_ohlcv'
+            ),
+        }
+
+    def _extract_market_universe_tickers(self, frame) -> list[str]:
+        if getattr(frame, 'empty', True):
+            return []
+        index = getattr(frame, 'index', None)
+        if index is None:
+            return []
+        raw_tickers = index.tolist() if hasattr(index, 'tolist') else list(index)
+        items: list[str] = []
+        for ticker in raw_tickers:
+            normalized = str(ticker).zfill(6)
+            if not normalized.isdigit() or len(normalized) != 6:
+                continue
+            items.append(normalized)
         return items
+
+    def _fetch_master_fallback_for_market(
+        self,
+        *,
+        market: str,
+        as_of_date: str,
+        current_count: int,
+        limit: int | None,
+    ) -> list[PykrxSymbol]:
+        remaining = None if limit is None else max(limit - current_count, 0)
+        if remaining == 0:
+            return []
+        logger.warning('Falling back to KIS master universe for %s on %s', market, as_of_date)
+        return self._fetch_master_fallback_universe(markets=(market,), limit=remaining)
 
     def _fetch_master_fallback_universe(
         self,
