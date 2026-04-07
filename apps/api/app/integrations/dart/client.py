@@ -199,6 +199,7 @@ class DartClient:
 
     async def download_document(self, *, rcept_no: str) -> dict[str, Any]:
         response = await self._request('/document.xml', {'rcept_no': rcept_no})
+        self._raise_for_binary_error_envelope(response, path='/document.xml')
         payload = self._build_binary_payload(
             response,
             default_filename=f'dart-document-{rcept_no}.zip',
@@ -220,6 +221,7 @@ class DartClient:
             params['reprt_code'] = reprt_code
 
         response = await self._request('/fnlttXbrl.xml', params)
+        self._raise_for_binary_error_envelope(response, path='/fnlttXbrl.xml')
         filename_suffix = f'-{reprt_code}' if reprt_code else ''
         payload = self._build_binary_payload(
             response,
@@ -402,6 +404,49 @@ class DartClient:
             return match.group('filename')
 
         return default_filename
+
+    @staticmethod
+    def _raise_for_binary_error_envelope(response: httpx.Response, *, path: str) -> None:
+        content = response.content or b''
+        if not content:
+            return
+
+        stripped = content.lstrip()
+        content_type = (response.headers.get('content-type') or '').lower()
+
+        if stripped.startswith(b'{') or 'json' in content_type:
+            try:
+                payload = response.json()
+            except Exception:
+                return
+            DartClient._raise_for_binary_error_payload(payload, path=path)
+            return
+
+        if stripped.startswith(b'<') or 'xml' in content_type or 'text/' in content_type:
+            try:
+                root = ElementTree.fromstring(content)
+            except ElementTree.ParseError:
+                return
+            payload = {
+                'status': (root.findtext('.//status') or '').strip(),
+                'message': (root.findtext('.//message') or '').strip(),
+            }
+            DartClient._raise_for_binary_error_payload(payload, path=path)
+
+    @staticmethod
+    def _raise_for_binary_error_payload(payload: dict[str, Any], *, path: str) -> None:
+        status = str(payload.get('status') or '').strip()
+        if status and status != '000':
+            message = payload.get('message', 'Unknown error')
+            log_fetch_event(
+                service='dart',
+                operation='request_binary',
+                status='failed',
+                path=path,
+                response_status=status,
+                error_message=message,
+            )
+            raise DartAPIError(f'DART request failed [{status}]: {message}')
 
 
 dart_client = DartClient()

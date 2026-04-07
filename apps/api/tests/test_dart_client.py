@@ -135,6 +135,26 @@ class DartClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['filename'], 'dart-xbrl-20260407000001-11011.zip')
         self.assertEqual(result['size_bytes'], len(b'PK\x03\x04xbrl'))
 
+    async def test_download_document_raises_for_json_error_envelope(self):
+        client = TestableDartClient(
+            {'status': '014', 'message': 'File does not exist'},
+            content=b'{"status":"014","message":"File does not exist"}',
+            headers={'content-type': 'application/json'},
+        )
+
+        with self.assertRaisesRegex(DartAPIError, '014'):
+            await client.download_document(rcept_no='20260407000001')
+
+    async def test_download_xbrl_raises_for_xml_error_envelope(self):
+        client = TestableDartClient(
+            {'status': '014', 'message': 'File does not exist'},
+            content=b'<result><status>014</status><message>File does not exist</message></result>',
+            headers={'content-type': 'application/xml'},
+        )
+
+        with self.assertRaisesRegex(DartAPIError, '014'):
+            await client.download_xbrl(rcept_no='20260407000001', reprt_code='11011')
+
     async def test_request_http_error_logging_omits_raw_response_body(self):
         client = DartClient()
         client.api_key = 'test-secret-key'
