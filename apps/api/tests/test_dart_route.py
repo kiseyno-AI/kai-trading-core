@@ -42,6 +42,24 @@ class FakeRouteService:
         }
 
 
+class FakeSyncService:
+    async def sync_recent_disclosures(self, **kwargs):
+        return {
+            'run_id': 7,
+            'status': 'completed',
+            'events_seen': 3,
+            'financial_report_events': 2,
+        }
+
+    def inspect_sync(self, **kwargs):
+        return {
+            'latest_run': {'id': 7, 'status': 'completed'},
+            'summary': {'total_events': 3, 'financial_report_events': 2},
+            'runs': [{'id': 7, 'status': 'completed'}],
+            'events': [{'rcept_no': '20260407000001'}],
+        }
+
+
 class LookupErrorService:
     async def get_company_snapshot(self, **kwargs):
         raise DartLookupError('Unknown stock_code: 999999')
@@ -110,6 +128,32 @@ class DartRouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 502)
         self.assertIn('DART request failed', response.json()['detail'])
+
+    def test_sync_events_route_returns_sync_payload(self):
+        original_service = routes_dart.dart_disclosure_sync_service
+        routes_dart.dart_disclosure_sync_service = FakeSyncService()
+        try:
+            client = TestClient(self.app)
+            response = client.post('/disclosures/dart/sync/events', params={'days': 5})
+        finally:
+            routes_dart.dart_disclosure_sync_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['run_id'], 7)
+        self.assertEqual(response.json()['financial_report_events'], 2)
+
+    def test_sync_inspect_route_returns_runs_and_events(self):
+        original_service = routes_dart.dart_disclosure_sync_service
+        routes_dart.dart_disclosure_sync_service = FakeSyncService()
+        try:
+            client = TestClient(self.app)
+            response = client.get('/disclosures/dart/sync/inspect', params={'financial_only': 'true'})
+        finally:
+            routes_dart.dart_disclosure_sync_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['latest_run']['id'], 7)
+        self.assertEqual(response.json()['summary']['total_events'], 3)
 
     def test_fundamentals_route_returns_payload_for_fiscal_year_shape(self):
         original_service = routes_dart.dart_service
