@@ -20,6 +20,16 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _capture_run_activity_at(row: DartFundamentalsCaptureRun) -> datetime:
+    progress_at = (row.run_metadata or {}).get('last_progress_at')
+    if isinstance(progress_at, str):
+        try:
+            return datetime.fromisoformat(progress_at)
+        except ValueError:
+            pass
+    return row.started_at
+
+
 def _serialize_capture_run(row: DartFundamentalsCaptureRun) -> dict[str, Any]:
     return {
         'id': row.id,
@@ -115,13 +125,12 @@ class DartFundamentalsRepository:
     ) -> list[int]:
         with session_scope() as session:
             rows = session.execute(
-                select(DartFundamentalsCaptureRun).where(
-                    DartFundamentalsCaptureRun.status == 'running',
-                    DartFundamentalsCaptureRun.started_at < stale_before,
-                )
+                select(DartFundamentalsCaptureRun).where(DartFundamentalsCaptureRun.status == 'running')
             ).scalars().all()
             failed_run_ids: list[int] = []
             for row in rows:
+                if _capture_run_activity_at(row) >= stale_before:
+                    continue
                 row.status = 'failed'
                 row.error_message = error_message
                 row.completed_at = _utcnow()
