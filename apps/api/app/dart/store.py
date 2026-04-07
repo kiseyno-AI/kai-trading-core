@@ -51,6 +51,11 @@ def _serialize_event(row: DartDisclosureEvent) -> dict:
         'remark': row.remark,
         'first_seen_run_id': row.first_seen_run_id,
         'last_seen_run_id': row.last_seen_run_id,
+        'fundamentals_capture_status': row.fundamentals_capture_status,
+        'fundamentals_capture_attempts': row.fundamentals_capture_attempts,
+        'fundamentals_last_attempt_at': row.fundamentals_last_attempt_at.isoformat() if row.fundamentals_last_attempt_at else None,
+        'fundamentals_last_success_at': row.fundamentals_last_success_at.isoformat() if row.fundamentals_last_success_at else None,
+        'fundamentals_last_error': row.fundamentals_last_error,
         'payload': row.payload,
         'created_at': row.created_at.isoformat() if row.created_at else None,
         'updated_at': row.updated_at.isoformat() if row.updated_at else None,
@@ -173,15 +178,20 @@ class DartSyncRepository:
             ).scalars()
             return [_serialize_run(row) for row in rows]
 
-    def list_events(self, *, limit: int = 50, financial_only: bool = False) -> list[dict]:
+    def list_events(
+        self,
+        *,
+        limit: int = 50,
+        financial_only: bool = False,
+        capture_status: str | None = None,
+    ) -> list[dict]:
         with session_scope() as session:
-            stmt = (
-                select(DartDisclosureEvent)
-                .order_by(DartDisclosureEvent.receipt_date.desc(), DartDisclosureEvent.rcept_no.desc())
-                .limit(limit)
-            )
+            stmt = select(DartDisclosureEvent)
             if financial_only:
                 stmt = stmt.where(DartDisclosureEvent.is_financial_report.is_(True))
+            if capture_status:
+                stmt = stmt.where(DartDisclosureEvent.fundamentals_capture_status == capture_status)
+            stmt = stmt.order_by(DartDisclosureEvent.receipt_date.desc(), DartDisclosureEvent.rcept_no.desc()).limit(limit)
             rows = session.execute(stmt).scalars()
             return [_serialize_event(row) for row in rows]
 
@@ -192,10 +202,19 @@ class DartSyncRepository:
                 select(func.count()).select_from(DartDisclosureEvent).where(DartDisclosureEvent.is_financial_report.is_(True))
             ).scalar_one()
             latest_receipt_date = session.execute(select(func.max(DartDisclosureEvent.receipt_date))).scalar_one()
+            capture_status_rows = session.execute(
+                select(
+                    DartDisclosureEvent.fundamentals_capture_status,
+                    func.count(),
+                )
+                .select_from(DartDisclosureEvent)
+                .group_by(DartDisclosureEvent.fundamentals_capture_status)
+            ).all()
             return {
                 'total_events': total_events,
                 'financial_report_events': financial_events,
                 'latest_receipt_date': latest_receipt_date.isoformat() if latest_receipt_date else None,
+                'capture_status_counts': {status: count for status, count in capture_status_rows},
             }
 
 

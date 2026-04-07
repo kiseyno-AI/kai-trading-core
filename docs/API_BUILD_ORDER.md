@@ -7,6 +7,7 @@
 4. Korea Exim FX daily exchange-rate snapshot route
 5. DART company snapshot route
 6. DART single-company fundamentals route
+7. DART fundamentals incremental capture from synced disclosure events
 
 ## Current routes
 - `POST /broker/kis/token`
@@ -21,6 +22,8 @@
 - `GET /disclosures/dart/sync/inspect?runs_limit=10&events_limit=25&financial_only=false`
 - `GET /disclosures/dart/fundamentals?stock_code=005930&fiscal_year=2025&period=annual`
 - `GET /disclosures/dart/fundamentals?stock_code=005930&business_year=2025&report_code=11011&fs_div=CFS`
+- `POST /disclosures/dart/fundamentals/capture?limit=20&force=false`
+- `GET /disclosures/dart/fundamentals/capture/inspect?runs_limit=10&events_limit=25&capture_status=failed`
 - `GET /eod/status`
 - `POST /eod/master/refresh-if-due`
 - `POST /eod/capture-if-due`
@@ -30,7 +33,6 @@
 - `POST /eod/pykrx/daily/run-if-due?market_date=YYYY-MM-DD`
 
 ## Next routes
-- DART single-company financial statements or key financial indicators persisted from synced financial-report events
 - DART filing document/original attachment access
 - KIS balance inquiry
 - KIS account positions
