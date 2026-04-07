@@ -3,6 +3,7 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, Query
 
 from app.core.settings import settings
+from app.dart.fundamentals_capture_service import dart_fundamentals_capture_service
 from app.dart.service import dart_service
 from app.dart.sync_service import dart_disclosure_sync_service
 from app.integrations.dart.client import DartAPIError, DartLookupError
@@ -38,6 +39,7 @@ async def get_dart_company_snapshot(
         raise HTTPException(status_code=502, detail=f'DART request failed: {exc}') from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f'DART snapshot failed: {exc}') from exc
+
 
 @router.post('/sync/events')
 async def run_dart_disclosure_event_sync(
@@ -105,6 +107,42 @@ async def get_dart_fundamentals(
         raise HTTPException(status_code=502, detail=f'DART request failed: {exc}') from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f'DART fundamentals failed: {exc}') from exc
+
+
+@router.post('/fundamentals/capture')
+async def capture_dart_fundamentals(
+    limit: int = Query(default=20, ge=1, le=200),
+    force: bool = False,
+    fs_div: Optional[str] = Query(default=None),
+) -> dict:
+    normalized_fs_div = _normalize_fs_div(fs_div) if fs_div is not None else settings.dart_fundamentals_default_fs_div.strip().upper()
+    try:
+        return await dart_fundamentals_capture_service.capture_recent_fundamentals(
+            limit=limit,
+            force=force,
+            trigger='manual_api',
+            fs_div=normalized_fs_div,
+        )
+    except DartAPIError as exc:
+        raise HTTPException(status_code=502, detail=f'DART request failed: {exc}') from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'DART fundamentals capture failed: {exc}') from exc
+
+
+@router.get('/fundamentals/capture/inspect')
+async def inspect_dart_fundamentals_capture(
+    runs_limit: int = Query(default=10, ge=1, le=50),
+    events_limit: int = Query(default=25, ge=1, le=100),
+    capture_status: Optional[str] = Query(default=None),
+) -> dict:
+    try:
+        return dart_fundamentals_capture_service.inspect_capture_status(
+            runs_limit=runs_limit,
+            events_limit=events_limit,
+            capture_status=capture_status,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'DART fundamentals capture inspect failed: {exc}') from exc
 
 
 def _resolve_business_year(*, business_year: Optional[int], fiscal_year: Optional[int]) -> int:

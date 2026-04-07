@@ -178,6 +178,11 @@ class DartDisclosureSyncService:
             'payload': raw_item,
             'first_seen_run_id': run_id,
             'last_seen_run_id': run_id,
+            'fundamentals_capture_status': 'pending' if classification['is_financial_report'] else 'not_applicable',
+            'fundamentals_capture_attempts': 0,
+            'fundamentals_last_attempt_at': None,
+            'fundamentals_last_success_at': None,
+            'fundamentals_last_error': None,
         }
 
 

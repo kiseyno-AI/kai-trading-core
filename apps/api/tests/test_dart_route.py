@@ -60,6 +60,25 @@ class FakeSyncService:
         }
 
 
+class FakeCaptureService:
+    async def capture_recent_fundamentals(self, **kwargs):
+        return {
+            'run_id': 12,
+            'status': 'completed',
+            'events_seen': 2,
+            'events_captured': 1,
+            'events_failed': 1,
+        }
+
+    def inspect_capture_status(self, **kwargs):
+        return {
+            'latest_run': {'id': 12, 'status': 'completed'},
+            'summary': {'financial_event_capture_status_counts': {'captured': 1, 'failed': 1}},
+            'runs': [{'id': 12, 'status': 'completed'}],
+            'events': [{'rcept_no': '20260407000003', 'fundamentals_capture_status': 'captured'}],
+        }
+
+
 class LookupErrorService:
     async def get_company_snapshot(self, **kwargs):
         raise DartLookupError('Unknown stock_code: 999999')
@@ -237,6 +256,32 @@ class DartRouteTests(unittest.TestCase):
             response.json()['detail'],
             'period and report_code refer to different filing windows',
         )
+
+    def test_fundamentals_capture_route_returns_payload(self):
+        original_service = routes_dart.dart_fundamentals_capture_service
+        routes_dart.dart_fundamentals_capture_service = FakeCaptureService()
+        try:
+            client = TestClient(self.app)
+            response = client.post('/disclosures/dart/fundamentals/capture', params={'limit': 5})
+        finally:
+            routes_dart.dart_fundamentals_capture_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['run_id'], 12)
+        self.assertEqual(response.json()['events_captured'], 1)
+
+    def test_fundamentals_capture_inspect_route_returns_payload(self):
+        original_service = routes_dart.dart_fundamentals_capture_service
+        routes_dart.dart_fundamentals_capture_service = FakeCaptureService()
+        try:
+            client = TestClient(self.app)
+            response = client.get('/disclosures/dart/fundamentals/capture/inspect', params={'capture_status': 'captured'})
+        finally:
+            routes_dart.dart_fundamentals_capture_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['latest_run']['id'], 12)
+        self.assertEqual(response.json()['events'][0]['fundamentals_capture_status'], 'captured')
 
 
 if __name__ == '__main__':

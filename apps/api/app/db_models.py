@@ -185,3 +185,131 @@ class DartDisclosureEvent(Base, TimestampMixin):
         ForeignKey('dart_disclosure_sync_runs.id', ondelete='SET NULL'),
         index=True,
     )
+    fundamentals_capture_status: Mapped[str] = mapped_column(String(32), nullable=False, default='pending', index=True)
+    fundamentals_capture_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    fundamentals_last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    fundamentals_last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    fundamentals_last_error: Mapped[str | None] = mapped_column(Text)
+
+
+class DartFundamentalsCaptureRun(Base):
+    __tablename__ = 'dart_fundamentals_capture_runs'
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    trigger: Mapped[str] = mapped_column(String(32), nullable=False, default='manual')
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default='running', index=True)
+    limit_requested: Mapped[int | None] = mapped_column(Integer)
+    force: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    fs_div: Mapped[str] = mapped_column(String(8), nullable=False, default='CFS')
+    events_seen: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    events_captured: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    events_failed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    events_skipped: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    run_metadata: Mapped[dict | None] = mapped_column(JSON)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class DartFundamentalsSnapshot(Base, TimestampMixin):
+    __tablename__ = 'dart_fundamentals_snapshots'
+    __table_args__ = (
+        UniqueConstraint(
+            'disclosure_event_id',
+            'business_year',
+            'report_code',
+            'fs_div',
+            name='uq_dart_fundamentals_snapshots_event_period_fs_div',
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    disclosure_event_id: Mapped[int] = mapped_column(
+        ForeignKey('dart_disclosure_events.id', ondelete='CASCADE'),
+        nullable=False,
+        index=True,
+    )
+    capture_run_id: Mapped[int | None] = mapped_column(
+        ForeignKey('dart_fundamentals_capture_runs.id', ondelete='SET NULL'),
+        index=True,
+    )
+    rcept_no: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    corp_code: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    stock_code: Mapped[str | None] = mapped_column(String(16), index=True)
+    corp_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    business_year: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    report_code: Mapped[str] = mapped_column(String(8), nullable=False, index=True)
+    filing_category: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    fs_div: Mapped[str] = mapped_column(String(8), nullable=False)
+    statement_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    period_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    period_end_month: Mapped[int | None] = mapped_column(Integer)
+    currency: Mapped[str | None] = mapped_column(String(16))
+    source_status: Mapped[str | None] = mapped_column(String(8))
+    source_message: Mapped[str | None] = mapped_column(Text)
+    request_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    response_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class DartFundamentalsRow(Base, TimestampMixin):
+    __tablename__ = 'dart_fundamentals_rows'
+    __table_args__ = (
+        UniqueConstraint('snapshot_id', 'row_key', name='uq_dart_fundamentals_rows_snapshot_row_key'),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    snapshot_id: Mapped[int] = mapped_column(
+        ForeignKey('dart_fundamentals_snapshots.id', ondelete='CASCADE'),
+        nullable=False,
+        index=True,
+    )
+    row_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    receipt_number: Mapped[str | None] = mapped_column(String(32))
+    report_code: Mapped[str | None] = mapped_column(String(8))
+    business_year: Mapped[str | None] = mapped_column(String(8))
+    statement_type: Mapped[str | None] = mapped_column(String(32))
+    statement_name: Mapped[str | None] = mapped_column(String(255))
+    account_id: Mapped[str | None] = mapped_column(String(255))
+    account_name: Mapped[str | None] = mapped_column(String(255))
+    account_detail: Mapped[str | None] = mapped_column(String(255))
+    current_period_name: Mapped[str | None] = mapped_column(String(255))
+    current_amount: Mapped[int | None] = mapped_column(BigInteger)
+    current_cumulative_amount: Mapped[int | None] = mapped_column(BigInteger)
+    prior_period_name: Mapped[str | None] = mapped_column(String(255))
+    prior_amount: Mapped[int | None] = mapped_column(BigInteger)
+    prior_quarter_name: Mapped[str | None] = mapped_column(String(255))
+    prior_quarter_amount: Mapped[int | None] = mapped_column(BigInteger)
+    prior_cumulative_amount: Mapped[int | None] = mapped_column(BigInteger)
+    pre_prior_period_name: Mapped[str | None] = mapped_column(String(255))
+    pre_prior_amount: Mapped[int | None] = mapped_column(BigInteger)
+    row_order: Mapped[int | None] = mapped_column(Integer)
+    currency: Mapped[str | None] = mapped_column(String(16))
+    payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+
+
+class DartFundamentalsHighlight(Base, TimestampMixin):
+    __tablename__ = 'dart_fundamentals_highlights'
+    __table_args__ = (
+        UniqueConstraint('snapshot_id', 'metric_key', name='uq_dart_fundamentals_highlights_snapshot_metric_key'),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    snapshot_id: Mapped[int] = mapped_column(
+        ForeignKey('dart_fundamentals_snapshots.id', ondelete='CASCADE'),
+        nullable=False,
+        index=True,
+    )
+    metric_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    metric_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    statement_type: Mapped[str | None] = mapped_column(String(32))
+    statement_name: Mapped[str | None] = mapped_column(String(255))
+    account_id: Mapped[str | None] = mapped_column(String(255))
+    account_name: Mapped[str | None] = mapped_column(String(255))
+    current_amount: Mapped[int | None] = mapped_column(BigInteger)
+    current_cumulative_amount: Mapped[int | None] = mapped_column(BigInteger)
+    prior_amount: Mapped[int | None] = mapped_column(BigInteger)
+    prior_cumulative_amount: Mapped[int | None] = mapped_column(BigInteger)
+    pre_prior_amount: Mapped[int | None] = mapped_column(BigInteger)
+    currency: Mapped[str | None] = mapped_column(String(16))
+    ratio_value: Mapped[float | None] = mapped_column(Numeric(18, 4))

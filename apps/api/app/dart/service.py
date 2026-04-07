@@ -170,8 +170,7 @@ class DartService:
             reprt_code=resolved_report_code,
             fs_div=resolved_fs_div,
         )
-        items = [_normalize_statement_item(item) for item in statements.get('list', [])]
-        highlights = _build_highlights(items)
+        dataset = build_fundamentals_dataset(statements)
 
         return {
             'lookup': {
@@ -201,13 +200,13 @@ class DartService:
                 'fs_label': FS_DIV_TO_STATEMENT_TYPE[resolved_fs_div],
                 'dataset': 'fnlttSinglAcntAll',
             },
-            'highlights': highlights,
+            'highlights': dataset['highlights'],
             'statements': {
                 'status': statements.get('status'),
                 'message': statements.get('message'),
-                'currency': next((item['currency'] for item in items if item.get('currency')), None),
-                'count': len(items),
-                'items': items,
+                'currency': dataset['currency'],
+                'count': len(dataset['items']),
+                'items': dataset['items'],
             },
             'source': {
                 'status': statements.get('status'),
@@ -289,6 +288,15 @@ class DartService:
         if default_fs_div not in FS_DIV_TO_STATEMENT_TYPE:
             raise ValueError('fs_div must be one of CFS or OFS')
         return default_fs_div, FS_DIV_TO_STATEMENT_TYPE[default_fs_div]
+
+
+def build_fundamentals_dataset(statements: dict[str, Any]) -> dict[str, Any]:
+    items = [_normalize_statement_item(item) for item in statements.get('list', [])]
+    return {
+        'items': items,
+        'highlights': _build_highlights(items),
+        'currency': next((item['currency'] for item in items if item.get('currency')), None),
+    }
 
 
 def _normalize_statement_item(item: dict[str, Any]) -> dict[str, Any]:
