@@ -6,6 +6,13 @@ from app.dart.fundamentals_capture_service import DartFundamentalsCaptureService
 class FakeCaptureClient:
     def __init__(self):
         self.calls = []
+        self.overview_calls = []
+
+    async def fetch_company_overview(self, corp_code):
+        self.overview_calls.append(corp_code)
+        if corp_code == 'quarterly-non-calendar':
+            return {'acc_mt': '03'}
+        return {'acc_mt': '12'}
 
     async def fetch_financial_statements(self, **kwargs):
         self.calls.append(kwargs)
@@ -71,6 +78,16 @@ class FakeCaptureRepository:
                 'filing_category': 'semiannual_report',
                 'fundamentals_capture_status': 'failed',
             },
+            {
+                'id': 3,
+                'rcept_no': '20260407000005',
+                'corp_code': 'quarterly-non-calendar',
+                'corp_name': '비캘린더법인',
+                'stock_code': '000002',
+                'report_nm': '분기보고서 (2025.12)',
+                'filing_category': 'quarterly_report',
+                'fundamentals_capture_status': 'pending',
+            },
         ][:limit]
 
     def replace_snapshot_dataset(self, **kwargs):
@@ -108,17 +125,20 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
         repository = FakeCaptureRepository()
         service = DartFundamentalsCaptureService(client=client, repository=repository)
 
-        result = await service.capture_recent_fundamentals(limit=2, force=False, trigger='test', fs_div='CFS')
+        result = await service.capture_recent_fundamentals(limit=3, force=False, trigger='test', fs_div='CFS')
 
         self.assertEqual(result['run_id'], 88)
-        self.assertEqual(result['events_seen'], 2)
-        self.assertEqual(result['events_captured'], 1)
+        self.assertEqual(result['events_seen'], 3)
+        self.assertEqual(result['events_captured'], 2)
         self.assertEqual(result['events_failed'], 1)
         self.assertEqual(client.calls[0]['reprt_code'], '11011')
         self.assertEqual(client.calls[1]['reprt_code'], '11012')
-        self.assertEqual(repository.successes, [1])
+        self.assertEqual(client.calls[2]['reprt_code'], '11014')
+        self.assertEqual(repository.successes, [1, 3])
         self.assertEqual(repository.failures[0][0], 2)
         self.assertEqual(repository.snapshots[0]['snapshot_payload']['business_year'], 2025)
+        self.assertEqual(len(repository.snapshots), 2)
+        self.assertEqual(repository.snapshots[1]['snapshot_payload']['report_code'], '11014')
         self.assertEqual(repository.completed_runs[-1][1]['status'], 'completed')
 
     async def test_inspect_capture_status_returns_repository_views(self):
@@ -143,15 +163,28 @@ class InferFundamentalsRequestTests(unittest.TestCase):
         quarter = infer_fundamentals_request(
             {'report_nm': '분기보고서 (2025.09)', 'filing_category': 'quarterly_report'},
             fs_div='OFS',
+            fiscal_year_end_month=12,
+        )
+        non_calendar_quarter = infer_fundamentals_request(
+            {'report_nm': '분기보고서 (2025.12)', 'filing_category': 'quarterly_report'},
+            fs_div='CFS',
+            fiscal_year_end_month=3,
+        )
+        non_calendar_first_quarter = infer_fundamentals_request(
+            {'report_nm': '분기보고서 (2025.06)', 'filing_category': 'quarterly_report'},
+            fs_div='CFS',
+            fiscal_year_end_month=3,
         )
 
         self.assertEqual(annual['report_code'], '11011')
         self.assertEqual(annual['business_year'], 2025)
         self.assertEqual(quarter['report_code'], '11014')
         self.assertEqual(quarter['statement_type'], 'separate')
+        self.assertEqual(non_calendar_quarter['report_code'], '11014')
+        self.assertEqual(non_calendar_first_quarter['report_code'], '11013')
 
-    def test_infer_fundamentals_request_rejects_unknown_quarter_window(self):
-        with self.assertRaisesRegex(ValueError, 'Unsupported quarterly period month'):
+    def test_infer_fundamentals_request_rejects_quarterly_requests_without_fiscal_calendar(self):
+        with self.assertRaisesRegex(ValueError, 'requires a fiscal year-end month'):
             infer_fundamentals_request(
                 {'report_nm': '분기보고서 (2025.06)', 'filing_category': 'quarterly_report'},
                 fs_div='CFS',

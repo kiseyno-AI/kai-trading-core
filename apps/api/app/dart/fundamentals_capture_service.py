@@ -20,13 +20,12 @@ _FILING_CATEGORY_TO_REPORT_CODE = {
     'semiannual_report': '11012',
 }
 
-_QUARTER_END_MONTH_TO_REPORT_CODE = {
-    3: '11013',
-    9: '11014',
-}
-
-
-def infer_fundamentals_request(event: dict[str, Any], *, fs_div: str) -> dict[str, Any]:
+def infer_fundamentals_request(
+    event: dict[str, Any],
+    *,
+    fs_div: str,
+    fiscal_year_end_month: int | str | None = None,
+) -> dict[str, Any]:
     filing_category = event['filing_category']
     report_name = event['report_nm']
     period_match = _REPORT_PERIOD_PATTERN.search(report_name)
@@ -37,9 +36,10 @@ def infer_fundamentals_request(event: dict[str, Any], *, fs_div: str) -> dict[st
     period_end_month = int(period_match.group(2))
 
     if filing_category == 'quarterly_report':
-        report_code = _QUARTER_END_MONTH_TO_REPORT_CODE.get(period_end_month)
-        if report_code is None:
-            raise ValueError(f'Unsupported quarterly period month for fundamentals capture: {period_end_month:02d}')
+        report_code = _infer_quarterly_report_code(
+            period_end_month=period_end_month,
+            fiscal_year_end_month=fiscal_year_end_month,
+        )
     else:
         report_code = _FILING_CATEGORY_TO_REPORT_CODE.get(filing_category)
         if report_code is None:
@@ -53,6 +53,42 @@ def infer_fundamentals_request(event: dict[str, Any], *, fs_div: str) -> dict[st
         'statement_type': FS_DIV_TO_STATEMENT_TYPE[fs_div],
         'fs_div': fs_div,
     }
+
+
+def _infer_quarterly_report_code(
+    *,
+    period_end_month: int,
+    fiscal_year_end_month: int | str | None,
+) -> str:
+    normalized_fiscal_year_end_month = _normalize_month(fiscal_year_end_month)
+    if normalized_fiscal_year_end_month is None:
+        raise ValueError('Quarterly fundamentals capture requires a fiscal year-end month from DART company overview')
+
+    first_quarter_end_month = _month_after(normalized_fiscal_year_end_month, 3)
+    third_quarter_end_month = _month_after(normalized_fiscal_year_end_month, 9)
+
+    if period_end_month == first_quarter_end_month:
+        return '11013'
+    if period_end_month == third_quarter_end_month:
+        return '11014'
+
+    raise ValueError(
+        'Quarterly period month does not match the company fiscal calendar: '
+        f'period_end_month={period_end_month:02d}, fiscal_year_end_month={normalized_fiscal_year_end_month:02d}'
+    )
+
+
+def _normalize_month(value: int | str | None) -> int | None:
+    if value in (None, ''):
+        return None
+    month = int(value)
+    if month < 1 or month > 12:
+        raise ValueError(f'Invalid fiscal year-end month: {value}')
+    return month
+
+
+def _month_after(base_month: int, months_forward: int) -> int:
+    return ((base_month - 1 + months_forward) % 12) + 1
 
 
 def build_row_payloads(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -185,7 +221,12 @@ class DartFundamentalsCaptureService:
             for event in events:
                 events_seen += 1
                 try:
-                    request = infer_fundamentals_request(event, fs_div=resolved_fs_div)
+                    company_overview = await self.client.fetch_company_overview(event['corp_code'])
+                    request = infer_fundamentals_request(
+                        event,
+                        fs_div=resolved_fs_div,
+                        fiscal_year_end_month=company_overview.get('acc_mt'),
+                    )
                     source_payload = await self.client.fetch_financial_statements(
                         corp_code=event['corp_code'],
                         bsns_year=str(request['business_year']),
@@ -217,6 +258,7 @@ class DartFundamentalsCaptureService:
                                 'report_code': request['report_code'],
                                 'fs_div': resolved_fs_div,
                                 'rcept_no': event['rcept_no'],
+                                'fiscal_year_end_month': company_overview.get('acc_mt'),
                             },
                             'response_payload': source_payload,
                         },
