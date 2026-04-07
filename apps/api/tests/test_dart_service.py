@@ -1,6 +1,6 @@
 import unittest
 
-from app.dart.service import DartService
+from app.dart.service import DartService, build_fundamentals_dataset
 
 
 class FakeDartClient:
@@ -214,6 +214,165 @@ class DartServiceTests(unittest.IsolatedAsyncioTestCase):
                 period='annual',
                 report_code='11013',
             )
+
+    def test_build_fundamentals_dataset_matches_financial_industry_variants(self):
+        dataset = build_fundamentals_dataset(
+            {
+                'list': [
+                    {
+                        'rcept_no': '20260407000001',
+                        'reprt_code': '11011',
+                        'bsns_year': '2024',
+                        'sj_div': 'BS',
+                        'sj_nm': '재무상태표',
+                        'account_id': 'ifrs-full_Assets',
+                        'account_nm': '자산총계',
+                        'thstrm_amount': '1,325,242',
+                        'ord': '10',
+                        'currency': 'KRW',
+                    },
+                    {
+                        'rcept_no': '20260407000001',
+                        'reprt_code': '11011',
+                        'bsns_year': '2024',
+                        'sj_div': 'BS',
+                        'sj_nm': '재무상태표',
+                        'account_id': 'ifrs-full_Liabilities',
+                        'account_nm': '부채총계',
+                        'thstrm_amount': '1,017,688',
+                        'ord': '35',
+                        'currency': 'KRW',
+                    },
+                    {
+                        'rcept_no': '20260407000001',
+                        'reprt_code': '11011',
+                        'bsns_year': '2024',
+                        'sj_div': 'BS',
+                        'sj_nm': '재무상태표',
+                        'account_id': 'ifrs-full_Equity',
+                        'account_nm': '자본총계',
+                        'thstrm_amount': '307,554',
+                        'ord': '24',
+                        'currency': 'KRW',
+                    },
+                    {
+                        'rcept_no': '20260407000001',
+                        'reprt_code': '11011',
+                        'bsns_year': '2024',
+                        'sj_div': 'CIS',
+                        'sj_nm': '포괄손익계산서',
+                        'account_id': 'ifrs-full_FeeAndCommissionIncome',
+                        'account_nm': '수수료수익',
+                        'thstrm_amount': '1,192',
+                        'ord': '19',
+                        'currency': 'KRW',
+                    },
+                    {
+                        'rcept_no': '20260407000001',
+                        'reprt_code': '11011',
+                        'bsns_year': '2024',
+                        'sj_div': 'CIS',
+                        'sj_nm': '포괄손익계산서',
+                        'account_id': 'ifrs-full_RevenueFromInterest',
+                        'account_nm': '이자수익',
+                        'thstrm_amount': '83,149',
+                        'ord': '23',
+                        'currency': 'KRW',
+                    },
+                    {
+                        'rcept_no': '20260407000001',
+                        'reprt_code': '11011',
+                        'bsns_year': '2024',
+                        'sj_div': 'CIS',
+                        'sj_nm': '포괄손익계산서',
+                        'account_id': 'ifrs-full_ProfitLossFromOperatingActivities',
+                        'account_nm': '영업이익(손실)',
+                        'thstrm_amount': '6,847',
+                        'ord': '32',
+                        'currency': 'KRW',
+                    },
+                    {
+                        'rcept_no': '20260407000001',
+                        'reprt_code': '11011',
+                        'bsns_year': '2024',
+                        'sj_div': 'CIS',
+                        'sj_nm': '포괄손익계산서',
+                        'account_id': 'ifrs-full_ProfitLoss',
+                        'account_nm': '당기순이익',
+                        'thstrm_amount': '7,013',
+                        'ord': '30',
+                        'currency': 'KRW',
+                    },
+                    {
+                        'rcept_no': '20260407000001',
+                        'reprt_code': '11011',
+                        'bsns_year': '2024',
+                        'sj_div': 'CF',
+                        'sj_nm': '현금흐름표',
+                        'account_id': 'ifrs-full_CashFlowsFromUsedInOperatingActivities',
+                        'account_nm': '영업활동순현금흐름',
+                        'thstrm_amount': '-11,878',
+                        'ord': '28',
+                        'currency': 'KRW',
+                    },
+                    {
+                        'rcept_no': '20260407000001',
+                        'reprt_code': '11011',
+                        'bsns_year': '2024',
+                        'sj_div': 'SCE',
+                        'sj_nm': '자본변동표',
+                        'account_id': 'ifrs-full_ProfitLoss',
+                        'account_nm': '당기순이익',
+                        'account_detail': '자본 [구성요소]|이익잉여금 [구성요소]',
+                        'thstrm_amount': '7,013',
+                        'ord': '16',
+                        'currency': 'KRW',
+                    },
+                ],
+            }
+        )
+
+        self.assertEqual(dataset['highlights']['revenue']['account_id'], 'ifrs-full_RevenueFromInterest')
+        self.assertEqual(dataset['highlights']['operating_income']['account_id'], 'ifrs-full_ProfitLossFromOperatingActivities')
+        self.assertEqual(dataset['highlights']['net_income']['statement_type'], 'CIS')
+        self.assertEqual(dataset['highlights']['operating_cash_flow']['account_name'], '영업활동순현금흐름')
+
+    def test_build_fundamentals_dataset_prefers_primary_statement_rows_over_component_rows(self):
+        dataset = build_fundamentals_dataset(
+            {
+                'list': [
+                    {
+                        'rcept_no': '20260407000002',
+                        'reprt_code': '11011',
+                        'bsns_year': '2024',
+                        'sj_div': 'SCE',
+                        'sj_nm': '자본변동표',
+                        'account_id': 'ifrs-full_Equity',
+                        'account_nm': '자본총계',
+                        'account_detail': '자본 [구성요소]|이익잉여금 [구성요소]',
+                        'thstrm_amount': '297,547',
+                        'ord': '17',
+                        'currency': 'KRW',
+                    },
+                    {
+                        'rcept_no': '20260407000002',
+                        'reprt_code': '11011',
+                        'bsns_year': '2024',
+                        'sj_div': 'BS',
+                        'sj_nm': '재무상태표',
+                        'account_id': 'ifrs-full_Equity',
+                        'account_nm': '자본총계',
+                        'account_detail': '-',
+                        'thstrm_amount': '307,554',
+                        'ord': '24',
+                        'currency': 'KRW',
+                    },
+                ],
+            }
+        )
+
+        self.assertEqual(dataset['highlights']['total_equity']['statement_type'], 'BS')
+        self.assertEqual(dataset['highlights']['total_equity']['current_amount'], 307554)
 
 
 if __name__ == '__main__':
