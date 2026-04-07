@@ -11,6 +11,7 @@
 8. DART current-active-universe fundamentals backfill operator
 9. DART filing original-document download route
 10. DART filing XBRL download route
+11. DART stored fundamentals history retrieval route
 
 ## Current routes
 - `POST /broker/kis/token`
@@ -25,6 +26,7 @@
 - `GET /disclosures/dart/sync/inspect?runs_limit=10&events_limit=25&financial_only=false`
 - `GET /disclosures/dart/fundamentals?stock_code=005930&fiscal_year=2025&period=annual`
 - `GET /disclosures/dart/fundamentals?stock_code=005930&business_year=2025&report_code=11011&fs_div=CFS`
+- `GET /disclosures/dart/fundamentals/history?symbols=005930&symbols=000660&start_date=2024-01-01&end_date=2024-12-31`
 - `POST /disclosures/dart/fundamentals/capture?limit=20&force=false`
 - `GET /disclosures/dart/fundamentals/capture/inspect?runs_limit=10&events_limit=25&capture_status=failed`
 - `POST /disclosures/dart/fundamentals/backfill/current-universe?symbol_limit=25&symbol_offset=0&capture_limit=250`

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import defaultdict
 from datetime import date, datetime, timezone
 from typing import Any
 
@@ -297,6 +298,74 @@ class DartFundamentalsRepository:
                 'latest_snapshot_at': latest_snapshot_at.isoformat() if latest_snapshot_at else None,
             }
 
+    def list_stored_fundamentals(
+        self,
+        *,
+        stock_codes: list[str],
+        fs_div: str | None = None,
+    ) -> list[dict[str, Any]]:
+        if not stock_codes:
+            return []
+
+        with session_scope() as session:
+            stmt = (
+                select(DartFundamentalsSnapshot, DartDisclosureEvent)
+                .join(
+                    DartDisclosureEvent,
+                    DartDisclosureEvent.id == DartFundamentalsSnapshot.disclosure_event_id,
+                )
+                .where(DartFundamentalsSnapshot.stock_code.in_(stock_codes))
+            )
+            if fs_div:
+                stmt = stmt.where(DartFundamentalsSnapshot.fs_div == fs_div)
+
+            snapshot_rows = session.execute(
+                stmt.order_by(
+                    DartFundamentalsSnapshot.stock_code.asc(),
+                    DartDisclosureEvent.receipt_date.desc(),
+                    DartFundamentalsSnapshot.business_year.desc(),
+                    DartFundamentalsSnapshot.report_code.desc(),
+                    DartFundamentalsSnapshot.id.desc(),
+                )
+            ).all()
+            if not snapshot_rows:
+                return []
+
+            snapshot_ids = [snapshot.id for snapshot, _event in snapshot_rows]
+            highlight_rows = session.execute(
+                select(DartFundamentalsHighlight)
+                .where(DartFundamentalsHighlight.snapshot_id.in_(snapshot_ids))
+                .order_by(DartFundamentalsHighlight.snapshot_id.asc(), DartFundamentalsHighlight.metric_key.asc())
+            ).scalars()
+            statement_rows = session.execute(
+                select(DartFundamentalsRow)
+                .where(DartFundamentalsRow.snapshot_id.in_(snapshot_ids))
+                .order_by(
+                    DartFundamentalsRow.snapshot_id.asc(),
+                    DartFundamentalsRow.row_order.asc(),
+                    DartFundamentalsRow.id.asc(),
+                )
+            ).scalars()
+
+            highlights_by_snapshot: dict[int, list[dict[str, Any]]] = defaultdict(list)
+            rows_by_snapshot: dict[int, list[dict[str, Any]]] = defaultdict(list)
+            for row in highlight_rows:
+                highlights_by_snapshot[row.snapshot_id].append(self._serialize_highlight(row))
+            for row in statement_rows:
+                rows_by_snapshot[row.snapshot_id].append(self._serialize_statement_row(row))
+
+            items: list[dict[str, Any]] = []
+            for snapshot, event in snapshot_rows:
+                items.append(
+                    {
+                        **self._serialize_snapshot(snapshot),
+                        'disclosure': self._serialize_event(event),
+                        'highlights': highlights_by_snapshot.get(snapshot.id, []),
+                        'statement_rows': rows_by_snapshot.get(snapshot.id, []),
+                    }
+                )
+            return items
+
     def _serialize_event(self, row: DartDisclosureEvent) -> dict[str, Any]:
         return {
             'id': row.id,
@@ -312,6 +381,74 @@ class DartFundamentalsRepository:
             'fundamentals_last_attempt_at': row.fundamentals_last_attempt_at.isoformat() if row.fundamentals_last_attempt_at else None,
             'fundamentals_last_success_at': row.fundamentals_last_success_at.isoformat() if row.fundamentals_last_success_at else None,
             'fundamentals_last_error': row.fundamentals_last_error,
+        }
+
+    def _serialize_snapshot(self, row: DartFundamentalsSnapshot) -> dict[str, Any]:
+        return {
+            'id': row.id,
+            'disclosure_event_id': row.disclosure_event_id,
+            'capture_run_id': row.capture_run_id,
+            'rcept_no': row.rcept_no,
+            'corp_code': row.corp_code,
+            'stock_code': row.stock_code,
+            'corp_name': row.corp_name,
+            'business_year': row.business_year,
+            'report_code': row.report_code,
+            'filing_category': row.filing_category,
+            'fs_div': row.fs_div,
+            'statement_type': row.statement_type,
+            'period_type': row.period_type,
+            'period_end_month': row.period_end_month,
+            'currency': row.currency,
+            'source_status': row.source_status,
+            'source_message': row.source_message,
+            'request_payload': row.request_payload,
+            'response_payload': row.response_payload,
+            'captured_at': row.captured_at.isoformat() if row.captured_at else None,
+            'created_at': row.created_at.isoformat() if row.created_at else None,
+            'updated_at': row.updated_at.isoformat() if row.updated_at else None,
+        }
+
+    def _serialize_highlight(self, row: DartFundamentalsHighlight) -> dict[str, Any]:
+        return {
+            'metric_key': row.metric_key,
+            'metric_type': row.metric_type,
+            'statement_type': row.statement_type,
+            'statement_name': row.statement_name,
+            'account_id': row.account_id,
+            'account_name': row.account_name,
+            'current_amount': row.current_amount,
+            'current_cumulative_amount': row.current_cumulative_amount,
+            'prior_amount': row.prior_amount,
+            'prior_cumulative_amount': row.prior_cumulative_amount,
+            'pre_prior_amount': row.pre_prior_amount,
+            'currency': row.currency,
+            'ratio_value': str(row.ratio_value) if row.ratio_value is not None else None,
+        }
+
+    def _serialize_statement_row(self, row: DartFundamentalsRow) -> dict[str, Any]:
+        return {
+            'row_key': row.row_key,
+            'receipt_number': row.receipt_number,
+            'report_code': row.report_code,
+            'business_year': row.business_year,
+            'statement_type': row.statement_type,
+            'statement_name': row.statement_name,
+            'account_id': row.account_id,
+            'account_name': row.account_name,
+            'account_detail': row.account_detail,
+            'current_period_name': row.current_period_name,
+            'current_amount': row.current_amount,
+            'current_cumulative_amount': row.current_cumulative_amount,
+            'prior_period_name': row.prior_period_name,
+            'prior_amount': row.prior_amount,
+            'prior_quarter_name': row.prior_quarter_name,
+            'prior_quarter_amount': row.prior_quarter_amount,
+            'prior_cumulative_amount': row.prior_cumulative_amount,
+            'pre_prior_period_name': row.pre_prior_period_name,
+            'pre_prior_amount': row.pre_prior_amount,
+            'order': row.row_order,
+            'currency': row.currency,
         }
 
 
