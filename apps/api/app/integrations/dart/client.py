@@ -91,6 +91,32 @@ class DartClient:
             }
         return payload
 
+    async def fetch_financial_statements(
+        self,
+        *,
+        corp_code: str,
+        bsns_year: str,
+        reprt_code: str,
+        fs_div: str = 'CFS',
+    ) -> dict[str, Any]:
+        payload = await self._get_json(
+            '/fnlttSinglAcntAll.json',
+            {
+                'corp_code': corp_code,
+                'bsns_year': bsns_year,
+                'reprt_code': reprt_code,
+                'fs_div': fs_div,
+            },
+            allowed_statuses={'013'},
+        )
+        if payload.get('status') == '013':
+            return {
+                'status': '013',
+                'message': payload.get('message'),
+                'list': [],
+            }
+        return payload
+
     async def lookup_corp_code(
         self,
         *,

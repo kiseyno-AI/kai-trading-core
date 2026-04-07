@@ -30,8 +30,11 @@ class FakeRouteService:
             },
             'request': {
                 'business_year': kwargs['business_year'],
-                'report_code': kwargs['report_code'],
-                'fs_div': kwargs['fs_div'],
+                'fiscal_year': str(kwargs['business_year']),
+                'period': kwargs.get('period') or 'annual',
+                'report_code': kwargs.get('report_code') or '11011',
+                'statement_type': kwargs.get('statement_type') or 'consolidated',
+                'fs_div': kwargs.get('fs_div') or 'CFS',
                 'dataset': 'fnlttSinglAcntAll',
             },
             'highlights': {},
@@ -50,6 +53,11 @@ class UpstreamErrorService:
 
     async def get_fundamentals(self, **kwargs):
         raise DartAPIError('DART upstream unavailable')
+
+
+class ValidationErrorService:
+    async def get_fundamentals(self, **kwargs):
+        raise ValueError('period and report_code refer to different filing windows')
 
 
 class DartRouteTests(unittest.TestCase):
@@ -103,7 +111,22 @@ class DartRouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 502)
         self.assertIn('DART request failed', response.json()['detail'])
 
-    def test_fundamentals_route_returns_payload(self):
+    def test_fundamentals_route_returns_payload_for_fiscal_year_shape(self):
+        original_service = routes_dart.dart_service
+        routes_dart.dart_service = FakeRouteService()
+        try:
+            client = TestClient(self.app)
+            response = client.get(
+                '/disclosures/dart/fundamentals',
+                params={'stock_code': '005930', 'fiscal_year': 2025, 'period': 'annual'},
+            )
+        finally:
+            routes_dart.dart_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['request']['report_code'], '11011')
+
+    def test_fundamentals_route_accepts_business_year_alias(self):
         original_service = routes_dart.dart_service
         routes_dart.dart_service = FakeRouteService()
         try:
@@ -117,6 +140,13 @@ class DartRouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()['request']['dataset'], 'fnlttSinglAcntAll')
+
+    def test_fundamentals_route_requires_a_year(self):
+        client = TestClient(self.app)
+        response = client.get('/disclosures/dart/fundamentals', params={'stock_code': '005930'})
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()['detail'], 'One of business_year or fiscal_year is required')
 
     def test_fundamentals_route_validates_report_code(self):
         client = TestClient(self.app)
@@ -140,6 +170,29 @@ class DartRouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.json()['detail'], 'fs_div must be one of CFS or OFS')
+
+    def test_fundamentals_route_maps_validation_errors_to_400(self):
+        original_service = routes_dart.dart_service
+        routes_dart.dart_service = ValidationErrorService()
+        try:
+            client = TestClient(self.app)
+            response = client.get(
+                '/disclosures/dart/fundamentals',
+                params={
+                    'stock_code': '005930',
+                    'fiscal_year': 2025,
+                    'period': 'annual',
+                    'report_code': '11013',
+                },
+            )
+        finally:
+            routes_dart.dart_service = original_service
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.json()['detail'],
+            'period and report_code refer to different filing windows',
+        )
 
 
 if __name__ == '__main__':

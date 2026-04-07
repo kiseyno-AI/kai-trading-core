@@ -90,6 +90,66 @@ class FakeDartClient:
                     'ord': '2',
                     'currency': 'KRW',
                 },
+                {
+                    'rcept_no': '20260311001234',
+                    'reprt_code': reprt_code,
+                    'bsns_year': bsns_year,
+                    'sj_div': 'IS',
+                    'sj_nm': '손익계산서',
+                    'account_id': 'dart_OperatingIncomeLoss',
+                    'account_nm': '영업이익',
+                    'thstrm_nm': '제 57 기',
+                    'thstrm_amount': '20,000',
+                    'frmtrm_nm': '제 56 기',
+                    'frmtrm_amount': '18,000',
+                    'ord': '3',
+                    'currency': 'KRW',
+                },
+                {
+                    'rcept_no': '20260311001234',
+                    'reprt_code': reprt_code,
+                    'bsns_year': bsns_year,
+                    'sj_div': 'IS',
+                    'sj_nm': '손익계산서',
+                    'account_id': 'ifrs-full_ProfitLoss',
+                    'account_nm': '당기순이익',
+                    'thstrm_nm': '제 57 기',
+                    'thstrm_amount': '15,000',
+                    'frmtrm_nm': '제 56 기',
+                    'frmtrm_amount': '14,000',
+                    'ord': '4',
+                    'currency': 'KRW',
+                },
+                {
+                    'rcept_no': '20260311001234',
+                    'reprt_code': reprt_code,
+                    'bsns_year': bsns_year,
+                    'sj_div': 'BS',
+                    'sj_nm': '재무상태표',
+                    'account_id': 'ifrs-full_Liabilities',
+                    'account_nm': '부채총계',
+                    'thstrm_nm': '제 57 기말',
+                    'thstrm_amount': '300,000',
+                    'frmtrm_nm': '제 56 기말',
+                    'frmtrm_amount': '280,000',
+                    'ord': '5',
+                    'currency': 'KRW',
+                },
+                {
+                    'rcept_no': '20260311001234',
+                    'reprt_code': reprt_code,
+                    'bsns_year': bsns_year,
+                    'sj_div': 'BS',
+                    'sj_nm': '재무상태표',
+                    'account_id': 'ifrs-full_Equity',
+                    'account_nm': '자본총계',
+                    'thstrm_nm': '제 57 기말',
+                    'thstrm_amount': '200,000',
+                    'frmtrm_nm': '제 56 기말',
+                    'frmtrm_amount': '170,000',
+                    'ord': '6',
+                    'currency': 'KRW',
+                },
             ],
         }
 
@@ -120,10 +180,40 @@ class DartServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.financials_args['reprt_code'], '11011')
         self.assertEqual(client.financials_args['fs_div'], 'CFS')
         self.assertEqual(result['request']['dataset'], 'fnlttSinglAcntAll')
-        self.assertEqual(result['statements']['count'], 2)
+        self.assertEqual(result['statements']['count'], 6)
         self.assertEqual(result['statements']['items'][0]['current_amount'], 500000)
         self.assertEqual(result['highlights']['total_assets']['current_amount'], 500000)
         self.assertEqual(result['highlights']['revenue']['current_cumulative_amount'], 100000)
+        self.assertEqual(result['highlights']['ratios']['operating_margin'], '0.2000')
+
+    async def test_fundamentals_keeps_period_and_statement_type_usability(self):
+        client = FakeDartClient()
+        service = DartService(client=client)
+
+        result = await service.get_company_fundamentals(
+            stock_code='005930',
+            fiscal_year=2025,
+            period='q1',
+            statement_type='consolidated',
+        )
+
+        self.assertEqual(client.financials_args['reprt_code'], '11013')
+        self.assertEqual(client.financials_args['fs_div'], 'CFS')
+        self.assertEqual(result['request']['period'], 'q1')
+        self.assertEqual(result['request']['period_scope'], 'year_to_date')
+        self.assertEqual(result['request']['statement_type'], 'consolidated')
+
+    async def test_company_fundamentals_rejects_mismatched_period_and_report_code(self):
+        client = FakeDartClient()
+        service = DartService(client=client)
+
+        with self.assertRaisesRegex(ValueError, 'period and report_code refer to different filing windows'):
+            await service.get_company_fundamentals(
+                stock_code='005930',
+                fiscal_year=2025,
+                period='annual',
+                report_code='11013',
+            )
 
 
 if __name__ == '__main__':

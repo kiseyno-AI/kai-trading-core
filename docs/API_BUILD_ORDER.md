@@ -13,9 +13,11 @@
 - `GET /broker/kis/health`
 - `GET /broker/kis/quote?symbol=005930`
 - `GET /macro/ecos/series?stat_code=...&cycle=...&start_period=...&end_period=...&item_code_1=...`
+- `GET /macro/ecos/catalog`
 - `GET /macro/bok/series?series_id=...&cycle=...&start_period=...&end_period=...&item_code_1=...`
 - `GET /fx/koreaexim/rates?search_date=YYYYMMDD&currency=USD&fallback_days=2`
 - `GET /disclosures/dart/company-snapshot?stock_code=005930`
+- `GET /disclosures/dart/fundamentals?stock_code=005930&fiscal_year=2025&period=annual`
 - `GET /disclosures/dart/fundamentals?stock_code=005930&business_year=2025&report_code=11011&fs_div=CFS`
 - `GET /eod/status`
 - `POST /eod/master/refresh-if-due`
