@@ -20,6 +20,24 @@ class FakeRouteService:
             'recent_filings': {'items': []},
         }
 
+    async def get_fundamentals(self, **kwargs):
+        return {
+            'lookup': {
+                'corp_code': '00126380',
+                'corp_name': '삼성전자',
+                'stock_code': kwargs.get('stock_code') or '005930',
+                'modify_date': '20250101',
+            },
+            'request': {
+                'business_year': kwargs['business_year'],
+                'report_code': kwargs['report_code'],
+                'fs_div': kwargs['fs_div'],
+                'dataset': 'fnlttSinglAcntAll',
+            },
+            'highlights': {},
+            'statements': {'count': 0, 'items': []},
+        }
+
 
 class LookupErrorService:
     async def get_company_snapshot(self, **kwargs):
@@ -28,6 +46,9 @@ class LookupErrorService:
 
 class UpstreamErrorService:
     async def get_company_snapshot(self, **kwargs):
+        raise DartAPIError('DART upstream unavailable')
+
+    async def get_fundamentals(self, **kwargs):
         raise DartAPIError('DART upstream unavailable')
 
 
@@ -81,6 +102,44 @@ class DartRouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 502)
         self.assertIn('DART request failed', response.json()['detail'])
+
+    def test_fundamentals_route_returns_payload(self):
+        original_service = routes_dart.dart_service
+        routes_dart.dart_service = FakeRouteService()
+        try:
+            client = TestClient(self.app)
+            response = client.get(
+                '/disclosures/dart/fundamentals',
+                params={'stock_code': '005930', 'business_year': 2025},
+            )
+        finally:
+            routes_dart.dart_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['request']['dataset'], 'fnlttSinglAcntAll')
+
+    def test_fundamentals_route_validates_report_code(self):
+        client = TestClient(self.app)
+        response = client.get(
+            '/disclosures/dart/fundamentals',
+            params={'stock_code': '005930', 'business_year': 2025, 'report_code': '99999'},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.json()['detail'],
+            'report_code must be one of 11011, 11012, 11013, 11014',
+        )
+
+    def test_fundamentals_route_validates_fs_div(self):
+        client = TestClient(self.app)
+        response = client.get(
+            '/disclosures/dart/fundamentals',
+            params={'stock_code': '005930', 'business_year': 2025, 'fs_div': 'bad'},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()['detail'], 'fs_div must be one of CFS or OFS')
 
 
 if __name__ == '__main__':

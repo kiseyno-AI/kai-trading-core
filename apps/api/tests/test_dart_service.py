@@ -47,6 +47,52 @@ class FakeDartClient:
             ],
         }
 
+    async def fetch_single_company_financial_statements(self, *, corp_code, bsns_year, reprt_code, fs_div):
+        self.financials_args = {
+            'corp_code': corp_code,
+            'bsns_year': bsns_year,
+            'reprt_code': reprt_code,
+            'fs_div': fs_div,
+        }
+        return {
+            'status': '000',
+            'message': 'OK',
+            'list': [
+                {
+                    'rcept_no': '20260311001234',
+                    'reprt_code': reprt_code,
+                    'bsns_year': bsns_year,
+                    'sj_div': 'BS',
+                    'sj_nm': '재무상태표',
+                    'account_id': 'ifrs-full_Assets',
+                    'account_nm': '자산총계',
+                    'thstrm_nm': '제 57 기말',
+                    'thstrm_amount': '500,000',
+                    'frmtrm_nm': '제 56 기말',
+                    'frmtrm_amount': '450,000',
+                    'ord': '1',
+                    'currency': 'KRW',
+                },
+                {
+                    'rcept_no': '20260311001234',
+                    'reprt_code': reprt_code,
+                    'bsns_year': bsns_year,
+                    'sj_div': 'IS',
+                    'sj_nm': '손익계산서',
+                    'account_id': 'ifrs-full_Revenue',
+                    'account_nm': '매출액',
+                    'thstrm_nm': '제 57 기',
+                    'thstrm_amount': '100,000',
+                    'thstrm_add_amount': '100,000',
+                    'frmtrm_nm': '제 56 기',
+                    'frmtrm_amount': '95,000',
+                    'frmtrm_add_amount': '95,000',
+                    'ord': '2',
+                    'currency': 'KRW',
+                },
+            ],
+        }
+
 
 class DartServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_company_snapshot_combines_lookup_company_and_filings(self):
@@ -62,6 +108,22 @@ class DartServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['lookup']['stock_code'], '005930')
         self.assertEqual(result['company']['corp_name'], '삼성전자')
         self.assertEqual(result['recent_filings']['items'][0]['rcept_no'], '20250101000001')
+
+    async def test_fundamentals_returns_normalized_financials_and_highlights(self):
+        client = FakeDartClient()
+        service = DartService(client=client)
+
+        result = await service.get_fundamentals(stock_code='005930', business_year=2025)
+
+        self.assertEqual(client.financials_args['corp_code'], '00126380')
+        self.assertEqual(client.financials_args['bsns_year'], '2025')
+        self.assertEqual(client.financials_args['reprt_code'], '11011')
+        self.assertEqual(client.financials_args['fs_div'], 'CFS')
+        self.assertEqual(result['request']['dataset'], 'fnlttSinglAcntAll')
+        self.assertEqual(result['statements']['count'], 2)
+        self.assertEqual(result['statements']['items'][0]['current_amount'], 500000)
+        self.assertEqual(result['highlights']['total_assets']['current_amount'], 500000)
+        self.assertEqual(result['highlights']['revenue']['current_cumulative_amount'], 100000)
 
 
 if __name__ == '__main__':

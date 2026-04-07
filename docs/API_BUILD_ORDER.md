@@ -6,6 +6,7 @@
 3. BOK/ECOS macro series route
 4. Korea Exim FX daily exchange-rate snapshot route
 5. DART company snapshot route
+6. DART single-company fundamentals route
 
 ## Current routes
 - `POST /broker/kis/token`
@@ -15,6 +16,7 @@
 - `GET /macro/bok/series?series_id=...&cycle=...&start_period=...&end_period=...&item_code_1=...`
 - `GET /fx/koreaexim/rates?search_date=YYYYMMDD&currency=USD&fallback_days=2`
 - `GET /disclosures/dart/company-snapshot?stock_code=005930`
+- `GET /disclosures/dart/fundamentals?stock_code=005930&business_year=2025&report_code=11011&fs_div=CFS`
 - `GET /eod/status`
 - `POST /eod/master/refresh-if-due`
 - `POST /eod/capture-if-due`
@@ -24,7 +26,6 @@
 - `POST /eod/pykrx/daily/run-if-due?market_date=YYYY-MM-DD`
 
 ## Next routes
-- DART single-company financial statements or key financial indicators
 - DART filing document/original attachment access
 - KIS balance inquiry
 - KIS account positions
