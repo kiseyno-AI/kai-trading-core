@@ -33,3 +33,36 @@ async def get_dart_company_snapshot(
         raise HTTPException(status_code=502, detail=f'DART request failed: {exc}') from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f'DART snapshot failed: {exc}') from exc
+
+
+@router.get('/fundamentals')
+async def get_dart_company_fundamentals(
+    corp_code: Optional[str] = None,
+    stock_code: Optional[str] = None,
+    corp_name: Optional[str] = None,
+    fiscal_year: int = Query(..., ge=2015, le=2100),
+    period: str = Query(default='annual'),
+    report_code: Optional[str] = None,
+    statement_type: str = Query(default='consolidated'),
+) -> dict:
+    if not any([corp_code, stock_code, corp_name]):
+        raise HTTPException(status_code=400, detail='One of corp_code, stock_code, or corp_name is required')
+
+    try:
+        return await dart_service.get_company_fundamentals(
+            corp_code=corp_code,
+            stock_code=stock_code,
+            corp_name=corp_name,
+            fiscal_year=fiscal_year,
+            period=period,
+            report_code=report_code,
+            statement_type=statement_type,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except DartLookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except DartAPIError as exc:
+        raise HTTPException(status_code=502, detail=f'DART request failed: {exc}') from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'DART fundamentals failed: {exc}') from exc
