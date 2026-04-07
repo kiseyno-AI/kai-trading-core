@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import io
+import re
+from urllib.parse import unquote
 import zipfile
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -19,6 +21,10 @@ class DartAPIError(RuntimeError):
 
 class DartLookupError(LookupError):
     pass
+
+
+_FILENAME_STAR_PATTERN = re.compile(r"filename\*\s*=\s*([^']*)''([^;]+)")
+_FILENAME_PATTERN = re.compile(r'filename\s*=\s*"?(?P<filename>[^";]+)"?')
 
 
 class DartClient:
@@ -191,6 +197,46 @@ class DartClient:
             }
         return payload
 
+    async def download_document(self, *, rcept_no: str) -> dict[str, Any]:
+        response = await self._request('/document.xml', {'rcept_no': rcept_no})
+        payload = self._build_binary_payload(
+            response,
+            default_filename=f'dart-document-{rcept_no}.zip',
+        )
+        log_fetch_event(
+            service='dart',
+            operation='download_document',
+            status='completed',
+            receipt_number=rcept_no,
+            content_type=payload['content_type'],
+            file_name=payload['filename'],
+            payload_bytes=payload['size_bytes'],
+        )
+        return payload
+
+    async def download_xbrl(self, *, rcept_no: str, reprt_code: str | None = None) -> dict[str, Any]:
+        params = {'rcept_no': rcept_no}
+        if reprt_code:
+            params['reprt_code'] = reprt_code
+
+        response = await self._request('/fnlttXbrl.xml', params)
+        filename_suffix = f'-{reprt_code}' if reprt_code else ''
+        payload = self._build_binary_payload(
+            response,
+            default_filename=f'dart-xbrl-{rcept_no}{filename_suffix}.zip',
+        )
+        log_fetch_event(
+            service='dart',
+            operation='download_xbrl',
+            status='completed',
+            receipt_number=rcept_no,
+            report_code=reprt_code,
+            content_type=payload['content_type'],
+            file_name=payload['filename'],
+            payload_bytes=payload['size_bytes'],
+        )
+        return payload
+
     async def lookup_corp_code(
         self,
         *,
@@ -330,6 +376,32 @@ class DartClient:
                 }
             )
         return corp_codes
+
+    @staticmethod
+    def _build_binary_payload(response: httpx.Response, *, default_filename: str) -> dict[str, Any]:
+        headers = dict(response.headers)
+        return {
+            'content': response.content,
+            'content_type': response.headers.get('content-type', 'application/octet-stream'),
+            'filename': DartClient._extract_filename(response.headers.get('content-disposition'), default_filename),
+            'size_bytes': len(response.content),
+            'headers': headers,
+        }
+
+    @staticmethod
+    def _extract_filename(content_disposition: str | None, default_filename: str) -> str:
+        if not content_disposition:
+            return default_filename
+
+        star_match = _FILENAME_STAR_PATTERN.search(content_disposition)
+        if star_match:
+            return unquote(star_match.group(2)) or default_filename
+
+        match = _FILENAME_PATTERN.search(content_disposition)
+        if match:
+            return match.group('filename')
+
+        return default_filename
 
 
 dart_client = DartClient()

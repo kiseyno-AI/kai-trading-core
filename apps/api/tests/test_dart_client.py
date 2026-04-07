@@ -5,23 +5,26 @@ from app.integrations.dart.client import DartAPIError, DartClient
 
 
 class FakeResponse:
-    def __init__(self, payload):
+    def __init__(self, payload, *, content=b'', headers=None):
         self._payload = payload
         self.status_code = 200
         self.text = ''
-        self.content = b''
+        self.content = content
+        self.headers = headers or {}
 
     def json(self):
         return self._payload
 
 
 class TestableDartClient(DartClient):
-    def __init__(self, payload):
+    def __init__(self, payload, *, content=b'', headers=None):
         super().__init__()
         self.payload = payload
+        self.content = content
+        self.headers = headers or {}
 
     async def _request(self, path, params):
-        return FakeResponse(self.payload)
+        return FakeResponse(self.payload, content=self.content, headers=self.headers)
 
 
 class FakeHTTPErrorResponse:
@@ -100,6 +103,37 @@ class DartClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['status'], '013')
         self.assertEqual(result['page_no'], '3')
         self.assertEqual(result['list'], [])
+
+    async def test_download_document_returns_binary_payload_with_header_filename(self):
+        client = TestableDartClient(
+            {'status': '000'},
+            content=b'PK\x03\x04document',
+            headers={
+                'content-type': 'application/zip',
+                'content-disposition': 'attachment; filename="original.zip"',
+            },
+        )
+
+        result = await client.download_document(rcept_no='20260407000001')
+
+        self.assertEqual(result['filename'], 'original.zip')
+        self.assertEqual(result['content_type'], 'application/zip')
+        self.assertEqual(result['size_bytes'], len(b'PK\x03\x04document'))
+
+    async def test_download_xbrl_uses_default_filename_when_header_missing(self):
+        client = TestableDartClient(
+            {'status': '000'},
+            content=b'PK\x03\x04xbrl',
+            headers={'content-type': 'application/octet-stream'},
+        )
+
+        result = await client.download_xbrl(
+            rcept_no='20260407000001',
+            reprt_code='11011',
+        )
+
+        self.assertEqual(result['filename'], 'dart-xbrl-20260407000001-11011.zip')
+        self.assertEqual(result['size_bytes'], len(b'PK\x03\x04xbrl'))
 
     async def test_request_http_error_logging_omits_raw_response_body(self):
         client = DartClient()
