@@ -1,4 +1,5 @@
 import unittest
+from datetime import date
 from unittest.mock import patch
 
 from app.dart.fundamentals_capture_service import (
@@ -12,6 +13,7 @@ class FakeCaptureClient:
     def __init__(self):
         self.calls = []
         self.overview_calls = []
+        self.lookup_calls = []
 
     async def fetch_company_overview(self, corp_code):
         self.overview_calls.append(corp_code)
@@ -45,6 +47,15 @@ class FakeCaptureClient:
             ],
         }
 
+    async def lookup_corp_code(self, *, stock_code=None, corp_code=None, corp_name=None):
+        self.lookup_calls.append({'stock_code': stock_code, 'corp_code': corp_code, 'corp_name': corp_name})
+        return {
+            'corp_code': f'corp-{stock_code}',
+            'corp_name': f'Corp {stock_code}',
+            'stock_code': stock_code,
+            'modify_date': '20260407',
+        }
+
 
 class FakeCaptureRepository:
     def __init__(self):
@@ -61,8 +72,8 @@ class FakeCaptureRepository:
     def complete_capture_run(self, run_id, **kwargs):
         self.completed_runs.append((run_id, kwargs))
 
-    def list_capture_candidates(self, *, limit=20, force=False):
-        return [
+    def list_capture_candidates(self, *, limit=20, force=False, stock_codes=None, receipt_date_from=None, receipt_date_to=None):
+        events = [
             {
                 'id': 1,
                 'rcept_no': '20260407000003',
@@ -93,7 +104,10 @@ class FakeCaptureRepository:
                 'filing_category': 'quarterly_report',
                 'fundamentals_capture_status': 'pending',
             },
-        ][:limit]
+        ]
+        if stock_codes:
+            events = [event for event in events if event['stock_code'] in stock_codes]
+        return events[:limit] if limit is not None else events
 
     def replace_snapshot_dataset(self, **kwargs):
         self.snapshots.append(kwargs)
@@ -155,6 +169,16 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
+    async def test_capture_recent_fundamentals_filters_to_requested_stock_codes(self):
+        client = FakeCaptureClient()
+        repository = FakeCaptureRepository()
+        service = DartFundamentalsCaptureService(client=client, repository=repository)
+
+        result = await service.capture_recent_fundamentals(limit=None, stock_codes=['005930'], fs_div='CFS')
+
+        self.assertEqual(result['events_seen'], 1)
+        self.assertEqual(repository.successes, [1])
+
     async def test_inspect_capture_status_returns_repository_views(self):
         service = DartFundamentalsCaptureService(
             client=FakeCaptureClient(),
@@ -166,6 +190,51 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['latest_run']['id'], 88)
         self.assertEqual(result['summary']['financial_event_capture_status_counts']['captured'], 1)
         self.assertEqual(result['events'][0]['fundamentals_capture_status'], 'failed')
+
+    async def test_backfill_current_universe_uses_2015_floor_and_selected_active_symbols(self):
+        client = FakeCaptureClient()
+        repository = FakeCaptureRepository()
+        service = DartFundamentalsCaptureService(
+            client=client,
+            repository=repository,
+            active_symbol_loader=lambda: [
+                {'symbol': '005930'},
+                {'symbol': '000001'},
+                {'symbol': '000002'},
+            ],
+            daily_price_bar_bounds_loader=lambda: (date(2007, 6, 5), date(2026, 4, 7)),
+        )
+
+        with patch(
+            'app.dart.sync_service.dart_disclosure_sync_service.sync_disclosures_for_corporations',
+            return_value={
+                'run_id': 77,
+                'status': 'completed',
+                'financial_report_events': 4,
+            },
+        ):
+            result = await service.backfill_current_universe_fundamentals(
+                symbol_limit=2,
+                symbol_offset=1,
+                capture_limit=10,
+                fs_div='CFS',
+            )
+
+        self.assertEqual(result['effective_start_date'], '2015-01-01')
+        self.assertEqual(result['symbols_selected'], 2)
+        self.assertEqual(result['symbols_resolved'], 2)
+        self.assertEqual(result['sync']['run_id'], 77)
+
+    async def test_backfill_current_universe_rejects_reversed_effective_date_window(self):
+        service = DartFundamentalsCaptureService(
+            client=FakeCaptureClient(),
+            repository=FakeCaptureRepository(),
+            active_symbol_loader=lambda: [{'symbol': '005930'}],
+            daily_price_bar_bounds_loader=lambda: (date(2007, 6, 5), date(2014, 12, 31)),
+        )
+
+        with self.assertRaisesRegex(ValueError, 'effective_start_date'):
+            await service.backfill_current_universe_fundamentals(symbol_limit=1, capture_limit=10, fs_div='CFS')
 
 
 class InferFundamentalsRequestTests(unittest.TestCase):

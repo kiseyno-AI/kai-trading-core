@@ -1,3 +1,4 @@
+from datetime import date
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query
@@ -144,6 +145,37 @@ async def inspect_dart_fundamentals_capture(
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f'DART fundamentals capture inspect failed: {exc}') from exc
+
+
+@router.post('/fundamentals/backfill/current-universe')
+async def backfill_dart_fundamentals_for_current_universe(
+    symbol_limit: int = Query(default=25, ge=1, le=250),
+    symbol_offset: int = Query(default=0, ge=0, le=20000),
+    capture_limit: int = Query(default=250, ge=1, le=5000),
+    force: bool = False,
+    fs_div: Optional[str] = Query(default=None),
+    start_date: Optional[date] = Query(default=None),
+    end_date: Optional[date] = Query(default=None),
+) -> dict:
+    normalized_fs_div = _normalize_fs_div(fs_div) if fs_div is not None else settings.dart_fundamentals_default_fs_div.strip().upper()
+    try:
+        return await dart_fundamentals_capture_service.backfill_current_universe_fundamentals(
+            symbol_limit=symbol_limit,
+            symbol_offset=symbol_offset,
+            capture_limit=capture_limit,
+            force=force,
+            fs_div=normalized_fs_div,
+            start_date=start_date,
+            end_date=end_date,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except DartLookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except DartAPIError as exc:
+        raise HTTPException(status_code=502, detail=f'DART request failed: {exc}') from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'DART current-universe backfill failed: {exc}') from exc
 
 
 @router.get('/filings/document')

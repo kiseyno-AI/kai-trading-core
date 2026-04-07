@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import re
+from datetime import date
 from decimal import Decimal, InvalidOperation
-from typing import Any
+from typing import Any, Callable
 
 from app.core.audit_logging import log_fetch_event
 from app.core.settings import settings
+from app.db import session_scope
+from app.db_models import DailyPriceBar
 from app.dart.fundamentals_store import DartFundamentalsRepository, dart_fundamentals_repository
 from app.dart.service import (
     FS_DIV_TO_STATEMENT_TYPE,
@@ -14,6 +17,8 @@ from app.dart.service import (
     build_fundamentals_dataset,
 )
 from app.integrations.dart.client import DartClient, dart_client
+from app.market_data_store import load_symbols
+from sqlalchemy import func, select
 
 _REPORT_PERIOD_PATTERN = re.compile(r'\((\d{4})\.(\d{2})\)')
 
@@ -21,6 +26,8 @@ _FILING_CATEGORY_TO_REPORT_CODE = {
     'annual_report': '11011',
     'semiannual_report': '11012',
 }
+
+DART_FUNDAMENTALS_MIN_START_DATE = date(settings.dart_fundamentals_min_business_year, 1, 1)
 
 def infer_fundamentals_request(
     event: dict[str, Any],
@@ -201,25 +208,51 @@ def _parse_decimal(value: str | None) -> Decimal | None:
         return None
 
 
+def _load_active_symbols() -> list[dict[str, Any]]:
+    return [item for item in load_symbols(is_active=True) if (item.get('symbol') or '').strip().isdigit()]
+
+
+def _load_daily_price_bar_bounds() -> tuple[date | None, date | None]:
+    with session_scope() as session:
+        return (
+            session.execute(select(func.min(DailyPriceBar.trade_date))).scalar_one(),
+            session.execute(select(func.max(DailyPriceBar.trade_date))).scalar_one(),
+        )
+
+
 class DartFundamentalsCaptureService:
     def __init__(
         self,
         *,
         client: DartClient | None = None,
         repository: DartFundamentalsRepository | None = None,
+        active_symbol_loader: Callable[[], list[dict[str, Any]]] | None = None,
+        daily_price_bar_bounds_loader: Callable[[], tuple[date | None, date | None]] | None = None,
     ) -> None:
         self.client = client or dart_client
         self.repository = repository or dart_fundamentals_repository
+        self.active_symbol_loader = active_symbol_loader or _load_active_symbols
+        self.daily_price_bar_bounds_loader = daily_price_bar_bounds_loader or _load_daily_price_bar_bounds
 
     async def capture_recent_fundamentals(
         self,
         *,
-        limit: int = 20,
+        limit: int | None = 20,
         force: bool = False,
         trigger: str = 'manual_api',
         fs_div: str | None = None,
+        stock_codes: list[str] | None = None,
+        receipt_date_from: date | None = None,
+        receipt_date_to: date | None = None,
     ) -> dict[str, Any]:
         resolved_fs_div = (fs_div or settings.dart_fundamentals_default_fs_div).strip().upper()
+        run_metadata: dict[str, Any] = {'requested_limit': limit}
+        if stock_codes:
+            run_metadata['stock_code_count'] = len(stock_codes)
+        if receipt_date_from:
+            run_metadata['receipt_date_from'] = receipt_date_from.isoformat()
+        if receipt_date_to:
+            run_metadata['receipt_date_to'] = receipt_date_to.isoformat()
         log_fetch_event(
             service='dart',
             operation='capture_recent_fundamentals',
@@ -234,7 +267,7 @@ class DartFundamentalsCaptureService:
             limit_requested=limit,
             force=force,
             fs_div=resolved_fs_div,
-            run_metadata={'requested_limit': limit},
+            run_metadata=run_metadata,
         )
         events_seen = 0
         events_captured = 0
@@ -243,7 +276,13 @@ class DartFundamentalsCaptureService:
         results: list[dict[str, Any]] = []
 
         try:
-            events = self.repository.list_capture_candidates(limit=limit, force=force)
+            events = self.repository.list_capture_candidates(
+                limit=limit,
+                force=force,
+                stock_codes=stock_codes,
+                receipt_date_from=receipt_date_from,
+                receipt_date_to=receipt_date_to,
+            )
             for event in events:
                 events_seen += 1
                 try:
@@ -368,7 +407,7 @@ class DartFundamentalsCaptureService:
                 events_captured=events_captured,
                 events_failed=events_failed,
                 events_skipped=events_skipped,
-                run_metadata={'requested_limit': limit},
+                run_metadata=run_metadata,
             )
             return result
         except Exception as exc:
@@ -393,9 +432,95 @@ class DartFundamentalsCaptureService:
                 events_failed=events_failed,
                 events_skipped=events_skipped,
                 error_message=str(exc),
-                run_metadata={'requested_limit': limit},
+                run_metadata=run_metadata,
             )
             raise
+
+    async def backfill_current_universe_fundamentals(
+        self,
+        *,
+        symbol_limit: int = 25,
+        symbol_offset: int = 0,
+        capture_limit: int | None = 250,
+        force: bool = False,
+        fs_div: str | None = None,
+        start_date: date | None = None,
+        end_date: date | None = None,
+    ) -> dict[str, Any]:
+        active_symbols = self.active_symbol_loader()
+        min_trade_date, max_trade_date = self.daily_price_bar_bounds_loader()
+        resolved_end_date = end_date or max_trade_date or date.today()
+        candidate_start_date = start_date or min_trade_date or DART_FUNDAMENTALS_MIN_START_DATE
+        effective_start_date = max(candidate_start_date, DART_FUNDAMENTALS_MIN_START_DATE)
+        if effective_start_date > resolved_end_date:
+            raise ValueError(
+                'effective_start_date must be on or before effective_end_date '
+                f'({effective_start_date.isoformat()} > {resolved_end_date.isoformat()})'
+            )
+        selected_symbols = active_symbols[symbol_offset : symbol_offset + symbol_limit]
+        corp_records = []
+        symbol_lookup_errors: list[dict[str, str]] = []
+
+        for symbol in selected_symbols:
+            stock_code = (symbol.get('symbol') or '').strip().zfill(6)
+            try:
+                corp = await self.client.lookup_corp_code(stock_code=stock_code)
+                corp_records.append(
+                    {
+                        'stock_code': stock_code,
+                        'corp_code': corp['corp_code'],
+                        'corp_name': corp['corp_name'],
+                    }
+                )
+            except Exception as exc:
+                symbol_lookup_errors.append({'stock_code': stock_code, 'error': str(exc)})
+
+        from app.dart.sync_service import dart_disclosure_sync_service
+
+        sync_result = await dart_disclosure_sync_service.sync_disclosures_for_corporations(
+            corporations=corp_records,
+            start_date=effective_start_date,
+            end_date=resolved_end_date,
+            trigger='manual_active_universe_backfill',
+        )
+        if corp_records:
+            capture_result = await self.capture_recent_fundamentals(
+                limit=capture_limit,
+                force=force,
+                trigger='manual_active_universe_backfill',
+                fs_div=fs_div,
+                stock_codes=[corp['stock_code'] for corp in corp_records],
+                receipt_date_from=effective_start_date,
+                receipt_date_to=resolved_end_date,
+            )
+        else:
+            capture_result = {
+                'run_id': None,
+                'status': 'completed',
+                'fs_div': (fs_div or settings.dart_fundamentals_default_fs_div).strip().upper(),
+                'events_seen': 0,
+                'events_captured': 0,
+                'events_failed': 0,
+                'events_skipped': 0,
+                'results': [],
+            }
+        return {
+            'scope': 'current_active_universe',
+            'active_symbols_total': len(active_symbols),
+            'symbol_offset': symbol_offset,
+            'symbol_limit': symbol_limit,
+            'symbols_selected': len(selected_symbols),
+            'symbols_resolved': len(corp_records),
+            'symbol_lookup_errors': symbol_lookup_errors,
+            'requested_start_date': candidate_start_date.isoformat() if candidate_start_date else None,
+            'effective_start_date': effective_start_date.isoformat(),
+            'effective_end_date': resolved_end_date.isoformat(),
+            'daily_price_bar_min_trade_date': min_trade_date.isoformat() if min_trade_date else None,
+            'daily_price_bar_max_trade_date': max_trade_date.isoformat() if max_trade_date else None,
+            'dart_min_start_date': DART_FUNDAMENTALS_MIN_START_DATE.isoformat(),
+            'sync': sync_result,
+            'capture': capture_result,
+        }
 
     def inspect_capture_status(
         self,

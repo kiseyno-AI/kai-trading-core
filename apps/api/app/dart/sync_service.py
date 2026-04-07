@@ -8,7 +8,7 @@ from typing import Any
 from app.core.audit_logging import log_fetch_event
 from app.core.settings import settings
 from app.dart.store import DartSyncRepository, dart_sync_repository
-from app.integrations.dart.client import DartClient, dart_client
+from app.integrations.dart.client import DartAPIError, DartClient, dart_client
 
 _ANNUAL_REPORT = 'annual_report'
 _SEMIANNUAL_REPORT = 'semiannual_report'
@@ -111,13 +111,18 @@ class DartDisclosureSyncService:
                 total_count = int(payload.get('total_count', '0') or 0)
                 total_pages = max(math.ceil(total_count / page_size), 1) if total_count else 1
 
+                raw_items = payload.get('list', [])
+                events_seen += len(raw_items)
+
                 page_items = []
-                for raw_item in payload.get('list', []):
+                for raw_item in raw_items:
                     rcept_no = (raw_item.get('rcept_no') or '').strip()
                     if not rcept_no or rcept_no in processed_rcept_nos:
                         continue
                     processed_rcept_nos.add(rcept_no)
-                    page_items.append(self._build_event_record(raw_item, run_id=run_id))
+                    event_record = self._build_event_record(raw_item, run_id=run_id)
+                    if event_record['is_financial_report']:
+                        page_items.append(event_record)
 
                 counts = self.repository.upsert_events(page_items, run_id=run_id)
                 log_fetch_event(
@@ -129,13 +134,13 @@ class DartDisclosureSyncService:
                     page_size=page_size,
                     total_pages=total_pages,
                     payload_total_count=total_count,
-                    item_count=len(page_items),
-                    events_seen=counts['seen'],
+                    raw_item_count=len(raw_items),
+                    stored_item_count=len(page_items),
+                    events_seen=events_seen,
                     events_inserted=counts['inserted'],
                     events_updated=counts['updated'],
                     financial_report_events=counts['financial_report_events'],
                 )
-                events_seen += counts['seen']
                 events_inserted += counts['inserted']
                 events_updated += counts['updated']
                 financial_report_events += counts['financial_report_events']
@@ -197,6 +202,139 @@ class DartDisclosureSyncService:
                 financial_report_events=financial_report_events,
                 error_message=str(exc),
                 run_metadata={'window_days': window_days},
+            )
+            raise
+
+    async def sync_disclosures_for_corporations(
+        self,
+        *,
+        corporations: list[dict[str, str]],
+        start_date: date,
+        end_date: date,
+        trigger: str = 'manual_active_universe_backfill',
+    ) -> dict[str, Any]:
+        page_size = max(min(settings.dart_sync_page_count, 100), 1)
+        run_id = self.repository.create_sync_run(
+            window_start=start_date,
+            window_end=end_date,
+            trigger=trigger,
+            page_size=page_size,
+            run_metadata={
+                'scope': 'current_active_universe',
+                'requested_corporations': len(corporations),
+            },
+        )
+
+        pages_fetched = 0
+        events_seen = 0
+        events_inserted = 0
+        events_updated = 0
+        financial_report_events = 0
+        corporations_processed = 0
+        corporations_failed = 0
+        corporation_errors: list[dict[str, str]] = []
+
+        try:
+            for corporation in corporations:
+                processed_rcept_nos: set[str] = set()
+                try:
+                    page_no = 1
+                    total_pages = 1
+                    while page_no <= total_pages:
+                        payload = await self.client.fetch_disclosure_list(
+                            corp_code=corporation['corp_code'],
+                            bgn_de=start_date.strftime('%Y%m%d'),
+                            end_de=end_date.strftime('%Y%m%d'),
+                            page_no=page_no,
+                            page_count=page_size,
+                            last_reprt_at='N',
+                        )
+                        pages_fetched += 1
+                        total_count = int(payload.get('total_count', '0') or 0)
+                        total_pages = max(math.ceil(total_count / page_size), 1) if total_count else 1
+
+                        raw_items = payload.get('list', [])
+                        events_seen += len(raw_items)
+                        page_items = []
+                        for raw_item in raw_items:
+                            rcept_no = (raw_item.get('rcept_no') or '').strip()
+                            if not rcept_no or rcept_no in processed_rcept_nos:
+                                continue
+                            processed_rcept_nos.add(rcept_no)
+                            event_record = self._build_event_record(raw_item, run_id=run_id)
+                            if event_record['is_financial_report']:
+                                page_items.append(event_record)
+
+                        counts = self.repository.upsert_events(page_items, run_id=run_id)
+                        events_inserted += counts['inserted']
+                        events_updated += counts['updated']
+                        financial_report_events += counts['financial_report_events']
+                        page_no += 1
+
+                    corporations_processed += 1
+                except DartAPIError:
+                    raise
+                except Exception as exc:
+                    corporations_failed += 1
+                    corporation_errors.append(
+                        {
+                            'corp_code': corporation['corp_code'],
+                            'stock_code': corporation.get('stock_code', ''),
+                            'error': str(exc),
+                        }
+                    )
+
+            run_metadata = {
+                'scope': 'current_active_universe',
+                'requested_corporations': len(corporations),
+                'corporations_processed': corporations_processed,
+                'corporations_failed': corporations_failed,
+                'corporation_errors': corporation_errors[:25],
+            }
+            result = {
+                'run_id': run_id,
+                'status': 'completed',
+                'window_start': start_date.isoformat(),
+                'window_end': end_date.isoformat(),
+                'page_size': page_size,
+                'pages_fetched': pages_fetched,
+                'events_seen': events_seen,
+                'events_inserted': events_inserted,
+                'events_updated': events_updated,
+                'financial_report_events': financial_report_events,
+                'corporations_requested': len(corporations),
+                'corporations_processed': corporations_processed,
+                'corporations_failed': corporations_failed,
+                'corporation_errors': corporation_errors[:25],
+            }
+            self.repository.complete_sync_run(
+                run_id,
+                status='completed',
+                pages_fetched=pages_fetched,
+                events_seen=events_seen,
+                events_inserted=events_inserted,
+                events_updated=events_updated,
+                financial_report_events=financial_report_events,
+                run_metadata=run_metadata,
+            )
+            return result
+        except Exception as exc:
+            self.repository.complete_sync_run(
+                run_id,
+                status='failed',
+                pages_fetched=pages_fetched,
+                events_seen=events_seen,
+                events_inserted=events_inserted,
+                events_updated=events_updated,
+                financial_report_events=financial_report_events,
+                error_message=str(exc),
+                run_metadata={
+                    'scope': 'current_active_universe',
+                    'requested_corporations': len(corporations),
+                    'corporations_processed': corporations_processed,
+                    'corporations_failed': corporations_failed,
+                    'corporation_errors': corporation_errors[:25],
+                },
             )
             raise
 
