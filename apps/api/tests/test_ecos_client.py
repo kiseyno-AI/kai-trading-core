@@ -1,12 +1,15 @@
 import unittest
 from unittest.mock import patch
 
+import httpx
+
 from app.integrations.bok.client import ECOSClient
 
 
 class FakeResponse:
     status_code = 200
     text = ''
+    headers = {}
 
     def json(self):
         return {'StatisticSearch': {'row': []}}
@@ -24,8 +27,11 @@ class FakeAsyncClient:
     async def __aexit__(self, exc_type, exc, tb):
         return False
 
-    async def get(self, url):
-        self.__class__.last_url = url
+    def build_request(self, method, url, headers=None, params=None, json=None):
+        self.__class__.last_url = str(httpx.URL(url, params=params))
+        return httpx.Request(method, url, headers=headers, params=params, json=json)
+
+    async def send(self, request):
         return FakeResponse()
 
 

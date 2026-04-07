@@ -1,4 +1,6 @@
 import logging
+import time
+import uuid
 from contextlib import asynccontextmanager
 from secrets import compare_digest
 
@@ -15,12 +17,20 @@ from app.api.routes_scanner import router as scanner_router
 from app.api.routes_market import router as market_router
 from app.api.routes_quotes import router as quotes_router
 from app.api.routes_symbols import router as symbols_router
+from app.core.audit_logging import (
+    build_api_request_event,
+    configure_file_logging,
+    log_api_request_event,
+    reset_request_id,
+    set_request_id,
+)
 from app.core.settings import settings
 from app.db import check_database, init_database
 from app.eod.runner import background_runner
 from app.market_data_store import load_tracked_symbols
 from app.scanner.state import scanner_state
 
+configure_file_logging()
 logger = logging.getLogger(__name__)
 
 
@@ -50,20 +60,52 @@ app.add_middleware(
 
 
 @app.middleware('http')
-async def require_upstream_bearer_token(request: Request, call_next):
+async def audit_and_require_upstream_bearer_token(request: Request, call_next):
+    request_id = request.headers.get('X-Request-ID') or str(uuid.uuid4())
+    request.state.request_id = request_id
+    request_token = set_request_id(request_id)
+    started_at = time.perf_counter()
+    response = None
+    error = None
+
     configured_token = settings.upstream_bearer_token
-    if not configured_token or request.method == 'OPTIONS':
-        return await call_next(request)
-
-    scheme, _, credentials = request.headers.get('Authorization', '').partition(' ')
-    if scheme != 'Bearer' or not credentials or not compare_digest(credentials, configured_token):
-        return JSONResponse(
-            status_code=401,
-            content={'detail': 'Unauthorized'},
-            headers={'WWW-Authenticate': 'Bearer'},
+    try:
+        if configured_token and request.method != 'OPTIONS':
+            scheme, _, credentials = request.headers.get('Authorization', '').partition(' ')
+            if scheme != 'Bearer' or not credentials or not compare_digest(credentials, configured_token):
+                response = JSONResponse(
+                    status_code=401,
+                    content={'detail': 'Unauthorized'},
+                    headers={'WWW-Authenticate': 'Bearer'},
+                )
+            else:
+                response = await call_next(request)
+        else:
+            response = await call_next(request)
+        response.headers['X-Request-ID'] = request_id
+        return response
+    except Exception as exc:
+        error = exc
+        raise
+    finally:
+        duration_ms = (time.perf_counter() - started_at) * 1000
+        status_code = response.status_code if response is not None else 500
+        log_api_request_event(
+            build_api_request_event(
+                request_id=request_id,
+                method=request.method,
+                path=request.url.path,
+                query_params=request.query_params,
+                client_ip=request.client.host if request.client else None,
+                user_agent=request.headers.get('user-agent'),
+                status_code=status_code,
+                duration_ms=duration_ms,
+                request_headers=request.headers,
+                response_headers=response.headers if response is not None else None,
+                error=error,
+            )
         )
-
-    return await call_next(request)
+        reset_request_id(request_token)
 
 
 app.include_router(kis_router)

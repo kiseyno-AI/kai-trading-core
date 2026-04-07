@@ -3,6 +3,7 @@ from __future__ import annotations
 import httpx
 from urllib.parse import quote
 
+from app.core.audit_logging import request_with_audit
 from app.core.settings import settings
 
 
@@ -57,7 +58,13 @@ class ECOSClient:
 
         url = f"{self.base_url}/{'/'.join(path_parts)}"
         async with httpx.AsyncClient(timeout=20.0) as client:
-            response = await client.get(url)
+            response = await request_with_audit(
+                client,
+                'bok_ecos',
+                'GET',
+                url,
+                secret_values=[self.api_key],
+            )
             if response.status_code >= 400:
                 raise ECOSAPIError(f'ECOS request failed [{response.status_code}]: {response.text}')
 

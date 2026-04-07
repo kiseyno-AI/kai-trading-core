@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 
 import httpx
 
+from app.core.audit_logging import request_with_audit
 from app.core.settings import settings
 
 
@@ -43,7 +44,13 @@ class KISClient:
             'appsecret': settings.kis_app_secret,
         }
         async with httpx.AsyncClient(base_url=self.base_url, timeout=15.0) as client:
-            response = await client.post('/oauth2/tokenP', json=payload)
+            response = await request_with_audit(
+                client,
+                'kis',
+                'POST',
+                '/oauth2/tokenP',
+                json_body=payload,
+            )
             if response.status_code >= 400:
                 raise RuntimeError(f'KIS token issue failed [{response.status_code}]: {response.text}')
             token = response.json()
@@ -78,7 +85,14 @@ class KISClient:
             'tr_id': tr_id,
         }
         async with httpx.AsyncClient(base_url=self.base_url, timeout=15.0) as client:
-            response = await client.get(path, headers=headers, params=params)
+            response = await request_with_audit(
+                client,
+                'kis',
+                'GET',
+                path,
+                headers=headers,
+                params=params,
+            )
             if response.status_code >= 400:
                 raise RuntimeError(f'KIS request failed [{response.status_code}] {path}: {response.text}')
             return response.json()

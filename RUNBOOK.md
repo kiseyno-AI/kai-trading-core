@@ -16,6 +16,7 @@ What it does:
 - starts FastAPI via uvicorn on `127.0.0.1:8000` by default
 - if `UPSTREAM_BEARER_TOKEN` is set, all incoming API requests require `Authorization: Bearer <token>`
 - if `DB_AUTO_UPGRADE=true`, startup also runs Alembic migrations to `head`
+- if `API_REQUEST_LOGGING_ENABLED=true` and/or `UPSTREAM_HTTP_LOGGING_ENABLED=true`, the service writes rotating JSONL audit logs under `apps/api/var/log` by default
 
 ## Health checks
 - `GET /health`
@@ -78,6 +79,22 @@ Local overrides:
 - Set `EOD_AUTO_PYKRX_ENABLED=false` in `apps/api/.env` to disable the recurring scheduler.
 - Tune `EOD_AUTO_PYKRX_AFTER_CLOSE_MINUTES`, `EOD_AUTO_PYKRX_POLL_SECONDS`, `EOD_AUTO_PYKRX_MARKETS`, `EOD_AUTO_PYKRX_REFRESH_UNIVERSE`, `EOD_AUTO_PYKRX_STALE_RUN_MINUTES`, and `EOD_PYKRX_REQUEST_TIMEOUT_SECONDS` in `apps/api/.env`, then restart the API.
 - Use `GET /eod/status` to inspect the scheduler state and last result.
+
+## Audit logging
+
+- Default log directory: `apps/api/var/log`
+- Incoming API log file: `api-requests.log`
+- Outbound integration log file: `upstream-http.log`
+- Rotation uses `RotatingFileHandler` with `API_LOG_ROTATION_MAX_BYTES` and `API_LOG_ROTATION_BACKUP_COUNT`
+- Logged fields are metadata only: request ID, method, path/target URL, redacted query params, status, timing, content type/length, client IP, user agent, and error type/message when a call fails
+- Request and response bodies are omitted by default; secrets such as bearer tokens, API keys, app secrets, cookies, and token-like query params are redacted
+
+Local validation:
+
+1. From `apps/api`, start the API with `python -m uvicorn app.main:app --reload`
+2. Call `curl -i http://127.0.0.1:8000/health`
+3. Trigger an upstream-backed route such as `curl "http://127.0.0.1:8000/fx/koreaexim/rates?search_date=20260406&currency=USD"`
+4. Inspect `var/log/api-requests.log` and `var/log/upstream-http.log`
 
 ## Next ops step
 Set this up under a long-running process manager (LaunchAgent, systemd, pm2, or equivalent).
