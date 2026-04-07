@@ -153,6 +153,24 @@ class FakeDartClient:
             ],
         }
 
+    async def download_document(self, *, rcept_no):
+        self.document_args = {'rcept_no': rcept_no}
+        return {
+            'content': b'PK\x03\x04document',
+            'content_type': 'application/zip',
+            'filename': 'original.zip',
+            'size_bytes': len(b'PK\x03\x04document'),
+        }
+
+    async def download_xbrl(self, *, rcept_no, reprt_code=None):
+        self.xbrl_args = {'rcept_no': rcept_no, 'reprt_code': reprt_code}
+        return {
+            'content': b'PK\x03\x04xbrl',
+            'content_type': 'application/octet-stream',
+            'filename': 'xbrl.zip',
+            'size_bytes': len(b'PK\x03\x04xbrl'),
+        }
+
 
 class DartServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_company_snapshot_combines_lookup_company_and_filings(self):
@@ -214,6 +232,30 @@ class DartServiceTests(unittest.IsolatedAsyncioTestCase):
                 period='annual',
                 report_code='11013',
             )
+
+    async def test_get_filing_document_returns_download_metadata(self):
+        client = FakeDartClient()
+        service = DartService(client=client)
+
+        result = await service.get_filing_document(rcept_no='20260407000001')
+
+        self.assertEqual(client.document_args['rcept_no'], '20260407000001')
+        self.assertEqual(result['artifact_type'], 'original_document')
+        self.assertEqual(result['filename'], 'original.zip')
+        self.assertEqual(result['size_bytes'], len(b'PK\x03\x04document'))
+
+    async def test_get_filing_xbrl_normalizes_report_code(self):
+        client = FakeDartClient()
+        service = DartService(client=client)
+
+        result = await service.get_filing_xbrl(
+            rcept_no='20260407000001',
+            report_code='11011',
+        )
+
+        self.assertEqual(client.xbrl_args['reprt_code'], '11011')
+        self.assertEqual(result['artifact_type'], 'xbrl')
+        self.assertEqual(result['report_code'], '11011')
 
     def test_build_fundamentals_dataset_matches_financial_industry_variants(self):
         dataset = build_fundamentals_dataset(

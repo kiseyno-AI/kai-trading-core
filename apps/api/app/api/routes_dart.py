@@ -2,6 +2,7 @@ from datetime import date
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import Response
 
 from app.core.settings import settings
 from app.dart.fundamentals_capture_service import dart_fundamentals_capture_service
@@ -177,6 +178,40 @@ async def backfill_dart_fundamentals_for_current_universe(
         raise HTTPException(status_code=500, detail=f'DART current-universe backfill failed: {exc}') from exc
 
 
+@router.get('/filings/document')
+async def download_dart_filing_document(
+    rcept_no: str = Query(..., min_length=14, max_length=14),
+) -> Response:
+    try:
+        artifact = await dart_service.get_filing_document(rcept_no=rcept_no)
+        return _build_binary_response(artifact)
+    except DartAPIError as exc:
+        raise HTTPException(status_code=502, detail=f'DART request failed: {exc}') from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'DART filing document download failed: {exc}') from exc
+
+
+@router.get('/filings/xbrl')
+async def download_dart_filing_xbrl(
+    rcept_no: str = Query(..., min_length=14, max_length=14),
+    report_code: Optional[str] = Query(default=None),
+) -> Response:
+    normalized_report_code = _normalize_report_code(report_code)
+
+    try:
+        artifact = await dart_service.get_filing_xbrl(
+            rcept_no=rcept_no,
+            report_code=normalized_report_code,
+        )
+        return _build_binary_response(artifact)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except DartAPIError as exc:
+        raise HTTPException(status_code=502, detail=f'DART request failed: {exc}') from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'DART XBRL download failed: {exc}') from exc
+
+
 def _resolve_business_year(*, business_year: Optional[int], fiscal_year: Optional[int]) -> int:
     if business_year is None and fiscal_year is None:
         raise HTTPException(status_code=400, detail='One of business_year or fiscal_year is required')
@@ -209,3 +244,16 @@ def _normalize_fs_div(fs_div: Optional[str]) -> Optional[str]:
     if normalized_fs_div not in VALID_FS_DIVS:
         raise HTTPException(status_code=400, detail='fs_div must be one of CFS or OFS')
     return normalized_fs_div
+
+
+def _build_binary_response(artifact: dict) -> Response:
+    return Response(
+        content=artifact['content'],
+        media_type=artifact['content_type'],
+        headers={
+            'Content-Disposition': f'attachment; filename="{artifact["filename"]}"',
+            'Content-Length': str(artifact['size_bytes']),
+            'X-DART-Artifact-Type': artifact['artifact_type'],
+            'X-DART-Receipt-No': artifact['rcept_no'],
+        },
+    )

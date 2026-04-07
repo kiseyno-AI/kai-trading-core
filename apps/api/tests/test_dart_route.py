@@ -41,6 +41,27 @@ class FakeRouteService:
             'statements': {'count': 0, 'items': []},
         }
 
+    async def get_filing_document(self, **kwargs):
+        return {
+            'rcept_no': kwargs['rcept_no'],
+            'artifact_type': 'original_document',
+            'content': b'PK\x03\x04document',
+            'content_type': 'application/zip',
+            'filename': 'original.zip',
+            'size_bytes': len(b'PK\x03\x04document'),
+        }
+
+    async def get_filing_xbrl(self, **kwargs):
+        return {
+            'rcept_no': kwargs['rcept_no'],
+            'artifact_type': 'xbrl',
+            'report_code': kwargs.get('report_code'),
+            'content': b'PK\x03\x04xbrl',
+            'content_type': 'application/octet-stream',
+            'filename': 'xbrl.zip',
+            'size_bytes': len(b'PK\x03\x04xbrl'),
+        }
+
 
 class FakeSyncService:
     async def sync_recent_disclosures(self, **kwargs):
@@ -100,6 +121,12 @@ class UpstreamErrorService:
         raise DartAPIError('DART upstream unavailable')
 
     async def get_fundamentals(self, **kwargs):
+        raise DartAPIError('DART upstream unavailable')
+
+    async def get_filing_document(self, **kwargs):
+        raise DartAPIError('DART upstream unavailable')
+
+    async def get_filing_xbrl(self, **kwargs):
         raise DartAPIError('DART upstream unavailable')
 
 
@@ -335,6 +362,67 @@ class DartRouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 400)
         self.assertIn('effective_start_date', response.json()['detail'])
+
+    def test_filing_document_route_returns_binary_payload(self):
+        original_service = routes_dart.dart_service
+        routes_dart.dart_service = FakeRouteService()
+        try:
+            client = TestClient(self.app)
+            response = client.get(
+                '/disclosures/dart/filings/document',
+                params={'rcept_no': '20260407000001'},
+            )
+        finally:
+            routes_dart.dart_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.content, b'PK\x03\x04document')
+        self.assertEqual(response.headers['x-dart-artifact-type'], 'original_document')
+        self.assertIn('original.zip', response.headers['content-disposition'])
+
+    def test_filing_xbrl_route_validates_report_code(self):
+        client = TestClient(self.app)
+        response = client.get(
+            '/disclosures/dart/filings/xbrl',
+            params={'rcept_no': '20260407000001', 'report_code': '99999'},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.json()['detail'],
+            'report_code must be one of 11011, 11012, 11013, 11014',
+        )
+
+    def test_filing_xbrl_route_returns_binary_payload(self):
+        original_service = routes_dart.dart_service
+        routes_dart.dart_service = FakeRouteService()
+        try:
+            client = TestClient(self.app)
+            response = client.get(
+                '/disclosures/dart/filings/xbrl',
+                params={'rcept_no': '20260407000001', 'report_code': '11011'},
+            )
+        finally:
+            routes_dart.dart_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.content, b'PK\x03\x04xbrl')
+        self.assertEqual(response.headers['x-dart-artifact-type'], 'xbrl')
+
+    def test_filing_document_route_maps_upstream_errors_to_502(self):
+        original_service = routes_dart.dart_service
+        routes_dart.dart_service = UpstreamErrorService()
+        try:
+            client = TestClient(self.app)
+            response = client.get(
+                '/disclosures/dart/filings/document',
+                params={'rcept_no': '20260407000001'},
+            )
+        finally:
+            routes_dart.dart_service = original_service
+
+        self.assertEqual(response.status_code, 502)
+        self.assertIn('DART request failed', response.json()['detail'])
 
 
 if __name__ == '__main__':
