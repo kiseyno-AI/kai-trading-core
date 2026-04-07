@@ -95,7 +95,7 @@ class AuditLoggingTests(unittest.IsolatedAsyncioTestCase):
                     'test_service',
                     'GET',
                     'https://example.test/resource',
-                    params={'api_key': 'secret', 'symbol': '005930'},
+                    params={'authkey': 'secret', 'symbol': '005930'},
                     headers={'Authorization': 'Bearer upstream-secret'},
                 )
         finally:
@@ -106,11 +106,30 @@ class AuditLoggingTests(unittest.IsolatedAsyncioTestCase):
 
         event = self._read_log_lines('upstream-http.log')[-1]
         self.assertEqual(event['service'], 'test_service')
-        self.assertIn('api_key=%5BREDACTED%5D', event['url'])
+        self.assertIn('authkey=%5BREDACTED%5D', event['url'])
         self.assertIn('symbol=005930', event['url'])
         self.assertEqual(event['request_headers']['authorization'], '[REDACTED]')
         self.assertEqual(event['request_headers']['x-request-id'], 'req-upstream-1')
         self.assertEqual(event['status_code'], 200)
+
+    async def test_upstream_logging_redacts_secret_values_embedded_in_path(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={}, request=request)
+
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            response = await audit_logging.request_with_audit(
+                client,
+                'bok_ecos',
+                'GET',
+                'https://ecos.example.test/api/StatisticSearch/test-key/json/kr/1/100/STAT123/M/202401/202403',
+                secret_values=['test-key'],
+            )
+
+        self.assertEqual(response.status_code, 200)
+
+        event = self._read_log_lines('upstream-http.log')[-1]
+        self.assertIn('/StatisticSearch/[REDACTED]/json/', event['url'])
 
     async def test_download_logging_records_non_httpx_upstream_calls(self):
         class FakeResponse:

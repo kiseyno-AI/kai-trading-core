@@ -6,7 +6,7 @@ import time
 from contextvars import ContextVar
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
@@ -26,6 +26,7 @@ _SENSITIVE_KEYS = {
     'appkey',
     'appsecret',
     'auth',
+    'authkey',
     'authorization',
     'cookie',
     'crtfc_key',
@@ -75,14 +76,20 @@ def redact_mapping(values: Mapping[str, Any] | None) -> dict[str, Any]:
     return redacted
 
 
-def redact_url(url: str) -> str:
+def redact_url(url: str, *, secret_values: Iterable[str] | None = None) -> str:
     parsed = urlsplit(url)
     if not parsed.query:
-        return url
-    query = []
-    for key, value in parse_qsl(parsed.query, keep_blank_values=True):
-        query.append((key, '[REDACTED]' if _is_sensitive_key(key) else value))
-    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(query), parsed.fragment))
+        redacted_url = url
+    else:
+        query = []
+        for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+            query.append((key, '[REDACTED]' if _is_sensitive_key(key) else value))
+        redacted_url = urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(query), parsed.fragment))
+
+    for secret_value in secret_values or ():
+        if secret_value:
+            redacted_url = redacted_url.replace(secret_value, '[REDACTED]')
+    return redacted_url
 
 
 def sanitize_headers(headers: Mapping[str, str] | None) -> dict[str, Any]:
@@ -235,6 +242,7 @@ async def request_with_audit(
     headers: Mapping[str, str] | None = None,
     params: Mapping[str, Any] | None = None,
     json_body: Any = None,
+    secret_values: Iterable[str] | None = None,
 ) -> httpx.Response:
     request_headers = dict(headers or {})
     if get_request_id() and 'X-Request-ID' not in request_headers:
@@ -253,7 +261,7 @@ async def request_with_audit(
         raise
     finally:
         duration_ms = (time.perf_counter() - started_at) * 1000
-        sanitized_url = redact_url(str(request.url))
+        sanitized_url = redact_url(str(request.url), secret_values=secret_values)
         payload = {
             'event': 'upstream_request',
             'request_id': get_request_id(),

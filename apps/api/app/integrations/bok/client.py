@@ -58,7 +58,13 @@ class ECOSClient:
 
         url = f"{self.base_url}/{'/'.join(path_parts)}"
         async with httpx.AsyncClient(timeout=20.0) as client:
-            response = await request_with_audit(client, 'bok_ecos', 'GET', url)
+            response = await request_with_audit(
+                client,
+                'bok_ecos',
+                'GET',
+                url,
+                secret_values=[self.api_key],
+            )
             if response.status_code >= 400:
                 raise ECOSAPIError(f'ECOS request failed [{response.status_code}]: {response.text}')
 
