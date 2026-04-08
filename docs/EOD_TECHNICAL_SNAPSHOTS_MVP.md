@@ -73,6 +73,11 @@ Current signal set:
    - direct internal service call
    - CLI rerun `python3.11 -m app.eod.technical_snapshots --market-date YYYY-MM-DD`
 
+Retry semantics:
+
+- A pykrx EOD run is only marked `completed` when both bar persistence and technical snapshot persistence finish without failures.
+- If any technical snapshot rows fail, the EOD run is marked `completed_with_errors`, which keeps `run-if-due` retryable on the next invocation instead of silently skipping the snapshot gap forever.
+
 ## Operational use today
 
 After today’s EOD is available, the preferred path is:

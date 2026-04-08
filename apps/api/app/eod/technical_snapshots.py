@@ -120,7 +120,7 @@ class DailyTechnicalSnapshotService:
         average_volume_20d = _average(volumes[-20:]) if len(volumes) >= 20 else None
         volume_ratio_20d = _round((volumes[-1] / average_volume_20d) if average_volume_20d not in (None, 0) else None)
 
-        trailing_20 = bars[-21:-1]
+        trailing_20 = bars[-21:-1] if len(bars) >= 21 else []
         prior_high_20 = max((float(item['high_price']) for item in trailing_20), default=None)
         prior_low_20 = min((float(item['low_price']) for item in trailing_20), default=None)
         close_price = int(latest['close_price'])
