@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 
 from sqlalchemy import delete, func, select, text, update
@@ -630,6 +630,56 @@ def load_daily_bars_for_symbol(
         return items
 
 
+def load_daily_bars_for_symbol_range(
+    symbol: str,
+    *,
+    start_date: str | date | None = None,
+    end_date: str | date | None = None,
+    limit: int | None = None,
+) -> list[dict]:
+    with session_scope() as session:
+        descending_window = limit is not None
+        stmt = (
+            select(
+                DailyPriceBar.trade_date,
+                DailyPriceBar.open_price,
+                DailyPriceBar.high_price,
+                DailyPriceBar.low_price,
+                DailyPriceBar.close_price,
+                DailyPriceBar.volume,
+                DailyPriceBar.turnover,
+                DailyPriceBar.source,
+                DailyPriceBar.captured_at,
+            )
+            .join(Symbol, Symbol.id == DailyPriceBar.symbol_id)
+            .where(Symbol.symbol == symbol)
+            .order_by(DailyPriceBar.trade_date.desc() if descending_window else DailyPriceBar.trade_date.asc())
+        )
+        if start_date is not None:
+            stmt = stmt.where(DailyPriceBar.trade_date >= _normalize_trade_date(start_date))
+        if end_date is not None:
+            stmt = stmt.where(DailyPriceBar.trade_date <= _normalize_trade_date(end_date))
+        if limit is not None:
+            stmt = stmt.limit(limit)
+
+        rows = session.execute(stmt).all()
+        ordered_rows = reversed(rows) if descending_window else rows
+        return [
+            {
+                'trade_date': row.trade_date.isoformat(),
+                'open_price': int(row.open_price),
+                'high_price': int(row.high_price),
+                'low_price': int(row.low_price),
+                'close_price': int(row.close_price),
+                'volume': int(row.volume),
+                'turnover': int(row.turnover),
+                'source': row.source,
+                'captured_at': row.captured_at.isoformat() if row.captured_at else None,
+            }
+            for row in ordered_rows
+        ]
+
+
 def upsert_daily_technical_snapshot(snapshot: dict, *, run_id: int | None = None) -> None:
     refreshed_at = datetime.utcnow()
     with session_scope() as session:
@@ -698,17 +748,50 @@ def load_daily_technical_snapshots(
     market_date: str | date,
     symbols: list[str] | None = None,
     limit: int = 100,
+    fallback_window_days: int = 0,
 ) -> list[dict]:
+    normalized_market_date = _normalize_trade_date(market_date)
     with session_scope() as session:
-        stmt = (
-            select(DailyTechnicalSnapshot, Symbol.symbol)
-            .join(Symbol, Symbol.id == DailyTechnicalSnapshot.symbol_id)
-            .where(DailyTechnicalSnapshot.market_date == _normalize_trade_date(market_date))
-            .order_by(Symbol.symbol.asc())
-            .limit(limit)
-        )
-        if symbols:
-            stmt = stmt.where(Symbol.symbol.in_(symbols))
+        if fallback_window_days > 0:
+            ranked = (
+                select(
+                    DailyTechnicalSnapshot.id.label('snapshot_id'),
+                    func.row_number()
+                    .over(
+                        partition_by=Symbol.symbol,
+                        order_by=(
+                            DailyTechnicalSnapshot.market_date.desc(),
+                            DailyTechnicalSnapshot.id.desc(),
+                        ),
+                    )
+                    .label('symbol_rank'),
+                )
+                .join(Symbol, Symbol.id == DailyTechnicalSnapshot.symbol_id)
+                .where(DailyTechnicalSnapshot.market_date <= normalized_market_date)
+                .where(DailyTechnicalSnapshot.market_date >= normalized_market_date - timedelta(days=fallback_window_days))
+            )
+            if symbols:
+                ranked = ranked.where(Symbol.symbol.in_(symbols))
+            ranked_subquery = ranked.subquery()
+
+            stmt = (
+                select(DailyTechnicalSnapshot, Symbol.symbol)
+                .join(Symbol, Symbol.id == DailyTechnicalSnapshot.symbol_id)
+                .join(ranked_subquery, DailyTechnicalSnapshot.id == ranked_subquery.c.snapshot_id)
+                .where(ranked_subquery.c.symbol_rank <= 1)
+                .order_by(Symbol.symbol.asc())
+                .limit(limit)
+            )
+        else:
+            stmt = (
+                select(DailyTechnicalSnapshot, Symbol.symbol)
+                .join(Symbol, Symbol.id == DailyTechnicalSnapshot.symbol_id)
+                .where(DailyTechnicalSnapshot.market_date == normalized_market_date)
+                .order_by(Symbol.symbol.asc())
+                .limit(limit)
+            )
+            if symbols:
+                stmt = stmt.where(Symbol.symbol.in_(symbols))
 
         rows = session.execute(stmt).all()
         return [
