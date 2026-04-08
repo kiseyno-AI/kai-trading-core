@@ -10,6 +10,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from app.db import engine, session_scope
 from app.db_models import (
     CurrentQuoteCache,
+    DailyActionSummary,
     DailyPriceBar,
     DailyTechnicalSnapshot,
     EODCollectionRun,
@@ -727,4 +728,150 @@ def load_daily_technical_snapshots(
                 'captured_at': snapshot.captured_at.isoformat() if snapshot.captured_at else None,
             }
             for snapshot, symbol in rows
+        ]
+
+
+
+def load_daily_technical_snapshot_inputs(
+    *,
+    market_date: str | date,
+    symbols: list[str] | None = None,
+    limit: int = 100,
+) -> list[dict]:
+    with session_scope() as session:
+        stmt = (
+            select(DailyTechnicalSnapshot, Symbol.symbol)
+            .join(Symbol, Symbol.id == DailyTechnicalSnapshot.symbol_id)
+            .where(DailyTechnicalSnapshot.market_date == _normalize_trade_date(market_date))
+            .order_by(Symbol.symbol.asc())
+            .limit(limit)
+        )
+        if symbols:
+            stmt = stmt.where(Symbol.symbol.in_(symbols))
+
+        rows = session.execute(stmt).all()
+        return [
+            {
+                'technical_snapshot_id': snapshot.id,
+                'symbol': symbol,
+                'market_date': snapshot.market_date.isoformat(),
+                'source': snapshot.source,
+                'close_price': int(snapshot.close_price),
+                'volume': int(snapshot.volume),
+                'trend_state': snapshot.trend_state,
+                'ma_alignment': snapshot.ma_alignment,
+                'breakout_20d': snapshot.breakout_20d,
+                'breakdown_20d': snapshot.breakdown_20d,
+                'return_5d': _decimal_to_float(snapshot.return_5d),
+                'return_20d': _decimal_to_float(snapshot.return_20d),
+                'volume_ratio_20d': _decimal_to_float(snapshot.volume_ratio_20d),
+                'atr_14': _decimal_to_float(snapshot.atr_14),
+                'atr_pct_14': _decimal_to_float(snapshot.atr_pct_14),
+                'signal_payload': snapshot.signal_payload,
+                'captured_at': snapshot.captured_at.isoformat() if snapshot.captured_at else None,
+            }
+            for snapshot, symbol in rows
+        ]
+
+
+def upsert_daily_action_summary(summary: dict, *, run_id: int | None = None) -> None:
+    refreshed_at = datetime.utcnow()
+    with session_scope() as session:
+        symbol = _get_symbol(session, summary['symbol'])
+        if symbol is None:
+            symbol = Symbol(
+                symbol=summary['symbol'],
+                market='KRX',
+                name_ko=summary['symbol'],
+                instrument_type='equity',
+                source=summary.get('source', 'pykrx'),
+                is_active=True,
+                last_refreshed_at=refreshed_at,
+            )
+            session.add(symbol)
+            session.flush()
+
+        values = {
+            'symbol_id': symbol.id,
+            'technical_snapshot_id': summary.get('technical_snapshot_id'),
+            'eod_run_id': run_id,
+            'market_date': _normalize_trade_date(summary['market_date']),
+            'source': summary.get('source', 'pykrx'),
+            'action_label': summary['action_label'],
+            'bias_direction': summary['bias_direction'],
+            'signal_score': int(summary['signal_score']),
+            'confidence_tier': summary['confidence_tier'],
+            'risk_tier': summary['risk_tier'],
+            'trigger_price': summary.get('trigger_price'),
+            'invalidation_price': summary.get('invalidation_price'),
+            'support_price': summary.get('support_price'),
+            'resistance_price': summary.get('resistance_price'),
+            'reasons': summary['reasons'],
+            'summary_payload': summary['summary_payload'],
+            'captured_at': refreshed_at,
+            'updated_at': refreshed_at,
+        }
+        statement = pg_insert(DailyActionSummary).values(values)
+        session.execute(
+            statement.on_conflict_do_update(
+                constraint='uq_daily_action_summaries_symbol_market_date',
+                set_={
+                    'technical_snapshot_id': statement.excluded.technical_snapshot_id,
+                    'eod_run_id': statement.excluded.eod_run_id,
+                    'source': statement.excluded.source,
+                    'action_label': statement.excluded.action_label,
+                    'bias_direction': statement.excluded.bias_direction,
+                    'signal_score': statement.excluded.signal_score,
+                    'confidence_tier': statement.excluded.confidence_tier,
+                    'risk_tier': statement.excluded.risk_tier,
+                    'trigger_price': statement.excluded.trigger_price,
+                    'invalidation_price': statement.excluded.invalidation_price,
+                    'support_price': statement.excluded.support_price,
+                    'resistance_price': statement.excluded.resistance_price,
+                    'reasons': statement.excluded.reasons,
+                    'summary_payload': statement.excluded.summary_payload,
+                    'captured_at': statement.excluded.captured_at,
+                    'updated_at': refreshed_at,
+                },
+            )
+        )
+
+
+def load_daily_action_summaries(
+    *,
+    market_date: str | date,
+    symbols: list[str] | None = None,
+    limit: int = 100,
+) -> list[dict]:
+    with session_scope() as session:
+        stmt = (
+            select(DailyActionSummary, Symbol.symbol)
+            .join(Symbol, Symbol.id == DailyActionSummary.symbol_id)
+            .where(DailyActionSummary.market_date == _normalize_trade_date(market_date))
+            .order_by(Symbol.symbol.asc())
+            .limit(limit)
+        )
+        if symbols:
+            stmt = stmt.where(Symbol.symbol.in_(symbols))
+
+        rows = session.execute(stmt).all()
+        return [
+            {
+                'symbol': symbol,
+                'market_date': summary.market_date.isoformat(),
+                'source': summary.source,
+                'action_label': summary.action_label,
+                'bias_direction': summary.bias_direction,
+                'signal_score': int(summary.signal_score),
+                'confidence_tier': summary.confidence_tier,
+                'risk_tier': summary.risk_tier,
+                'trigger_price': _decimal_to_float(summary.trigger_price),
+                'invalidation_price': _decimal_to_float(summary.invalidation_price),
+                'support_price': _decimal_to_float(summary.support_price),
+                'resistance_price': _decimal_to_float(summary.resistance_price),
+                'reasons': list(summary.reasons or []),
+                'summary_payload': summary.summary_payload,
+                'captured_at': summary.captured_at.isoformat() if summary.captured_at else None,
+            }
+            for summary, symbol in rows
         ]

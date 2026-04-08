@@ -3,6 +3,7 @@ import asyncio
 from fastapi import APIRouter, HTTPException
 
 from app.core.settings import settings
+from app.eod.action_summaries import daily_action_summary_service
 from app.eod.auto_pykrx import auto_pykrx_eod_scheduler
 from app.eod.master import refresh_master_if_due
 from app.eod.pykrx_backfill import DEFAULT_MARKETS, PYKRX_BACKFILL_SERVICE
@@ -151,3 +152,44 @@ async def inspect_daily_technical_snapshots(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f'Daily technical snapshot inspect failed: {exc}') from exc
+
+
+
+@router.post('/action-summaries/compute')
+async def compute_daily_action_summaries(
+    market_date: str,
+    symbols: str | None = None,
+    source: str = 'pykrx',
+) -> dict:
+    try:
+        parsed_symbols = [item.strip() for item in symbols.split(',') if item.strip()] if symbols else None
+        return await asyncio.to_thread(
+            daily_action_summary_service.compute_and_persist_for_market_date,
+            market_date=market_date,
+            symbols=parsed_symbols,
+            source=source,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f'Daily action summary compute failed: {exc}') from exc
+
+
+@router.get('/action-summaries')
+async def inspect_daily_action_summaries(
+    market_date: str,
+    symbols: str | None = None,
+    limit: int = 100,
+) -> dict:
+    try:
+        parsed_symbols = [item.strip() for item in symbols.split(',') if item.strip()] if symbols else None
+        return await asyncio.to_thread(
+            daily_action_summary_service.inspect,
+            market_date=market_date,
+            symbols=parsed_symbols,
+            limit=limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'Daily action summary inspect failed: {exc}') from exc
