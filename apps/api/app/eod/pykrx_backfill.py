@@ -15,6 +15,7 @@ from pykrx.website.comm import webio
 from app.core.audit_logging import log_fetch_event
 from app.core.settings import settings
 from app.eod.master import get_master_symbols
+from app.eod.technical_snapshots import daily_technical_snapshot_service
 from app.market_data_store import (
     advisory_eod_collection_lock,
     count_eod_run_persisted_symbols,
@@ -753,6 +754,12 @@ class PykrxBackfillService:
             symbols_failed=symbols_failed,
             error_message=None if not failed_symbols else f'Failed symbols: {",".join(failed_symbols[:20])}',
         )
+        technical_snapshot_result = daily_technical_snapshot_service.compute_and_persist_for_market_date(
+            market_date=latest_trade_date,
+            symbols=[item.symbol for item in symbols],
+            source='pykrx',
+            run_id=run_id,
+        )
         result = {
             'run_id': run_id,
             'source': 'pykrx',
@@ -766,6 +773,7 @@ class PykrxBackfillService:
             'symbols_failed': symbols_failed,
             'failed_symbols': failed_symbols[:50],
             'bars_upserted': bars_upserted,
+            'technical_snapshots': technical_snapshot_result,
             'refresh_universe': refresh_universe,
             'universe_snapshot': universe_snapshot,
         }

@@ -206,6 +206,10 @@ class PykrxBackfillServiceTests(TestCase):
             patch('app.eod.pykrx_backfill.create_eod_collection_run', return_value=12),
             patch('app.eod.pykrx_backfill._get_market_ohlcv_by_date', return_value=type('Frame', (), {'empty': False})()),
             patch('app.eod.pykrx_backfill.persist_daily_price_bars', return_value=1),
+            patch(
+                'app.eod.pykrx_backfill.daily_technical_snapshot_service.compute_and_persist_for_market_date',
+                return_value={'snapshots_persisted': 1, 'snapshots_failed': 0},
+            ) as technical_snapshots,
             patch('app.eod.pykrx_backfill.update_eod_collection_run_progress', side_effect=RuntimeError('progress write failed')),
             patch('app.eod.pykrx_backfill.complete_eod_collection_run') as complete_run,
         ):
@@ -217,6 +221,13 @@ class PykrxBackfillServiceTests(TestCase):
 
         self.assertEqual(result['status'], 'completed')
         self.assertEqual(result['symbols_succeeded'], 1)
+        self.assertEqual(result['technical_snapshots']['snapshots_persisted'], 1)
+        technical_snapshots.assert_called_once_with(
+            market_date='2026-04-03',
+            symbols=['005930'],
+            source='pykrx',
+            run_id=12,
+        )
         self.assertTrue(
             any(
                 call.kwargs.get('operation') == 'update_collection_progress'
@@ -249,6 +260,10 @@ class PykrxBackfillServiceTests(TestCase):
                 side_effect=RuntimeError('pykrx timeout'),
             ),
             patch('app.eod.pykrx_backfill.update_eod_collection_run_progress'),
+            patch(
+                'app.eod.pykrx_backfill.daily_technical_snapshot_service.compute_and_persist_for_market_date',
+                return_value={'snapshots_persisted': 0, 'snapshots_failed': 1},
+            ) as technical_snapshots,
             patch('app.eod.pykrx_backfill.complete_eod_collection_run'),
         ):
             result = service.run_backfill(
@@ -258,6 +273,12 @@ class PykrxBackfillServiceTests(TestCase):
             )
 
         self.assertEqual(result['status'], 'completed_with_errors')
+        technical_snapshots.assert_called_once_with(
+            market_date='2026-04-03',
+            symbols=['005930'],
+            source='pykrx',
+            run_id=12,
+        )
         self.assertTrue(
             any(
                 call.kwargs.get('operation') == 'fetch_symbol_ohlcv'

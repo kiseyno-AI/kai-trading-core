@@ -141,6 +141,30 @@ class DailyPriceBar(Base):
     captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
+class DailyTechnicalSnapshot(Base, TimestampMixin):
+    __tablename__ = 'daily_technical_snapshots'
+    __table_args__ = (UniqueConstraint('symbol_id', 'market_date', name='uq_daily_technical_snapshots_symbol_market_date'),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol_id: Mapped[int] = mapped_column(ForeignKey('symbols.id', ondelete='CASCADE'), nullable=False, index=True)
+    eod_run_id: Mapped[int | None] = mapped_column(ForeignKey('eod_collection_runs.id', ondelete='SET NULL'), index=True)
+    market_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default='pykrx')
+    close_price: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    volume: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    trend_state: Mapped[str] = mapped_column(String(32), nullable=False, default='insufficient_history', index=True)
+    ma_alignment: Mapped[str] = mapped_column(String(32), nullable=False, default='insufficient_history', index=True)
+    breakout_20d: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, index=True)
+    breakdown_20d: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, index=True)
+    return_5d: Mapped[float | None] = mapped_column(Numeric(12, 4))
+    return_20d: Mapped[float | None] = mapped_column(Numeric(12, 4))
+    volume_ratio_20d: Mapped[float | None] = mapped_column(Numeric(12, 4))
+    atr_14: Mapped[float | None] = mapped_column(Numeric(14, 4))
+    atr_pct_14: Mapped[float | None] = mapped_column(Numeric(12, 4))
+    signal_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
 class DartDisclosureSyncRun(Base):
     __tablename__ = 'dart_disclosure_sync_runs'
 

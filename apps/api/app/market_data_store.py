@@ -8,7 +8,16 @@ from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.db import engine, session_scope
-from app.db_models import CurrentQuoteCache, DailyPriceBar, EODCollectionRun, MarketStatusSnapshot, QuoteSnapshot, Symbol, TrackedSymbol
+from app.db_models import (
+    CurrentQuoteCache,
+    DailyPriceBar,
+    DailyTechnicalSnapshot,
+    EODCollectionRun,
+    MarketStatusSnapshot,
+    QuoteSnapshot,
+    Symbol,
+    TrackedSymbol,
+)
 from app.market.clock import MarketState
 
 
@@ -30,6 +39,12 @@ def _parse_datetime(value: str | None) -> datetime | None:
 
 def _as_decimal(value: float | int | str) -> Decimal:
     return Decimal(str(value))
+
+
+def _decimal_to_float(value) -> float | None:
+    if value is None:
+        return None
+    return float(value)
 
 
 def _get_symbol(session, symbol: str) -> Symbol | None:
@@ -558,3 +573,158 @@ def persist_daily_price_bars(
             )
         )
     return len(values)
+
+
+def list_symbols_with_daily_bar_on_date(trade_date: str) -> list[str]:
+    with session_scope() as session:
+        rows = session.execute(
+            select(Symbol.symbol)
+            .join(DailyPriceBar, DailyPriceBar.symbol_id == Symbol.id)
+            .where(DailyPriceBar.trade_date == _normalize_trade_date(trade_date))
+            .order_by(Symbol.symbol.asc())
+        ).all()
+        return [row[0] for row in rows]
+
+
+def load_daily_bars_for_symbol(
+    symbol: str,
+    *,
+    end_date: str | date,
+    limit: int = 60,
+) -> list[dict]:
+    with session_scope() as session:
+        rows = session.execute(
+            select(
+                DailyPriceBar.trade_date,
+                DailyPriceBar.open_price,
+                DailyPriceBar.high_price,
+                DailyPriceBar.low_price,
+                DailyPriceBar.close_price,
+                DailyPriceBar.volume,
+                DailyPriceBar.turnover,
+            )
+            .join(Symbol, Symbol.id == DailyPriceBar.symbol_id)
+            .where(
+                Symbol.symbol == symbol,
+                DailyPriceBar.trade_date <= _normalize_trade_date(end_date),
+            )
+            .order_by(DailyPriceBar.trade_date.desc())
+            .limit(limit)
+        ).all()
+        items = [
+            {
+                'trade_date': row.trade_date.isoformat(),
+                'open_price': int(row.open_price),
+                'high_price': int(row.high_price),
+                'low_price': int(row.low_price),
+                'close_price': int(row.close_price),
+                'volume': int(row.volume),
+                'turnover': int(row.turnover),
+            }
+            for row in reversed(rows)
+        ]
+        return items
+
+
+def upsert_daily_technical_snapshot(snapshot: dict, *, run_id: int | None = None) -> None:
+    refreshed_at = datetime.utcnow()
+    with session_scope() as session:
+        symbol = _get_symbol(session, snapshot['symbol'])
+        if symbol is None:
+            symbol = Symbol(
+                symbol=snapshot['symbol'],
+                market='KRX',
+                name_ko=snapshot['symbol'],
+                instrument_type='equity',
+                source=snapshot.get('source', 'pykrx'),
+                is_active=True,
+                last_refreshed_at=refreshed_at,
+            )
+            session.add(symbol)
+            session.flush()
+
+        values = {
+            'symbol_id': symbol.id,
+            'eod_run_id': run_id,
+            'market_date': _normalize_trade_date(snapshot['market_date']),
+            'source': snapshot.get('source', 'pykrx'),
+            'close_price': int(snapshot['close_price']),
+            'volume': int(snapshot['volume']),
+            'trend_state': snapshot['trend_state'],
+            'ma_alignment': snapshot['ma_alignment'],
+            'breakout_20d': bool(snapshot['breakout_20d']),
+            'breakdown_20d': bool(snapshot['breakdown_20d']),
+            'return_5d': snapshot.get('return_5d'),
+            'return_20d': snapshot.get('return_20d'),
+            'volume_ratio_20d': snapshot.get('volume_ratio_20d'),
+            'atr_14': snapshot.get('atr_14'),
+            'atr_pct_14': snapshot.get('atr_pct_14'),
+            'signal_payload': snapshot['signal_payload'],
+            'captured_at': refreshed_at,
+            'updated_at': refreshed_at,
+        }
+        statement = pg_insert(DailyTechnicalSnapshot).values(values)
+        session.execute(
+            statement.on_conflict_do_update(
+                constraint='uq_daily_technical_snapshots_symbol_market_date',
+                set_={
+                    'eod_run_id': statement.excluded.eod_run_id,
+                    'source': statement.excluded.source,
+                    'close_price': statement.excluded.close_price,
+                    'volume': statement.excluded.volume,
+                    'trend_state': statement.excluded.trend_state,
+                    'ma_alignment': statement.excluded.ma_alignment,
+                    'breakout_20d': statement.excluded.breakout_20d,
+                    'breakdown_20d': statement.excluded.breakdown_20d,
+                    'return_5d': statement.excluded.return_5d,
+                    'return_20d': statement.excluded.return_20d,
+                    'volume_ratio_20d': statement.excluded.volume_ratio_20d,
+                    'atr_14': statement.excluded.atr_14,
+                    'atr_pct_14': statement.excluded.atr_pct_14,
+                    'signal_payload': statement.excluded.signal_payload,
+                    'captured_at': statement.excluded.captured_at,
+                    'updated_at': refreshed_at,
+                },
+            )
+        )
+
+
+def load_daily_technical_snapshots(
+    *,
+    market_date: str | date,
+    symbols: list[str] | None = None,
+    limit: int = 100,
+) -> list[dict]:
+    with session_scope() as session:
+        stmt = (
+            select(DailyTechnicalSnapshot, Symbol.symbol)
+            .join(Symbol, Symbol.id == DailyTechnicalSnapshot.symbol_id)
+            .where(DailyTechnicalSnapshot.market_date == _normalize_trade_date(market_date))
+            .order_by(Symbol.symbol.asc())
+            .limit(limit)
+        )
+        if symbols:
+            stmt = stmt.where(Symbol.symbol.in_(symbols))
+
+        rows = session.execute(stmt).all()
+        return [
+            {
+                'symbol': symbol,
+                'market_date': snapshot.market_date.isoformat(),
+                'source': snapshot.source,
+                'close_price': int(snapshot.close_price),
+                'volume': int(snapshot.volume),
+                'trend_state': snapshot.trend_state,
+                'ma_alignment': snapshot.ma_alignment,
+                'breakout_20d': snapshot.breakout_20d,
+                'breakdown_20d': snapshot.breakdown_20d,
+                'return_5d': _decimal_to_float(snapshot.return_5d),
+                'return_20d': _decimal_to_float(snapshot.return_20d),
+                'volume_ratio_20d': _decimal_to_float(snapshot.volume_ratio_20d),
+                'atr_14': _decimal_to_float(snapshot.atr_14),
+                'atr_pct_14': _decimal_to_float(snapshot.atr_pct_14),
+                'signal_payload': snapshot.signal_payload,
+                'captured_at': snapshot.captured_at.isoformat() if snapshot.captured_at else None,
+            }
+            for snapshot, symbol in rows
+        ]

@@ -37,6 +37,8 @@ What it does:
 - `POST /eod/pykrx/universe/refresh`
 - `POST /eod/pykrx/backfill`
 - `POST /eod/pykrx/daily/run-if-due`
+- `POST /eod/technical-snapshots/compute`
+- `GET /eod/technical-snapshots`
 
 ## Current runtime expectations
 - Core server should stay up 24/7.
@@ -81,11 +83,14 @@ Useful limited-scope runs:
 - DART filing XBRL smoke test: `curl -OJ "http://127.0.0.1:8000/disclosures/dart/filings/xbrl?rcept_no=20260407000001&report_code=11011"`
 - ECOS series smoke test: `curl "http://127.0.0.1:8000/macro/ecos/series?stat_code=722Y001&cycle=M&start_period=202401&end_period=202403&item_code_1=0101000"`
 - API-triggered daily auto path: `curl -X POST "http://127.0.0.1:8000/eod/pykrx/daily/run-if-due?market_date=2026-04-03&force=true"`
+- Manual technical snapshot rerun after EOD: `python3.11 -m app.eod.technical_snapshots --market-date 2026-04-07`
+- API-triggered technical snapshot rerun: `curl -X POST "http://127.0.0.1:8000/eod/technical-snapshots/compute?market_date=2026-04-07"`
 
 Notes:
 
 - The pykrx path refreshes the active listed universe first, then backfills only those active symbols.
 - Automatic daily ingestion uses the same pykrx universe/backfill persistence path, but only for the resolved market date and only once per day unless forced or retrying a partial/failed run.
+- The automatic pykrx daily ingestion path now also persists `daily_technical_snapshots` after the day bar write completes.
 - Duplicate bar writes are harmless because `daily_price_bars` upserts on `(symbol_id, trade_date)`, and the scheduler checks `eod_collection_runs` plus a Postgres advisory lock before starting.
 - When pykrx market-wide universe endpoints are empty, the command falls back to the existing KIS master universe so delisted names are still excluded.
 - Historical bars use pykrx's default adjusted OHLCV series because long-range `adjusted=False` calls returned empty data during local verification.
