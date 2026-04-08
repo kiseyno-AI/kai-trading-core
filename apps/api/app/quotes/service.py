@@ -70,7 +70,7 @@ class QuoteService:
         payload: dict,
         *,
         symbol: str,
-        company_name: str,
+        company_name: str | None,
         market_state: str,
         source: str,
         fallback: bool,
@@ -83,7 +83,7 @@ class QuoteService:
     ) -> dict:
         marked = dict(payload)
         marked['symbol'] = symbol
-        marked['company_name'] = marked.get('company_name') or company_name
+        marked['company_name'] = marked.get('company_name') or company_name or symbol
         marked['market_state'] = market_state
         marked['source'] = source
         marked['fallback'] = fallback
@@ -95,7 +95,7 @@ class QuoteService:
         marked['unavailable_reason'] = unavailable_reason
         return marked
 
-    def _build_unavailable_quote(self, symbol: str, company_name: str, market_state: str, reason: str) -> dict:
+    def _build_unavailable_quote(self, symbol: str, market_state: str, reason: str) -> dict:
         logger.warning('No acceptable quote fallback for %s in market state %s: %s', symbol, market_state, reason)
         return self._mark_quote(
             {
@@ -107,7 +107,7 @@ class QuoteService:
                 'as_of': None,
             },
             symbol=symbol,
-            company_name=company_name,
+            company_name=None,
             market_state=market_state,
             source='unavailable',
             fallback=False,
@@ -116,7 +116,7 @@ class QuoteService:
             unavailable_reason=reason,
         )
 
-    def _load_same_day_cache_quote(self, symbol: str, market_date: date, market_state: str, company_name: str) -> dict | None:
+    def _load_same_day_cache_quote(self, symbol: str, market_date: date, market_state: str) -> dict | None:
         cached = quote_cache.get(symbol)
         cached_at = quote_cache.get_updated_at(symbol)
         cached_timestamp = _parse_iso_datetime(cached_at)
@@ -124,7 +124,7 @@ class QuoteService:
             return self._mark_quote(
                 cached,
                 symbol=symbol,
-                company_name=company_name,
+                company_name=None,
                 market_state=market_state,
                 source='cache',
                 fallback=True,
@@ -148,7 +148,7 @@ class QuoteService:
             return self._mark_quote(
                 persisted,
                 symbol=symbol,
-                company_name=company_name,
+                company_name=None,
                 market_state=market_state,
                 source='db_cache',
                 fallback=True,
@@ -161,7 +161,7 @@ class QuoteService:
             logger.warning('Ignoring stale current_quote_cache row for %s captured at %s', symbol, persisted_cached_at)
         return None
 
-    def _load_daily_bar_fallback(self, symbol: str, market_date: date, market_state: str, company_name: str) -> dict | None:
+    def _load_daily_bar_fallback(self, symbol: str, market_date: date, market_state: str) -> dict | None:
         try:
             bars = load_daily_bars_for_symbol(symbol, end_date=market_date, limit=2)
         except Exception as exc:
@@ -190,9 +190,13 @@ class QuoteService:
             )
             return None
 
-        previous_close = bars[-2]['close_price'] if len(bars) > 1 else latest_bar['open_price']
-        change = latest_bar['close_price'] - previous_close
-        change_pct = 0.0 if previous_close == 0 else (change / previous_close) * 100
+        if len(bars) > 1:
+            previous_close = bars[-2]['close_price']
+            change = latest_bar['close_price'] - previous_close
+            change_pct = 0.0 if previous_close == 0 else (change / previous_close) * 100
+        else:
+            change = None
+            change_pct = None
         return self._mark_quote(
             {
                 'price': latest_bar['close_price'],
@@ -203,7 +207,7 @@ class QuoteService:
                 'as_of': trade_date_text,
             },
             symbol=symbol,
-            company_name=company_name,
+            company_name=None,
             market_state=market_state,
             source='daily_price_bar',
             fallback=True,
@@ -215,7 +219,6 @@ class QuoteService:
     async def get_quote(self, symbol: str) -> dict:
         market = get_market_state()
         market_date = _market_calendar_date(market.server_time)
-        company_name = await self._resolve_company_name(symbol)
 
         if market.is_open:
             try:
@@ -224,7 +227,7 @@ class QuoteService:
                 logger.warning('Live quote fetch failed for %s: %s', symbol, exc)
             else:
                 normalized = normalize_kis_quote(symbol=symbol, raw=raw, market_state=market.state)
-                normalized['company_name'] = company_name
+                normalized['company_name'] = await self._resolve_company_name(symbol)
                 normalized['trade_date'] = market_date.isoformat()
                 normalized = quote_cache.set(symbol, normalized)
                 try:
@@ -234,7 +237,7 @@ class QuoteService:
                 return self._mark_quote(
                     normalized,
                     symbol=symbol,
-                    company_name=company_name,
+                    company_name=normalized.get('company_name'),
                     market_state=market.state,
                     source='kis',
                     fallback=False,
@@ -243,17 +246,16 @@ class QuoteService:
                     trade_date=market_date.isoformat(),
                 )
 
-        daily_bar_fallback = self._load_daily_bar_fallback(symbol, market_date, market.state, company_name)
+        daily_bar_fallback = self._load_daily_bar_fallback(symbol, market_date, market.state)
         if daily_bar_fallback:
             return daily_bar_fallback
 
-        same_day_cache = self._load_same_day_cache_quote(symbol, market_date, market.state, company_name)
+        same_day_cache = self._load_same_day_cache_quote(symbol, market_date, market.state)
         if same_day_cache:
             return same_day_cache
 
         return self._build_unavailable_quote(
             symbol,
-            company_name,
             market.state,
             'no_live_quote_or_fresh_fallback',
         )
@@ -267,11 +269,9 @@ class QuoteService:
                 items.append(await self.get_quote(symbol))
             except Exception as exc:
                 logger.warning('Tracked quote assembly failed for %s: %s', symbol, exc)
-                company_name = await self._resolve_company_name(symbol)
                 items.append(
                     self._build_unavailable_quote(
                         symbol,
-                        company_name,
                         market.state,
                         'tracked_quote_service_error',
                     )

@@ -39,10 +39,11 @@ class QuoteServiceTests(unittest.IsolatedAsyncioTestCase):
             'as_of': '153000',
         }
         quote_cache.updated_at['005930'] = '2026-04-03T15:31:00+09:00'
+        resolve_company_name = AsyncMock(return_value='Samsung Electronics')
 
         with (
             patch('app.quotes.service.get_market_state', return_value=market_state),
-            patch.object(service, '_resolve_company_name', new=AsyncMock(return_value='Samsung Electronics')),
+            patch.object(service, '_resolve_company_name', new=resolve_company_name),
             patch('app.quotes.service.load_daily_bars_for_symbol', return_value=[
                 {
                     'trade_date': '2026-04-07',
@@ -74,6 +75,7 @@ class QuoteServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result['fallback'])
         self.assertTrue(result['available'])
         self.assertEqual(result['fallback_reason'], 'daily_price_bar_current_trade_date')
+        resolve_company_name.assert_not_called()
 
     async def test_get_quote_marks_unavailable_when_only_stale_cache_exists(self) -> None:
         service = QuoteService()
@@ -97,10 +99,11 @@ class QuoteServiceTests(unittest.IsolatedAsyncioTestCase):
             'as_of': '153000',
         }
         quote_cache.updated_at['005930'] = '2026-04-03T15:31:00+09:00'
+        resolve_company_name = AsyncMock(return_value='Samsung Electronics')
 
         with (
             patch('app.quotes.service.get_market_state', return_value=market_state),
-            patch.object(service, '_resolve_company_name', new=AsyncMock(return_value='Samsung Electronics')),
+            patch.object(service, '_resolve_company_name', new=resolve_company_name),
             patch('app.quotes.service.load_daily_bars_for_symbol', return_value=[]),
             patch('app.quotes.service.load_current_quote', return_value={
                 'symbol': '005930',
@@ -120,6 +123,7 @@ class QuoteServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['price'], None)
         self.assertFalse(result['available'])
         self.assertEqual(result['unavailable_reason'], 'no_live_quote_or_fresh_fallback')
+        resolve_company_name.assert_not_called()
 
     async def test_get_quote_uses_recent_previous_daily_bar_for_preopen(self) -> None:
         service = QuoteService()
@@ -133,9 +137,11 @@ class QuoteServiceTests(unittest.IsolatedAsyncioTestCase):
             session_close_at='2026-04-13T15:30:00+09:00',
         )
 
+        resolve_company_name = AsyncMock(return_value='Samsung Electronics')
+
         with (
             patch('app.quotes.service.get_market_state', return_value=market_state),
-            patch.object(service, '_resolve_company_name', new=AsyncMock(return_value='Samsung Electronics')),
+            patch.object(service, '_resolve_company_name', new=resolve_company_name),
             patch('app.quotes.service.load_daily_bars_for_symbol', return_value=[
                 {
                     'trade_date': '2026-04-10',
@@ -154,6 +160,34 @@ class QuoteServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['trade_date'], '2026-04-10')
         self.assertEqual(result['fallback_reason'], 'daily_price_bar_recent_previous_trade_date')
         self.assertTrue(result['available'])
+        self.assertEqual(result['change'], None)
+        self.assertEqual(result['change_pct'], None)
+        resolve_company_name.assert_not_called()
+
+    async def test_get_quote_resolves_company_name_for_selected_live_quote(self) -> None:
+        service = QuoteService()
+        market_state = MarketState(
+            market='KRX',
+            state='OPEN',
+            is_trading_day=True,
+            is_open=True,
+            server_time='2026-04-08T10:15:00+09:00',
+            session_open_at='2026-04-08T09:00:00+09:00',
+            session_close_at='2026-04-08T15:30:00+09:00',
+        )
+        resolve_company_name = AsyncMock(return_value='Samsung Electronics')
+
+        with (
+            patch('app.quotes.service.get_market_state', return_value=market_state),
+            patch.object(service, '_resolve_company_name', new=resolve_company_name),
+            patch.object(service.client, 'fetch_domestic_quote', new=AsyncMock(return_value={'output': {'stck_prpr': '61500'}})),
+            patch('app.quotes.service.persist_quote_snapshot'),
+        ):
+            result = await service.get_quote('005930')
+
+        self.assertEqual(result['source'], 'kis')
+        self.assertEqual(result['company_name'], 'Samsung Electronics')
+        resolve_company_name.assert_awaited_once_with('005930')
 
 
 if __name__ == '__main__':
