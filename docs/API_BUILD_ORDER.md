@@ -57,6 +57,15 @@
 - The pykrx daily EOD path computes and persists these snapshots after daily bar persistence completes, so downstream agents can consume stored data rather than recomputing chart state ad hoc.
 - For manual reruns after an EOD capture, use `python3.11 -m app.eod.technical_snapshots --market-date YYYY-MM-DD` from `apps/api`.
 
+## Quote fallback notes
+- `GET /quotes/{symbol}` and `GET /quotes/tracked` now expose explicit quote provenance through `source`, `fallback`, `available`, `fallback_reason`, `unavailable_reason`, `cached_at`, and `trade_date`.
+- Freshness policy is deliberate:
+  - live KIS quote first
+  - then current-market-date `daily_price_bars`
+  - then same-day `quote_cache` or `current_quote_cache`
+  - otherwise `available: false`
+- Multi-day stale quote cache must not be surfaced as if it were a current quote.
+
 ## EOD action summary notes
 - `daily_action_summaries` is the DB-backed rules and scoring layer keyed by `symbol_id + market_date`, reading only stored `daily_technical_snapshots`.
 - The current summary contract is deterministic and machine-friendly: `action_label`, `bias_direction`, `signal_score`, `confidence_tier`, `risk_tier`, `reasons`, and trigger, invalidation, support, and resistance levels.

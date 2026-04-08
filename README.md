@@ -202,8 +202,15 @@ Interactive docs when the server is running:
 | Method | Path | Query / body | Description |
 |--------|------|----------------|-------------|
 | `GET` | `/market/status` | - | Current market state |
-| `GET` | `/quotes/tracked` | - | Quotes for tracked scanner symbols |
-| `GET` | `/quotes/{symbol}` | path symbol | Single-symbol quote |
+| `GET` | `/quotes/tracked` | - | Quotes for tracked scanner symbols with explicit fallback provenance |
+| `GET` | `/quotes/{symbol}` | path symbol | Single-symbol quote with explicit fallback provenance |
+
+Quote fallback policy:
+- Prefer live KIS quote data when the market is open and the upstream call succeeds.
+- If live data is unavailable, prefer DB-backed `daily_price_bars` for the current market date.
+- In `PREOPEN` or `WEEKEND`, allow the most recent `daily_price_bars` row only when it is within 3 calendar days of the Seoul market date.
+- Same-day in-memory or `current_quote_cache` fallbacks are allowed only when their `cached_at` timestamp matches the current Seoul market date.
+- Multi-day stale quote cache is rejected. When no acceptable fresh fallback exists, quote responses return `available: false`, `source: "unavailable"`, and an `unavailable_reason` instead of misleading stale numbers.
 
 ### Scanner (`/scanner`)
 
