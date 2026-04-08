@@ -56,6 +56,18 @@ Authorization: Bearer <same token>
 
 If `UPSTREAM_BEARER_TOKEN` is unset or empty, the API accepts requests without a bearer token, which is typical for local development.
 
+For local orchestration on the same machine, prefer direct internal commands from `apps/api` instead of looping back through `http://127.0.0.1:8000`:
+
+```bash
+python3.11 -m app.internal.ops market-status
+python3.11 -m app.internal.ops quotes-tracked
+python3.11 -m app.internal.ops scanner-tracked-symbols
+python3.11 -m app.internal.ops eod-status
+python3.11 -m app.internal.ops eod-pykrx-daily-run-if-due --market-date 2026-04-08 --force
+```
+
+Those commands call the repo services directly, so they do not fail on bearer middleware. If an internal integration must stay on HTTP, use `app.internal.http_client.InternalAPIClient`, which automatically sends the configured bearer token.
+
 ## Data flow overview
 
 ### 1. Instrument master and quote layer

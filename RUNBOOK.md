@@ -15,6 +15,7 @@ What it does:
 - loads `apps/api/.env`
 - starts FastAPI via uvicorn on `127.0.0.1:8000` by default
 - if `UPSTREAM_BEARER_TOKEN` is set, all incoming API requests require `Authorization: Bearer <token>`
+- local orchestration should prefer `python3.11 -m app.internal.ops ...` over raw localhost `curl` so bearer auth does not break internal jobs
 - if `DB_AUTO_UPGRADE=true`, startup also runs Alembic migrations to `head`
 - if `API_REQUEST_LOGGING_ENABLED=true` and/or `UPSTREAM_HTTP_LOGGING_ENABLED=true`, the service writes rotating JSONL audit logs under `apps/api/var/log` by default
 
@@ -85,10 +86,25 @@ Useful limited-scope runs:
 - DART filing XBRL smoke test: `curl -OJ "http://127.0.0.1:8000/disclosures/dart/filings/xbrl?rcept_no=20260407000001&report_code=11011"`
 - ECOS series smoke test: `curl "http://127.0.0.1:8000/macro/ecos/series?stat_code=722Y001&cycle=M&start_period=202401&end_period=202403&item_code_1=0101000"`
 - API-triggered daily auto path: `curl -X POST "http://127.0.0.1:8000/eod/pykrx/daily/run-if-due?market_date=2026-04-03&force=true"`
+- Preferred internal daily auto path: `python3.11 -m app.internal.ops eod-pykrx-daily-run-if-due --market-date 2026-04-03 --force`
 - Manual technical snapshot rerun after EOD: `python3.11 -m app.eod.technical_snapshots --market-date 2026-04-07`
 - Manual action summary rerun after EOD: `python3.11 -m app.eod.action_summaries --market-date 2026-04-07`
 - API-triggered technical snapshot rerun: `curl -X POST "http://127.0.0.1:8000/eod/technical-snapshots/compute?market_date=2026-04-07"`
 - API-triggered action summary rerun: `curl -X POST "http://127.0.0.1:8000/eod/action-summaries/compute?market_date=2026-04-07"`
+
+Internal ops commands from `apps/api`:
+
+- `python3.11 -m app.internal.ops market-status`
+- `python3.11 -m app.internal.ops quotes-tracked`
+- `python3.11 -m app.internal.ops scanner-tracked-symbols`
+- `python3.11 -m app.internal.ops eod-status`
+- `python3.11 -m app.internal.ops eod-master-refresh-if-due --force`
+- `python3.11 -m app.internal.ops eod-pykrx-daily-run-if-due --market-date 2026-04-08 --force`
+
+Notes:
+
+- These commands call repo services directly instead of looping back through `127.0.0.1:8000`, so they are safe when `UPSTREAM_BEARER_TOKEN` is enabled.
+- If HTTP must remain for an internal localhost caller, use `app.internal.http_client.InternalAPIClient`, which automatically sends the configured bearer token.
 
 Notes:
 
@@ -119,8 +135,8 @@ Local overrides:
 Local validation:
 
 1. From `apps/api`, start the API with `python -m uvicorn app.main:app --reload`
-2. Call `curl -i http://127.0.0.1:8000/health`
-3. Trigger an upstream-backed route such as `curl "http://127.0.0.1:8000/fx/koreaexim/rates?search_date=20260406&currency=USD"`
+2. Call `curl -i -H "Authorization: Bearer <token>" http://127.0.0.1:8000/health` when `UPSTREAM_BEARER_TOKEN` is set
+3. Trigger an upstream-backed route such as `curl -H "Authorization: Bearer <token>" "http://127.0.0.1:8000/fx/koreaexim/rates?search_date=20260406&currency=USD"` when bearer auth is enabled
 4. Inspect `var/log/api-requests.log` and `var/log/upstream-http.log`
 
 ## Next ops step
