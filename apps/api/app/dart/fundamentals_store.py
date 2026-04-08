@@ -304,6 +304,31 @@ class DartFundamentalsRepository:
         stock_codes: list[str],
         fs_div: str | None = None,
     ) -> list[dict[str, Any]]:
+        return self._list_stored_fundamentals(
+            stock_codes=stock_codes,
+            fs_div=fs_div,
+            include_statement_rows=True,
+        )
+
+    def list_stored_fundamentals_summary(
+        self,
+        *,
+        stock_codes: list[str],
+        fs_div: str | None = None,
+    ) -> list[dict[str, Any]]:
+        return self._list_stored_fundamentals(
+            stock_codes=stock_codes,
+            fs_div=fs_div,
+            include_statement_rows=False,
+        )
+
+    def _list_stored_fundamentals(
+        self,
+        *,
+        stock_codes: list[str],
+        fs_div: str | None = None,
+        include_statement_rows: bool,
+    ) -> list[dict[str, Any]]:
         if not stock_codes:
             return []
 
@@ -337,18 +362,27 @@ class DartFundamentalsRepository:
                 .where(DartFundamentalsHighlight.snapshot_id.in_(snapshot_ids))
                 .order_by(DartFundamentalsHighlight.snapshot_id.asc(), DartFundamentalsHighlight.metric_key.asc())
             ).scalars()
-            statement_rows = session.execute(
-                select(DartFundamentalsRow)
+            statement_row_counts = session.execute(
+                select(DartFundamentalsRow.snapshot_id, func.count(DartFundamentalsRow.id))
                 .where(DartFundamentalsRow.snapshot_id.in_(snapshot_ids))
-                .order_by(
-                    DartFundamentalsRow.snapshot_id.asc(),
-                    DartFundamentalsRow.row_order.asc(),
-                    DartFundamentalsRow.id.asc(),
-                )
-            ).scalars()
+                .group_by(DartFundamentalsRow.snapshot_id)
+            ).all()
+
+            statement_rows = []
+            if include_statement_rows:
+                statement_rows = session.execute(
+                    select(DartFundamentalsRow)
+                    .where(DartFundamentalsRow.snapshot_id.in_(snapshot_ids))
+                    .order_by(
+                        DartFundamentalsRow.snapshot_id.asc(),
+                        DartFundamentalsRow.row_order.asc(),
+                        DartFundamentalsRow.id.asc(),
+                    )
+                ).scalars()
 
             highlights_by_snapshot: dict[int, list[dict[str, Any]]] = defaultdict(list)
             rows_by_snapshot: dict[int, list[dict[str, Any]]] = defaultdict(list)
+            row_count_by_snapshot = {snapshot_id: row_count for snapshot_id, row_count in statement_row_counts}
             for row in highlight_rows:
                 highlights_by_snapshot[row.snapshot_id].append(self._serialize_highlight(row))
             for row in statement_rows:
@@ -362,6 +396,7 @@ class DartFundamentalsRepository:
                         'disclosure': self._serialize_event(event),
                         'highlights': highlights_by_snapshot.get(snapshot.id, []),
                         'statement_rows': rows_by_snapshot.get(snapshot.id, []),
+                        'statement_row_count': row_count_by_snapshot.get(snapshot.id, 0),
                     }
                 )
             return items

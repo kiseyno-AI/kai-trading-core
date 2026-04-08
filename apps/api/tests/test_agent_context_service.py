@@ -6,6 +6,9 @@ from app.agent_context.read_service import AgentContextReadService
 
 class FakeFundamentalsRepository:
     def list_stored_fundamentals(self, *, stock_codes, fs_div=None):
+        raise AssertionError('agent context should use summary fundamentals path')
+
+    def list_stored_fundamentals_summary(self, *, stock_codes, fs_div=None):
         assert stock_codes == ['005930', '000660']
         assert fs_div == 'CFS'
         return [
@@ -46,7 +49,7 @@ class FakeFundamentalsRepository:
                         'ratio_value': None,
                     }
                 ],
-                'statement_rows': [{'row_key': 'row-1'}],
+                'statement_row_count': 1,
             },
             {
                 'rcept_no': '20260410000123',
@@ -69,7 +72,7 @@ class FakeFundamentalsRepository:
                     'receipt_date': '2026-04-10',
                 },
                 'highlights': [],
-                'statement_rows': [],
+                'statement_row_count': 0,
             },
         ]
 
@@ -186,6 +189,7 @@ class AgentContextReadServiceTests(unittest.TestCase):
         self.assertEqual(first_item['technical_snapshot']['trend_state'], 'uptrend')
         self.assertEqual(first_item['action_summary']['action_label'], 'long_breakout')
         self.assertEqual(first_item['fundamentals']['latest_snapshot']['period']['period_end_date'], '2024-12-31')
+        self.assertEqual(first_item['fundamentals']['latest_snapshot']['statement']['row_count'], 1)
         self.assertEqual(first_item['recent_disclosures']['count'], 1)
 
         second_item = result['items'][1]

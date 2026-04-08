@@ -71,6 +71,7 @@ def _summarize_highlights(rows: list[dict[str, Any]]) -> dict[str, Any]:
 def _build_fundamentals_snapshot(item: dict[str, Any], *, period_end_date: date | None) -> dict[str, Any]:
     report_meta = REPORT_CODE_METADATA.get(item['report_code'], {})
     statement_rows = item.get('statement_rows') or []
+    statement_row_count = item.get('statement_row_count')
     return {
         'filing': {
             'rcept_no': item['rcept_no'],
@@ -96,7 +97,7 @@ def _build_fundamentals_snapshot(item: dict[str, Any], *, period_end_date: date 
             'currency': item.get('currency'),
             'source_status': item.get('source_status'),
             'source_message': item.get('source_message'),
-            'row_count': len(statement_rows),
+            'row_count': statement_row_count if statement_row_count is not None else len(statement_rows),
         },
         'highlights': _summarize_highlights(item.get('highlights') or []),
     }
@@ -215,7 +216,7 @@ class AgentContextReadService:
             symbols=normalized_symbols,
             limit=max(len(normalized_symbols), 1000),
         )
-        fundamentals_rows = self.fundamentals_repository.list_stored_fundamentals(
+        fundamentals_rows = self.fundamentals_repository.list_stored_fundamentals_summary(
             stock_codes=normalized_symbols,
             fs_div=normalized_fs_div,
         )
