@@ -1,8 +1,6 @@
 # trading-core (kai-trading-core)
 
-Core trading platform repository — **backend API and services** for the KAI system. It is **not** the web UI (see **Related repos**).
-
----
+Core trading platform repository for the KAI system. This repo is the backend and data-service layer, not the web UI.
 
 ## What this project is
 
@@ -11,102 +9,248 @@ Core trading platform repository — **backend API and services** for the KAI sy
 | **HTTP API** | Active | FastAPI app in `apps/api`, default `http://127.0.0.1:8000` |
 | **KIS (Korea Investment & Securities)** | Integrated | Token, health, domestic quotes; mock vs production via env |
 | **Market clock & quotes** | Active | Market state, tracked quotes, symbol search from master list |
-| **Scanner** | Active | In-memory tracked symbol list (get/update) |
-| **EOD pipeline** | Active | Master refresh, scheduled capture hooks, status endpoints |
+| **Scanner** | Active | In-memory tracked symbol list backed by DB persistence |
+| **EOD bars pipeline** | Active | Master refresh, scheduled capture hooks, pykrx backfill, status endpoints |
+| **Post-EOD technical snapshots** | Active | DB-backed deterministic signal layer keyed by symbol/day |
+| **Deterministic daily action summaries** | Active | DB-backed machine-friendly action context keyed by symbol/day |
+| **DART disclosures + fundamentals history** | Active | Sync, capture, history retrieval, current-universe backfill |
+| **Agent aggregate read layer** | Active | Structured symbol/day context for downstream agents |
 | **Macro (BOK ECOS)** | Integrated | Statistic series proxy |
 | **FX (Korea Exim)** | Integrated | Exchange rate lookup |
-| **Market-data persistence** | Active | Alembic-backed Postgres schema for symbols, tracking, quotes, market status, and EOD bars |
-| **Execution engine / order persistence** | Roadmap | Trading and execution boundaries remain future work in `ARCHITECTURE.md` |
+| **Execution engine / order persistence** | Roadmap | Trading and execution boundaries remain future work |
 
-**Tech stack:** Python 3, FastAPI, Uvicorn, Pydantic Settings, HTTPX for outbound calls. Configuration via `apps/api/.env` (see `apps/api/.env.example`).
+**Tech stack:** Python 3, FastAPI, SQLAlchemy, Alembic, HTTPX, Pydantic Settings, Postgres.
 
-**Documentation in-repo:** `ARCHITECTURE.md`, `RUNBOOK.md`, `docs/API_BUILD_ORDER.md`, `docs/ARCHITECTURE.md`, `docs/KIS_API_ONBOARDING.md`, scanner notes under `docs/scanner/`.
+**Primary in-repo docs:** `AGENTS.md`, `ARCHITECTURE.md`, `RUNBOOK.md`, `docs/API_BUILD_ORDER.md`, `docs/ARCHITECTURE.md`, `docs/KIS_API_ONBOARDING.md`, `docs/scanner/`.
 
----
+## Current implemented architecture
+
+The current backend is a modular monolith centered on the FastAPI service in `apps/api`. It now has five practical layers:
+
+1. External integrations for KIS, DART, BOK/ECOS, and Korea Exim.
+2. Persistence for symbol master data, intraday quote snapshots, market-status snapshots, EOD bars, DART disclosure events, and DART fundamentals snapshots.
+3. Post-EOD deterministic computation layers for technical snapshots and action summaries.
+4. Operator-facing jobs and HTTP routes for ingestion, capture, backfill, and inspection.
+5. Agent-facing aggregate read APIs that package stored context for symbol/day analysis without making final ranking decisions.
+
+The intended split is deliberate:
+
+- Core services persist normalized facts and deterministic computed context.
+- The read layer returns structured blocks for agents and subagents.
+- Prioritization, ranking, and interpretation stay outside the core API.
 
 ## Authentication
 
-If **`UPSTREAM_BEARER_TOKEN`** is set in the environment, every request except **`OPTIONS`** must include:
+If `UPSTREAM_BEARER_TOKEN` is set, every request except `OPTIONS` must include:
 
 ```http
 Authorization: Bearer <same token>
 ```
 
-If the variable is unset or empty, the API accepts requests without a bearer token (typical for local development).
+If `UPSTREAM_BEARER_TOKEN` is unset or empty, the API accepts requests without a bearer token, which is typical for local development.
 
----
+## Data flow overview
+
+### 1. Instrument master and quote layer
+
+Persisted tables in this layer:
+
+- `symbols`
+- `tracked_symbols`
+- `quote_snapshots`
+- `current_quote_cache`
+- `market_status_snapshots`
+
+These power the market, scanner, quotes, and symbols endpoints.
+
+### 2. EOD bars flow
+
+The repository currently supports both:
+
+- KIS-driven EOD capture for a target `market_date`
+- pykrx-based historical and daily backfill for broader bar coverage
+
+Persisted EOD tables:
+
+- `eod_collection_runs` for run audit and progress
+- `daily_price_bars` for durable OHLCV history keyed by `symbol_id + trade_date`
+
+Operationally, the current flow supports:
+
+- master refresh before collection
+- due-check based capture
+- direct capture for a specific market date
+- pykrx universe refresh
+- pykrx historical backfill
+- pykrx daily run-if-due
+
+### 3. Post-EOD technical snapshot layer
+
+After daily bars exist for a symbol/day, the system can compute and persist a deterministic technical context row in `daily_technical_snapshots`.
+
+Current snapshot fields include:
+
+- close and volume
+- MA alignment
+- trend state
+- 5d and 20d returns
+- 20d breakout and breakdown flags
+- 20d volume ratio
+- ATR and ATR percent
+- compact `signal_payload` context
+
+This layer is intentionally not a ranking model. It is a reusable, deterministic summary of chart state derived from stored bars.
+
+### 4. Deterministic daily action summary layer
+
+Once a technical snapshot exists, the system can compute and persist a deterministic action-summary object in `daily_action_summaries`.
+
+Current action summary fields include:
+
+- `action_label`
+- `bias_direction`
+- `signal_score`
+- `confidence_tier`
+- `risk_tier`
+- `reasons`
+- trigger, invalidation, support, and resistance levels
+- compact `summary_payload`
+
+This is still not the final agent decision layer. It is a stable, rules-based read model that agents can consume consistently.
+
+### 5. DART disclosures and fundamentals ingestion/history
+
+Implemented DART pieces:
+
+- company snapshot lookup
+- disclosure event sync for recent filings
+- persistent `dart_disclosure_events` and `dart_disclosure_sync_runs`
+- fundamentals capture from synced financial-report disclosures
+- persistent `dart_fundamentals_snapshots`, `dart_fundamentals_rows`, and highlight rows
+- stored fundamentals history retrieval across one or many symbols
+- current-active-universe fundamentals backfill operator
+- filing document and XBRL download routes
+
+In practice, the DART pipeline works like this:
+
+1. Sync recent disclosure events from Open DART.
+2. Persist the financial-report events the fundamentals flow depends on.
+3. Capture statement snapshots from those events.
+4. Persist both normalized highlights and full statement rows.
+5. Serve stored history for later read-side aggregation.
+
+### 6. Agent context aggregate read layer
+
+The latest implemented read layer is:
+
+- `GET /agent-context/symbol-day`
+
+This route supports one or many symbols for a given `market_date` and returns a compact machine-friendly payload that aggregates:
+
+- company identity and symbol metadata
+- same-day technical snapshot when available
+- same-day deterministic action summary when available
+- latest stored DART fundamentals snapshot summary and short history summary
+- recent stored DART disclosure events up to the requested market date
+
+This route is specifically for agent consumption. It does not emit final prioritization or ranking decisions.
 
 ## HTTP API reference
 
 Base URL (local default): `http://127.0.0.1:8000`
 
-Interactive docs (when the server is running): **`GET /docs`** (Swagger UI), **`GET /redoc`**.
+Interactive docs when the server is running:
 
-### Core & health
+- `GET /docs`
+- `GET /redoc`
+
+### Core and health
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/health` | Liveness: `status`, `app`, `env` |
+| `GET` | `/health` | Liveness: app, env, database status |
 
-### Broker — KIS (`/broker/kis`)
-
-| Method | Path | Query / body | Description |
-|--------|------|----------------|-------------|
-| `GET` | `/broker/kis/health` | — | KIS connectivity / health check |
-| `POST` | `/broker/kis/token` | Query: `force_refresh` (bool, default false) | Issue or refresh KIS access token |
-| `GET` | `/broker/kis/quote` | `symbol` (required), `market_code` (default `J`) | Domestic quote via KIS |
-
-### Market & quotes
+### Broker - KIS (`/broker/kis`)
 
 | Method | Path | Query / body | Description |
 |--------|------|----------------|-------------|
-| `GET` | `/market/status` | — | Current market state (clock / session) |
-| `GET` | `/quotes/tracked` | — | Quotes for all tracked scanner symbols |
-| `GET` | `/quotes/{symbol}` | Path: `symbol` | Single-symbol quote |
+| `GET` | `/broker/kis/health` | - | KIS connectivity check |
+| `POST` | `/broker/kis/token` | `force_refresh` | Issue or refresh KIS access token |
+| `GET` | `/broker/kis/quote` | `symbol`, `market_code` | Domestic quote via KIS |
+
+### Market and quotes
+
+| Method | Path | Query / body | Description |
+|--------|------|----------------|-------------|
+| `GET` | `/market/status` | - | Current market state |
+| `GET` | `/quotes/tracked` | - | Quotes for tracked scanner symbols |
+| `GET` | `/quotes/{symbol}` | path symbol | Single-symbol quote |
 
 ### Scanner (`/scanner`)
 
 | Method | Path | Query / body | Description |
 |--------|------|----------------|-------------|
-| `GET` | `/scanner/tracked-symbols` | — | Current tracked symbol list snapshot |
-| `POST` | `/scanner/tracked-symbols` | JSON body: `{ "symbols": ["005930", ...] }` | Replace tracked symbols |
+| `GET` | `/scanner/tracked-symbols` | - | Current tracked symbol snapshot |
+| `POST` | `/scanner/tracked-symbols` | JSON `{ "symbols": [...] }` | Replace tracked symbols |
 
 ### Symbols (`/symbols`)
 
 | Method | Path | Query / body | Description |
 |--------|------|----------------|-------------|
-| `GET` | `/symbols/search` | `q` (string, optional), `limit` (1–100, default 20) | Search master symbols by code or Korean name |
+| `GET` | `/symbols/search` | `q`, `limit` | Search master symbols by code or Korean name |
 
-### Macro — Bank of Korea ECOS (`/macro/bok`)
-
-| Method | Path | Query / body | Description |
-|--------|------|----------------|-------------|
-| `GET` | `/macro/bok/series` | `series_id`, `start_period`, `end_period`, `cycle` (default `D`) | ECOS statistic series (proxy) |
-
-### FX — Korea Exim (`/fx/koreaexim`)
+### Macro - Bank of Korea ECOS (`/macro/bok`)
 
 | Method | Path | Query / body | Description |
 |--------|------|----------------|-------------|
-| `GET` | `/fx/koreaexim/rates` | `search_date` (optional, `YYYYMMDD`), `data` (default `AP01`) | Exchange rates |
+| `GET` | `/macro/bok/series` | `series_id`, `start_period`, `end_period`, `cycle` | ECOS statistic series proxy |
+
+### FX - Korea Exim (`/fx/koreaexim`)
+
+| Method | Path | Query / body | Description |
+|--------|------|----------------|-------------|
+| `GET` | `/fx/koreaexim/rates` | `search_date`, `data` | Exchange rates |
+
+### DART (`/disclosures/dart`)
+
+| Method | Path | Query / body | Description |
+|--------|------|----------------|-------------|
+| `GET` | `/disclosures/dart/company-snapshot` | `corp_code` or `stock_code` or `corp_name` | Company lookup plus recent filing snapshot |
+| `POST` | `/disclosures/dart/sync/events` | `days` | Sync recent disclosure events |
+| `GET` | `/disclosures/dart/sync/inspect` | `runs_limit`, `events_limit`, `financial_only` | Inspect recent sync runs and stored events |
+| `GET` | `/disclosures/dart/fundamentals` | `business_year` or `fiscal_year`, lookup params, period params | Direct single-company DART fundamentals fetch |
+| `POST` | `/disclosures/dart/fundamentals/capture` | `limit`, `force`, `fs_div` | Capture fundamentals from stored disclosure events |
+| `GET` | `/disclosures/dart/fundamentals/history` | repeatable `symbols`, date window, `fs_div` | Read stored DART fundamentals history |
+| `GET` | `/disclosures/dart/fundamentals/capture/inspect` | `runs_limit`, `events_limit`, `capture_status` | Inspect capture runs and capture status |
+| `POST` | `/disclosures/dart/fundamentals/backfill/current-universe` | `symbol_limit`, `symbol_offset`, `capture_limit`, `force`, `fs_div`, date window | Batch backfill current active universe fundamentals |
+| `GET` | `/disclosures/dart/filings/document` | `rcept_no` | Download filing artifact |
+| `GET` | `/disclosures/dart/filings/xbrl` | `rcept_no`, `report_code` | Download filing XBRL artifact |
 
 ### EOD (`/eod`)
 
 | Method | Path | Query / body | Description |
 |--------|------|----------------|-------------|
-| `GET` | `/eod/status` | — | EOD job + master refresh state snapshot |
-| `POST` | `/eod/master/refresh-if-due` | Query: `force` (bool, default false) | Refresh symbol master if due (or forced) |
-| `POST` | `/eod/capture-if-due` | — | Run EOD capture when due |
-| `POST` | `/eod/capture` | Query: `market_date` | Capture EOD for a specific `market_date` |
+| `GET` | `/eod/status` | - | EOD job, master refresh, and pykrx-auto snapshot |
+| `POST` | `/eod/master/refresh-if-due` | `force` | Refresh symbol master if due |
+| `POST` | `/eod/capture-if-due` | - | Run EOD capture when due |
+| `POST` | `/eod/capture` | `market_date` | Capture EOD for a specific market date |
+| `POST` | `/eod/pykrx/universe/refresh` | `markets`, `limit` | Refresh pykrx active universe |
+| `POST` | `/eod/pykrx/backfill` | `start_date`, `end_date`, `markets`, `limit`, `symbol`, `refresh_universe` | Historical pykrx OHLCV backfill |
+| `POST` | `/eod/pykrx/daily/run-if-due` | `market_date`, `markets`, `force`, `refresh_universe` | pykrx daily collection run |
+| `POST` | `/eod/technical-snapshots/compute` | `market_date`, `symbols`, `source` | Compute and persist technical snapshots |
+| `GET` | `/eod/technical-snapshots` | `market_date`, `symbols`, `limit` | Read persisted technical snapshots |
+| `POST` | `/eod/action-summaries/compute` | `market_date`, `symbols`, `source` | Compute and persist action summaries |
+| `GET` | `/eod/action-summaries` | `market_date`, `symbols`, `limit` | Read persisted action summaries |
 
-Errors from upstream services are generally returned as **502** with a `detail` message; invalid bearer token returns **401** when `UPSTREAM_BEARER_TOKEN` is configured.
+### Agent Context (`/agent-context`)
 
----
+| Method | Path | Query / body | Description |
+|--------|------|----------------|-------------|
+| `GET` | `/agent-context/symbol-day` | `market_date`, repeatable `symbols`, optional `fs_div`, `disclosures_limit` | Aggregate symbol/day agent context from stored metadata, technicals, action summaries, DART fundamentals, and recent disclosures |
 
 ## Run the API locally
 
-- **`apps/api`** — application root; Python package is **`app`**.
-- **`apps/api/start-api.sh`** — installs requirements, loads `.env`, starts Uvicorn (see **RUNBOOK.md**).
-- Environment template: **`apps/api/.env.example`**.
+Application root is `apps/api` and the Python package import root is `app`.
 
 ```bash
 cd apps/api
@@ -116,72 +260,109 @@ pip install -r requirements.txt
 # or: uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
----
-
 ## Database bootstrap and schema overview
 
-The project now uses **Alembic-backed schema bootstrap** for the market-data database. The source of truth is the migration set under `apps/api/db_migrations/`, and startup can apply pending revisions automatically when `DB_AUTO_UPGRADE=true`.
+The project uses Alembic-backed schema bootstrap under `apps/api/db_migrations/`. The migration set is the source of truth, and startup can apply pending revisions automatically when `DB_AUTO_UPGRADE=true`.
 
-At a high level, the current core tables cover:
+Core tables currently cover:
 
-- `symbols` for the normalized instrument master: symbol/code identity, Korean display name, market, instrument type, source, active flag, and refresh timestamps
-- `tracked_symbols` for the scanner/watchlist set: a foreign-key link to `symbols` plus stable sort order
-- `quote_snapshots` and `current_quote_cache` for quote history plus the latest cached quote per symbol: market state, price/change fields, volume/turnover, source flags, capture timestamps, and raw payloads
-- `market_status_snapshots` for persisted market-clock observations: market/state values, trading-day and open flags, reason text, and server/session timestamps
-- `eod_collection_runs` and `daily_price_bars` for end-of-day collection tracking and OHLCV bars: run status/counters/metadata plus per-symbol trade-date open, high, low, close, volume, and turnover values
+- `symbols` for the normalized instrument master
+- `tracked_symbols` for persisted scanner membership
+- `quote_snapshots` and `current_quote_cache` for intraday quote history and latest quote state
+- `market_status_snapshots` for persisted market-clock observations
+- `eod_collection_runs` and `daily_price_bars` for EOD collection history and OHLCV bars
+- `daily_technical_snapshots` and `daily_action_summaries` for post-EOD computed read models
+- `dart_disclosure_sync_runs`, `dart_disclosure_events`, `dart_fundamentals_capture_runs`, `dart_fundamentals_snapshots`, `dart_fundamentals_rows`, and highlights for DART ingestion and history
 
-For a fresh machine or a reset local database, use this bootstrap flow from `apps/api`:
+For a fresh machine or reset local database, use this flow from `apps/api`:
 
 ```bash
 pip install -r requirements.txt
 cp .env.example .env
-# update .env with the local Postgres database/user/password you want to use
-createdb kai_trading            # or create the database with your preferred Postgres workflow
+# update .env for your local Postgres instance
+createdb kai_trading
 alembic upgrade head
 python -c "from app.main import app"
 ```
 
-Practical notes for newcomers:
+Practical notes:
 
-- To see what your environment is currently on before changing anything, run `alembic current` from `apps/api`.
-- `alembic upgrade head` is the explicit, predictable way to apply the schema before first startup.
-- If `DB_AUTO_UPGRADE=true`, `./start-api.sh` will also run Alembic upgrades during API startup.
-- The database name and credentials can differ per machine; what matters is that `.env` points at a reachable Postgres instance and Alembic reaches `head`.
-- After bootstrapping, rerun `alembic current` to confirm your database revision matches the repo's current head.
+- Run `alembic current` before and after bootstrapping if you want explicit revision visibility.
+- `alembic upgrade head` is the predictable explicit bootstrap path.
+- If `DB_AUTO_UPGRADE=true`, startup can also apply pending migrations.
 
-### Core tables in practical terms
+## Implemented jobs, APIs, and operator flows
 
-Use this as the quick mental model:
+### HTTP APIs
 
-- `symbols` is the master list of instruments.
-- `tracked_symbols` is the subset the scanner/watchlist currently cares about.
-- `quote_snapshots` and `current_quote_cache` store intraday quotes.
-- `market_status_snapshots` stores what the app believed the market clock was.
-- `eod_collection_runs` and `daily_price_bars` store end-of-day collection history and the resulting daily bars.
+Implemented and currently useful endpoints include:
 
-| Table | What it is for | Key attributes and why they matter |
-|------|-----------------|------------------------------------|
-| `symbols` | Canonical instrument master used by the rest of the schema. Other tables reference `symbol_id` here instead of repeating symbol text everywhere. | `symbol` is the actual trading code such as `005930`. `name_ko` is the Korean display name. `market` tells you which market bucket it belongs to. `standard_code` keeps the upstream reference code when available. `instrument_type` is the asset class label. `source` tells you whether the row came from the KIS master refresh, scanner, or quote flow. `is_active` marks whether the master entry is still current. `last_refreshed_at` shows when the metadata was last refreshed. |
-| `tracked_symbols` | Persisted watchlist/scanner membership. This is the small set returned by `/scanner/tracked-symbols` and used by tracked-quote flows. | `symbol_id` points to the instrument in `symbols`. `sort_order` preserves the caller-facing order. `created_at` tells you when that tracked row was added. |
-| `quote_snapshots` | Append-only intraday quote history. Each persisted quote event creates a new row. | `symbol_id` ties the quote to an instrument. `market_state` captures the market session context. `price`, `change`, `change_pct`, `volume`, and `turnover` are the normalized quote fields most downstream code will read first. `as_of` stores the upstream quote time string. `source` records which provider or app path supplied the data. `is_live` distinguishes a live quote from a non-live path. `fallback` marks restart-safe fallback data. `payload` keeps the raw normalized quote payload for debugging and later reprocessing. `captured_at` is when the snapshot was written. |
-| `current_quote_cache` | The latest known quote per symbol. Use this when you want current state, not history. | It intentionally mirrors the main quote fields from `quote_snapshots`, but `symbol_id` is unique so there is only one current row per symbol. `captured_at` tells you when the cached quote was observed. `updated_at` tells you when that cache row was last rewritten. |
-| `market_status_snapshots` | Persisted market-clock observations over time. This is the history behind "what market state did the app think we were in?" | `market` names the market scope. `state` stores values like pre-open, open, or closed. `is_trading_day` and `is_open` are the first booleans most callers care about. `reason` explains special cases such as holidays. `server_time` is the reference timestamp used to evaluate the state. `session_open_at` and `session_close_at` are the expected trading-session bounds. `source` identifies the writer. `captured_at` is when the row was persisted. |
-| `eod_collection_runs` | Audit trail for EOD collection jobs. One row represents one attempt to collect a market day's daily bars. | `trade_date` is the market date being collected. `market`, `source`, and `trigger` explain what was collected and why the run started. `status` shows whether the run is still running, completed, or completed with errors. `symbols_total`, `symbols_succeeded`, and `symbols_failed` are the main progress counters. `error_message` stores a run-level failure summary. `started_at` and `completed_at` tell you how long the run took. `run_metadata` is JSON for extra context that does not justify a dedicated column yet. |
-| `daily_price_bars` | One daily OHLCV row per symbol per trade date. This is the durable end-of-day price history table. | `symbol_id` identifies the instrument. `trade_date` is the date of the bar. `open_price`, `high_price`, `low_price`, and `close_price` are the daily OHLC values. `volume` and `turnover` capture activity for that day. `eod_run_id` links the bar back to the collection run that produced or associated it. `source` records the upstream provider. `captured_at` shows when the row was stored. |
+- broker/KIS health, token, and quote APIs
+- market status, tracked quotes, tracked symbols, and symbol search APIs
+- BOK/ECOS macro and Korea Exim FX APIs
+- DART company snapshot, disclosure sync and inspect, fundamentals fetch, fundamentals capture and inspect, stored fundamentals history, current-universe backfill, and filing artifact download APIs
+- EOD status, master refresh, capture, pykrx backfill and daily refresh, technical snapshot compute and inspect, and action summary compute and inspect APIs
+- agent-context symbol/day aggregate read API
 
----
+### CLI and module entry points
+
+Operator-friendly Python module entry points from `apps/api` include:
+
+- `python3.11 -m app.eod.technical_snapshots --market-date YYYY-MM-DD`
+- `python3.11 -m app.eod.action_summaries --market-date YYYY-MM-DD`
+- `python3.11 -m app.dart.backfill_current_universe ...`
+- `python3.11 -m app.dart.backfill_current_universe_runner ...`
+
+### Background behavior
+
+- API startup initializes the DB and hydrates tracked symbols.
+- `background_runner` keeps the long-running EOD scheduling loop alive while the service is up.
+- `DB_AUTO_UPGRADE=true` can apply Alembic migrations during normal startup.
+
+## How the implemented pieces connect
+
+For a future engineer or agent landing in the repo cold, the important mental model is:
+
+1. Symbol master and EOD bars are the base market-data facts.
+2. Technical snapshots derive from stored daily bars.
+3. Action summaries derive from stored technical snapshots.
+4. DART sync and fundamentals capture build a separate persisted fundamentals history.
+5. The agent-context route reads across these persisted layers and returns one compact symbol/day context object per symbol.
+
+That means downstream agents should generally prefer:
+
+- stored read models over ad hoc recomputation
+- aggregate read APIs over stitching multiple raw endpoints into prompts
+- their own prioritization logic over pushing ranking logic into the core API too early
+
+## Example requests
+
+Agent context read API examples:
+
+```bash
+curl "http://127.0.0.1:8000/agent-context/symbol-day?market_date=2026-04-08&symbols=005930"
+```
+
+```bash
+curl "http://127.0.0.1:8000/agent-context/symbol-day?market_date=2026-04-08&symbols=005930&symbols=000660&fs_div=CFS&disclosures_limit=5"
+```
+
+Related manual post-EOD flows:
+
+```bash
+curl -X POST "http://127.0.0.1:8000/eod/technical-snapshots/compute?market_date=2026-04-08&symbols=005930,000660"
+curl -X POST "http://127.0.0.1:8000/eod/action-summaries/compute?market_date=2026-04-08&symbols=005930,000660"
+```
 
 ## Runtime direction
 
-- The core API is intended to run **24/7**.
-- A **background runner** (see `app/eod/runner.py`, **RUNBOOK.md**) polls market state and drives pre-market master refresh and post-close EOD behavior while the process is up.
-- **CORS** is currently permissive (`allow_origins=['*']`) for development; tighten for production deployments.
-
----
+- The core API is intended to run 24/7.
+- A background runner polls market state and drives pre-market master refresh and post-close EOD behavior while the process is up.
+- CORS is currently permissive for development and should be tightened for production.
 
 ## OpenAI Codex
 
-Agent instructions: **`.codex/config.toml`**, **`.codex/skills/`**, **`.codex/agents/`**. Trust the project in Codex so they load.
+Agent instructions live in `.codex/config.toml`, `.codex/skills/`, and `.codex/agents/`. Trust the project in Codex so they load.
 
 Quick smoke check from `apps/api`:
 
@@ -190,16 +371,21 @@ pip install -r requirements.txt
 python -c "from app.main import app"
 ```
 
-More detail: **[AGENTS.md](./AGENTS.md)**.
-
----
+See `AGENTS.md` for repo-specific working rules.
 
 ## Related repos
 
-- **trading-web** (Next.js) — may proxy this API (e.g. `/market/status`, `/quotes/tracked`, `/scanner/tracked-symbols`). Keep paths and JSON shapes aligned when you change either side.
+- `trading-web` (Next.js) may proxy this API. Keep paths and JSON shapes aligned when changing either side.
 
----
+## What remains future or planned
 
-## Planned API surface (not necessarily implemented)
+The repo is materially beyond scaffolding, but several major pieces are still intentionally future work:
 
-See **`docs/API_BUILD_ORDER.md`** for the intended build order and ideas such as KIS balance, positions, order skeletons, and news abstractions.
+- final agent ranking and portfolio-prioritization logic
+- execution engine and order persistence
+- account balance and positions APIs
+- richer DART normalized analytics beyond the current disclosure and fundamentals backbone
+- broader research and data-lake layers such as Redis, Parquet, and DuckDB workflows
+- more explicit retention and archival policy as historical datasets grow
+
+See `docs/API_BUILD_ORDER.md` for the next planned slices.
