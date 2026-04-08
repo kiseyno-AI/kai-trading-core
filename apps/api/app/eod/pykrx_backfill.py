@@ -15,6 +15,7 @@ from pykrx.website.comm import webio
 from app.core.audit_logging import log_fetch_event
 from app.core.settings import settings
 from app.eod.master import get_master_symbols
+from app.eod.technical_snapshots import daily_technical_snapshot_service
 from app.market_data_store import (
     advisory_eod_collection_lock,
     count_eod_run_persisted_symbols,
@@ -745,13 +746,46 @@ class PykrxBackfillService:
             )
             raise
 
-        status = 'completed' if symbols_failed == 0 else 'completed_with_errors'
+        technical_snapshot_result: dict
+        snapshot_error_message: str | None = None
+        try:
+            technical_snapshot_result = daily_technical_snapshot_service.compute_and_persist_for_market_date(
+                market_date=latest_trade_date,
+                symbols=[item.symbol for item in symbols],
+                source='pykrx',
+                run_id=run_id,
+            )
+        except Exception as exc:
+            technical_snapshot_result = {
+                'market_date': latest_trade_date,
+                'source': 'pykrx',
+                'requested_symbols': len(symbols),
+                'snapshots_persisted': 0,
+                'snapshots_failed': len(symbols),
+                'failed_symbols': [item.symbol for item in symbols][:50],
+                'items': [],
+                'error': str(exc),
+            }
+            snapshot_error_message = f'Technical snapshot persistence failed: {exc}'
+
+        run_errors: list[str] = []
+        if failed_symbols:
+            run_errors.append(f'Failed symbols: {",".join(failed_symbols[:20])}')
+        if snapshot_error_message:
+            run_errors.append(snapshot_error_message)
+        elif technical_snapshot_result.get('snapshots_failed'):
+            run_errors.append(
+                'Technical snapshot persistence incomplete for symbols: '
+                + ','.join(technical_snapshot_result.get('failed_symbols', [])[:20])
+            )
+
+        status = 'completed' if not run_errors else 'completed_with_errors'
         complete_eod_collection_run(
             run_id,
             status=status,
             symbols_succeeded=symbols_succeeded,
             symbols_failed=symbols_failed,
-            error_message=None if not failed_symbols else f'Failed symbols: {",".join(failed_symbols[:20])}',
+            error_message=' | '.join(run_errors) if run_errors else None,
         )
         result = {
             'run_id': run_id,
@@ -766,6 +800,7 @@ class PykrxBackfillService:
             'symbols_failed': symbols_failed,
             'failed_symbols': failed_symbols[:50],
             'bars_upserted': bars_upserted,
+            'technical_snapshots': technical_snapshot_result,
             'refresh_universe': refresh_universe,
             'universe_snapshot': universe_snapshot,
         }

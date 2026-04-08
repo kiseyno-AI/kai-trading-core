@@ -9,6 +9,7 @@ from app.eod.pykrx_backfill import DEFAULT_MARKETS, PYKRX_BACKFILL_SERVICE
 from app.eod.master_state import master_refresh_state
 from app.eod.service import EOD_SERVICE
 from app.eod.state import job_state
+from app.eod.technical_snapshots import daily_technical_snapshot_service
 from app.market.clock import get_market_state
 
 router = APIRouter(prefix='/eod', tags=['eod'])
@@ -110,3 +111,43 @@ async def run_pykrx_daily_if_due(
         )
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f'pykrx daily EOD run failed: {exc}') from exc
+
+
+@router.post('/technical-snapshots/compute')
+async def compute_daily_technical_snapshots(
+    market_date: str,
+    symbols: str | None = None,
+    source: str = 'pykrx',
+) -> dict:
+    try:
+        parsed_symbols = [item.strip() for item in symbols.split(',') if item.strip()] if symbols else None
+        return await asyncio.to_thread(
+            daily_technical_snapshot_service.compute_and_persist_for_market_date,
+            market_date=market_date,
+            symbols=parsed_symbols,
+            source=source,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f'Daily technical snapshot compute failed: {exc}') from exc
+
+
+@router.get('/technical-snapshots')
+async def inspect_daily_technical_snapshots(
+    market_date: str,
+    symbols: str | None = None,
+    limit: int = 100,
+) -> dict:
+    try:
+        parsed_symbols = [item.strip() for item in symbols.split(',') if item.strip()] if symbols else None
+        return await asyncio.to_thread(
+            daily_technical_snapshot_service.inspect,
+            market_date=market_date,
+            symbols=parsed_symbols,
+            limit=limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'Daily technical snapshot inspect failed: {exc}') from exc
