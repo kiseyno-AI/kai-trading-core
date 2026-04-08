@@ -157,6 +157,7 @@ def load_symbols(
     is_active: bool | None = None,
     source: str | None = None,
     markets: list[str] | None = None,
+    symbols: list[str] | None = None,
     limit: int | None = None,
 ) -> list[dict]:
     with session_scope() as session:
@@ -177,6 +178,8 @@ def load_symbols(
             stmt = stmt.where(Symbol.source == source)
         if markets:
             stmt = stmt.where(Symbol.market.in_(markets))
+        if symbols:
+            stmt = stmt.where(Symbol.symbol.in_(symbols))
         if limit:
             stmt = stmt.limit(limit)
         rows = session.execute(stmt).all()

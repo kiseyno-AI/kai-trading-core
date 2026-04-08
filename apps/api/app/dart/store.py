@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import defaultdict
 from datetime import date, datetime
 
 from sqlalchemy import func, select
@@ -194,6 +195,56 @@ class DartSyncRepository:
             stmt = stmt.order_by(DartDisclosureEvent.receipt_date.desc(), DartDisclosureEvent.rcept_no.desc()).limit(limit)
             rows = session.execute(stmt).scalars()
             return [_serialize_event(row) for row in rows]
+
+    def list_recent_events_by_stock_codes(
+        self,
+        *,
+        stock_codes: list[str],
+        receipt_date_to: date | str | None = None,
+        limit_per_symbol: int = 5,
+    ) -> dict[str, list[dict]]:
+        normalized_stock_codes = [code for code in dict.fromkeys(stock_codes) if code]
+        if not normalized_stock_codes or limit_per_symbol <= 0:
+            return {code: [] for code in normalized_stock_codes}
+
+        cutoff_date = _normalize_date(receipt_date_to) if receipt_date_to is not None else None
+        ranked_events = (
+            select(
+                DartDisclosureEvent.id.label('event_id'),
+                func.row_number()
+                .over(
+                    partition_by=DartDisclosureEvent.stock_code,
+                    order_by=(
+                        DartDisclosureEvent.receipt_date.desc(),
+                        DartDisclosureEvent.rcept_no.desc(),
+                    ),
+                )
+                .label('symbol_rank'),
+            )
+            .where(DartDisclosureEvent.stock_code.in_(normalized_stock_codes))
+        )
+        if cutoff_date is not None:
+            ranked_events = ranked_events.where(DartDisclosureEvent.receipt_date <= cutoff_date)
+        ranked_events_subquery = ranked_events.subquery()
+
+        with session_scope() as session:
+            rows = session.execute(
+                select(DartDisclosureEvent)
+                .join(ranked_events_subquery, DartDisclosureEvent.id == ranked_events_subquery.c.event_id)
+                .where(ranked_events_subquery.c.symbol_rank <= limit_per_symbol)
+                .order_by(
+                    DartDisclosureEvent.stock_code.asc(),
+                    DartDisclosureEvent.receipt_date.desc(),
+                    DartDisclosureEvent.rcept_no.desc(),
+                )
+            ).scalars()
+
+            grouped: dict[str, list[dict]] = defaultdict(list)
+            for row in rows:
+                stock_code = row.stock_code or ''
+                grouped[stock_code].append(_serialize_event(row))
+
+        return {code: grouped.get(code, []) for code in normalized_stock_codes}
 
     def get_summary(self) -> dict:
         with session_scope() as session:
