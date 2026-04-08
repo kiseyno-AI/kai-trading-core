@@ -286,8 +286,24 @@ class DartClient:
             if self._corp_codes and self._corp_codes_loaded_at and now - self._corp_codes_loaded_at < ttl:
                 return self._corp_codes
 
-            payload = await self._get_bytes('/corpCode.xml', {})
-            corp_codes = self._parse_corp_code_zip(payload)
+            response = await self._request('/corpCode.xml', {})
+            payload = response.content
+            content_type = response.headers.get('content-type')
+
+            try:
+                self._raise_for_binary_error_envelope(response, path='/corpCode.xml')
+                corp_codes = self._parse_corp_code_payload(payload, content_type=content_type)
+            except DartAPIError as exc:
+                log_fetch_event(
+                    service='dart',
+                    operation='load_corp_codes',
+                    status='failed',
+                    content_type=content_type,
+                    payload_bytes=len(payload),
+                    error_message=str(exc),
+                )
+                raise
+
             self._corp_codes = corp_codes
             self._corp_codes_loaded_at = now
             log_fetch_event(
@@ -352,15 +368,63 @@ class DartClient:
             return response
 
     @staticmethod
-    def _parse_corp_code_zip(payload: bytes) -> list[dict[str, str]]:
+    def _parse_corp_code_payload(
+        payload: bytes,
+        *,
+        content_type: str | None = None,
+    ) -> list[dict[str, str]]:
+        if zipfile.is_zipfile(io.BytesIO(payload)):
+            return DartClient._parse_corp_code_zip(payload, content_type=content_type)
+
+        xml_root = DartClient._try_parse_xml(payload)
+        if xml_root is not None:
+            if xml_root.findall('list'):
+                return DartClient._parse_corp_code_xml_root(xml_root)
+
+            status = (xml_root.findtext('.//status') or '').strip()
+            message = (xml_root.findtext('.//message') or '').strip()
+            if status and status != '000':
+                DartClient._raise_for_binary_error_payload(
+                    {'status': status, 'message': message},
+                    path='/corpCode.xml',
+                )
+
+            raise DartAPIError(
+                'Invalid DART corp code archive response '
+                f'({DartClient._describe_binary_payload(payload, content_type=content_type, xml_root=xml_root)})'
+            )
+
+        raise DartAPIError(
+            'Invalid DART corp code archive response '
+            f'({DartClient._describe_binary_payload(payload, content_type=content_type)})'
+        )
+
+    @staticmethod
+    def _parse_corp_code_zip(
+        payload: bytes,
+        *,
+        content_type: str | None = None,
+    ) -> list[dict[str, str]]:
         try:
             with zipfile.ZipFile(io.BytesIO(payload)) as archive:
                 first_member = archive.namelist()[0]
                 xml_bytes = archive.read(first_member)
         except (IndexError, zipfile.BadZipFile) as exc:
-            raise DartAPIError('Invalid DART corp code archive response') from exc
+            raise DartAPIError(
+                'Invalid DART corp code archive response '
+                f'({DartClient._describe_binary_payload(payload, content_type=content_type)})'
+            ) from exc
 
-        root = ElementTree.fromstring(xml_bytes)
+        root = DartClient._try_parse_xml(xml_bytes)
+        if root is None:
+            raise DartAPIError(
+                'Invalid DART corp code archive response '
+                f'({DartClient._describe_binary_payload(xml_bytes, content_type="application/xml")})'
+            )
+        return DartClient._parse_corp_code_xml_root(root)
+
+    @staticmethod
+    def _parse_corp_code_xml_root(root: ElementTree.Element) -> list[dict[str, str]]:
         corp_codes: list[dict[str, str]] = []
         for item in root.findall('list'):
             corp_code = (item.findtext('corp_code') or '').strip()
@@ -378,6 +442,33 @@ class DartClient:
                 }
             )
         return corp_codes
+
+    @staticmethod
+    def _try_parse_xml(payload: bytes) -> ElementTree.Element | None:
+        try:
+            return ElementTree.fromstring(payload)
+        except ElementTree.ParseError:
+            return None
+
+    @staticmethod
+    def _describe_binary_payload(
+        payload: bytes,
+        *,
+        content_type: str | None = None,
+        xml_root: ElementTree.Element | None = None,
+    ) -> str:
+        parts = [f'size_bytes={len(payload)}']
+        if content_type:
+            parts.append(f'content_type={content_type}')
+
+        prefix = payload[:16].hex()
+        if prefix:
+            parts.append(f'prefix_hex={prefix}')
+
+        if xml_root is not None:
+            parts.append(f'xml_root={xml_root.tag}')
+
+        return ', '.join(parts)
 
     @staticmethod
     def _build_binary_payload(response: httpx.Response, *, default_filename: str) -> dict[str, Any]:

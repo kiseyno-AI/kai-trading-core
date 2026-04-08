@@ -155,6 +155,42 @@ class DartClientTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(DartAPIError, '014'):
             await client.download_xbrl(rcept_no='20260407000001', reprt_code='11011')
 
+    async def test_lookup_corp_code_raises_upstream_xml_error_for_corp_archive(self):
+        client = TestableDartClient(
+            {'status': '020', 'message': 'Rate limit'},
+            content=b'<?xml version="1.0" encoding="UTF-8"?><result><status>020</status><message>Rate limit</message></result>',
+            headers={'content-type': 'application/xml'},
+        )
+
+        with self.assertRaisesRegex(DartAPIError, '020'):
+            await client.lookup_corp_code(stock_code='005930')
+
+    async def test_lookup_corp_code_accepts_direct_xml_without_zip_wrapper(self):
+        client = TestableDartClient(
+            {'status': '000'},
+            content=(
+                b'<?xml version="1.0" encoding="UTF-8"?>'
+                b'<result><list><corp_code>00126380</corp_code><corp_name>Samsung Electronics</corp_name>'
+                b'<stock_code>005930</stock_code><modify_date>20260408</modify_date></list></result>'
+            ),
+            headers={'content-type': 'application/xml'},
+        )
+
+        corp = await client.lookup_corp_code(stock_code='005930')
+
+        self.assertEqual(corp['corp_code'], '00126380')
+        self.assertEqual(corp['corp_name'], 'Samsung Electronics')
+
+    async def test_lookup_corp_code_invalid_payload_reports_diagnostics(self):
+        client = TestableDartClient(
+            {'status': '000'},
+            content=b'not-a-zip-payload',
+            headers={'content-type': 'text/plain'},
+        )
+
+        with self.assertRaisesRegex(DartAPIError, 'content_type=text/plain'):
+            await client.lookup_corp_code(stock_code='005930')
+
     async def test_request_http_error_logging_omits_raw_response_body(self):
         client = DartClient()
         client.api_key = 'test-secret-key'
