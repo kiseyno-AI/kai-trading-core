@@ -175,6 +175,8 @@ class AgentContextReadServiceTests(unittest.TestCase):
             disclosures_limit=3,
         )
 
+        self.assertEqual(load_technical_mock.call_args.kwargs['fallback_window_days'], 3)
+
         self.assertEqual(result['summary']['requested_symbol_count'], 2)
         self.assertEqual(result['summary']['matched_symbol_count'], 1)
         self.assertEqual(result['summary']['technical_snapshot_count'], 1)

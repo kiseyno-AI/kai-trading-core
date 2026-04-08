@@ -210,6 +210,7 @@ class AgentContextReadService:
             market_date=normalized_market_date,
             symbols=normalized_symbols,
             limit=max(len(normalized_symbols), 1000),
+            fallback_window_days=3,
         )
         action_rows = load_daily_action_summaries(
             market_date=normalized_market_date,
