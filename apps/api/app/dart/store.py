@@ -208,12 +208,31 @@ class DartSyncRepository:
             return {code: [] for code in normalized_stock_codes}
 
         cutoff_date = _normalize_date(receipt_date_to) if receipt_date_to is not None else None
+        ranked_events = (
+            select(
+                DartDisclosureEvent.id.label('event_id'),
+                func.row_number()
+                .over(
+                    partition_by=DartDisclosureEvent.stock_code,
+                    order_by=(
+                        DartDisclosureEvent.receipt_date.desc(),
+                        DartDisclosureEvent.rcept_no.desc(),
+                    ),
+                )
+                .label('symbol_rank'),
+            )
+            .where(DartDisclosureEvent.stock_code.in_(normalized_stock_codes))
+        )
+        if cutoff_date is not None:
+            ranked_events = ranked_events.where(DartDisclosureEvent.receipt_date <= cutoff_date)
+        ranked_events_subquery = ranked_events.subquery()
+
         with session_scope() as session:
-            stmt = select(DartDisclosureEvent).where(DartDisclosureEvent.stock_code.in_(normalized_stock_codes))
-            if cutoff_date is not None:
-                stmt = stmt.where(DartDisclosureEvent.receipt_date <= cutoff_date)
             rows = session.execute(
-                stmt.order_by(
+                select(DartDisclosureEvent)
+                .join(ranked_events_subquery, DartDisclosureEvent.id == ranked_events_subquery.c.event_id)
+                .where(ranked_events_subquery.c.symbol_rank <= limit_per_symbol)
+                .order_by(
                     DartDisclosureEvent.stock_code.asc(),
                     DartDisclosureEvent.receipt_date.desc(),
                     DartDisclosureEvent.rcept_no.desc(),
@@ -223,8 +242,6 @@ class DartSyncRepository:
             grouped: dict[str, list[dict]] = defaultdict(list)
             for row in rows:
                 stock_code = row.stock_code or ''
-                if len(grouped[stock_code]) >= limit_per_symbol:
-                    continue
                 grouped[stock_code].append(_serialize_event(row))
 
         return {code: grouped.get(code, []) for code in normalized_stock_codes}
