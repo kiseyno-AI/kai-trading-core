@@ -13,6 +13,7 @@
 10. DART filing XBRL download route
 11. DART stored fundamentals history retrieval route
 12. EOD daily technical snapshot compute/inspect routes
+13. EOD daily action summary compute/inspect routes
 
 ## Current routes
 - `POST /broker/kis/token`
@@ -42,12 +43,20 @@
 - `POST /eod/pykrx/daily/run-if-due?market_date=YYYY-MM-DD`
 - `POST /eod/technical-snapshots/compute?market_date=YYYY-MM-DD&symbols=005930,000660`
 - `GET /eod/technical-snapshots?market_date=YYYY-MM-DD&symbols=005930,000660`
+- `POST /eod/action-summaries/compute?market_date=YYYY-MM-DD&symbols=005930,000660`
+- `GET /eod/action-summaries?market_date=YYYY-MM-DD&symbols=005930,000660`
 
 ## EOD technical snapshot notes
 - `daily_technical_snapshots` is the new DB-backed post-EOD signal layer keyed by `symbol_id + market_date`.
 - The initial deterministic signal set is intentionally small: MA alignment / trend state, 5d and 20d returns, 20d volume ratio, 20d breakout or breakdown flags, and ATR-based volatility context.
 - The pykrx daily EOD path now computes and persists these snapshots immediately after daily bar persistence completes, so downstream agents can consume stored data rather than recomputing chart state ad hoc.
 - For manual reruns after an EOD capture, use `python3.11 -m app.eod.technical_snapshots --market-date YYYY-MM-DD` from `apps/api`.
+
+## EOD action summary notes
+- `daily_action_summaries` is the new DB-backed rules/scoring layer keyed by `symbol_id + market_date`, reading only stored `daily_technical_snapshots`.
+- The MVP summary contract is deterministic and machine-friendly: `action_label`, `bias_direction`, `signal_score`, `confidence_tier`, `risk_tier`, `reasons`, and trigger/invalidation/support/resistance levels.
+- The pykrx daily EOD path now computes and persists these action summaries immediately after technical snapshots, so downstream sub-agents can consume a stable post-EOD recommendation object instead of inferring one ad hoc.
+- For manual reruns after an EOD capture, use `python3.11 -m app.eod.action_summaries --market-date YYYY-MM-DD` from `apps/api`.
 
 ## DART pipeline notes
 - Practical lower bound for `fnlttSinglAcntAll` and `list.json` in this pipeline is 2015 onward. Open DART documents both the filing-search date range and the financial-statement `bsns_year` support as 2015 and later, so the DB `daily_price_bars` minimum of `2007-06-05` does not expand the usable fundamentals backfill window.

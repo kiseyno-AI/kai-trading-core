@@ -165,6 +165,34 @@ class DailyTechnicalSnapshot(Base, TimestampMixin):
     captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
+
+class DailyActionSummary(Base, TimestampMixin):
+    __tablename__ = 'daily_action_summaries'
+    __table_args__ = (UniqueConstraint('symbol_id', 'market_date', name='uq_daily_action_summaries_symbol_market_date'),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol_id: Mapped[int] = mapped_column(ForeignKey('symbols.id', ondelete='CASCADE'), nullable=False, index=True)
+    technical_snapshot_id: Mapped[int | None] = mapped_column(
+        ForeignKey('daily_technical_snapshots.id', ondelete='SET NULL'),
+        index=True,
+    )
+    eod_run_id: Mapped[int | None] = mapped_column(ForeignKey('eod_collection_runs.id', ondelete='SET NULL'), index=True)
+    market_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default='pykrx')
+    action_label: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    bias_direction: Mapped[str] = mapped_column(String(16), nullable=False, default='neutral', index=True)
+    signal_score: Mapped[int] = mapped_column(Integer, nullable=False, default=0, index=True)
+    confidence_tier: Mapped[str] = mapped_column(String(16), nullable=False, default='low', index=True)
+    risk_tier: Mapped[str] = mapped_column(String(16), nullable=False, default='medium', index=True)
+    trigger_price: Mapped[float | None] = mapped_column(Numeric(14, 4))
+    invalidation_price: Mapped[float | None] = mapped_column(Numeric(14, 4))
+    support_price: Mapped[float | None] = mapped_column(Numeric(14, 4))
+    resistance_price: Mapped[float | None] = mapped_column(Numeric(14, 4))
+    reasons: Mapped[list] = mapped_column(JSON, nullable=False)
+    summary_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
 class DartDisclosureSyncRun(Base):
     __tablename__ = 'dart_disclosure_sync_runs'
 
