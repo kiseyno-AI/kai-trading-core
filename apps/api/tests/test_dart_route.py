@@ -111,6 +111,46 @@ class FakeCaptureService:
         }
 
 
+class FakeHistoryService:
+    def __init__(self):
+        self.last_args = None
+
+    def get_historical_fundamentals(self, **kwargs):
+        self.last_args = kwargs
+        return {
+            'request': {
+                'symbols': kwargs['symbols'],
+                'date': kwargs['exact_date'].isoformat() if kwargs.get('exact_date') else None,
+                'start_date': kwargs['start_date'].isoformat() if kwargs.get('start_date') else None,
+                'end_date': kwargs['end_date'].isoformat() if kwargs.get('end_date') else None,
+                'fs_div': kwargs.get('fs_div'),
+                'matched_on': 'period_end_date',
+            },
+            'summary': {
+                'requested_symbol_count': len(kwargs['symbols']),
+                'matched_symbol_count': 1,
+                'missing_symbols': [],
+                'entries': 1,
+            },
+            'companies': [
+                {
+                    'symbol': kwargs['symbols'][0],
+                    'corp_code': '00126380',
+                    'corp_name': '삼성전자',
+                    'entries': [
+                        {
+                            'filing': {'rcept_no': '20250312000123', 'receipt_date': '2025-03-12'},
+                            'period': {'period_end_date': '2024-12-31', 'report_code': '11011'},
+                            'statement': {'fs_div': kwargs.get('fs_div') or 'CFS', 'row_count': 1},
+                            'highlights': {'revenue': {'current_amount': 100}},
+                            'statements': {'count': 1, 'items': []},
+                        }
+                    ],
+                }
+            ],
+        }
+
+
 class LookupErrorService:
     async def get_company_snapshot(self, **kwargs):
         raise DartLookupError('Unknown stock_code: 999999')
@@ -133,6 +173,11 @@ class UpstreamErrorService:
 class ValidationErrorService:
     async def get_fundamentals(self, **kwargs):
         raise ValueError('period and report_code refer to different filing windows')
+
+
+class HistoryValidationService:
+    def get_historical_fundamentals(self, **kwargs):
+        raise ValueError('date cannot be combined with start_date or end_date')
 
 
 class DartRouteTests(unittest.TestCase):
@@ -307,6 +352,39 @@ class DartRouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()['run_id'], 12)
         self.assertEqual(response.json()['events_captured'], 1)
+
+    def test_fundamentals_history_route_returns_stored_payload(self):
+        original_service = routes_dart.dart_fundamentals_history_service
+        fake_service = FakeHistoryService()
+        routes_dart.dart_fundamentals_history_service = fake_service
+        try:
+            client = TestClient(self.app)
+            response = client.get(
+                '/disclosures/dart/fundamentals/history',
+                params=[('symbols', '005930'), ('symbols', '000660'), ('start_date', '2024-01-01'), ('end_date', '2024-12-31')],
+            )
+        finally:
+            routes_dart.dart_fundamentals_history_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(fake_service.last_args['symbols'], ['005930', '000660'])
+        self.assertEqual(response.json()['request']['matched_on'], 'period_end_date')
+        self.assertEqual(response.json()['companies'][0]['symbol'], '005930')
+
+    def test_fundamentals_history_route_validates_date_shape(self):
+        original_service = routes_dart.dart_fundamentals_history_service
+        routes_dart.dart_fundamentals_history_service = HistoryValidationService()
+        try:
+            client = TestClient(self.app)
+            response = client.get(
+                '/disclosures/dart/fundamentals/history',
+                params={'symbols': '005930', 'date': '2024-12-31', 'start_date': '2024-01-01'},
+            )
+        finally:
+            routes_dart.dart_fundamentals_history_service = original_service
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()['detail'], 'date cannot be combined with start_date or end_date')
 
     def test_fundamentals_capture_inspect_route_returns_payload(self):
         original_service = routes_dart.dart_fundamentals_capture_service

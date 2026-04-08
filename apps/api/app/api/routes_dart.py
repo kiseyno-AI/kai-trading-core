@@ -6,6 +6,7 @@ from fastapi.responses import Response
 
 from app.core.settings import settings
 from app.dart.fundamentals_capture_service import dart_fundamentals_capture_service
+from app.dart.fundamentals_history_service import dart_fundamentals_history_service
 from app.dart.service import dart_service
 from app.dart.sync_service import dart_disclosure_sync_service
 from app.integrations.dart.client import DartAPIError, DartLookupError
@@ -129,6 +130,29 @@ async def capture_dart_fundamentals(
         raise HTTPException(status_code=502, detail=f'DART request failed: {exc}') from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f'DART fundamentals capture failed: {exc}') from exc
+
+
+@router.get('/fundamentals/history')
+async def get_stored_dart_fundamentals_history(
+    symbols: list[str] = Query(...),
+    date: Optional[date] = Query(default=None),
+    start_date: Optional[date] = Query(default=None),
+    end_date: Optional[date] = Query(default=None),
+    fs_div: Optional[str] = Query(default=None),
+) -> dict:
+    normalized_fs_div = _normalize_fs_div(fs_div) if fs_div is not None else None
+    try:
+        return dart_fundamentals_history_service.get_historical_fundamentals(
+            symbols=symbols,
+            exact_date=date,
+            start_date=start_date,
+            end_date=end_date,
+            fs_div=normalized_fs_div,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'DART fundamentals history failed: {exc}') from exc
 
 
 @router.get('/fundamentals/capture/inspect')
