@@ -21,7 +21,14 @@ Core trading platform repository for the KAI system. This repo is the backend an
 
 **Tech stack:** Python 3, FastAPI, SQLAlchemy, Alembic, HTTPX, Pydantic Settings, Postgres.
 
-**Primary in-repo docs:** `AGENTS.md`, `ARCHITECTURE.md`, `RUNBOOK.md`, `docs/API_BUILD_ORDER.md`, `docs/ARCHITECTURE.md`, `docs/KIS_API_ONBOARDING.md`, `docs/scanner/`.
+**Primary in-repo docs:** `AGENTS.md`, `ARCHITECTURE.md`, `RUNBOOK.md`, `docs/REPOSITORY_ARCHITECTURE.md`, `docs/API_BUILD_ORDER.md`, `docs/ARCHITECTURE.md`, `docs/KIS_API_ONBOARDING.md`, `docs/scanner/`.
+
+## Architecture docs
+
+- Repository walkthrough with diagrams: `docs/REPOSITORY_ARCHITECTURE.md`
+- Docs index: `docs/ARCHITECTURE.md`
+- Top-level summary: `ARCHITECTURE.md`
+- API surface inventory: `docs/API_BUILD_ORDER.md`
 
 ## Current implemented architecture
 
