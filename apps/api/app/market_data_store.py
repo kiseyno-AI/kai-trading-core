@@ -961,3 +961,32 @@ def load_daily_action_summaries(
             }
             for summary, symbol in rows
         ]
+
+
+def count_daily_price_bars_for_date(trade_date: str | date) -> int:
+    with session_scope() as session:
+        return int(
+            session.execute(
+                select(func.count())
+                .select_from(DailyPriceBar)
+                .where(DailyPriceBar.trade_date == _normalize_trade_date(trade_date))
+            ).scalar_one()
+        )
+
+
+def load_latest_available_daily_price_trade_date() -> str | None:
+    with session_scope() as session:
+        value = session.execute(select(func.max(DailyPriceBar.trade_date))).scalar_one()
+        return value.isoformat() if value else None
+
+
+def load_latest_available_daily_technical_snapshot_date() -> str | None:
+    with session_scope() as session:
+        value = session.execute(select(func.max(DailyTechnicalSnapshot.market_date))).scalar_one()
+        return value.isoformat() if value else None
+
+
+def load_latest_available_daily_action_summary_date() -> str | None:
+    with session_scope() as session:
+        value = session.execute(select(func.max(DailyActionSummary.market_date))).scalar_one()
+        return value.isoformat() if value else None

@@ -258,6 +258,7 @@ Quote fallback policy:
 |--------|------|----------------|-------------|
 | `GET` | `/eod/status` | - | EOD job, master refresh, and pykrx-auto snapshot |
 | `POST` | `/eod/master/refresh-if-due` | `force` | Refresh symbol master if due |
+| `GET` | `/eod/freshness` | - | Current trade-date EOD freshness plus latest derived-data dates |
 | `POST` | `/eod/capture-if-due` | - | Run EOD capture when due |
 | `POST` | `/eod/capture` | `market_date` | Capture EOD for a specific market date |
 | `POST` | `/eod/pykrx/universe/refresh` | `markets`, `limit` | Refresh pykrx active universe |
@@ -269,6 +270,31 @@ Quote fallback policy:
 | `GET` | `/eod/action-summaries` | `market_date`, `symbols`, `limit` | Read persisted action summaries |
 
 ### Agent Context (`/agent-context`)
+`GET /eod/freshness` returns a stable, web-oriented payload:
+
+```json
+{
+  "today": {
+    "trade_date": "2026-04-10",
+    "eod_status": "completed",
+    "symbols_total": 950,
+    "symbols_succeeded": 950,
+    "symbols_failed": 0,
+    "received": true
+  },
+  "latest": {
+    "price_trade_date": "2026-04-10",
+    "technical_market_date": "2026-04-10",
+    "action_market_date": "2026-04-10"
+  }
+}
+```
+
+Behavior notes:
+- `today.trade_date` comes from the current Seoul market server date.
+- `eod_status` resolves to `running`, `completed`, `completed_with_errors`, or `missing`.
+- If same-day bars exist without a matching stored run record, `received` is still `true` and symbol totals remain `null`.
+
 
 | Method | Path | Query / body | Description |
 |--------|------|----------------|-------------|

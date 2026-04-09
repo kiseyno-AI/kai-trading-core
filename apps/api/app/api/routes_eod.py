@@ -5,6 +5,7 @@ from fastapi import APIRouter, HTTPException
 from app.core.settings import settings
 from app.eod.action_summaries import daily_action_summary_service
 from app.eod.auto_pykrx import auto_pykrx_eod_scheduler
+from app.eod.freshness import eod_freshness_service
 from app.eod.master import refresh_master_if_due
 from app.eod.pykrx_backfill import DEFAULT_MARKETS, PYKRX_BACKFILL_SERVICE
 from app.eod.master_state import master_refresh_state
@@ -23,6 +24,11 @@ async def get_eod_status() -> dict:
         'master': master_refresh_state.snapshot(),
         'pykrx_auto': auto_pykrx_eod_scheduler.snapshot(),
     }
+
+
+@router.get('/freshness')
+async def get_eod_freshness() -> dict:
+    return eod_freshness_service.read()
 
 
 @router.post('/master/refresh-if-due')
