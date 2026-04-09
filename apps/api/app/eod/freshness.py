@@ -49,6 +49,8 @@ class EODFreshnessService:
             status = latest_run.get('status')
             if status == 'running':
                 return 'running'
+            if status == 'completed_with_errors':
+                return 'completed_with_errors'
             if status == 'completed':
                 return 'completed_with_errors' if (latest_run.get('symbols_failed') or 0) > 0 else 'completed'
             if status == 'failed':

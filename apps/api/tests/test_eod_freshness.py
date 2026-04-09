@@ -52,6 +52,25 @@ class EODFreshnessServiceTests(unittest.TestCase):
         self.assertEqual(result['today']['received'], True)
         self.assertEqual(result['latest']['action_market_date'], '2026-04-09')
 
+    def test_read_preserves_completed_with_errors_run_status(self):
+        service = EODFreshnessService(
+            market_state_loader=lambda: _FakeMarketState(),
+            latest_run_loader=lambda **_: {
+                'status': 'completed_with_errors',
+                'symbols_total': 3,
+                'symbols_succeeded': 2,
+                'symbols_failed': 1,
+            },
+            daily_price_bar_count_loader=lambda _: 0,
+            latest_price_trade_date_loader=lambda: '2026-04-09',
+            latest_technical_market_date_loader=lambda: '2026-04-09',
+            latest_action_market_date_loader=lambda: '2026-04-09',
+        )
+
+        result = service.read()
+
+        self.assertEqual(result['today']['eod_status'], 'completed_with_errors')
+
     def test_read_returns_running_when_run_in_progress(self):
         service = EODFreshnessService(
             market_state_loader=lambda: _FakeMarketState(),
