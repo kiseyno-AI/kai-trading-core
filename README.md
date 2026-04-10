@@ -224,6 +224,7 @@ Quote fallback policy:
 | Method | Path | Query / body | Description |
 |--------|------|----------------|-------------|
 | `GET` | `/symbols/search` | `q`, `limit` | Search master symbols by code or Korean name |
+| `GET` | `/symbols/{symbol}/price-bars` | `start_date`, `end_date`, `limit` | Read stored daily OHLCV history from `daily_price_bars` |
 
 ### Macro - Bank of Korea ECOS (`/macro/bok`)
 
@@ -257,8 +258,8 @@ Quote fallback policy:
 | Method | Path | Query / body | Description |
 |--------|------|----------------|-------------|
 | `GET` | `/eod/status` | - | EOD job, master refresh, and pykrx-auto snapshot |
-| `POST` | `/eod/master/refresh-if-due` | `force` | Refresh symbol master if due |
 | `GET` | `/eod/freshness` | - | Current trade-date EOD freshness plus latest derived-data dates |
+| `POST` | `/eod/master/refresh-if-due` | `force` | Refresh symbol master if due |
 | `POST` | `/eod/capture-if-due` | - | Run EOD capture when due |
 | `POST` | `/eod/capture` | `market_date` | Capture EOD for a specific market date |
 | `POST` | `/eod/pykrx/universe/refresh` | `markets`, `limit` | Refresh pykrx active universe |
@@ -269,7 +270,6 @@ Quote fallback policy:
 | `POST` | `/eod/action-summaries/compute` | `market_date`, `symbols`, `source` | Compute and persist action summaries |
 | `GET` | `/eod/action-summaries` | `market_date`, `symbols`, `limit` | Read persisted action summaries |
 
-### Agent Context (`/agent-context`)
 `GET /eod/freshness` returns a stable, web-oriented payload:
 
 ```json
@@ -295,6 +295,7 @@ Behavior notes:
 - `eod_status` resolves to `running`, `completed`, `completed_with_errors`, or `missing`.
 - If same-day bars exist without a matching stored run record, `received` is still `true` and symbol totals remain `null`.
 
+### Agent Context (`/agent-context`)
 
 | Method | Path | Query / body | Description |
 |--------|------|----------------|-------------|
