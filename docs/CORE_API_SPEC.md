@@ -223,7 +223,7 @@ Returns historical price bars for charting.
 
 ### Example request
 ```http
-GET /symbols/005930/price-bars?range=1Y&market_date=2026-04-09
+GET /symbols/005930/price-bars?start_date=2025-04-09&end_date=2026-04-09&limit=250
 Authorization: Bearer <token>
 ```
 
@@ -231,7 +231,11 @@ Authorization: Bearer <token>
 ```json
 {
   "symbol": "005930",
-  "range": "1Y",
+  "count": 2,
+  "start_date": "2026-04-07",
+  "end_date": "2026-04-08",
+  "requested_start_date": "2025-04-09",
+  "requested_end_date": "2026-04-09",
   "items": [
     {
       "trade_date": "2026-04-07",
@@ -262,7 +266,7 @@ Authorization: Bearer <token>
 # 2. EOD and Derived Data APIs
 
 ## 2.1 `GET /eod/status`
-Returns EOD collection status information.
+Returns nested EOD automation status snapshots.
 
 ### Example request
 ```http
@@ -273,19 +277,48 @@ Authorization: Bearer <token>
 ### Example response
 ```json
 {
-  "market_date": "2026-04-09",
-  "status": "completed_with_errors",
-  "symbols_total": 3584,
-  "symbols_succeeded": 3581,
-  "symbols_failed": 3,
-  "started_at": "2026-04-09T18:42:00+09:00",
-  "completed_at": "2026-04-09T18:51:21+09:00"
+  "job": {
+    "last_market_date": "2026-04-09",
+    "last_started_at": "2026-04-09T09:42:00+00:00",
+    "last_completed_at": "2026-04-09T09:51:21+00:00",
+    "last_status": "completed_with_errors",
+    "last_error": null,
+    "symbols_total": 3584,
+    "symbols_processed": 3584,
+    "symbols_succeeded": 3581,
+    "symbols_failed": 3,
+    "last_failed_symbols": ["444920", "458610", "473370"]
+  },
+  "master": {
+    "market_date": "2026-04-09",
+    "last_started_at": "2026-04-09T08:59:00+00:00",
+    "last_completed_at": "2026-04-09T08:59:07+00:00",
+    "last_status": "completed",
+    "last_error": null,
+    "symbol_count": 3584,
+    "kospi_count": 958,
+    "kosdaq_count": 2626
+  },
+  "pykrx_auto": {
+    "enabled": true,
+    "active_task": false,
+    "last_market_state": "CLOSED",
+    "last_market_date": "2026-04-09",
+    "last_checked_at": "2026-04-09T09:52:00+00:00",
+    "last_started_at": "2026-04-09T09:42:00+00:00",
+    "last_completed_at": "2026-04-09T09:51:21+00:00",
+    "last_status": "completed",
+    "last_reason": "completed_with_errors",
+    "last_result": {"triggered": true}
+  }
 }
 ```
 
 ### Notes
-- Useful for operational and admin UI.
-- Distinct from `freshness`, which is more web-consumer friendly.
+- `job` reflects the primary EOD collection job snapshot.
+- `master` reflects symbol-master refresh state.
+- `pykrx_auto` reflects automatic scheduler state.
+- Use `/eod/freshness` when the consumer wants a compact web-facing freshness summary instead of these nested operational snapshots.
 
 ---
 
@@ -515,16 +548,38 @@ Authorization: Bearer <token>
 ### Example response
 ```json
 {
-  "market_date": "2026-04-09",
-  "companies": [
+  "request": {
+    "market_date": "2026-04-09",
+    "symbols": ["005930"],
+    "fs_div": "CFS",
+    "fs_label": "consolidated",
+    "disclosures_limit": 5
+  },
+  "summary": {
+    "requested_symbol_count": 1,
+    "matched_symbol_count": 1,
+    "missing_symbols": [],
+    "technical_snapshot_count": 1,
+    "action_summary_count": 1,
+    "fundamentals_count": 0,
+    "recent_disclosure_symbol_count": 0
+  },
+  "items": [
     {
       "symbol": "005930",
+      "market_date": "2026-04-09",
       "company": {
         "symbol": "005930",
-        "name": "삼성전자",
-        "market": "KOSPI"
+        "name_ko": "삼성전자",
+        "market": "KOSPI",
+        "instrument_type": "EQUITY",
+        "dart": {
+          "corp_code": null,
+          "corp_name": null
+        }
       },
       "technical_snapshot": {
+        "symbol": "005930",
         "market_date": "2026-04-09",
         "trend_state": "range",
         "ma_alignment": "mixed",
@@ -535,14 +590,34 @@ Authorization: Bearer <token>
         "atr_pct_14": 5.436
       },
       "action_summary": {
+        "symbol": "005930",
         "market_date": "2026-04-09",
         "action_label": "watch_long",
         "signal_score": 40,
         "confidence_tier": "medium",
         "risk_tier": "medium"
       },
-      "fundamentals_summary": null,
-      "recent_disclosures": []
+      "fundamentals": {
+        "latest_snapshot": null,
+        "history_summary": {
+          "entries": 0,
+          "latest_receipt_date": null,
+          "latest_period_end_date": null,
+          "available_business_years": [],
+          "recent_periods": []
+        }
+      },
+      "recent_disclosures": {
+        "count": 0,
+        "items": []
+      },
+      "availability": {
+        "company": true,
+        "technical_snapshot": true,
+        "action_summary": true,
+        "fundamentals": false,
+        "recent_disclosures": false
+      }
     }
   ]
 }
@@ -561,8 +636,8 @@ Each subsection can be absent independently.
 For example, a company may have:
 - technical snapshot present,
 - action summary present,
-- fundamentals summary absent,
-- recent disclosures empty.
+- `fundamentals.latest_snapshot` absent,
+- `recent_disclosures.items` empty.
 
 Clients must not assume all sub-sections are always populated.
 
