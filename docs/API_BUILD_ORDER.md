@@ -40,6 +40,7 @@
 - `GET /disclosures/dart/filings/xbrl?rcept_no=20250312000123&report_code=11011`
 - `GET /eod/status`
 - `POST /eod/master/refresh-if-due?force=false`
+- `GET /eod/freshness`
 - `POST /eod/capture-if-due`
 - `POST /eod/capture?market_date=YYYY-MM-DD`
 - `POST /eod/pykrx/universe/refresh?markets=KOSPI,KOSDAQ`
@@ -52,6 +53,10 @@
 - `GET /agent-context/symbol-day?market_date=YYYY-MM-DD&symbols=005930&symbols=000660&fs_div=CFS&disclosures_limit=5`
 
 ## EOD technical snapshot notes
+## EOD freshness read-layer notes
+- `GET /eod/freshness` is the compact web-facing read API for EOD ingestion freshness.
+- It reports the current Seoul trade date, today's EOD receipt status, stored run counts when available, and the latest stored dates for price bars, technical snapshots, and action summaries.
+
 - `daily_technical_snapshots` is the DB-backed post-EOD signal layer keyed by `symbol_id + market_date`.
 - The current deterministic signal set is intentionally small: MA alignment and trend state, 5d and 20d returns, 20d volume ratio, 20d breakout or breakdown flags, and ATR-based volatility context.
 - The pykrx daily EOD path computes and persists these snapshots after daily bar persistence completes, so downstream agents can consume stored data rather than recomputing chart state ad hoc.

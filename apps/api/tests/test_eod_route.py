@@ -7,6 +7,25 @@ from fastapi.testclient import TestClient
 from app.api import routes_eod
 
 
+class FakeFreshnessService:
+    def read(self):
+        return {
+            'today': {
+                'trade_date': '2026-04-10',
+                'eod_status': 'completed',
+                'symbols_total': 3,
+                'symbols_succeeded': 3,
+                'symbols_failed': 0,
+                'received': True,
+            },
+            'latest': {
+                'price_trade_date': '2026-04-10',
+                'technical_market_date': '2026-04-10',
+                'action_market_date': '2026-04-10',
+            },
+        }
+
+
 class FakeTechnicalSnapshotService:
     def __init__(self):
         self.compute_args = None
@@ -57,6 +76,22 @@ class EODRouteTests(unittest.TestCase):
     def setUp(self):
         self.app = FastAPI()
         self.app.include_router(routes_eod.router)
+
+    def test_get_eod_freshness_route_returns_service_payload(self):
+        fake_service = FakeFreshnessService()
+        original_service = routes_eod.eod_freshness_service
+        routes_eod.eod_freshness_service = fake_service
+        try:
+            client = TestClient(self.app)
+            response = client.get('/eod/freshness')
+        finally:
+            routes_eod.eod_freshness_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload['today']['trade_date'], '2026-04-10')
+        self.assertEqual(payload['today']['eod_status'], 'completed')
+        self.assertEqual(payload['latest']['action_market_date'], '2026-04-10')
 
     def test_compute_technical_snapshots_route_calls_service(self):
         fake_service = FakeTechnicalSnapshotService()
