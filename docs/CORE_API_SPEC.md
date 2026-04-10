@@ -1,0 +1,646 @@
+# Core API Specification
+
+## Purpose
+This document describes the currently implemented `kai-trading-core` API surface in a consumer-friendly way for web, UX, GUI, and agent integration work.
+
+It focuses on:
+- what the API currently serves,
+- how requests are shaped,
+- what responses roughly look like,
+- how to interpret freshness, nullability, and partial coverage.
+
+This document is intentionally based on the current implemented system, not on hypothetical future endpoints.
+
+---
+
+## Base Concepts
+
+### Authentication
+Most external read/write API routes are protected.
+Typical access pattern:
+- `Authorization: Bearer <token>`
+
+Internal automation may use separate internal call paths, but UX/web consumers should assume bearer-protected upstream APIs unless explicitly proxied through the web layer.
+
+### Date Formats
+Dates generally use ISO calendar date format:
+- `YYYY-MM-DD`
+
+Examples:
+- `2026-04-09`
+- `2015-01-01`
+
+### Timestamps
+Timestamps generally use ISO 8601 with timezone offsets.
+
+Example:
+- `2026-04-10T02:51:10.622651+00:00`
+
+### Symbols
+Symbols are Korean equity codes represented as strings.
+
+Examples:
+- `005930`
+- `071050`
+
+Do not assume numeric semantics in clients. Treat them as string identifiers.
+
+---
+
+# 1. Market / Quote APIs
+
+## 1.1 `GET /market/status`
+Returns current market state and related session timing metadata.
+
+### Example request
+```http
+GET /market/status
+Authorization: Bearer <token>
+```
+
+### Example response
+```json
+{
+  "market": "KRX",
+  "state": "CLOSED",
+  "as_of": "2026-04-10T15:20:11+09:00",
+  "session_label": "after_close",
+  "is_open": false
+}
+```
+
+### Notes
+- `state` is used by the web to decide whether some screens should keep polling.
+- Common consumer interpretation:
+  - `OPEN` means live market behavior
+  - `CLOSED` means post-close behavior
+- Exact extra fields may evolve, but `state` is the key UX field.
+
+---
+
+## 1.2 `GET /quotes/{symbol}`
+Returns a quote payload for a single symbol.
+
+### Example request
+```http
+GET /quotes/005930
+Authorization: Bearer <token>
+```
+
+### Example response
+```json
+{
+  "symbol": "005930",
+  "name": "삼성전자",
+  "price": 81200,
+  "change": -300,
+  "change_pct": -0.37,
+  "market_state": "CLOSED",
+  "available": true,
+  "source": "daily_bar",
+  "as_of": "2026-04-09"
+}
+```
+
+### Important semantics
+- `market_state` is used with `/market/status` to decide whether symbol-detail polling should stop.
+- `available: false` is a valid state and should not be converted into synthetic zero values.
+- `source` communicates provenance, for example:
+  - live quote source,
+  - daily bar fallback,
+  - cache.
+
+### UX guidance
+If `available` is false:
+- do not render fake price values,
+- show an explicit unavailable state.
+
+---
+
+## 1.3 `GET /quotes/tracked`
+Returns tracked-universe quote data for dashboard-like surfaces.
+
+### Example request
+```http
+GET /quotes/tracked
+Authorization: Bearer <token>
+```
+
+### Example response
+```json
+{
+  "items": [
+    {
+      "symbol": "005930",
+      "name": "삼성전자",
+      "price": 81200,
+      "change": -300,
+      "change_pct": -0.37,
+      "market_state": "CLOSED",
+      "available": true
+    },
+    {
+      "symbol": "000660",
+      "name": "SK하이닉스",
+      "price": 203500,
+      "change": 4200,
+      "change_pct": 2.11,
+      "market_state": "CLOSED",
+      "available": true
+    }
+  ]
+}
+```
+
+### Notes
+- Used primarily by tracked/dashboard surfaces.
+- Not the same as symbol-detail quote polling.
+
+---
+
+## 1.4 `GET /scanner/tracked-symbols`
+Returns tracked/scanner symbol universe information used by dashboard/tracker-like surfaces.
+
+### Example request
+```http
+GET /scanner/tracked-symbols
+Authorization: Bearer <token>
+```
+
+### Example response
+```json
+{
+  "symbols": [
+    "005930",
+    "000660",
+    "035420"
+  ],
+  "count": 3
+}
+```
+
+### Notes
+- This is used for tracked-universe/dashboard logic.
+- Symbol detail should not depend on this route.
+
+---
+
+## 1.5 `GET /symbols/search`
+Searches symbol metadata.
+
+### Example request
+```http
+GET /symbols/search?q=삼성
+Authorization: Bearer <token>
+```
+
+### Example response
+```json
+{
+  "query": "삼성",
+  "items": [
+    {
+      "symbol": "005930",
+      "name": "삼성전자",
+      "market": "KOSPI"
+    },
+    {
+      "symbol": "207940",
+      "name": "삼성바이오로직스",
+      "market": "KOSPI"
+    }
+  ]
+}
+```
+
+### Notes
+- Used in search UI and occasional route metadata recovery flows.
+
+---
+
+## 1.6 `GET /symbols/{symbol}/price-bars`
+Returns historical price bars for charting.
+
+### Example request
+```http
+GET /symbols/005930/price-bars?range=1Y&market_date=2026-04-09
+Authorization: Bearer <token>
+```
+
+### Example response
+```json
+{
+  "symbol": "005930",
+  "range": "1Y",
+  "items": [
+    {
+      "trade_date": "2026-04-07",
+      "open": 79800,
+      "high": 81000,
+      "low": 79400,
+      "close": 80700,
+      "volume": 15234567
+    },
+    {
+      "trade_date": "2026-04-08",
+      "open": 80800,
+      "high": 82000,
+      "low": 80400,
+      "close": 81500,
+      "volume": 17567890
+    }
+  ]
+}
+```
+
+### Notes
+- Intended for chart rendering.
+- Date ordering should be treated as explicit rather than assumed.
+
+---
+
+# 2. EOD and Derived Data APIs
+
+## 2.1 `GET /eod/status`
+Returns EOD collection status information.
+
+### Example request
+```http
+GET /eod/status
+Authorization: Bearer <token>
+```
+
+### Example response
+```json
+{
+  "market_date": "2026-04-09",
+  "status": "completed_with_errors",
+  "symbols_total": 3584,
+  "symbols_succeeded": 3581,
+  "symbols_failed": 3,
+  "started_at": "2026-04-09T18:42:00+09:00",
+  "completed_at": "2026-04-09T18:51:21+09:00"
+}
+```
+
+### Notes
+- Useful for operational and admin UI.
+- Distinct from `freshness`, which is more web-consumer friendly.
+
+---
+
+## 2.2 `GET /eod/freshness`
+Returns UX-friendly EOD and derived-data freshness information.
+
+### Example request
+```http
+GET /eod/freshness
+Authorization: Bearer <token>
+```
+
+### Example response
+```json
+{
+  "today": {
+    "trade_date": "2026-04-10",
+    "eod_status": "completed_with_errors",
+    "symbols_total": 3584,
+    "symbols_succeeded": 3581,
+    "symbols_failed": 3,
+    "received": true
+  },
+  "latest": {
+    "price_trade_date": "2026-04-09",
+    "technical_market_date": "2026-04-09",
+    "action_market_date": "2026-04-09"
+  }
+}
+```
+
+### Status meanings
+- `running`
+- `completed`
+- `completed_with_errors`
+- `missing`
+
+### UX use
+This route is the preferred API for expressing:
+- whether today’s EOD is done,
+- whether it was partial,
+- whether derived layers lag behind price data,
+- latest available dates for key data groups.
+
+---
+
+## 2.3 `GET /eod/technical-snapshots`
+Returns stored technical snapshot data.
+
+### Example request
+```http
+GET /eod/technical-snapshots?market_date=2026-04-09&symbols=005930
+Authorization: Bearer <token>
+```
+
+### Example response
+```json
+{
+  "market_date": "2026-04-09",
+  "items": [
+    {
+      "symbol": "005930",
+      "trend_state": "range",
+      "ma_alignment": "mixed",
+      "breakout_20d": true,
+      "breakdown_20d": false,
+      "return_5d": 11.0232,
+      "return_20d": 10.7895,
+      "volume_ratio_20d": 1.3315,
+      "atr_pct_14": 5.436
+    }
+  ]
+}
+```
+
+### Important nullability
+Some fields can be null for legitimate historical reasons.
+Examples:
+- `return_5d` needs enough lookback,
+- `return_20d` needs enough lookback,
+- `volume_ratio_20d` needs enough lookback,
+- `atr_pct_14` needs enough lookback.
+
+Nulls in these fields do not automatically mean ingestion failure.
+
+---
+
+## 2.4 `GET /eod/action-summaries`
+Returns stored action-summary data derived from technical snapshots.
+
+### Example request
+```http
+GET /eod/action-summaries?market_date=2026-04-09&symbols=005930
+Authorization: Bearer <token>
+```
+
+### Example response
+```json
+{
+  "market_date": "2026-04-09",
+  "items": [
+    {
+      "symbol": "005930",
+      "action_label": "watch_long",
+      "signal_score": 40,
+      "confidence_tier": "medium",
+      "risk_tier": "medium",
+      "reasons": [
+        "20-day breakout detected",
+        "MA alignment is mixed"
+      ]
+    }
+  ]
+}
+```
+
+### Notes
+- Action summaries are deterministic derived summaries, not free-form LLM output.
+- Good for ranking/display layers, but consumers should still preserve nuance.
+
+---
+
+# 3. DART APIs
+
+## 3.1 `GET /disclosures/dart/fundamentals/history`
+Returns stored DART fundamentals history for one or more symbols.
+
+### Example request
+```http
+GET /disclosures/dart/fundamentals/history?symbols=071050&start_date=2024-01-01&end_date=2026-04-09&fs_div=CFS
+Authorization: Bearer <token>
+```
+
+### Example response
+```json
+{
+  "request": {
+    "symbols": ["071050"],
+    "start_date": "2024-01-01",
+    "end_date": "2026-04-09",
+    "fs_div": "CFS"
+  },
+  "companies": [
+    {
+      "symbol": "071050",
+      "name": "한국금융지주우",
+      "entries": [
+        {
+          "filing": {
+            "rcept_no": "20260319001006",
+            "report_nm": "사업보고서 (2025.12)",
+            "receipt_date": "2026-03-19"
+          },
+          "period": {
+            "business_year": 2025,
+            "report_code": "11011"
+          },
+          "statement": {
+            "fs_div": "CFS"
+          },
+          "highlights": [
+            {
+              "metric_key": "revenue",
+              "label": "매출액",
+              "value": 123456789
+            }
+          ],
+          "statements": [
+            {
+              "account_name": "매출액",
+              "current_amount": 123456789
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+```
+
+### Notes
+- This is stored-history access, not a live raw DART passthrough.
+- Coverage may be partial by symbol, filing, and period.
+
+---
+
+## 3.2 `GET /disclosures/dart/filings/document`
+Returns filing package/binary content for a DART filing.
+
+### Example request
+```http
+GET /disclosures/dart/filings/document?rcept_no=20260319001006
+Authorization: Bearer <token>
+```
+
+### Notes
+- Intended for filing retrieval/download flows.
+- Binary success and error envelope handling are explicitly guarded in current implementation.
+
+---
+
+## 3.3 `GET /disclosures/dart/filings/xbrl`
+Returns XBRL-related filing content.
+
+### Example request
+```http
+GET /disclosures/dart/filings/xbrl?rcept_no=20260319001006&report_code=11011
+Authorization: Bearer <token>
+```
+
+### Notes
+- Intended for consumers that want structured filing package access.
+
+---
+
+# 4. Aggregate Context API
+
+## 4.1 `GET /agent-context/symbol-day`
+Returns a symbol/day aggregate payload combining multiple stored datasets.
+
+### Example request
+```http
+GET /agent-context/symbol-day?market_date=2026-04-09&symbols=005930&fs_div=CFS&disclosures_limit=5
+Authorization: Bearer <token>
+```
+
+### Example response
+```json
+{
+  "market_date": "2026-04-09",
+  "companies": [
+    {
+      "symbol": "005930",
+      "company": {
+        "symbol": "005930",
+        "name": "삼성전자",
+        "market": "KOSPI"
+      },
+      "technical_snapshot": {
+        "market_date": "2026-04-09",
+        "trend_state": "range",
+        "ma_alignment": "mixed",
+        "breakout_20d": true,
+        "return_5d": 11.0232,
+        "return_20d": 10.7895,
+        "volume_ratio_20d": 1.3315,
+        "atr_pct_14": 5.436
+      },
+      "action_summary": {
+        "market_date": "2026-04-09",
+        "action_label": "watch_long",
+        "signal_score": 40,
+        "confidence_tier": "medium",
+        "risk_tier": "medium"
+      },
+      "fundamentals_summary": null,
+      "recent_disclosures": []
+    }
+  ]
+}
+```
+
+### Semantics
+This is not a raw DB dump.
+It is a composed read payload intended for:
+- web symbol-detail surfaces,
+- agent reasoning,
+- summary card generation,
+- low-roundtrip consumers.
+
+### Important nullability
+Each subsection can be absent independently.
+For example, a company may have:
+- technical snapshot present,
+- action summary present,
+- fundamentals summary absent,
+- recent disclosures empty.
+
+Clients must not assume all sub-sections are always populated.
+
+---
+
+# 5. Consumer Notes for UX / Web / Agent Layers
+
+## 5.1 Freshness is not globally uniform
+Do not assume:
+- price latest date,
+- technical latest date,
+- action latest date,
+- DART latest date
+all match.
+
+Use `/eod/freshness` and section-specific timestamps/dates where possible.
+
+## 5.2 Partial coverage is normal
+This system legitimately produces partial coverage in cases such as:
+- sparse DART history,
+- DART `[013]` no-data filings,
+- insufficient lookback for technical fields,
+- unavailable quote states.
+
+## 5.3 Unavailable does not mean zero
+If a quote or subsection is unavailable:
+- preserve that state explicitly,
+- do not fabricate a numeric value,
+- do not silently degrade to misleading UI.
+
+## 5.4 Symbol detail is a composite screen
+Symbol-detail style consumers should think in layered modules:
+- quote,
+- market status,
+- price history,
+- technical snapshot,
+- action summary,
+- fundamentals summary,
+- disclosures.
+
+These modules may differ in freshness and completeness.
+
+---
+
+# 6. Recommended Core APIs for UX/GUI Planning
+
+If a UX or frontend team needs to plan against the current system, the most important core APIs are:
+- `/market/status`
+- `/quotes/{symbol}`
+- `/quotes/tracked`
+- `/scanner/tracked-symbols`
+- `/symbols/search`
+- `/symbols/{symbol}/price-bars`
+- `/eod/freshness`
+- `/eod/technical-snapshots`
+- `/eod/action-summaries`
+- `/agent-context/symbol-day`
+- `/disclosures/dart/fundamentals/history`
+
+These cover most currently meaningful user-facing flows.
+
+---
+
+# 7. Summary
+
+`kai-trading-core` currently provides a layered API system covering:
+- market state,
+- single-symbol and tracked-universe quotes,
+- symbol search,
+- historical price bars,
+- EOD status and freshness,
+- technical snapshots,
+- action summaries,
+- DART fundamentals/disclosure history,
+- aggregated symbol/day context.
+
+The key design reality for consumers is that:
+- freshness differs by data layer,
+- nullability is sometimes expected and correct,
+- DART coverage is uneven,
+- aggregate consumers should treat sections as independently optional.
