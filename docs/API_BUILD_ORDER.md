@@ -26,6 +26,7 @@
 - `GET /scanner/tracked-symbols`
 - `POST /scanner/tracked-symbols`
 - `GET /symbols/search?q=삼성&limit=20`
+- `GET /symbols/005930/price-bars?start_date=2021-04-09&end_date=2026-04-09`
 - `GET /macro/bok/series?series_id=722Y001/0101000&start_period=20240101&end_period=20240131&cycle=D`
 - `GET /fx/koreaexim/rates?search_date=20260408&data=AP01`
 - `GET /disclosures/dart/company-snapshot?stock_code=005930`
@@ -39,8 +40,8 @@
 - `GET /disclosures/dart/filings/document?rcept_no=20250312000123`
 - `GET /disclosures/dart/filings/xbrl?rcept_no=20250312000123&report_code=11011`
 - `GET /eod/status`
-- `POST /eod/master/refresh-if-due?force=false`
 - `GET /eod/freshness`
+- `POST /eod/master/refresh-if-due?force=false`
 - `POST /eod/capture-if-due`
 - `POST /eod/capture?market_date=YYYY-MM-DD`
 - `POST /eod/pykrx/universe/refresh?markets=KOSPI,KOSDAQ`
@@ -52,11 +53,11 @@
 - `GET /eod/action-summaries?market_date=YYYY-MM-DD&symbols=005930,000660`
 - `GET /agent-context/symbol-day?market_date=YYYY-MM-DD&symbols=005930&symbols=000660&fs_div=CFS&disclosures_limit=5`
 
-## EOD technical snapshot notes
 ## EOD freshness read-layer notes
 - `GET /eod/freshness` is the compact web-facing read API for EOD ingestion freshness.
 - It reports the current Seoul trade date, today's EOD receipt status, stored run counts when available, and the latest stored dates for price bars, technical snapshots, and action summaries.
 
+## EOD technical snapshot notes
 - `daily_technical_snapshots` is the DB-backed post-EOD signal layer keyed by `symbol_id + market_date`.
 - The current deterministic signal set is intentionally small: MA alignment and trend state, 5d and 20d returns, 20d volume ratio, 20d breakout or breakdown flags, and ATR-based volatility context.
 - The pykrx daily EOD path computes and persists these snapshots after daily bar persistence completes, so downstream agents can consume stored data rather than recomputing chart state ad hoc.
@@ -70,6 +71,11 @@
   - then same-day `quote_cache` or `current_quote_cache`
   - otherwise `available: false`
 - Multi-day stale quote cache must not be surfaced as if it were a current quote.
+
+## Symbol price history notes
+- `GET /symbols/{symbol}/price-bars` is the read API for the web symbol-detail candlestick chart.
+- It reads directly from `daily_price_bars` and supports bounded range windows with `start_date` and `end_date`, plus a capped `limit` for recent-history or max-history retrieval.
+- When `limit` is used, the API reads the newest rows first for index-friendly retrieval and returns them sorted ascending for chart consumers.
 
 ## EOD action summary notes
 - `daily_action_summaries` is the DB-backed rules and scoring layer keyed by `symbol_id + market_date`, reading only stored `daily_technical_snapshots`.
