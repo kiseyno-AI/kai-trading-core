@@ -493,6 +493,99 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(repository.candidate_call_kwargs[-1]['event_ids'], [7])
         self.assertEqual(repository.successes, [7])
 
+    async def test_daily_incremental_refresh_heartbeats_during_sync_and_capture_work(self):
+        client = FakeCaptureClient()
+        repository = FakeCaptureRepository()
+        repository.symbol_states = {
+            '005930': {
+                'stock_code': '005930',
+                'has_fundamentals': True,
+                'latest_fundamentals_receipt_date': '2026-04-01',
+                'latest_snapshot': {'id': 100},
+            },
+        }
+        service = DartFundamentalsCaptureService(
+            client=client,
+            repository=repository,
+            active_symbol_loader=lambda: [{'symbol': '005930'}],
+        )
+
+        sync_active = False
+        capture_active = False
+        sync_heartbeat_seen = asyncio.Event()
+        capture_heartbeat_seen = asyncio.Event()
+        original_update_refresh_run_progress = repository.update_refresh_run_progress
+
+        def recording_update_refresh_run_progress(run_id, **kwargs):
+            metadata = kwargs.get('run_metadata') or {}
+            if sync_active and metadata.get('stage') == 'syncing_disclosures' and metadata.get('last_progress_at'):
+                sync_heartbeat_seen.set()
+            if capture_active and metadata.get('stage') == 'capturing_fundamentals' and metadata.get('last_progress_at'):
+                capture_heartbeat_seen.set()
+            original_update_refresh_run_progress(run_id, **kwargs)
+
+        repository.update_refresh_run_progress = recording_update_refresh_run_progress
+
+        async def fake_sync(**kwargs):
+            nonlocal sync_active
+            sync_active = True
+            try:
+                await asyncio.wait_for(sync_heartbeat_seen.wait(), timeout=1)
+            finally:
+                sync_active = False
+            return {
+                'run_id': 77,
+                'status': 'completed',
+                'financial_report_events': len(kwargs['corporations']),
+            }
+
+        async def fake_capture_recent_fundamentals(**kwargs):
+            nonlocal capture_active
+            capture_active = True
+            try:
+                await asyncio.wait_for(capture_heartbeat_seen.wait(), timeout=1)
+            finally:
+                capture_active = False
+            return {
+                'run_id': 88,
+                'status': 'completed',
+                'fs_div': kwargs['fs_div'],
+                'events_seen': 1,
+                'events_captured': 1,
+                'events_failed': 0,
+                'events_skipped': 0,
+                'results': [
+                    {
+                        'event_id': 4,
+                        'stock_code': '005930',
+                        'status': 'captured',
+                    }
+                ],
+            }
+
+        service.capture_recent_fundamentals = fake_capture_recent_fundamentals
+
+        with patch(
+            'app.dart.sync_service.dart_disclosure_sync_service.sync_disclosures_for_corporations',
+            side_effect=fake_sync,
+        ), patch('app.dart.fundamentals_capture_service.DART_FUNDAMENTALS_REFRESH_HEARTBEAT_SECONDS', 0.001):
+            result = await service.run_daily_incremental_refresh(
+                market_date=date(2026, 4, 14),
+                capture_limit=10,
+                fs_div='CFS',
+                trigger='test_daily',
+            )
+
+        self.assertTrue(result['triggered'])
+        self.assertTrue(sync_heartbeat_seen.is_set())
+        self.assertTrue(capture_heartbeat_seen.is_set())
+        progress_stages = [
+            (update[1].get('run_metadata') or {}).get('stage')
+            for update in repository.refresh_progress_updates
+        ]
+        self.assertIn('syncing_disclosures', progress_stages)
+        self.assertIn('capturing_fundamentals', progress_stages)
+
     async def test_daily_incremental_refresh_skips_completed_market_date_without_force(self):
         repository = FakeCaptureRepository()
         repository.latest_refresh_run = {

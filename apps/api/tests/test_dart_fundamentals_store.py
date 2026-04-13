@@ -4,7 +4,12 @@ from uuid import uuid4
 
 from app.dart.fundamentals_store import DartFundamentalsRepository
 from app.db import session_scope
-from app.db_models import DartDisclosureEvent, DartFundamentalsCaptureRun, DartFundamentalsSnapshot
+from app.db_models import (
+    DartDisclosureEvent,
+    DartFundamentalsCaptureRun,
+    DartFundamentalsRefreshRun,
+    DartFundamentalsSnapshot,
+)
 from sqlalchemy import delete, select
 
 
@@ -12,11 +17,17 @@ class DartFundamentalsRepositoryTests(unittest.TestCase):
     def setUp(self):
         self.repository = DartFundamentalsRepository()
         self.created_run_ids: list[int] = []
+        self.created_refresh_run_ids: list[int] = []
         self.created_event_ids: list[int] = []
         self.created_snapshot_ids: list[int] = []
 
     def tearDown(self):
-        if not self.created_run_ids and not self.created_event_ids and not self.created_snapshot_ids:
+        if (
+            not self.created_run_ids
+            and not self.created_refresh_run_ids
+            and not self.created_event_ids
+            and not self.created_snapshot_ids
+        ):
             return
         with session_scope() as session:
             if self.created_snapshot_ids:
@@ -31,6 +42,12 @@ class DartFundamentalsRepositoryTests(unittest.TestCase):
                 session.execute(
                     delete(DartFundamentalsCaptureRun).where(DartFundamentalsCaptureRun.id.in_(self.created_run_ids))
                 )
+            if self.created_refresh_run_ids:
+                session.execute(
+                    delete(DartFundamentalsRefreshRun).where(
+                        DartFundamentalsRefreshRun.id.in_(self.created_refresh_run_ids)
+                    )
+                )
 
     def _create_run(self, *, trigger: str) -> int:
         run_id = self.repository.create_capture_run(
@@ -41,6 +58,20 @@ class DartFundamentalsRepositoryTests(unittest.TestCase):
             run_metadata=None,
         )
         self.created_run_ids.append(run_id)
+        return run_id
+
+    def _create_refresh_run(self, *, trigger: str) -> int:
+        run_id = self.repository.create_refresh_run(
+            market_date=date(2026, 4, 14),
+            trigger=trigger,
+            fs_div='CFS',
+            force=False,
+            symbol_limit=1,
+            symbol_offset=0,
+            symbols_total=1,
+            run_metadata=None,
+        )
+        self.created_refresh_run_ids.append(run_id)
         return run_id
 
     def _create_event_snapshot(
@@ -186,3 +217,50 @@ class DartFundamentalsRepositoryTests(unittest.TestCase):
         self.assertFalse(states[failed_only_stock_code]['has_fundamentals'])
         self.assertIsNone(states[failed_only_stock_code]['latest_fundamentals_receipt_date'])
         self.assertIsNone(states[failed_only_stock_code]['latest_snapshot'])
+
+    def test_fail_stale_refresh_runs_uses_last_progress_at_when_present(self):
+        now = datetime.now(timezone.utc)
+        fresh_run_id = self._create_refresh_run(trigger='test_refresh_fresh_progress')
+        stale_progress_run_id = self._create_refresh_run(trigger='test_refresh_old_progress')
+        stale_no_progress_run_id = self._create_refresh_run(trigger='test_refresh_no_progress')
+
+        with session_scope() as session:
+            fresh_run = session.execute(
+                select(DartFundamentalsRefreshRun).where(DartFundamentalsRefreshRun.id == fresh_run_id)
+            ).scalar_one()
+            fresh_run.started_at = now - timedelta(hours=3)
+            fresh_run.run_metadata = {'last_progress_at': (now - timedelta(minutes=5)).isoformat()}
+
+            stale_progress_run = session.execute(
+                select(DartFundamentalsRefreshRun).where(DartFundamentalsRefreshRun.id == stale_progress_run_id)
+            ).scalar_one()
+            stale_progress_run.started_at = now - timedelta(hours=3)
+            stale_progress_run.run_metadata = {'last_progress_at': (now - timedelta(hours=2)).isoformat()}
+
+            stale_no_progress_run = session.execute(
+                select(DartFundamentalsRefreshRun).where(DartFundamentalsRefreshRun.id == stale_no_progress_run_id)
+            ).scalar_one()
+            stale_no_progress_run.started_at = now - timedelta(hours=3)
+            stale_no_progress_run.run_metadata = None
+
+        failed_run_ids = self.repository.fail_stale_refresh_runs(
+            stale_before=now - timedelta(minutes=60),
+            error_message='stale',
+        )
+
+        self.assertCountEqual(failed_run_ids, [stale_progress_run_id, stale_no_progress_run_id])
+
+        with session_scope() as session:
+            fresh_run = session.execute(
+                select(DartFundamentalsRefreshRun).where(DartFundamentalsRefreshRun.id == fresh_run_id)
+            ).scalar_one()
+            stale_progress_run = session.execute(
+                select(DartFundamentalsRefreshRun).where(DartFundamentalsRefreshRun.id == stale_progress_run_id)
+            ).scalar_one()
+            stale_no_progress_run = session.execute(
+                select(DartFundamentalsRefreshRun).where(DartFundamentalsRefreshRun.id == stale_no_progress_run_id)
+            ).scalar_one()
+
+            self.assertEqual(fresh_run.status, 'running')
+            self.assertEqual(stale_progress_run.status, 'failed')
+            self.assertEqual(stale_no_progress_run.status, 'failed')

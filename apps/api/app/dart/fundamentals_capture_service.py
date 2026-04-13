@@ -3,9 +3,10 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import re
+from contextlib import suppress
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 
 from app.core.audit_logging import log_fetch_event
 from app.core.settings import settings
@@ -29,10 +30,41 @@ _FILING_CATEGORY_TO_REPORT_CODE = {
 }
 
 DART_FUNDAMENTALS_MIN_START_DATE = date(settings.dart_fundamentals_min_business_year, 1, 1)
+DART_FUNDAMENTALS_REFRESH_HEARTBEAT_SECONDS = 30.0
 
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+async def _await_with_refresh_heartbeat(
+    operation: Callable[[], Awaitable[Any]],
+    *,
+    heartbeat: Callable[[], None],
+    interval_seconds: float | None = None,
+) -> Any:
+    heartbeat()
+    resolved_interval_seconds = (
+        DART_FUNDAMENTALS_REFRESH_HEARTBEAT_SECONDS
+        if interval_seconds is None
+        else interval_seconds
+    )
+    if resolved_interval_seconds <= 0:
+        return await operation()
+
+    async def heartbeat_loop() -> None:
+        while True:
+            await asyncio.sleep(resolved_interval_seconds)
+            heartbeat()
+
+    task = asyncio.create_task(heartbeat_loop())
+    try:
+        return await operation()
+    finally:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
 
 def infer_fundamentals_request(
     event: dict[str, Any],
@@ -824,6 +856,34 @@ class DartFundamentalsCaptureService:
         check_start_by_symbol: dict[str, date] = {}
         latest_fundamentals_date_by_symbol: dict[str, date | None] = {}
 
+        def update_refresh_progress(
+            *,
+            stage: str,
+            extra_metadata: dict[str, Any] | None = None,
+        ) -> None:
+            metadata = {
+                **run_metadata,
+                'stage': stage,
+                'lookup_errors': _limited_sample(lookup_errors),
+                'sync_run_count': len(sync_results),
+                'last_progress_at': _utcnow().isoformat(),
+            }
+            if extra_metadata:
+                metadata.update(extra_metadata)
+            self.repository.update_refresh_run_progress(
+                run_id,
+                symbols_checked=symbols_checked,
+                symbols_missing=symbols_missing,
+                symbols_stale=symbols_stale,
+                symbols_fresh=symbols_fresh,
+                symbols_refreshed=symbols_refreshed,
+                symbols_failed=symbols_failed,
+                events_detected=events_detected,
+                events_captured=events_captured,
+                events_failed=events_failed,
+                run_metadata=metadata,
+            )
+
         try:
             for stock_code in selected_stock_codes:
                 state = states.get(stock_code) or {
@@ -876,33 +936,41 @@ class DartFundamentalsCaptureService:
                 check_start_by_symbol[stock_code] = check_start_date
                 sync_groups.setdefault(check_start_date, []).append(corp_record)
 
-            self.repository.update_refresh_run_progress(
-                run_id,
-                symbols_checked=symbols_checked,
-                symbols_missing=symbols_missing,
-                symbols_stale=0,
-                symbols_fresh=0,
-                symbols_refreshed=0,
-                symbols_failed=len(lookup_failed_symbols),
-                events_detected=0,
-                events_captured=0,
-                events_failed=0,
-                run_metadata={
-                    **run_metadata,
-                    'lookup_errors': _limited_sample(lookup_errors),
+            symbols_failed = len(lookup_failed_symbols)
+            update_refresh_progress(
+                stage='sync_groups_prepared',
+                extra_metadata={
                     'sync_group_count': len(sync_groups),
-                    'last_progress_at': _utcnow().isoformat(),
                 },
             )
 
             from app.dart.sync_service import dart_disclosure_sync_service
 
             for check_start_date, corporations in sorted(sync_groups.items(), key=lambda item: item[0]):
-                sync_result = await dart_disclosure_sync_service.sync_disclosures_for_corporations(
-                    corporations=corporations,
-                    start_date=check_start_date,
-                    end_date=resolved_market_date,
-                    trigger='daily_incremental_refresh',
+                sync_group_metadata = {
+                    'current_sync_group': {
+                        'check_start_date': check_start_date.isoformat(),
+                        'corporation_count': len(corporations),
+                        'stock_codes_sample': _limited_sample(
+                            [corporation['stock_code'] for corporation in corporations]
+                        ),
+                    },
+                }
+
+                async def sync_group_operation() -> dict[str, Any]:
+                    return await dart_disclosure_sync_service.sync_disclosures_for_corporations(
+                        corporations=corporations,
+                        start_date=check_start_date,
+                        end_date=resolved_market_date,
+                        trigger='daily_incremental_refresh',
+                    )
+
+                sync_result = await _await_with_refresh_heartbeat(
+                    sync_group_operation,
+                    heartbeat=lambda: update_refresh_progress(
+                        stage='syncing_disclosures',
+                        extra_metadata=sync_group_metadata,
+                    ),
                 )
                 sync_results.append(
                     {
@@ -910,6 +978,14 @@ class DartFundamentalsCaptureService:
                         'check_start_date': check_start_date.isoformat(),
                         'corporation_count': len(corporations),
                     }
+                )
+                update_refresh_progress(
+                    stage='sync_group_completed',
+                    extra_metadata={
+                        **sync_group_metadata,
+                        'sync_run_id': sync_result.get('run_id'),
+                        'sync_status': sync_result.get('status'),
+                    },
                 )
 
             sync_stock_codes = list(check_start_by_symbol.keys())
@@ -970,15 +1046,30 @@ class DartFundamentalsCaptureService:
 
             capture_result: dict[str, Any]
             if event_ids_to_capture:
-                capture_result = await self.capture_recent_fundamentals(
-                    limit=len(event_ids_to_capture),
-                    force=False,
-                    trigger='daily_incremental_refresh',
-                    fs_div=resolved_fs_div,
-                    stock_codes=sorted(candidate_symbols),
-                    receipt_date_from=min(check_start_by_symbol.values()) if check_start_by_symbol else None,
-                    receipt_date_to=resolved_market_date,
-                    event_ids=event_ids_to_capture,
+                capture_metadata = {
+                    'candidate_event_count': events_detected,
+                    'capture_event_count': len(event_ids_to_capture),
+                    'candidate_event_ids_sample': _limited_sample(candidate_event_ids, limit=100),
+                }
+
+                async def capture_operation() -> dict[str, Any]:
+                    return await self.capture_recent_fundamentals(
+                        limit=len(event_ids_to_capture),
+                        force=False,
+                        trigger='daily_incremental_refresh',
+                        fs_div=resolved_fs_div,
+                        stock_codes=sorted(candidate_symbols),
+                        receipt_date_from=min(check_start_by_symbol.values()) if check_start_by_symbol else None,
+                        receipt_date_to=resolved_market_date,
+                        event_ids=event_ids_to_capture,
+                    )
+
+                capture_result = await _await_with_refresh_heartbeat(
+                    capture_operation,
+                    heartbeat=lambda: update_refresh_progress(
+                        stage='capturing_fundamentals',
+                        extra_metadata=capture_metadata,
+                    ),
                 )
             else:
                 capture_result = {
