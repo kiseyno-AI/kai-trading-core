@@ -27,10 +27,6 @@ class EODFreshnessService:
         latest_price_trade_date = self.latest_price_trade_date_loader()
         latest_run = self.latest_run_loader(market='KRX', trade_date=trade_date)
         price_bar_count = self.daily_price_bar_count_loader(trade_date)
-        if latest_run is None and latest_price_trade_date and latest_price_trade_date != trade_date:
-            latest_run = self.latest_run_loader(market='KRX', trade_date=latest_price_trade_date)
-            if latest_run is not None:
-                price_bar_count = self.daily_price_bar_count_loader(latest_price_trade_date)
 
         return {
             'today': {
