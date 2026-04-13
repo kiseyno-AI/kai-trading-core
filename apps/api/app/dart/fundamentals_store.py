@@ -422,6 +422,7 @@ class DartFundamentalsRepository:
             .where(
                 DartFundamentalsSnapshot.stock_code.in_(normalized_codes),
                 DartFundamentalsSnapshot.fs_div == fs_div,
+                DartDisclosureEvent.fundamentals_capture_status == 'captured',
             )
         ).subquery()
 

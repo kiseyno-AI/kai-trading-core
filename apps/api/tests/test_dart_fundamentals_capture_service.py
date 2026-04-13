@@ -211,6 +211,17 @@ class FakeCaptureRepository:
                         'fundamentals_capture_status': 'failed',
                         'receipt_date': '2026-03-01',
                     },
+                    {
+                        'id': 7,
+                        'rcept_no': '20260412000001',
+                        'corp_code': 'corp-222222',
+                        'corp_name': 'Retry Corp',
+                        'stock_code': '222222',
+                        'report_nm': '사업보고서 (2025.12)',
+                        'filing_category': 'annual_report',
+                        'fundamentals_capture_status': 'failed',
+                        'receipt_date': '2026-04-12',
+                    },
                 ]
             )
         if stock_codes:
@@ -441,6 +452,46 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([call['start_date'] for call in sync_calls], [date(2015, 1, 1), date(2026, 4, 2)])
         self.assertEqual(repository.candidate_call_kwargs[-1]['event_ids'], [4, 5])
         self.assertEqual(repository.completed_refresh_runs[-1][1]['status'], 'completed')
+
+    async def test_daily_incremental_refresh_retries_failed_event_when_baseline_is_missing(self):
+        client = FakeCaptureClient()
+        repository = FakeCaptureRepository()
+        repository.symbol_states = {
+            '222222': {
+                'stock_code': '222222',
+                'has_fundamentals': False,
+                'latest_fundamentals_receipt_date': None,
+                'latest_snapshot': None,
+            },
+        }
+        service = DartFundamentalsCaptureService(
+            client=client,
+            repository=repository,
+            active_symbol_loader=lambda: [{'symbol': '222222'}],
+        )
+
+        with patch(
+            'app.dart.sync_service.dart_disclosure_sync_service.sync_disclosures_for_corporations',
+            return_value={
+                'run_id': 77,
+                'status': 'completed',
+                'financial_report_events': 1,
+            },
+        ):
+            result = await service.run_daily_incremental_refresh(
+                market_date=date(2026, 4, 14),
+                capture_limit=10,
+                fs_div='CFS',
+                trigger='test_daily',
+            )
+
+        self.assertTrue(result['triggered'])
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['symbols_missing'], 1)
+        self.assertEqual(result['events_detected'], 1)
+        self.assertEqual(result['events_captured'], 1)
+        self.assertEqual(repository.candidate_call_kwargs[-1]['event_ids'], [7])
+        self.assertEqual(repository.successes, [7])
 
     async def test_daily_incremental_refresh_skips_completed_market_date_without_force(self):
         repository = FakeCaptureRepository()
