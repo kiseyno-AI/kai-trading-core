@@ -15,6 +15,29 @@ This repository is part of the KAI trading system — **backend / core API** (Fa
 - After the PR is merged or the work is cancelled, delete the task branch locally and remotely unless there is a specific reason to keep it.
 - **Python service root is `apps/api/`** — run installs, uvicorn, and `python -c "from app.main import app"` there (import path is `app`, not `apps.api`).
 
+## developer_instructions
+This workspace is kai-trading-core: backend for the KAI trading system. The runnable FastAPI service lives under apps/api/ (not the repo root). Use apps/api as the working directory for installs, uvicorn, and Python imports (package root is app/).
+
+Before substantial edits, read AGENTS.md, RULES.md, ARCHITECTURE.md, TASKS.md, and RUNBOOK.md at the repository root. For API surface and build order, read docs/API_BUILD_ORDER.md; for scanner/EOD details see docs/ when relevant.
+
+Git workflow is mandatory for every task: create and switch to a dedicated branch before task work, restore the main workspace checkout to `main` after finishing, and once the PR is merged or the work is cancelled delete that branch locally and remotely unless there is a specific reason to keep it.
+
+Stack: FastAPI, Pydantic Settings (app/core/settings.py), httpx for outbound calls, lifespan hooks and background_runner in app/main.py. Incoming requests can require Authorization: Bearer when UPSTREAM_BEARER_TOKEN is set (see main.py middleware). Never log or commit secrets (KIS_APP_KEY, KIS_APP_SECRET, API keys).
+
+Broker and data: KIS integration under app/brokers/kis/; KIS_USE_MOCK, KIS_MOCK_BASE_URL vs production URLs in settings. BOK and Korea Exim under app/integrations/. Quotes, market clock, scanner, EOD in app/quotes, app/market, app/scanner, app/eod.
+
+Do not add live order execution, position-changing calls, or production trading behavior without explicit product approval. Prefer mock/sandbox endpoints for development.
+
+When adding or changing HTTP routes, keep docs/API_BUILD_ORDER.md and any consumer contract (e.g. trading-web docs/API_CONTRACT.md) aligned with actual paths and JSON shapes.
+
+After code changes in apps/api: from apps/api run `pip install -r requirements.txt` (if needed) and `python -c "from app.main import app"` as a smoke import; run the server and hit GET /health per RUNBOOK.md when behavior needs verification.
+
+Project skills and agents: .codex/skills/ and .codex/agents/. Guidance is Codex-only (no .cursor rules in this repo).
+
+Use a task branch for changes that will be committed or reviewed. Writable agents own branch creation, switching, cleanup, and PR workflow; read-only agents must respect the active branch context and leave any checkout or branch mutation steps to the parent or another writable agent.
+
+For ACP coding work, default to fresh thread-spawned ACP sessions. Treat `acpx exited with code 1`, empty spawned-session messages, and gateway errors such as `queue owner unavailable`, `Resource not found`, or `repairing dead named session` as dead-session symptoms. Silent run fallback is forbidden. Required recovery is stale ACP session cleanup, gateway restart if needed, then a fresh spawned ACP session retry.
+
 ## OpenAI Codex
 - **Project layer:** [`.codex/config.toml`](./.codex/config.toml) loads when the workspace is **trusted**. See [Codex configuration](https://developers.openai.com/codex/config-reference).
 - **Skills:** [`.codex/skills/*/SKILL.md`](./.codex/skills/) — `codex-workflow`, `fastapi-trading-api`, `kis-broker-integration`, `trading-core-quality`.
