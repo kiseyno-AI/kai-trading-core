@@ -336,11 +336,11 @@ Authorization: Bearer <token>
 {
   "today": {
     "trade_date": "2026-04-10",
-    "eod_status": "completed_with_errors",
-    "symbols_total": 3584,
-    "symbols_succeeded": 3581,
-    "symbols_failed": 3,
-    "received": true
+    "eod_status": "missing",
+    "symbols_total": null,
+    "symbols_succeeded": null,
+    "symbols_failed": null,
+    "received": false
   },
   "latest": {
     "price_trade_date": "2026-04-09",
@@ -362,6 +362,8 @@ This route is the preferred API for expressing:
 - whether it was partial,
 - whether derived layers lag behind price data,
 - latest available dates for key data groups.
+
+The `today` block is always scoped to the current Seoul trade date. When no run or bars exist for that date, it remains `missing` even if `latest.*` points to a prior available date.
 
 ---
 

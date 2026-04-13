@@ -24,6 +24,7 @@ class EODFreshnessService:
 
     def read(self) -> dict:
         trade_date = self.market_state_loader().server_time[:10]
+        latest_price_trade_date = self.latest_price_trade_date_loader()
         latest_run = self.latest_run_loader(market='KRX', trade_date=trade_date)
         price_bar_count = self.daily_price_bar_count_loader(trade_date)
 
@@ -37,7 +38,7 @@ class EODFreshnessService:
                 'received': price_bar_count > 0,
             },
             'latest': {
-                'price_trade_date': self.latest_price_trade_date_loader(),
+                'price_trade_date': latest_price_trade_date,
                 'technical_market_date': self.latest_technical_market_date_loader(),
                 'action_market_date': self.latest_action_market_date_loader(),
             },

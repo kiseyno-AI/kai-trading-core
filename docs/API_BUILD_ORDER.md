@@ -55,7 +55,8 @@
 
 ## EOD freshness read-layer notes
 - `GET /eod/freshness` is the compact web-facing read API for EOD ingestion freshness.
-- It reports the current Seoul trade date, today's EOD receipt status, stored run counts when available, and the latest stored dates for price bars, technical snapshots, and action summaries.
+- It reports the current Seoul trade date, today's EOD receipt status, stored run counts for that date when available, and the latest stored dates for price bars, technical snapshots, and action summaries.
+- The `today` block is scoped only to the current Seoul trade date; previous-day historical availability is surfaced through `latest.*`, not copied into `today.*`.
 
 ## EOD technical snapshot notes
 - `daily_technical_snapshots` is the DB-backed post-EOD signal layer keyed by `symbol_id + market_date`.

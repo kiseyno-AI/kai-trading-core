@@ -28,6 +28,51 @@ class EODFreshnessServiceTests(unittest.TestCase):
         self.assertEqual(result['today']['received'], False)
         self.assertEqual(result['latest']['price_trade_date'], None)
 
+    def test_read_keeps_today_missing_when_only_previous_date_run_exists(self):
+        requested_run_dates = []
+        requested_count_dates = []
+
+        def latest_run_loader(**kwargs):
+            requested_run_dates.append(kwargs['trade_date'])
+            if kwargs['trade_date'] == '2026-04-09':
+                return {
+                    'status': 'completed',
+                    'symbols_total': 3584,
+                    'symbols_succeeded': 3581,
+                    'symbols_failed': 3,
+                }
+            return None
+
+        def daily_price_bar_count_loader(trade_date):
+            requested_count_dates.append(trade_date)
+            return {
+                '2026-04-10': 0,
+                '2026-04-09': 3581,
+            }[trade_date]
+
+        service = EODFreshnessService(
+            market_state_loader=lambda: _FakeMarketState(),
+            latest_run_loader=latest_run_loader,
+            daily_price_bar_count_loader=daily_price_bar_count_loader,
+            latest_price_trade_date_loader=lambda: '2026-04-09',
+            latest_technical_market_date_loader=lambda: '2026-04-09',
+            latest_action_market_date_loader=lambda: '2026-04-09',
+        )
+
+        result = service.read()
+
+        self.assertEqual(result['today']['trade_date'], '2026-04-10')
+        self.assertEqual(result['today']['eod_status'], 'missing')
+        self.assertEqual(result['today']['symbols_total'], None)
+        self.assertEqual(result['today']['symbols_succeeded'], None)
+        self.assertEqual(result['today']['symbols_failed'], None)
+        self.assertEqual(result['today']['received'], False)
+        self.assertEqual(result['latest']['price_trade_date'], '2026-04-09')
+        self.assertEqual(result['latest']['technical_market_date'], '2026-04-09')
+        self.assertEqual(result['latest']['action_market_date'], '2026-04-09')
+        self.assertEqual(requested_run_dates, ['2026-04-10'])
+        self.assertEqual(requested_count_dates, ['2026-04-10'])
+
     def test_read_returns_completed_with_errors_from_run(self):
         service = EODFreshnessService(
             market_state_loader=lambda: _FakeMarketState(),
