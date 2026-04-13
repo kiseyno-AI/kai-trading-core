@@ -64,9 +64,16 @@ class FakeCaptureRepository:
         self.completed_runs = []
         self.progress_updates = []
         self.stale_run_failures = []
+        self.created_refresh_runs = []
+        self.completed_refresh_runs = []
+        self.refresh_progress_updates = []
+        self.stale_refresh_run_failures = []
+        self.latest_refresh_run = None
+        self.symbol_states = {}
         self.successes = []
         self.failures = []
         self.snapshots = []
+        self.candidate_call_kwargs = []
 
     def create_capture_run(self, **kwargs):
         self.created_runs.append(kwargs)
@@ -82,7 +89,60 @@ class FakeCaptureRepository:
         self.stale_run_failures.append((stale_before, error_message))
         return []
 
-    def list_capture_candidates(self, *, limit=20, force=False, stock_codes=None, receipt_date_from=None, receipt_date_to=None):
+    def create_refresh_run(self, **kwargs):
+        self.created_refresh_runs.append(kwargs)
+        return 188
+
+    def complete_refresh_run(self, run_id, **kwargs):
+        self.completed_refresh_runs.append((run_id, kwargs))
+
+    def update_refresh_run_progress(self, run_id, **kwargs):
+        self.refresh_progress_updates.append((run_id, kwargs))
+
+    def fail_stale_refresh_runs(self, *, stale_before, error_message):
+        self.stale_refresh_run_failures.append((stale_before, error_message))
+        return []
+
+    def get_latest_refresh_run(self, **kwargs):
+        return self.latest_refresh_run
+
+    def list_refresh_runs(self, **kwargs):
+        return [self.latest_refresh_run] if self.latest_refresh_run else []
+
+    def list_symbol_fundamentals_states(self, *, stock_codes, fs_div):
+        return {
+            stock_code: self.symbol_states.get(
+                stock_code,
+                {
+                    'stock_code': stock_code,
+                    'has_fundamentals': False,
+                    'latest_fundamentals_receipt_date': None,
+                    'latest_snapshot': None,
+                },
+            )
+            for stock_code in stock_codes
+        }
+
+    def list_capture_candidates(
+        self,
+        *,
+        limit=20,
+        force=False,
+        stock_codes=None,
+        receipt_date_from=None,
+        receipt_date_to=None,
+        event_ids=None,
+    ):
+        self.candidate_call_kwargs.append(
+            {
+                'limit': limit,
+                'force': force,
+                'stock_codes': stock_codes,
+                'receipt_date_from': receipt_date_from,
+                'receipt_date_to': receipt_date_to,
+                'event_ids': event_ids,
+            }
+        )
         events = [
             {
                 'id': 1,
@@ -115,8 +175,59 @@ class FakeCaptureRepository:
                 'fundamentals_capture_status': 'pending',
             },
         ]
+        if receipt_date_from is not None or receipt_date_to is not None or event_ids is not None:
+            events.extend(
+                [
+                    {
+                        'id': 4,
+                        'rcept_no': '20260410000001',
+                        'corp_code': 'corp-005930',
+                        'corp_name': '삼성전자',
+                        'stock_code': '005930',
+                        'report_nm': '분기보고서 (2026.03)',
+                        'filing_category': 'quarterly_report',
+                        'fundamentals_capture_status': 'pending',
+                        'receipt_date': '2026-04-10',
+                    },
+                    {
+                        'id': 5,
+                        'rcept_no': '20250320000001',
+                        'corp_code': 'corp-123456',
+                        'corp_name': 'Missing Corp',
+                        'stock_code': '123456',
+                        'report_nm': '사업보고서 (2024.12)',
+                        'filing_category': 'annual_report',
+                        'fundamentals_capture_status': 'pending',
+                        'receipt_date': '2025-03-20',
+                    },
+                    {
+                        'id': 6,
+                        'rcept_no': '20260301000001',
+                        'corp_code': 'corp-005930',
+                        'corp_name': '삼성전자',
+                        'stock_code': '005930',
+                        'report_nm': '사업보고서 (2025.12)',
+                        'filing_category': 'annual_report',
+                        'fundamentals_capture_status': 'failed',
+                        'receipt_date': '2026-03-01',
+                    },
+                    {
+                        'id': 7,
+                        'rcept_no': '20260412000001',
+                        'corp_code': 'corp-222222',
+                        'corp_name': 'Retry Corp',
+                        'stock_code': '222222',
+                        'report_nm': '사업보고서 (2025.12)',
+                        'filing_category': 'annual_report',
+                        'fundamentals_capture_status': 'failed',
+                        'receipt_date': '2026-04-12',
+                    },
+                ]
+            )
         if stock_codes:
             events = [event for event in events if event['stock_code'] in stock_codes]
+        if event_ids is not None:
+            events = [event for event in events if event['id'] in event_ids]
         return events[:limit] if limit is not None else events
 
     def replace_snapshot_dataset(self, **kwargs):
@@ -274,6 +385,226 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaisesRegex(ValueError, 'effective_start_date'):
             await service.backfill_current_universe_fundamentals(symbol_limit=1, capture_limit=10, fs_div='CFS')
+
+    async def test_daily_incremental_refresh_syncs_only_missing_or_newer_symbol_windows(self):
+        client = FakeCaptureClient()
+        repository = FakeCaptureRepository()
+        repository.symbol_states = {
+            '005930': {
+                'stock_code': '005930',
+                'has_fundamentals': True,
+                'latest_fundamentals_receipt_date': '2026-04-01',
+                'latest_snapshot': {'id': 100},
+            },
+            '000660': {
+                'stock_code': '000660',
+                'has_fundamentals': True,
+                'latest_fundamentals_receipt_date': '2026-04-14',
+                'latest_snapshot': {'id': 101},
+            },
+            '123456': {
+                'stock_code': '123456',
+                'has_fundamentals': False,
+                'latest_fundamentals_receipt_date': None,
+                'latest_snapshot': None,
+            },
+        }
+        service = DartFundamentalsCaptureService(
+            client=client,
+            repository=repository,
+            active_symbol_loader=lambda: [
+                {'symbol': '005930'},
+                {'symbol': '000660'},
+                {'symbol': '123456'},
+            ],
+        )
+
+        sync_calls = []
+
+        async def fake_sync(**kwargs):
+            sync_calls.append(kwargs)
+            return {
+                'run_id': len(sync_calls),
+                'status': 'completed',
+                'financial_report_events': len(kwargs['corporations']),
+            }
+
+        with patch(
+            'app.dart.sync_service.dart_disclosure_sync_service.sync_disclosures_for_corporations',
+            side_effect=fake_sync,
+        ):
+            result = await service.run_daily_incremental_refresh(
+                market_date=date(2026, 4, 14),
+                capture_limit=10,
+                fs_div='CFS',
+                trigger='test_daily',
+            )
+
+        self.assertTrue(result['triggered'])
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['symbols_selected'], 3)
+        self.assertEqual(result['symbols_missing'], 1)
+        self.assertEqual(result['symbols_stale'], 1)
+        self.assertEqual(result['symbols_fresh'], 1)
+        self.assertEqual(result['events_detected'], 2)
+        self.assertEqual(result['events_captured'], 2)
+        self.assertEqual(repository.successes, [4, 5])
+        self.assertEqual([call['start_date'] for call in sync_calls], [date(2015, 1, 1), date(2026, 4, 2)])
+        self.assertEqual(repository.candidate_call_kwargs[-1]['event_ids'], [4, 5])
+        self.assertEqual(repository.completed_refresh_runs[-1][1]['status'], 'completed')
+
+    async def test_daily_incremental_refresh_retries_failed_event_when_baseline_is_missing(self):
+        client = FakeCaptureClient()
+        repository = FakeCaptureRepository()
+        repository.symbol_states = {
+            '222222': {
+                'stock_code': '222222',
+                'has_fundamentals': False,
+                'latest_fundamentals_receipt_date': None,
+                'latest_snapshot': None,
+            },
+        }
+        service = DartFundamentalsCaptureService(
+            client=client,
+            repository=repository,
+            active_symbol_loader=lambda: [{'symbol': '222222'}],
+        )
+
+        with patch(
+            'app.dart.sync_service.dart_disclosure_sync_service.sync_disclosures_for_corporations',
+            return_value={
+                'run_id': 77,
+                'status': 'completed',
+                'financial_report_events': 1,
+            },
+        ):
+            result = await service.run_daily_incremental_refresh(
+                market_date=date(2026, 4, 14),
+                capture_limit=10,
+                fs_div='CFS',
+                trigger='test_daily',
+            )
+
+        self.assertTrue(result['triggered'])
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['symbols_missing'], 1)
+        self.assertEqual(result['events_detected'], 1)
+        self.assertEqual(result['events_captured'], 1)
+        self.assertEqual(repository.candidate_call_kwargs[-1]['event_ids'], [7])
+        self.assertEqual(repository.successes, [7])
+
+    async def test_daily_incremental_refresh_heartbeats_during_sync_and_capture_work(self):
+        client = FakeCaptureClient()
+        repository = FakeCaptureRepository()
+        repository.symbol_states = {
+            '005930': {
+                'stock_code': '005930',
+                'has_fundamentals': True,
+                'latest_fundamentals_receipt_date': '2026-04-01',
+                'latest_snapshot': {'id': 100},
+            },
+        }
+        service = DartFundamentalsCaptureService(
+            client=client,
+            repository=repository,
+            active_symbol_loader=lambda: [{'symbol': '005930'}],
+        )
+
+        sync_active = False
+        capture_active = False
+        sync_heartbeat_seen = asyncio.Event()
+        capture_heartbeat_seen = asyncio.Event()
+        original_update_refresh_run_progress = repository.update_refresh_run_progress
+
+        def recording_update_refresh_run_progress(run_id, **kwargs):
+            metadata = kwargs.get('run_metadata') or {}
+            if sync_active and metadata.get('stage') == 'syncing_disclosures' and metadata.get('last_progress_at'):
+                sync_heartbeat_seen.set()
+            if capture_active and metadata.get('stage') == 'capturing_fundamentals' and metadata.get('last_progress_at'):
+                capture_heartbeat_seen.set()
+            original_update_refresh_run_progress(run_id, **kwargs)
+
+        repository.update_refresh_run_progress = recording_update_refresh_run_progress
+
+        async def fake_sync(**kwargs):
+            nonlocal sync_active
+            sync_active = True
+            try:
+                await asyncio.wait_for(sync_heartbeat_seen.wait(), timeout=1)
+            finally:
+                sync_active = False
+            return {
+                'run_id': 77,
+                'status': 'completed',
+                'financial_report_events': len(kwargs['corporations']),
+            }
+
+        async def fake_capture_recent_fundamentals(**kwargs):
+            nonlocal capture_active
+            capture_active = True
+            try:
+                await asyncio.wait_for(capture_heartbeat_seen.wait(), timeout=1)
+            finally:
+                capture_active = False
+            return {
+                'run_id': 88,
+                'status': 'completed',
+                'fs_div': kwargs['fs_div'],
+                'events_seen': 1,
+                'events_captured': 1,
+                'events_failed': 0,
+                'events_skipped': 0,
+                'results': [
+                    {
+                        'event_id': 4,
+                        'stock_code': '005930',
+                        'status': 'captured',
+                    }
+                ],
+            }
+
+        service.capture_recent_fundamentals = fake_capture_recent_fundamentals
+
+        with patch(
+            'app.dart.sync_service.dart_disclosure_sync_service.sync_disclosures_for_corporations',
+            side_effect=fake_sync,
+        ), patch('app.dart.fundamentals_capture_service.DART_FUNDAMENTALS_REFRESH_HEARTBEAT_SECONDS', 0.001):
+            result = await service.run_daily_incremental_refresh(
+                market_date=date(2026, 4, 14),
+                capture_limit=10,
+                fs_div='CFS',
+                trigger='test_daily',
+            )
+
+        self.assertTrue(result['triggered'])
+        self.assertTrue(sync_heartbeat_seen.is_set())
+        self.assertTrue(capture_heartbeat_seen.is_set())
+        progress_stages = [
+            (update[1].get('run_metadata') or {}).get('stage')
+            for update in repository.refresh_progress_updates
+        ]
+        self.assertIn('syncing_disclosures', progress_stages)
+        self.assertIn('capturing_fundamentals', progress_stages)
+
+    async def test_daily_incremental_refresh_skips_completed_market_date_without_force(self):
+        repository = FakeCaptureRepository()
+        repository.latest_refresh_run = {
+            'id': 188,
+            'market_date': '2026-04-14',
+            'status': 'completed',
+            'fs_div': 'CFS',
+        }
+        service = DartFundamentalsCaptureService(
+            client=FakeCaptureClient(),
+            repository=repository,
+            active_symbol_loader=lambda: [{'symbol': '005930'}],
+        )
+
+        result = await service.run_daily_incremental_refresh(market_date=date(2026, 4, 14), fs_div='CFS')
+
+        self.assertFalse(result['triggered'])
+        self.assertEqual(result['reason'], 'already_completed')
+        self.assertEqual(repository.created_refresh_runs, [])
 
 
 class InferFundamentalsRequestTests(unittest.TestCase):

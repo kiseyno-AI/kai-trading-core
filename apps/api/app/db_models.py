@@ -263,6 +263,33 @@ class DartFundamentalsCaptureRun(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class DartFundamentalsRefreshRun(Base):
+    __tablename__ = 'dart_fundamentals_refresh_runs'
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    market_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    trigger: Mapped[str] = mapped_column(String(64), nullable=False, default='manual')
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default='running', index=True)
+    fs_div: Mapped[str] = mapped_column(String(8), nullable=False, default='CFS')
+    force: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    symbol_limit: Mapped[int | None] = mapped_column(Integer)
+    symbol_offset: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    symbols_total: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    symbols_checked: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    symbols_missing: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    symbols_stale: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    symbols_fresh: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    symbols_refreshed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    symbols_failed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    events_detected: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    events_captured: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    events_failed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    run_metadata: Mapped[dict | None] = mapped_column(JSON)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 class DartFundamentalsSnapshot(Base, TimestampMixin):
     __tablename__ = 'dart_fundamentals_snapshots'
     __table_args__ = (

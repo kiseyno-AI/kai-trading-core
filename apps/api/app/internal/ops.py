@@ -6,6 +6,7 @@ import json
 from typing import Any, Iterable
 
 from app.core.settings import settings
+from app.dart.fundamentals_capture_service import dart_fundamentals_capture_service
 from app.db import init_database
 from app.eod.action_summaries import daily_action_summary_service
 from app.eod.auto_pykrx import auto_pykrx_eod_scheduler
@@ -68,6 +69,29 @@ def run_pykrx_daily_if_due(
     )
 
 
+def run_dart_fundamentals_daily_if_due(
+    *,
+    market_date: str | None = None,
+    symbol_limit: int | None = None,
+    symbol_offset: int = 0,
+    capture_limit: int = 500,
+    force: bool = False,
+    fs_div: str | None = None,
+) -> dict[str, Any]:
+    bootstrap_runtime()
+    return asyncio.run(
+        dart_fundamentals_capture_service.run_daily_incremental_refresh(
+            market_date=market_date,
+            symbol_limit=symbol_limit,
+            symbol_offset=symbol_offset,
+            capture_limit=capture_limit,
+            force=force,
+            fs_div=fs_div,
+            trigger='internal_ops_cli',
+        )
+    )
+
+
 def refresh_master_if_due_internal(*, force: bool = False) -> dict[str, Any]:
     bootstrap_runtime()
     symbols = refresh_master_if_due(force=force)
@@ -116,6 +140,17 @@ def _build_parser() -> argparse.ArgumentParser:
     pykrx_daily_parser.add_argument('--force', action='store_true')
     pykrx_daily_parser.add_argument('--refresh-universe', choices=('true', 'false'))
 
+    dart_daily_parser = subparsers.add_parser(
+        'dart-fundamentals-daily-run-if-due',
+        help='Run DART fundamentals daily incremental refresh directly',
+    )
+    dart_daily_parser.add_argument('--market-date')
+    dart_daily_parser.add_argument('--symbol-limit', type=int)
+    dart_daily_parser.add_argument('--symbol-offset', type=int, default=0)
+    dart_daily_parser.add_argument('--capture-limit', type=int, default=500)
+    dart_daily_parser.add_argument('--force', action='store_true')
+    dart_daily_parser.add_argument('--fs-div')
+
     technical_parser = subparsers.add_parser('eod-technical-snapshots-compute', help='Compute technical snapshots directly')
     technical_parser.add_argument('--market-date', required=True)
     technical_parser.add_argument('--symbols')
@@ -146,6 +181,15 @@ def main(argv: Iterable[str] | None = None) -> int:
             markets=args.markets,
             force=args.force,
             refresh_universe=None if args.refresh_universe is None else args.refresh_universe == 'true',
+        )
+    elif args.command == 'dart-fundamentals-daily-run-if-due':
+        payload = run_dart_fundamentals_daily_if_due(
+            market_date=args.market_date,
+            symbol_limit=args.symbol_limit,
+            symbol_offset=args.symbol_offset,
+            capture_limit=args.capture_limit,
+            force=args.force,
+            fs_div=args.fs_div,
         )
     elif args.command == 'eod-technical-snapshots-compute':
         payload = compute_technical_snapshots(market_date=args.market_date, symbols=args.symbols)
