@@ -11,6 +11,7 @@ from app.db import session_scope
 from app.db_models import (
     DartDisclosureEvent,
     DartFundamentalsCaptureRun,
+    DartFundamentalsRefreshRun,
     DartFundamentalsHighlight,
     DartFundamentalsRow,
     DartFundamentalsSnapshot,
@@ -22,6 +23,16 @@ def _utcnow() -> datetime:
 
 
 def _capture_run_activity_at(row: DartFundamentalsCaptureRun) -> datetime:
+    progress_at = (row.run_metadata or {}).get('last_progress_at')
+    if isinstance(progress_at, str):
+        try:
+            return datetime.fromisoformat(progress_at)
+        except ValueError:
+            pass
+    return row.started_at
+
+
+def _refresh_run_activity_at(row: DartFundamentalsRefreshRun) -> datetime:
     progress_at = (row.run_metadata or {}).get('last_progress_at')
     if isinstance(progress_at, str):
         try:
@@ -43,6 +54,33 @@ def _serialize_capture_run(row: DartFundamentalsCaptureRun) -> dict[str, Any]:
         'events_captured': row.events_captured,
         'events_failed': row.events_failed,
         'events_skipped': row.events_skipped,
+        'error_message': row.error_message,
+        'run_metadata': row.run_metadata,
+        'started_at': row.started_at.isoformat() if row.started_at else None,
+        'completed_at': row.completed_at.isoformat() if row.completed_at else None,
+    }
+
+
+def _serialize_refresh_run(row: DartFundamentalsRefreshRun) -> dict[str, Any]:
+    return {
+        'id': row.id,
+        'market_date': row.market_date.isoformat(),
+        'trigger': row.trigger,
+        'status': row.status,
+        'fs_div': row.fs_div,
+        'force': row.force,
+        'symbol_limit': row.symbol_limit,
+        'symbol_offset': row.symbol_offset,
+        'symbols_total': row.symbols_total,
+        'symbols_checked': row.symbols_checked,
+        'symbols_missing': row.symbols_missing,
+        'symbols_stale': row.symbols_stale,
+        'symbols_fresh': row.symbols_fresh,
+        'symbols_refreshed': row.symbols_refreshed,
+        'symbols_failed': row.symbols_failed,
+        'events_detected': row.events_detected,
+        'events_captured': row.events_captured,
+        'events_failed': row.events_failed,
         'error_message': row.error_message,
         'run_metadata': row.run_metadata,
         'started_at': row.started_at.isoformat() if row.started_at else None,
@@ -158,6 +196,158 @@ class DartFundamentalsRepository:
                 return None
             return _serialize_capture_run(row)
 
+    def create_refresh_run(
+        self,
+        *,
+        market_date: date,
+        trigger: str,
+        fs_div: str,
+        force: bool,
+        symbol_limit: int | None,
+        symbol_offset: int,
+        symbols_total: int,
+        run_metadata: dict[str, Any] | None = None,
+    ) -> int:
+        with session_scope() as session:
+            row = DartFundamentalsRefreshRun(
+                market_date=market_date,
+                trigger=trigger,
+                status='running',
+                fs_div=fs_div,
+                force=force,
+                symbol_limit=symbol_limit,
+                symbol_offset=symbol_offset,
+                symbols_total=symbols_total,
+                run_metadata=run_metadata,
+            )
+            session.add(row)
+            session.flush()
+            return row.id
+
+    def update_refresh_run_progress(
+        self,
+        run_id: int,
+        *,
+        symbols_checked: int,
+        symbols_missing: int,
+        symbols_stale: int,
+        symbols_fresh: int,
+        symbols_refreshed: int,
+        symbols_failed: int,
+        events_detected: int,
+        events_captured: int,
+        events_failed: int,
+        run_metadata: dict[str, Any] | None = None,
+    ) -> None:
+        with session_scope() as session:
+            row = session.get(DartFundamentalsRefreshRun, run_id)
+            if row is None:
+                return
+            row.symbols_checked = symbols_checked
+            row.symbols_missing = symbols_missing
+            row.symbols_stale = symbols_stale
+            row.symbols_fresh = symbols_fresh
+            row.symbols_refreshed = symbols_refreshed
+            row.symbols_failed = symbols_failed
+            row.events_detected = events_detected
+            row.events_captured = events_captured
+            row.events_failed = events_failed
+            row.run_metadata = run_metadata
+
+    def complete_refresh_run(
+        self,
+        run_id: int,
+        *,
+        status: str,
+        symbols_checked: int,
+        symbols_missing: int,
+        symbols_stale: int,
+        symbols_fresh: int,
+        symbols_refreshed: int,
+        symbols_failed: int,
+        events_detected: int,
+        events_captured: int,
+        events_failed: int,
+        error_message: str | None = None,
+        run_metadata: dict[str, Any] | None = None,
+    ) -> None:
+        with session_scope() as session:
+            row = session.get(DartFundamentalsRefreshRun, run_id)
+            if row is None:
+                return
+            row.status = status
+            row.symbols_checked = symbols_checked
+            row.symbols_missing = symbols_missing
+            row.symbols_stale = symbols_stale
+            row.symbols_fresh = symbols_fresh
+            row.symbols_refreshed = symbols_refreshed
+            row.symbols_failed = symbols_failed
+            row.events_detected = events_detected
+            row.events_captured = events_captured
+            row.events_failed = events_failed
+            row.error_message = error_message
+            row.run_metadata = run_metadata
+            row.completed_at = _utcnow()
+
+    def fail_stale_refresh_runs(
+        self,
+        *,
+        stale_before: datetime,
+        error_message: str,
+    ) -> list[int]:
+        with session_scope() as session:
+            rows = session.execute(
+                select(DartFundamentalsRefreshRun).where(DartFundamentalsRefreshRun.status == 'running')
+            ).scalars().all()
+            failed_run_ids: list[int] = []
+            for row in rows:
+                if _refresh_run_activity_at(row) >= stale_before:
+                    continue
+                row.status = 'failed'
+                row.error_message = error_message
+                row.completed_at = _utcnow()
+                failed_run_ids.append(row.id)
+            return failed_run_ids
+
+    def get_latest_refresh_run(
+        self,
+        *,
+        market_date: date | None = None,
+        fs_div: str | None = None,
+    ) -> dict[str, Any] | None:
+        with session_scope() as session:
+            stmt = select(DartFundamentalsRefreshRun)
+            if market_date is not None:
+                stmt = stmt.where(DartFundamentalsRefreshRun.market_date == market_date)
+            if fs_div is not None:
+                stmt = stmt.where(DartFundamentalsRefreshRun.fs_div == fs_div)
+            row = session.execute(
+                stmt.order_by(DartFundamentalsRefreshRun.started_at.desc(), DartFundamentalsRefreshRun.id.desc())
+                .limit(1)
+            ).scalar_one_or_none()
+            if row is None:
+                return None
+            return _serialize_refresh_run(row)
+
+    def list_refresh_runs(
+        self,
+        *,
+        limit: int = 10,
+        market_date: date | None = None,
+        fs_div: str | None = None,
+    ) -> list[dict[str, Any]]:
+        with session_scope() as session:
+            stmt = select(DartFundamentalsRefreshRun)
+            if market_date is not None:
+                stmt = stmt.where(DartFundamentalsRefreshRun.market_date == market_date)
+            if fs_div is not None:
+                stmt = stmt.where(DartFundamentalsRefreshRun.fs_div == fs_div)
+            rows = session.execute(
+                stmt.order_by(DartFundamentalsRefreshRun.started_at.desc(), DartFundamentalsRefreshRun.id.desc())
+                .limit(limit)
+            ).scalars()
+            return [_serialize_refresh_run(row) for row in rows]
+
     def list_capture_candidates(
         self,
         *,
@@ -166,7 +356,11 @@ class DartFundamentalsRepository:
         stock_codes: list[str] | None = None,
         receipt_date_from: date | None = None,
         receipt_date_to: date | None = None,
+        event_ids: list[int] | None = None,
     ) -> list[dict[str, Any]]:
+        if event_ids == []:
+            return []
+
         with session_scope() as session:
             stmt = select(DartDisclosureEvent).where(DartDisclosureEvent.is_financial_report.is_(True))
             if not force:
@@ -177,12 +371,82 @@ class DartFundamentalsRepository:
                 stmt = stmt.where(DartDisclosureEvent.receipt_date >= receipt_date_from)
             if receipt_date_to:
                 stmt = stmt.where(DartDisclosureEvent.receipt_date <= receipt_date_to)
+            if event_ids is not None:
+                stmt = stmt.where(DartDisclosureEvent.id.in_(event_ids))
             rows = session.execute(
                 stmt.order_by(DartDisclosureEvent.receipt_date.desc(), DartDisclosureEvent.rcept_no.desc())
                 if limit is None
                 else stmt.order_by(DartDisclosureEvent.receipt_date.desc(), DartDisclosureEvent.rcept_no.desc()).limit(limit)
             ).scalars()
             return [self._serialize_event(row) for row in rows]
+
+    def list_symbol_fundamentals_states(
+        self,
+        *,
+        stock_codes: list[str],
+        fs_div: str,
+    ) -> dict[str, dict[str, Any]]:
+        normalized_codes = [code for code in dict.fromkeys(stock_codes) if code]
+        states: dict[str, dict[str, Any]] = {
+            code: {
+                'stock_code': code,
+                'has_fundamentals': False,
+                'latest_fundamentals_receipt_date': None,
+                'latest_snapshot': None,
+            }
+            for code in normalized_codes
+        }
+        if not normalized_codes:
+            return states
+
+        ranked_snapshots = (
+            select(
+                DartFundamentalsSnapshot.id.label('snapshot_id'),
+                DartFundamentalsSnapshot.stock_code.label('stock_code'),
+                func.row_number()
+                .over(
+                    partition_by=DartFundamentalsSnapshot.stock_code,
+                    order_by=(
+                        DartDisclosureEvent.receipt_date.desc(),
+                        DartFundamentalsSnapshot.business_year.desc(),
+                        DartFundamentalsSnapshot.report_code.desc(),
+                        DartFundamentalsSnapshot.id.desc(),
+                    ),
+                )
+                .label('symbol_rank'),
+            )
+            .join(
+                DartDisclosureEvent,
+                DartDisclosureEvent.id == DartFundamentalsSnapshot.disclosure_event_id,
+            )
+            .where(
+                DartFundamentalsSnapshot.stock_code.in_(normalized_codes),
+                DartFundamentalsSnapshot.fs_div == fs_div,
+            )
+        ).subquery()
+
+        with session_scope() as session:
+            rows = session.execute(
+                select(DartFundamentalsSnapshot, DartDisclosureEvent)
+                .join(ranked_snapshots, DartFundamentalsSnapshot.id == ranked_snapshots.c.snapshot_id)
+                .join(DartDisclosureEvent, DartDisclosureEvent.id == DartFundamentalsSnapshot.disclosure_event_id)
+                .where(ranked_snapshots.c.symbol_rank == 1)
+            ).all()
+
+            for snapshot, event in rows:
+                stock_code = snapshot.stock_code
+                if not stock_code:
+                    continue
+                states[stock_code] = {
+                    'stock_code': stock_code,
+                    'has_fundamentals': True,
+                    'latest_fundamentals_receipt_date': event.receipt_date.isoformat() if event.receipt_date else None,
+                    'latest_snapshot': {
+                        **self._serialize_snapshot(snapshot),
+                        'disclosure': self._serialize_event(event),
+                    },
+                }
+        return states
 
     def list_financial_events(
         self,

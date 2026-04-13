@@ -171,6 +171,51 @@ async def inspect_dart_fundamentals_capture(
         raise HTTPException(status_code=500, detail=f'DART fundamentals capture inspect failed: {exc}') from exc
 
 
+@router.post('/fundamentals/daily/run-if-due')
+async def run_dart_fundamentals_daily_refresh_if_due(
+    market_date: Optional[date] = Query(default=None),
+    symbol_limit: Optional[int] = Query(default=None, ge=1, le=20000),
+    symbol_offset: int = Query(default=0, ge=0, le=20000),
+    capture_limit: int = Query(default=500, ge=1, le=5000),
+    force: bool = False,
+    fs_div: Optional[str] = Query(default=None),
+) -> dict:
+    normalized_fs_div = _normalize_fs_div(fs_div) if fs_div is not None else settings.dart_fundamentals_default_fs_div.strip().upper()
+    try:
+        return await dart_fundamentals_capture_service.run_daily_incremental_refresh(
+            market_date=market_date,
+            symbol_limit=symbol_limit,
+            symbol_offset=symbol_offset,
+            capture_limit=capture_limit,
+            force=force,
+            fs_div=normalized_fs_div,
+            trigger='manual_daily_api',
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except DartAPIError as exc:
+        raise HTTPException(status_code=502, detail=f'DART request failed: {exc}') from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'DART fundamentals daily refresh failed: {exc}') from exc
+
+
+@router.get('/fundamentals/daily/inspect')
+async def inspect_dart_fundamentals_daily_refresh(
+    runs_limit: int = Query(default=10, ge=1, le=50),
+    market_date: Optional[date] = Query(default=None),
+    fs_div: Optional[str] = Query(default=None),
+) -> dict:
+    normalized_fs_div = _normalize_fs_div(fs_div) if fs_div is not None else None
+    try:
+        return dart_fundamentals_capture_service.inspect_daily_refresh_status(
+            runs_limit=runs_limit,
+            market_date=market_date,
+            fs_div=normalized_fs_div,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'DART fundamentals daily refresh inspect failed: {exc}') from exc
+
+
 @router.post('/fundamentals/backfill/current-universe')
 async def backfill_dart_fundamentals_for_current_universe(
     symbol_limit: int = Query(default=25, ge=1, le=250),

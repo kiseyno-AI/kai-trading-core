@@ -102,12 +102,30 @@ class FakeCaptureService:
             'capture': {'run_id': 12, 'events_captured': 4},
         }
 
+    async def run_daily_incremental_refresh(self, **kwargs):
+        return {
+            'triggered': True,
+            'run_id': 15,
+            'status': 'completed',
+            'market_date': kwargs['market_date'].isoformat(),
+            'fs_div': kwargs['fs_div'],
+            'symbols_checked': kwargs['symbol_limit'],
+            'symbols_stale': 1,
+            'events_captured': 1,
+        }
+
     def inspect_capture_status(self, **kwargs):
         return {
             'latest_run': {'id': 12, 'status': 'completed'},
             'summary': {'financial_event_capture_status_counts': {'captured': 1, 'failed': 1}},
             'runs': [{'id': 12, 'status': 'completed'}],
             'events': [{'rcept_no': '20260407000003', 'fundamentals_capture_status': 'captured'}],
+        }
+
+    def inspect_daily_refresh_status(self, **kwargs):
+        return {
+            'latest_run': {'id': 15, 'status': 'completed'},
+            'runs': [{'id': 15, 'status': 'completed', 'market_date': kwargs['market_date'].isoformat()}],
         }
 
 
@@ -414,6 +432,38 @@ class DartRouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()['effective_start_date'], '2015-01-01')
         self.assertEqual(response.json()['sync']['financial_report_events'], 6)
+
+    def test_daily_incremental_refresh_route_returns_payload(self):
+        original_service = routes_dart.dart_fundamentals_capture_service
+        routes_dart.dart_fundamentals_capture_service = FakeCaptureService()
+        try:
+            client = TestClient(self.app)
+            response = client.post(
+                '/disclosures/dart/fundamentals/daily/run-if-due',
+                params={'market_date': '2026-04-14', 'symbol_limit': 5, 'capture_limit': 20},
+            )
+        finally:
+            routes_dart.dart_fundamentals_capture_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()['triggered'])
+        self.assertEqual(response.json()['run_id'], 15)
+        self.assertEqual(response.json()['symbols_stale'], 1)
+
+    def test_daily_incremental_refresh_inspect_route_returns_runs(self):
+        original_service = routes_dart.dart_fundamentals_capture_service
+        routes_dart.dart_fundamentals_capture_service = FakeCaptureService()
+        try:
+            client = TestClient(self.app)
+            response = client.get(
+                '/disclosures/dart/fundamentals/daily/inspect',
+                params={'market_date': '2026-04-14'},
+            )
+        finally:
+            routes_dart.dart_fundamentals_capture_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['latest_run']['id'], 15)
 
     def test_current_universe_backfill_route_validates_fs_div(self):
         client = TestClient(self.app)

@@ -225,6 +225,28 @@ def _load_daily_price_bar_bounds() -> tuple[date | None, date | None]:
         )
 
 
+def _normalize_refresh_date(value: date | str | None, *, default: date) -> date:
+    if value is None:
+        return default
+    if isinstance(value, date):
+        return value
+    return date.fromisoformat(value)
+
+
+def _parse_optional_iso_date(value: str | None) -> date | None:
+    if not value:
+        return None
+    return date.fromisoformat(value)
+
+
+def _date_after(value: date) -> date:
+    return value + timedelta(days=1)
+
+
+def _limited_sample(items: list[Any], *, limit: int = 50) -> list[Any]:
+    return items[:limit]
+
+
 class DartFundamentalsCaptureService:
     def __init__(
         self,
@@ -251,6 +273,7 @@ class DartFundamentalsCaptureService:
         stock_codes: list[str] | None = None,
         receipt_date_from: date | None = None,
         receipt_date_to: date | None = None,
+        event_ids: list[int] | None = None,
     ) -> dict[str, Any]:
         resolved_fs_div = (fs_div or settings.dart_fundamentals_default_fs_div).strip().upper()
         run_metadata: dict[str, Any] = {'requested_limit': limit}
@@ -260,6 +283,8 @@ class DartFundamentalsCaptureService:
             run_metadata['receipt_date_from'] = receipt_date_from.isoformat()
         if receipt_date_to:
             run_metadata['receipt_date_to'] = receipt_date_to.isoformat()
+        if event_ids is not None:
+            run_metadata['event_id_count'] = len(event_ids)
         log_fetch_event(
             service='dart',
             operation='capture_recent_fundamentals',
@@ -304,6 +329,7 @@ class DartFundamentalsCaptureService:
                 stock_codes=stock_codes,
                 receipt_date_from=receipt_date_from,
                 receipt_date_to=receipt_date_to,
+                event_ids=event_ids,
             )
             run_metadata_with_progress = {**run_metadata, 'candidate_count': len(events)}
             self.repository.update_capture_run_progress(
@@ -395,6 +421,7 @@ class DartFundamentalsCaptureService:
                         {
                             'event_id': event['id'],
                             'rcept_no': event['rcept_no'],
+                            'stock_code': event['stock_code'],
                             'status': 'captured',
                             'business_year': request['business_year'],
                             'report_code': request['report_code'],
@@ -445,6 +472,7 @@ class DartFundamentalsCaptureService:
                         {
                             'event_id': event['id'],
                             'rcept_no': event['rcept_no'],
+                            'stock_code': event['stock_code'],
                             'status': 'failed',
                             'error': timeout_message,
                         }
@@ -488,6 +516,7 @@ class DartFundamentalsCaptureService:
                         {
                             'event_id': event['id'],
                             'rcept_no': event['rcept_no'],
+                            'stock_code': event['stock_code'],
                             'status': 'failed',
                             'error': str(exc),
                         }
@@ -693,6 +722,415 @@ class DartFundamentalsCaptureService:
             'capture': capture_result,
         }
 
+    async def run_daily_incremental_refresh(
+        self,
+        *,
+        market_date: date | str | None = None,
+        symbol_limit: int | None = None,
+        symbol_offset: int = 0,
+        capture_limit: int | None = 500,
+        force: bool = False,
+        fs_div: str | None = None,
+        trigger: str = 'manual_daily_api',
+    ) -> dict[str, Any]:
+        if symbol_offset < 0:
+            raise ValueError('symbol_offset must be greater than or equal to 0')
+        if symbol_limit is not None and symbol_limit < 1:
+            raise ValueError('symbol_limit must be greater than or equal to 1')
+        if capture_limit is not None and capture_limit < 1:
+            raise ValueError('capture_limit must be greater than or equal to 1')
+
+        resolved_market_date = _normalize_refresh_date(market_date, default=date.today())
+        resolved_fs_div = (fs_div or settings.dart_fundamentals_default_fs_div).strip().upper()
+        stale_refresh_run_ids = self.repository.fail_stale_refresh_runs(
+            stale_before=_utcnow() - timedelta(minutes=self.stale_run_minutes),
+            error_message=(
+                'Marked failed after exceeding the stale running threshold before a new daily refresh started'
+            ),
+        )
+        latest_run = self.repository.get_latest_refresh_run(
+            market_date=resolved_market_date,
+            fs_div=resolved_fs_div,
+        )
+        if latest_run and latest_run['status'] == 'running':
+            return {
+                'triggered': False,
+                'reason': 'already_running',
+                'market_date': resolved_market_date.isoformat(),
+                'fs_div': resolved_fs_div,
+                'existing_run': latest_run,
+                'stale_refresh_run_ids_failed': stale_refresh_run_ids,
+            }
+        if latest_run and latest_run['status'] == 'completed' and not force:
+            return {
+                'triggered': False,
+                'reason': 'already_completed',
+                'market_date': resolved_market_date.isoformat(),
+                'fs_div': resolved_fs_div,
+                'existing_run': latest_run,
+                'stale_refresh_run_ids_failed': stale_refresh_run_ids,
+            }
+
+        active_symbols = self.active_symbol_loader()
+        upper_bound = None if symbol_limit is None else symbol_offset + symbol_limit
+        selected_symbols = active_symbols[symbol_offset:upper_bound]
+        selected_stock_codes = [
+            (symbol.get('symbol') or '').strip().zfill(6)
+            for symbol in selected_symbols
+            if (symbol.get('symbol') or '').strip()
+        ]
+        states = self.repository.list_symbol_fundamentals_states(
+            stock_codes=selected_stock_codes,
+            fs_div=resolved_fs_div,
+        )
+        run_metadata: dict[str, Any] = {
+            'scope': 'daily_incremental_fundamentals_refresh',
+            'market_date': resolved_market_date.isoformat(),
+            'fs_div': resolved_fs_div,
+            'active_symbols_total': len(active_symbols),
+            'symbols_selected': len(selected_stock_codes),
+            'symbol_offset': symbol_offset,
+            'symbol_limit': symbol_limit,
+            'capture_limit': capture_limit,
+            'selected_symbols_sample': _limited_sample(selected_stock_codes),
+            'stale_refresh_run_ids_failed': stale_refresh_run_ids,
+            'last_progress_at': _utcnow().isoformat(),
+        }
+        run_id = self.repository.create_refresh_run(
+            market_date=resolved_market_date,
+            trigger=trigger,
+            fs_div=resolved_fs_div,
+            force=force,
+            symbol_limit=symbol_limit,
+            symbol_offset=symbol_offset,
+            symbols_total=len(active_symbols),
+            run_metadata=run_metadata,
+        )
+
+        symbols_checked = len(selected_stock_codes)
+        symbols_missing = 0
+        symbols_stale = 0
+        symbols_fresh = 0
+        symbols_refreshed = 0
+        symbols_failed = 0
+        events_detected = 0
+        events_captured = 0
+        events_failed = 0
+        sync_results: list[dict[str, Any]] = []
+        symbol_results: dict[str, dict[str, Any]] = {}
+        lookup_errors: list[dict[str, str]] = []
+        lookup_failed_symbols: set[str] = set()
+        sync_groups: dict[date, list[dict[str, str]]] = {}
+        check_start_by_symbol: dict[str, date] = {}
+        latest_fundamentals_date_by_symbol: dict[str, date | None] = {}
+
+        try:
+            for stock_code in selected_stock_codes:
+                state = states.get(stock_code) or {
+                    'stock_code': stock_code,
+                    'has_fundamentals': False,
+                    'latest_fundamentals_receipt_date': None,
+                    'latest_snapshot': None,
+                }
+                latest_fundamentals_date = _parse_optional_iso_date(
+                    state.get('latest_fundamentals_receipt_date')
+                )
+                latest_fundamentals_date_by_symbol[stock_code] = latest_fundamentals_date
+                check_start_date = (
+                    _date_after(latest_fundamentals_date)
+                    if latest_fundamentals_date is not None
+                    else DART_FUNDAMENTALS_MIN_START_DATE
+                )
+                symbol_result = {
+                    'stock_code': stock_code,
+                    'has_fundamentals': latest_fundamentals_date is not None,
+                    'latest_fundamentals_receipt_date': (
+                        latest_fundamentals_date.isoformat() if latest_fundamentals_date else None
+                    ),
+                    'check_start_date': check_start_date.isoformat(),
+                    'state': 'checking',
+                }
+                symbol_results[stock_code] = symbol_result
+
+                if latest_fundamentals_date is None:
+                    symbols_missing += 1
+                if check_start_date > resolved_market_date:
+                    symbol_result['state'] = 'fresh'
+                    continue
+
+                try:
+                    corp = await self.client.lookup_corp_code(stock_code=stock_code)
+                except Exception as exc:
+                    error = {'stock_code': stock_code, 'error': str(exc)}
+                    lookup_errors.append(error)
+                    lookup_failed_symbols.add(stock_code)
+                    symbol_result['state'] = 'lookup_failed'
+                    symbol_result['error'] = str(exc)
+                    continue
+
+                corp_record = {
+                    'stock_code': stock_code,
+                    'corp_code': corp['corp_code'],
+                    'corp_name': corp['corp_name'],
+                }
+                check_start_by_symbol[stock_code] = check_start_date
+                sync_groups.setdefault(check_start_date, []).append(corp_record)
+
+            self.repository.update_refresh_run_progress(
+                run_id,
+                symbols_checked=symbols_checked,
+                symbols_missing=symbols_missing,
+                symbols_stale=0,
+                symbols_fresh=0,
+                symbols_refreshed=0,
+                symbols_failed=len(lookup_failed_symbols),
+                events_detected=0,
+                events_captured=0,
+                events_failed=0,
+                run_metadata={
+                    **run_metadata,
+                    'lookup_errors': _limited_sample(lookup_errors),
+                    'sync_group_count': len(sync_groups),
+                    'last_progress_at': _utcnow().isoformat(),
+                },
+            )
+
+            from app.dart.sync_service import dart_disclosure_sync_service
+
+            for check_start_date, corporations in sorted(sync_groups.items(), key=lambda item: item[0]):
+                sync_result = await dart_disclosure_sync_service.sync_disclosures_for_corporations(
+                    corporations=corporations,
+                    start_date=check_start_date,
+                    end_date=resolved_market_date,
+                    trigger='daily_incremental_refresh',
+                )
+                sync_results.append(
+                    {
+                        **sync_result,
+                        'check_start_date': check_start_date.isoformat(),
+                        'corporation_count': len(corporations),
+                    }
+                )
+
+            sync_stock_codes = list(check_start_by_symbol.keys())
+            candidate_events: list[dict[str, Any]] = []
+            if sync_stock_codes:
+                pending_events = self.repository.list_capture_candidates(
+                    limit=None,
+                    force=False,
+                    stock_codes=sync_stock_codes,
+                    receipt_date_from=min(check_start_by_symbol.values()),
+                    receipt_date_to=resolved_market_date,
+                )
+                seen_event_ids: set[int] = set()
+                for event in pending_events:
+                    event_id = int(event['id'])
+                    if event_id in seen_event_ids:
+                        continue
+                    stock_code = event.get('stock_code')
+                    if not stock_code or stock_code not in check_start_by_symbol:
+                        continue
+                    receipt_date = _parse_optional_iso_date(event.get('receipt_date'))
+                    latest_fundamentals_date = latest_fundamentals_date_by_symbol.get(stock_code)
+                    if latest_fundamentals_date is not None and (
+                        receipt_date is None or receipt_date <= latest_fundamentals_date
+                    ):
+                        continue
+                    candidate_events.append(event)
+                    seen_event_ids.add(event_id)
+
+            events_detected = len(candidate_events)
+            candidate_event_ids = [int(event['id']) for event in candidate_events]
+            event_ids_to_capture = (
+                candidate_event_ids
+                if capture_limit is None
+                else candidate_event_ids[:capture_limit]
+            )
+            candidate_symbols = {event['stock_code'] for event in candidate_events if event.get('stock_code')}
+            stale_symbols = {
+                stock_code
+                for stock_code in candidate_symbols
+                if latest_fundamentals_date_by_symbol.get(stock_code) is not None
+            }
+            missing_candidate_symbols = candidate_symbols - stale_symbols
+            symbols_stale = len(stale_symbols)
+
+            for stock_code in stale_symbols:
+                symbol_results[stock_code]['state'] = 'stale'
+            for stock_code in missing_candidate_symbols:
+                symbol_results[stock_code]['state'] = 'missing'
+            for stock_code, symbol_result in symbol_results.items():
+                if symbol_result['state'] != 'checking':
+                    continue
+                symbol_result['state'] = (
+                    'missing_no_newer_events'
+                    if latest_fundamentals_date_by_symbol.get(stock_code) is None
+                    else 'fresh'
+                )
+
+            capture_result: dict[str, Any]
+            if event_ids_to_capture:
+                capture_result = await self.capture_recent_fundamentals(
+                    limit=len(event_ids_to_capture),
+                    force=False,
+                    trigger='daily_incremental_refresh',
+                    fs_div=resolved_fs_div,
+                    stock_codes=sorted(candidate_symbols),
+                    receipt_date_from=min(check_start_by_symbol.values()) if check_start_by_symbol else None,
+                    receipt_date_to=resolved_market_date,
+                    event_ids=event_ids_to_capture,
+                )
+            else:
+                capture_result = {
+                    'run_id': None,
+                    'status': 'skipped',
+                    'reason': 'no_stale_or_missing_events',
+                    'fs_div': resolved_fs_div,
+                    'events_seen': 0,
+                    'events_captured': 0,
+                    'events_failed': 0,
+                    'events_skipped': 0,
+                    'results': [],
+                }
+
+            events_captured = int(capture_result.get('events_captured') or 0)
+            events_failed = int(capture_result.get('events_failed') or 0)
+            refreshed_symbols = {
+                item['stock_code']
+                for item in capture_result.get('results', [])
+                if item.get('status') == 'captured' and item.get('stock_code')
+            }
+            failed_symbols = {
+                item['stock_code']
+                for item in capture_result.get('results', [])
+                if item.get('status') == 'failed' and item.get('stock_code')
+            }
+            symbols_refreshed = len(refreshed_symbols)
+            symbols_failed = len(lookup_failed_symbols | failed_symbols)
+            remaining_candidate_events = max(events_detected - len(event_ids_to_capture), 0)
+            symbols_fresh = len(
+                [
+                    stock_code
+                    for stock_code, latest_date in latest_fundamentals_date_by_symbol.items()
+                    if latest_date is not None
+                    and stock_code not in stale_symbols
+                    and stock_code not in lookup_failed_symbols
+                ]
+            )
+
+            status = 'completed'
+            if symbols_failed or events_failed or remaining_candidate_events:
+                status = 'partial'
+
+            metadata = {
+                **run_metadata,
+                'lookup_errors': _limited_sample(lookup_errors),
+                'sync_runs': sync_results,
+                'capture_run_id': capture_result.get('run_id'),
+                'candidate_event_count': events_detected,
+                'candidate_event_ids_sample': _limited_sample(candidate_event_ids, limit=100),
+                'candidate_events_sample': _limited_sample(
+                    [
+                        {
+                            'event_id': event['id'],
+                            'rcept_no': event['rcept_no'],
+                            'stock_code': event['stock_code'],
+                            'receipt_date': event['receipt_date'],
+                            'report_nm': event['report_nm'],
+                            'fundamentals_capture_status': event['fundamentals_capture_status'],
+                        }
+                        for event in candidate_events
+                    ],
+                    limit=50,
+                ),
+                'stale_symbols_sample': _limited_sample(sorted(stale_symbols)),
+                'missing_candidate_symbols_sample': _limited_sample(sorted(missing_candidate_symbols)),
+                'refreshed_symbols_sample': _limited_sample(sorted(refreshed_symbols)),
+                'failed_symbols_sample': _limited_sample(sorted(lookup_failed_symbols | failed_symbols)),
+                'symbol_results_sample': _limited_sample(
+                    [symbol_results[stock_code] for stock_code in sorted(symbol_results)],
+                    limit=100,
+                ),
+                'remaining_candidate_events': remaining_candidate_events,
+                'last_progress_at': _utcnow().isoformat(),
+            }
+            self.repository.complete_refresh_run(
+                run_id,
+                status=status,
+                symbols_checked=symbols_checked,
+                symbols_missing=symbols_missing,
+                symbols_stale=symbols_stale,
+                symbols_fresh=symbols_fresh,
+                symbols_refreshed=symbols_refreshed,
+                symbols_failed=symbols_failed,
+                events_detected=events_detected,
+                events_captured=events_captured,
+                events_failed=events_failed,
+                run_metadata=metadata,
+            )
+            return {
+                'triggered': True,
+                'run_id': run_id,
+                'status': status,
+                'market_date': resolved_market_date.isoformat(),
+                'fs_div': resolved_fs_div,
+                'active_symbols_total': len(active_symbols),
+                'symbol_offset': symbol_offset,
+                'symbol_limit': symbol_limit,
+                'symbols_selected': len(selected_stock_codes),
+                'symbols_checked': symbols_checked,
+                'symbols_missing': symbols_missing,
+                'symbols_stale': symbols_stale,
+                'symbols_fresh': symbols_fresh,
+                'symbols_refreshed': symbols_refreshed,
+                'symbols_failed': symbols_failed,
+                'events_detected': events_detected,
+                'events_captured': events_captured,
+                'events_failed': events_failed,
+                'stale_refresh_run_ids_failed': stale_refresh_run_ids,
+                'sync': {
+                    'run_count': len(sync_results),
+                    'runs': sync_results,
+                    'financial_report_events': sum(
+                        int(item.get('financial_report_events') or 0) for item in sync_results
+                    ),
+                },
+                'capture': capture_result,
+                'samples': {
+                    'lookup_errors': _limited_sample(lookup_errors),
+                    'stale_symbols': _limited_sample(sorted(stale_symbols)),
+                    'missing_candidate_symbols': _limited_sample(sorted(missing_candidate_symbols)),
+                    'refreshed_symbols': _limited_sample(sorted(refreshed_symbols)),
+                    'failed_symbols': _limited_sample(sorted(lookup_failed_symbols | failed_symbols)),
+                },
+            }
+        except Exception as exc:
+            self.repository.complete_refresh_run(
+                run_id,
+                status='failed',
+                symbols_checked=symbols_checked,
+                symbols_missing=symbols_missing,
+                symbols_stale=symbols_stale,
+                symbols_fresh=symbols_fresh,
+                symbols_refreshed=symbols_refreshed,
+                symbols_failed=max(symbols_failed, len(lookup_failed_symbols)),
+                events_detected=events_detected,
+                events_captured=events_captured,
+                events_failed=events_failed,
+                error_message=str(exc),
+                run_metadata={
+                    **run_metadata,
+                    'lookup_errors': _limited_sample(lookup_errors),
+                    'sync_runs': sync_results,
+                    'symbol_results_sample': _limited_sample(
+                        [symbol_results[stock_code] for stock_code in sorted(symbol_results)],
+                        limit=100,
+                    ),
+                    'last_progress_at': _utcnow().isoformat(),
+                },
+            )
+            raise
+
     def inspect_capture_status(
         self,
         *,
@@ -705,6 +1143,26 @@ class DartFundamentalsCaptureService:
             'runs': self.repository.list_capture_runs(limit=runs_limit),
             'summary': self.repository.get_capture_summary(),
             'events': self.repository.list_financial_events(limit=events_limit, capture_status=capture_status),
+        }
+
+    def inspect_daily_refresh_status(
+        self,
+        *,
+        runs_limit: int = 10,
+        market_date: date | None = None,
+        fs_div: str | None = None,
+    ) -> dict[str, Any]:
+        resolved_fs_div = fs_div.strip().upper() if fs_div else None
+        return {
+            'latest_run': self.repository.get_latest_refresh_run(
+                market_date=market_date,
+                fs_div=resolved_fs_div,
+            ),
+            'runs': self.repository.list_refresh_runs(
+                limit=runs_limit,
+                market_date=market_date,
+                fs_div=resolved_fs_div,
+            ),
         }
 
 

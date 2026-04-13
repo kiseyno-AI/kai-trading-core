@@ -84,6 +84,30 @@ class InternalOpsTests(unittest.TestCase):
         self.assertEqual(run_daily.call_args.kwargs['trigger'], 'internal_ops_cli')
         self.assertEqual(run_daily.call_args.kwargs['force'], True)
 
+    def test_run_dart_fundamentals_daily_if_due_uses_direct_service_call(self) -> None:
+        with (
+            patch('app.internal.ops.bootstrap_runtime') as bootstrap_runtime,
+            patch(
+                'app.internal.ops.dart_fundamentals_capture_service.run_daily_incremental_refresh',
+                new=AsyncMock(return_value={'triggered': True, 'run_id': 15}),
+            ) as run_daily,
+        ):
+            result = ops.run_dart_fundamentals_daily_if_due(
+                market_date='2026-04-14',
+                symbol_limit=5,
+                capture_limit=20,
+                force=True,
+                fs_div='CFS',
+            )
+
+        bootstrap_runtime.assert_called_once_with()
+        self.assertEqual(result, {'triggered': True, 'run_id': 15})
+        self.assertEqual(run_daily.call_args.kwargs['market_date'], '2026-04-14')
+        self.assertEqual(run_daily.call_args.kwargs['symbol_limit'], 5)
+        self.assertEqual(run_daily.call_args.kwargs['capture_limit'], 20)
+        self.assertEqual(run_daily.call_args.kwargs['trigger'], 'internal_ops_cli')
+        self.assertEqual(run_daily.call_args.kwargs['force'], True)
+
     def test_cli_quotes_tracked_outputs_json(self) -> None:
         stdout = io.StringIO()
         with (

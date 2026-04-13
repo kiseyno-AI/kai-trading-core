@@ -15,6 +15,7 @@
 12. EOD daily technical snapshot compute/inspect routes
 13. EOD daily action summary compute/inspect routes
 14. Agent symbol/day aggregate context read route
+15. DART daily incremental fundamentals refresh route
 
 ## Current routes
 - `POST /broker/kis/token`
@@ -36,6 +37,8 @@
 - `POST /disclosures/dart/fundamentals/capture?limit=20&fs_div=CFS`
 - `GET /disclosures/dart/fundamentals/history?symbols=005930&symbols=000660&start_date=2024-01-01&end_date=2025-12-31&fs_div=CFS`
 - `GET /disclosures/dart/fundamentals/capture/inspect?capture_status=captured`
+- `POST /disclosures/dart/fundamentals/daily/run-if-due?market_date=2026-04-14&symbol_limit=250&capture_limit=500&fs_div=CFS`
+- `GET /disclosures/dart/fundamentals/daily/inspect?market_date=2026-04-14&fs_div=CFS`
 - `POST /disclosures/dart/fundamentals/backfill/current-universe?symbol_limit=25&symbol_offset=0&capture_limit=250&fs_div=CFS`
 - `GET /disclosures/dart/filings/document?rcept_no=20250312000123`
 - `GET /disclosures/dart/filings/xbrl?rcept_no=20250312000123&report_code=11011`
@@ -95,6 +98,7 @@
 - The current-universe backfill operator is intentionally batch-oriented. Use the current active symbol universe only, slice with `symbol_limit` and `symbol_offset`, sync only the relevant financial report events for that slice, then capture only those symbols' pending or failed fundamentals.
 - For operator-driven continuation batches, prefer `python3.11 -m app.dart.backfill_current_universe ...` or a quoted `curl` URL. Unquoted shell query strings can turn `?` and `&` into zsh parsing issues before the request reaches the API.
 - For unattended full-universe continuation, use `python3.11 -m app.dart.backfill_current_universe_runner ...`; it is the repo-owned long-run path with per-batch log-file progress and failure offsets.
+- Daily incremental fundamentals refresh is the EOD-style steady-state operator path. It reads each selected active symbol's latest stored DART fundamentals receipt date, syncs only that symbol's newer DART financial-report disclosure window, captures only stale or missing symbols' exact pending event IDs, and records a high-level `dart_fundamentals_refresh_runs` row for inspection.
 
 ## Next routes
 - DART corp-code refresh and inspect operator if lookup freshness becomes an operational issue
