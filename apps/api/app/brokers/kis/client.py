@@ -286,3 +286,51 @@ class KISClient:
             output_keys=('output1', 'output2'),
             max_pages=max_pages,
         )
+
+    async def fetch_domestic_volume_rank(self, market_code: str = 'J', input_iscd: str = '0000') -> dict:
+        return await self._get(
+            '/uapi/domestic-stock/v1/quotations/volume-rank',
+            tr_id='FHPST01710000',
+            params={
+                'FID_COND_MRKT_DIV_CODE': market_code,
+                'FID_COND_SCR_DIV_CODE': '20171',
+                'FID_INPUT_ISCD': input_iscd,
+                'FID_DIV_CLS_CODE': '0',
+                'FID_BLNG_CLS_CODE': '0',
+                'FID_TRGT_CLS_CODE': '111111111',
+                'FID_TRGT_EXLS_CLS_CODE': '000000',
+                'FID_INPUT_PRICE_1': '0',
+                'FID_INPUT_PRICE_2': '0',
+                'FID_VOL_CNT': '0',
+                'FID_INPUT_DATE_1': '0',
+            },
+        )
+
+    async def fetch_domestic_fluctuation_rank(self, market_code: str = 'J', count: int = 20) -> dict:
+        return await self._get(
+            '/uapi/domestic-stock/v1/ranking/fluctuation',
+            tr_id='FHPST01700000',
+            params={
+                'fid_rsfl_rate2': '',
+                'fid_cond_mrkt_div_code': market_code,
+                'fid_cond_scr_div_code': '20170',
+                'fid_input_iscd': '0000',
+                'fid_rank_sort_cls_code': '0',
+                'fid_input_cnt_1': str(count),
+                'fid_prc_cls_code': '0',
+                'fid_input_price_1': '',
+                'fid_input_price_2': '',
+                'fid_vol_cnt': '',
+                'fid_trgt_cls_code': '0',
+                'fid_trgt_exls_cls_code': '0',
+                'fid_div_cls_code': '0',
+                'fid_rsfl_rate1': '',
+            },
+        )
+
+    async def fetch_domestic_hts_top_view(self) -> dict:
+        return await self._get(
+            '/uapi/domestic-stock/v1/ranking/hts-top-view',
+            tr_id='HHMCM000100C0',
+            params={},
+        )

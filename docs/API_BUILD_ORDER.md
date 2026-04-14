@@ -18,7 +18,8 @@
 15. DART daily incremental fundamentals refresh route
 16. Favorite symbol read/delete routes
 17. Stored trending stocks read route
-18. KIS daily ranking signal-feature collect/inspect routes
+18. KIS realtime trending route
+19. KIS daily ranking signal-feature collect/inspect routes
 
 ## Current routes
 - `POST /broker/kis/token`
@@ -28,6 +29,7 @@
 - `GET /quotes/tracked`
 - `GET /quotes/005930`
 - `GET /scanner/tracked-symbols`
+- `GET /scanner/realtime-trending?limit=20&market_code=J&sources=volume-rank,fluctuation,hts-top-view`
 - `POST /scanner/tracked-symbols`
 - `GET /scanner/trending-stocks?period=5d&direction=both&limit=20&markets=KOSPI`
 - `GET /symbols/search?q=삼성&limit=20`
@@ -84,6 +86,12 @@
   - then same-day `quote_cache` or `current_quote_cache`
   - otherwise `available: false`
 - Multi-day stale quote cache must not be surfaced as if it were a current quote.
+
+## Realtime trending notes
+- `GET /scanner/realtime-trending` is the user-facing realtime trending read API backed by KIS ranking sources only.
+- Current source scope is `volume-rank`, `fluctuation`, and `hts-top-view`. The `sources` query parameter accepts a comma-separated subset of those source IDs.
+- The response keeps each source bucket and also returns a merged `items` list keyed by symbol, with per-symbol `sources` metadata so clients can show which ranking buckets included the symbol.
+- The route uses request-time KIS reads with a short in-memory TTL controlled by `KIS_REALTIME_TRENDING_CACHE_TTL_SECONDS`; it does not persist daily signal snapshots.
 
 ## Symbol price history notes
 - `GET /symbols/{symbol}/price-bars` is the read API for the web symbol-detail candlestick chart.
