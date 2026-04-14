@@ -447,6 +447,48 @@ Authorization: Bearer <token>
 
 ---
 
+## 2.5 `GET /eod/signal-features`
+Returns stored daily KIS ranking signal features.
+
+### Example request
+```http
+GET /eod/signal-features?market_date=2026-04-14&symbols=005930
+Authorization: Bearer <token>
+```
+
+### Example response
+```json
+{
+  "market_date": "2026-04-14",
+  "summary": {
+    "entries": 1,
+    "requested_symbols": ["005930"],
+    "matched_symbols": ["005930"],
+    "missing_symbols": []
+  },
+  "items": [
+    {
+      "symbol": "005930",
+      "source": "kis_ranking",
+      "signal_count": 2,
+      "volume_power_rank": 3,
+      "volume_power": 140.5,
+      "overtime_volume_rank": 7,
+      "overtime_volume": 120000,
+      "overtime_fluctuation_rank": null,
+      "overtime_fluctuation_rate": null
+    }
+  ]
+}
+```
+
+### Notes
+- Stored rows are keyed by symbol and market date.
+- The current persisted sources are `volume-power`, `overtime-volume`, and `overtime-fluctuation`.
+- `POST /eod/signal-features/collect` is the operator path that calls KIS and upserts these rows.
+
+---
+
 # 3. DART APIs
 
 ## 3.1 `GET /disclosures/dart/fundamentals/history`
@@ -567,6 +609,7 @@ Authorization: Bearer <token>
     "missing_symbols": [],
     "technical_snapshot_count": 1,
     "action_summary_count": 1,
+    "signal_feature_count": 1,
     "fundamentals_count": 0,
     "recent_disclosure_symbol_count": 0
   },
@@ -603,6 +646,14 @@ Authorization: Bearer <token>
         "confidence_tier": "medium",
         "risk_tier": "medium"
       },
+      "signal_features": {
+        "symbol": "005930",
+        "market_date": "2026-04-09",
+        "source": "kis_ranking",
+        "signal_count": 2,
+        "volume_power_rank": 3,
+        "overtime_volume_rank": 7
+      },
       "fundamentals": {
         "latest_snapshot": null,
         "history_summary": {
@@ -621,6 +672,7 @@ Authorization: Bearer <token>
         "company": true,
         "technical_snapshot": true,
         "action_summary": true,
+        "signal_features": true,
         "fundamentals": false,
         "recent_disclosures": false
       }
@@ -642,6 +694,7 @@ Each subsection can be absent independently.
 For example, a company may have:
 - technical snapshot present,
 - action summary present,
+- `signal_features` absent,
 - `fundamentals.latest_snapshot` absent,
 - `recent_disclosures.items` empty.
 
@@ -681,6 +734,7 @@ Symbol-detail style consumers should think in layered modules:
 - price history,
 - technical snapshot,
 - action summary,
+- signal features,
 - fundamentals summary,
 - disclosures.
 
@@ -700,6 +754,7 @@ If a UX or frontend team needs to plan against the current system, the most impo
 - `/eod/freshness`
 - `/eod/technical-snapshots`
 - `/eod/action-summaries`
+- `/eod/signal-features`
 - `/agent-context/symbol-day`
 - `/disclosures/dart/fundamentals/history`
 

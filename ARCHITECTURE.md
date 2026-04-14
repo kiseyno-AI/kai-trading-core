@@ -18,7 +18,7 @@
 - **`app/brokers/kis/`** — KIS client/provider/schemas.
 - **`app/integrations/`** — BOK, FX (Korea Exim), etc.
 - **`app/fx/`** — Korea Exim FX service-level normalization, filtering, and date fallback behavior.
-- **`app/quotes/`**, **`app/market/`**, **`app/scanner/`**, **`app/eod/`** — domain services and background behavior, including pykrx-based historical EOD backfill.
+- **`app/quotes/`**, **`app/market/`**, **`app/scanner/`**, **`app/eod/`**, **`app/signals/`** — domain services and background behavior, including pykrx-based historical EOD backfill and daily KIS ranking signal features.
 
 ## Documentation
 - **`docs/API_BUILD_ORDER.md`** — implemented vs planned HTTP routes (keep in sync with code).

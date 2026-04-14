@@ -249,6 +249,25 @@ class DailyTrendingRank(Base, TimestampMixin):
     captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
+class DailySignalFeature(Base, TimestampMixin):
+    __tablename__ = 'daily_signal_features'
+    __table_args__ = (UniqueConstraint('symbol_id', 'market_date', name='uq_daily_signal_features_symbol_market_date'),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol_id: Mapped[int] = mapped_column(ForeignKey('symbols.id', ondelete='CASCADE'), nullable=False, index=True)
+    market_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default='kis_ranking')
+    signal_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, index=True)
+    volume_power_rank: Mapped[int | None] = mapped_column(Integer, index=True)
+    volume_power: Mapped[float | None] = mapped_column(Numeric(12, 4))
+    overtime_volume_rank: Mapped[int | None] = mapped_column(Integer, index=True)
+    overtime_volume: Mapped[int | None] = mapped_column(BigInteger)
+    overtime_fluctuation_rank: Mapped[int | None] = mapped_column(Integer, index=True)
+    overtime_fluctuation_rate: Mapped[float | None] = mapped_column(Numeric(12, 4))
+    feature_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
 class DartDisclosureSyncRun(Base):
     __tablename__ = 'dart_disclosure_sync_runs'
 

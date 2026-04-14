@@ -76,7 +76,7 @@ class KISClient:
             'app_secret_configured': bool(settings.kis_app_secret),
         }
 
-    async def _get(self, path: str, *, tr_id: str, params: dict) -> dict:
+    async def _get_response(self, path: str, *, tr_id: str, params: dict, tr_cont: str = '') -> tuple[dict, str]:
         token = await self.issue_access_token()
         headers = {
             'authorization': f"Bearer {token['access_token']}",
@@ -84,6 +84,8 @@ class KISClient:
             'appsecret': settings.kis_app_secret,
             'tr_id': tr_id,
         }
+        if tr_cont:
+            headers['tr_cont'] = tr_cont
         async with httpx.AsyncClient(base_url=self.base_url, timeout=15.0) as client:
             response = await request_with_audit(
                 client,
@@ -95,7 +97,47 @@ class KISClient:
             )
             if response.status_code >= 400:
                 raise RuntimeError(f'KIS request failed [{response.status_code}] {path}: {response.text}')
-            return response.json()
+            return response.json(), response.headers.get('tr_cont', '')
+
+    async def _get(self, path: str, *, tr_id: str, params: dict) -> dict:
+        body, _ = await self._get_response(path, tr_id=tr_id, params=params)
+        return body
+
+    async def _get_paginated_ranking(
+        self,
+        path: str,
+        *,
+        tr_id: str,
+        params: dict,
+        output_keys: tuple[str, ...],
+        max_pages: int = 10,
+    ) -> dict:
+        merged: dict[str, list] = {key: [] for key in output_keys}
+        pages: list[dict] = []
+        tr_cont = ''
+        continuation_pending = False
+
+        for _ in range(max_pages):
+            body, next_tr_cont = await self._get_response(path, tr_id=tr_id, params=params, tr_cont=tr_cont)
+            pages.append(body)
+            for key in output_keys:
+                value = body.get(key)
+                if isinstance(value, list):
+                    merged[key].extend(value)
+                elif isinstance(value, dict):
+                    merged[key].append(value)
+
+            continuation_pending = next_tr_cont in {'M', 'F'}
+            if not continuation_pending:
+                break
+            tr_cont = 'N'
+
+        return {
+            **merged,
+            'page_count': len(pages),
+            'max_pages_reached': continuation_pending and len(pages) >= max_pages,
+            'raw_pages': pages,
+        }
 
     async def fetch_domestic_quote(self, symbol: str, market_code: str = 'J') -> dict:
         return await self._get(
@@ -148,4 +190,99 @@ class KISClient:
                 'FID_PERIOD_DIV_CODE': period_code,
                 'FID_ORG_ADJ_PRC': adjusted_price,
             },
+        )
+
+    async def fetch_domestic_ranking_volume_power(
+        self,
+        *,
+        market_code: str = 'J',
+        input_iscd: str = '0000',
+        div_cls_code: str = '0',
+        min_price: str = '0',
+        max_price: str = '1000000',
+        min_volume: str = '0',
+        target_cls_code: str = '0',
+        target_exclude_cls_code: str = '0',
+        max_pages: int = 10,
+    ) -> dict:
+        return await self._get_paginated_ranking(
+            '/uapi/domestic-stock/v1/ranking/volume-power',
+            tr_id='FHPST01680000',
+            params={
+                'fid_trgt_exls_cls_code': target_exclude_cls_code,
+                'fid_cond_mrkt_div_code': market_code,
+                'fid_cond_scr_div_code': '20168',
+                'fid_input_iscd': input_iscd,
+                'fid_div_cls_code': div_cls_code,
+                'fid_input_price_1': min_price,
+                'fid_input_price_2': max_price,
+                'fid_vol_cnt': min_volume,
+                'fid_trgt_cls_code': target_cls_code,
+            },
+            output_keys=('output',),
+            max_pages=max_pages,
+        )
+
+    async def fetch_domestic_ranking_overtime_volume(
+        self,
+        *,
+        market_code: str = 'J',
+        input_iscd: str = '0000',
+        rank_sort_cls_code: str = '2',
+        min_price: str = '',
+        max_price: str = '',
+        min_volume: str = '',
+        target_cls_code: str = '',
+        target_exclude_cls_code: str = '',
+        max_pages: int = 10,
+    ) -> dict:
+        return await self._get_paginated_ranking(
+            '/uapi/domestic-stock/v1/ranking/overtime-volume',
+            tr_id='FHPST02350000',
+            params={
+                'FID_COND_MRKT_DIV_CODE': market_code,
+                'FID_COND_SCR_DIV_CODE': '20235',
+                'FID_INPUT_ISCD': input_iscd,
+                'FID_RANK_SORT_CLS_CODE': rank_sort_cls_code,
+                'FID_INPUT_PRICE_1': min_price,
+                'FID_INPUT_PRICE_2': max_price,
+                'FID_VOL_CNT': min_volume,
+                'FID_TRGT_CLS_CODE': target_cls_code,
+                'FID_TRGT_EXLS_CLS_CODE': target_exclude_cls_code,
+            },
+            output_keys=('output1', 'output2'),
+            max_pages=max_pages,
+        )
+
+    async def fetch_domestic_ranking_overtime_fluctuation(
+        self,
+        *,
+        market_code: str = 'J',
+        market_cls_code: str = '',
+        input_iscd: str = '0000',
+        div_cls_code: str = '2',
+        min_price: str = '',
+        max_price: str = '',
+        min_volume: str = '',
+        target_cls_code: str = '',
+        target_exclude_cls_code: str = '',
+        max_pages: int = 10,
+    ) -> dict:
+        return await self._get_paginated_ranking(
+            '/uapi/domestic-stock/v1/ranking/overtime-fluctuation',
+            tr_id='FHPST02340000',
+            params={
+                'FID_COND_MRKT_DIV_CODE': market_code,
+                'FID_MRKT_CLS_CODE': market_cls_code,
+                'FID_COND_SCR_DIV_CODE': '20234',
+                'FID_INPUT_ISCD': input_iscd,
+                'FID_DIV_CLS_CODE': div_cls_code,
+                'FID_INPUT_PRICE_1': min_price,
+                'FID_INPUT_PRICE_2': max_price,
+                'FID_VOL_CNT': min_volume,
+                'FID_TRGT_CLS_CODE': target_cls_code,
+                'FID_TRGT_EXLS_CLS_CODE': target_exclude_cls_code,
+            },
+            output_keys=('output1', 'output2'),
+            max_pages=max_pages,
         )
