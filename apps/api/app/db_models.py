@@ -56,6 +56,16 @@ class TrackedSymbol(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
+class FavoriteSymbol(Base):
+    __tablename__ = 'favorite_symbols'
+    __table_args__ = (UniqueConstraint('symbol_id', name='uq_favorite_symbols_symbol_id'),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol_id: Mapped[int] = mapped_column(ForeignKey('symbols.id', ondelete='CASCADE'), nullable=False, index=True)
+    sort_order: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
 class QuoteSnapshot(Base):
     __tablename__ = 'quote_snapshots'
 

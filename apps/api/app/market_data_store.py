@@ -16,6 +16,7 @@ from app.db_models import (
     DailyTechnicalSnapshot,
     DailyTrendingRank,
     EODCollectionRun,
+    FavoriteSymbol,
     MarketStatusSnapshot,
     QuoteSnapshot,
     Symbol,
@@ -69,6 +70,13 @@ TRENDING_RANK_REBUILD_LIMIT = 100000
 
 def _get_symbol(session, symbol: str) -> Symbol | None:
     return session.execute(select(Symbol).where(Symbol.symbol == symbol)).scalar_one_or_none()
+
+
+def _normalize_symbol_code(symbol: str) -> str:
+    normalized = symbol.strip().upper()
+    if not normalized:
+        raise ValueError('symbol is required')
+    return normalized
 
 
 def ensure_symbol(
@@ -234,6 +242,51 @@ def replace_tracked_symbols(symbols: list[str]) -> None:
                 session.add(record)
                 session.flush()
             session.add(TrackedSymbol(symbol_id=record.id, sort_order=index))
+
+
+def load_favorite_symbols() -> list[dict]:
+    with session_scope() as session:
+        rows = session.execute(
+            select(
+                Symbol.symbol,
+                Symbol.standard_code,
+                Symbol.name_ko,
+                Symbol.market,
+                Symbol.instrument_type,
+                Symbol.is_active,
+                FavoriteSymbol.sort_order,
+                FavoriteSymbol.created_at,
+            )
+            .join(FavoriteSymbol, FavoriteSymbol.symbol_id == Symbol.id)
+            .order_by(FavoriteSymbol.sort_order.asc(), FavoriteSymbol.id.asc())
+        ).all()
+        return [
+            {
+                'symbol': row.symbol,
+                'standard_code': row.standard_code,
+                'name_ko': row.name_ko,
+                'market': row.market,
+                'instrument_type': row.instrument_type,
+                'is_active': row.is_active,
+                'sort_order': row.sort_order,
+                'favorited_at': row.created_at.isoformat() if row.created_at else None,
+            }
+            for row in rows
+        ]
+
+
+def remove_favorite_symbol(symbol: str) -> bool:
+    normalized_symbol = _normalize_symbol_code(symbol)
+    with session_scope() as session:
+        favorite = session.execute(
+            select(FavoriteSymbol)
+            .join(Symbol, Symbol.id == FavoriteSymbol.symbol_id)
+            .where(Symbol.symbol == normalized_symbol)
+        ).scalar_one_or_none()
+        if favorite is None:
+            return False
+        session.delete(favorite)
+        return True
 
 
 def persist_quote_snapshot(payload: dict) -> None:
