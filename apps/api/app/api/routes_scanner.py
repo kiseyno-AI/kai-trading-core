@@ -5,6 +5,7 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 from app.market_data_store import replace_tracked_symbols
+from app.scanner.realtime_trending import KIS_REALTIME_TRENDING_SOURCES, realtime_trending_service
 from app.scanner.state import scanner_state
 from app.scanner.trending import trending_stocks_service
 
@@ -41,6 +42,22 @@ async def get_trending_stocks(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f'Trending stocks read failed: {exc}') from exc
+
+
+@router.get('/realtime-trending')
+async def get_realtime_trending(
+    limit: int = Query(20, ge=1, le=50),
+    market_code: str = Query('J'),
+    sources: str = Query(','.join(KIS_REALTIME_TRENDING_SOURCES)),
+) -> dict:
+    try:
+        return await realtime_trending_service.get_realtime_trending(
+            limit=limit,
+            market_code=market_code,
+            sources=sources,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post('/tracked-symbols')

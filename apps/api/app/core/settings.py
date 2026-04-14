@@ -38,6 +38,7 @@ class Settings(BaseSettings):
     kis_mock_base_url: str = 'https://openapivts.koreainvestment.com:29443'
     kis_use_mock: bool = True
     kis_token_refresh_margin_seconds: int = 300
+    kis_realtime_trending_cache_ttl_seconds: int = 20
 
     bok_ecos_api_key: str = Field(
         default='',
