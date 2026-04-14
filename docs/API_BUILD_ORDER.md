@@ -16,6 +16,7 @@
 13. EOD daily action summary compute/inspect routes
 14. Agent symbol/day aggregate context read route
 15. DART daily incremental fundamentals refresh route
+16. Favorite symbol read/delete routes
 
 ## Current routes
 - `POST /broker/kis/token`
@@ -27,6 +28,8 @@
 - `GET /scanner/tracked-symbols`
 - `POST /scanner/tracked-symbols`
 - `GET /symbols/search?q=삼성&limit=20`
+- `GET /symbols/favorites`
+- `DELETE /symbols/favorites/005930`
 - `GET /symbols/005930/price-bars?start_date=2021-04-09&end_date=2026-04-09`
 - `GET /macro/bok/series?series_id=722Y001/0101000&start_period=20240101&end_period=20240131&cycle=D`
 - `GET /fx/koreaexim/rates?search_date=20260408&data=AP01`
@@ -81,6 +84,10 @@
 - `GET /symbols/{symbol}/price-bars` is the read API for the web symbol-detail candlestick chart.
 - It reads directly from `daily_price_bars` and supports bounded range windows with `start_date` and `end_date`, plus a capped `limit` for recent-history or max-history retrieval.
 - When `limit` is used, the API reads the newest rows first for index-friendly retrieval and returns them sorted ascending for chart consumers.
+
+## Favorite symbol notes
+- `GET /symbols/favorites` returns the persisted favorite symbol list in display order, including symbol metadata from `symbols`.
+- `DELETE /symbols/favorites/{symbol}` removes one favorite symbol and returns `removed: false` when the symbol was not currently favorited, so web clients can treat repeat deletes as harmless.
 
 ## EOD action summary notes
 - `daily_action_summaries` is the DB-backed rules and scoring layer keyed by `symbol_id + market_date`, reading only stored `daily_technical_snapshots`.
