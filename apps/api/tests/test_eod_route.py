@@ -20,6 +20,10 @@ class FakeFreshnessService:
             },
             'latest': {
                 'price_trade_date': '2026-04-10',
+                'eod_status': 'completed',
+                'symbols_total': 3,
+                'symbols_succeeded': 3,
+                'symbols_failed': 0,
                 'technical_market_date': '2026-04-10',
                 'action_market_date': '2026-04-10',
             },
@@ -91,6 +95,7 @@ class EODRouteTests(unittest.TestCase):
         payload = response.json()
         self.assertEqual(payload['today']['trade_date'], '2026-04-10')
         self.assertEqual(payload['today']['eod_status'], 'completed')
+        self.assertEqual(payload['latest']['symbols_succeeded'], 3)
         self.assertEqual(payload['latest']['action_market_date'], '2026-04-10')
 
     def test_compute_technical_snapshots_route_calls_service(self):

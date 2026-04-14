@@ -27,6 +27,10 @@ class EODFreshnessServiceTests(unittest.TestCase):
         self.assertEqual(result['today']['symbols_failed'], None)
         self.assertEqual(result['today']['received'], False)
         self.assertEqual(result['latest']['price_trade_date'], None)
+        self.assertEqual(result['latest']['eod_status'], 'missing')
+        self.assertEqual(result['latest']['symbols_total'], None)
+        self.assertEqual(result['latest']['symbols_succeeded'], None)
+        self.assertEqual(result['latest']['symbols_failed'], None)
 
     def test_read_keeps_today_missing_when_only_previous_date_run_exists(self):
         requested_run_dates = []
@@ -68,10 +72,14 @@ class EODFreshnessServiceTests(unittest.TestCase):
         self.assertEqual(result['today']['symbols_failed'], None)
         self.assertEqual(result['today']['received'], False)
         self.assertEqual(result['latest']['price_trade_date'], '2026-04-09')
+        self.assertEqual(result['latest']['eod_status'], 'completed_with_errors')
+        self.assertEqual(result['latest']['symbols_total'], 3584)
+        self.assertEqual(result['latest']['symbols_succeeded'], 3581)
+        self.assertEqual(result['latest']['symbols_failed'], 3)
         self.assertEqual(result['latest']['technical_market_date'], '2026-04-09')
         self.assertEqual(result['latest']['action_market_date'], '2026-04-09')
-        self.assertEqual(requested_run_dates, ['2026-04-10'])
-        self.assertEqual(requested_count_dates, ['2026-04-10'])
+        self.assertEqual(requested_run_dates, ['2026-04-10', '2026-04-09'])
+        self.assertEqual(requested_count_dates, ['2026-04-10', '2026-04-09'])
 
     def test_read_returns_completed_with_errors_from_run(self):
         service = EODFreshnessService(
@@ -95,6 +103,10 @@ class EODFreshnessServiceTests(unittest.TestCase):
         self.assertEqual(result['today']['symbols_succeeded'], 2)
         self.assertEqual(result['today']['symbols_failed'], 1)
         self.assertEqual(result['today']['received'], True)
+        self.assertEqual(result['latest']['eod_status'], 'completed_with_errors')
+        self.assertEqual(result['latest']['symbols_total'], 3)
+        self.assertEqual(result['latest']['symbols_succeeded'], 2)
+        self.assertEqual(result['latest']['symbols_failed'], 1)
         self.assertEqual(result['latest']['action_market_date'], '2026-04-09')
 
     def test_read_preserves_completed_with_errors_run_status(self):

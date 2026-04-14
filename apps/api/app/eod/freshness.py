@@ -25,20 +25,36 @@ class EODFreshnessService:
     def read(self) -> dict:
         trade_date = self.market_state_loader().server_time[:10]
         latest_price_trade_date = self.latest_price_trade_date_loader()
-        latest_run = self.latest_run_loader(market='KRX', trade_date=trade_date)
+        today_run = self.latest_run_loader(market='KRX', trade_date=trade_date)
         price_bar_count = self.daily_price_bar_count_loader(trade_date)
+        if latest_price_trade_date == trade_date:
+            latest_price_run = today_run
+            latest_price_bar_count = price_bar_count
+        elif latest_price_trade_date:
+            latest_price_run = self.latest_run_loader(market='KRX', trade_date=latest_price_trade_date)
+            latest_price_bar_count = self.daily_price_bar_count_loader(latest_price_trade_date)
+        else:
+            latest_price_run = None
+            latest_price_bar_count = 0
 
         return {
             'today': {
                 'trade_date': trade_date,
-                'eod_status': self._resolve_eod_status(latest_run=latest_run, price_bar_count=price_bar_count),
-                'symbols_total': latest_run.get('symbols_total') if latest_run else None,
-                'symbols_succeeded': latest_run.get('symbols_succeeded') if latest_run else None,
-                'symbols_failed': latest_run.get('symbols_failed') if latest_run else None,
+                'eod_status': self._resolve_eod_status(latest_run=today_run, price_bar_count=price_bar_count),
+                'symbols_total': today_run.get('symbols_total') if today_run else None,
+                'symbols_succeeded': today_run.get('symbols_succeeded') if today_run else None,
+                'symbols_failed': today_run.get('symbols_failed') if today_run else None,
                 'received': price_bar_count > 0,
             },
             'latest': {
                 'price_trade_date': latest_price_trade_date,
+                'eod_status': self._resolve_eod_status(
+                    latest_run=latest_price_run,
+                    price_bar_count=latest_price_bar_count,
+                ),
+                'symbols_total': latest_price_run.get('symbols_total') if latest_price_run else None,
+                'symbols_succeeded': latest_price_run.get('symbols_succeeded') if latest_price_run else None,
+                'symbols_failed': latest_price_run.get('symbols_failed') if latest_price_run else None,
                 'technical_market_date': self.latest_technical_market_date_loader(),
                 'action_market_date': self.latest_action_market_date_loader(),
             },
