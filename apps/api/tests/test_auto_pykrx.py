@@ -214,6 +214,10 @@ class PykrxBackfillServiceTests(TestCase):
                 'app.eod.pykrx_backfill.daily_action_summary_service.compute_and_persist_for_market_date',
                 return_value={'action_summaries_persisted': 1, 'action_summaries_failed': 0},
             ) as action_summaries,
+            patch(
+                'app.eod.pykrx_backfill.compute_and_persist_daily_trending_ranks',
+                return_value={'trending_ranks_persisted': 3},
+            ) as trending_ranks,
             patch('app.eod.pykrx_backfill.update_eod_collection_run_progress', side_effect=RuntimeError('progress write failed')),
             patch('app.eod.pykrx_backfill.complete_eod_collection_run') as complete_run,
         ):
@@ -227,6 +231,7 @@ class PykrxBackfillServiceTests(TestCase):
         self.assertEqual(result['symbols_succeeded'], 1)
         self.assertEqual(result['technical_snapshots']['snapshots_persisted'], 1)
         self.assertEqual(result['action_summaries']['action_summaries_persisted'], 1)
+        self.assertEqual(result['trending_ranks']['trending_ranks_persisted'], 3)
         technical_snapshots.assert_called_once_with(
             market_date='2026-04-03',
             symbols=['005930'],
@@ -236,6 +241,11 @@ class PykrxBackfillServiceTests(TestCase):
         action_summaries.assert_called_once_with(
             market_date='2026-04-03',
             symbols=['005930'],
+            source='pykrx',
+            run_id=12,
+        )
+        trending_ranks.assert_called_once_with(
+            market_date='2026-04-03',
             source='pykrx',
             run_id=12,
         )
@@ -294,6 +304,10 @@ class PykrxBackfillServiceTests(TestCase):
                     'failed_symbols': ['005930'],
                     'items': [],
                 },
+            ),
+            patch(
+                'app.eod.pykrx_backfill.compute_and_persist_daily_trending_ranks',
+                return_value={'trending_ranks_persisted': 0},
             ),
             patch('app.eod.pykrx_backfill.complete_eod_collection_run') as complete_run,
         ):
@@ -370,6 +384,10 @@ class PykrxBackfillServiceTests(TestCase):
                 'app.eod.pykrx_backfill.daily_action_summary_service.compute_and_persist_for_market_date',
                 return_value={'action_summaries_persisted': 0, 'action_summaries_failed': 1},
             ) as action_summaries,
+            patch(
+                'app.eod.pykrx_backfill.compute_and_persist_daily_trending_ranks',
+                return_value={'trending_ranks_persisted': 0},
+            ),
             patch('app.eod.pykrx_backfill.complete_eod_collection_run'),
         ):
             result = service.run_backfill(

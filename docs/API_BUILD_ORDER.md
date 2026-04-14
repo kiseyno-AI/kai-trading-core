@@ -17,6 +17,7 @@
 14. Agent symbol/day aggregate context read route
 15. DART daily incremental fundamentals refresh route
 16. Favorite symbol read/delete routes
+17. Stored trending stocks read route
 
 ## Current routes
 - `POST /broker/kis/token`
@@ -27,6 +28,7 @@
 - `GET /quotes/005930`
 - `GET /scanner/tracked-symbols`
 - `POST /scanner/tracked-symbols`
+- `GET /scanner/trending-stocks?period=5d&direction=both&limit=20&markets=KOSPI`
 - `GET /symbols/search?q=삼성&limit=20`
 - `GET /symbols/favorites`
 - `DELETE /symbols/favorites/005930`
@@ -99,6 +101,13 @@
 - `GET /agent-context/symbol-day` is the current machine-consumption read layer for symbol/day analysis. It does not rank names or emit final trading decisions.
 - The route aggregates persisted symbol metadata, same-day technical snapshot, same-day deterministic action summary, latest stored DART fundamentals summary, and recent disclosure events up to the requested `market_date`.
 - The response is intentionally block-oriented and compact so downstream agents can prioritize and interpret instead of re-querying multiple endpoints or parsing prose-heavy summaries.
+
+## Trending stocks read-layer notes
+- `GET /scanner/trending-stocks` is the compact web-facing read API for stored trending-stock candidates.
+- For day-based periods, it reads `daily_trending_ranks`; it does not recompute 1d, 5d, or 20d candidates during the request and does not call live order or execution APIs.
+- The pykrx daily EOD path rebuilds stored `1d`, `5d`, and `20d` trending ranks after daily bars, technical snapshots, and action summaries are persisted. Manual rebuilds can use `python3.11 -m app.internal.ops eod-trending-ranks-compute --market-date YYYY-MM-DD` from `apps/api`.
+- `period=1d` ranks by stored daily close versus the previous stored close, `period=5d` and `period=20d` rank by stored technical-snapshot returns, and `period=action_score` remains a direct read over stored action-summary signal score.
+- `direction=up`, `direction=down`, and `direction=both` let clients request gainers, losers, or the largest absolute movers for a stored market date. When `market_date` is omitted, the route uses the latest stored date available for the requested period.
 
 ## DART pipeline notes
 - Practical lower bound for `fnlttSinglAcntAll` and `list.json` in this pipeline is 2015 onward. Open DART documents both the filing-search date range and the financial-statement `bsns_year` support as 2015 and later, so the DB `daily_price_bars` minimum of `2007-06-05` does not expand the usable fundamentals backfill window.

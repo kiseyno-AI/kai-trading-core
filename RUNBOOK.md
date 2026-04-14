@@ -35,6 +35,7 @@ What it does:
 - `GET /disclosures/dart/filings/document?rcept_no=20260407000001`
 - `GET /disclosures/dart/filings/xbrl?rcept_no=20260407000001&report_code=11011`
 - `GET /fx/koreaexim/rates?search_date=20260406&currency=USD`
+- `GET /scanner/trending-stocks?period=5d&direction=both&limit=20`
 - `GET /eod/status`
 - `POST /eod/master/refresh-if-due`
 - `POST /eod/pykrx/universe/refresh`
@@ -51,7 +52,7 @@ What it does:
 - A background runner checks market state every 60 seconds while the API process is alive.
 - During `PREOPEN`, it refreshes the daily master if needed.
 - During `CLOSED`, after `EOD_AUTO_PYKRX_AFTER_CLOSE_MINUTES`, it schedules a thread-based pykrx daily EOD run if that trade date is available and not already completed.
-- Database persistence stores symbol master data, tracked symbols, quote cache/history, market status snapshots, EOD bars, and EOD run records.
+- Database persistence stores symbol master data, tracked symbols, quote cache/history, market status snapshots, EOD bars, EOD run records, daily technical/action snapshots, and stored day-based trending ranks.
 
 ## Database bootstrap
 
@@ -93,6 +94,7 @@ Useful limited-scope runs:
 - Preferred internal daily auto path: `python3.11 -m app.internal.ops eod-pykrx-daily-run-if-due --market-date 2026-04-03 --force`
 - Manual technical snapshot rerun after EOD: `python3.11 -m app.eod.technical_snapshots --market-date 2026-04-07`
 - Manual action summary rerun after EOD: `python3.11 -m app.eod.action_summaries --market-date 2026-04-07`
+- Manual stored trending rank rebuild after EOD: `python3.11 -m app.internal.ops eod-trending-ranks-compute --market-date 2026-04-07`
 - API-triggered technical snapshot rerun: `curl -X POST "http://127.0.0.1:8000/eod/technical-snapshots/compute?market_date=2026-04-07"`
 - API-triggered action summary rerun: `curl -X POST "http://127.0.0.1:8000/eod/action-summaries/compute?market_date=2026-04-07"`
 
@@ -104,6 +106,7 @@ Internal ops commands from `apps/api`:
 - `python3.11 -m app.internal.ops eod-status`
 - `python3.11 -m app.internal.ops eod-master-refresh-if-due --force`
 - `python3.11 -m app.internal.ops eod-pykrx-daily-run-if-due --market-date 2026-04-08 --force`
+- `python3.11 -m app.internal.ops eod-trending-ranks-compute --market-date 2026-04-08`
 - `python3.11 -m app.internal.ops dart-fundamentals-daily-run-if-due --market-date 2026-04-14 --symbol-limit 250 --capture-limit 500`
 
 Notes:
@@ -115,12 +118,12 @@ Notes:
 
 - The pykrx path refreshes the active listed universe first, then backfills only those active symbols.
 - Automatic daily ingestion uses the same pykrx universe/backfill persistence path, but only for the resolved market date and only once per day unless forced or retrying a partial/failed run.
-- The automatic pykrx daily ingestion path now also persists `daily_technical_snapshots` and `daily_action_summaries` after the day bar write completes.
+- The automatic pykrx daily ingestion path now also persists `daily_technical_snapshots`, `daily_action_summaries`, and day-based `daily_trending_ranks` after the day bar write completes.
 - Duplicate bar writes are harmless because `daily_price_bars` upserts on `(symbol_id, trade_date)`, and the scheduler checks `eod_collection_runs` plus a Postgres advisory lock before starting.
 - When pykrx market-wide universe endpoints are empty, the command falls back to the existing KIS master universe so delisted names are still excluded.
 - Historical bars use pykrx's default adjusted OHLCV series because long-range `adjusted=False` calls returned empty data during local verification.
 - `--limit` runs do not deactivate missing symbols in the DB, so they are safe for small smoke tests.
-- The backfill writes into `symbols`, `daily_price_bars`, and `eod_collection_runs` without adding new schema.
+- The backfill writes into `symbols`, `daily_price_bars`, `eod_collection_runs`, `daily_technical_snapshots`, `daily_action_summaries`, and day-based `daily_trending_ranks`.
 
 Local overrides:
 

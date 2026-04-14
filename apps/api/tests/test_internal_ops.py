@@ -108,6 +108,22 @@ class InternalOpsTests(unittest.TestCase):
         self.assertEqual(run_daily.call_args.kwargs['trigger'], 'internal_ops_cli')
         self.assertEqual(run_daily.call_args.kwargs['force'], True)
 
+    def test_compute_trending_ranks_uses_direct_store_call(self) -> None:
+        with (
+            patch('app.internal.ops.bootstrap_runtime') as bootstrap_runtime,
+            patch(
+                'app.internal.ops.compute_and_persist_daily_trending_ranks',
+                return_value={'trending_ranks_persisted': 3},
+            ) as compute_ranks,
+        ):
+            result = ops.compute_trending_ranks(market_date='2026-04-10', periods='1d,20d')
+
+        bootstrap_runtime.assert_called_once_with()
+        self.assertEqual(result, {'trending_ranks_persisted': 3})
+        self.assertEqual(compute_ranks.call_args.kwargs['market_date'], '2026-04-10')
+        self.assertEqual(compute_ranks.call_args.kwargs['periods'], ['1d', '20d'])
+        self.assertEqual(compute_ranks.call_args.kwargs['source'], 'internal_ops_cli')
+
     def test_cli_quotes_tracked_outputs_json(self) -> None:
         stdout = io.StringIO()
         with (
