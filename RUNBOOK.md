@@ -35,6 +35,7 @@ What it does:
 - `GET /disclosures/dart/filings/document?rcept_no=20260407000001`
 - `GET /disclosures/dart/filings/xbrl?rcept_no=20260407000001&report_code=11011`
 - `GET /fx/koreaexim/rates?search_date=20260406&currency=USD`
+- `GET /scanner/trending-stocks?period=5d&direction=both&limit=20`
 - `GET /eod/status`
 - `POST /eod/master/refresh-if-due`
 - `POST /eod/pykrx/universe/refresh`

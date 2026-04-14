@@ -4,8 +4,9 @@ from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 
-from sqlalchemy import delete, func, select, text, update
+from sqlalchemy import Numeric, cast, delete, func, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.orm import aliased
 
 from app.db import engine, session_scope
 from app.db_models import (
@@ -46,6 +47,19 @@ def _decimal_to_float(value) -> float | None:
     if value is None:
         return None
     return float(value)
+
+
+def _round_float(value, digits: int = 4) -> float | None:
+    converted = _decimal_to_float(value)
+    if converted is None:
+        return None
+    return round(converted, digits)
+
+
+def _trend_direction(value: float | None) -> str:
+    if value is None or value == 0:
+        return 'flat'
+    return 'up' if value > 0 else 'down'
 
 
 def _get_symbol(session, symbol: str) -> Symbol | None:
@@ -961,6 +975,308 @@ def load_daily_action_summaries(
             }
             for summary, symbol in rows
         ]
+
+
+def _trending_action_summary(row) -> dict | None:
+    if row.action_label is None:
+        return None
+    return {
+        'action_label': row.action_label,
+        'bias_direction': row.bias_direction,
+        'signal_score': int(row.signal_score) if row.signal_score is not None else None,
+        'confidence_tier': row.confidence_tier,
+        'risk_tier': row.risk_tier,
+        'reasons': list(row.reasons or []),
+        'source': row.action_source,
+        'captured_at': row.action_captured_at.isoformat() if row.action_captured_at else None,
+    }
+
+
+def _trending_technical_context(row) -> dict:
+    return {
+        'close_price': int(row.close_price) if row.close_price is not None else None,
+        'volume': int(row.volume) if row.volume is not None else None,
+        'trend_state': row.trend_state,
+        'ma_alignment': row.ma_alignment,
+        'breakout_20d': row.breakout_20d,
+        'breakdown_20d': row.breakdown_20d,
+        'return_5d': _round_float(row.return_5d),
+        'return_20d': _round_float(row.return_20d),
+        'volume_ratio_20d': _round_float(row.volume_ratio_20d),
+        'source': row.technical_source,
+        'captured_at': row.technical_captured_at.isoformat() if row.technical_captured_at else None,
+    }
+
+
+def _apply_trending_order(stmt, metric_expr, *, direction: str):
+    if direction == 'up':
+        return stmt.where(metric_expr > 0).order_by(metric_expr.desc(), Symbol.symbol.asc())
+    if direction == 'down':
+        return stmt.where(metric_expr < 0).order_by(metric_expr.asc(), Symbol.symbol.asc())
+    return stmt.order_by(func.abs(metric_expr).desc(), Symbol.symbol.asc())
+
+
+def _load_trending_stocks_from_daily_price_bars(
+    *,
+    normalized_market_date: date,
+    direction: str,
+    limit: int,
+    markets: list[str] | None,
+) -> list[dict]:
+    previous_bar = aliased(DailyPriceBar)
+    previous_close_expr = (
+        select(previous_bar.close_price)
+        .where(previous_bar.symbol_id == DailyPriceBar.symbol_id)
+        .where(previous_bar.trade_date < DailyPriceBar.trade_date)
+        .order_by(previous_bar.trade_date.desc())
+        .limit(1)
+        .correlate(DailyPriceBar)
+        .scalar_subquery()
+    )
+    previous_close_numeric = cast(previous_close_expr, Numeric(20, 6))
+    close_numeric = cast(DailyPriceBar.close_price, Numeric(20, 6))
+    change_expr = DailyPriceBar.close_price - previous_close_expr
+    change_pct_expr = ((close_numeric - previous_close_numeric) / func.nullif(previous_close_numeric, 0)) * 100
+
+    with session_scope() as session:
+        stmt = (
+            select(
+                Symbol.symbol.label('symbol'),
+                Symbol.name_ko.label('name_ko'),
+                Symbol.market.label('market'),
+                DailyPriceBar.trade_date.label('market_date'),
+                DailyPriceBar.open_price.label('open_price'),
+                DailyPriceBar.high_price.label('high_price'),
+                DailyPriceBar.low_price.label('low_price'),
+                DailyPriceBar.close_price.label('close_price'),
+                DailyPriceBar.volume.label('volume'),
+                DailyPriceBar.turnover.label('turnover'),
+                DailyPriceBar.source.label('price_source'),
+                DailyPriceBar.captured_at.label('price_captured_at'),
+                previous_close_expr.label('previous_close_price'),
+                change_expr.label('change'),
+                change_pct_expr.label('metric_value'),
+                DailyTechnicalSnapshot.trend_state.label('trend_state'),
+                DailyTechnicalSnapshot.ma_alignment.label('ma_alignment'),
+                DailyTechnicalSnapshot.breakout_20d.label('breakout_20d'),
+                DailyTechnicalSnapshot.breakdown_20d.label('breakdown_20d'),
+                DailyTechnicalSnapshot.return_5d.label('return_5d'),
+                DailyTechnicalSnapshot.return_20d.label('return_20d'),
+                DailyTechnicalSnapshot.volume_ratio_20d.label('volume_ratio_20d'),
+                DailyTechnicalSnapshot.source.label('technical_source'),
+                DailyTechnicalSnapshot.captured_at.label('technical_captured_at'),
+                DailyActionSummary.action_label.label('action_label'),
+                DailyActionSummary.bias_direction.label('bias_direction'),
+                DailyActionSummary.signal_score.label('signal_score'),
+                DailyActionSummary.confidence_tier.label('confidence_tier'),
+                DailyActionSummary.risk_tier.label('risk_tier'),
+                DailyActionSummary.reasons.label('reasons'),
+                DailyActionSummary.source.label('action_source'),
+                DailyActionSummary.captured_at.label('action_captured_at'),
+            )
+            .join(Symbol, Symbol.id == DailyPriceBar.symbol_id)
+            .outerjoin(
+                DailyTechnicalSnapshot,
+                (DailyTechnicalSnapshot.symbol_id == DailyPriceBar.symbol_id)
+                & (DailyTechnicalSnapshot.market_date == DailyPriceBar.trade_date),
+            )
+            .outerjoin(
+                DailyActionSummary,
+                (DailyActionSummary.symbol_id == DailyPriceBar.symbol_id)
+                & (DailyActionSummary.market_date == DailyPriceBar.trade_date),
+            )
+            .where(DailyPriceBar.trade_date == normalized_market_date)
+            .where(Symbol.is_active.is_(True))
+            .where(previous_close_expr.isnot(None))
+            .where(change_pct_expr.isnot(None))
+        )
+        if markets:
+            stmt = stmt.where(Symbol.market.in_(markets))
+        stmt = _apply_trending_order(stmt, change_pct_expr, direction=direction).limit(limit)
+        rows = session.execute(stmt).all()
+
+        items: list[dict] = []
+        for row in rows:
+            metric_value = _round_float(row.metric_value)
+            items.append(
+                {
+                    'symbol': row.symbol,
+                    'name_ko': row.name_ko,
+                    'market': row.market,
+                    'market_date': row.market_date.isoformat(),
+                    'trend_direction': _trend_direction(metric_value),
+                    'metric': {
+                        'period': '1d',
+                        'name': 'daily_change_pct',
+                        'value': metric_value,
+                    },
+                    'price': {
+                        'open_price': int(row.open_price),
+                        'high_price': int(row.high_price),
+                        'low_price': int(row.low_price),
+                        'close_price': int(row.close_price),
+                        'previous_close_price': int(row.previous_close_price),
+                        'change': int(row.change),
+                        'change_pct': metric_value,
+                        'volume': int(row.volume),
+                        'turnover': int(row.turnover),
+                        'source': row.price_source,
+                        'captured_at': row.price_captured_at.isoformat() if row.price_captured_at else None,
+                    },
+                    'technical': _trending_technical_context(row),
+                    'action_summary': _trending_action_summary(row),
+                }
+            )
+        return items
+
+
+def _load_trending_stocks_from_snapshots(
+    *,
+    normalized_market_date: date,
+    period: str,
+    direction: str,
+    limit: int,
+    markets: list[str] | None,
+) -> list[dict]:
+    if period == '5d':
+        metric_expr = DailyTechnicalSnapshot.return_5d
+        metric_name = 'return_5d_pct'
+    elif period == '20d':
+        metric_expr = DailyTechnicalSnapshot.return_20d
+        metric_name = 'return_20d_pct'
+    else:
+        metric_expr = DailyActionSummary.signal_score
+        metric_name = 'signal_score'
+
+    with session_scope() as session:
+        if period == 'action_score':
+            stmt = (
+                select(
+                    Symbol.symbol.label('symbol'),
+                    Symbol.name_ko.label('name_ko'),
+                    Symbol.market.label('market'),
+                    DailyActionSummary.market_date.label('market_date'),
+                    DailyTechnicalSnapshot.close_price.label('close_price'),
+                    DailyTechnicalSnapshot.volume.label('volume'),
+                    DailyTechnicalSnapshot.trend_state.label('trend_state'),
+                    DailyTechnicalSnapshot.ma_alignment.label('ma_alignment'),
+                    DailyTechnicalSnapshot.breakout_20d.label('breakout_20d'),
+                    DailyTechnicalSnapshot.breakdown_20d.label('breakdown_20d'),
+                    DailyTechnicalSnapshot.return_5d.label('return_5d'),
+                    DailyTechnicalSnapshot.return_20d.label('return_20d'),
+                    DailyTechnicalSnapshot.volume_ratio_20d.label('volume_ratio_20d'),
+                    DailyTechnicalSnapshot.source.label('technical_source'),
+                    DailyTechnicalSnapshot.captured_at.label('technical_captured_at'),
+                    DailyActionSummary.action_label.label('action_label'),
+                    DailyActionSummary.bias_direction.label('bias_direction'),
+                    DailyActionSummary.signal_score.label('signal_score'),
+                    DailyActionSummary.confidence_tier.label('confidence_tier'),
+                    DailyActionSummary.risk_tier.label('risk_tier'),
+                    DailyActionSummary.reasons.label('reasons'),
+                    DailyActionSummary.source.label('action_source'),
+                    DailyActionSummary.captured_at.label('action_captured_at'),
+                    metric_expr.label('metric_value'),
+                )
+                .join(Symbol, Symbol.id == DailyActionSummary.symbol_id)
+                .outerjoin(
+                    DailyTechnicalSnapshot,
+                    (DailyTechnicalSnapshot.symbol_id == DailyActionSummary.symbol_id)
+                    & (DailyTechnicalSnapshot.market_date == DailyActionSummary.market_date),
+                )
+                .where(DailyActionSummary.market_date == normalized_market_date)
+                .where(Symbol.is_active.is_(True))
+                .where(metric_expr.isnot(None))
+            )
+        else:
+            stmt = (
+                select(
+                    Symbol.symbol.label('symbol'),
+                    Symbol.name_ko.label('name_ko'),
+                    Symbol.market.label('market'),
+                    DailyTechnicalSnapshot.market_date.label('market_date'),
+                    DailyTechnicalSnapshot.close_price.label('close_price'),
+                    DailyTechnicalSnapshot.volume.label('volume'),
+                    DailyTechnicalSnapshot.trend_state.label('trend_state'),
+                    DailyTechnicalSnapshot.ma_alignment.label('ma_alignment'),
+                    DailyTechnicalSnapshot.breakout_20d.label('breakout_20d'),
+                    DailyTechnicalSnapshot.breakdown_20d.label('breakdown_20d'),
+                    DailyTechnicalSnapshot.return_5d.label('return_5d'),
+                    DailyTechnicalSnapshot.return_20d.label('return_20d'),
+                    DailyTechnicalSnapshot.volume_ratio_20d.label('volume_ratio_20d'),
+                    DailyTechnicalSnapshot.source.label('technical_source'),
+                    DailyTechnicalSnapshot.captured_at.label('technical_captured_at'),
+                    DailyActionSummary.action_label.label('action_label'),
+                    DailyActionSummary.bias_direction.label('bias_direction'),
+                    DailyActionSummary.signal_score.label('signal_score'),
+                    DailyActionSummary.confidence_tier.label('confidence_tier'),
+                    DailyActionSummary.risk_tier.label('risk_tier'),
+                    DailyActionSummary.reasons.label('reasons'),
+                    DailyActionSummary.source.label('action_source'),
+                    DailyActionSummary.captured_at.label('action_captured_at'),
+                    metric_expr.label('metric_value'),
+                )
+                .join(Symbol, Symbol.id == DailyTechnicalSnapshot.symbol_id)
+                .outerjoin(
+                    DailyActionSummary,
+                    (DailyActionSummary.symbol_id == DailyTechnicalSnapshot.symbol_id)
+                    & (DailyActionSummary.market_date == DailyTechnicalSnapshot.market_date),
+                )
+                .where(DailyTechnicalSnapshot.market_date == normalized_market_date)
+                .where(Symbol.is_active.is_(True))
+                .where(metric_expr.isnot(None))
+            )
+        if markets:
+            stmt = stmt.where(Symbol.market.in_(markets))
+        stmt = _apply_trending_order(stmt, metric_expr, direction=direction).limit(limit)
+        rows = session.execute(stmt).all()
+
+        items: list[dict] = []
+        for row in rows:
+            metric_value = _round_float(row.metric_value)
+            items.append(
+                {
+                    'symbol': row.symbol,
+                    'name_ko': row.name_ko,
+                    'market': row.market,
+                    'market_date': row.market_date.isoformat(),
+                    'trend_direction': _trend_direction(metric_value),
+                    'metric': {
+                        'period': period,
+                        'name': metric_name,
+                        'value': metric_value,
+                    },
+                    'price': None,
+                    'technical': _trending_technical_context(row),
+                    'action_summary': _trending_action_summary(row),
+                }
+            )
+        return items
+
+
+def load_trending_stocks(
+    *,
+    market_date: str | date,
+    period: str,
+    direction: str,
+    limit: int = 20,
+    markets: list[str] | None = None,
+) -> list[dict]:
+    normalized_market_date = _normalize_trade_date(market_date)
+    normalized_markets = [market.upper() for market in markets] if markets else None
+    if period == '1d':
+        return _load_trending_stocks_from_daily_price_bars(
+            normalized_market_date=normalized_market_date,
+            direction=direction,
+            limit=limit,
+            markets=normalized_markets,
+        )
+    return _load_trending_stocks_from_snapshots(
+        normalized_market_date=normalized_market_date,
+        period=period,
+        direction=direction,
+        limit=limit,
+        markets=normalized_markets,
+    )
 
 
 def count_daily_price_bars_for_date(trade_date: str | date) -> int:
