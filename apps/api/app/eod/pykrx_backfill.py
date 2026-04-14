@@ -19,6 +19,7 @@ from app.eod.action_summaries import daily_action_summary_service
 from app.eod.technical_snapshots import daily_technical_snapshot_service
 from app.market_data_store import (
     advisory_eod_collection_lock,
+    compute_and_persist_daily_trending_ranks,
     count_eod_run_persisted_symbols,
     complete_eod_collection_run,
     create_eod_collection_run,
@@ -791,6 +792,24 @@ class PykrxBackfillService:
             }
             action_summary_error_message = f'Action summary persistence failed: {exc}'
 
+        trending_rank_result: dict
+        trending_rank_error_message: str | None = None
+        try:
+            trending_rank_result = compute_and_persist_daily_trending_ranks(
+                market_date=latest_trade_date,
+                source='pykrx',
+                run_id=run_id,
+            )
+        except Exception as exc:
+            trending_rank_result = {
+                'market_date': latest_trade_date,
+                'source': 'pykrx',
+                'periods': [],
+                'trending_ranks_persisted': 0,
+                'error': str(exc),
+            }
+            trending_rank_error_message = f'Trending rank persistence failed: {exc}'
+
         run_errors: list[str] = []
         if failed_symbols:
             run_errors.append(f'Failed symbols: {",".join(failed_symbols[:20])}')
@@ -808,6 +827,8 @@ class PykrxBackfillService:
                 'Action summary persistence incomplete for symbols: '
                 + ','.join(action_summary_result.get('failed_symbols', [])[:20])
             )
+        if trending_rank_error_message:
+            run_errors.append(trending_rank_error_message)
 
         status = 'completed' if not run_errors else 'completed_with_errors'
         complete_eod_collection_run(
@@ -832,6 +853,7 @@ class PykrxBackfillService:
             'bars_upserted': bars_upserted,
             'technical_snapshots': technical_snapshot_result,
             'action_summaries': action_summary_result,
+            'trending_ranks': trending_rank_result,
             'refresh_universe': refresh_universe,
             'universe_snapshot': universe_snapshot,
         }

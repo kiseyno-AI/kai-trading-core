@@ -1,6 +1,20 @@
 from datetime import date, datetime
 
-from sqlalchemy import JSON, BigInteger, Boolean, Date, DateTime, ForeignKey, Integer, Numeric, String, Text, UniqueConstraint, func
+from sqlalchemy import (
+    JSON,
+    BigInteger,
+    Boolean,
+    Date,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    Numeric,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -190,6 +204,38 @@ class DailyActionSummary(Base, TimestampMixin):
     resistance_price: Mapped[float | None] = mapped_column(Numeric(14, 4))
     reasons: Mapped[list] = mapped_column(JSON, nullable=False)
     summary_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class DailyTrendingRank(Base, TimestampMixin):
+    __tablename__ = 'daily_trending_ranks'
+    __table_args__ = (
+        UniqueConstraint(
+            'symbol_id',
+            'market_date',
+            'period',
+            name='uq_daily_trending_ranks_symbol_market_date_period',
+        ),
+        Index('ix_daily_trending_ranks_market_period_absolute', 'market_date', 'period', 'absolute_rank'),
+        Index('ix_daily_trending_ranks_market_period_up', 'market_date', 'period', 'up_rank'),
+        Index('ix_daily_trending_ranks_market_period_down', 'market_date', 'period', 'down_rank'),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol_id: Mapped[int] = mapped_column(ForeignKey('symbols.id', ondelete='CASCADE'), nullable=False, index=True)
+    eod_run_id: Mapped[int | None] = mapped_column(ForeignKey('eod_collection_runs.id', ondelete='SET NULL'), index=True)
+    market_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    period: Mapped[str] = mapped_column(String(8), nullable=False, index=True)
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default='pykrx')
+    metric_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    metric_value: Mapped[float] = mapped_column(Numeric(14, 4), nullable=False)
+    trend_direction: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    absolute_rank: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    up_rank: Mapped[int | None] = mapped_column(Integer, index=True)
+    down_rank: Mapped[int | None] = mapped_column(Integer, index=True)
+    price_payload: Mapped[dict | None] = mapped_column(JSON)
+    technical_payload: Mapped[dict | None] = mapped_column(JSON)
+    action_summary_payload: Mapped[dict | None] = mapped_column(JSON)
     captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 

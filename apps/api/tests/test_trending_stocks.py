@@ -5,12 +5,14 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.api import routes_scanner
+from app.market_data_store import build_daily_trending_rank_items
 from app.scanner.trending import TrendingStocksService
 
 
 class TrendingStocksServiceTests(unittest.TestCase):
-    def test_get_trending_stocks_uses_latest_snapshot_date_and_ranks_rows(self):
+    def test_get_trending_stocks_uses_latest_stored_rank_date_and_ranks_rows(self):
         calls = []
+        requested_periods = []
 
         def fake_loader(**kwargs):
             calls.append(kwargs)
@@ -39,8 +41,12 @@ class TrendingStocksServiceTests(unittest.TestCase):
                 },
             ]
 
+        def latest_day_trending_date(period):
+            requested_periods.append(period)
+            return '2026-04-10'
+
         service = TrendingStocksService(
-            latest_technical_market_date_loader=lambda: '2026-04-10',
+            latest_day_trending_market_date_loader=latest_day_trending_date,
             trending_loader=fake_loader,
         )
 
@@ -55,6 +61,7 @@ class TrendingStocksServiceTests(unittest.TestCase):
         self.assertEqual(calls[0]['period'], '5d')
         self.assertEqual(calls[0]['direction'], 'both')
         self.assertEqual(calls[0]['markets'], ['KOSPI', 'KOSDAQ'])
+        self.assertEqual(requested_periods, ['5d'])
         self.assertEqual(result['request']['resolved_market_date'], '2026-04-10')
         self.assertEqual(result['summary']['count'], 2)
         self.assertEqual(result['summary']['up_count'], 1)
@@ -64,7 +71,7 @@ class TrendingStocksServiceTests(unittest.TestCase):
 
     def test_get_trending_stocks_returns_empty_when_no_stored_date_exists(self):
         service = TrendingStocksService(
-            latest_technical_market_date_loader=lambda: None,
+            latest_day_trending_market_date_loader=lambda _: None,
             trending_loader=lambda **_: [{'symbol': 'should-not-load'}],
         )
 
@@ -80,6 +87,57 @@ class TrendingStocksServiceTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, 'period must be one of'):
             service.get_trending_stocks(period='1h')
+
+    def test_get_trending_stocks_keeps_action_score_on_action_summary_date(self):
+        calls = []
+
+        service = TrendingStocksService(
+            latest_day_trending_market_date_loader=lambda _: calls.append('day') or None,
+            latest_action_market_date_loader=lambda: '2026-04-09',
+            trending_loader=lambda **kwargs: [
+                {
+                    'symbol': '005930',
+                    'name_ko': 'Samsung Electronics',
+                    'market': 'KOSPI',
+                    'market_date': kwargs['market_date'],
+                    'trend_direction': 'up',
+                    'metric': {'period': kwargs['period'], 'name': 'signal_score', 'value': 82},
+                    'price': None,
+                    'technical': {},
+                    'action_summary': {},
+                }
+            ],
+        )
+
+        result = service.get_trending_stocks(period='action_score')
+
+        self.assertEqual(calls, [])
+        self.assertEqual(result['request']['resolved_market_date'], '2026-04-09')
+        self.assertEqual(result['items'][0]['metric']['name'], 'signal_score')
+
+
+class TrendingRankBuilderTests(unittest.TestCase):
+    def test_build_daily_trending_rank_items_assigns_directional_and_absolute_ranks(self):
+        ranked = build_daily_trending_rank_items(
+            [
+                {'symbol': 'BBB', 'metric': {'value': 5.0}, 'trend_direction': 'up'},
+                {'symbol': 'AAA', 'metric': {'value': -7.0}, 'trend_direction': 'down'},
+                {'symbol': 'CCC', 'metric': {'value': 0.0}, 'trend_direction': 'flat'},
+                {'symbol': 'AAA2', 'metric': {'value': 5.0}, 'trend_direction': 'up'},
+            ]
+        )
+
+        ranks_by_symbol = {item['symbol']: item['stored_ranks'] for item in ranked}
+
+        self.assertEqual(ranks_by_symbol['AAA']['absolute_rank'], 1)
+        self.assertEqual(ranks_by_symbol['AAA2']['absolute_rank'], 2)
+        self.assertEqual(ranks_by_symbol['BBB']['absolute_rank'], 3)
+        self.assertEqual(ranks_by_symbol['CCC']['absolute_rank'], 4)
+        self.assertEqual(ranks_by_symbol['AAA']['down_rank'], 1)
+        self.assertEqual(ranks_by_symbol['AAA2']['up_rank'], 1)
+        self.assertEqual(ranks_by_symbol['BBB']['up_rank'], 2)
+        self.assertIsNone(ranks_by_symbol['CCC']['up_rank'])
+        self.assertIsNone(ranks_by_symbol['CCC']['down_rank'])
 
 
 class FakeTrendingStocksService:

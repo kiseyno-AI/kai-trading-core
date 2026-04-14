@@ -16,7 +16,11 @@ from app.eod.pykrx_backfill import DEFAULT_MARKETS, PYKRX_BACKFILL_SERVICE
 from app.eod.state import job_state
 from app.eod.technical_snapshots import daily_technical_snapshot_service
 from app.market.clock import get_market_state
-from app.market_data_store import load_tracked_symbols, persist_market_status_snapshot
+from app.market_data_store import (
+    compute_and_persist_daily_trending_ranks,
+    load_tracked_symbols,
+    persist_market_status_snapshot,
+)
 from app.quotes.service import QuoteService
 from app.scanner.state import scanner_state
 
@@ -122,6 +126,16 @@ def compute_action_summaries(*, market_date: str, symbols: str | None = None) ->
     )
 
 
+def compute_trending_ranks(*, market_date: str, periods: str | None = None) -> dict[str, Any]:
+    bootstrap_runtime()
+    parsed_periods = [item.strip().lower() for item in periods.split(',') if item.strip()] if periods else None
+    return compute_and_persist_daily_trending_ranks(
+        market_date=market_date,
+        periods=parsed_periods,
+        source='internal_ops_cli',
+    )
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description='Internal kai-trading-core operations without self-HTTP.')
     subparsers = parser.add_subparsers(dest='command', required=True)
@@ -158,6 +172,13 @@ def _build_parser() -> argparse.ArgumentParser:
     action_parser = subparsers.add_parser('eod-action-summaries-compute', help='Compute action summaries directly')
     action_parser.add_argument('--market-date', required=True)
     action_parser.add_argument('--symbols')
+
+    trending_parser = subparsers.add_parser(
+        'eod-trending-ranks-compute',
+        help='Compute stored day-based trending ranks directly',
+    )
+    trending_parser.add_argument('--market-date', required=True)
+    trending_parser.add_argument('--periods')
     return parser
 
 
@@ -195,6 +216,8 @@ def main(argv: Iterable[str] | None = None) -> int:
         payload = compute_technical_snapshots(market_date=args.market_date, symbols=args.symbols)
     elif args.command == 'eod-action-summaries-compute':
         payload = compute_action_summaries(market_date=args.market_date, symbols=args.symbols)
+    elif args.command == 'eod-trending-ranks-compute':
+        payload = compute_trending_ranks(market_date=args.market_date, periods=args.periods)
     else:
         parser.error(f'Unsupported command: {args.command}')
 

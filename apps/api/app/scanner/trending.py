@@ -5,9 +5,9 @@ from datetime import date
 from typing import Callable, Sequence
 
 from app.market_data_store import (
+    DAY_BASED_TRENDING_PERIODS,
     load_latest_available_daily_action_summary_date,
-    load_latest_available_daily_price_trade_date,
-    load_latest_available_daily_technical_snapshot_date,
+    load_latest_available_daily_trending_rank_date,
     load_trending_stocks,
 )
 
@@ -32,19 +32,18 @@ def _normalize_list(values: Sequence[str] | None) -> list[str] | None:
 
 @dataclass
 class TrendingStocksService:
-    latest_price_trade_date_loader: Callable[[], str | None] = load_latest_available_daily_price_trade_date
-    latest_technical_market_date_loader: Callable[[], str | None] = load_latest_available_daily_technical_snapshot_date
+    latest_day_trending_market_date_loader: Callable[[str], str | None] = load_latest_available_daily_trending_rank_date
     latest_action_market_date_loader: Callable[[], str | None] = load_latest_available_daily_action_summary_date
     trending_loader: Callable = load_trending_stocks
 
     def _resolve_market_date(self, *, period: str, market_date: date | None) -> str | None:
         if market_date is not None:
             return market_date.isoformat()
-        if period == '1d':
-            return self.latest_price_trade_date_loader()
+        if period in DAY_BASED_TRENDING_PERIODS:
+            return self.latest_day_trending_market_date_loader(period)
         if period == 'action_score':
             return self.latest_action_market_date_loader()
-        return self.latest_technical_market_date_loader()
+        return None
 
     def get_trending_stocks(
         self,

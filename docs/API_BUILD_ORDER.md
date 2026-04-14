@@ -97,8 +97,9 @@
 
 ## Trending stocks read-layer notes
 - `GET /scanner/trending-stocks` is the compact web-facing read API for stored trending-stock candidates.
-- It reads persisted daily price bars, daily technical snapshots, and daily action summaries; it does not call live order or execution APIs.
-- `period=1d` ranks by stored daily close versus the previous stored close, `period=5d` and `period=20d` rank by stored technical-snapshot returns, and `period=action_score` ranks by stored action-summary signal score.
+- For day-based periods, it reads `daily_trending_ranks`; it does not recompute 1d, 5d, or 20d candidates during the request and does not call live order or execution APIs.
+- The pykrx daily EOD path rebuilds stored `1d`, `5d`, and `20d` trending ranks after daily bars, technical snapshots, and action summaries are persisted. Manual rebuilds can use `python3.11 -m app.internal.ops eod-trending-ranks-compute --market-date YYYY-MM-DD` from `apps/api`.
+- `period=1d` ranks by stored daily close versus the previous stored close, `period=5d` and `period=20d` rank by stored technical-snapshot returns, and `period=action_score` remains a direct read over stored action-summary signal score.
 - `direction=up`, `direction=down`, and `direction=both` let clients request gainers, losers, or the largest absolute movers for a stored market date. When `market_date` is omitted, the route uses the latest stored date available for the requested period.
 
 ## DART pipeline notes
