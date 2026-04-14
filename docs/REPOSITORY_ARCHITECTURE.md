@@ -187,8 +187,9 @@ These support universe identity, scanner state, quote history, current quote cac
 - `daily_price_bars`
 - `daily_technical_snapshots`
 - `daily_action_summaries`
+- `daily_signal_features`
 
-These tables store both raw durable EOD bars and deterministic read models derived from those bars.
+These tables store raw durable EOD bars, deterministic read models derived from those bars, and daily KIS ranking signal features keyed by symbol/date.
 
 ### DART disclosure and fundamentals persistence
 
@@ -426,11 +427,13 @@ flowchart TD
     ReadService --> Symbols["load_symbols()"]
     ReadService --> Tech["load_daily_technical_snapshots()"]
     ReadService --> Actions["load_daily_action_summaries()"]
+    ReadService --> Signals["load_daily_signal_features()"]
     ReadService --> Fundamentals["list_stored_fundamentals_summary()"]
     ReadService --> Disclosures["list_recent_events_by_stock_codes()"]
     Symbols --> Compose["compose per-symbol context"]
     Tech --> Compose
     Actions --> Compose
+    Signals --> Compose
     Fundamentals --> Compose
     Disclosures --> Compose
     Compose --> Response["symbol-day context payload"]
@@ -525,6 +528,7 @@ These primarily expose persisted or in-memory state.
 - `/eod/pykrx/daily/run-if-due`
 - `/eod/technical-snapshots/compute`
 - `/eod/action-summaries/compute`
+- `/eod/signal-features/collect`
 - `/disclosures/dart/sync/events`
 - `/disclosures/dart/fundamentals/capture`
 - `/disclosures/dart/fundamentals/backfill/current-universe`

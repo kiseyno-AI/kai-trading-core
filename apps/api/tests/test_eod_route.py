@@ -76,6 +76,29 @@ class FakeActionSummaryService:
         }
 
 
+class FakeSignalFeatureService:
+    def __init__(self):
+        self.collect_args = None
+        self.inspect_args = None
+
+    async def collect_and_persist_for_market_date(self, **kwargs):
+        self.collect_args = kwargs
+        return {
+            'market_date': kwargs['market_date'],
+            'features_persisted': 2,
+            'features_failed': 0,
+            'items': [{'symbol': '005930', 'signal_count': 2}],
+        }
+
+    def inspect(self, **kwargs):
+        self.inspect_args = kwargs
+        return {
+            'market_date': kwargs['market_date'],
+            'summary': {'entries': 1},
+            'items': [{'symbol': '005930', 'signal_count': 2}],
+        }
+
+
 class EODRouteTests(unittest.TestCase):
     def setUp(self):
         self.app = FastAPI()
@@ -167,3 +190,43 @@ class EODRouteTests(unittest.TestCase):
         self.assertEqual(fake_service.inspect_args['symbols'], ['005930'])
         self.assertEqual(fake_service.inspect_args['limit'], 5)
         self.assertEqual(response.json()['items'][0]['action_label'], 'long_breakout')
+
+    def test_collect_signal_features_route_calls_service(self):
+        fake_service = FakeSignalFeatureService()
+        original_service = routes_eod.daily_signal_feature_service
+        routes_eod.daily_signal_feature_service = fake_service
+        try:
+            client = TestClient(self.app)
+            response = client.post(
+                '/eod/signal-features/collect',
+                params={
+                    'market_date': '2026-04-14',
+                    'sources': 'volume-power,overtime-volume',
+                    'max_pages': 2,
+                },
+            )
+        finally:
+            routes_eod.daily_signal_feature_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(fake_service.collect_args['sources'], ['volume-power', 'overtime-volume'])
+        self.assertEqual(fake_service.collect_args['max_pages'], 2)
+        self.assertEqual(response.json()['features_persisted'], 2)
+
+    def test_inspect_signal_features_route_calls_service(self):
+        fake_service = FakeSignalFeatureService()
+        original_service = routes_eod.daily_signal_feature_service
+        routes_eod.daily_signal_feature_service = fake_service
+        try:
+            client = TestClient(self.app)
+            response = client.get(
+                '/eod/signal-features',
+                params={'market_date': '2026-04-14', 'symbols': '005930', 'limit': 5},
+            )
+        finally:
+            routes_eod.daily_signal_feature_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(fake_service.inspect_args['symbols'], ['005930'])
+        self.assertEqual(fake_service.inspect_args['limit'], 5)
+        self.assertEqual(response.json()['items'][0]['signal_count'], 2)

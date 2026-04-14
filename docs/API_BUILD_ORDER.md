@@ -19,6 +19,7 @@
 16. Favorite symbol read/delete routes
 17. Stored trending stocks read route
 18. KIS realtime trending route
+19. KIS daily ranking signal-feature collect/inspect routes
 
 ## Current routes
 - `POST /broker/kis/token`
@@ -61,6 +62,8 @@
 - `GET /eod/technical-snapshots?market_date=YYYY-MM-DD&symbols=005930,000660`
 - `POST /eod/action-summaries/compute?market_date=YYYY-MM-DD&symbols=005930,000660`
 - `GET /eod/action-summaries?market_date=YYYY-MM-DD&symbols=005930,000660`
+- `POST /eod/signal-features/collect?market_date=YYYY-MM-DD&sources=volume-power,overtime-volume,overtime-fluctuation`
+- `GET /eod/signal-features?market_date=YYYY-MM-DD&symbols=005930,000660`
 - `GET /agent-context/symbol-day?market_date=YYYY-MM-DD&symbols=005930&symbols=000660&fs_div=CFS&disclosures_limit=5`
 
 ## EOD freshness read-layer notes
@@ -107,8 +110,14 @@
 
 ## Agent context read-layer notes
 - `GET /agent-context/symbol-day` is the current machine-consumption read layer for symbol/day analysis. It does not rank names or emit final trading decisions.
-- The route aggregates persisted symbol metadata, same-day technical snapshot, same-day deterministic action summary, latest stored DART fundamentals summary, and recent disclosure events up to the requested `market_date`.
+- The route aggregates persisted symbol metadata, same-day technical snapshot, same-day deterministic action summary, same-day KIS ranking signal features, latest stored DART fundamentals summary, and recent disclosure events up to the requested `market_date`.
 - The response is intentionally block-oriented and compact so downstream agents can prioritize and interpret instead of re-querying multiple endpoints or parsing prose-heavy summaries.
+
+## Daily signal feature notes
+- `daily_signal_features` is the DB-backed KIS ranking feature layer keyed by `symbol_id + market_date`.
+- The current scope intentionally covers only `volume-power`, `overtime-volume`, and `overtime-fluctuation`.
+- `POST /eod/signal-features/collect` calls those KIS ranking sources, normalizes symbol-level ranks and metrics, and upserts one compact feature row per symbol/date.
+- For shell-driven operations, prefer `python3.11 -m app.internal.ops kis-daily-signal-features-collect --market-date YYYY-MM-DD` from `apps/api`.
 
 ## Trending stocks read-layer notes
 - `GET /scanner/trending-stocks` is the compact web-facing read API for stored trending-stock candidates.

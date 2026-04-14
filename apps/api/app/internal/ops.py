@@ -23,6 +23,7 @@ from app.market_data_store import (
 )
 from app.quotes.service import QuoteService
 from app.scanner.state import scanner_state
+from app.signals.daily_signal_features import daily_signal_feature_service
 
 
 def bootstrap_runtime() -> None:
@@ -96,6 +97,27 @@ def run_dart_fundamentals_daily_if_due(
     )
 
 
+def collect_kis_daily_signal_features(
+    *,
+    market_date: str | None = None,
+    sources: str | None = None,
+    max_pages: int = 10,
+    overtime_volume_rank_sort_cls_code: str = '2',
+    overtime_fluctuation_div_cls_code: str = '2',
+) -> dict[str, Any]:
+    bootstrap_runtime()
+    parsed_sources = [item.strip() for item in sources.split(',') if item.strip()] if sources else None
+    return asyncio.run(
+        daily_signal_feature_service.collect_and_persist_for_market_date(
+            market_date=market_date or get_market_state().server_time[:10],
+            sources=parsed_sources,
+            max_pages=max_pages,
+            overtime_volume_rank_sort_cls_code=overtime_volume_rank_sort_cls_code,
+            overtime_fluctuation_div_cls_code=overtime_fluctuation_div_cls_code,
+        )
+    )
+
+
 def refresh_master_if_due_internal(*, force: bool = False) -> dict[str, Any]:
     bootstrap_runtime()
     symbols = refresh_master_if_due(force=force)
@@ -165,6 +187,16 @@ def _build_parser() -> argparse.ArgumentParser:
     dart_daily_parser.add_argument('--force', action='store_true')
     dart_daily_parser.add_argument('--fs-div')
 
+    signal_features_parser = subparsers.add_parser(
+        'kis-daily-signal-features-collect',
+        help='Collect daily KIS ranking signal features directly',
+    )
+    signal_features_parser.add_argument('--market-date')
+    signal_features_parser.add_argument('--sources')
+    signal_features_parser.add_argument('--max-pages', type=int, default=10)
+    signal_features_parser.add_argument('--overtime-volume-rank-sort-cls-code', default='2')
+    signal_features_parser.add_argument('--overtime-fluctuation-div-cls-code', default='2')
+
     technical_parser = subparsers.add_parser('eod-technical-snapshots-compute', help='Compute technical snapshots directly')
     technical_parser.add_argument('--market-date', required=True)
     technical_parser.add_argument('--symbols')
@@ -211,6 +243,14 @@ def main(argv: Iterable[str] | None = None) -> int:
             capture_limit=args.capture_limit,
             force=args.force,
             fs_div=args.fs_div,
+        )
+    elif args.command == 'kis-daily-signal-features-collect':
+        payload = collect_kis_daily_signal_features(
+            market_date=args.market_date,
+            sources=args.sources,
+            max_pages=args.max_pages,
+            overtime_volume_rank_sort_cls_code=args.overtime_volume_rank_sort_cls_code,
+            overtime_fluctuation_div_cls_code=args.overtime_fluctuation_div_cls_code,
         )
     elif args.command == 'eod-technical-snapshots-compute':
         payload = compute_technical_snapshots(market_date=args.market_date, symbols=args.symbols)

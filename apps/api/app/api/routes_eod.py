@@ -13,6 +13,7 @@ from app.eod.service import EOD_SERVICE
 from app.eod.state import job_state
 from app.eod.technical_snapshots import daily_technical_snapshot_service
 from app.market.clock import get_market_state
+from app.signals.daily_signal_features import daily_signal_feature_service
 
 router = APIRouter(prefix='/eod', tags=['eod'])
 
@@ -199,3 +200,46 @@ async def inspect_daily_action_summaries(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f'Daily action summary inspect failed: {exc}') from exc
+
+
+@router.post('/signal-features/collect')
+async def collect_daily_signal_features(
+    market_date: str,
+    sources: str | None = None,
+    max_pages: int = 10,
+    overtime_volume_rank_sort_cls_code: str = '2',
+    overtime_fluctuation_div_cls_code: str = '2',
+) -> dict:
+    try:
+        parsed_sources = [item.strip() for item in sources.split(',') if item.strip()] if sources else None
+        return await daily_signal_feature_service.collect_and_persist_for_market_date(
+            market_date=market_date,
+            sources=parsed_sources,
+            max_pages=max_pages,
+            overtime_volume_rank_sort_cls_code=overtime_volume_rank_sort_cls_code,
+            overtime_fluctuation_div_cls_code=overtime_fluctuation_div_cls_code,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f'Daily signal feature collection failed: {exc}') from exc
+
+
+@router.get('/signal-features')
+async def inspect_daily_signal_features(
+    market_date: str,
+    symbols: str | None = None,
+    limit: int = 100,
+) -> dict:
+    try:
+        parsed_symbols = [item.strip() for item in symbols.split(',') if item.strip()] if symbols else None
+        return await asyncio.to_thread(
+            daily_signal_feature_service.inspect,
+            market_date=market_date,
+            symbols=parsed_symbols,
+            limit=limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'Daily signal feature inspect failed: {exc}') from exc

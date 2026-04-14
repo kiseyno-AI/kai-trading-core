@@ -7,7 +7,12 @@ from typing import Any, Sequence
 from app.dart.fundamentals_store import DartFundamentalsRepository, dart_fundamentals_repository
 from app.dart.service import FS_DIV_TO_STATEMENT_TYPE, REPORT_CODE_METADATA
 from app.dart.store import DartSyncRepository, dart_sync_repository
-from app.market_data_store import load_daily_action_summaries, load_daily_technical_snapshots, load_symbols
+from app.market_data_store import (
+    load_daily_action_summaries,
+    load_daily_signal_features,
+    load_daily_technical_snapshots,
+    load_symbols,
+)
 
 
 def _normalize_symbols(symbols: Sequence[str]) -> list[str]:
@@ -217,6 +222,11 @@ class AgentContextReadService:
             symbols=normalized_symbols,
             limit=max(len(normalized_symbols), 1000),
         )
+        signal_feature_rows = load_daily_signal_features(
+            market_date=normalized_market_date,
+            symbols=normalized_symbols,
+            limit=max(len(normalized_symbols), 1000),
+        )
         fundamentals_rows = self.fundamentals_repository.list_stored_fundamentals_summary(
             stock_codes=normalized_symbols,
             fs_div=normalized_fs_div,
@@ -230,6 +240,7 @@ class AgentContextReadService:
         symbol_map = {item['symbol']: item for item in symbol_rows}
         technical_map = {item['symbol']: item for item in technical_rows}
         action_map = {item['symbol']: item for item in action_rows}
+        signal_feature_map = {item['symbol']: item for item in signal_feature_rows}
         fundamentals_map: dict[str, list[dict[str, Any]]] = {symbol: [] for symbol in normalized_symbols}
         for item in fundamentals_rows:
             stock_code = item.get('stock_code')
@@ -243,6 +254,7 @@ class AgentContextReadService:
         for symbol in normalized_symbols:
             technical_snapshot = technical_map.get(symbol)
             action_summary = action_map.get(symbol)
+            signal_features = signal_feature_map.get(symbol)
             fundamentals = _build_fundamentals_summary(
                 fundamentals_map.get(symbol, []),
                 market_date=normalized_market_date,
@@ -285,6 +297,7 @@ class AgentContextReadService:
                 'company': company_row is not None,
                 'technical_snapshot': technical_snapshot is not None,
                 'action_summary': action_summary is not None,
+                'signal_features': signal_features is not None,
                 'fundamentals': fundamentals['latest_snapshot'] is not None,
                 'recent_disclosures': bool(recent_disclosures),
             }
@@ -300,6 +313,7 @@ class AgentContextReadService:
                     'company': company,
                     'technical_snapshot': technical_snapshot,
                     'action_summary': action_summary,
+                    'signal_features': signal_features,
                     'fundamentals': fundamentals,
                     'recent_disclosures': {
                         'count': len(recent_disclosures),
@@ -323,6 +337,7 @@ class AgentContextReadService:
                 'missing_symbols': missing_symbols,
                 'technical_snapshot_count': sum(1 for item in items if item['technical_snapshot'] is not None),
                 'action_summary_count': sum(1 for item in items if item['action_summary'] is not None),
+                'signal_feature_count': sum(1 for item in items if item['signal_features'] is not None),
                 'fundamentals_count': sum(
                     1 for item in items if item['fundamentals']['latest_snapshot'] is not None
                 ),

@@ -45,6 +45,8 @@ What it does:
 - `GET /eod/technical-snapshots`
 - `POST /eod/action-summaries/compute`
 - `GET /eod/action-summaries`
+- `POST /eod/signal-features/collect`
+- `GET /eod/signal-features`
 
 ## Current runtime expectations
 - Core server should stay up 24/7.
@@ -52,7 +54,7 @@ What it does:
 - A background runner checks market state every 60 seconds while the API process is alive.
 - During `PREOPEN`, it refreshes the daily master if needed.
 - During `CLOSED`, after `EOD_AUTO_PYKRX_AFTER_CLOSE_MINUTES`, it schedules a thread-based pykrx daily EOD run if that trade date is available and not already completed.
-- Database persistence stores symbol master data, tracked symbols, quote cache/history, market status snapshots, EOD bars, EOD run records, daily technical/action snapshots, and stored day-based trending ranks.
+- Database persistence stores symbol master data, tracked symbols, quote cache/history, market status snapshots, EOD bars, EOD run records, daily technical/action snapshots, KIS daily signal features, and stored day-based trending ranks.
 
 ## Database bootstrap
 
@@ -97,6 +99,8 @@ Useful limited-scope runs:
 - Manual stored trending rank rebuild after EOD: `python3.11 -m app.internal.ops eod-trending-ranks-compute --market-date 2026-04-07`
 - API-triggered technical snapshot rerun: `curl -X POST "http://127.0.0.1:8000/eod/technical-snapshots/compute?market_date=2026-04-07"`
 - API-triggered action summary rerun: `curl -X POST "http://127.0.0.1:8000/eod/action-summaries/compute?market_date=2026-04-07"`
+- KIS ranking signal-feature collection: `python3.11 -m app.internal.ops kis-daily-signal-features-collect --market-date 2026-04-14`
+- API-triggered KIS ranking signal-feature collection: `curl -X POST "http://127.0.0.1:8000/eod/signal-features/collect?market_date=2026-04-14"`
 
 Internal ops commands from `apps/api`:
 
@@ -108,6 +112,7 @@ Internal ops commands from `apps/api`:
 - `python3.11 -m app.internal.ops eod-pykrx-daily-run-if-due --market-date 2026-04-08 --force`
 - `python3.11 -m app.internal.ops eod-trending-ranks-compute --market-date 2026-04-08`
 - `python3.11 -m app.internal.ops dart-fundamentals-daily-run-if-due --market-date 2026-04-14 --symbol-limit 250 --capture-limit 500`
+- `python3.11 -m app.internal.ops kis-daily-signal-features-collect --market-date 2026-04-14`
 
 Notes:
 
@@ -119,6 +124,7 @@ Notes:
 - The pykrx path refreshes the active listed universe first, then backfills only those active symbols.
 - Automatic daily ingestion uses the same pykrx universe/backfill persistence path, but only for the resolved market date and only once per day unless forced or retrying a partial/failed run.
 - The automatic pykrx daily ingestion path now also persists `daily_technical_snapshots`, `daily_action_summaries`, and day-based `daily_trending_ranks` after the day bar write completes.
+- KIS ranking signal-feature collection is a separate ops path because it calls KIS ranking endpoints (`volume-power`, `overtime-volume`, and `overtime-fluctuation`) rather than pykrx bars.
 - Duplicate bar writes are harmless because `daily_price_bars` upserts on `(symbol_id, trade_date)`, and the scheduler checks `eod_collection_runs` plus a Postgres advisory lock before starting.
 - When pykrx market-wide universe endpoints are empty, the command falls back to the existing KIS master universe so delisted names are still excluded.
 - Historical bars use pykrx's default adjusted OHLCV series because long-range `adjusted=False` calls returned empty data during local verification.

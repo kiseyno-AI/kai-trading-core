@@ -102,12 +102,14 @@ class FakeDisclosureRepository:
 
 class AgentContextReadServiceTests(unittest.TestCase):
     @patch('app.agent_context.read_service.load_daily_action_summaries')
+    @patch('app.agent_context.read_service.load_daily_signal_features')
     @patch('app.agent_context.read_service.load_daily_technical_snapshots')
     @patch('app.agent_context.read_service.load_symbols')
     def test_get_symbol_day_context_aggregates_existing_blocks(
         self,
         load_symbols_mock,
         load_technical_mock,
+        load_signal_features_mock,
         load_actions_mock,
     ):
         load_symbols_mock.return_value = [
@@ -162,6 +164,22 @@ class AgentContextReadServiceTests(unittest.TestCase):
                 'captured_at': '2026-04-08T15:00:00+09:00',
             }
         ]
+        load_signal_features_mock.return_value = [
+            {
+                'symbol': '005930',
+                'market_date': '2026-04-08',
+                'source': 'kis_ranking',
+                'signal_count': 2,
+                'volume_power_rank': 3,
+                'volume_power': 140.5,
+                'overtime_volume_rank': 7,
+                'overtime_volume': 120000,
+                'overtime_fluctuation_rank': None,
+                'overtime_fluctuation_rate': None,
+                'feature_payload': {'sources': {'volume-power': {'rank': 3}}},
+                'captured_at': '2026-04-08T15:00:00+09:00',
+            }
+        ]
 
         service = AgentContextReadService(
             fundamentals_repository=FakeFundamentalsRepository(),
@@ -181,6 +199,7 @@ class AgentContextReadServiceTests(unittest.TestCase):
         self.assertEqual(result['summary']['matched_symbol_count'], 1)
         self.assertEqual(result['summary']['technical_snapshot_count'], 1)
         self.assertEqual(result['summary']['action_summary_count'], 1)
+        self.assertEqual(result['summary']['signal_feature_count'], 1)
         self.assertEqual(result['summary']['fundamentals_count'], 1)
         self.assertEqual(result['summary']['missing_symbols'], ['000660'])
 
@@ -190,6 +209,7 @@ class AgentContextReadServiceTests(unittest.TestCase):
         self.assertEqual(first_item['company']['dart']['corp_code'], '00126380')
         self.assertEqual(first_item['technical_snapshot']['trend_state'], 'uptrend')
         self.assertEqual(first_item['action_summary']['action_label'], 'long_breakout')
+        self.assertEqual(first_item['signal_features']['signal_count'], 2)
         self.assertEqual(first_item['fundamentals']['latest_snapshot']['period']['period_end_date'], '2024-12-31')
         self.assertEqual(first_item['fundamentals']['latest_snapshot']['statement']['row_count'], 1)
         self.assertEqual(first_item['recent_disclosures']['count'], 1)
@@ -197,6 +217,7 @@ class AgentContextReadServiceTests(unittest.TestCase):
         second_item = result['items'][1]
         self.assertEqual(second_item['symbol'], '000660')
         self.assertIsNone(second_item['technical_snapshot'])
+        self.assertIsNone(second_item['signal_features'])
         self.assertIsNone(second_item['fundamentals']['latest_snapshot'])
         self.assertEqual(second_item['recent_disclosures']['count'], 0)
 

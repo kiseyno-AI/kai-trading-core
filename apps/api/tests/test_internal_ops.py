@@ -124,6 +124,26 @@ class InternalOpsTests(unittest.TestCase):
         self.assertEqual(compute_ranks.call_args.kwargs['periods'], ['1d', '20d'])
         self.assertEqual(compute_ranks.call_args.kwargs['source'], 'internal_ops_cli')
 
+    def test_collect_kis_daily_signal_features_uses_direct_service_call(self) -> None:
+        with (
+            patch('app.internal.ops.bootstrap_runtime') as bootstrap_runtime,
+            patch(
+                'app.internal.ops.daily_signal_feature_service.collect_and_persist_for_market_date',
+                new=AsyncMock(return_value={'features_persisted': 2}),
+            ) as collect_features,
+        ):
+            result = ops.collect_kis_daily_signal_features(
+                market_date='2026-04-14',
+                sources='volume-power,overtime-volume',
+                max_pages=2,
+            )
+
+        bootstrap_runtime.assert_called_once_with()
+        self.assertEqual(result, {'features_persisted': 2})
+        self.assertEqual(collect_features.call_args.kwargs['market_date'], '2026-04-14')
+        self.assertEqual(collect_features.call_args.kwargs['sources'], ['volume-power', 'overtime-volume'])
+        self.assertEqual(collect_features.call_args.kwargs['max_pages'], 2)
+
     def test_cli_quotes_tracked_outputs_json(self) -> None:
         stdout = io.StringIO()
         with (

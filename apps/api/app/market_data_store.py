@@ -13,6 +13,7 @@ from app.db_models import (
     CurrentQuoteCache,
     DailyActionSummary,
     DailyPriceBar,
+    DailySignalFeature,
     DailyTechnicalSnapshot,
     DailyTrendingRank,
     EODCollectionRun,
@@ -1588,6 +1589,99 @@ def load_trending_stocks(
         limit=limit,
         markets=normalized_markets,
     )
+
+
+def upsert_daily_signal_feature(feature: dict) -> None:
+    refreshed_at = datetime.utcnow()
+    with session_scope() as session:
+        symbol = _get_symbol(session, feature['symbol'])
+        if symbol is None:
+            symbol = Symbol(
+                symbol=feature['symbol'],
+                market=feature.get('market', 'KRX'),
+                name_ko=feature.get('name_ko') or feature['symbol'],
+                instrument_type='equity',
+                source=feature.get('source', 'kis_ranking'),
+                is_active=True,
+                last_refreshed_at=refreshed_at,
+            )
+            session.add(symbol)
+            session.flush()
+        elif feature.get('name_ko') and symbol.name_ko == symbol.symbol:
+            symbol.name_ko = feature['name_ko']
+            symbol.last_refreshed_at = refreshed_at
+
+        values = {
+            'symbol_id': symbol.id,
+            'market_date': _normalize_trade_date(feature['market_date']),
+            'source': feature.get('source', 'kis_ranking'),
+            'signal_count': int(feature.get('signal_count') or 0),
+            'volume_power_rank': feature.get('volume_power_rank'),
+            'volume_power': feature.get('volume_power'),
+            'overtime_volume_rank': feature.get('overtime_volume_rank'),
+            'overtime_volume': feature.get('overtime_volume'),
+            'overtime_fluctuation_rank': feature.get('overtime_fluctuation_rank'),
+            'overtime_fluctuation_rate': feature.get('overtime_fluctuation_rate'),
+            'feature_payload': feature['feature_payload'],
+            'captured_at': refreshed_at,
+            'updated_at': refreshed_at,
+        }
+        statement = pg_insert(DailySignalFeature).values(values)
+        session.execute(
+            statement.on_conflict_do_update(
+                constraint='uq_daily_signal_features_symbol_market_date',
+                set_={
+                    'source': statement.excluded.source,
+                    'signal_count': statement.excluded.signal_count,
+                    'volume_power_rank': statement.excluded.volume_power_rank,
+                    'volume_power': statement.excluded.volume_power,
+                    'overtime_volume_rank': statement.excluded.overtime_volume_rank,
+                    'overtime_volume': statement.excluded.overtime_volume,
+                    'overtime_fluctuation_rank': statement.excluded.overtime_fluctuation_rank,
+                    'overtime_fluctuation_rate': statement.excluded.overtime_fluctuation_rate,
+                    'feature_payload': statement.excluded.feature_payload,
+                    'captured_at': statement.excluded.captured_at,
+                    'updated_at': refreshed_at,
+                },
+            )
+        )
+
+
+def load_daily_signal_features(
+    *,
+    market_date: str | date,
+    symbols: list[str] | None = None,
+    limit: int = 100,
+) -> list[dict]:
+    with session_scope() as session:
+        stmt = (
+            select(DailySignalFeature, Symbol.symbol)
+            .join(Symbol, Symbol.id == DailySignalFeature.symbol_id)
+            .where(DailySignalFeature.market_date == _normalize_trade_date(market_date))
+            .order_by(DailySignalFeature.signal_count.desc(), Symbol.symbol.asc())
+            .limit(limit)
+        )
+        if symbols:
+            stmt = stmt.where(Symbol.symbol.in_(symbols))
+
+        rows = session.execute(stmt).all()
+        return [
+            {
+                'symbol': symbol,
+                'market_date': feature.market_date.isoformat(),
+                'source': feature.source,
+                'signal_count': int(feature.signal_count),
+                'volume_power_rank': feature.volume_power_rank,
+                'volume_power': _decimal_to_float(feature.volume_power),
+                'overtime_volume_rank': feature.overtime_volume_rank,
+                'overtime_volume': int(feature.overtime_volume) if feature.overtime_volume is not None else None,
+                'overtime_fluctuation_rank': feature.overtime_fluctuation_rank,
+                'overtime_fluctuation_rate': _decimal_to_float(feature.overtime_fluctuation_rate),
+                'feature_payload': feature.feature_payload,
+                'captured_at': feature.captured_at.isoformat() if feature.captured_at else None,
+            }
+            for feature, symbol in rows
+        ]
 
 
 def count_daily_price_bars_for_date(trade_date: str | date) -> int:
