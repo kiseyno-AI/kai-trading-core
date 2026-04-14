@@ -190,7 +190,7 @@ class RealtimeTrendingService:
         change_pct = _signed_number(row.get('prdy_ctrt'), sign_code)
         volume = _parse_number(row.get('acml_vol'), as_int=True)
         turnover = _parse_number(row.get('acml_tr_pbmn'), as_int=True)
-        source_market_code = _clean_text(row.get('mrkt_div_cls_code')) or market_code
+        source_market_code = (_clean_text(row.get('mrkt_div_cls_code')) or market_code).upper()
 
         metric_name = str(config['metric_name'])
         if metric_name == 'volume':
@@ -207,7 +207,7 @@ class RealtimeTrendingService:
             'symbol': symbol,
             'name': _clean_text(row.get('hts_kor_isnm')) or symbol,
             'market_code': source_market_code,
-            'market': VALID_MARKET_CODES.get(market_code, market_code),
+            'market': VALID_MARKET_CODES.get(source_market_code, source_market_code),
             'price': price,
             'change': change,
             'change_pct': change_pct,

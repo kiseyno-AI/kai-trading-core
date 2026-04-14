@@ -128,6 +128,17 @@ class RealtimeTrendingServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['summary']['error_source_count'], 1)
         self.assertEqual(result['sources'][1]['error'], 'kis_source_request_failed')
 
+    async def test_realtime_trending_uses_row_market_label_when_source_market_differs(self) -> None:
+        fake_client = FakeKISRankingClient()
+        service = RealtimeTrendingService(client=fake_client, cache_ttl_seconds=0)
+
+        result = await service.get_realtime_trending(limit=1, market_code='NX', sources='hts-top-view')
+
+        item = result['items'][0]
+        self.assertEqual(item['market_code'], 'J')
+        self.assertEqual(item['market'], 'KRX')
+        self.assertEqual(item['sources'][0]['market'], 'KRX')
+
     async def test_realtime_trending_rejects_unknown_market_code(self) -> None:
         service = RealtimeTrendingService(client=FakeKISRankingClient(), cache_ttl_seconds=0)
 
