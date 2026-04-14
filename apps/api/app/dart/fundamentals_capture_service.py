@@ -1205,10 +1205,7 @@ class DartFundamentalsCaptureService:
                     if not stock_code or stock_code not in check_start_by_symbol:
                         continue
                     receipt_date = _parse_optional_iso_date(event.get('receipt_date'))
-                    latest_fundamentals_date = latest_fundamentals_date_by_symbol.get(stock_code)
-                    if latest_fundamentals_date is not None and (
-                        receipt_date is None or receipt_date <= latest_fundamentals_date
-                    ):
+                    if receipt_date is None or receipt_date < check_start_by_symbol[stock_code]:
                         continue
                     candidate_events.append(event)
                     seen_event_ids.add(event_id)

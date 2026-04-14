@@ -255,10 +255,44 @@ class FakeCaptureRepository:
                         'fundamentals_capture_status': 'pending',
                         'receipt_date': '2026-04-14',
                     },
+                    {
+                        'id': 10,
+                        'rcept_no': '20260409000001',
+                        'corp_code': 'corp-555555',
+                        'corp_name': 'Terminal Baseline Corp',
+                        'stock_code': '555555',
+                        'report_nm': '사업보고서 (2025.12)',
+                        'filing_category': 'annual_report',
+                        'fundamentals_capture_status': 'failed',
+                        'receipt_date': '2026-04-09',
+                    },
+                    {
+                        'id': 11,
+                        'rcept_no': '20260412000002',
+                        'corp_code': 'corp-555555',
+                        'corp_name': 'Terminal Baseline Corp',
+                        'stock_code': '555555',
+                        'report_nm': '사업보고서 (2025.12)',
+                        'filing_category': 'annual_report',
+                        'fundamentals_capture_status': 'failed',
+                        'receipt_date': '2026-04-12',
+                    },
                 ]
             )
         if stock_codes:
             events = [event for event in events if event['stock_code'] in stock_codes]
+        if receipt_date_from is not None:
+            events = [
+                event
+                for event in events
+                if event.get('receipt_date') and date.fromisoformat(event['receipt_date']) >= receipt_date_from
+            ]
+        if receipt_date_to is not None:
+            events = [
+                event
+                for event in events
+                if event.get('receipt_date') and date.fromisoformat(event['receipt_date']) <= receipt_date_to
+            ]
         if event_ids is not None:
             events = [event for event in events if event['id'] in event_ids]
         return events[:limit] if limit is not None else events
@@ -574,6 +608,60 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['events_captured'], 1)
         self.assertEqual(repository.candidate_call_kwargs[-1]['event_ids'], [7])
         self.assertEqual(repository.successes, [7])
+
+    async def test_daily_incremental_refresh_filters_candidates_by_symbol_resolved_baseline(self):
+        client = FakeCaptureClient()
+        repository = FakeCaptureRepository()
+        repository.symbol_states = {
+            '123456': {
+                'stock_code': '123456',
+                'has_fundamentals': False,
+                'latest_fundamentals_receipt_date': None,
+                'latest_resolved_fundamentals_receipt_date': None,
+                'latest_snapshot': None,
+            },
+            '555555': {
+                'stock_code': '555555',
+                'has_fundamentals': False,
+                'latest_fundamentals_receipt_date': None,
+                'latest_resolved_fundamentals_receipt_date': '2026-04-10',
+                'latest_snapshot': None,
+                'latest_terminal_fundamentals_event': {
+                    'fundamentals_capture_status': 'no_data',
+                    'receipt_date': '2026-04-10',
+                },
+            },
+        }
+        service = DartFundamentalsCaptureService(
+            client=client,
+            repository=repository,
+            active_symbol_loader=lambda: [
+                {'symbol': '123456'},
+                {'symbol': '555555'},
+            ],
+        )
+
+        with patch(
+            'app.dart.sync_service.dart_disclosure_sync_service.sync_disclosures_for_corporations',
+            return_value={
+                'run_id': 77,
+                'status': 'completed',
+                'financial_report_events': 2,
+            },
+        ):
+            result = await service.run_daily_incremental_refresh(
+                market_date=date(2026, 4, 14),
+                capture_limit=10,
+                fs_div='CFS',
+                trigger='test_daily',
+            )
+
+        self.assertTrue(result['triggered'])
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['events_detected'], 2)
+        self.assertEqual(repository.candidate_call_kwargs[-1]['event_ids'], [5, 11])
+        self.assertEqual(repository.successes, [5, 11])
+        self.assertNotIn(10, repository.successes)
 
     async def test_daily_incremental_refresh_heartbeats_during_sync_and_capture_work(self):
         client = FakeCaptureClient()
