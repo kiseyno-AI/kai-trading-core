@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import re
+from collections import defaultdict
 from contextlib import suppress
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -12,7 +13,13 @@ from app.core.audit_logging import log_fetch_event
 from app.core.settings import settings
 from app.db import session_scope
 from app.db_models import DailyPriceBar
-from app.dart.fundamentals_store import DartFundamentalsRepository, dart_fundamentals_repository
+from app.dart.fundamentals_store import (
+    CAPTURE_STATUS_MAPPING_FAILED,
+    CAPTURE_STATUS_NO_DATA,
+    TERMINAL_CAPTURE_STATUSES,
+    DartFundamentalsRepository,
+    dart_fundamentals_repository,
+)
 from app.dart.service import (
     FS_DIV_TO_STATEMENT_TYPE,
     REPORT_CODE_METADATA,
@@ -31,6 +38,19 @@ _FILING_CATEGORY_TO_REPORT_CODE = {
 
 DART_FUNDAMENTALS_MIN_START_DATE = date(settings.dart_fundamentals_min_business_year, 1, 1)
 DART_FUNDAMENTALS_REFRESH_HEARTBEAT_SECONDS = 30.0
+DART_NO_DATA_STATUS = '013'
+
+
+class TerminalFundamentalsCaptureError(RuntimeError):
+    capture_status = ''
+
+
+class DartFundamentalsNoDataError(TerminalFundamentalsCaptureError):
+    capture_status = CAPTURE_STATUS_NO_DATA
+
+
+class DartFundamentalsMappingError(TerminalFundamentalsCaptureError):
+    capture_status = CAPTURE_STATUS_MAPPING_FAILED
 
 
 def _utcnow() -> datetime:
@@ -279,6 +299,77 @@ def _limited_sample(items: list[Any], *, limit: int = 50) -> list[Any]:
     return items[:limit]
 
 
+def _terminal_symbol_state(status: str | None) -> str:
+    if status == CAPTURE_STATUS_NO_DATA:
+        return 'terminal_no_data'
+    if status == CAPTURE_STATUS_MAPPING_FAILED:
+        return 'terminal_mapping_failed'
+    return 'terminal_resolved'
+
+
+def _build_operator_buckets(
+    *,
+    lookup_errors: list[dict[str, str]],
+    capture_results: list[dict[str, Any]],
+    terminal_resolved_symbols: dict[str, str],
+    remaining_retryable_events: int = 0,
+) -> dict[str, Any]:
+    retryable_capture_failures = [
+        item for item in capture_results if item.get('status') == 'failed'
+    ]
+    terminal_results_by_status: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for item in capture_results:
+        status = item.get('status')
+        if status in TERMINAL_CAPTURE_STATUSES:
+            terminal_results_by_status[status].append(item)
+
+    no_data_symbols = {
+        item['stock_code']
+        for item in terminal_results_by_status.get(CAPTURE_STATUS_NO_DATA, [])
+        if item.get('stock_code')
+    }
+    mapping_symbols = {
+        item['stock_code']
+        for item in terminal_results_by_status.get(CAPTURE_STATUS_MAPPING_FAILED, [])
+        if item.get('stock_code')
+    }
+    for stock_code, terminal_status in terminal_resolved_symbols.items():
+        if terminal_status == CAPTURE_STATUS_NO_DATA:
+            no_data_symbols.add(stock_code)
+        elif terminal_status == CAPTURE_STATUS_MAPPING_FAILED:
+            mapping_symbols.add(stock_code)
+
+    return {
+        'lookup_or_mapping_errors': {
+            'count': len(lookup_errors),
+            'items_sample': _limited_sample(lookup_errors),
+            'symbols_sample': _limited_sample(sorted({item['stock_code'] for item in lookup_errors})),
+        },
+        'retryable_capture_failures': {
+            'count': len(retryable_capture_failures),
+            'items_sample': _limited_sample(retryable_capture_failures),
+            'symbols_sample': _limited_sample(
+                sorted({item['stock_code'] for item in retryable_capture_failures if item.get('stock_code')})
+            ),
+        },
+        'terminal_no_data': {
+            'event_count': len(terminal_results_by_status.get(CAPTURE_STATUS_NO_DATA, [])),
+            'symbol_count': len(no_data_symbols),
+            'items_sample': _limited_sample(terminal_results_by_status.get(CAPTURE_STATUS_NO_DATA, [])),
+            'symbols_sample': _limited_sample(sorted(no_data_symbols)),
+        },
+        'terminal_mapping_failed': {
+            'event_count': len(terminal_results_by_status.get(CAPTURE_STATUS_MAPPING_FAILED, [])),
+            'symbol_count': len(mapping_symbols),
+            'items_sample': _limited_sample(terminal_results_by_status.get(CAPTURE_STATUS_MAPPING_FAILED, [])),
+            'symbols_sample': _limited_sample(sorted(mapping_symbols)),
+        },
+        'remaining_retryable_events': {
+            'count': remaining_retryable_events,
+        },
+    }
+
+
 class DartFundamentalsCaptureService:
     def __init__(
         self,
@@ -509,6 +600,58 @@ class DartFundamentalsCaptureService:
                             'error': timeout_message,
                         }
                     )
+                except TerminalFundamentalsCaptureError as exc:
+                    capture_status = exc.capture_status
+                    self.repository.mark_event_capture_terminal(
+                        event['id'],
+                        capture_status=capture_status,
+                        error_message=str(exc),
+                    )
+                    events_skipped += 1
+                    run_metadata_with_progress = {
+                        **run_metadata,
+                        'candidate_count': len(events),
+                        'last_event': {
+                            'event_id': event['id'],
+                            'rcept_no': event['rcept_no'],
+                            'status': capture_status,
+                            'terminal': True,
+                            'error': str(exc),
+                        },
+                        'last_progress_at': _utcnow().isoformat(),
+                    }
+                    self.repository.update_capture_run_progress(
+                        run_id,
+                        events_seen=events_seen,
+                        events_captured=events_captured,
+                        events_failed=events_failed,
+                        events_skipped=events_skipped,
+                        run_metadata=run_metadata_with_progress,
+                    )
+                    log_fetch_event(
+                        service='dart',
+                        operation='capture_fundamentals_event',
+                        status=capture_status,
+                        run_id=run_id,
+                        event_id=event['id'],
+                        rcept_no=event['rcept_no'],
+                        corp_code=event['corp_code'],
+                        stock_code=event['stock_code'],
+                        fs_div=resolved_fs_div,
+                        terminal=True,
+                        error_type=type(exc).__name__,
+                        error_message=str(exc),
+                    )
+                    results.append(
+                        {
+                            'event_id': event['id'],
+                            'rcept_no': event['rcept_no'],
+                            'stock_code': event['stock_code'],
+                            'status': capture_status,
+                            'terminal': True,
+                            'error': str(exc),
+                        }
+                    )
                 except Exception as exc:
                     self.repository.mark_event_capture_failed(event['id'], error_message=str(exc))
                     events_failed += 1
@@ -554,6 +697,11 @@ class DartFundamentalsCaptureService:
                         }
                     )
 
+            operator_buckets = _build_operator_buckets(
+                lookup_errors=[],
+                capture_results=results,
+                terminal_resolved_symbols={},
+            )
             result = {
                 'run_id': run_id,
                 'status': 'completed',
@@ -563,6 +711,7 @@ class DartFundamentalsCaptureService:
                 'events_failed': events_failed,
                 'events_skipped': events_skipped,
                 'results': results,
+                'operator_buckets': operator_buckets,
             }
             log_fetch_event(
                 service='dart',
@@ -580,6 +729,7 @@ class DartFundamentalsCaptureService:
                 run_metadata={
                     **run_metadata,
                     'candidate_count': len(events),
+                    'operator_buckets': operator_buckets,
                     'last_progress_at': _utcnow().isoformat(),
                 },
             )
@@ -621,11 +771,14 @@ class DartFundamentalsCaptureService:
         fs_div: str,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         company_overview = await self.client.fetch_company_overview(event['corp_code'])
-        request = infer_fundamentals_request(
-            event,
-            fs_div=fs_div,
-            fiscal_year_end_month=company_overview.get('acc_mt'),
-        )
+        try:
+            request = infer_fundamentals_request(
+                event,
+                fs_div=fs_div,
+                fiscal_year_end_month=company_overview.get('acc_mt'),
+            )
+        except ValueError as exc:
+            raise DartFundamentalsMappingError(str(exc)) from exc
         source_payload = await self.client.fetch_financial_statements(
             corp_code=event['corp_code'],
             bsns_year=str(request['business_year']),
@@ -664,8 +817,14 @@ class DartFundamentalsCaptureService:
             row_payloads=build_row_payloads(dataset['items']),
             highlight_payloads=build_highlight_payloads(dataset['highlights']),
         )
+        if source_payload.get('status') == DART_NO_DATA_STATUS:
+            raise DartFundamentalsNoDataError(
+                f"DART fundamentals returned [{source_payload.get('status')}]: {source_payload.get('message')}"
+            )
         if source_payload.get('status') != '000':
-            raise ValueError(f"DART fundamentals returned [{source_payload.get('status')}]: {source_payload.get('message')}")
+            raise RuntimeError(
+                f"DART fundamentals returned [{source_payload.get('status')}]: {source_payload.get('message')}"
+            )
         return request, dataset
 
     async def backfill_current_universe_fundamentals(
@@ -705,7 +864,9 @@ class DartFundamentalsCaptureService:
                     }
                 )
             except Exception as exc:
-                symbol_lookup_errors.append({'stock_code': stock_code, 'error': str(exc)})
+                symbol_lookup_errors.append(
+                    {'stock_code': stock_code, 'error_type': type(exc).__name__, 'error': str(exc)}
+                )
 
         from app.dart.sync_service import dart_disclosure_sync_service
 
@@ -743,6 +904,7 @@ class DartFundamentalsCaptureService:
             'symbol_limit': symbol_limit,
             'symbols_selected': len(selected_symbols),
             'symbols_resolved': len(corp_records),
+            'symbol_lookup_error_count': len(symbol_lookup_errors),
             'symbol_lookup_errors': symbol_lookup_errors,
             'requested_start_date': candidate_start_date.isoformat() if candidate_start_date else None,
             'effective_start_date': effective_start_date.isoformat(),
@@ -752,6 +914,11 @@ class DartFundamentalsCaptureService:
             'dart_min_start_date': DART_FUNDAMENTALS_MIN_START_DATE.isoformat(),
             'sync': sync_result,
             'capture': capture_result,
+            'operator_buckets': _build_operator_buckets(
+                lookup_errors=symbol_lookup_errors,
+                capture_results=capture_result.get('results', []),
+                terminal_resolved_symbols={},
+            ),
         }
 
     async def run_daily_incremental_refresh(
@@ -855,6 +1022,8 @@ class DartFundamentalsCaptureService:
         sync_groups: dict[date, list[dict[str, str]]] = {}
         check_start_by_symbol: dict[str, date] = {}
         latest_fundamentals_date_by_symbol: dict[str, date | None] = {}
+        latest_resolved_date_by_symbol: dict[str, date | None] = {}
+        terminal_resolved_symbols: dict[str, str] = {}
 
         def update_refresh_progress(
             *,
@@ -864,7 +1033,8 @@ class DartFundamentalsCaptureService:
             metadata = {
                 **run_metadata,
                 'stage': stage,
-                'lookup_errors': _limited_sample(lookup_errors),
+                'lookup_error_count': len(lookup_errors),
+                'lookup_or_mapping_errors': _limited_sample(lookup_errors),
                 'sync_run_count': len(sync_results),
                 'last_progress_at': _utcnow().isoformat(),
             }
@@ -890,15 +1060,30 @@ class DartFundamentalsCaptureService:
                     'stock_code': stock_code,
                     'has_fundamentals': False,
                     'latest_fundamentals_receipt_date': None,
+                    'latest_resolved_fundamentals_receipt_date': None,
                     'latest_snapshot': None,
+                    'latest_terminal_fundamentals_event': None,
                 }
                 latest_fundamentals_date = _parse_optional_iso_date(
                     state.get('latest_fundamentals_receipt_date')
                 )
+                latest_resolved_date = _parse_optional_iso_date(
+                    state.get('latest_resolved_fundamentals_receipt_date')
+                ) or latest_fundamentals_date
+                terminal_event = state.get('latest_terminal_fundamentals_event') or {}
+                latest_terminal_status = terminal_event.get('fundamentals_capture_status')
+                latest_terminal_date = _parse_optional_iso_date(terminal_event.get('receipt_date'))
                 latest_fundamentals_date_by_symbol[stock_code] = latest_fundamentals_date
+                latest_resolved_date_by_symbol[stock_code] = latest_resolved_date
+                if (
+                    latest_resolved_date is not None
+                    and latest_terminal_date == latest_resolved_date
+                    and latest_terminal_status in TERMINAL_CAPTURE_STATUSES
+                ):
+                    terminal_resolved_symbols[stock_code] = latest_terminal_status
                 check_start_date = (
-                    _date_after(latest_fundamentals_date)
-                    if latest_fundamentals_date is not None
+                    _date_after(latest_resolved_date)
+                    if latest_resolved_date is not None
                     else DART_FUNDAMENTALS_MIN_START_DATE
                 )
                 symbol_result = {
@@ -907,6 +1092,10 @@ class DartFundamentalsCaptureService:
                     'latest_fundamentals_receipt_date': (
                         latest_fundamentals_date.isoformat() if latest_fundamentals_date else None
                     ),
+                    'latest_resolved_fundamentals_receipt_date': (
+                        latest_resolved_date.isoformat() if latest_resolved_date else None
+                    ),
+                    'latest_terminal_capture_status': latest_terminal_status,
                     'check_start_date': check_start_date.isoformat(),
                     'state': 'checking',
                 }
@@ -915,13 +1104,21 @@ class DartFundamentalsCaptureService:
                 if latest_fundamentals_date is None:
                     symbols_missing += 1
                 if check_start_date > resolved_market_date:
-                    symbol_result['state'] = 'fresh'
+                    symbol_result['state'] = (
+                        _terminal_symbol_state(latest_terminal_status)
+                        if latest_fundamentals_date is None and latest_terminal_status in TERMINAL_CAPTURE_STATUSES
+                        else 'fresh'
+                    )
                     continue
 
                 try:
                     corp = await self.client.lookup_corp_code(stock_code=stock_code)
                 except Exception as exc:
-                    error = {'stock_code': stock_code, 'error': str(exc)}
+                    error = {
+                        'stock_code': stock_code,
+                        'error_type': type(exc).__name__,
+                        'error': str(exc),
+                    }
                     lookup_errors.append(error)
                     lookup_failed_symbols.add(stock_code)
                     symbol_result['state'] = 'lookup_failed'
@@ -997,6 +1194,7 @@ class DartFundamentalsCaptureService:
                     stock_codes=sync_stock_codes,
                     receipt_date_from=min(check_start_by_symbol.values()),
                     receipt_date_to=resolved_market_date,
+                    oldest_first=True,
                 )
                 seen_event_ids: set[int] = set()
                 for event in pending_events:
@@ -1007,10 +1205,7 @@ class DartFundamentalsCaptureService:
                     if not stock_code or stock_code not in check_start_by_symbol:
                         continue
                     receipt_date = _parse_optional_iso_date(event.get('receipt_date'))
-                    latest_fundamentals_date = latest_fundamentals_date_by_symbol.get(stock_code)
-                    if latest_fundamentals_date is not None and (
-                        receipt_date is None or receipt_date <= latest_fundamentals_date
-                    ):
+                    if receipt_date is None or receipt_date < check_start_by_symbol[stock_code]:
                         continue
                     candidate_events.append(event)
                     seen_event_ids.add(event_id)
@@ -1038,11 +1233,12 @@ class DartFundamentalsCaptureService:
             for stock_code, symbol_result in symbol_results.items():
                 if symbol_result['state'] != 'checking':
                     continue
-                symbol_result['state'] = (
-                    'missing_no_newer_events'
-                    if latest_fundamentals_date_by_symbol.get(stock_code) is None
-                    else 'fresh'
-                )
+                if latest_fundamentals_date_by_symbol.get(stock_code) is not None:
+                    symbol_result['state'] = 'fresh'
+                elif latest_resolved_date_by_symbol.get(stock_code) is not None:
+                    symbol_result['state'] = 'terminal_no_newer_events'
+                else:
+                    symbol_result['state'] = 'missing_no_newer_events'
 
             capture_result: dict[str, Any]
             if event_ids_to_capture:
@@ -1096,6 +1292,16 @@ class DartFundamentalsCaptureService:
                 for item in capture_result.get('results', [])
                 if item.get('status') == 'failed' and item.get('stock_code')
             }
+            terminal_symbols_by_status: dict[str, set[str]] = defaultdict(set)
+            for item in capture_result.get('results', []):
+                status_value = item.get('status')
+                stock_code = item.get('stock_code')
+                if status_value in TERMINAL_CAPTURE_STATUSES and stock_code:
+                    terminal_symbols_by_status[status_value].add(stock_code)
+                    if stock_code in symbol_results:
+                        symbol_results[stock_code]['state'] = _terminal_symbol_state(status_value)
+                        symbol_results[stock_code]['terminal'] = True
+                        symbol_results[stock_code]['error'] = item.get('error')
             symbols_refreshed = len(refreshed_symbols)
             symbols_failed = len(lookup_failed_symbols | failed_symbols)
             remaining_candidate_events = max(events_detected - len(event_ids_to_capture), 0)
@@ -1108,6 +1314,12 @@ class DartFundamentalsCaptureService:
                     and stock_code not in lookup_failed_symbols
                 ]
             )
+            operator_buckets = _build_operator_buckets(
+                lookup_errors=lookup_errors,
+                capture_results=capture_result.get('results', []),
+                terminal_resolved_symbols=terminal_resolved_symbols,
+                remaining_retryable_events=remaining_candidate_events,
+            )
 
             status = 'completed'
             if symbols_failed or events_failed or remaining_candidate_events:
@@ -1115,7 +1327,9 @@ class DartFundamentalsCaptureService:
 
             metadata = {
                 **run_metadata,
-                'lookup_errors': _limited_sample(lookup_errors),
+                'lookup_error_count': len(lookup_errors),
+                'lookup_or_mapping_errors': _limited_sample(lookup_errors),
+                'operator_buckets': operator_buckets,
                 'sync_runs': sync_results,
                 'capture_run_id': capture_result.get('run_id'),
                 'candidate_event_count': events_detected,
@@ -1138,6 +1352,12 @@ class DartFundamentalsCaptureService:
                 'missing_candidate_symbols_sample': _limited_sample(sorted(missing_candidate_symbols)),
                 'refreshed_symbols_sample': _limited_sample(sorted(refreshed_symbols)),
                 'failed_symbols_sample': _limited_sample(sorted(lookup_failed_symbols | failed_symbols)),
+                'terminal_no_data_symbols_sample': _limited_sample(
+                    sorted(terminal_symbols_by_status.get(CAPTURE_STATUS_NO_DATA, set()))
+                ),
+                'terminal_mapping_failed_symbols_sample': _limited_sample(
+                    sorted(terminal_symbols_by_status.get(CAPTURE_STATUS_MAPPING_FAILED, set()))
+                ),
                 'symbol_results_sample': _limited_sample(
                     [symbol_results[stock_code] for stock_code in sorted(symbol_results)],
                     limit=100,
@@ -1193,7 +1413,14 @@ class DartFundamentalsCaptureService:
                     'missing_candidate_symbols': _limited_sample(sorted(missing_candidate_symbols)),
                     'refreshed_symbols': _limited_sample(sorted(refreshed_symbols)),
                     'failed_symbols': _limited_sample(sorted(lookup_failed_symbols | failed_symbols)),
+                    'terminal_no_data_symbols': _limited_sample(
+                        sorted(terminal_symbols_by_status.get(CAPTURE_STATUS_NO_DATA, set()))
+                    ),
+                    'terminal_mapping_failed_symbols': _limited_sample(
+                        sorted(terminal_symbols_by_status.get(CAPTURE_STATUS_MAPPING_FAILED, set()))
+                    ),
                 },
+                'operator_buckets': operator_buckets,
             }
         except Exception as exc:
             self.repository.complete_refresh_run(
@@ -1211,7 +1438,13 @@ class DartFundamentalsCaptureService:
                 error_message=str(exc),
                 run_metadata={
                     **run_metadata,
-                    'lookup_errors': _limited_sample(lookup_errors),
+                    'lookup_error_count': len(lookup_errors),
+                    'lookup_or_mapping_errors': _limited_sample(lookup_errors),
+                    'operator_buckets': _build_operator_buckets(
+                        lookup_errors=lookup_errors,
+                        capture_results=[],
+                        terminal_resolved_symbols=terminal_resolved_symbols,
+                    ),
                     'sync_runs': sync_results,
                     'symbol_results_sample': _limited_sample(
                         [symbol_results[stock_code] for stock_code in sorted(symbol_results)],

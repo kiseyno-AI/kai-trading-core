@@ -134,6 +134,39 @@ class DartFundamentalsRepositoryTests(unittest.TestCase):
         self.created_snapshot_ids.append(snapshot_id)
         return event_id, snapshot_id
 
+    def _create_financial_event(
+        self,
+        *,
+        stock_code: str,
+        receipt_date: date,
+        capture_status: str,
+        attempts: int = 0,
+    ) -> int:
+        suffix = uuid4().hex[:16]
+        rcept_no = f'T{suffix}'
+        corp_code = f'C{suffix[:8]}'
+        with session_scope() as session:
+            event = DartDisclosureEvent(
+                rcept_no=rcept_no,
+                corp_code=corp_code,
+                corp_name=f'Test Corp {stock_code}',
+                stock_code=stock_code,
+                corp_cls='Y',
+                report_nm='Annual Report (2025.12)',
+                filing_category='annual_report',
+                is_financial_report=True,
+                receipt_date=receipt_date,
+                payload={'rcept_no': rcept_no},
+                fundamentals_capture_status=capture_status,
+                fundamentals_capture_attempts=attempts,
+            )
+            session.add(event)
+            session.flush()
+            event_id = event.id
+
+        self.created_event_ids.append(event_id)
+        return event_id
+
     def test_fail_stale_capture_runs_uses_last_progress_at_when_present(self):
         now = datetime.now(timezone.utc)
         fresh_run_id = self._create_run(trigger='test_stale_fresh_progress')
@@ -217,6 +250,98 @@ class DartFundamentalsRepositoryTests(unittest.TestCase):
         self.assertFalse(states[failed_only_stock_code]['has_fundamentals'])
         self.assertIsNone(states[failed_only_stock_code]['latest_fundamentals_receipt_date'])
         self.assertIsNone(states[failed_only_stock_code]['latest_snapshot'])
+
+    def test_list_capture_candidates_excludes_terminal_statuses_and_can_drain_oldest_first(self):
+        stock_code = f'T{uuid4().hex[:10]}'
+        old_retryable_event_id = self._create_financial_event(
+            stock_code=stock_code,
+            receipt_date=date(2026, 4, 9),
+            capture_status='failed',
+            attempts=0,
+        )
+        newer_pending_event_id = self._create_financial_event(
+            stock_code=stock_code,
+            receipt_date=date(2026, 4, 11),
+            capture_status='pending',
+            attempts=0,
+        )
+        attempted_retry_event_id = self._create_financial_event(
+            stock_code=stock_code,
+            receipt_date=date(2026, 4, 8),
+            capture_status='failed',
+            attempts=2,
+        )
+        self._create_financial_event(
+            stock_code=stock_code,
+            receipt_date=date(2026, 4, 12),
+            capture_status='no_data',
+        )
+        self._create_financial_event(
+            stock_code=stock_code,
+            receipt_date=date(2026, 4, 13),
+            capture_status='mapping_failed',
+        )
+
+        candidates = self.repository.list_capture_candidates(
+            limit=None,
+            stock_codes=[stock_code],
+            receipt_date_from=date(2026, 4, 1),
+            receipt_date_to=date(2026, 4, 30),
+            oldest_first=True,
+        )
+
+        self.assertEqual(
+            [candidate['id'] for candidate in candidates],
+            [old_retryable_event_id, newer_pending_event_id, attempted_retry_event_id],
+        )
+        self.assertEqual(
+            {candidate['fundamentals_capture_status'] for candidate in candidates},
+            {'pending', 'failed'},
+        )
+
+    def test_list_symbol_fundamentals_states_uses_terminal_event_as_resolved_baseline(self):
+        no_data_only_stock_code = f'T{uuid4().hex[:10]}'
+        captured_then_terminal_stock_code = f'T{uuid4().hex[:10]}'
+        self._create_financial_event(
+            stock_code=no_data_only_stock_code,
+            receipt_date=date(2026, 4, 12),
+            capture_status='no_data',
+        )
+        self._create_event_snapshot(
+            stock_code=captured_then_terminal_stock_code,
+            receipt_date=date(2026, 3, 20),
+            capture_status='captured',
+            business_year=2025,
+        )
+        self._create_financial_event(
+            stock_code=captured_then_terminal_stock_code,
+            receipt_date=date(2026, 4, 13),
+            capture_status='no_data',
+        )
+
+        states = self.repository.list_symbol_fundamentals_states(
+            stock_codes=[no_data_only_stock_code, captured_then_terminal_stock_code],
+            fs_div='CFS',
+        )
+
+        self.assertFalse(states[no_data_only_stock_code]['has_fundamentals'])
+        self.assertEqual(
+            states[no_data_only_stock_code]['latest_resolved_fundamentals_receipt_date'],
+            '2026-04-12',
+        )
+        self.assertEqual(
+            states[no_data_only_stock_code]['latest_terminal_fundamentals_event']['fundamentals_capture_status'],
+            'no_data',
+        )
+        self.assertTrue(states[captured_then_terminal_stock_code]['has_fundamentals'])
+        self.assertEqual(
+            states[captured_then_terminal_stock_code]['latest_fundamentals_receipt_date'],
+            '2026-03-20',
+        )
+        self.assertEqual(
+            states[captured_then_terminal_stock_code]['latest_resolved_fundamentals_receipt_date'],
+            '2026-04-13',
+        )
 
     def test_fail_stale_refresh_runs_uses_last_progress_at_when_present(self):
         now = datetime.now(timezone.utc)
