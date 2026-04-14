@@ -268,6 +268,30 @@ class DailySignalFeature(Base, TimestampMixin):
     captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
+class AgentContextFeedback(Base, TimestampMixin):
+    __tablename__ = 'agent_context_feedback'
+    __table_args__ = (
+        Index(
+            'ix_agent_context_feedback_market_symbol_agent_received',
+            'market_date',
+            'symbol',
+            'agent_name',
+            'received_at',
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    market_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    symbol: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    agent_name: Mapped[str] = mapped_column(String(64), nullable=False, default='openclaw', index=True)
+    agent_version: Mapped[str | None] = mapped_column(String(64))
+    run_id: Mapped[str | None] = mapped_column(String(128), index=True)
+    summary_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    feedback_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    context_payload: Mapped[dict | None] = mapped_column(JSON)
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+
+
 class DartDisclosureSyncRun(Base):
     __tablename__ = 'dart_disclosure_sync_runs'
 

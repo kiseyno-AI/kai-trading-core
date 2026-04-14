@@ -20,6 +20,7 @@
 17. Stored trending stocks read route
 18. KIS realtime trending route
 19. KIS daily ranking signal-feature collect/inspect routes
+20. Agent feedback intake/read routes for OpenClaw summaries
 
 ## Current routes
 - `POST /broker/kis/token`
@@ -65,6 +66,8 @@
 - `POST /eod/signal-features/collect?market_date=YYYY-MM-DD&sources=volume-power,overtime-volume,overtime-fluctuation`
 - `GET /eod/signal-features?market_date=YYYY-MM-DD&symbols=005930,000660`
 - `GET /agent-context/symbol-day?market_date=YYYY-MM-DD&symbols=005930&symbols=000660&fs_div=CFS&disclosures_limit=5`
+- `POST /agent-context/feedback`
+- `GET /agent-context/feedback?market_date=YYYY-MM-DD&symbols=005930&agent_name=openclaw&limit=50`
 
 ## EOD freshness read-layer notes
 - `GET /eod/freshness` is the compact web-facing read API for EOD ingestion freshness.
@@ -112,6 +115,11 @@
 - `GET /agent-context/symbol-day` is the current machine-consumption read layer for symbol/day analysis. It does not rank names or emit final trading decisions.
 - The route aggregates persisted symbol metadata, same-day technical snapshot, same-day deterministic action summary, same-day KIS ranking signal features, latest stored DART fundamentals summary, and recent disclosure events up to the requested `market_date`.
 - The response is intentionally block-oriented and compact so downstream agents can prioritize and interpret instead of re-querying multiple endpoints or parsing prose-heavy summaries.
+
+## Agent feedback notes
+- `POST /agent-context/feedback` is the JSON intake path for downstream agents such as OpenClaw to send post-EOD symbol summaries and structured feedback back to Core.
+- Feedback is append-only and stored separately from deterministic `daily_action_summaries`; it does not create orders, positions, or live-trading behavior.
+- `GET /agent-context/feedback` reads stored feedback for a requested `market_date`, optionally filtered by symbol and `agent_name`, so operators or later jobs can inspect the summaries Core received.
 
 ## Daily signal feature notes
 - `daily_signal_features` is the DB-backed KIS ranking feature layer keyed by `symbol_id + market_date`.
