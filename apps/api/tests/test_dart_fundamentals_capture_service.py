@@ -26,6 +26,12 @@ class FakeCaptureClient:
         self.calls.append(kwargs)
         if kwargs['corp_code'] == 'fail-me':
             raise RuntimeError('upstream timeout')
+        if kwargs['corp_code'] == 'no-data':
+            return {
+                'status': '013',
+                'message': 'No data',
+                'list': [],
+            }
         return {
             'status': '000',
             'message': 'OK',
@@ -50,6 +56,8 @@ class FakeCaptureClient:
 
     async def lookup_corp_code(self, *, stock_code=None, corp_code=None, corp_name=None):
         self.lookup_calls.append({'stock_code': stock_code, 'corp_code': corp_code, 'corp_name': corp_name})
+        if stock_code == '999999':
+            raise LookupError('Unknown stock_code: 999999')
         return {
             'corp_code': f'corp-{stock_code}',
             'corp_name': f'Corp {stock_code}',
@@ -72,6 +80,7 @@ class FakeCaptureRepository:
         self.symbol_states = {}
         self.successes = []
         self.failures = []
+        self.terminals = []
         self.snapshots = []
         self.candidate_call_kwargs = []
 
@@ -132,6 +141,7 @@ class FakeCaptureRepository:
         receipt_date_from=None,
         receipt_date_to=None,
         event_ids=None,
+        oldest_first=False,
     ):
         self.candidate_call_kwargs.append(
             {
@@ -141,6 +151,7 @@ class FakeCaptureRepository:
                 'receipt_date_from': receipt_date_from,
                 'receipt_date_to': receipt_date_to,
                 'event_ids': event_ids,
+                'oldest_first': oldest_first,
             }
         )
         events = [
@@ -222,6 +233,28 @@ class FakeCaptureRepository:
                         'fundamentals_capture_status': 'failed',
                         'receipt_date': '2026-04-12',
                     },
+                    {
+                        'id': 8,
+                        'rcept_no': '20260413000001',
+                        'corp_code': 'no-data',
+                        'corp_name': 'No Data Corp',
+                        'stock_code': '333333',
+                        'report_nm': '사업보고서 (2025.12)',
+                        'filing_category': 'annual_report',
+                        'fundamentals_capture_status': 'pending',
+                        'receipt_date': '2026-04-13',
+                    },
+                    {
+                        'id': 9,
+                        'rcept_no': '20260414000001',
+                        'corp_code': 'corp-444444',
+                        'corp_name': 'Bad Mapping Corp',
+                        'stock_code': '444444',
+                        'report_nm': 'Unparseable Report',
+                        'filing_category': 'annual_report',
+                        'fundamentals_capture_status': 'pending',
+                        'receipt_date': '2026-04-14',
+                    },
                 ]
             )
         if stock_codes:
@@ -239,6 +272,9 @@ class FakeCaptureRepository:
 
     def mark_event_capture_failed(self, event_id, *, error_message):
         self.failures.append((event_id, error_message))
+
+    def mark_event_capture_terminal(self, event_id, *, capture_status, error_message):
+        self.terminals.append((event_id, capture_status, error_message))
 
     def get_latest_capture_run(self):
         return {'id': 88, 'status': 'completed'}
@@ -318,6 +354,52 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['events_failed'], 1)
         self.assertEqual(repository.failures[0][0], 1)
         self.assertIn('timed out', repository.failures[0][1])
+
+    async def test_capture_recent_fundamentals_marks_dart_no_data_terminal(self):
+        client = FakeCaptureClient()
+        repository = FakeCaptureRepository()
+        service = DartFundamentalsCaptureService(client=client, repository=repository)
+
+        result = await service.capture_recent_fundamentals(
+            limit=1,
+            event_ids=[8],
+            force=False,
+            trigger='test',
+            fs_div='CFS',
+        )
+
+        self.assertEqual(result['events_seen'], 1)
+        self.assertEqual(result['events_captured'], 0)
+        self.assertEqual(result['events_failed'], 0)
+        self.assertEqual(result['events_skipped'], 1)
+        self.assertEqual(result['results'][0]['status'], 'no_data')
+        self.assertEqual(repository.terminals[0][0], 8)
+        self.assertEqual(repository.terminals[0][1], 'no_data')
+        self.assertEqual(repository.failures, [])
+        self.assertEqual(repository.snapshots[0]['snapshot_payload']['source_status'], '013')
+        self.assertEqual(result['operator_buckets']['terminal_no_data']['event_count'], 1)
+
+    async def test_capture_recent_fundamentals_marks_mapping_failure_terminal(self):
+        client = FakeCaptureClient()
+        repository = FakeCaptureRepository()
+        service = DartFundamentalsCaptureService(client=client, repository=repository)
+
+        result = await service.capture_recent_fundamentals(
+            limit=1,
+            event_ids=[9],
+            force=False,
+            trigger='test',
+            fs_div='CFS',
+        )
+
+        self.assertEqual(result['events_seen'], 1)
+        self.assertEqual(result['events_failed'], 0)
+        self.assertEqual(result['events_skipped'], 1)
+        self.assertEqual(result['results'][0]['status'], 'mapping_failed')
+        self.assertEqual(repository.terminals[0][1], 'mapping_failed')
+        self.assertIn('Unable to infer report period', repository.terminals[0][2])
+        self.assertEqual(repository.failures, [])
+        self.assertEqual(result['operator_buckets']['terminal_mapping_failed']['event_count'], 1)
 
     async def test_capture_recent_fundamentals_fails_stale_runs_before_new_run(self):
         client = FakeCaptureClient()
@@ -585,6 +667,73 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertIn('syncing_disclosures', progress_stages)
         self.assertIn('capturing_fundamentals', progress_stages)
+
+    async def test_daily_incremental_refresh_skips_latest_terminal_no_data_baseline(self):
+        client = FakeCaptureClient()
+        repository = FakeCaptureRepository()
+        repository.symbol_states = {
+            '333333': {
+                'stock_code': '333333',
+                'has_fundamentals': False,
+                'latest_fundamentals_receipt_date': None,
+                'latest_resolved_fundamentals_receipt_date': '2026-04-14',
+                'latest_snapshot': None,
+                'latest_terminal_fundamentals_event': {
+                    'fundamentals_capture_status': 'no_data',
+                    'receipt_date': '2026-04-14',
+                },
+            },
+        }
+        service = DartFundamentalsCaptureService(
+            client=client,
+            repository=repository,
+            active_symbol_loader=lambda: [{'symbol': '333333'}],
+        )
+
+        with patch(
+            'app.dart.sync_service.dart_disclosure_sync_service.sync_disclosures_for_corporations',
+            side_effect=AssertionError('terminal no-data symbols should not be synced again'),
+        ):
+            result = await service.run_daily_incremental_refresh(
+                market_date=date(2026, 4, 14),
+                capture_limit=10,
+                fs_div='CFS',
+                trigger='test_daily',
+            )
+
+        self.assertEqual(client.lookup_calls, [])
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['sync']['run_count'], 0)
+        self.assertEqual(result['capture']['reason'], 'no_stale_or_missing_events')
+        self.assertEqual(result['operator_buckets']['terminal_no_data']['symbol_count'], 1)
+        symbol_sample = repository.completed_refresh_runs[-1][1]['run_metadata']['symbol_results_sample'][0]
+        self.assertEqual(symbol_sample['state'], 'terminal_no_data')
+
+    async def test_daily_incremental_refresh_records_lookup_errors_in_operator_bucket(self):
+        client = FakeCaptureClient()
+        repository = FakeCaptureRepository()
+        service = DartFundamentalsCaptureService(
+            client=client,
+            repository=repository,
+            active_symbol_loader=lambda: [{'symbol': '999999'}],
+        )
+
+        with patch(
+            'app.dart.sync_service.dart_disclosure_sync_service.sync_disclosures_for_corporations',
+            side_effect=AssertionError('lookup failures should not reach sync'),
+        ):
+            result = await service.run_daily_incremental_refresh(
+                market_date=date(2026, 4, 14),
+                capture_limit=10,
+                fs_div='CFS',
+                trigger='test_daily',
+            )
+
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['symbols_failed'], 1)
+        self.assertEqual(result['operator_buckets']['lookup_or_mapping_errors']['count'], 1)
+        self.assertEqual(result['samples']['lookup_errors'][0]['stock_code'], '999999')
+        self.assertIn('Unknown stock_code', result['samples']['lookup_errors'][0]['error'])
 
     async def test_daily_incremental_refresh_skips_completed_market_date_without_force(self):
         repository = FakeCaptureRepository()

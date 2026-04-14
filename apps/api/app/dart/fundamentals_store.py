@@ -18,6 +18,22 @@ from app.db_models import (
 )
 
 
+CAPTURE_STATUS_PENDING = 'pending'
+CAPTURE_STATUS_CAPTURED = 'captured'
+CAPTURE_STATUS_FAILED = 'failed'
+CAPTURE_STATUS_NO_DATA = 'no_data'
+CAPTURE_STATUS_MAPPING_FAILED = 'mapping_failed'
+
+RETRYABLE_CAPTURE_STATUSES = (
+    CAPTURE_STATUS_PENDING,
+    CAPTURE_STATUS_FAILED,
+)
+TERMINAL_CAPTURE_STATUSES = (
+    CAPTURE_STATUS_NO_DATA,
+    CAPTURE_STATUS_MAPPING_FAILED,
+)
+
+
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -357,6 +373,7 @@ class DartFundamentalsRepository:
         receipt_date_from: date | None = None,
         receipt_date_to: date | None = None,
         event_ids: list[int] | None = None,
+        oldest_first: bool = False,
     ) -> list[dict[str, Any]]:
         if event_ids == []:
             return []
@@ -364,7 +381,7 @@ class DartFundamentalsRepository:
         with session_scope() as session:
             stmt = select(DartDisclosureEvent).where(DartDisclosureEvent.is_financial_report.is_(True))
             if not force:
-                stmt = stmt.where(DartDisclosureEvent.fundamentals_capture_status.in_(('pending', 'failed')))
+                stmt = stmt.where(DartDisclosureEvent.fundamentals_capture_status.in_(RETRYABLE_CAPTURE_STATUSES))
             if stock_codes:
                 stmt = stmt.where(DartDisclosureEvent.stock_code.in_(stock_codes))
             if receipt_date_from:
@@ -373,10 +390,21 @@ class DartFundamentalsRepository:
                 stmt = stmt.where(DartDisclosureEvent.receipt_date <= receipt_date_to)
             if event_ids is not None:
                 stmt = stmt.where(DartDisclosureEvent.id.in_(event_ids))
+            if oldest_first:
+                ordered_stmt = stmt.order_by(
+                    DartDisclosureEvent.fundamentals_capture_attempts.asc(),
+                    DartDisclosureEvent.receipt_date.asc(),
+                    DartDisclosureEvent.rcept_no.asc(),
+                )
+            else:
+                ordered_stmt = stmt.order_by(
+                    DartDisclosureEvent.receipt_date.desc(),
+                    DartDisclosureEvent.rcept_no.desc(),
+                )
             rows = session.execute(
-                stmt.order_by(DartDisclosureEvent.receipt_date.desc(), DartDisclosureEvent.rcept_no.desc())
+                ordered_stmt
                 if limit is None
-                else stmt.order_by(DartDisclosureEvent.receipt_date.desc(), DartDisclosureEvent.rcept_no.desc()).limit(limit)
+                else ordered_stmt.limit(limit)
             ).scalars()
             return [self._serialize_event(row) for row in rows]
 
@@ -392,7 +420,9 @@ class DartFundamentalsRepository:
                 'stock_code': code,
                 'has_fundamentals': False,
                 'latest_fundamentals_receipt_date': None,
+                'latest_resolved_fundamentals_receipt_date': None,
                 'latest_snapshot': None,
+                'latest_terminal_fundamentals_event': None,
             }
             for code in normalized_codes
         }
@@ -422,7 +452,29 @@ class DartFundamentalsRepository:
             .where(
                 DartFundamentalsSnapshot.stock_code.in_(normalized_codes),
                 DartFundamentalsSnapshot.fs_div == fs_div,
-                DartDisclosureEvent.fundamentals_capture_status == 'captured',
+                DartDisclosureEvent.fundamentals_capture_status == CAPTURE_STATUS_CAPTURED,
+            )
+        ).subquery()
+
+        ranked_terminal_events = (
+            select(
+                DartDisclosureEvent.id.label('event_id'),
+                DartDisclosureEvent.stock_code.label('stock_code'),
+                func.row_number()
+                .over(
+                    partition_by=DartDisclosureEvent.stock_code,
+                    order_by=(
+                        DartDisclosureEvent.receipt_date.desc(),
+                        DartDisclosureEvent.id.desc(),
+                    ),
+                )
+                .label('symbol_rank'),
+            )
+            .where(
+                DartDisclosureEvent.stock_code.in_(normalized_codes),
+                DartDisclosureEvent.is_financial_report.is_(True),
+                DartDisclosureEvent.receipt_date.is_not(None),
+                DartDisclosureEvent.fundamentals_capture_status.in_(TERMINAL_CAPTURE_STATUSES),
             )
         ).subquery()
 
@@ -442,11 +494,33 @@ class DartFundamentalsRepository:
                     'stock_code': stock_code,
                     'has_fundamentals': True,
                     'latest_fundamentals_receipt_date': event.receipt_date.isoformat() if event.receipt_date else None,
+                    'latest_resolved_fundamentals_receipt_date': (
+                        event.receipt_date.isoformat() if event.receipt_date else None
+                    ),
                     'latest_snapshot': {
                         **self._serialize_snapshot(snapshot),
                         'disclosure': self._serialize_event(event),
                     },
+                    'latest_terminal_fundamentals_event': None,
                 }
+
+            terminal_rows = session.execute(
+                select(DartDisclosureEvent)
+                .join(ranked_terminal_events, DartDisclosureEvent.id == ranked_terminal_events.c.event_id)
+                .where(ranked_terminal_events.c.symbol_rank == 1)
+            ).scalars()
+            for event in terminal_rows:
+                stock_code = event.stock_code
+                if not stock_code:
+                    continue
+                state = states[stock_code]
+                terminal_receipt_date = event.receipt_date.isoformat() if event.receipt_date else None
+                state['latest_terminal_fundamentals_event'] = self._serialize_event(event)
+                current_resolved_date = state.get('latest_resolved_fundamentals_receipt_date')
+                if terminal_receipt_date and (
+                    current_resolved_date is None or terminal_receipt_date > current_resolved_date
+                ):
+                    state['latest_resolved_fundamentals_receipt_date'] = terminal_receipt_date
         return states
 
     def list_financial_events(
@@ -469,7 +543,20 @@ class DartFundamentalsRepository:
             row = session.get(DartDisclosureEvent, event_id)
             if row is None:
                 return
-            row.fundamentals_capture_status = 'failed'
+            row.fundamentals_capture_status = CAPTURE_STATUS_FAILED
+            row.fundamentals_capture_attempts += 1
+            row.fundamentals_last_attempt_at = _utcnow()
+            row.fundamentals_last_error = error_message
+
+    def mark_event_capture_terminal(self, event_id: int, *, capture_status: str, error_message: str) -> None:
+        if capture_status not in TERMINAL_CAPTURE_STATUSES:
+            raise ValueError(f'Unsupported terminal capture status: {capture_status}')
+
+        with session_scope() as session:
+            row = session.get(DartDisclosureEvent, event_id)
+            if row is None:
+                return
+            row.fundamentals_capture_status = capture_status
             row.fundamentals_capture_attempts += 1
             row.fundamentals_last_attempt_at = _utcnow()
             row.fundamentals_last_error = error_message
@@ -480,7 +567,7 @@ class DartFundamentalsRepository:
             if row is None:
                 return
             now = _utcnow()
-            row.fundamentals_capture_status = 'captured'
+            row.fundamentals_capture_status = CAPTURE_STATUS_CAPTURED
             row.fundamentals_capture_attempts += 1
             row.fundamentals_last_attempt_at = now
             row.fundamentals_last_success_at = now
@@ -559,6 +646,8 @@ class DartFundamentalsRepository:
             latest_snapshot_at = session.execute(select(func.max(DartFundamentalsSnapshot.captured_at))).scalar_one()
             return {
                 'financial_event_capture_status_counts': {status: count for status, count in capture_status_rows},
+                'retryable_capture_statuses': list(RETRYABLE_CAPTURE_STATUSES),
+                'terminal_capture_statuses': list(TERMINAL_CAPTURE_STATUSES),
                 'snapshots_total': snapshots_total,
                 'latest_snapshot_at': latest_snapshot_at.isoformat() if latest_snapshot_at else None,
             }

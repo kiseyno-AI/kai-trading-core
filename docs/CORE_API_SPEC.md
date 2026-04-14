@@ -664,7 +664,7 @@ Use `/eod/freshness` and section-specific timestamps/dates where possible.
 ## 5.2 Partial coverage is normal
 This system legitimately produces partial coverage in cases such as:
 - sparse DART history,
-- DART `[013]` no-data filings,
+- DART `[013]` no-data filings, which are stored as terminal `no_data` fundamentals capture state instead of retryable failures,
 - insufficient lookback for technical fields,
 - unavailable quote states.
 
