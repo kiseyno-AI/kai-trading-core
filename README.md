@@ -356,6 +356,7 @@ Implemented and currently useful endpoints include:
 - DART company snapshot, disclosure sync and inspect, fundamentals fetch, fundamentals capture and inspect, stored fundamentals history, current-universe backfill, and filing artifact download APIs
 - EOD status, master refresh, capture, pykrx backfill and daily refresh, technical snapshot compute and inspect, and action summary compute and inspect APIs
 - agent-context symbol/day aggregate read API
+- agent feedback dispatch, intake, and read APIs for the three summarizer roles (`eod-summarizer`, `technical-summarizer`, `fundamental-summarizer`)
 
 ### CLI and module entry points
 
@@ -398,6 +399,24 @@ curl "http://127.0.0.1:8000/agent-context/symbol-day?market_date=2026-04-08&symb
 
 ```bash
 curl "http://127.0.0.1:8000/agent-context/symbol-day?market_date=2026-04-08&symbols=005930&symbols=000660&fs_div=CFS&disclosures_limit=5"
+```
+
+Agent feedback orchestration examples (current scope: three summarizer roles only, no final signal-decider synthesis yet):
+
+```bash
+curl -X POST "http://127.0.0.1:8000/agent-context/feedback/dispatch" \
+  -H "Content-Type: application/json" \
+  -d '{"eod_run_id": 158}'
+```
+
+```bash
+curl -X POST "http://127.0.0.1:8000/agent-context/feedback/dispatch" \
+  -H "Content-Type: application/json" \
+  -d '{"eod_run_id": 158, "roles": ["eod-summarizer", "technical-summarizer"]}'
+```
+
+```bash
+curl "http://127.0.0.1:8000/agent-context/feedback?market_date=2026-04-15&agent_name=eod-summarizer&limit=20"
 ```
 
 Related manual post-EOD flows:

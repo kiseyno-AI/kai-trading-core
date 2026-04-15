@@ -67,6 +67,7 @@
 - `GET /eod/signal-features?market_date=YYYY-MM-DD&symbols=005930,000660`
 - `GET /agent-context/symbol-day?market_date=YYYY-MM-DD&symbols=005930&symbols=000660&fs_div=CFS&disclosures_limit=5`
 - `POST /agent-context/feedback`
+- `POST /agent-context/feedback/dispatch`
 - `GET /agent-context/feedback?market_date=YYYY-MM-DD&symbols=005930&agent_name=openclaw&limit=50`
 
 ## EOD freshness read-layer notes
@@ -118,6 +119,8 @@
 
 ## Agent feedback notes
 - `POST /agent-context/feedback` is the JSON intake path for downstream agents such as OpenClaw to send post-EOD symbol summaries and structured feedback back to Core.
+- `POST /agent-context/feedback/dispatch` is the orchestration trigger for role-based OpenClaw dispatch from a completed or partially completed EOD run. In the current phase it fans out only to the three summarizer roles (`eod-summarizer`, `technical-summarizer`, `fundamental-summarizer`), retries retryable failures, and persists successful responses into `agent_context_feedback`.
+- Dispatch requires `OPENCLAW_BASE_URL` and `OPENCLAW_GATEWAY_TOKEN` configuration, and currently stores market-level feedback rows with symbol `__MARKET__` so Core can inspect role outputs per run.
 - Feedback is append-only and stored separately from deterministic `daily_action_summaries`; it does not create orders, positions, or live-trading behavior.
 - `GET /agent-context/feedback` reads stored feedback for a requested `market_date`, optionally filtered by symbol and `agent_name`, so operators or later jobs can inspect the summaries Core received.
 

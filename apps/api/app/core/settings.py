@@ -72,5 +72,11 @@ class Settings(BaseSettings):
     eod_auto_pykrx_stale_run_minutes: int = 30
     eod_pykrx_request_timeout_seconds: int = 20
 
+    openclaw_base_url: str = 'http://127.0.0.1:4178'
+    openclaw_gateway_token: Optional[str] = None
+    openclaw_agent_timeout_seconds: float = 120.0
+    openclaw_agent_max_retries: int = 2
+    openclaw_agent_retry_backoff_seconds: float = 2.0
+
 
 settings = Settings()
