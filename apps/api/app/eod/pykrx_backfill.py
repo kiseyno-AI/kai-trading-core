@@ -504,22 +504,31 @@ class PykrxBackfillService:
                 }
                 _log_pykrx_fetch('run_daily_collection_if_due', 'skipped', **result)
                 return result
-            if (
-                not force
-                and latest_run
-                and latest_run['status'] == 'completed'
-                and latest_run['symbols_failed'] == 0
-            ):
-                result = {
-                    'triggered': False,
-                    'reason': 'already_completed',
-                    'market_date': market_date_iso,
-                    'latest_available_trade_date': latest_trade_date,
-                    'source': 'pykrx',
-                    'existing_run': latest_run,
-                }
-                _log_pykrx_fetch('run_daily_collection_if_due', 'skipped', **result)
-                return result
+            if not force and latest_run:
+                latest_status = latest_run.get('status')
+                latest_failed = int(latest_run.get('symbols_failed') or 0)
+                if latest_status == 'completed' and latest_failed == 0:
+                    result = {
+                        'triggered': False,
+                        'reason': 'already_completed',
+                        'market_date': market_date_iso,
+                        'latest_available_trade_date': latest_trade_date,
+                        'source': 'pykrx',
+                        'existing_run': latest_run,
+                    }
+                    _log_pykrx_fetch('run_daily_collection_if_due', 'skipped', **result)
+                    return result
+                if latest_status == 'completed_with_errors':
+                    result = {
+                        'triggered': False,
+                        'reason': 'already_completed_with_errors',
+                        'market_date': market_date_iso,
+                        'latest_available_trade_date': latest_trade_date,
+                        'source': 'pykrx',
+                        'existing_run': latest_run,
+                    }
+                    _log_pykrx_fetch('run_daily_collection_if_due', 'skipped', **result)
+                    return result
 
             result = self._run_collection(
                 start_date=normalized_market_date,
