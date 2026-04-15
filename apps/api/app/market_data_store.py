@@ -255,11 +255,11 @@ def load_favorite_symbols() -> list[dict]:
                 Symbol.market,
                 Symbol.instrument_type,
                 Symbol.is_active,
-                FavoriteSymbol.sort_order,
-                FavoriteSymbol.created_at,
+                TrackedSymbol.sort_order,
+                TrackedSymbol.created_at,
             )
-            .join(FavoriteSymbol, FavoriteSymbol.symbol_id == Symbol.id)
-            .order_by(FavoriteSymbol.sort_order.asc(), FavoriteSymbol.id.asc())
+            .join(TrackedSymbol, TrackedSymbol.symbol_id == Symbol.id)
+            .order_by(TrackedSymbol.sort_order.asc(), TrackedSymbol.id.asc())
         ).all()
         return [
             {
@@ -280,8 +280,8 @@ def remove_favorite_symbol(symbol: str) -> bool:
     normalized_symbol = _normalize_symbol_code(symbol)
     with session_scope() as session:
         favorite = session.execute(
-            select(FavoriteSymbol)
-            .join(Symbol, Symbol.id == FavoriteSymbol.symbol_id)
+            select(TrackedSymbol)
+            .join(Symbol, Symbol.id == TrackedSymbol.symbol_id)
             .where(Symbol.symbol == normalized_symbol)
         ).scalar_one_or_none()
         if favorite is None:
