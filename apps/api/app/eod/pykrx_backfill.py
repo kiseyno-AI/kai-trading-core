@@ -518,7 +518,7 @@ class PykrxBackfillService:
                     }
                     _log_pykrx_fetch('run_daily_collection_if_due', 'skipped', **result)
                     return result
-                if latest_status == 'completed_with_errors':
+                if latest_status == 'completed_with_errors' and latest_failed == 0:
                     result = {
                         'triggered': False,
                         'reason': 'already_completed_with_errors',
