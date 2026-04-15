@@ -5,6 +5,7 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.agent_context.feedback_service import agent_context_feedback_service
+from app.agent_context.orchestrator import agent_feedback_orchestrator
 from app.agent_context.read_service import agent_context_read_service
 
 router = APIRouter(prefix='/agent-context', tags=['agent-context'])
@@ -27,6 +28,23 @@ class AgentFeedbackRequest(BaseModel):
         if not self.summary and not self.feedback:
             raise ValueError('Either summary or feedback must be provided')
         return self
+
+
+class AgentFeedbackDispatchRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+    eod_run_id: int = Field(..., ge=1)
+    roles: list[str] | None = None
+
+
+class AgentSymbolFeedbackDispatchRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+    market_date: date
+    symbols: list[str] = Field(..., min_length=1, max_length=20)
+    roles: list[str] | None = None
+    fs_div: str | None = None
+    disclosures_limit: int = Field(default=5, ge=0, le=20)
 
 
 @router.get('/symbol-day')
@@ -66,6 +84,35 @@ async def submit_agent_feedback(payload: AgentFeedbackRequest) -> dict:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f'Agent feedback submit failed: {exc}') from exc
+
+
+@router.post('/feedback/dispatch')
+async def dispatch_agent_feedback(payload: AgentFeedbackDispatchRequest) -> dict:
+    try:
+        return agent_feedback_orchestrator.dispatch_for_eod_run(
+            eod_run_id=payload.eod_run_id,
+            roles=payload.roles,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'Agent feedback dispatch failed: {exc}') from exc
+
+
+@router.post('/feedback/dispatch/symbols')
+async def dispatch_symbol_agent_feedback(payload: AgentSymbolFeedbackDispatchRequest) -> dict:
+    try:
+        return agent_feedback_orchestrator.dispatch_for_symbols(
+            market_date=payload.market_date,
+            symbols=payload.symbols,
+            roles=payload.roles,
+            fs_div=payload.fs_div,
+            disclosures_limit=payload.disclosures_limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'Agent symbol feedback dispatch failed: {exc}') from exc
 
 
 @router.get('/feedback')

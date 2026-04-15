@@ -93,37 +93,9 @@ class AgentPayloadBuilder:
 
     def _build_market_payload(self, *, run: EODCollectionRun) -> dict[str, Any]:
         with session_scope() as session:
-            period_rows = session.execute(
-                select(DailyTrendingRank, Symbol)
-                .join(Symbol, Symbol.id == DailyTrendingRank.symbol_id)
-                .where(
-                    DailyTrendingRank.market_date == run.trade_date,
-                    DailyTrendingRank.period.in_(['1d', '5d', '20d']),
-                    DailyTrendingRank.absolute_rank <= self.windows.top_n,
-                )
-                .order_by(DailyTrendingRank.period.asc(), DailyTrendingRank.absolute_rank.asc())
-            ).all()
-
-            signal_rows = session.execute(
-                select(DailySignalFeature, Symbol)
-                .join(Symbol, Symbol.id == DailySignalFeature.symbol_id)
-                .where(DailySignalFeature.market_date == run.trade_date)
-                .order_by(DailySignalFeature.signal_count.desc(), Symbol.symbol.asc())
-                .limit(self.windows.top_n)
-            ).all()
-
-            price_window_start = run.trade_date - timedelta(days=self.windows.market_breadth_days * 2)
-            price_rows = session.execute(
-                select(DailyPriceBar.trade_date, func.count(), func.sum(DailyPriceBar.turnover), func.sum(DailyPriceBar.volume))
-                .where(DailyPriceBar.trade_date >= price_window_start, DailyPriceBar.trade_date <= run.trade_date)
-                .group_by(DailyPriceBar.trade_date)
-                .order_by(DailyPriceBar.trade_date.asc())
-            ).all()
-
-        grouped: dict[str, list[dict[str, Any]]] = {'1d': [], '5d': [], '20d': []}
-        for rank, symbol in period_rows:
-            grouped.setdefault(rank.period, []).append(
+            period_rows = [
                 {
+                    'period': rank.period,
                     'symbol': symbol.symbol,
                     'name_ko': symbol.name_ko,
                     'market': symbol.market,
@@ -135,11 +107,19 @@ class AgentPayloadBuilder:
                     'technical': rank.technical_payload,
                     'action_summary': rank.action_summary_payload,
                 }
-            )
+                for rank, symbol in session.execute(
+                    select(DailyTrendingRank, Symbol)
+                    .join(Symbol, Symbol.id == DailyTrendingRank.symbol_id)
+                    .where(
+                        DailyTrendingRank.market_date == run.trade_date,
+                        DailyTrendingRank.period.in_(['1d', '5d', '20d']),
+                        DailyTrendingRank.absolute_rank <= self.windows.top_n,
+                    )
+                    .order_by(DailyTrendingRank.period.asc(), DailyTrendingRank.absolute_rank.asc())
+                ).all()
+            ]
 
-        return {
-            'top_trending': grouped,
-            'signal_feature_leaders': [
+            signal_rows = [
                 {
                     'symbol': symbol.symbol,
                     'name_ko': symbol.name_ko,
@@ -152,58 +132,45 @@ class AgentPayloadBuilder:
                     'overtime_fluctuation_rank': feature.overtime_fluctuation_rank,
                     'overtime_fluctuation_rate': _to_float(feature.overtime_fluctuation_rate),
                 }
-                for feature, symbol in signal_rows
-            ],
-            'breadth_window': [
+                for feature, symbol in session.execute(
+                    select(DailySignalFeature, Symbol)
+                    .join(Symbol, Symbol.id == DailySignalFeature.symbol_id)
+                    .where(DailySignalFeature.market_date == run.trade_date)
+                    .order_by(DailySignalFeature.signal_count.desc(), Symbol.symbol.asc())
+                    .limit(self.windows.top_n)
+                ).all()
+            ]
+
+            price_window_start = run.trade_date - timedelta(days=self.windows.market_breadth_days * 2)
+            price_rows = [
                 {
                     'trade_date': _safe_date(trade_date),
                     'symbol_count': symbol_count,
                     'total_turnover': int(total_turnover or 0),
                     'total_volume': int(total_volume or 0),
                 }
-                for trade_date, symbol_count, total_turnover, total_volume in price_rows[-self.windows.market_breadth_days :]
-            ],
+                for trade_date, symbol_count, total_turnover, total_volume in session.execute(
+                    select(DailyPriceBar.trade_date, func.count(), func.sum(DailyPriceBar.turnover), func.sum(DailyPriceBar.volume))
+                    .where(DailyPriceBar.trade_date >= price_window_start, DailyPriceBar.trade_date <= run.trade_date)
+                    .group_by(DailyPriceBar.trade_date)
+                    .order_by(DailyPriceBar.trade_date.asc())
+                ).all()
+            ]
+
+        grouped: dict[str, list[dict[str, Any]]] = {'1d': [], '5d': [], '20d': []}
+        for row in period_rows:
+            grouped.setdefault(row['period'], []).append({k: v for k, v in row.items() if k != 'period'})
+
+        return {
+            'top_trending': grouped,
+            'signal_feature_leaders': signal_rows,
+            'breadth_window': price_rows[-self.windows.market_breadth_days :],
         }
 
     def _build_technical_payload(self, *, run: EODCollectionRun) -> dict[str, Any]:
         window_start = run.trade_date - timedelta(days=self.windows.technical_days + 60)
         with session_scope() as session:
-            top_actions = session.execute(
-                select(DailyActionSummary, Symbol)
-                .join(Symbol, Symbol.id == DailyActionSummary.symbol_id)
-                .where(DailyActionSummary.market_date == run.trade_date)
-                .order_by(DailyActionSummary.signal_score.desc(), Symbol.symbol.asc())
-                .limit(self.windows.top_n)
-            ).all()
-
-            top_technicals = session.execute(
-                select(DailyTechnicalSnapshot, Symbol)
-                .join(Symbol, Symbol.id == DailyTechnicalSnapshot.symbol_id)
-                .where(DailyTechnicalSnapshot.market_date == run.trade_date)
-                .order_by(
-                    DailyTechnicalSnapshot.breakout_20d.desc(),
-                    DailyTechnicalSnapshot.return_20d.desc().nullslast(),
-                    Symbol.symbol.asc(),
-                )
-                .limit(self.windows.top_n)
-            ).all()
-
-            regime_rows = session.execute(
-                select(DailyTechnicalSnapshot.trend_state, func.count())
-                .where(DailyTechnicalSnapshot.market_date == run.trade_date)
-                .group_by(DailyTechnicalSnapshot.trend_state)
-            ).all()
-
-            history_rows = session.execute(
-                select(DailyPriceBar.trade_date, func.avg(DailyPriceBar.close_price), func.sum(DailyPriceBar.turnover))
-                .where(and_(DailyPriceBar.trade_date >= window_start, DailyPriceBar.trade_date <= run.trade_date))
-                .group_by(DailyPriceBar.trade_date)
-                .order_by(DailyPriceBar.trade_date.asc())
-            ).all()
-
-        return {
-            'trend_state_distribution': {state: count for state, count in regime_rows},
-            'top_signal_scores': [
+            top_actions = [
                 {
                     'symbol': symbol.symbol,
                     'name_ko': symbol.name_ko,
@@ -216,9 +183,16 @@ class AgentPayloadBuilder:
                     'reasons': summary.reasons,
                     'summary_payload': summary.summary_payload,
                 }
-                for summary, symbol in top_actions
-            ],
-            'top_technical_snapshots': [
+                for summary, symbol in session.execute(
+                    select(DailyActionSummary, Symbol)
+                    .join(Symbol, Symbol.id == DailyActionSummary.symbol_id)
+                    .where(DailyActionSummary.market_date == run.trade_date)
+                    .order_by(DailyActionSummary.signal_score.desc(), Symbol.symbol.asc())
+                    .limit(self.windows.top_n)
+                ).all()
+            ]
+
+            top_technicals = [
                 {
                     'symbol': symbol.symbol,
                     'name_ko': symbol.name_ko,
@@ -233,52 +207,54 @@ class AgentPayloadBuilder:
                     'atr_pct_14': _to_float(snapshot.atr_pct_14),
                     'signal_payload': snapshot.signal_payload,
                 }
-                for snapshot, symbol in top_technicals
-            ],
-            'market_window': [
+                for snapshot, symbol in session.execute(
+                    select(DailyTechnicalSnapshot, Symbol)
+                    .join(Symbol, Symbol.id == DailyTechnicalSnapshot.symbol_id)
+                    .where(DailyTechnicalSnapshot.market_date == run.trade_date)
+                    .order_by(
+                        DailyTechnicalSnapshot.breakout_20d.desc(),
+                        DailyTechnicalSnapshot.return_20d.desc().nullslast(),
+                        Symbol.symbol.asc(),
+                    )
+                    .limit(self.windows.top_n)
+                ).all()
+            ]
+
+            regime_rows = {
+                state: count
+                for state, count in session.execute(
+                    select(DailyTechnicalSnapshot.trend_state, func.count())
+                    .where(DailyTechnicalSnapshot.market_date == run.trade_date)
+                    .group_by(DailyTechnicalSnapshot.trend_state)
+                ).all()
+            }
+
+            history_rows = [
                 {
                     'trade_date': _safe_date(trade_date),
                     'average_close': _to_float(avg_close),
                     'total_turnover': int(total_turnover or 0),
                 }
-                for trade_date, avg_close, total_turnover in history_rows[-self.windows.technical_days :]
-            ],
+                for trade_date, avg_close, total_turnover in session.execute(
+                    select(DailyPriceBar.trade_date, func.avg(DailyPriceBar.close_price), func.sum(DailyPriceBar.turnover))
+                    .where(and_(DailyPriceBar.trade_date >= window_start, DailyPriceBar.trade_date <= run.trade_date))
+                    .group_by(DailyPriceBar.trade_date)
+                    .order_by(DailyPriceBar.trade_date.asc())
+                ).all()
+            ]
+
+        return {
+            'trend_state_distribution': regime_rows,
+            'top_signal_scores': top_actions,
+            'top_technical_snapshots': top_technicals,
+            'market_window': history_rows[-self.windows.technical_days :],
         }
 
     def _build_fundamental_payload(self, *, run: EODCollectionRun) -> dict[str, Any]:
         disclosure_start = run.trade_date - timedelta(days=self.windows.disclosures_days)
         minimum_business_year = max(run.trade_date.year - self.windows.fundamentals_years + 1, 2015)
         with session_scope() as session:
-            disclosures = session.execute(
-                select(DartDisclosureEvent)
-                .where(
-                    or_(
-                        DartDisclosureEvent.receipt_date == run.trade_date,
-                        and_(
-                            DartDisclosureEvent.receipt_date >= disclosure_start,
-                            DartDisclosureEvent.receipt_date <= run.trade_date,
-                        ),
-                    )
-                )
-                .order_by(desc(DartDisclosureEvent.receipt_date), desc(DartDisclosureEvent.id))
-                .limit(self.windows.top_n * 3)
-            ).scalars().all()
-
-            fundamentals = session.execute(
-                select(DartFundamentalsSnapshot)
-                .where(DartFundamentalsSnapshot.business_year >= minimum_business_year)
-                .order_by(desc(DartFundamentalsSnapshot.business_year), desc(DartFundamentalsSnapshot.id))
-                .limit(self.windows.top_n)
-            ).scalars().all()
-
-        filing_counter = Counter(item.filing_category for item in disclosures)
-        financial_counter = Counter(item.fundamentals_capture_status for item in disclosures if item.is_financial_report)
-
-        return {
-            'disclosure_window_start': disclosure_start.isoformat(),
-            'filing_category_counts': dict(filing_counter),
-            'financial_capture_status_counts': dict(financial_counter),
-            'recent_disclosures': [
+            disclosures = [
                 {
                     'rcept_no': item.rcept_no,
                     'receipt_date': _safe_date(item.receipt_date),
@@ -290,9 +266,23 @@ class AgentPayloadBuilder:
                     'fundamentals_capture_status': item.fundamentals_capture_status,
                     'fundamentals_last_error': item.fundamentals_last_error,
                 }
-                for item in disclosures[: self.windows.top_n]
-            ],
-            'latest_fundamentals_snapshots': [
+                for item in session.execute(
+                    select(DartDisclosureEvent)
+                    .where(
+                        or_(
+                            DartDisclosureEvent.receipt_date == run.trade_date,
+                            and_(
+                                DartDisclosureEvent.receipt_date >= disclosure_start,
+                                DartDisclosureEvent.receipt_date <= run.trade_date,
+                            ),
+                        )
+                    )
+                    .order_by(desc(DartDisclosureEvent.receipt_date), desc(DartDisclosureEvent.id))
+                    .limit(self.windows.top_n * 3)
+                ).scalars().all()
+            ]
+
+            fundamentals = [
                 {
                     'rcept_no': item.rcept_no,
                     'stock_code': item.stock_code,
@@ -306,8 +296,23 @@ class AgentPayloadBuilder:
                     'source_status': item.source_status,
                     'captured_at': item.captured_at.isoformat() if item.captured_at else None,
                 }
-                for item in fundamentals
-            ],
+                for item in session.execute(
+                    select(DartFundamentalsSnapshot)
+                    .where(DartFundamentalsSnapshot.business_year >= minimum_business_year)
+                    .order_by(desc(DartFundamentalsSnapshot.business_year), desc(DartFundamentalsSnapshot.id))
+                    .limit(self.windows.top_n)
+                ).scalars().all()
+            ]
+
+        filing_counter = Counter(item['filing_category'] for item in disclosures)
+        financial_counter = Counter(item['fundamentals_capture_status'] for item in disclosures if item['is_financial_report'])
+
+        return {
+            'disclosure_window_start': disclosure_start.isoformat(),
+            'filing_category_counts': dict(filing_counter),
+            'financial_capture_status_counts': dict(financial_counter),
+            'recent_disclosures': disclosures[: self.windows.top_n],
+            'latest_fundamentals_snapshots': fundamentals,
         }
 
 
