@@ -419,6 +419,28 @@ curl -X POST "http://127.0.0.1:8000/agent-context/feedback/dispatch" \
 curl "http://127.0.0.1:8000/agent-context/feedback?market_date=2026-04-15&agent_name=eod-summarizer&limit=20"
 ```
 
+Agent feedback read/status API usage:
+
+```bash
+curl "http://127.0.0.1:8000/agent-context/feedback/payloads?market_date=2026-04-15&symbols=005930"
+```
+
+```bash
+curl "http://127.0.0.1:8000/agent-context/feedback/requests?market_date=2026-04-15&symbols=005930"
+```
+
+```bash
+curl "http://127.0.0.1:8000/agent-context/feedback/status?market_date=2026-04-15&symbols=005930&symbols=000660&symbols=012450"
+```
+
+Notes:
+
+- `feedback/payloads` returns what the agents answered, using stored `feedback_payload` rows.
+- `feedback/requests` returns what Core sent to the agents, using stored `context_payload` rows.
+- `feedback/status` returns workflow state for the expected three-agent set: `eod-summarizer`, `technical-summarizer`, `fundamental-summarizer`.
+- Symbol status becomes `pending`, `in_progress`, `partial`, or `completed` based on how many of those three agent rows have been stored.
+- These endpoints are historical reads over `agent_context_feedback`, newest rows first.
+
 Related manual post-EOD flows:
 
 ```bash
