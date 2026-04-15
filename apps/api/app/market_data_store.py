@@ -24,6 +24,7 @@ from app.db_models import (
     TrackedSymbol,
 )
 from app.market.clock import MarketState
+from app.scanner.state import scanner_state
 
 
 def _parse_trade_date(value: str) -> date:
@@ -287,7 +288,9 @@ def remove_favorite_symbol(symbol: str) -> bool:
         if favorite is None:
             return False
         session.delete(favorite)
-        return True
+
+    scanner_state.update(load_tracked_symbols())
+    return True
 
 
 def persist_quote_snapshot(payload: dict) -> None:
