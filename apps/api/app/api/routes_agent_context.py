@@ -1,10 +1,32 @@
 from datetime import date
+from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from app.agent_context.feedback_service import agent_context_feedback_service
 from app.agent_context.read_service import agent_context_read_service
 
 router = APIRouter(prefix='/agent-context', tags=['agent-context'])
+
+
+class AgentFeedbackRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+    market_date: date
+    symbol: str = Field(..., min_length=1, max_length=32)
+    agent_name: str = Field(default='openclaw', min_length=1, max_length=64)
+    agent_version: str | None = Field(default=None, max_length=64)
+    run_id: str | None = Field(default=None, max_length=128)
+    summary: dict[str, Any] = Field(default_factory=dict)
+    feedback: dict[str, Any] = Field(default_factory=dict)
+    context: dict[str, Any] | None = None
+
+    @model_validator(mode='after')
+    def require_feedback_payload(self) -> 'AgentFeedbackRequest':
+        if not self.summary and not self.feedback:
+            raise ValueError('Either summary or feedback must be provided')
+        return self
 
 
 @router.get('/symbol-day')
@@ -25,3 +47,42 @@ async def get_symbol_day_context(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f'Agent context read failed: {exc}') from exc
+
+
+@router.post('/feedback', status_code=201)
+async def submit_agent_feedback(payload: AgentFeedbackRequest) -> dict:
+    try:
+        return agent_context_feedback_service.submit_feedback(
+            market_date=payload.market_date,
+            symbol=payload.symbol,
+            agent_name=payload.agent_name,
+            agent_version=payload.agent_version,
+            run_id=payload.run_id,
+            summary=payload.summary,
+            feedback=payload.feedback,
+            context=payload.context,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'Agent feedback submit failed: {exc}') from exc
+
+
+@router.get('/feedback')
+async def list_agent_feedback(
+    market_date: date = Query(...),
+    symbols: list[str] | None = Query(default=None),
+    agent_name: str | None = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=200),
+) -> dict:
+    try:
+        return agent_context_feedback_service.list_feedback(
+            market_date=market_date,
+            symbols=symbols,
+            agent_name=agent_name,
+            limit=limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'Agent feedback read failed: {exc}') from exc

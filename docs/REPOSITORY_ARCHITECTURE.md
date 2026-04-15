@@ -424,12 +424,14 @@ This is the main machine-facing aggregate read layer added on top of the stored 
 ```mermaid
 flowchart TD
     Request["GET /agent-context/symbol-day"] --> ReadService["agent_context/read_service.py"]
+    FeedbackRequest["POST /agent-context/feedback"] --> FeedbackService["agent_context/feedback_service.py"]
     ReadService --> Symbols["load_symbols()"]
     ReadService --> Tech["load_daily_technical_snapshots()"]
     ReadService --> Actions["load_daily_action_summaries()"]
     ReadService --> Signals["load_daily_signal_features()"]
     ReadService --> Fundamentals["list_stored_fundamentals_summary()"]
     ReadService --> Disclosures["list_recent_events_by_stock_codes()"]
+    FeedbackService --> FeedbackTable["agent_context_feedback"]
     Symbols --> Compose["compose per-symbol context"]
     Tech --> Compose
     Actions --> Compose
@@ -448,6 +450,8 @@ Returned composition per symbol:
 - recent disclosure events up to the requested market date
 
 This is intentionally a read model, not a decision engine.
+
+Downstream agent feedback is stored through `/agent-context/feedback` as append-only JSON summaries. It is kept separate from deterministic action summaries and does not trigger order or position behavior.
 
 ## Where APIs, CLI, and Jobs Fit
 
@@ -538,8 +542,9 @@ These exist to trigger ingestion, recomputation, or backfill behavior.
 ### Agent-facing aggregate route
 
 - `/agent-context/symbol-day`
+- `/agent-context/feedback`
 
-This is the current machine-oriented composition API for downstream agents.
+These are the current machine-oriented context and feedback APIs for downstream agents.
 
 ## Practical Reading Order For A New Engineer
 

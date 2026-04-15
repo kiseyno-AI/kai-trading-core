@@ -702,6 +702,95 @@ Clients must not assume all sub-sections are always populated.
 
 ---
 
+## 4.2 `POST /agent-context/feedback`
+Stores JSON feedback from a downstream agent after it consumes Core context.
+
+### Example request
+```http
+POST /agent-context/feedback
+Authorization: Bearer <token>
+Content-Type: application/json
+```
+
+```json
+{
+  "market_date": "2026-04-14",
+  "symbol": "005930",
+  "agent_name": "openclaw",
+  "agent_version": "daily-v1",
+  "run_id": "openclaw-20260414-001",
+  "summary": {
+    "headline": "watch breakout continuation",
+    "thesis": "stored technical and signal context improved after EOD"
+  },
+  "feedback": {
+    "confidence": 0.72,
+    "risk_notes": ["earnings volatility", "market gap risk"]
+  },
+  "context": {
+    "source_route": "/agent-context/symbol-day",
+    "market_date": "2026-04-14"
+  }
+}
+```
+
+### Example response
+```json
+{
+  "accepted": true,
+  "item": {
+    "id": 11,
+    "market_date": "2026-04-14",
+    "symbol": "005930",
+    "agent": {
+      "name": "openclaw",
+      "version": "daily-v1",
+      "run_id": "openclaw-20260414-001"
+    },
+    "summary": {
+      "headline": "watch breakout continuation",
+      "thesis": "stored technical and signal context improved after EOD"
+    },
+    "feedback": {
+      "confidence": 0.72,
+      "risk_notes": ["earnings volatility", "market gap risk"]
+    },
+    "context": {
+      "source_route": "/agent-context/symbol-day",
+      "market_date": "2026-04-14"
+    },
+    "received_at": "2026-04-14T15:00:00+00:00"
+  },
+  "summary": {
+    "summary_keys": ["headline", "thesis"],
+    "feedback_keys": ["confidence", "risk_notes"]
+  }
+}
+```
+
+### Notes
+- `summary` and `feedback` are JSON objects; at least one must be non-empty.
+- Stored feedback is append-only and separate from deterministic action summaries.
+- This route does not trigger orders, positions, or live trading.
+
+---
+
+## 4.3 `GET /agent-context/feedback`
+Reads stored downstream-agent feedback for a market date.
+
+### Example request
+```http
+GET /agent-context/feedback?market_date=2026-04-14&symbols=005930&agent_name=openclaw&limit=50
+Authorization: Bearer <token>
+```
+
+### Notes
+- `symbols` accepts repeated query parameters or comma-separated values.
+- Results are ordered newest first by receipt time.
+- This route is intended for operator inspection and later post-EOD orchestration jobs.
+
+---
+
 # 5. Consumer Notes for UX / Web / Agent Layers
 
 ## 5.1 Freshness is not globally uniform
