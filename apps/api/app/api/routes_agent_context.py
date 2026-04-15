@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from app.agent_context.feedback_service import agent_context_feedback_service
 from app.agent_context.orchestrator import agent_feedback_orchestrator
 from app.agent_context.read_service import agent_context_read_service
+from app.agent_context.status_service import agent_context_status_service
 
 router = APIRouter(prefix='/agent-context', tags=['agent-context'])
 
@@ -115,6 +116,62 @@ async def dispatch_symbol_agent_feedback(payload: AgentSymbolFeedbackDispatchReq
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f'Agent symbol feedback dispatch failed: {exc}') from exc
+
+
+@router.get('/feedback/payloads')
+async def list_agent_feedback_payloads(
+    market_date: date = Query(...),
+    symbols: list[str] = Query(...),
+    agent_name: str | None = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=200),
+) -> dict:
+    try:
+        return agent_context_feedback_service.get_feedback_payloads(
+            market_date=market_date,
+            symbols=symbols,
+            agent_name=agent_name,
+            limit=limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'Agent feedback payload read failed: {exc}') from exc
+
+
+@router.get('/feedback/requests')
+async def list_agent_request_payloads(
+    market_date: date = Query(...),
+    symbols: list[str] = Query(...),
+    agent_name: str | None = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=200),
+) -> dict:
+    try:
+        return agent_context_feedback_service.get_request_payloads(
+            market_date=market_date,
+            symbols=symbols,
+            agent_name=agent_name,
+            limit=limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'Agent request payload read failed: {exc}') from exc
+
+
+@router.get('/feedback/status')
+async def get_agent_feedback_status(
+    market_date: date = Query(...),
+    symbols: list[str] = Query(...),
+) -> dict:
+    try:
+        return agent_context_status_service.get_feedback_status(
+            market_date=market_date,
+            symbols=symbols,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'Agent feedback status read failed: {exc}') from exc
 
 
 @router.get('/feedback')
