@@ -71,6 +71,9 @@
 - `POST /agent-context/feedback/dispatch`
 - `POST /agent-context/feedback/dispatch/symbols`
 - `GET /agent-context/feedback?market_date=YYYY-MM-DD&symbols=005930&agent_name=openclaw&limit=50`
+- `GET /agent-context/feedback/payloads?market_date=YYYY-MM-DD&symbols=005930`
+- `GET /agent-context/feedback/requests?market_date=YYYY-MM-DD&symbols=005930`
+- `GET /agent-context/feedback/status?market_date=YYYY-MM-DD&symbols=005930&symbols=000660`
 
 ## EOD freshness read-layer notes
 - `GET /eod/freshness` is the compact web-facing read API for EOD ingestion freshness.
@@ -124,6 +127,9 @@
 - `POST /agent-context/feedback` is the JSON intake path for downstream agents such as OpenClaw to send post-EOD symbol summaries and structured feedback back to Core.
 - `POST /agent-context/feedback/dispatch` is the orchestration trigger for role-based OpenClaw dispatch from a completed or partially completed EOD run.
 - `POST /agent-context/feedback/dispatch/symbols` dispatches the same summarizer roles against symbol-day context for explicit symbol lists.
+- `GET /agent-context/feedback/payloads` reads stored agent feedback payloads by symbol and date.
+- `GET /agent-context/feedback/requests` reads the stored request/context payloads that were sent to the agents by symbol and date.
+- `GET /agent-context/feedback/status` reports whether the three-agent feedback workflow is pending, in progress, partial, or completed for requested symbols, plus completed counts and pending agents.
 - The current dispatch phase targets only `eod-summarizer`, `technical-summarizer`, and `fundamental-summarizer`.
 - Each role now receives a different JSON payload built for its job instead of one shared generic blob: market breadth and trending context for EOD summary, technical/state windows for technical summary, and disclosure plus fundamentals windows for fundamental summary.
 - Dispatch requires `OPENCLAW_BASE_URL` and `OPENCLAW_GATEWAY_TOKEN` configuration, retries retryable failures, and persists successful responses into `agent_context_feedback` as either market-level rows with symbol `__MARKET__` or symbol-level rows for symbol dispatch.

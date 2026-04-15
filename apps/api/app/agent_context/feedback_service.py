@@ -4,6 +4,7 @@ from datetime import date, datetime, timezone
 from typing import Any, Sequence
 
 from sqlalchemy import select
+from sqlalchemy.orm import Query
 
 from app.db import session_scope
 from app.db_models import AgentContextFeedback
@@ -85,6 +86,21 @@ def _serialize_feedback(record: AgentContextFeedback) -> dict[str, Any]:
     }
 
 
+def _apply_feedback_filters(
+    stmt: Query | Any,
+    *,
+    market_date: date,
+    symbols: list[str],
+    agent_name: str | None = None,
+) -> Query | Any:
+    stmt = stmt.where(AgentContextFeedback.market_date == market_date)
+    if symbols:
+        stmt = stmt.where(AgentContextFeedback.symbol.in_(symbols))
+    if agent_name:
+        stmt = stmt.where(AgentContextFeedback.agent_name == agent_name)
+    return stmt
+
+
 class AgentContextFeedbackRepository:
     def create_feedback(
         self,
@@ -124,19 +140,64 @@ class AgentContextFeedbackRepository:
         limit: int = 50,
     ) -> list[dict[str, Any]]:
         with session_scope() as session:
-            stmt = (
-                select(AgentContextFeedback)
-                .where(AgentContextFeedback.market_date == market_date)
-                .order_by(AgentContextFeedback.received_at.desc(), AgentContextFeedback.id.desc())
-                .limit(limit)
-            )
-            if symbols:
-                stmt = stmt.where(AgentContextFeedback.symbol.in_(symbols))
-            if agent_name:
-                stmt = stmt.where(AgentContextFeedback.agent_name == agent_name)
+            stmt = select(AgentContextFeedback)
+            stmt = _apply_feedback_filters(stmt, market_date=market_date, symbols=symbols, agent_name=agent_name)
+            stmt = stmt.order_by(AgentContextFeedback.received_at.desc(), AgentContextFeedback.id.desc()).limit(limit)
+
 
             rows = session.execute(stmt).scalars().all()
             return [_serialize_feedback(row) for row in rows]
+
+
+    def list_feedback_payloads(
+        self,
+        *,
+        market_date: date,
+        symbols: list[str],
+        agent_name: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        with session_scope() as session:
+            stmt = select(AgentContextFeedback)
+            stmt = _apply_feedback_filters(stmt, market_date=market_date, symbols=symbols, agent_name=agent_name)
+            stmt = stmt.order_by(AgentContextFeedback.received_at.desc(), AgentContextFeedback.id.desc()).limit(limit)
+            rows = session.execute(stmt).scalars().all()
+            return [
+                {
+                    'market_date': row.market_date.isoformat(),
+                    'symbol': row.symbol,
+                    'agent_name': row.agent_name,
+                    'run_id': row.run_id,
+                    'received_at': row.received_at.isoformat() if row.received_at else None,
+                    'payload': row.feedback_payload,
+                }
+                for row in rows
+            ]
+
+    def list_request_payloads(
+        self,
+        *,
+        market_date: date,
+        symbols: list[str],
+        agent_name: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        with session_scope() as session:
+            stmt = select(AgentContextFeedback)
+            stmt = _apply_feedback_filters(stmt, market_date=market_date, symbols=symbols, agent_name=agent_name)
+            stmt = stmt.order_by(AgentContextFeedback.received_at.desc(), AgentContextFeedback.id.desc()).limit(limit)
+            rows = session.execute(stmt).scalars().all()
+            return [
+                {
+                    'market_date': row.market_date.isoformat(),
+                    'symbol': row.symbol,
+                    'agent_name': row.agent_name,
+                    'run_id': row.run_id,
+                    'received_at': row.received_at.isoformat() if row.received_at else None,
+                    'payload': row.context_payload,
+                }
+                for row in rows
+            ]
 
 
 class AgentContextFeedbackService:
@@ -207,6 +268,63 @@ class AgentContextFeedbackService:
             'summary': {
                 'count': len(items),
             },
+            'items': items,
+        }
+
+
+    def get_feedback_payloads(
+        self,
+        *,
+        market_date: str | date,
+        symbols: Sequence[str],
+        agent_name: str | None = None,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        normalized_market_date = _normalize_market_date(market_date)
+        normalized_symbols = _normalize_symbols(symbols)
+        normalized_agent_name = _normalize_agent_name(agent_name) if agent_name is not None else None
+        items = self.repository.list_feedback_payloads(
+            market_date=normalized_market_date,
+            symbols=normalized_symbols,
+            agent_name=normalized_agent_name,
+            limit=limit,
+        )
+        return {
+            'request': {
+                'market_date': normalized_market_date.isoformat(),
+                'symbols': normalized_symbols,
+                'agent_name': normalized_agent_name,
+                'limit': limit,
+            },
+            'summary': {'count': len(items)},
+            'items': items,
+        }
+
+    def get_request_payloads(
+        self,
+        *,
+        market_date: str | date,
+        symbols: Sequence[str],
+        agent_name: str | None = None,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        normalized_market_date = _normalize_market_date(market_date)
+        normalized_symbols = _normalize_symbols(symbols)
+        normalized_agent_name = _normalize_agent_name(agent_name) if agent_name is not None else None
+        items = self.repository.list_request_payloads(
+            market_date=normalized_market_date,
+            symbols=normalized_symbols,
+            agent_name=normalized_agent_name,
+            limit=limit,
+        )
+        return {
+            'request': {
+                'market_date': normalized_market_date.isoformat(),
+                'symbols': normalized_symbols,
+                'agent_name': normalized_agent_name,
+                'limit': limit,
+            },
+            'summary': {'count': len(items)},
             'items': items,
         }
 
