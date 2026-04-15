@@ -58,8 +58,11 @@ class AgentContextStatusService:
 
         for symbol in normalized_symbols:
             symbol_rows = grouped.get(symbol, [])
+            latest_run_id = symbol_rows[0]['run_id'] if symbol_rows else None
+            run_rows = [row for row in symbol_rows if row['run_id'] == latest_run_id] if latest_run_id else []
+
             agent_map: dict[str, dict[str, Any]] = {}
-            for row in symbol_rows:
+            for row in run_rows:
                 if row['agent_name'] in EXPECTED_AGENT_SET and row['agent_name'] not in agent_map:
                     agent_map[row['agent_name']] = row
 
@@ -74,10 +77,6 @@ class AgentContextStatusService:
             else:
                 status = 'pending'
                 pending_symbols += 1
-
-            latest_run_id = None
-            if symbol_rows:
-                latest_run_id = symbol_rows[0]['run_id']
 
             items.append(
                 {
