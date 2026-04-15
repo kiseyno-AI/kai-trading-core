@@ -21,6 +21,7 @@
 18. KIS realtime trending route
 19. KIS daily ranking signal-feature collect/inspect routes
 20. Agent feedback intake/read routes for OpenClaw summaries
+21. Role-specific post-EOD agent feedback dispatch route
 
 ## Current routes
 - `POST /broker/kis/token`
@@ -68,6 +69,7 @@
 - `GET /agent-context/symbol-day?market_date=YYYY-MM-DD&symbols=005930&symbols=000660&fs_div=CFS&disclosures_limit=5`
 - `POST /agent-context/feedback`
 - `POST /agent-context/feedback/dispatch`
+- `POST /agent-context/feedback/dispatch/symbols`
 - `GET /agent-context/feedback?market_date=YYYY-MM-DD&symbols=005930&agent_name=openclaw&limit=50`
 
 ## EOD freshness read-layer notes
@@ -115,12 +117,17 @@
 ## Agent context read-layer notes
 - `GET /agent-context/symbol-day` is the current machine-consumption read layer for symbol/day analysis. It does not rank names or emit final trading decisions.
 - The route aggregates persisted symbol metadata, same-day technical snapshot, same-day deterministic action summary, same-day KIS ranking signal features, latest stored DART fundamentals summary, and recent disclosure events up to the requested `market_date`.
+- Symbol-day context now uses exact-date technical snapshots for downstream agent dispatch and does not silently fall back to older technical snapshot rows.
 - The response is intentionally block-oriented and compact so downstream agents can prioritize and interpret instead of re-querying multiple endpoints or parsing prose-heavy summaries.
 
 ## Agent feedback notes
 - `POST /agent-context/feedback` is the JSON intake path for downstream agents such as OpenClaw to send post-EOD symbol summaries and structured feedback back to Core.
-- `POST /agent-context/feedback/dispatch` is the orchestration trigger for role-based OpenClaw dispatch from a completed or partially completed EOD run. In the current phase it fans out only to the three summarizer roles (`eod-summarizer`, `technical-summarizer`, `fundamental-summarizer`), retries retryable failures, and persists successful responses into `agent_context_feedback`.
-- Dispatch requires `OPENCLAW_BASE_URL` and `OPENCLAW_GATEWAY_TOKEN` configuration, and currently stores market-level feedback rows with symbol `__MARKET__` so Core can inspect role outputs per run.
+- `POST /agent-context/feedback/dispatch` is the orchestration trigger for role-based OpenClaw dispatch from a completed or partially completed EOD run.
+- `POST /agent-context/feedback/dispatch/symbols` dispatches the same summarizer roles against symbol-day context for explicit symbol lists.
+- The current dispatch phase targets only `eod-summarizer`, `technical-summarizer`, and `fundamental-summarizer`.
+- Each role now receives a different JSON payload built for its job instead of one shared generic blob: market breadth and trending context for EOD summary, technical/state windows for technical summary, and disclosure plus fundamentals windows for fundamental summary.
+- Dispatch requires `OPENCLAW_BASE_URL` and `OPENCLAW_GATEWAY_TOKEN` configuration, retries retryable failures, and persists successful responses into `agent_context_feedback` as either market-level rows with symbol `__MARKET__` or symbol-level rows for symbol dispatch.
+- Stored normalized feedback now includes a shared top-level contract: `role`, `summary`, `confidence`, `risk_flags`, `details`, and `improvement_notes` so later jobs can mine repeated data/algorithm gaps.
 - Feedback is append-only and stored separately from deterministic `daily_action_summaries`; it does not create orders, positions, or live-trading behavior.
 - `GET /agent-context/feedback` reads stored feedback for a requested `market_date`, optionally filtered by symbol and `agent_name`, so operators or later jobs can inspect the summaries Core received.
 

@@ -38,6 +38,16 @@ class AgentFeedbackDispatchRequest(BaseModel):
     roles: list[str] | None = None
 
 
+class AgentSymbolFeedbackDispatchRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+    market_date: date
+    symbols: list[str] = Field(..., min_length=1, max_length=20)
+    roles: list[str] | None = None
+    fs_div: str | None = None
+    disclosures_limit: int = Field(default=5, ge=0, le=20)
+
+
 @router.get('/symbol-day')
 async def get_symbol_day_context(
     market_date: date = Query(...),
@@ -89,6 +99,22 @@ async def dispatch_agent_feedback(payload: AgentFeedbackDispatchRequest) -> dict
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f'Agent feedback dispatch failed: {exc}') from exc
+
+
+@router.post('/feedback/dispatch/symbols')
+async def dispatch_symbol_agent_feedback(payload: AgentSymbolFeedbackDispatchRequest) -> dict:
+    try:
+        return agent_feedback_orchestrator.dispatch_for_symbols(
+            market_date=payload.market_date,
+            symbols=payload.symbols,
+            roles=payload.roles,
+            fs_div=payload.fs_div,
+            disclosures_limit=payload.disclosures_limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'Agent symbol feedback dispatch failed: {exc}') from exc
 
 
 @router.get('/feedback')
