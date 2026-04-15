@@ -21,6 +21,7 @@
 18. KIS realtime trending route
 19. KIS daily ranking signal-feature collect/inspect routes
 20. Agent feedback intake/read routes for OpenClaw summaries
+21. Role-specific post-EOD agent feedback dispatch route
 
 ## Current routes
 - `POST /broker/kis/token`
@@ -67,6 +68,7 @@
 - `GET /eod/signal-features?market_date=YYYY-MM-DD&symbols=005930,000660`
 - `GET /agent-context/symbol-day?market_date=YYYY-MM-DD&symbols=005930&symbols=000660&fs_div=CFS&disclosures_limit=5`
 - `POST /agent-context/feedback`
+- `POST /agent-context/feedback/dispatch`
 - `GET /agent-context/feedback?market_date=YYYY-MM-DD&symbols=005930&agent_name=openclaw&limit=50`
 
 ## EOD freshness read-layer notes
@@ -118,6 +120,10 @@
 
 ## Agent feedback notes
 - `POST /agent-context/feedback` is the JSON intake path for downstream agents such as OpenClaw to send post-EOD symbol summaries and structured feedback back to Core.
+- `POST /agent-context/feedback/dispatch` is the orchestration trigger for role-based OpenClaw dispatch from a completed or partially completed EOD run.
+- The current dispatch phase targets only `eod-summarizer`, `technical-summarizer`, and `fundamental-summarizer`.
+- Each role now receives a different JSON payload built for its job instead of one shared generic blob: market breadth and trending context for EOD summary, technical/state windows for technical summary, and disclosure plus fundamentals windows for fundamental summary.
+- Dispatch requires `OPENCLAW_BASE_URL` and `OPENCLAW_GATEWAY_TOKEN` configuration, retries retryable failures, and persists successful responses into `agent_context_feedback` as market-level rows with symbol `__MARKET__`.
 - Feedback is append-only and stored separately from deterministic `daily_action_summaries`; it does not create orders, positions, or live-trading behavior.
 - `GET /agent-context/feedback` reads stored feedback for a requested `market_date`, optionally filtered by symbol and `agent_name`, so operators or later jobs can inspect the summaries Core received.
 

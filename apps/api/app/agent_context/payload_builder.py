@@ -1,0 +1,314 @@
+from __future__ import annotations
+
+from collections import Counter
+from dataclasses import dataclass
+from datetime import date, timedelta
+from decimal import Decimal
+from typing import Any
+
+from sqlalchemy import and_, desc, func, or_, select
+
+from app.db import session_scope
+from app.db_models import (
+    DailyActionSummary,
+    DailyPriceBar,
+    DailySignalFeature,
+    DailyTechnicalSnapshot,
+    DailyTrendingRank,
+    DartDisclosureEvent,
+    DartFundamentalsSnapshot,
+    EODCollectionRun,
+    Symbol,
+)
+
+
+def _to_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, (int, float)):
+        return float(value)
+    return None
+
+
+def _safe_date(value: date | None) -> str | None:
+    return value.isoformat() if value else None
+
+
+@dataclass(frozen=True)
+class PayloadWindows:
+    technical_days: int = 252
+    market_breadth_days: int = 20
+    disclosures_days: int = 30
+    fundamentals_years: int = 3
+    top_n: int = 20
+
+
+class AgentPayloadBuilder:
+    def __init__(self, *, windows: PayloadWindows | None = None) -> None:
+        self.windows = windows or PayloadWindows()
+
+    def build_payloads(self, *, run: EODCollectionRun) -> dict[str, dict[str, Any]]:
+        base = self._build_base_payload(run=run)
+        market = self._build_market_payload(run=run)
+        technical = self._build_technical_payload(run=run)
+        fundamentals = self._build_fundamental_payload(run=run)
+        return {
+            'eod-summarizer': base | {'role': 'eod-summarizer', 'market_context': market},
+            'technical-summarizer': base | {'role': 'technical-summarizer', 'technical_context': technical},
+            'fundamental-summarizer': base | {'role': 'fundamental-summarizer', 'fundamental_context': fundamentals},
+        }
+
+    def _build_base_payload(self, *, run: EODCollectionRun) -> dict[str, Any]:
+        return {
+            'trade_date': run.trade_date.isoformat(),
+            'market': run.market,
+            'eod_run': {
+                'id': run.id,
+                'status': run.status,
+                'trigger': run.trigger,
+                'source': run.source,
+                'symbols_total': run.symbols_total,
+                'symbols_succeeded': run.symbols_succeeded,
+                'symbols_failed': run.symbols_failed,
+                'error_message': run.error_message,
+                'started_at': run.started_at.isoformat() if run.started_at else None,
+                'completed_at': run.completed_at.isoformat() if run.completed_at else None,
+            },
+            'data_quality': {
+                'has_errors': run.status == 'completed_with_errors' or bool(run.error_message),
+                'error_message': run.error_message,
+                'success_ratio': (run.symbols_succeeded / run.symbols_total) if run.symbols_total else None,
+            },
+            'run_metadata': run.run_metadata or {},
+            'windows': {
+                'technical_days': self.windows.technical_days,
+                'market_breadth_days': self.windows.market_breadth_days,
+                'disclosures_days': self.windows.disclosures_days,
+                'fundamentals_years': self.windows.fundamentals_years,
+                'top_n': self.windows.top_n,
+            },
+        }
+
+    def _build_market_payload(self, *, run: EODCollectionRun) -> dict[str, Any]:
+        with session_scope() as session:
+            period_rows = session.execute(
+                select(DailyTrendingRank, Symbol)
+                .join(Symbol, Symbol.id == DailyTrendingRank.symbol_id)
+                .where(
+                    DailyTrendingRank.market_date == run.trade_date,
+                    DailyTrendingRank.period.in_(['1d', '5d', '20d']),
+                    DailyTrendingRank.absolute_rank <= self.windows.top_n,
+                )
+                .order_by(DailyTrendingRank.period.asc(), DailyTrendingRank.absolute_rank.asc())
+            ).all()
+
+            signal_rows = session.execute(
+                select(DailySignalFeature, Symbol)
+                .join(Symbol, Symbol.id == DailySignalFeature.symbol_id)
+                .where(DailySignalFeature.market_date == run.trade_date)
+                .order_by(DailySignalFeature.signal_count.desc(), Symbol.symbol.asc())
+                .limit(self.windows.top_n)
+            ).all()
+
+            price_window_start = run.trade_date - timedelta(days=self.windows.market_breadth_days * 2)
+            price_rows = session.execute(
+                select(DailyPriceBar.trade_date, func.count(), func.sum(DailyPriceBar.turnover), func.sum(DailyPriceBar.volume))
+                .where(DailyPriceBar.trade_date >= price_window_start, DailyPriceBar.trade_date <= run.trade_date)
+                .group_by(DailyPriceBar.trade_date)
+                .order_by(DailyPriceBar.trade_date.asc())
+            ).all()
+
+        grouped: dict[str, list[dict[str, Any]]] = {'1d': [], '5d': [], '20d': []}
+        for rank, symbol in period_rows:
+            grouped.setdefault(rank.period, []).append(
+                {
+                    'symbol': symbol.symbol,
+                    'name_ko': symbol.name_ko,
+                    'market': symbol.market,
+                    'rank': rank.absolute_rank,
+                    'direction': rank.trend_direction,
+                    'metric_name': rank.metric_name,
+                    'metric_value': _to_float(rank.metric_value),
+                    'price': rank.price_payload,
+                    'technical': rank.technical_payload,
+                    'action_summary': rank.action_summary_payload,
+                }
+            )
+
+        return {
+            'top_trending': grouped,
+            'signal_feature_leaders': [
+                {
+                    'symbol': symbol.symbol,
+                    'name_ko': symbol.name_ko,
+                    'market': symbol.market,
+                    'signal_count': feature.signal_count,
+                    'volume_power_rank': feature.volume_power_rank,
+                    'volume_power': _to_float(feature.volume_power),
+                    'overtime_volume_rank': feature.overtime_volume_rank,
+                    'overtime_volume': feature.overtime_volume,
+                    'overtime_fluctuation_rank': feature.overtime_fluctuation_rank,
+                    'overtime_fluctuation_rate': _to_float(feature.overtime_fluctuation_rate),
+                }
+                for feature, symbol in signal_rows
+            ],
+            'breadth_window': [
+                {
+                    'trade_date': _safe_date(trade_date),
+                    'symbol_count': symbol_count,
+                    'total_turnover': int(total_turnover or 0),
+                    'total_volume': int(total_volume or 0),
+                }
+                for trade_date, symbol_count, total_turnover, total_volume in price_rows[-self.windows.market_breadth_days :]
+            ],
+        }
+
+    def _build_technical_payload(self, *, run: EODCollectionRun) -> dict[str, Any]:
+        window_start = run.trade_date - timedelta(days=self.windows.technical_days + 60)
+        with session_scope() as session:
+            top_actions = session.execute(
+                select(DailyActionSummary, Symbol)
+                .join(Symbol, Symbol.id == DailyActionSummary.symbol_id)
+                .where(DailyActionSummary.market_date == run.trade_date)
+                .order_by(DailyActionSummary.signal_score.desc(), Symbol.symbol.asc())
+                .limit(self.windows.top_n)
+            ).all()
+
+            top_technicals = session.execute(
+                select(DailyTechnicalSnapshot, Symbol)
+                .join(Symbol, Symbol.id == DailyTechnicalSnapshot.symbol_id)
+                .where(DailyTechnicalSnapshot.market_date == run.trade_date)
+                .order_by(
+                    DailyTechnicalSnapshot.breakout_20d.desc(),
+                    DailyTechnicalSnapshot.return_20d.desc().nullslast(),
+                    Symbol.symbol.asc(),
+                )
+                .limit(self.windows.top_n)
+            ).all()
+
+            regime_rows = session.execute(
+                select(DailyTechnicalSnapshot.trend_state, func.count())
+                .where(DailyTechnicalSnapshot.market_date == run.trade_date)
+                .group_by(DailyTechnicalSnapshot.trend_state)
+            ).all()
+
+            history_rows = session.execute(
+                select(DailyPriceBar.trade_date, func.avg(DailyPriceBar.close_price), func.sum(DailyPriceBar.turnover))
+                .where(and_(DailyPriceBar.trade_date >= window_start, DailyPriceBar.trade_date <= run.trade_date))
+                .group_by(DailyPriceBar.trade_date)
+                .order_by(DailyPriceBar.trade_date.asc())
+            ).all()
+
+        return {
+            'trend_state_distribution': {state: count for state, count in regime_rows},
+            'top_signal_scores': [
+                {
+                    'symbol': symbol.symbol,
+                    'name_ko': symbol.name_ko,
+                    'market': symbol.market,
+                    'action_label': summary.action_label,
+                    'bias_direction': summary.bias_direction,
+                    'signal_score': summary.signal_score,
+                    'confidence_tier': summary.confidence_tier,
+                    'risk_tier': summary.risk_tier,
+                    'reasons': summary.reasons,
+                    'summary_payload': summary.summary_payload,
+                }
+                for summary, symbol in top_actions
+            ],
+            'top_technical_snapshots': [
+                {
+                    'symbol': symbol.symbol,
+                    'name_ko': symbol.name_ko,
+                    'market': symbol.market,
+                    'trend_state': snapshot.trend_state,
+                    'ma_alignment': snapshot.ma_alignment,
+                    'breakout_20d': snapshot.breakout_20d,
+                    'breakdown_20d': snapshot.breakdown_20d,
+                    'return_5d': _to_float(snapshot.return_5d),
+                    'return_20d': _to_float(snapshot.return_20d),
+                    'volume_ratio_20d': _to_float(snapshot.volume_ratio_20d),
+                    'atr_pct_14': _to_float(snapshot.atr_pct_14),
+                    'signal_payload': snapshot.signal_payload,
+                }
+                for snapshot, symbol in top_technicals
+            ],
+            'market_window': [
+                {
+                    'trade_date': _safe_date(trade_date),
+                    'average_close': _to_float(avg_close),
+                    'total_turnover': int(total_turnover or 0),
+                }
+                for trade_date, avg_close, total_turnover in history_rows[-self.windows.technical_days :]
+            ],
+        }
+
+    def _build_fundamental_payload(self, *, run: EODCollectionRun) -> dict[str, Any]:
+        disclosure_start = run.trade_date - timedelta(days=self.windows.disclosures_days)
+        minimum_business_year = max(run.trade_date.year - self.windows.fundamentals_years + 1, 2015)
+        with session_scope() as session:
+            disclosures = session.execute(
+                select(DartDisclosureEvent)
+                .where(
+                    or_(
+                        DartDisclosureEvent.receipt_date == run.trade_date,
+                        and_(
+                            DartDisclosureEvent.receipt_date >= disclosure_start,
+                            DartDisclosureEvent.receipt_date <= run.trade_date,
+                        ),
+                    )
+                )
+                .order_by(desc(DartDisclosureEvent.receipt_date), desc(DartDisclosureEvent.id))
+                .limit(self.windows.top_n * 3)
+            ).scalars().all()
+
+            fundamentals = session.execute(
+                select(DartFundamentalsSnapshot)
+                .where(DartFundamentalsSnapshot.business_year >= minimum_business_year)
+                .order_by(desc(DartFundamentalsSnapshot.business_year), desc(DartFundamentalsSnapshot.id))
+                .limit(self.windows.top_n)
+            ).scalars().all()
+
+        filing_counter = Counter(item.filing_category for item in disclosures)
+        financial_counter = Counter(item.fundamentals_capture_status for item in disclosures if item.is_financial_report)
+
+        return {
+            'disclosure_window_start': disclosure_start.isoformat(),
+            'filing_category_counts': dict(filing_counter),
+            'financial_capture_status_counts': dict(financial_counter),
+            'recent_disclosures': [
+                {
+                    'rcept_no': item.rcept_no,
+                    'receipt_date': _safe_date(item.receipt_date),
+                    'stock_code': item.stock_code,
+                    'corp_name': item.corp_name,
+                    'report_nm': item.report_nm,
+                    'filing_category': item.filing_category,
+                    'is_financial_report': item.is_financial_report,
+                    'fundamentals_capture_status': item.fundamentals_capture_status,
+                    'fundamentals_last_error': item.fundamentals_last_error,
+                }
+                for item in disclosures[: self.windows.top_n]
+            ],
+            'latest_fundamentals_snapshots': [
+                {
+                    'rcept_no': item.rcept_no,
+                    'stock_code': item.stock_code,
+                    'corp_name': item.corp_name,
+                    'business_year': item.business_year,
+                    'report_code': item.report_code,
+                    'filing_category': item.filing_category,
+                    'fs_div': item.fs_div,
+                    'statement_type': item.statement_type,
+                    'period_type': item.period_type,
+                    'source_status': item.source_status,
+                    'captured_at': item.captured_at.isoformat() if item.captured_at else None,
+                }
+                for item in fundamentals
+            ],
+        }
+
+
+agent_payload_builder = AgentPayloadBuilder()
