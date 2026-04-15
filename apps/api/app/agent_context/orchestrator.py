@@ -161,6 +161,8 @@ class AgentFeedbackOrchestrator:
             run = session.get(EODCollectionRun, eod_run_id)
             if run is None:
                 raise ValueError(f'eod_run_id {eod_run_id} not found')
+            if run.status not in {'completed', 'completed_with_errors'}:
+                raise ValueError(f'eod_run_id {eod_run_id} is not finalized (status={run.status})')
             session.expunge(run)
             return run
 
