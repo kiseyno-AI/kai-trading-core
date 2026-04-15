@@ -2,6 +2,7 @@ from datetime import date
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.agent_context.feedback_service import agent_context_feedback_service
@@ -89,7 +90,8 @@ async def submit_agent_feedback(payload: AgentFeedbackRequest) -> dict:
 @router.post('/feedback/dispatch')
 async def dispatch_agent_feedback(payload: AgentFeedbackDispatchRequest) -> dict:
     try:
-        return agent_feedback_orchestrator.dispatch_for_eod_run(
+        return await run_in_threadpool(
+            agent_feedback_orchestrator.dispatch_for_eod_run,
             eod_run_id=payload.eod_run_id,
             roles=payload.roles,
         )
