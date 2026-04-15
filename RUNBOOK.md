@@ -113,6 +113,13 @@ Internal ops commands from `apps/api`:
 - `python3.11 -m app.internal.ops eod-trending-ranks-compute --market-date 2026-04-08`
 - `python3.11 -m app.internal.ops dart-fundamentals-daily-run-if-due --market-date 2026-04-14 --symbol-limit 250 --capture-limit 500`
 - `python3.11 -m app.internal.ops kis-daily-signal-features-collect --market-date 2026-04-14`
+- `python3.11 -m app.internal.index_audit`
+
+Performance audit note:
+
+- Use `python3.11 -m app.internal.index_audit` when large-table reads suddenly slow down after storage moves, cache resets, or dataset growth.
+- It reports the heaviest sequentially-read tables from `pg_stat_user_tables`, shows existing indexes, and prints simple index suggestions for common date-driven access patterns.
+- Current known hot-path examples include `daily_price_bars`, `daily_technical_snapshots`, `daily_action_summaries`, and `dart_fundamentals_rows`.
 
 Notes:
 

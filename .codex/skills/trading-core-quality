@@ -16,6 +16,16 @@ python -c "from app.main import app"
 
 - `GET /health` — process up.
 - `GET /eod/status`, `POST /eod/master/refresh-if-due` — per `RUNBOOK.md`.
+- For recurring status-style endpoints such as freshness, prefer precomputed or cached summary state over repeated full-table aggregate reads when the source tables are large.
+
+## Performance and indexing guardrails
+
+- Treat date-driven reads on large tables as index-sensitive by default.
+- When adding or changing queries that depend on recentness or latest-state semantics, explicitly review index coverage for columns such as `market_date`, `trade_date`, `receipt_date`, and common FK-plus-date access patterns.
+- For large append-heavy tables, consider indexes during schema design rather than waiting for production regressions.
+- When performance changes after storage moves, cache resets, or dataset growth, run `python3.11 -m app.internal.index_audit` from `apps/api` before guessing.
+- Use the audit output plus `pg_stat_user_tables`, `pg_indexes`, and, when needed, `pg_stat_progress_create_index` to identify hot sequential scans and confirm index work completion.
+- If an endpoint only needs the latest known status, consider a summary/cache/materialized-state write path instead of recomputing from large historical tables on every request.
 
 ## Documentation
 

@@ -6,6 +6,8 @@ from alembic.config import Config
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
+ENGINE_CONNECT_ARGS = {'client_encoding': 'UTF8'}
+
 from app.core.settings import settings
 from app.db_models import Base
 
@@ -20,7 +22,12 @@ def _build_database_url() -> str:
 
 
 DATABASE_URL = _build_database_url()
-engine = create_engine(DATABASE_URL, pool_pre_ping=True, future=True)
+engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,
+    future=True,
+    connect_args=ENGINE_CONNECT_ARGS,
+)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 
 
