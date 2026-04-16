@@ -7,6 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.agent_context.feedback_service import agent_context_feedback_service
 from app.agent_context.orchestrator import agent_feedback_orchestrator
+from app.agent_context.progress_service import agent_context_progress_service
 from app.agent_context.read_service import agent_context_read_service
 from app.agent_context.status_service import agent_context_status_service
 
@@ -172,6 +173,24 @@ async def get_agent_feedback_status(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f'Agent feedback status read failed: {exc}') from exc
+
+
+
+
+@router.get('/feedback/progress')
+async def get_agent_feedback_progress(
+    market_date: date = Query(...),
+    symbols: list[str] | None = Query(default=None),
+) -> dict:
+    try:
+        return agent_context_progress_service.get_feedback_progress(
+            market_date=market_date,
+            symbols=symbols,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'Agent feedback progress read failed: {exc}') from exc
 
 
 @router.get('/feedback')

@@ -74,6 +74,7 @@
 - `GET /agent-context/feedback/payloads?market_date=YYYY-MM-DD&symbols=005930`
 - `GET /agent-context/feedback/requests?market_date=YYYY-MM-DD&symbols=005930`
 - `GET /agent-context/feedback/status?market_date=YYYY-MM-DD&symbols=005930&symbols=000660`
+- `GET /agent-context/feedback/progress?market_date=YYYY-MM-DD`
 
 ## EOD freshness read-layer notes
 - `GET /eod/freshness` is the compact web-facing read API for EOD ingestion freshness.
@@ -132,6 +133,7 @@
 - `GET /agent-context/feedback/payloads` reads stored agent feedback payloads by symbol and date.
 - `GET /agent-context/feedback/requests` reads the stored request/context payloads that were sent to the agents by symbol and date.
 - `GET /agent-context/feedback/status` reports whether the three-agent feedback workflow is pending, in progress, partial, or completed for requested symbols, plus completed counts and pending agents.
+- `GET /agent-context/feedback/progress` reports aggregate progress for the expected three-agent feedback workflow, including `total_symbols`, `processed_symbols`, `completed_symbols`, `in_progress_symbols`, `pending_symbols`, `progress_ratio`, `progress_percent`, `failed_items`, `completed_feedback_count`, and `expected_feedback_count`. When `symbols` is omitted, the symbol universe is derived from distinct `daily_price_bars` symbols for the requested market date.
 - The current dispatch phase targets only `eod-summarizer`, `technical-summarizer`, and `fundamental-summarizer`.
 - Each role now receives a different JSON payload built for its job instead of one shared generic blob: market breadth and trending context for EOD summary, technical/state windows for technical summary, and disclosure plus fundamentals windows for fundamental summary.
 - Dispatch requires `OPENCLAW_BASE_URL` and `OPENCLAW_GATEWAY_TOKEN` configuration, retries retryable failures, and persists successful responses into `agent_context_feedback` as either market-level rows with symbol `__MARKET__` or symbol-level rows for symbol dispatch.
