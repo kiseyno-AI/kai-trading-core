@@ -12,11 +12,30 @@ class FakeFreshnessService:
         return {
             'today': {
                 'trade_date': '2026-04-10',
-                'eod_status': 'completed',
-                'symbols_total': 3,
-                'symbols_succeeded': 3,
-                'symbols_failed': 0,
-                'received': True,
+                'price': {
+                    'status': 'ready',
+                    'symbols_total': 3,
+                    'symbols_succeeded': 3,
+                    'symbols_failed': 0,
+                },
+                'technical_analysis': {
+                    'status': 'ready',
+                    'symbols_total': 3,
+                    'symbols_succeeded': 3,
+                    'symbols_failed': 0,
+                },
+                'action_summary': {
+                    'status': 'ready',
+                    'symbols_total': 3,
+                    'symbols_succeeded': 3,
+                    'symbols_failed': 0,
+                },
+                'fundamentals': {
+                    'status': 'ready',
+                    'symbols_total': 1,
+                    'symbols_succeeded': 1,
+                    'symbols_failed': 0,
+                },
             },
             'latest': {
                 'price_trade_date': '2026-04-10',
@@ -117,7 +136,9 @@ class EODRouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         payload = response.json()
         self.assertEqual(payload['today']['trade_date'], '2026-04-10')
-        self.assertEqual(payload['today']['eod_status'], 'completed')
+        self.assertEqual(payload['today']['price']['status'], 'ready')
+        self.assertEqual(payload['today']['technical_analysis']['symbols_succeeded'], 3)
+        self.assertEqual(payload['today']['fundamentals']['symbols_total'], 1)
         self.assertEqual(payload['latest']['symbols_succeeded'], 3)
         self.assertEqual(payload['latest']['action_market_date'], '2026-04-10')
 
