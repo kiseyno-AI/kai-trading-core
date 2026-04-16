@@ -459,6 +459,7 @@ Notes:
 - `dispatch/symbols` accepts `reuse_existing`; when true, Core reuses the latest feedback at or before the requested `market_date` if the relevant source data has not changed, instead of re-dispatching that role.
 - In practice this lets unchanged DART/fundamentals keep using the latest `fundamental-summarizer` result until a newer eligible DART input arrives.
 - For daily operations, the recommended pattern is retry cycles: run the full symbol universe once, collect remaining incomplete symbols, then run one or more smaller follow-up cycles over only the incomplete set. This makes the workflow resilient to transient OpenClaw gateway restarts or brief agent/API failures without redoing the whole universe.
+- Optional post-fundamentals trigger: when `OPENCLAW_FEEDBACK_TRIGGER_AFTER_FUNDAMENTALS_REFRESH=true`, the daily DART fundamentals refresh path automatically starts the symbol feedback retry-cycle workflow after fundamentals collection finishes.
 - Repo helper script: from `apps/api`, `python3.11 -m scripts.run_feedback_retry_cycles` runs a bounded retry-cycle workflow for the configured market date.
 - Symbol status becomes `pending`, `in_progress`, `partial`, or `completed` based on how many of those three agent rows have been stored.
 - These endpoints are historical reads over `agent_context_feedback`, newest rows first.
