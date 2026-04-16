@@ -1331,9 +1331,15 @@ class DartFundamentalsCaptureService:
                 remaining_retryable_events=remaining_candidate_events,
             )
 
-            status = 'completed'
-            if symbols_failed or events_failed or remaining_candidate_events:
-                status = 'partial'
+            partial_reasons: list[str] = []
+            if symbols_failed:
+                partial_reasons.append('symbol_failures')
+            if events_failed:
+                partial_reasons.append('event_failures')
+            if remaining_candidate_events:
+                partial_reasons.append('remaining_retryable_events')
+
+            status = 'partial' if partial_reasons else 'completed'
 
             metadata = {
                 **run_metadata,
@@ -1373,6 +1379,11 @@ class DartFundamentalsCaptureService:
                     limit=100,
                 ),
                 'remaining_candidate_events': remaining_candidate_events,
+                'partial_reasons': partial_reasons,
+                'terminal_outcomes': {
+                    'no_data': len(terminal_symbols_by_status.get(CAPTURE_STATUS_NO_DATA, set())),
+                    'mapping_failed': len(terminal_symbols_by_status.get(CAPTURE_STATUS_MAPPING_FAILED, set())),
+                },
                 'last_progress_at': _utcnow().isoformat(),
             }
             self.repository.complete_refresh_run(
@@ -1420,6 +1431,7 @@ class DartFundamentalsCaptureService:
                 'events_detected': events_detected,
                 'events_captured': events_captured,
                 'events_failed': events_failed,
+                'partial_reasons': partial_reasons,
                 'stale_refresh_run_ids_failed': stale_refresh_run_ids,
                 'sync': {
                     'run_count': len(sync_results),
