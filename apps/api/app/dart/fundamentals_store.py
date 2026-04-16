@@ -186,16 +186,37 @@ class DartFundamentalsRepository:
     ) -> list[int]:
         with session_scope() as session:
             rows = session.execute(
-                select(DartFundamentalsCaptureRun).where(DartFundamentalsCaptureRun.status == 'running')
-            ).scalars().all()
+                select(
+                    DartFundamentalsCaptureRun.id,
+                    DartFundamentalsCaptureRun.started_at,
+                    DartFundamentalsCaptureRun.run_metadata,
+                ).where(DartFundamentalsCaptureRun.status == 'running')
+            ).all()
             failed_run_ids: list[int] = []
-            for row in rows:
-                if _capture_run_activity_at(row) >= stale_before:
+            for run_id, started_at, run_metadata in rows:
+                progress_at = None
+                if isinstance(run_metadata, dict):
+                    progress_at = run_metadata.get('last_progress_at')
+                activity_at = started_at
+                if isinstance(progress_at, str):
+                    try:
+                        activity_at = datetime.fromisoformat(progress_at)
+                    except ValueError:
+                        pass
+                if activity_at >= stale_before:
                     continue
-                row.status = 'failed'
-                row.error_message = error_message
-                row.completed_at = _utcnow()
-                failed_run_ids.append(row.id)
+                failed_run_ids.append(run_id)
+
+            if failed_run_ids:
+                session.execute(
+                    update(DartFundamentalsCaptureRun)
+                    .where(DartFundamentalsCaptureRun.id.in_(failed_run_ids))
+                    .values(
+                        status='failed',
+                        error_message=error_message,
+                        completed_at=func.now(),
+                    )
+                )
             return failed_run_ids
 
     def list_capture_runs(self, *, limit: int = 10) -> list[dict[str, Any]]:
