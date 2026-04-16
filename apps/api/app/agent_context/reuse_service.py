@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime
-from typing import Any, Iterable, Sequence
+from typing import Any, Sequence
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import func, select
 
 from app.agent_context.feedback_service import _normalize_market_date, _normalize_symbols
 from app.agent_context.status_service import EXPECTED_AGENT_NAMES
@@ -70,10 +70,10 @@ class AgentContextReuseService:
                     agent_name = ROLE_TO_AGENT[role]
                     latest_feedback = session.execute(
                         select(AgentContextFeedback)
-                        .where(AgentContextFeedback.market_date == normalized_market_date)
+                        .where(AgentContextFeedback.market_date <= normalized_market_date)
                         .where(AgentContextFeedback.symbol == symbol)
                         .where(AgentContextFeedback.agent_name == agent_name)
-                        .order_by(AgentContextFeedback.received_at.desc(), AgentContextFeedback.id.desc())
+                        .order_by(AgentContextFeedback.market_date.desc(), AgentContextFeedback.received_at.desc(), AgentContextFeedback.id.desc())
                         .limit(1)
                     ).scalar_one_or_none()
 
@@ -203,7 +203,9 @@ class AgentContextReuseService:
             timestamps.append(
                 session.execute(
                     select(func.max(DartFundamentalsSnapshot.captured_at))
+                    .join(DartDisclosureEvent, DartDisclosureEvent.id == DartFundamentalsSnapshot.disclosure_event_id)
                     .where(DartFundamentalsSnapshot.stock_code == symbol)
+                    .where(DartDisclosureEvent.receipt_date <= market_date)
                 ).scalar_one()
             )
         elif role == 'eod-summarizer':
