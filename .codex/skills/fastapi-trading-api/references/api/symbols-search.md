@@ -11,14 +11,15 @@ GET /symbols/search?q=삼성&limit=5
 ## Example response
 ```json
 {
+  "query": "삼성",
+  "count": 1,
   "items": [
     {
       "symbol": "005930",
-      "name": "삼성전자",
-      "market": "KOSPI",
-      "is_active": true
+      "standard_code": "KR7005930003",
+      "name_ko": "삼성전자",
+      "market": "KOSPI"
     }
-  ],
-  "count": 1
+  ]
 }
 ```

@@ -11,8 +11,9 @@ GET /scanner/tracked-symbols
 ## Example read response
 ```json
 {
-  "symbols": ["005930", "000660"],
-  "count": 2
+  "tracked_symbols": ["005930", "000660"],
+  "count": 2,
+  "last_updated_at": "2026-04-16T07:12:00Z"
 }
 ```
 
@@ -29,7 +30,8 @@ Content-Type: application/json
 ## Example replace response
 ```json
 {
-  "symbols": ["005930", "000660", "012450"],
-  "count": 3
+  "tracked_symbols": ["005930", "000660", "012450"],
+  "count": 3,
+  "last_updated_at": "2026-04-16T07:13:00Z"
 }
 ```
