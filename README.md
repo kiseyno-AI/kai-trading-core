@@ -43,7 +43,7 @@ The current backend is a modular monolith centered on the FastAPI service in `ap
 The intended split is deliberate:
 
 - Core services persist normalized facts and deterministic computed context.
-- The read layer returns structured blocks for agents and subagents.
+- The read layer returns structured blocks for agents and batch-oriented summarizer calls.
 - Prioritization, ranking, and interpretation stay outside the core API.
 
 ## Authentication
@@ -173,6 +173,8 @@ This route supports one or many symbols for a given `market_date` and returns a 
 - recent stored DART disclosure events up to the requested market date
 
 This route is specifically for agent consumption. It does not emit final prioritization or ranking decisions.
+
+For symbol-level OpenClaw feedback dispatch, the current production direction is direct parallel fan-out: Core splits symbol-day context into bounded chunks and calls the same summarizer agent ids (`eod-summarizer`, `technical-summarizer`, `fundamental-summarizer`) multiple times in parallel over `/v1/responses`, then merges and stores the per-symbol results. It does not rely on parent-agent `sessions_spawn` orchestration.
 
 ## HTTP API reference
 
