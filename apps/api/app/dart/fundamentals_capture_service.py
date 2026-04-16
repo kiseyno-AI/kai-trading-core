@@ -10,6 +10,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Awaitable, Callable
 
 from app.core.audit_logging import log_fetch_event
+from app.agent_context.retry_service import EXPECTED_ROLES, FeedbackRetryCycleConfig, agent_feedback_retry_service
 from app.core.settings import settings
 from app.db import session_scope
 from app.db_models import DailyPriceBar
@@ -1379,6 +1380,18 @@ class DartFundamentalsCaptureService:
                 events_failed=events_failed,
                 run_metadata=metadata,
             )
+            feedback_followup = None
+            if settings.openclaw_feedback_trigger_after_fundamentals_refresh and status in {'completed', 'partial'}:
+                feedback_followup = agent_feedback_retry_service.run_retry_cycles(
+                    config=FeedbackRetryCycleConfig(
+                        market_date=resolved_market_date,
+                        roles=EXPECTED_ROLES,
+                        max_cycles=settings.openclaw_feedback_retry_max_cycles,
+                        outer_batch_size=settings.openclaw_feedback_retry_outer_batch_size,
+                        reuse_existing=True,
+                    )
+                )
+
             return {
                 'triggered': True,
                 'run_id': run_id,
