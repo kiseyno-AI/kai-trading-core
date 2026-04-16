@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any, Sequence
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 
 from app.agent_context.feedback_service import _normalize_market_date, _normalize_symbols
 from app.agent_context.status_service import EXPECTED_AGENT_NAMES
