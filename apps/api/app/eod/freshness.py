@@ -155,7 +155,7 @@ class EODFreshnessService:
 
         return {
             'status': status,
-            'symbols_total': symbols_succeeded,
+            'symbols_total': symbols_succeeded + symbols_failed,
             'symbols_succeeded': symbols_succeeded,
             'symbols_failed': symbols_failed,
         }
