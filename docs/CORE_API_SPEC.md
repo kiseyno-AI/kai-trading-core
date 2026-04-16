@@ -336,11 +336,30 @@ Authorization: Bearer <token>
 {
   "today": {
     "trade_date": "2026-04-10",
-    "eod_status": "missing",
-    "symbols_total": null,
-    "symbols_succeeded": null,
-    "symbols_failed": null,
-    "received": false
+    "price": {
+      "status": "missing",
+      "symbols_total": 3584,
+      "symbols_succeeded": 0,
+      "symbols_failed": 0
+    },
+    "technical_analysis": {
+      "status": "missing",
+      "symbols_total": 3584,
+      "symbols_succeeded": 0,
+      "symbols_failed": 0
+    },
+    "action_summary": {
+      "status": "missing",
+      "symbols_total": 3584,
+      "symbols_succeeded": 0,
+      "symbols_failed": 0
+    },
+    "fundamentals": {
+      "status": "missing",
+      "symbols_total": 0,
+      "symbols_succeeded": 0,
+      "symbols_failed": 0
+    }
   },
   "latest": {
     "price_trade_date": "2026-04-09",
@@ -354,20 +373,21 @@ Authorization: Bearer <token>
 }
 ```
 
-### Status meanings
+### Today's stage status meanings
 - `running`
-- `completed`
-- `completed_with_errors`
+- `ready`
 - `missing`
+
+`latest.eod_status` keeps the legacy EOD run statuses: `running`, `completed`, `completed_with_errors`, and `missing`.
 
 ### UX use
 This route is the preferred API for expressing:
-- whether today’s EOD is done,
+- whether today’s price, technical-analysis, action-summary, and fundamentals stages are ready or running,
 - whether it was partial,
 - whether derived layers lag behind price data,
 - latest available dates for key data groups.
 
-The `today` block is always scoped to the current Seoul trade date. When no run or bars exist for that date, it remains `missing` even if `latest.*` points to a prior available date. Use `latest.symbols_total`, `latest.symbols_succeeded`, `latest.symbols_failed`, and `latest.eod_status` for the run metadata tied to `latest.price_trade_date`.
+The `today` block is always scoped to the current Seoul trade date. Price, technical-analysis, and action-summary totals use the active symbol universe; fundamentals totals use the number of symbols refreshed by today's DART daily fundamentals run. When no run or rows exist for a stage, that stage remains `missing` even if `latest.*` points to a prior available date. Use `latest.symbols_total`, `latest.symbols_succeeded`, `latest.symbols_failed`, and `latest.eod_status` for the run metadata tied to `latest.price_trade_date`.
 
 ---
 

@@ -1750,3 +1750,53 @@ def load_latest_available_daily_action_summary_date() -> str | None:
     with session_scope() as session:
         value = session.execute(select(func.max(DailyActionSummary.market_date))).scalar_one()
         return value.isoformat() if value else None
+
+
+def count_live_symbols() -> int:
+    with session_scope() as session:
+        return int(
+            session.execute(
+                select(func.count(Symbol.id))
+                .select_from(Symbol)
+                .where(Symbol.is_active.is_(True))
+            ).scalar_one()
+        )
+
+
+def count_daily_price_bars_for_live_symbols(trade_date: str | date) -> int:
+    with session_scope() as session:
+        return int(
+            session.execute(
+                select(func.count(func.distinct(DailyPriceBar.symbol_id)))
+                .select_from(DailyPriceBar)
+                .join(Symbol, Symbol.id == DailyPriceBar.symbol_id)
+                .where(DailyPriceBar.trade_date == _normalize_trade_date(trade_date))
+                .where(Symbol.is_active.is_(True))
+            ).scalar_one()
+        )
+
+
+def count_daily_technical_snapshots_for_live_symbols(market_date: str | date) -> int:
+    with session_scope() as session:
+        return int(
+            session.execute(
+                select(func.count(func.distinct(DailyTechnicalSnapshot.symbol_id)))
+                .select_from(DailyTechnicalSnapshot)
+                .join(Symbol, Symbol.id == DailyTechnicalSnapshot.symbol_id)
+                .where(DailyTechnicalSnapshot.market_date == _normalize_trade_date(market_date))
+                .where(Symbol.is_active.is_(True))
+            ).scalar_one()
+        )
+
+
+def count_daily_action_summaries_for_live_symbols(market_date: str | date) -> int:
+    with session_scope() as session:
+        return int(
+            session.execute(
+                select(func.count(func.distinct(DailyActionSummary.symbol_id)))
+                .select_from(DailyActionSummary)
+                .join(Symbol, Symbol.id == DailyActionSummary.symbol_id)
+                .where(DailyActionSummary.market_date == _normalize_trade_date(market_date))
+                .where(Symbol.is_active.is_(True))
+            ).scalar_one()
+        )

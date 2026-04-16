@@ -13,10 +13,30 @@ GET /eod/freshness
 {
   "today": {
     "trade_date": "2026-04-16",
-    "eod_status": "running",
-    "symbols_total": 3579,
-    "symbols_succeeded": 3314,
-    "symbols_failed": 0
+    "price": {
+      "status": "running",
+      "symbols_total": 3579,
+      "symbols_succeeded": 3314,
+      "symbols_failed": 0
+    },
+    "technical_analysis": {
+      "status": "running",
+      "symbols_total": 3579,
+      "symbols_succeeded": 0,
+      "symbols_failed": 0
+    },
+    "action_summary": {
+      "status": "running",
+      "symbols_total": 3579,
+      "symbols_succeeded": 0,
+      "symbols_failed": 0
+    },
+    "fundamentals": {
+      "status": "ready",
+      "symbols_total": 42,
+      "symbols_succeeded": 42,
+      "symbols_failed": 1
+    }
   },
   "latest": {
     "price_trade_date": "2026-04-15",
