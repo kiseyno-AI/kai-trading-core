@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date
 from typing import Any, Sequence
 
-from sqlalchemy import func, select
+from sqlalchemy import distinct, func, select
 
 from app.agent_context.feedback_service import _normalize_market_date, _normalize_symbols
 from app.agent_context.status_service import EXPECTED_AGENT_NAMES, EXPECTED_AGENT_SET
@@ -22,15 +22,17 @@ class AgentContextProgressService:
         normalized_symbols = _normalize_symbols(symbols) if symbols is not None else None
 
         with session_scope() as session:
-            universe_stmt = (
-                select(func.count(func.distinct(Symbol.symbol)))
+            universe_symbols_stmt = (
+                select(distinct(Symbol.symbol))
                 .select_from(DailyPriceBar)
                 .join(Symbol, Symbol.id == DailyPriceBar.symbol_id)
                 .where(DailyPriceBar.trade_date == normalized_market_date)
+                .order_by(Symbol.symbol.asc())
             )
             if normalized_symbols:
-                universe_stmt = universe_stmt.where(Symbol.symbol.in_(normalized_symbols))
-            total_symbols = int(session.execute(universe_stmt).scalar() or 0)
+                universe_symbols_stmt = universe_symbols_stmt.where(Symbol.symbol.in_(normalized_symbols))
+            universe_symbols = [str(symbol) for symbol in session.execute(universe_symbols_stmt).scalars().all()]
+            total_symbols = len(universe_symbols)
 
             rows_stmt = (
                 select(
@@ -68,14 +70,12 @@ class AgentContextProgressService:
         pending_symbols = 0
         failed_items = 0
 
-        target_symbols = normalized_symbols if normalized_symbols is not None else sorted(grouped.keys())
-        if normalized_symbols is None and total_symbols > len(target_symbols):
-            pending_symbols = total_symbols - len(target_symbols)
+        target_symbols = universe_symbols
 
         for symbol in target_symbols:
             symbol_rows = grouped.get(symbol, [])
             latest_run_id = symbol_rows[0]['run_id'] if symbol_rows else None
-            run_rows = [row for row in symbol_rows if row['run_id'] == latest_run_id] if latest_run_id else []
+            run_rows = [row for row in symbol_rows if row['run_id'] == latest_run_id] if symbol_rows else []
 
             agent_names = {row['agent_name'] for row in run_rows if row['agent_name'] in EXPECTED_AGENT_SET}
             if len(agent_names) == len(EXPECTED_AGENT_NAMES):
