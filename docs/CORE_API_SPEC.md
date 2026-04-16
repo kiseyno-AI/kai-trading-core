@@ -387,7 +387,7 @@ This route is the preferred API for expressing:
 - whether derived layers lag behind price data,
 - latest available dates for key data groups.
 
-The `today` block is always scoped to the current Seoul trade date. Price, technical-analysis, and action-summary totals use the active symbol universe; fundamentals totals use the number of symbols refreshed by today's DART daily fundamentals run. When no run or rows exist for a stage, that stage remains `missing` even if `latest.*` points to a prior available date. Use `latest.symbols_total`, `latest.symbols_succeeded`, `latest.symbols_failed`, and `latest.eod_status` for the run metadata tied to `latest.price_trade_date`.
+The `today` block is always scoped to the current Seoul trade date. Price, technical-analysis, and action-summary totals use the active symbol universe; fundamentals totals use the number of symbols refreshed by today's DART daily fundamentals run. When no run or rows exist for a stage, that stage remains `missing` even if `latest.*` points to a prior available date. Use `latest.symbols_total`, `latest.symbols_succeeded`, `latest.symbols_failed`, and `latest.eod_status` for the run metadata tied to `latest.price_trade_date`. Bar-availability checks for `latest.eod_status` use all stored bars for `latest.price_trade_date`, not only symbols still active in the current universe.
 
 ---
 

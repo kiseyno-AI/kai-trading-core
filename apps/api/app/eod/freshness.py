@@ -9,6 +9,7 @@ from app.dart.fundamentals_store import dart_fundamentals_repository
 from app.market.clock import get_market_state
 from app.market_data_store import (
     count_daily_action_summaries_for_live_symbols,
+    count_daily_price_bars_for_date,
     count_daily_price_bars_for_live_symbols,
     count_daily_technical_snapshots_for_live_symbols,
     count_live_symbols,
@@ -36,6 +37,7 @@ class EODFreshnessService:
     daily_action_summary_count_loader: Callable = count_daily_action_summaries_for_live_symbols
     latest_fundamentals_run_loader: Callable = _load_latest_fundamentals_refresh_run
     latest_price_trade_date_loader: Callable = load_latest_available_daily_price_trade_date
+    latest_price_bar_count_loader: Callable = count_daily_price_bars_for_date
     latest_technical_market_date_loader: Callable = load_latest_available_daily_technical_snapshot_date
     latest_action_market_date_loader: Callable = load_latest_available_daily_action_summary_date
 
@@ -49,12 +51,13 @@ class EODFreshnessService:
         action_summary_count = self.daily_action_summary_count_loader(trade_date)
         fundamentals_run = self.latest_fundamentals_run_loader(trade_date)
 
-        if latest_price_trade_date == trade_date:
-            latest_price_run = today_run
-            latest_price_bar_count = price_bar_count
-        elif latest_price_trade_date:
-            latest_price_run = self.latest_run_loader(market='KRX', trade_date=latest_price_trade_date)
-            latest_price_bar_count = self.daily_price_bar_count_loader(latest_price_trade_date)
+        if latest_price_trade_date:
+            latest_price_run = (
+                today_run
+                if latest_price_trade_date == trade_date
+                else self.latest_run_loader(market='KRX', trade_date=latest_price_trade_date)
+            )
+            latest_price_bar_count = self.latest_price_bar_count_loader(latest_price_trade_date)
         else:
             latest_price_run = None
             latest_price_bar_count = 0

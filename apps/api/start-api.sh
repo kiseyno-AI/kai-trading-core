@@ -18,7 +18,7 @@ if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
   exit 1
 fi
 
-if [ "${INSTALL_REQUIREMENTS_ON_START:-false}" = "true" ]; then
+if [ "${INSTALL_REQUIREMENTS_ON_START:-true}" = "true" ]; then
   "$PYTHON_BIN" -m pip install -r requirements.txt
 fi
 set -a
