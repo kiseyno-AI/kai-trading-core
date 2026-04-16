@@ -20,3 +20,15 @@ description: FastAPI app structure, routers, middleware, lifespan, and settings 
 ## Consumer alignment
 
 - Paths like `/market/status`, `/quotes/tracked`, `/scanner/...` should stay compatible with the frontend BFF contract; update `docs/API_BUILD_ORDER.md` (and external contract docs) when routes or payloads change.
+
+## API reference pages
+
+- Route reference pages live under `references/api/` in this skill.
+- When changing an existing HTTP endpoint, update its matching markdown page with:
+  - summary
+  - example request
+  - example response payload
+- When adding a new HTTP endpoint, create a new markdown page in `references/api/` using the same structure.
+- Keep one route or tightly related route pair per markdown file where practical.
+- Prefer concise, real-shape payload examples over exhaustive field dumps.
+- If the route contract changes, update both the route page and `docs/API_BUILD_ORDER.md` in the same PR.

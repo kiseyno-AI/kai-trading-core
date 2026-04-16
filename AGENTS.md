@@ -29,6 +29,7 @@ Broker and data: KIS integration under app/brokers/kis/; KIS_USE_MOCK, KIS_MOCK_
 Do not add live order execution, position-changing calls, or production trading behavior without explicit product approval. Prefer mock/sandbox endpoints for development.
 
 When adding or changing HTTP routes, keep docs/API_BUILD_ORDER.md and any consumer contract (e.g. trading-web docs/API_CONTRACT.md) aligned with actual paths and JSON shapes.
+When adding or changing HTTP routes, also maintain the per-endpoint markdown reference pages under `.codex/skills/fastapi-trading-api/references/api/`. For each route, keep a concise page with summary, example request, and example response payload. New routes should add a new page in the same PR.
 
 After code changes in apps/api: from apps/api run `pip install -r requirements.txt` (if needed) and `python -c "from app.main import app"` as a smoke import; run the server and hit GET /health per RUNBOOK.md when behavior needs verification.
 
