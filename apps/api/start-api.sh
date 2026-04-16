@@ -18,9 +18,18 @@ if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
   exit 1
 fi
 
-if [ "${INSTALL_REQUIREMENTS_ON_START:-true}" = "true" ]; then
+NEEDS_BOOTSTRAP=0
+if ! "$PYTHON_BIN" - <<'PYCODE' >/dev/null 2>&1
+import fastapi, uvicorn, httpx, pydantic_settings, sqlalchemy, psycopg, alembic, pykrx
+PYCODE
+then
+  NEEDS_BOOTSTRAP=1
+fi
+
+if [ "${INSTALL_REQUIREMENTS_ON_START:-auto}" = "true" ] ||    { [ "${INSTALL_REQUIREMENTS_ON_START:-auto}" = "auto" ] && [ "$NEEDS_BOOTSTRAP" = "1" ]; }; then
   "$PYTHON_BIN" -m pip install -r requirements.txt
 fi
+
 set -a
 source .env
 set +a
