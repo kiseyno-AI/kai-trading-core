@@ -166,14 +166,17 @@ class DartFundamentalsRepository:
         run_metadata: dict[str, Any] | None = None,
     ) -> None:
         with session_scope() as session:
-            row = session.get(DartFundamentalsCaptureRun, run_id)
-            if row is None:
-                return
-            row.events_seen = events_seen
-            row.events_captured = events_captured
-            row.events_failed = events_failed
-            row.events_skipped = events_skipped
-            row.run_metadata = run_metadata
+            session.execute(
+                update(DartFundamentalsCaptureRun)
+                .where(DartFundamentalsCaptureRun.id == run_id)
+                .values(
+                    events_seen=events_seen,
+                    events_captured=events_captured,
+                    events_failed=events_failed,
+                    events_skipped=events_skipped,
+                    run_metadata=run_metadata,
+                )
+            )
 
     def fail_stale_capture_runs(
         self,
@@ -259,19 +262,22 @@ class DartFundamentalsRepository:
         run_metadata: dict[str, Any] | None = None,
     ) -> None:
         with session_scope() as session:
-            row = session.get(DartFundamentalsRefreshRun, run_id)
-            if row is None:
-                return
-            row.symbols_checked = symbols_checked
-            row.symbols_missing = symbols_missing
-            row.symbols_stale = symbols_stale
-            row.symbols_fresh = symbols_fresh
-            row.symbols_refreshed = symbols_refreshed
-            row.symbols_failed = symbols_failed
-            row.events_detected = events_detected
-            row.events_captured = events_captured
-            row.events_failed = events_failed
-            row.run_metadata = run_metadata
+            session.execute(
+                update(DartFundamentalsRefreshRun)
+                .where(DartFundamentalsRefreshRun.id == run_id)
+                .values(
+                    symbols_checked=symbols_checked,
+                    symbols_missing=symbols_missing,
+                    symbols_stale=symbols_stale,
+                    symbols_fresh=symbols_fresh,
+                    symbols_refreshed=symbols_refreshed,
+                    symbols_failed=symbols_failed,
+                    events_detected=events_detected,
+                    events_captured=events_captured,
+                    events_failed=events_failed,
+                    run_metadata=run_metadata,
+                )
+            )
 
     def complete_refresh_run(
         self,
