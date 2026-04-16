@@ -932,6 +932,7 @@ class DartFundamentalsCaptureService:
         force: bool = False,
         fs_div: str | None = None,
         trigger: str = 'manual_daily_api',
+        retry_cycles: int = 1,
     ) -> dict[str, Any]:
         if symbol_offset < 0:
             raise ValueError('symbol_offset must be greater than or equal to 0')
@@ -939,6 +940,8 @@ class DartFundamentalsCaptureService:
             raise ValueError('symbol_limit must be greater than or equal to 1')
         if capture_limit is not None and capture_limit < 1:
             raise ValueError('capture_limit must be greater than or equal to 1')
+        if retry_cycles < 1:
+            raise ValueError('retry_cycles must be greater than or equal to 1')
 
         resolved_market_date = _normalize_refresh_date(market_date, default=date.today())
         resolved_fs_div = (fs_div or settings.dart_fundamentals_default_fs_div).strip().upper()
@@ -992,6 +995,7 @@ class DartFundamentalsCaptureService:
             'symbol_offset': symbol_offset,
             'symbol_limit': symbol_limit,
             'capture_limit': capture_limit,
+            'retry_cycles_requested': retry_cycles,
             'selected_symbols_sample': _limited_sample(selected_stock_codes),
             'stale_refresh_run_ids_failed': stale_refresh_run_ids,
             'last_progress_at': _utcnow().isoformat(),
@@ -1249,47 +1253,92 @@ class DartFundamentalsCaptureService:
                 else:
                     symbol_result['state'] = 'missing_no_newer_events'
 
-            capture_result: dict[str, Any]
+            capture_runs: list[dict[str, Any]] = []
+            capture_result: dict[str, Any] = {
+                'run_id': None,
+                'status': 'skipped',
+                'reason': 'no_stale_or_missing_events',
+                'fs_div': resolved_fs_div,
+                'events_seen': 0,
+                'events_captured': 0,
+                'events_failed': 0,
+                'events_skipped': 0,
+                'results': [],
+            }
+            remaining_candidate_events = events_detected
+            retry_cycles_completed = 0
+
             if event_ids_to_capture:
-                capture_metadata = {
-                    'candidate_event_count': events_detected,
-                    'capture_event_count': len(event_ids_to_capture),
-                    'candidate_event_ids_sample': _limited_sample(candidate_event_ids, limit=100),
-                }
-
-                async def capture_operation() -> dict[str, Any]:
-                    return await self.capture_recent_fundamentals(
-                        limit=len(event_ids_to_capture),
-                        force=False,
-                        trigger='daily_incremental_refresh',
-                        fs_div=resolved_fs_div,
-                        stock_codes=sorted(candidate_symbols),
-                        receipt_date_from=min(check_start_by_symbol.values()) if check_start_by_symbol else None,
-                        receipt_date_to=resolved_market_date,
-                        event_ids=event_ids_to_capture,
-                    )
-
-                capture_result = await _await_with_refresh_heartbeat(
-                    capture_operation,
-                    heartbeat=lambda: update_refresh_progress(
-                        stage='capturing_fundamentals',
-                        extra_metadata=capture_metadata,
-                        persist=False,
-                    ),
+                pending_event_ids = list(event_ids_to_capture)
+                candidate_receipt_date_from = (
+                    min(check_start_by_symbol.values()) if check_start_by_symbol else None
                 )
-            else:
-                capture_result = {
-                    'run_id': None,
-                    'status': 'skipped',
-                    'reason': 'no_stale_or_missing_events',
-                    'fs_div': resolved_fs_div,
-                    'events_seen': 0,
-                    'events_captured': 0,
-                    'events_failed': 0,
-                    'events_skipped': 0,
-                    'results': [],
-                }
+                max_retry_cycles = max(1, retry_cycles)
+                for cycle_index in range(max_retry_cycles):
+                    if not pending_event_ids:
+                        break
+                    retry_cycles_completed = cycle_index + 1
+                    capture_metadata = {
+                        'candidate_event_count': events_detected,
+                        'capture_event_count': len(pending_event_ids),
+                        'candidate_event_ids_sample': _limited_sample(candidate_event_ids, limit=100),
+                        'retry_cycle': retry_cycles_completed,
+                        'retry_cycles_requested': max_retry_cycles,
+                    }
 
+                    async def capture_operation() -> dict[str, Any]:
+                        return await self.capture_recent_fundamentals(
+                            limit=len(pending_event_ids),
+                            force=False,
+                            trigger='daily_incremental_refresh',
+                            fs_div=resolved_fs_div,
+                            stock_codes=sorted(candidate_symbols),
+                            receipt_date_from=candidate_receipt_date_from,
+                            receipt_date_to=resolved_market_date,
+                            event_ids=list(pending_event_ids),
+                        )
+
+                    cycle_result = await _await_with_refresh_heartbeat(
+                        capture_operation,
+                        heartbeat=lambda: update_refresh_progress(
+                            stage='capturing_fundamentals',
+                            extra_metadata=capture_metadata,
+                            persist=False,
+                        ),
+                    )
+                    capture_runs.append(cycle_result)
+
+                    pending_set = set(pending_event_ids)
+                    retryable_next: list[int] = []
+                    for item in cycle_result.get('results', []):
+                        event_id = item.get('event_id')
+                        if event_id not in pending_set:
+                            continue
+                        if item.get('status') in RETRYABLE_CAPTURE_STATUSES:
+                            retryable_next.append(int(event_id))
+                    pending_event_ids = retryable_next
+                    remaining_candidate_events = len(pending_event_ids)
+                    if not pending_event_ids:
+                        break
+
+                if capture_runs:
+                    aggregated_results = []
+                    for cycle_result in capture_runs:
+                        aggregated_results.extend(cycle_result.get('results', []))
+                    capture_result = {
+                        'run_id': capture_runs[-1].get('run_id'),
+                        'status': capture_runs[-1].get('status'),
+                        'fs_div': resolved_fs_div,
+                        'events_seen': sum(int(item.get('events_seen') or 0) for item in capture_runs),
+                        'events_captured': sum(int(item.get('events_captured') or 0) for item in capture_runs),
+                        'events_failed': sum(int(item.get('events_failed') or 0) for item in capture_runs),
+                        'events_skipped': sum(int(item.get('events_skipped') or 0) for item in capture_runs),
+                        'results': aggregated_results,
+                        'runs': capture_runs,
+                        'retry_cycles_requested': max_retry_cycles,
+                        'retry_cycles_completed': retry_cycles_completed,
+                        'remaining_retryable_event_ids_sample': _limited_sample(pending_event_ids, limit=100),
+                    }
             events_captured = int(capture_result.get('events_captured') or 0)
             events_failed = int(capture_result.get('events_failed') or 0)
             refreshed_symbols = {
@@ -1314,7 +1363,6 @@ class DartFundamentalsCaptureService:
                         symbol_results[stock_code]['error'] = item.get('error')
             symbols_refreshed = len(refreshed_symbols)
             symbols_failed = len(lookup_failed_symbols | failed_symbols)
-            remaining_candidate_events = max(events_detected - len(event_ids_to_capture), 0)
             symbols_fresh = len(
                 [
                     stock_code
@@ -1348,6 +1396,7 @@ class DartFundamentalsCaptureService:
                 'operator_buckets': operator_buckets,
                 'sync_runs': sync_results,
                 'capture_run_id': capture_result.get('run_id'),
+                'capture_run_ids': [item.get('run_id') for item in capture_runs if item.get('run_id') is not None],
                 'candidate_event_count': events_detected,
                 'candidate_event_ids_sample': _limited_sample(candidate_event_ids, limit=100),
                 'candidate_events_sample': _limited_sample(
@@ -1379,6 +1428,8 @@ class DartFundamentalsCaptureService:
                     limit=100,
                 ),
                 'remaining_candidate_events': remaining_candidate_events,
+                'retry_cycles_requested': retry_cycles,
+                'retry_cycles_completed': retry_cycles_completed,
                 'partial_reasons': partial_reasons,
                 'terminal_outcomes': {
                     'no_data': len(terminal_symbols_by_status.get(CAPTURE_STATUS_NO_DATA, set())),
@@ -1441,6 +1492,9 @@ class DartFundamentalsCaptureService:
                     ),
                 },
                 'capture': capture_result,
+                'retry_cycles_requested': retry_cycles,
+                'retry_cycles_completed': retry_cycles_completed,
+                'remaining_retryable_events': remaining_candidate_events,
                 'samples': {
                     'lookup_errors': _limited_sample(lookup_errors),
                     'stale_symbols': _limited_sample(sorted(stale_symbols)),
