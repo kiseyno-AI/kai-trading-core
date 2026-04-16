@@ -83,7 +83,6 @@ class EODFreshnessService:
 
     def read(self) -> dict:
         trade_date = self.market_state_loader().server_time[:10]
-        live_symbols_total = self.live_symbol_count_loader()
         latest_price_trade_date = self.latest_price_trade_date_loader()
         price_bar_count = self.daily_price_bar_count_loader(trade_date)
         technical_snapshot_count = self.daily_technical_snapshot_count_loader(trade_date)
@@ -91,11 +90,26 @@ class EODFreshnessService:
         fundamentals_counts = self.daily_fundamentals_count_loader(trade_date)
 
         if latest_price_trade_date:
-            latest_price_run = self.latest_run_loader(market='KRX', trade_date=latest_price_trade_date)
+            latest_price_run = self.latest_run_loader(
+                market='KRX',
+                trade_date=latest_price_trade_date,
+                statuses=['completed', 'completed_with_errors'],
+            ) or self.latest_run_loader(market='KRX', trade_date=latest_price_trade_date)
             latest_price_bar_count = self.latest_price_bar_count_loader(latest_price_trade_date)
         else:
             latest_price_run = None
             latest_price_bar_count = 0
+
+        today_run = self.latest_run_loader(
+            market='KRX',
+            trade_date=trade_date,
+            statuses=['completed', 'completed_with_errors'],
+        ) or self.latest_run_loader(market='KRX', trade_date=trade_date)
+        live_symbols_total = int((today_run or {}).get('symbols_total') or 0)
+        if live_symbols_total == 0 and latest_price_run:
+            live_symbols_total = int(latest_price_run.get('symbols_total') or 0)
+        if live_symbols_total == 0:
+            live_symbols_total = int(self.live_symbol_count_loader() or 0)
 
         return {
             'today': {
