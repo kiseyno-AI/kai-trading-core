@@ -34,6 +34,11 @@ class AgentContextProgressService:
                 universe_symbols_stmt = universe_symbols_stmt.where(Symbol.symbol.in_(normalized_symbols))
             universe_symbols = [str(symbol) for symbol in session.execute(universe_symbols_stmt).scalars().all()]
 
+            latest_feedback_at = session.execute(
+                select(func.max(AgentContextFeedback.received_at))
+                .where(AgentContextFeedback.market_date == normalized_market_date)
+            ).scalar_one()
+
             rows_stmt = (
                 select(
                     AgentContextFeedback.symbol,
@@ -67,7 +72,7 @@ class AgentContextProgressService:
         for row in rows:
             grouped.setdefault(str(row['symbol']), []).append(row)
 
-        latest_feedback_at = rows[0]['received_at'] if rows else None
+        latest_feedback_at = latest_feedback_at.isoformat() if latest_feedback_at else None
         latest_feedback_dt = None
         if latest_feedback_at:
             latest_feedback_dt = datetime.fromisoformat(str(latest_feedback_at))
