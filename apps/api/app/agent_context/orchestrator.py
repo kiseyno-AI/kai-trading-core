@@ -383,8 +383,6 @@ class AgentFeedbackOrchestrator:
                         'attempt': response.get('attempt'),
                         'started_at': response.get('started_at'),
                         'completed_at': response.get('completed_at'),
-                        'session_ref': response.get('session_ref'),
-                        'cleanup': response.get('cleanup'),
                     },
                     'normalized_feedback': response.get('normalized_feedback'),
                 },
@@ -433,13 +431,11 @@ class AgentFeedbackOrchestrator:
                     agent_name=spec.agent_name,
                     run_id=request_run_id,
                     payload=role_payload,
-                    response={
-                        **response,
-                        'cleanup': {'status': 'pending'},
-                    },
+                    response=response,
                     context=role_payload,
                 )
-                response['cleanup'] = self._get_client().cleanup_session(response.get('session_ref'))
+                cleanup_result = self._get_client().cleanup_session(response.get('session_ref'))
+                logger.info('Agent feedback session cleanup finished', extra={'agent_name': spec.agent_name, 'symbol': symbol, 'session_ref': response.get('session_ref'), 'cleanup': cleanup_result})
                 if symbol != '__MARKET__':
                     with session_scope() as session:
                         record = session.get(AgentContextFeedback, stored['id'])
@@ -457,9 +453,13 @@ class AgentFeedbackOrchestrator:
                     }
                 )
             except AgentDispatchTerminalError as exc:
-                failures.append({'role': spec.role, 'agent_name': spec.agent_name, 'symbol': symbol, 'status': 'failed', 'retryable': False, 'error': str(exc), 'cleanup': self._get_client().cleanup_session(response.get('session_ref') if response else None)})
+                cleanup_result = self._get_client().cleanup_session(response.get('session_ref') if response else None)
+                logger.warning('Agent feedback dispatch failed after cleanup attempt', extra={'agent_name': spec.agent_name, 'symbol': symbol, 'session_ref': response.get('session_ref') if response else None, 'cleanup': cleanup_result, 'error': str(exc)})
+                failures.append({'role': spec.role, 'agent_name': spec.agent_name, 'symbol': symbol, 'status': 'failed', 'retryable': False, 'error': str(exc)})
             except Exception as exc:  # noqa: BLE001
-                failures.append({'role': spec.role, 'agent_name': spec.agent_name, 'symbol': symbol, 'status': 'failed', 'retryable': True, 'error': str(exc), 'cleanup': self._get_client().cleanup_session(response.get('session_ref') if response else None)})
+                cleanup_result = self._get_client().cleanup_session(response.get('session_ref') if response else None)
+                logger.warning('Agent feedback dispatch raised after cleanup attempt', extra={'agent_name': spec.agent_name, 'symbol': symbol, 'session_ref': response.get('session_ref') if response else None, 'cleanup': cleanup_result, 'error': str(exc)})
+                failures.append({'role': spec.role, 'agent_name': spec.agent_name, 'symbol': symbol, 'status': 'failed', 'retryable': True, 'error': str(exc)})
         return items, failures
 
     def dispatch_for_eod_run(self, *, eod_run_id: int, roles: Sequence[str] | None = None) -> dict[str, Any]:
@@ -595,8 +595,6 @@ class AgentFeedbackOrchestrator:
                                 'attempt': 1,
                                 'started_at': batch_result.get('started_at'),
                                 'completed_at': batch_result.get('completed_at'),
-                                'session_ref': batch_result.get('session_ref'),
-                                'cleanup': batch_result.get('cleanup'),
                                 'normalized_feedback': normalized_feedback,
                             },
                             context=source_item,
@@ -617,7 +615,8 @@ class AgentFeedbackOrchestrator:
                             }
                         )
                 except Exception as exc:  # noqa: BLE001
-                    cleanup = self._get_client().cleanup_session(batch_result.get('session_ref') if batch_result else None)
+                    cleanup_result = self._get_client().cleanup_session(batch_result.get('session_ref') if batch_result else None)
+                    logger.warning('Agent feedback batch failed after cleanup attempt', extra={'agent_name': spec.agent_name, 'session_ref': batch_result.get('session_ref') if batch_result else None, 'cleanup': cleanup_result, 'error': str(exc)})
                     for source_item in batch:
                         failures.append(
                             {
@@ -627,12 +626,12 @@ class AgentFeedbackOrchestrator:
                                 'status': 'failed',
                                 'retryable': True,
                                 'error': str(exc),
-                                'cleanup': cleanup,
                             }
                         )
                 finally:
                     if batch_result is not None:
-                        batch_result['cleanup'] = self._get_client().cleanup_session(batch_result.get('session_ref'))
+                        cleanup_result = self._get_client().cleanup_session(batch_result.get('session_ref'))
+                        logger.info('Agent feedback batch session cleanup finished', extra={'agent_name': spec.agent_name, 'session_ref': batch_result.get('session_ref'), 'cleanup': cleanup_result})
 
         status = 'completed'
         if failures and items:
