@@ -713,7 +713,6 @@ class DartFundamentalsCaptureService:
                 'events_skipped': events_skipped,
                 'results': results,
                 'operator_buckets': operator_buckets,
-                'feedback_followup': feedback_followup,
             }
             log_fetch_event(
                 service='dart',
