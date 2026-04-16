@@ -536,7 +536,8 @@ class AgentFeedbackOrchestrator:
             roles=requested_roles,
         ) if reuse_existing else {}
 
-        batch_jobs: list[tuple[AgentDispatchSpec, list[dict[str, Any]]]] = []
+        role_worker_count = max_workers
+        role_batch_jobs: dict[str, list[tuple[AgentDispatchSpec, list[dict[str, Any]]]]] = {}
         for spec in specs:
             dispatch_items = []
             for item in symbol_context['items']:
@@ -554,8 +555,7 @@ class AgentFeedbackOrchestrator:
                         }
                     )
                     continue
-                session_pool_size = max(1, min(max_workers, settings.openclaw_agent_parallel_subtasks))
-                slot = _stable_slot_for_value(value=item['symbol'], pool_size=session_pool_size) + 1
+                slot = _stable_slot_for_value(value=item['symbol'], pool_size=role_worker_count) + 1
                 dispatch_items.append(
                     {
                         **item,
@@ -563,10 +563,10 @@ class AgentFeedbackOrchestrator:
                     }
                 )
             role_batches = [dispatch_items[i:i + batch_size] for i in range(0, len(dispatch_items), batch_size)]
-            for batch in role_batches:
-                batch_jobs.append((spec, batch))
+            role_batch_jobs[spec.role] = [(spec, batch) for batch in role_batches]
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        total_max_workers = max(1, role_worker_count * max(1, len(specs)))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=total_max_workers) as executor:
             future_map = {
                 executor.submit(
                     self._get_client().dispatch_batch,
@@ -574,7 +574,8 @@ class AgentFeedbackOrchestrator:
                     market_date=normalized_market_date,
                     batch_items=batch,
                 ): (spec, batch)
-                for spec, batch in batch_jobs
+                for role_jobs in role_batch_jobs.values()
+                for spec, batch in role_jobs
             }
             for future in concurrent.futures.as_completed(future_map):
                 spec, batch = future_map[future]
@@ -659,7 +660,9 @@ class AgentFeedbackOrchestrator:
                 'fs_div': fs_div,
                 'disclosures_limit': disclosures_limit,
                 'symbol_chunk_size': batch_size,
-                'parallel_subtasks': max_workers,
+                'parallel_subtasks': role_worker_count,
+                'role_parallel_subtasks': role_worker_count,
+                'total_parallel_subtasks': total_max_workers,
                 'reuse_existing': reuse_existing,
             },
             'summary': {
