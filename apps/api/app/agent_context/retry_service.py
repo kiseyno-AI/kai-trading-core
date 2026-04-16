@@ -4,11 +4,12 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Any, Sequence
 
-from sqlalchemy import func, select
+from sqlalchemy import select
 
 from app.agent_context.orchestrator import agent_feedback_orchestrator
+from app.agent_context.reuse_service import agent_context_reuse_service
 from app.db import session_scope
-from app.db_models import AgentContextFeedback, DailyPriceBar, Symbol
+from app.db_models import DailyPriceBar, Symbol
 
 EXPECTED_ROLES: tuple[str, ...] = (
     'eod-summarizer',
@@ -28,49 +29,29 @@ class FeedbackRetryCycleConfig:
 
 class AgentFeedbackRetryService:
     def load_incomplete_symbols(self, *, market_date: date, roles: Sequence[str]) -> list[str]:
-        expected_count = len(tuple(roles))
         with session_scope() as session:
-            universe_subq = (
+            rows = session.execute(
                 select(Symbol.symbol)
                 .join(DailyPriceBar, DailyPriceBar.symbol_id == Symbol.id)
                 .where(DailyPriceBar.trade_date == market_date)
                 .distinct()
-                .subquery()
-            )
-
-            latest_subq = (
-                select(
-                    AgentContextFeedback.symbol,
-                    AgentContextFeedback.agent_name,
-                    func.row_number().over(
-                        partition_by=(AgentContextFeedback.symbol, AgentContextFeedback.agent_name),
-                        order_by=(
-                            AgentContextFeedback.market_date.desc(),
-                            AgentContextFeedback.received_at.desc(),
-                            AgentContextFeedback.id.desc(),
-                        ),
-                    ).label('rn'),
-                )
-                .where(AgentContextFeedback.symbol != '__MARKET__')
-                .where(AgentContextFeedback.agent_name.in_(tuple(roles)))
-                .where(AgentContextFeedback.market_date <= market_date)
-                .subquery()
-            )
-
-            latest_counts = (
-                select(latest_subq.c.symbol, func.count().label('latest_role_count'))
-                .where(latest_subq.c.rn == 1)
-                .group_by(latest_subq.c.symbol)
-                .subquery()
-            )
-
-            rows = session.execute(
-                select(universe_subq.c.symbol)
-                .outerjoin(latest_counts, latest_counts.c.symbol == universe_subq.c.symbol)
-                .where(func.coalesce(latest_counts.c.latest_role_count, 0) < expected_count)
-                .order_by(universe_subq.c.symbol.asc())
+                .order_by(Symbol.symbol.asc())
             ).all()
-            return [str(row.symbol) for row in rows]
+        symbols = [str(row.symbol) for row in rows]
+        if not symbols:
+            return []
+
+        decisions = agent_context_reuse_service.build_latest_decisions(
+            market_date=market_date,
+            symbols=symbols,
+            roles=roles,
+        )
+        incomplete: list[str] = []
+        for symbol in symbols:
+            symbol_decisions = decisions.get(symbol, {})
+            if any(decision.should_dispatch for decision in symbol_decisions.values()) or len(symbol_decisions) < len(tuple(roles)):
+                incomplete.append(symbol)
+        return incomplete
 
     def run_retry_cycles(self, *, config: FeedbackRetryCycleConfig) -> dict[str, Any]:
         cycles: list[dict[str, Any]] = []
