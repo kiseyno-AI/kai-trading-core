@@ -456,6 +456,27 @@ def load_latest_eod_collection_run(
         }
 
 
+def count_eod_collection_runs(
+    *,
+    market: str,
+    trade_date: str,
+    source: str | None = None,
+    trigger_prefix: str | None = None,
+) -> int:
+    with session_scope() as session:
+        stmt = select(func.count(EODCollectionRun.id)).where(
+            EODCollectionRun.market == market,
+            EODCollectionRun.trade_date == _parse_trade_date(trade_date),
+        )
+        if source:
+            stmt = stmt.where(EODCollectionRun.source == source)
+        if trigger_prefix:
+            escaped_prefix = trigger_prefix.replace('\\', '\\\\')
+            escaped_prefix = escaped_prefix.replace('%', '\\%').replace('_', '\\_')
+            stmt = stmt.where(EODCollectionRun.trigger.like(f'{escaped_prefix}%', escape='\\'))
+        return int(session.execute(stmt).scalar_one())
+
+
 def complete_eod_collection_run(
     run_id: int,
     *,
@@ -463,6 +484,7 @@ def complete_eod_collection_run(
     symbols_succeeded: int,
     symbols_failed: int,
     error_message: str | None = None,
+    run_metadata: dict | None = None,
 ) -> None:
     with session_scope() as session:
         run = session.get(EODCollectionRun, run_id)
@@ -473,6 +495,8 @@ def complete_eod_collection_run(
         run.symbols_failed = symbols_failed
         run.error_message = error_message
         run.completed_at = datetime.utcnow()
+        if run_metadata is not None:
+            run.run_metadata = run_metadata
 
 
 def update_eod_collection_run_progress(
@@ -498,6 +522,18 @@ def count_eod_run_persisted_symbols(run_id: int) -> int:
                 .where(DailyPriceBar.eod_run_id == run_id)
             ).scalar_one()
         )
+
+
+def load_eod_run_persisted_symbols(run_id: int) -> list[str]:
+    with session_scope() as session:
+        rows = session.execute(
+            select(Symbol.symbol)
+            .join(DailyPriceBar, DailyPriceBar.symbol_id == Symbol.id)
+            .where(DailyPriceBar.eod_run_id == run_id)
+            .group_by(Symbol.symbol)
+            .order_by(Symbol.symbol.asc())
+        ).all()
+        return [row[0] for row in rows]
 
 
 @contextmanager

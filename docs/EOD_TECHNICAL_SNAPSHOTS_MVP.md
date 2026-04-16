@@ -76,7 +76,7 @@ Current signal set:
 Retry semantics:
 
 - A pykrx EOD run is only marked `completed` when both bar persistence and technical snapshot persistence finish without failures.
-- If any technical snapshot rows fail, the EOD run is marked `completed_with_errors`, which keeps `run-if-due` retryable on the next invocation instead of silently skipping the snapshot gap forever.
+- If any technical snapshot rows fail, the EOD run is marked `completed_with_errors`; when all symbol bar writes succeeded (`symbols_failed == 0`), the automatic pykrx retry loop does not rerun the full universe. Use the dedicated technical snapshot CLI or API route for that repair.
 
 ## Operational use today
 

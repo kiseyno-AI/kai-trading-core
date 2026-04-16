@@ -21,8 +21,10 @@ from app.market_data_store import (
     advisory_eod_collection_lock,
     compute_and_persist_daily_trending_ranks,
     count_eod_run_persisted_symbols,
+    count_eod_collection_runs,
     complete_eod_collection_run,
     create_eod_collection_run,
+    load_eod_run_persisted_symbols,
     load_symbols,
     load_latest_eod_collection_run,
     persist_daily_price_bars,
@@ -35,6 +37,8 @@ _PYKRX_REQUEST_TIMEOUT_LOCK = threading.RLock()
 
 DEFAULT_START_DATE = '19560101'
 DEFAULT_MARKETS = ('KOSPI', 'KOSDAQ', 'KONEX')
+MAX_AUTO_PYKRX_DAILY_RUNS_PER_TRADE_DATE = 5
+RETRYABLE_DAILY_STATUSES = {'completed_with_errors', 'failed'}
 
 
 def _log_pykrx_fetch(operation: str, status: str, **fields) -> None:
@@ -104,6 +108,22 @@ def _call_pykrx(func, *args, **kwargs):
 def _get_market_ohlcv_by_date(start_date: str, end_date: str, symbol: str):
     getter = getattr(stock, 'get_market_ohlcv_by_date', None) or getattr(stock, 'get_market_ohlcv')
     return _call_pykrx(getter, start_date, end_date, symbol)
+
+
+def _is_auto_daily_trigger(trigger: str) -> bool:
+    return trigger.startswith('auto_')
+
+
+def _dedupe_symbol_codes(symbols: Sequence[object]) -> list[str]:
+    deduped: dict[str, None] = {}
+    for symbol in symbols:
+        normalized = str(symbol).strip()
+        if not normalized:
+            continue
+        if normalized.isdigit():
+            normalized = normalized.zfill(6)
+        deduped.setdefault(normalized, None)
+    return list(deduped.keys())
 
 
 class PykrxBackfillService:
@@ -504,6 +524,8 @@ class PykrxBackfillService:
                 }
                 _log_pykrx_fetch('run_daily_collection_if_due', 'skipped', **result)
                 return result
+            symbols_override: list[PykrxSymbol] | None = None
+            retry_context: dict | None = None
             if not force and latest_run:
                 latest_status = latest_run.get('status')
                 latest_failed = int(latest_run.get('symbols_failed') or 0)
@@ -529,14 +551,62 @@ class PykrxBackfillService:
                     }
                     _log_pykrx_fetch('run_daily_collection_if_due', 'skipped', **result)
                     return result
+                if _is_auto_daily_trigger(trigger) and self._is_retryable_daily_run(latest_run):
+                    automatic_run_count = count_eod_collection_runs(
+                        market='KRX',
+                        trade_date=market_date_iso,
+                        source='pykrx',
+                        trigger_prefix='auto_',
+                    )
+                    if automatic_run_count >= MAX_AUTO_PYKRX_DAILY_RUNS_PER_TRADE_DATE:
+                        result = {
+                            'triggered': False,
+                            'reason': 'auto_retry_limit_reached',
+                            'market_date': market_date_iso,
+                            'latest_available_trade_date': latest_trade_date,
+                            'source': 'pykrx',
+                            'existing_run': latest_run,
+                            'auto_retry': {
+                                'attempts': automatic_run_count,
+                                'max_attempts': MAX_AUTO_PYKRX_DAILY_RUNS_PER_TRADE_DATE,
+                            },
+                        }
+                        _log_pykrx_fetch('run_daily_collection_if_due', 'skipped', **result)
+                        return result
+                    symbols_override = self._load_retry_symbols_for_run(latest_run, markets=markets)
+                    if not symbols_override:
+                        result = {
+                            'triggered': False,
+                            'reason': 'no_failed_symbols_to_retry',
+                            'market_date': market_date_iso,
+                            'latest_available_trade_date': latest_trade_date,
+                            'source': 'pykrx',
+                            'existing_run': latest_run,
+                            'auto_retry': {
+                                'attempts': automatic_run_count,
+                                'max_attempts': MAX_AUTO_PYKRX_DAILY_RUNS_PER_TRADE_DATE,
+                            },
+                        }
+                        _log_pykrx_fetch('run_daily_collection_if_due', 'skipped', **result)
+                        return result
+                    retry_context = {
+                        'retry_of_run_id': latest_run.get('id'),
+                        'previous_status': latest_status,
+                        'previous_symbols_failed': latest_failed,
+                        'attempt': automatic_run_count + 1,
+                        'max_attempts': MAX_AUTO_PYKRX_DAILY_RUNS_PER_TRADE_DATE,
+                        'symbol_count': len(symbols_override),
+                    }
 
             result = self._run_collection(
                 start_date=normalized_market_date,
                 end_date=normalized_market_date,
                 markets=markets,
                 trigger=trigger,
-                refresh_universe=refresh_universe,
+                refresh_universe=False if symbols_override is not None else refresh_universe,
                 mode='daily_auto',
+                symbols_override=symbols_override,
+                retry_context=retry_context,
             )
             result['triggered'] = True
             _log_pykrx_fetch(
@@ -545,6 +615,69 @@ class PykrxBackfillService:
                 **{key: value for key, value in result.items() if key != 'status'},
             )
             return result
+
+    def _is_retryable_daily_run(self, run: dict) -> bool:
+        status = run.get('status')
+        if status not in RETRYABLE_DAILY_STATUSES:
+            return False
+        if status == 'failed':
+            return True
+        return int(run.get('symbols_failed') or 0) > 0
+
+    def _load_retry_symbols_for_run(self, run: dict, *, markets: Sequence[str]) -> list[PykrxSymbol]:
+        symbol_codes = self._failed_symbol_codes_for_run(run, markets=markets)
+        if not symbol_codes:
+            return []
+
+        rows = load_symbols(
+            is_active=True,
+            source='pykrx',
+            markets=list(markets),
+            symbols=symbol_codes,
+        )
+        by_symbol = {
+            row['symbol']: PykrxSymbol(
+                symbol=row['symbol'],
+                market=row['market'],
+                name_ko=row['name_ko'],
+                standard_code=row['standard_code'],
+            )
+            for row in rows
+        }
+
+        items: list[PykrxSymbol] = []
+        for symbol_code in symbol_codes:
+            item = by_symbol.get(symbol_code)
+            if item is None:
+                item = self.find_symbol(symbol_code, markets=markets)
+            if item is not None:
+                items.append(item)
+        return items
+
+    def _failed_symbol_codes_for_run(self, run: dict, *, markets: Sequence[str]) -> list[str]:
+        metadata = run.get('run_metadata') if isinstance(run.get('run_metadata'), dict) else {}
+        metadata_failed_symbols = metadata.get('failed_symbols') if metadata else None
+        if metadata_failed_symbols:
+            return _dedupe_symbol_codes(metadata_failed_symbols)
+
+        persisted_symbols = set(load_eod_run_persisted_symbols(run['id']))
+        requested_symbols = metadata.get('requested_symbols') if metadata else None
+        if requested_symbols:
+            return [
+                symbol
+                for symbol in _dedupe_symbol_codes(requested_symbols)
+                if symbol not in persisted_symbols
+            ]
+
+        active_universe = self.load_active_universe(markets=markets)
+        return [item.symbol for item in active_universe if item.symbol not in persisted_symbols]
+
+    def _run_metadata_with_failed_symbols(self, metadata: dict | None, failed_symbols: Sequence[str]) -> dict:
+        updated = dict(metadata or {})
+        failed_symbol_codes = _dedupe_symbol_codes(failed_symbols)
+        updated['failed_symbols'] = failed_symbol_codes
+        updated['failed_symbols_count'] = len(failed_symbol_codes)
+        return updated
 
     def _is_stale_running_run(self, run: dict) -> bool:
         stale_minutes = settings.eod_auto_pykrx_stale_run_minutes
@@ -562,6 +695,11 @@ class PykrxBackfillService:
         symbols_total = int(run.get('symbols_total') or 0)
         symbols_succeeded = max(int(run.get('symbols_succeeded') or 0), persisted_symbols)
         symbols_failed = max(int(run.get('symbols_failed') or 0), max(symbols_total - symbols_succeeded, 0))
+        metadata = run.get('run_metadata') if isinstance(run.get('run_metadata'), dict) else {}
+        markets = tuple(metadata.get('markets') or DEFAULT_MARKETS)
+        failed_symbols = self._failed_symbol_codes_for_run(run, markets=markets)
+        if failed_symbols:
+            symbols_failed = max(symbols_failed, len(failed_symbols))
         error_message = (
             f"Marked stale after {settings.eod_auto_pykrx_stale_run_minutes} minutes without completion."
         )
@@ -576,12 +714,16 @@ class PykrxBackfillService:
             symbols_failed=symbols_failed,
             error_message=error_message,
         )
+        complete_kwargs = {}
+        if failed_symbols:
+            complete_kwargs['run_metadata'] = self._run_metadata_with_failed_symbols(metadata, failed_symbols)
         complete_eod_collection_run(
             run['id'],
             status='failed',
             symbols_succeeded=symbols_succeeded,
             symbols_failed=symbols_failed,
             error_message=error_message,
+            **complete_kwargs,
         )
 
     def _run_collection(
@@ -595,6 +737,8 @@ class PykrxBackfillService:
         mode: str,
         limit: int | None = None,
         symbol: str | None = None,
+        symbols_override: Sequence[PykrxSymbol] | None = None,
+        retry_context: dict | None = None,
     ) -> dict:
         normalized_start = _normalize_yyyymmdd(start_date)
         normalized_end = _normalize_yyyymmdd(end_date)
@@ -608,10 +752,16 @@ class PykrxBackfillService:
             markets=list(markets),
             limit=limit,
             symbol=symbol,
+            symbols_override_count=len(symbols_override) if symbols_override is not None else None,
             refresh_universe=refresh_universe,
+            retry=retry_context,
         )
 
-        if refresh_universe:
+        effective_refresh_universe = refresh_universe and symbols_override is None
+        if symbols_override is not None:
+            universe_snapshot = None
+            symbols = list(symbols_override)
+        elif effective_refresh_universe:
             snapshot = self.fetch_recent_universe_snapshot(markets=markets, limit=limit)
             symbols = snapshot['symbols']
             deactivate_missing = limit is None and symbol is None
@@ -647,9 +797,12 @@ class PykrxBackfillService:
             'markets': list(markets),
             'symbol': symbol,
             'limited_run': limit is not None,
-            'universe_refreshed': refresh_universe,
+            'universe_refreshed': effective_refresh_universe,
             'universe_snapshot': universe_snapshot,
         }
+        if retry_context is not None:
+            run_metadata['retry'] = retry_context
+            run_metadata['requested_symbols'] = [item.symbol for item in symbols]
         run_id = create_eod_collection_run(
             market='KRX',
             trade_date=latest_trade_date,
@@ -748,12 +901,16 @@ class PykrxBackfillService:
                 error_type=type(exc).__name__,
                 error_message=str(exc),
             )
+            complete_kwargs = {}
+            if failed_symbols:
+                complete_kwargs['run_metadata'] = self._run_metadata_with_failed_symbols(run_metadata, failed_symbols)
             complete_eod_collection_run(
                 run_id,
                 status='failed',
                 symbols_succeeded=symbols_succeeded,
                 symbols_failed=symbols_failed,
                 error_message=str(exc),
+                **complete_kwargs,
             )
             raise
 
@@ -840,12 +997,16 @@ class PykrxBackfillService:
             run_errors.append(trending_rank_error_message)
 
         status = 'completed' if not run_errors else 'completed_with_errors'
+        complete_kwargs = {}
+        if failed_symbols:
+            complete_kwargs['run_metadata'] = self._run_metadata_with_failed_symbols(run_metadata, failed_symbols)
         complete_eod_collection_run(
             run_id,
             status=status,
             symbols_succeeded=symbols_succeeded,
             symbols_failed=symbols_failed,
             error_message=' | '.join(run_errors) if run_errors else None,
+            **complete_kwargs,
         )
         result = {
             'run_id': run_id,
@@ -863,9 +1024,11 @@ class PykrxBackfillService:
             'technical_snapshots': technical_snapshot_result,
             'action_summaries': action_summary_result,
             'trending_ranks': trending_rank_result,
-            'refresh_universe': refresh_universe,
+            'refresh_universe': effective_refresh_universe,
             'universe_snapshot': universe_snapshot,
         }
+        if retry_context is not None:
+            result['retry'] = retry_context
         _log_pykrx_fetch('run_collection', status, **{key: value for key, value in result.items() if key != 'status'})
         return result
 
