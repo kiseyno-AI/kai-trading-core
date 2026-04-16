@@ -29,6 +29,7 @@ class FeedbackRetryCycleConfig:
 
 class AgentFeedbackRetryService:
     def load_incomplete_symbols(self, *, market_date: date, roles: Sequence[str]) -> list[str]:
+        expected_roles = tuple(roles)
         with session_scope() as session:
             rows = session.execute(
                 select(Symbol.symbol)
@@ -44,12 +45,15 @@ class AgentFeedbackRetryService:
         decisions = agent_context_reuse_service.build_latest_decisions(
             market_date=market_date,
             symbols=symbols,
-            roles=roles,
+            roles=expected_roles,
         )
         incomplete: list[str] = []
         for symbol in symbols:
             symbol_decisions = decisions.get(symbol, {})
-            if any(decision.should_dispatch for decision in symbol_decisions.values()) or len(symbol_decisions) < len(tuple(roles)):
+            if any(
+                symbol_decisions.get(role) is None or symbol_decisions[role].should_dispatch
+                for role in expected_roles
+            ):
                 incomplete.append(symbol)
         return incomplete
 
