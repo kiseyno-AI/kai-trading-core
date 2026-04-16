@@ -3,7 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from unittest import IsolatedAsyncioTestCase, TestCase
-from unittest.mock import AsyncMock, patch
+from unittest.mock import ANY, AsyncMock, patch
 
 import pandas as pd
 
@@ -145,6 +145,21 @@ class PykrxBackfillServiceTests(TestCase):
                         'symbols_succeeded': 0,
                         'symbols_failed': 0,
                         'started_at': stale_started_at,
+                        'run_metadata': {
+                            'markets': ['KOSPI'],
+                            'requested_symbols': [
+                                '000001',
+                                '000002',
+                                '000003',
+                                '000004',
+                                '000005',
+                                '000006',
+                                '000007',
+                                '000008',
+                                '000009',
+                                '000010',
+                            ],
+                        },
                     },
                     {
                         'id': 8,
@@ -153,11 +168,33 @@ class PykrxBackfillServiceTests(TestCase):
                         'symbols_succeeded': 3,
                         'symbols_failed': 7,
                         'started_at': stale_started_at,
+                        'run_metadata': {
+                            'markets': ['KOSPI'],
+                            'failed_symbols': [
+                                '000004',
+                                '000005',
+                                '000006',
+                                '000007',
+                                '000008',
+                                '000009',
+                                '000010',
+                            ],
+                        },
                     },
                 ],
             ),
             patch('app.eod.pykrx_backfill.count_eod_run_persisted_symbols', return_value=3),
+            patch(
+                'app.eod.pykrx_backfill.load_eod_run_persisted_symbols',
+                return_value=['000001', '000002', '000003'],
+            ),
+            patch('app.eod.pykrx_backfill.count_eod_collection_runs', return_value=1),
             patch('app.eod.pykrx_backfill.complete_eod_collection_run') as complete_run,
+            patch.object(
+                service,
+                '_load_retry_symbols_for_run',
+                return_value=[PykrxSymbol(symbol='000004', market='KOSPI', name_ko='Retry Me')],
+            ),
             patch.object(
                 service,
                 '_run_collection',
@@ -180,6 +217,7 @@ class PykrxBackfillServiceTests(TestCase):
             symbols_succeeded=3,
             symbols_failed=7,
             error_message='Marked stale after 30 minutes without completion.',
+            run_metadata=ANY,
         )
         run_collection.assert_called_once()
 
@@ -326,7 +364,7 @@ class PykrxBackfillServiceTests(TestCase):
             error_message='Technical snapshot persistence incomplete for symbols: 005930 | Action summary persistence incomplete for symbols: 005930',
         )
 
-    def test_run_daily_collection_retries_when_previous_run_completed_with_errors(self) -> None:
+    def test_run_daily_collection_skips_completed_with_errors_without_failed_symbols(self) -> None:
         service = PykrxBackfillService()
 
         with (
@@ -356,8 +394,145 @@ class PykrxBackfillServiceTests(TestCase):
                 trigger='auto_close_scheduler',
             )
 
+        self.assertFalse(result['triggered'])
+        self.assertEqual(result['reason'], 'already_completed_with_errors')
+        run_collection.assert_not_called()
+
+    def test_auto_daily_retry_uses_previous_failed_symbols_only(self) -> None:
+        service = PykrxBackfillService()
+        retry_symbols = [
+            PykrxSymbol(symbol='000660', market='KOSPI', name_ko='SK hynix'),
+            PykrxSymbol(symbol='005930', market='KOSPI', name_ko='Samsung Electronics'),
+        ]
+
+        with (
+            patch.object(service, 'resolve_latest_trade_date', return_value='2026-04-03'),
+            patch('app.eod.pykrx_backfill.advisory_eod_collection_lock', return_value=_lock()),
+            patch(
+                'app.eod.pykrx_backfill.load_latest_eod_collection_run',
+                return_value={
+                    'id': 7,
+                    'status': 'completed_with_errors',
+                    'symbols_failed': 2,
+                    'run_metadata': {'failed_symbols': ['000660', '005930']},
+                },
+            ),
+            patch('app.eod.pykrx_backfill.count_eod_collection_runs', return_value=2),
+            patch(
+                'app.eod.pykrx_backfill.load_symbols',
+                return_value=[
+                    {
+                        'symbol': '000660',
+                        'market': 'KOSPI',
+                        'name_ko': 'SK hynix',
+                        'standard_code': None,
+                    },
+                    {
+                        'symbol': '005930',
+                        'market': 'KOSPI',
+                        'name_ko': 'Samsung Electronics',
+                        'standard_code': None,
+                    },
+                ],
+            ),
+            patch.object(
+                service,
+                '_run_collection',
+                return_value={
+                    'run_id': 8,
+                    'source': 'pykrx',
+                    'status': 'completed',
+                },
+            ) as run_collection,
+        ):
+            result = service.run_daily_collection_if_due(
+                market_date='2026-04-03',
+                trigger='auto_close_scheduler',
+            )
+
         self.assertTrue(result['triggered'])
         run_collection.assert_called_once()
+        kwargs = run_collection.call_args.kwargs
+        self.assertEqual(kwargs['symbols_override'], retry_symbols)
+        self.assertFalse(kwargs['refresh_universe'])
+        self.assertEqual(
+            kwargs['retry_context'],
+            {
+                'retry_of_run_id': 7,
+                'previous_status': 'completed_with_errors',
+                'previous_symbols_failed': 2,
+                'attempt': 3,
+                'max_attempts': 5,
+                'symbol_count': 2,
+            },
+        )
+
+    def test_auto_daily_retry_stops_after_five_auto_runs(self) -> None:
+        service = PykrxBackfillService()
+
+        with (
+            patch.object(service, 'resolve_latest_trade_date', return_value='2026-04-03'),
+            patch('app.eod.pykrx_backfill.advisory_eod_collection_lock', return_value=_lock()),
+            patch(
+                'app.eod.pykrx_backfill.load_latest_eod_collection_run',
+                return_value={
+                    'id': 7,
+                    'status': 'failed',
+                    'symbols_failed': 4,
+                    'run_metadata': {'failed_symbols': ['000660', '005930', '035420', '051910']},
+                },
+            ),
+            patch('app.eod.pykrx_backfill.count_eod_collection_runs', return_value=5),
+            patch.object(service, '_run_collection') as run_collection,
+        ):
+            result = service.run_daily_collection_if_due(
+                market_date='2026-04-03',
+                trigger='auto_close_scheduler',
+            )
+
+        self.assertFalse(result['triggered'])
+        self.assertEqual(result['reason'], 'auto_retry_limit_reached')
+        self.assertEqual(result['auto_retry']['attempts'], 5)
+        self.assertEqual(result['auto_retry']['max_attempts'], 5)
+        run_collection.assert_not_called()
+
+    def test_manual_daily_retry_keeps_full_collection_behavior(self) -> None:
+        service = PykrxBackfillService()
+
+        with (
+            patch.object(service, 'resolve_latest_trade_date', return_value='2026-04-03'),
+            patch('app.eod.pykrx_backfill.advisory_eod_collection_lock', return_value=_lock()),
+            patch(
+                'app.eod.pykrx_backfill.load_latest_eod_collection_run',
+                return_value={
+                    'id': 7,
+                    'status': 'failed',
+                    'symbols_failed': 2,
+                    'run_metadata': {'failed_symbols': ['000660', '005930']},
+                },
+            ),
+            patch('app.eod.pykrx_backfill.count_eod_collection_runs') as count_runs,
+            patch.object(
+                service,
+                '_run_collection',
+                return_value={
+                    'run_id': 8,
+                    'source': 'pykrx',
+                    'status': 'completed',
+                },
+            ) as run_collection,
+        ):
+            result = service.run_daily_collection_if_due(
+                market_date='2026-04-03',
+                trigger='manual_daily_api',
+            )
+
+        self.assertTrue(result['triggered'])
+        count_runs.assert_not_called()
+        kwargs = run_collection.call_args.kwargs
+        self.assertIsNone(kwargs['symbols_override'])
+        self.assertIsNone(kwargs['retry_context'])
+        self.assertTrue(kwargs['refresh_universe'])
 
     def test_run_collection_logs_per_symbol_failures(self) -> None:
         service = PykrxBackfillService()
