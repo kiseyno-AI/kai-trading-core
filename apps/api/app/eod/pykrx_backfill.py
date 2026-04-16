@@ -15,6 +15,7 @@ from pykrx.website.comm import webio
 from app.core.audit_logging import log_fetch_event
 from app.core.settings import settings
 from app.eod.master import get_master_symbols
+from app.dart.fundamentals_capture_service import dart_fundamentals_capture_service
 from app.eod.action_summaries import daily_action_summary_service
 from app.eod.technical_snapshots import daily_technical_snapshot_service
 from app.market_data_store import (
@@ -1027,6 +1028,14 @@ class PykrxBackfillService:
             'refresh_universe': effective_refresh_universe,
             'universe_snapshot': universe_snapshot,
         }
+        if settings.eod_trigger_fundamentals_after_capture and status in {'completed', 'completed_with_errors'}:
+            result['fundamentals_followup'] = asyncio.run(
+                dart_fundamentals_capture_service.run_daily_incremental_refresh(
+                    market_date=latest_trade_date,
+                    capture_limit=500,
+                    trigger='eod_pykrx_followup',
+                )
+            )
         if retry_context is not None:
             result['retry'] = retry_context
         _log_pykrx_fetch('run_collection', status, **{key: value for key, value in result.items() if key != 'status'})
