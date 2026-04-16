@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from datetime import date, datetime
+from datetime import date
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.db import session_scope
@@ -100,18 +100,21 @@ class DartSyncRepository:
         run_metadata: dict | None = None,
     ) -> None:
         with session_scope() as session:
-            row = session.get(DartDisclosureSyncRun, run_id)
-            if row is None:
-                return
-            row.status = status
-            row.pages_fetched = pages_fetched
-            row.events_seen = events_seen
-            row.events_inserted = events_inserted
-            row.events_updated = events_updated
-            row.financial_report_events = financial_report_events
-            row.error_message = error_message
-            row.run_metadata = run_metadata
-            row.completed_at = datetime.utcnow()
+            session.execute(
+                update(DartDisclosureSyncRun)
+                .where(DartDisclosureSyncRun.id == run_id)
+                .values(
+                    status=status,
+                    pages_fetched=pages_fetched,
+                    events_seen=events_seen,
+                    events_inserted=events_inserted,
+                    events_updated=events_updated,
+                    financial_report_events=financial_report_events,
+                    error_message=error_message,
+                    run_metadata=run_metadata,
+                    completed_at=func.now(),
+                )
+            )
 
     def upsert_events(self, items: list[dict], *, run_id: int) -> dict[str, int]:
         if not items:
