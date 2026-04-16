@@ -16,6 +16,7 @@ from app.market_data_store import (
     count_daily_price_bars_for_date,
     count_daily_price_bars_for_live_symbols,
     count_daily_technical_snapshots_for_live_symbols,
+    count_live_symbols,
     load_latest_available_daily_action_summary_date,
     load_latest_available_daily_price_trade_date,
     load_latest_available_daily_technical_snapshot_date,
@@ -70,6 +71,7 @@ def _load_daily_fundamentals_stage_counts(market_date: str) -> dict[str, int]:
 class EODFreshnessService:
     market_state_loader: Callable = get_market_state
     latest_run_loader: Callable = load_latest_eod_collection_run
+    live_symbol_count_loader: Callable = count_live_symbols
     daily_price_bar_count_loader: Callable = count_daily_price_bars_for_live_symbols
     daily_technical_snapshot_count_loader: Callable = count_daily_technical_snapshots_for_live_symbols
     daily_action_summary_count_loader: Callable = count_daily_action_summaries_for_live_symbols
@@ -106,6 +108,8 @@ class EODFreshnessService:
         live_symbols_total = int((today_run or {}).get('symbols_total') or 0)
         if live_symbols_total == 0 and latest_price_run:
             live_symbols_total = int(latest_price_run.get('symbols_total') or 0)
+        if live_symbols_total == 0:
+            live_symbols_total = int(self.live_symbol_count_loader() or 0)
 
         return {
             'today': {
