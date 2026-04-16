@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
 import json
 import logging
 import time
@@ -8,6 +9,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from typing import Any, Sequence
+from urllib.parse import quote
 
 import httpx
 
@@ -64,6 +66,16 @@ class AgentDispatchTerminalError(AgentOrchestratorError):
     pass
 
 
+def _stable_slot_for_value(*, value: str, pool_size: int) -> int:
+    normalized = value.strip() or 'default'
+    digest = hashlib.sha256(normalized.encode('utf-8')).hexdigest()
+    return int(digest[:8], 16) % max(1, pool_size)
+
+
+def _feedback_session_key(*, agent_name: str, slot: int) -> str:
+    return f"feedback/{agent_name}/slot-{slot:02d}"
+
+
 class OpenClawAgentClient:
     def __init__(
         self,
@@ -79,6 +91,55 @@ class OpenClawAgentClient:
         self.timeout_seconds = timeout_seconds
         self.max_retries = max(0, max_retries)
         self.retry_backoff_seconds = max(0.0, retry_backoff_seconds)
+
+    def _extract_session_ref(self, parsed: dict[str, Any], *, explicit_session_key: str | None = None) -> dict[str, Any] | None:
+        if explicit_session_key:
+            return {
+                'session_key': explicit_session_key,
+                'response_id': parsed.get('id'),
+            }
+        session_key = parsed.get('session_key') or parsed.get('sessionKey')
+        if isinstance(session_key, str) and session_key.strip():
+            return {
+                'session_key': session_key.strip(),
+                'response_id': parsed.get('id'),
+            }
+        return None
+
+    def cleanup_session(self, session_ref: dict[str, Any] | None) -> dict[str, Any]:
+        if not session_ref or not session_ref.get('session_key'):
+            return {'status': 'skipped', 'reason': 'missing_session_key'}
+        session_key = str(session_ref['session_key']).strip()
+        url = f"{self.base_url}/sessions/{quote(session_key, safe='')}/kill"
+        try:
+            with httpx.Client(timeout=max(10.0, min(self.timeout_seconds, 30.0)), headers=self._headers()) as client:
+                response = client.post(url)
+            if response.status_code == 404:
+                return {
+                    'status': 'not_found',
+                    'status_code': response.status_code,
+                    'session_key': session_key,
+                }
+            if response.status_code >= 400:
+                return {
+                    'status': 'failed',
+                    'status_code': response.status_code,
+                    'session_key': session_key,
+                    'error': response.text[:300],
+                }
+            parsed = response.json()
+            return {
+                'status': 'completed' if parsed.get('killed') else 'not_killed',
+                'status_code': response.status_code,
+                'session_key': session_key,
+                'killed': bool(parsed.get('killed')),
+            }
+        except Exception as exc:  # noqa: BLE001
+            return {
+                'status': 'failed',
+                'session_key': session_key,
+                'error': str(exc),
+            }
 
     def _headers(self) -> dict[str, str]:
         return {
@@ -134,6 +195,7 @@ class OpenClawAgentClient:
 
     def dispatch(self, *, spec: AgentDispatchSpec, payload: dict[str, Any]) -> dict[str, Any]:
         url = f'{self.base_url}/v1/responses'
+        request_session_key = str(payload.get('session_key') or f"feedback/{spec.agent_name}/{payload.get('request_id') or uuid.uuid4().hex}")
         body = {
             'model': f'openclaw/{spec.agent_name}',
             'input': self._build_message(spec=spec, payload=payload),
@@ -144,7 +206,8 @@ class OpenClawAgentClient:
             attempt += 1
             started_at = datetime.now(timezone.utc)
             try:
-                with httpx.Client(timeout=self.timeout_seconds, headers=self._headers()) as client:
+                headers = self._headers() | {'x-openclaw-session-key': request_session_key}
+                with httpx.Client(timeout=self.timeout_seconds, headers=headers) as client:
                     response = client.post(url, json=body)
                 if response.status_code >= 500:
                     raise AgentDispatchRetryableError(f'OpenClaw server error {response.status_code}: {response.text[:300]}')
@@ -170,6 +233,7 @@ class OpenClawAgentClient:
                     'completed_at': datetime.now(timezone.utc).isoformat(),
                     'response': parsed,
                     'output_text': output_text,
+                    'session_ref': self._extract_session_ref(parsed, explicit_session_key=request_session_key),
                     'normalized_feedback': normalize_agent_response(
                         role=spec.role,
                         output_text=output_text,
@@ -194,12 +258,22 @@ class OpenClawAgentClient:
         batch_items: Sequence[dict[str, Any]],
     ) -> dict[str, Any]:
         url = f'{self.base_url}/v1/responses'
+        session_keys = {
+            str(item.get('session_key'))
+            for item in batch_items
+            if item.get('session_key')
+        }
+        if len(session_keys) > 1:
+            raise ValueError(f'Batch items for {spec.agent_name} mixed session slots: {sorted(session_keys)}')
+        request_session_key = next(iter(session_keys), None)
+        request_session_key = str(request_session_key or f"feedback/{spec.agent_name}/{market_date.isoformat()}/{uuid.uuid4().hex}")
         body = {
             'model': f'openclaw/{spec.agent_name}',
             'input': self._build_batch_message(spec=spec, market_date=market_date, batch_items=batch_items),
         }
         started_at = datetime.now(timezone.utc)
-        with httpx.Client(timeout=max(self.timeout_seconds, settings.openclaw_agent_subtask_timeout_seconds), headers=self._headers()) as client:
+        headers = self._headers() | {'x-openclaw-session-key': request_session_key}
+        with httpx.Client(timeout=max(self.timeout_seconds, settings.openclaw_agent_subtask_timeout_seconds), headers=headers) as client:
             response = client.post(url, json=body)
         if response.status_code >= 400:
             raise AgentDispatchTerminalError(f'OpenClaw batch failed {response.status_code}: {response.text[:300]}')
@@ -262,6 +336,7 @@ class OpenClawAgentClient:
             'completed_at': datetime.now(timezone.utc).isoformat(),
             'response': parsed,
             'output_text': output_text,
+            'session_ref': self._extract_session_ref(parsed, explicit_session_key=request_session_key),
             'decoded': decoded,
         }
 
@@ -365,8 +440,9 @@ class AgentFeedbackOrchestrator:
         items: list[dict[str, Any]] = []
         failures: list[dict[str, Any]] = []
         for spec in specs:
+            response: dict[str, Any] | None = None
+            role_payload = payloads[spec.role]
             try:
-                role_payload = payloads[spec.role]
                 response = self._get_client().dispatch(spec=spec, payload=role_payload)
                 stored = self._store_feedback(
                     market_date=market_date,
@@ -393,8 +469,10 @@ class AgentFeedbackOrchestrator:
                     }
                 )
             except AgentDispatchTerminalError as exc:
+                logger.warning('Agent feedback dispatch failed', extra={'agent_name': spec.agent_name, 'symbol': symbol, 'session_ref': response.get('session_ref') if response else None, 'error': str(exc)})
                 failures.append({'role': spec.role, 'agent_name': spec.agent_name, 'symbol': symbol, 'status': 'failed', 'retryable': False, 'error': str(exc)})
             except Exception as exc:  # noqa: BLE001
+                logger.warning('Agent feedback dispatch raised', extra={'agent_name': spec.agent_name, 'symbol': symbol, 'session_ref': response.get('session_ref') if response else None, 'error': str(exc)})
                 failures.append({'role': spec.role, 'agent_name': spec.agent_name, 'symbol': symbol, 'status': 'failed', 'retryable': True, 'error': str(exc)})
         return items, failures
 
@@ -463,7 +541,8 @@ class AgentFeedbackOrchestrator:
             roles=requested_roles,
         ) if reuse_existing else {}
 
-        batch_jobs: list[tuple[AgentDispatchSpec, list[dict[str, Any]]]] = []
+        role_worker_count = max_workers
+        role_batch_jobs: dict[str, list[tuple[AgentDispatchSpec, list[dict[str, Any]]]]] = {}
         for spec in specs:
             dispatch_items = []
             for item in symbol_context['items']:
@@ -481,12 +560,29 @@ class AgentFeedbackOrchestrator:
                         }
                     )
                     continue
-                dispatch_items.append(item)
-            role_batches = [dispatch_items[i:i + batch_size] for i in range(0, len(dispatch_items), batch_size)]
-            for batch in role_batches:
-                batch_jobs.append((spec, batch))
+                slot = _stable_slot_for_value(value=item['symbol'], pool_size=role_worker_count) + 1
+                dispatch_items.append(
+                    {
+                        **item,
+                        'session_key': _feedback_session_key(agent_name=spec.agent_name, slot=slot),
+                    }
+                )
+            batches_by_session_key: dict[str, list[dict[str, Any]]] = {}
+            for item in dispatch_items:
+                session_key = str(item['session_key'])
+                batches_by_session_key.setdefault(session_key, []).append(item)
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            role_batches: list[list[dict[str, Any]]] = []
+            for session_key in sorted(batches_by_session_key.keys()):
+                session_items = batches_by_session_key[session_key]
+                role_batches.extend(
+                    session_items[i:i + batch_size]
+                    for i in range(0, len(session_items), batch_size)
+                )
+            role_batch_jobs[spec.role] = [(spec, batch) for batch in role_batches]
+
+        total_max_workers = max(1, role_worker_count * max(1, len(specs)))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=total_max_workers) as executor:
             future_map = {
                 executor.submit(
                     self._get_client().dispatch_batch,
@@ -494,10 +590,12 @@ class AgentFeedbackOrchestrator:
                     market_date=normalized_market_date,
                     batch_items=batch,
                 ): (spec, batch)
-                for spec, batch in batch_jobs
+                for role_jobs in role_batch_jobs.values()
+                for spec, batch in role_jobs
             }
             for future in concurrent.futures.as_completed(future_map):
                 spec, batch = future_map[future]
+                batch_result: dict[str, Any] | None = None
                 try:
                     batch_result = future.result()
                     decoded_items = batch_result.get('decoded', {}).get('items', [])
@@ -550,6 +648,7 @@ class AgentFeedbackOrchestrator:
                             }
                         )
                 except Exception as exc:  # noqa: BLE001
+                    logger.warning('Agent feedback batch failed', extra={'agent_name': spec.agent_name, 'session_ref': batch_result.get('session_ref') if batch_result else None, 'error': str(exc)})
                     for source_item in batch:
                         failures.append(
                             {
@@ -577,7 +676,9 @@ class AgentFeedbackOrchestrator:
                 'fs_div': fs_div,
                 'disclosures_limit': disclosures_limit,
                 'symbol_chunk_size': batch_size,
-                'parallel_subtasks': max_workers,
+                'parallel_subtasks': role_worker_count,
+                'role_parallel_subtasks': role_worker_count,
+                'total_parallel_subtasks': total_max_workers,
                 'reuse_existing': reuse_existing,
             },
             'summary': {

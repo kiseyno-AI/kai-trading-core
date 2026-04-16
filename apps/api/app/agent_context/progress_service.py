@@ -3,12 +3,12 @@ from __future__ import annotations
 from datetime import date
 from typing import Any, Sequence
 
-from sqlalchemy import distinct, func, select
+from sqlalchemy import func, select
 
 from app.agent_context.feedback_service import _normalize_market_date, _normalize_symbols
 from app.agent_context.status_service import EXPECTED_AGENT_NAMES, EXPECTED_AGENT_SET
 from app.db import session_scope
-from app.db_models import AgentContextFeedback, DailyPriceBar, Symbol
+from app.db_models import AgentContextFeedback, Symbol
 
 
 class AgentContextProgressService:
@@ -23,16 +23,13 @@ class AgentContextProgressService:
 
         with session_scope() as session:
             universe_symbols_stmt = (
-                select(distinct(Symbol.symbol))
-                .select_from(DailyPriceBar)
-                .join(Symbol, Symbol.id == DailyPriceBar.symbol_id)
-                .where(DailyPriceBar.trade_date == normalized_market_date)
+                select(Symbol.symbol)
+                .where(Symbol.is_active.is_(True))
                 .order_by(Symbol.symbol.asc())
             )
             if normalized_symbols:
                 universe_symbols_stmt = universe_symbols_stmt.where(Symbol.symbol.in_(normalized_symbols))
             universe_symbols = [str(symbol) for symbol in session.execute(universe_symbols_stmt).scalars().all()]
-            total_symbols = len(universe_symbols)
 
             rows_stmt = (
                 select(
@@ -40,6 +37,7 @@ class AgentContextProgressService:
                     AgentContextFeedback.agent_name,
                     AgentContextFeedback.run_id,
                     AgentContextFeedback.received_at,
+                    AgentContextFeedback.id,
                 )
                 .where(AgentContextFeedback.market_date == normalized_market_date)
                 .order_by(
@@ -57,6 +55,7 @@ class AgentContextProgressService:
                     'agent_name': row.agent_name,
                     'run_id': row.run_id,
                     'received_at': row.received_at.isoformat() if row.received_at else None,
+                    'id': row.id,
                 }
                 for row in session.execute(rows_stmt)
             ]
@@ -75,9 +74,18 @@ class AgentContextProgressService:
         for symbol in target_symbols:
             symbol_rows = grouped.get(symbol, [])
             latest_run_id = symbol_rows[0]['run_id'] if symbol_rows else None
-            run_rows = [row for row in symbol_rows if row['run_id'] == latest_run_id] if symbol_rows else []
+            if latest_run_id is not None:
+                run_rows = [row for row in symbol_rows if row['run_id'] == latest_run_id]
+            else:
+                run_rows = symbol_rows[:]
 
-            agent_names = {row['agent_name'] for row in run_rows if row['agent_name'] in EXPECTED_AGENT_SET}
+            agent_names = []
+            seen_agents = set()
+            for row in run_rows:
+                agent_name = row['agent_name']
+                if agent_name in EXPECTED_AGENT_SET and agent_name not in seen_agents:
+                    seen_agents.add(agent_name)
+                    agent_names.append(agent_name)
             if len(agent_names) == len(EXPECTED_AGENT_NAMES):
                 completed_symbols += 1
             elif agent_names:
@@ -87,7 +95,7 @@ class AgentContextProgressService:
 
             failed_items += sum(1 for row in run_rows if row['agent_name'] not in EXPECTED_AGENT_SET)
 
-        requested_symbol_count = len(target_symbols) if normalized_symbols is not None else total_symbols
+        requested_symbol_count = len(target_symbols)
         processed_symbols = completed_symbols + in_progress_symbols
         progress_ratio = (processed_symbols / requested_symbol_count) if requested_symbol_count else 0.0
         completed_feedback_count = sum(
