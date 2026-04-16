@@ -127,6 +127,8 @@
 - `POST /agent-context/feedback` is the JSON intake path for downstream agents such as OpenClaw to send post-EOD symbol summaries and structured feedback back to Core.
 - `POST /agent-context/feedback/dispatch` is the orchestration trigger for role-based OpenClaw dispatch from a completed or partially completed EOD run.
 - `POST /agent-context/feedback/dispatch/symbols` dispatches the same summarizer roles against symbol-day context for explicit symbol lists.
+- Symbol dispatch now uses direct parallel fan-out over `/v1/responses`: Core chunks symbols, calls the same summarizer agent ids multiple times in parallel, and merges/stores one normalized result per symbol and role.
+- Operational tuning for symbol dispatch is controlled by `OPENCLAW_AGENT_SYMBOL_CHUNK_SIZE` and `OPENCLAW_AGENT_PARALLEL_SUBTASKS`.
 - `GET /agent-context/feedback/payloads` reads stored agent feedback payloads by symbol and date.
 - `GET /agent-context/feedback/requests` reads the stored request/context payloads that were sent to the agents by symbol and date.
 - `GET /agent-context/feedback/status` reports whether the three-agent feedback workflow is pending, in progress, partial, or completed for requested symbols, plus completed counts and pending agents.

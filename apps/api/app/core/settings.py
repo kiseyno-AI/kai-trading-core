@@ -77,6 +77,10 @@ class Settings(BaseSettings):
     openclaw_agent_timeout_seconds: float = 120.0
     openclaw_agent_max_retries: int = 2
     openclaw_agent_retry_backoff_seconds: float = 2.0
+    openclaw_agent_parallel_subtasks: int = 4
+    openclaw_agent_symbol_chunk_size: int = 5
+    openclaw_agent_subtask_poll_seconds: float = 2.0
+    openclaw_agent_subtask_timeout_seconds: float = 900.0
 
 
 settings = Settings()
