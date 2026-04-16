@@ -457,6 +457,17 @@ class AgentFeedbackOrchestrator:
         batch_size = max(1, settings.openclaw_agent_symbol_chunk_size)
         max_workers = max(1, settings.openclaw_agent_parallel_subtasks)
 
+        logger.info(
+            'agent_feedback_symbol_dispatch_started market_date=%s request_run_id=%s symbol_count=%s roles=%s batch_size=%s max_workers=%s reuse_existing=%s',
+            normalized_market_date.isoformat(),
+            request_run_id,
+            len(symbols),
+            requested_roles,
+            batch_size,
+            max_workers,
+            reuse_existing,
+        )
+
         reuse_decisions = agent_context_reuse_service.build_latest_decisions(
             market_date=normalized_market_date,
             symbols=symbols,
@@ -466,6 +477,7 @@ class AgentFeedbackOrchestrator:
         batch_jobs: list[tuple[AgentDispatchSpec, list[dict[str, Any]]]] = []
         for spec in specs:
             dispatch_items = []
+            reused_count = 0
             for item in symbol_context['items']:
                 decision = reuse_decisions.get(item['symbol'], {}).get(spec.role) if reuse_existing else None
                 if decision and not decision.should_dispatch and decision.latest_feedback is not None:
@@ -480,9 +492,20 @@ class AgentFeedbackOrchestrator:
                             'response': {'normalized_feedback': decision.latest_feedback.get('feedback_payload')},
                         }
                     )
+                    reused_count += 1
                     continue
                 dispatch_items.append(item)
             role_batches = [dispatch_items[i:i + batch_size] for i in range(0, len(dispatch_items), batch_size)]
+            logger.info(
+                'agent_feedback_symbol_role_plan market_date=%s request_run_id=%s role=%s total_symbols=%s reused=%s dispatch_symbols=%s batch_count=%s',
+                normalized_market_date.isoformat(),
+                request_run_id,
+                spec.role,
+                len(symbol_context['items']),
+                reused_count,
+                len(dispatch_items),
+                len(role_batches),
+            )
             for batch in role_batches:
                 batch_jobs.append((spec, batch))
 
@@ -498,8 +521,19 @@ class AgentFeedbackOrchestrator:
             }
             for future in concurrent.futures.as_completed(future_map):
                 spec, batch = future_map[future]
+                batch_symbols = [item['symbol'] for item in batch]
                 try:
                     batch_result = future.result()
+                    logger.info(
+                        'agent_feedback_symbol_batch_completed market_date=%s request_run_id=%s role=%s batch_size=%s symbols=%s started_at=%s completed_at=%s',
+                        normalized_market_date.isoformat(),
+                        request_run_id,
+                        spec.role,
+                        len(batch_symbols),
+                        ','.join(batch_symbols),
+                        batch_result.get('started_at'),
+                        batch_result.get('completed_at'),
+                    )
                     decoded_items = batch_result.get('decoded', {}).get('items', [])
                     by_symbol = {
                         item['symbol']: item
@@ -550,6 +584,15 @@ class AgentFeedbackOrchestrator:
                             }
                         )
                 except Exception as exc:  # noqa: BLE001
+                    logger.exception(
+                        'agent_feedback_symbol_batch_failed market_date=%s request_run_id=%s role=%s batch_size=%s symbols=%s error=%s',
+                        normalized_market_date.isoformat(),
+                        request_run_id,
+                        spec.role,
+                        len(batch_symbols),
+                        ','.join(batch_symbols),
+                        exc,
+                    )
                     for source_item in batch:
                         failures.append(
                             {
@@ -567,6 +610,16 @@ class AgentFeedbackOrchestrator:
             status = 'partial'
         elif failures and not items:
             status = 'failed'
+
+        logger.info(
+            'agent_feedback_symbol_dispatch_finished market_date=%s request_run_id=%s status=%s completed=%s failed=%s reused=%s',
+            normalized_market_date.isoformat(),
+            request_run_id,
+            status,
+            len(items),
+            len(failures),
+            len([item for item in items if item.get('status') == 'reused']),
+        )
 
         return {
             'request': {
