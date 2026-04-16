@@ -38,31 +38,32 @@ def _load_daily_fundamentals_stage_counts(market_date: str) -> dict[str, int]:
     fs_div = settings.dart_fundamentals_default_fs_div.strip().upper()
 
     with session_scope() as session:
-        symbols_succeeded = int(
+        succeeded_codes = set(
             session.execute(
-                select(func.count(func.distinct(DartFundamentalsSnapshot.stock_code)))
+                select(func.distinct(DartFundamentalsSnapshot.stock_code))
                 .select_from(DartFundamentalsSnapshot)
                 .where(DartFundamentalsSnapshot.fs_div == fs_div)
                 .where(DartFundamentalsSnapshot.stock_code.is_not(None))
                 .where(DartFundamentalsSnapshot.updated_at >= start_at)
                 .where(DartFundamentalsSnapshot.updated_at < end_at)
-            ).scalar_one()
+            ).scalars()
         )
-        symbols_failed = int(
+        failed_codes = set(
             session.execute(
-                select(func.count(func.distinct(DartDisclosureEvent.stock_code)))
+                select(func.distinct(DartDisclosureEvent.stock_code))
                 .select_from(DartDisclosureEvent)
                 .where(DartDisclosureEvent.is_financial_report.is_(True))
                 .where(DartDisclosureEvent.stock_code.is_not(None))
                 .where(DartDisclosureEvent.fundamentals_capture_status == FUNDAMENTALS_CAPTURE_FAILED)
                 .where(DartDisclosureEvent.fundamentals_last_attempt_at >= start_at)
                 .where(DartDisclosureEvent.fundamentals_last_attempt_at < end_at)
-            ).scalar_one()
+            ).scalars()
         )
 
     return {
-        'symbols_succeeded': symbols_succeeded,
-        'symbols_failed': symbols_failed,
+        'symbols_succeeded': len(succeeded_codes),
+        'symbols_failed': len(failed_codes),
+        'symbols_total': len(succeeded_codes | failed_codes),
     }
 
 
@@ -155,7 +156,7 @@ class EODFreshnessService:
 
         return {
             'status': status,
-            'symbols_total': symbols_succeeded,
+            'symbols_total': int(counts.get('symbols_total') or 0),
             'symbols_succeeded': symbols_succeeded,
             'symbols_failed': symbols_failed,
         }
