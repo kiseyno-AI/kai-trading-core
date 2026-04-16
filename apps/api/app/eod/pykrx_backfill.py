@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import logging
 import threading
 import time
@@ -1028,7 +1029,12 @@ class PykrxBackfillService:
             'refresh_universe': effective_refresh_universe,
             'universe_snapshot': universe_snapshot,
         }
-        if settings.eod_trigger_fundamentals_after_capture and status in {'completed', 'completed_with_errors'}:
+        should_chain_fundamentals = (
+            settings.eod_trigger_fundamentals_after_capture
+            and mode == 'daily_collection'
+            and status in {'completed', 'completed_with_errors'}
+        )
+        if should_chain_fundamentals:
             result['fundamentals_followup'] = asyncio.run(
                 dart_fundamentals_capture_service.run_daily_incremental_refresh(
                     market_date=latest_trade_date,
