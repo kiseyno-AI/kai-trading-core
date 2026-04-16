@@ -631,8 +631,7 @@ class AgentFeedbackOrchestrator:
                             }
                         )
                 except Exception as exc:  # noqa: BLE001
-                    cleanup_result = self._get_client().cleanup_session(batch_result.get('session_ref') if batch_result else None)
-                    logger.warning('Agent feedback batch failed after cleanup attempt', extra={'agent_name': spec.agent_name, 'session_ref': batch_result.get('session_ref') if batch_result else None, 'cleanup': cleanup_result, 'error': str(exc)})
+                    logger.warning('Agent feedback batch failed', extra={'agent_name': spec.agent_name, 'session_ref': batch_result.get('session_ref') if batch_result else None, 'error': str(exc)})
                     for source_item in batch:
                         failures.append(
                             {
@@ -644,10 +643,6 @@ class AgentFeedbackOrchestrator:
                                 'error': str(exc),
                             }
                         )
-                finally:
-                    if batch_result is not None:
-                        cleanup_result = self._get_client().cleanup_session(batch_result.get('session_ref'))
-                        logger.info('Agent feedback batch session cleanup finished', extra={'agent_name': spec.agent_name, 'session_ref': batch_result.get('session_ref'), 'cleanup': cleanup_result})
 
         status = 'completed'
         if failures and items:
