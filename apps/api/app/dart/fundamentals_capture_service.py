@@ -1269,12 +1269,15 @@ class DartFundamentalsCaptureService:
             remaining_candidate_events = events_detected
             retry_cycles_completed = 0
 
+            over_limit_event_ids = candidate_event_ids[len(event_ids_to_capture):]
+
             if event_ids_to_capture:
                 pending_event_ids = list(event_ids_to_capture)
                 candidate_receipt_date_from = (
                     min(check_start_by_symbol.values()) if check_start_by_symbol else None
                 )
                 max_retry_cycles = max(1, resolved_retry_cycles)
+                remaining_candidate_events = len(over_limit_event_ids) + len(pending_event_ids)
                 for cycle_index in range(max_retry_cycles):
                     if not pending_event_ids:
                         break
@@ -1318,7 +1321,7 @@ class DartFundamentalsCaptureService:
                         if item.get('status') in RETRYABLE_CAPTURE_STATUSES:
                             retryable_next.append(int(event_id))
                     pending_event_ids = retryable_next
-                    remaining_candidate_events = len(pending_event_ids)
+                    remaining_candidate_events = len(over_limit_event_ids) + len(pending_event_ids)
                     if not pending_event_ids:
                         break
 
@@ -1367,6 +1370,7 @@ class DartFundamentalsCaptureService:
                         'retry_cycles_requested': max_retry_cycles,
                         'retry_cycles_completed': retry_cycles_completed,
                         'remaining_retryable_event_ids_sample': _limited_sample(pending_event_ids, limit=100),
+                        'over_limit_event_ids_sample': _limited_sample(over_limit_event_ids, limit=100),
                     }
             events_captured = int(capture_result.get('events_captured') or 0)
             events_failed = int(capture_result.get('events_failed') or 0)
@@ -1457,6 +1461,8 @@ class DartFundamentalsCaptureService:
                     limit=100,
                 ),
                 'remaining_candidate_events': remaining_candidate_events,
+                'over_limit_event_count': len(over_limit_event_ids),
+                'over_limit_event_ids_sample': _limited_sample(over_limit_event_ids, limit=100),
                 'retry_cycles_requested': resolved_retry_cycles,
                 'retry_cycles_completed': retry_cycles_completed,
                 'partial_reasons': partial_reasons,
@@ -1524,6 +1530,7 @@ class DartFundamentalsCaptureService:
                 'retry_cycles_requested': resolved_retry_cycles,
                 'retry_cycles_completed': retry_cycles_completed,
                 'remaining_retryable_events': remaining_candidate_events,
+                'over_limit_event_count': len(over_limit_event_ids),
                 'samples': {
                     'lookup_errors': _limited_sample(lookup_errors),
                     'stale_symbols': _limited_sample(sorted(stale_symbols)),
