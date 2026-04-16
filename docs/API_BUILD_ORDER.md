@@ -71,6 +71,7 @@
 - `POST /agent-context/feedback/dispatch`
 - `POST /agent-context/feedback/dispatch/symbols`
 - `GET /agent-context/feedback?market_date=YYYY-MM-DD&symbols=005930&agent_name=openclaw&limit=50`
+- `GET /agent-context/feedback/latest?market_date=YYYY-MM-DD&symbols=005930&symbols=000660`
 - `GET /agent-context/feedback/payloads?market_date=YYYY-MM-DD&symbols=005930`
 - `GET /agent-context/feedback/requests?market_date=YYYY-MM-DD&symbols=005930`
 - `GET /agent-context/feedback/status?market_date=YYYY-MM-DD&symbols=005930&symbols=000660`
@@ -127,14 +128,17 @@
 ## Agent feedback notes
 - `POST /agent-context/feedback` is the JSON intake path for downstream agents such as OpenClaw to send post-EOD symbol summaries and structured feedback back to Core.
 - `POST /agent-context/feedback/dispatch` is the orchestration trigger for role-based OpenClaw dispatch from a completed or partially completed EOD run.
-- `POST /agent-context/feedback/dispatch/symbols` dispatches the same summarizer roles against symbol-day context for explicit symbol lists.
+- `POST /agent-context/feedback/dispatch/symbols` dispatches the same summarizer roles against symbol-day context for explicit symbol lists and now accepts `reuse_existing` to skip reruns when the relevant source data has not changed.
 - Symbol dispatch now uses direct parallel fan-out over `/v1/responses`: Core chunks symbols, calls the same summarizer agent ids multiple times in parallel, and merges/stores one normalized result per symbol and role.
 - Operational tuning for symbol dispatch is controlled by `OPENCLAW_AGENT_SYMBOL_CHUNK_SIZE` and `OPENCLAW_AGENT_PARALLEL_SUBTASKS`.
+- `GET /agent-context/feedback/latest` returns the latest reusable feedback bundle by symbol and role, including whether Core would re-dispatch now or reuse the latest stored result.
 - `GET /agent-context/feedback/payloads` reads stored agent feedback payloads by symbol and date.
 - `GET /agent-context/feedback/requests` reads the stored request/context payloads that were sent to the agents by symbol and date.
 - `GET /agent-context/feedback/status` reports whether the three-agent feedback workflow is pending, in progress, partial, or completed for requested symbols, plus completed counts and pending agents.
 - `GET /agent-context/feedback/progress` reports aggregate progress for the expected three-agent feedback workflow, including `total_symbols`, `processed_symbols`, `completed_symbols`, `in_progress_symbols`, `pending_symbols`, `progress_ratio`, `progress_percent`, `failed_items`, `completed_feedback_count`, and `expected_feedback_count`. When `symbols` is omitted, the symbol universe is derived from distinct `daily_price_bars` symbols for the requested market date.
 - The current dispatch phase targets only `eod-summarizer`, `technical-summarizer`, and `fundamental-summarizer`.
+- Latest reusable feedback lookup is bounded to feedback rows with `market_date <= requested market_date`, so prior-day reusable feedback can carry forward when the source inputs are unchanged.
+- Fundamental freshness checks are bounded to DART filings and captured fundamentals eligible up to the requested `market_date`, so historical reads do not get marked stale by future filings.
 - Each role now receives a different JSON payload built for its job instead of one shared generic blob: market breadth and trending context for EOD summary, technical/state windows for technical summary, and disclosure plus fundamentals windows for fundamental summary.
 - Dispatch requires `OPENCLAW_BASE_URL` and `OPENCLAW_GATEWAY_TOKEN` configuration, retries retryable failures, and persists successful responses into `agent_context_feedback` as either market-level rows with symbol `__MARKET__` or symbol-level rows for symbol dispatch.
 - Stored normalized feedback now includes a shared top-level contract: `role`, `summary`, `confidence`, `risk_flags`, `details`, and `improvement_notes` so later jobs can mine repeated data/algorithm gaps.

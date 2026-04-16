@@ -418,10 +418,20 @@ curl -X POST "http://127.0.0.1:8000/agent-context/feedback/dispatch" \
 ```
 
 ```bash
+curl -X POST "http://127.0.0.1:8000/agent-context/feedback/dispatch/symbols" \
+  -H "Content-Type: application/json" \
+  -d '{"market_date":"2026-04-15","symbols":["005930","000660"],"roles":["fundamental-summarizer","technical-summarizer"],"reuse_existing":true}'
+```
+
+```bash
 curl "http://127.0.0.1:8000/agent-context/feedback?market_date=2026-04-15&agent_name=eod-summarizer&limit=20"
 ```
 
 Agent feedback read/status API usage:
+
+```bash
+curl "http://127.0.0.1:8000/agent-context/feedback/latest?market_date=2026-04-15&symbols=005930&symbols=000660"
+```
 
 ```bash
 curl "http://127.0.0.1:8000/agent-context/feedback/payloads?market_date=2026-04-15&symbols=005930"
@@ -441,10 +451,13 @@ curl "http://127.0.0.1:8000/agent-context/feedback/progress?market_date=2026-04-
 
 Notes:
 
+- `feedback/latest` returns the latest reusable feedback bundle per symbol and role, including whether Core would re-dispatch now or reuse the latest stored response.
 - `feedback/payloads` returns what the agents answered, using stored `feedback_payload` rows.
 - `feedback/requests` returns what Core sent to the agents, using stored `context_payload` rows.
 - `feedback/status` returns workflow state for the expected three-agent set: `eod-summarizer`, `technical-summarizer`, `fundamental-summarizer`.
 - `feedback/progress` returns aggregate workflow counters such as total symbols, processed/completed/pending symbols, progress ratio/percent, failed items, and completed versus expected feedback rows. Without `symbols`, it derives the requested universe from distinct `daily_price_bars` symbols on the requested market date.
+- `dispatch/symbols` accepts `reuse_existing`; when true, Core reuses the latest feedback at or before the requested `market_date` if the relevant source data has not changed, instead of re-dispatching that role.
+- In practice this lets unchanged DART/fundamentals keep using the latest `fundamental-summarizer` result until a newer eligible DART input arrives.
 - Symbol status becomes `pending`, `in_progress`, `partial`, or `completed` based on how many of those three agent rows have been stored.
 - These endpoints are historical reads over `agent_context_feedback`, newest rows first.
 
