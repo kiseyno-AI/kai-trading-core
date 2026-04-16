@@ -3,7 +3,7 @@
 ## Summary
 Compact web-facing freshness read API for EOD ingestion and downstream dashboards.
 
-The `today` block is scoped to the current Seoul trade date and is derived from persisted same-day data. Price, technical-analysis, and action-summary counts use the active symbol universe; fundamentals counts use DART fundamentals snapshots and failed financial-report capture attempts updated during the Seoul day. The `latest` block keeps the latest stored price date and its EOD run metadata.
+The `today` block is scoped to the current Seoul trade date and is derived from persisted same-day data. Price, technical-analysis, and action-summary counts use the active symbol universe; fundamentals counts use DART fundamentals snapshots and failed financial-report capture attempts updated during the Seoul day, with same-day succeeded symbols excluded from the failed bucket. The `latest` block keeps the latest stored price date and its EOD run metadata.
 
 ## Example request
 ```http
@@ -35,7 +35,7 @@ GET /eod/freshness
     },
     "fundamentals": {
       "status": "ready",
-      "symbols_total": 42,
+      "symbols_total": 43,
       "symbols_succeeded": 42,
       "symbols_failed": 1
     }

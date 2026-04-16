@@ -1,6 +1,6 @@
 import unittest
 
-from app.eod.freshness import EODFreshnessService
+from app.eod.freshness import EODFreshnessService, _summarize_daily_fundamentals_stage_counts
 
 
 class _FakeMarketState:
@@ -8,6 +8,17 @@ class _FakeMarketState:
 
 
 class EODFreshnessServiceTests(unittest.TestCase):
+    def test_fundamentals_stage_counts_exclude_succeeded_codes_from_failed_bucket(self):
+        counts = _summarize_daily_fundamentals_stage_counts(
+            succeeded_codes={'005930', '000660'},
+            failed_codes={'005930', '035420'},
+        )
+
+        self.assertEqual(
+            counts,
+            {'symbols_succeeded': 2, 'symbols_failed': 1, 'symbols_total': 3},
+        )
+
     def test_read_returns_missing_when_no_run_or_data(self):
         service = EODFreshnessService(
             market_state_loader=lambda: _FakeMarketState(),

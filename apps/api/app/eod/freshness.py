@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
-from typing import Callable
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, select
@@ -25,6 +25,21 @@ from app.market_data_store import (
 
 SEOUL_TZ = ZoneInfo('Asia/Seoul')
 FUNDAMENTALS_CAPTURE_FAILED = 'failed'
+
+
+def _summarize_daily_fundamentals_stage_counts(
+    *,
+    succeeded_codes: Iterable[str],
+    failed_codes: Iterable[str],
+) -> dict[str, int]:
+    succeeded_set = set(succeeded_codes)
+    failed_set = set(failed_codes) - succeeded_set
+
+    return {
+        'symbols_succeeded': len(succeeded_set),
+        'symbols_failed': len(failed_set),
+        'symbols_total': len(succeeded_set | failed_set),
+    }
 
 
 def _seoul_day_bounds(value: str | date) -> tuple[datetime, datetime]:
@@ -60,11 +75,10 @@ def _load_daily_fundamentals_stage_counts(market_date: str) -> dict[str, int]:
             ).scalars()
         )
 
-    return {
-        'symbols_succeeded': len(succeeded_codes),
-        'symbols_failed': len(failed_codes),
-        'symbols_total': len(succeeded_codes | failed_codes),
-    }
+    return _summarize_daily_fundamentals_stage_counts(
+        succeeded_codes=succeeded_codes,
+        failed_codes=failed_codes,
+    )
 
 
 @dataclass
@@ -152,11 +166,14 @@ class EODFreshnessService:
     def _build_fundamentals_stage(counts: dict[str, int]) -> dict:
         symbols_succeeded = int(counts.get('symbols_succeeded') or 0)
         symbols_failed = int(counts.get('symbols_failed') or 0)
+        symbols_total = counts.get('symbols_total')
+        if symbols_total is None:
+            symbols_total = max(symbols_succeeded, symbols_failed)
         status = 'ready' if symbols_succeeded > 0 else 'missing'
 
         return {
             'status': status,
-            'symbols_total': int(counts.get('symbols_total') or 0),
+            'symbols_total': int(symbols_total or 0),
             'symbols_succeeded': symbols_succeeded,
             'symbols_failed': symbols_failed,
         }
