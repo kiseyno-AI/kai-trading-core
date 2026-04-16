@@ -65,26 +65,7 @@ async def _await_with_refresh_heartbeat(
     interval_seconds: float | None = None,
 ) -> Any:
     heartbeat()
-    resolved_interval_seconds = (
-        DART_FUNDAMENTALS_REFRESH_HEARTBEAT_SECONDS
-        if interval_seconds is None
-        else interval_seconds
-    )
-    if resolved_interval_seconds <= 0:
-        return await operation()
-
-    async def heartbeat_loop() -> None:
-        while True:
-            await asyncio.sleep(resolved_interval_seconds)
-            heartbeat()
-
-    task = asyncio.create_task(heartbeat_loop())
-    try:
-        return await operation()
-    finally:
-        task.cancel()
-        with suppress(asyncio.CancelledError):
-            await task
+    return await operation()
 
 
 def infer_fundamentals_request(
