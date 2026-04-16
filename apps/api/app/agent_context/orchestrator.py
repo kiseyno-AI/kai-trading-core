@@ -258,9 +258,14 @@ class OpenClawAgentClient:
         batch_items: Sequence[dict[str, Any]],
     ) -> dict[str, Any]:
         url = f'{self.base_url}/v1/responses'
-        request_session_key = None
-        if batch_items:
-            request_session_key = batch_items[0].get('session_key')
+        session_keys = {
+            str(item.get('session_key'))
+            for item in batch_items
+            if item.get('session_key')
+        }
+        if len(session_keys) > 1:
+            raise ValueError(f'Batch items for {spec.agent_name} mixed session slots: {sorted(session_keys)}')
+        request_session_key = next(iter(session_keys), None)
         request_session_key = str(request_session_key or f"feedback/{spec.agent_name}/{market_date.isoformat()}/{uuid.uuid4().hex}")
         body = {
             'model': f'openclaw/{spec.agent_name}',
@@ -562,7 +567,18 @@ class AgentFeedbackOrchestrator:
                         'session_key': _feedback_session_key(agent_name=spec.agent_name, slot=slot),
                     }
                 )
-            role_batches = [dispatch_items[i:i + batch_size] for i in range(0, len(dispatch_items), batch_size)]
+            batches_by_session_key: dict[str, list[dict[str, Any]]] = {}
+            for item in dispatch_items:
+                session_key = str(item['session_key'])
+                batches_by_session_key.setdefault(session_key, []).append(item)
+
+            role_batches: list[list[dict[str, Any]]] = []
+            for session_key in sorted(batches_by_session_key.keys()):
+                session_items = batches_by_session_key[session_key]
+                role_batches.extend(
+                    session_items[i:i + batch_size]
+                    for i in range(0, len(session_items), batch_size)
+                )
             role_batch_jobs[spec.role] = [(spec, batch) for batch in role_batches]
 
         total_max_workers = max(1, role_worker_count * max(1, len(specs)))
