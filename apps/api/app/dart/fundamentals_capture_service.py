@@ -1323,16 +1323,44 @@ class DartFundamentalsCaptureService:
                         break
 
                 if capture_runs:
-                    aggregated_results = []
+                    final_results_by_event_id: dict[int, dict[str, Any]] = {}
+                    ordered_final_results: list[dict[str, Any]] = []
                     for cycle_result in capture_runs:
-                        aggregated_results.extend(cycle_result.get('results', []))
+                        for item in cycle_result.get('results', []):
+                            event_id = item.get('event_id')
+                            if event_id is None:
+                                ordered_final_results.append(item)
+                                continue
+                            normalized_event_id = int(event_id)
+                            if normalized_event_id not in final_results_by_event_id:
+                                ordered_final_results.append(item)
+                            final_results_by_event_id[normalized_event_id] = item
+
+                    aggregated_results = []
+                    seen_event_ids: set[int] = set()
+                    for item in ordered_final_results:
+                        event_id = item.get('event_id')
+                        if event_id is None:
+                            aggregated_results.append(item)
+                            continue
+                        normalized_event_id = int(event_id)
+                        if normalized_event_id in seen_event_ids:
+                            continue
+                        aggregated_results.append(final_results_by_event_id[normalized_event_id])
+                        seen_event_ids.add(normalized_event_id)
+
+                    final_failed_event_ids = {
+                        event_id
+                        for event_id, item in final_results_by_event_id.items()
+                        if item.get('status') == 'failed'
+                    }
                     capture_result = {
                         'run_id': capture_runs[-1].get('run_id'),
                         'status': capture_runs[-1].get('status'),
                         'fs_div': resolved_fs_div,
                         'events_seen': sum(int(item.get('events_seen') or 0) for item in capture_runs),
                         'events_captured': sum(int(item.get('events_captured') or 0) for item in capture_runs),
-                        'events_failed': sum(int(item.get('events_failed') or 0) for item in capture_runs),
+                        'events_failed': len(final_failed_event_ids),
                         'events_skipped': sum(int(item.get('events_skipped') or 0) for item in capture_runs),
                         'results': aggregated_results,
                         'runs': capture_runs,
