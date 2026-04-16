@@ -16,7 +16,7 @@ class EODFreshnessServiceTests(unittest.TestCase):
             daily_price_bar_count_loader=lambda _: 0,
             daily_technical_snapshot_count_loader=lambda _: 0,
             daily_action_summary_count_loader=lambda _: 0,
-            latest_fundamentals_run_loader=lambda _: None,
+            daily_fundamentals_count_loader=lambda _: {'symbols_succeeded': 0, 'symbols_failed': 0},
             latest_price_trade_date_loader=lambda: None,
             latest_price_bar_count_loader=lambda _: 0,
             latest_technical_market_date_loader=lambda: None,
@@ -79,7 +79,7 @@ class EODFreshnessServiceTests(unittest.TestCase):
             daily_price_bar_count_loader=daily_price_bar_count_loader,
             daily_technical_snapshot_count_loader=lambda _: 0,
             daily_action_summary_count_loader=lambda _: 0,
-            latest_fundamentals_run_loader=lambda _: None,
+            daily_fundamentals_count_loader=lambda _: {'symbols_succeeded': 0, 'symbols_failed': 0},
             latest_price_trade_date_loader=lambda: '2026-04-09',
             latest_price_bar_count_loader=latest_price_bar_count_loader,
             latest_technical_market_date_loader=lambda: '2026-04-09',
@@ -100,7 +100,7 @@ class EODFreshnessServiceTests(unittest.TestCase):
         self.assertEqual(result['latest']['symbols_failed'], 3)
         self.assertEqual(result['latest']['technical_market_date'], '2026-04-09')
         self.assertEqual(result['latest']['action_market_date'], '2026-04-09')
-        self.assertEqual(requested_run_dates, ['2026-04-10', '2026-04-09'])
+        self.assertEqual(requested_run_dates, ['2026-04-09'])
         self.assertEqual(requested_live_count_dates, ['2026-04-10'])
         self.assertEqual(requested_latest_count_dates, ['2026-04-09'])
 
@@ -123,7 +123,7 @@ class EODFreshnessServiceTests(unittest.TestCase):
             daily_price_bar_count_loader=daily_price_bar_count_loader,
             daily_technical_snapshot_count_loader=lambda _: 0,
             daily_action_summary_count_loader=lambda _: 0,
-            latest_fundamentals_run_loader=lambda _: None,
+            daily_fundamentals_count_loader=lambda _: {'symbols_succeeded': 0, 'symbols_failed': 0},
             latest_price_trade_date_loader=lambda: '2026-04-10',
             latest_price_bar_count_loader=latest_price_bar_count_loader,
             latest_technical_market_date_loader=lambda: None,
@@ -151,11 +151,7 @@ class EODFreshnessServiceTests(unittest.TestCase):
             daily_price_bar_count_loader=lambda _: 2,
             daily_technical_snapshot_count_loader=lambda _: 3,
             daily_action_summary_count_loader=lambda _: 2,
-            latest_fundamentals_run_loader=lambda _: {
-                'status': 'partial',
-                'symbols_refreshed': 2,
-                'symbols_failed': 1,
-            },
+            daily_fundamentals_count_loader=lambda _: {'symbols_succeeded': 2, 'symbols_failed': 1},
             latest_price_trade_date_loader=lambda: '2026-04-10',
             latest_price_bar_count_loader=lambda _: 2,
             latest_technical_market_date_loader=lambda: '2026-04-10',
@@ -199,7 +195,7 @@ class EODFreshnessServiceTests(unittest.TestCase):
             daily_price_bar_count_loader=lambda _: 0,
             daily_technical_snapshot_count_loader=lambda _: 0,
             daily_action_summary_count_loader=lambda _: 0,
-            latest_fundamentals_run_loader=lambda _: None,
+            daily_fundamentals_count_loader=lambda _: {'symbols_succeeded': 0, 'symbols_failed': 0},
             latest_price_trade_date_loader=lambda: '2026-04-09',
             latest_price_bar_count_loader=lambda _: 0,
             latest_technical_market_date_loader=lambda: '2026-04-09',
@@ -211,10 +207,10 @@ class EODFreshnessServiceTests(unittest.TestCase):
         self.assertEqual(result['latest']['eod_status'], 'completed_with_errors')
         self.assertEqual(
             result['today']['price'],
-            {'status': 'missing', 'symbols_total': 3, 'symbols_succeeded': 0, 'symbols_failed': 3},
+            {'status': 'missing', 'symbols_total': 3, 'symbols_succeeded': 0, 'symbols_failed': 0},
         )
 
-    def test_read_returns_running_when_run_in_progress(self):
+    def test_today_stages_use_persisted_counts_when_run_in_progress(self):
         service = EODFreshnessService(
             market_state_loader=lambda: _FakeMarketState(),
             latest_run_loader=lambda **_: {
@@ -227,11 +223,7 @@ class EODFreshnessServiceTests(unittest.TestCase):
             daily_price_bar_count_loader=lambda _: 12,
             daily_technical_snapshot_count_loader=lambda _: 0,
             daily_action_summary_count_loader=lambda _: 0,
-            latest_fundamentals_run_loader=lambda _: {
-                'status': 'running',
-                'symbols_refreshed': 5,
-                'symbols_failed': 1,
-            },
+            daily_fundamentals_count_loader=lambda _: {'symbols_succeeded': 5, 'symbols_failed': 1},
             latest_price_trade_date_loader=lambda: '2026-04-10',
             latest_price_bar_count_loader=lambda _: 12,
             latest_technical_market_date_loader=lambda: '2026-04-09',
@@ -240,13 +232,14 @@ class EODFreshnessServiceTests(unittest.TestCase):
 
         result = service.read()
 
-        self.assertEqual(result['today']['price']['status'], 'running')
+        self.assertEqual(result['today']['price']['status'], 'ready')
         self.assertEqual(result['today']['price']['symbols_total'], 100)
         self.assertEqual(result['today']['price']['symbols_succeeded'], 12)
-        self.assertEqual(result['today']['price']['symbols_failed'], 1)
-        self.assertEqual(result['today']['technical_analysis']['status'], 'running')
-        self.assertEqual(result['today']['action_summary']['status'], 'running')
+        self.assertEqual(result['today']['price']['symbols_failed'], 88)
+        self.assertEqual(result['today']['technical_analysis']['status'], 'missing')
+        self.assertEqual(result['today']['action_summary']['status'], 'missing')
         self.assertEqual(
             result['today']['fundamentals'],
-            {'status': 'running', 'symbols_total': 5, 'symbols_succeeded': 5, 'symbols_failed': 1},
+            {'status': 'ready', 'symbols_total': 5, 'symbols_succeeded': 5, 'symbols_failed': 1},
         )
+        self.assertEqual(result['latest']['eod_status'], 'running')

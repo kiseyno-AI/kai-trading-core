@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, time, timedelta
 from typing import Callable
+from zoneinfo import ZoneInfo
+
+from sqlalchemy import func, select
 
 from app.core.settings import settings
-from app.dart.fundamentals_store import dart_fundamentals_repository
+from app.db import session_scope
+from app.db_models import DartDisclosureEvent, DartFundamentalsSnapshot
 from app.market.clock import get_market_state
 from app.market_data_store import (
     count_daily_action_summaries_for_live_symbols,
@@ -19,12 +23,47 @@ from app.market_data_store import (
     load_latest_eod_collection_run,
 )
 
+SEOUL_TZ = ZoneInfo('Asia/Seoul')
+FUNDAMENTALS_CAPTURE_FAILED = 'failed'
 
-def _load_latest_fundamentals_refresh_run(market_date: str) -> dict | None:
-    return dart_fundamentals_repository.get_latest_refresh_run(
-        market_date=date.fromisoformat(market_date),
-        fs_div=settings.dart_fundamentals_default_fs_div.strip().upper(),
-    )
+
+def _seoul_day_bounds(value: str | date) -> tuple[datetime, datetime]:
+    market_date = date.fromisoformat(value) if isinstance(value, str) else value
+    start = datetime.combine(market_date, time.min, tzinfo=SEOUL_TZ)
+    return start, start + timedelta(days=1)
+
+
+def _load_daily_fundamentals_stage_counts(market_date: str) -> dict[str, int]:
+    start_at, end_at = _seoul_day_bounds(market_date)
+    fs_div = settings.dart_fundamentals_default_fs_div.strip().upper()
+
+    with session_scope() as session:
+        symbols_succeeded = int(
+            session.execute(
+                select(func.count(func.distinct(DartFundamentalsSnapshot.stock_code)))
+                .select_from(DartFundamentalsSnapshot)
+                .where(DartFundamentalsSnapshot.fs_div == fs_div)
+                .where(DartFundamentalsSnapshot.stock_code.is_not(None))
+                .where(DartFundamentalsSnapshot.updated_at >= start_at)
+                .where(DartFundamentalsSnapshot.updated_at < end_at)
+            ).scalar_one()
+        )
+        symbols_failed = int(
+            session.execute(
+                select(func.count(func.distinct(DartDisclosureEvent.stock_code)))
+                .select_from(DartDisclosureEvent)
+                .where(DartDisclosureEvent.is_financial_report.is_(True))
+                .where(DartDisclosureEvent.stock_code.is_not(None))
+                .where(DartDisclosureEvent.fundamentals_capture_status == FUNDAMENTALS_CAPTURE_FAILED)
+                .where(DartDisclosureEvent.fundamentals_last_attempt_at >= start_at)
+                .where(DartDisclosureEvent.fundamentals_last_attempt_at < end_at)
+            ).scalar_one()
+        )
+
+    return {
+        'symbols_succeeded': symbols_succeeded,
+        'symbols_failed': symbols_failed,
+    }
 
 
 @dataclass
@@ -35,7 +74,7 @@ class EODFreshnessService:
     daily_price_bar_count_loader: Callable = count_daily_price_bars_for_live_symbols
     daily_technical_snapshot_count_loader: Callable = count_daily_technical_snapshots_for_live_symbols
     daily_action_summary_count_loader: Callable = count_daily_action_summaries_for_live_symbols
-    latest_fundamentals_run_loader: Callable = _load_latest_fundamentals_refresh_run
+    daily_fundamentals_count_loader: Callable = _load_daily_fundamentals_stage_counts
     latest_price_trade_date_loader: Callable = load_latest_available_daily_price_trade_date
     latest_price_bar_count_loader: Callable = count_daily_price_bars_for_date
     latest_technical_market_date_loader: Callable = load_latest_available_daily_technical_snapshot_date
@@ -45,18 +84,13 @@ class EODFreshnessService:
         trade_date = self.market_state_loader().server_time[:10]
         live_symbols_total = self.live_symbol_count_loader()
         latest_price_trade_date = self.latest_price_trade_date_loader()
-        today_run = self.latest_run_loader(market='KRX', trade_date=trade_date)
         price_bar_count = self.daily_price_bar_count_loader(trade_date)
         technical_snapshot_count = self.daily_technical_snapshot_count_loader(trade_date)
         action_summary_count = self.daily_action_summary_count_loader(trade_date)
-        fundamentals_run = self.latest_fundamentals_run_loader(trade_date)
+        fundamentals_counts = self.daily_fundamentals_count_loader(trade_date)
 
         if latest_price_trade_date:
-            latest_price_run = (
-                today_run
-                if latest_price_trade_date == trade_date
-                else self.latest_run_loader(market='KRX', trade_date=latest_price_trade_date)
-            )
+            latest_price_run = self.latest_run_loader(market='KRX', trade_date=latest_price_trade_date)
             latest_price_bar_count = self.latest_price_bar_count_loader(latest_price_trade_date)
         else:
             latest_price_run = None
@@ -66,22 +100,18 @@ class EODFreshnessService:
             'today': {
                 'trade_date': trade_date,
                 'price': self._build_live_symbol_stage(
-                    latest_run=today_run,
                     symbols_total=live_symbols_total,
                     symbols_succeeded=price_bar_count,
-                    known_symbols_failed=today_run.get('symbols_failed') if today_run else 0,
                 ),
                 'technical_analysis': self._build_live_symbol_stage(
-                    latest_run=today_run,
                     symbols_total=live_symbols_total,
                     symbols_succeeded=technical_snapshot_count,
                 ),
                 'action_summary': self._build_live_symbol_stage(
-                    latest_run=today_run,
                     symbols_total=live_symbols_total,
                     symbols_succeeded=action_summary_count,
                 ),
-                'fundamentals': self._build_fundamentals_stage(fundamentals_run),
+                'fundamentals': self._build_fundamentals_stage(fundamentals_counts),
             },
             'latest': {
                 'price_trade_date': latest_price_trade_date,
@@ -100,26 +130,12 @@ class EODFreshnessService:
     @staticmethod
     def _build_live_symbol_stage(
         *,
-        latest_run: dict | None,
         symbols_total: int,
         symbols_succeeded: int,
-        known_symbols_failed: int | None = 0,
     ) -> dict:
-        run_status = latest_run.get('status') if latest_run else None
-        if run_status == 'running':
-            return {
-                'status': 'running',
-                'symbols_total': symbols_total,
-                'symbols_succeeded': symbols_succeeded,
-                'symbols_failed': int(known_symbols_failed or 0),
-            }
-
         if symbols_succeeded > 0:
             status = 'ready'
-            symbols_failed = max(symbols_total - symbols_succeeded, int(known_symbols_failed or 0), 0)
-        elif latest_run and run_status in {'completed', 'completed_with_errors', 'failed'}:
-            status = 'missing'
-            symbols_failed = max(symbols_total, int(known_symbols_failed or 0), 0)
+            symbols_failed = max(symbols_total - symbols_succeeded, 0)
         else:
             status = 'missing'
             symbols_failed = 0
@@ -132,25 +148,15 @@ class EODFreshnessService:
         }
 
     @staticmethod
-    def _build_fundamentals_stage(latest_run: dict | None) -> dict:
-        if latest_run is None:
-            return {
-                'status': 'missing',
-                'symbols_total': 0,
-                'symbols_succeeded': 0,
-                'symbols_failed': 0,
-            }
-
-        symbols_refreshed = int(latest_run.get('symbols_refreshed') or 0)
-        symbols_failed = int(latest_run.get('symbols_failed') or 0)
-        status = 'running' if latest_run.get('status') == 'running' else 'ready'
-        if latest_run.get('status') == 'failed' and symbols_refreshed == 0:
-            status = 'missing'
+    def _build_fundamentals_stage(counts: dict[str, int]) -> dict:
+        symbols_succeeded = int(counts.get('symbols_succeeded') or 0)
+        symbols_failed = int(counts.get('symbols_failed') or 0)
+        status = 'ready' if symbols_succeeded > 0 else 'missing'
 
         return {
             'status': status,
-            'symbols_total': symbols_refreshed,
-            'symbols_succeeded': symbols_refreshed,
+            'symbols_total': symbols_succeeded,
+            'symbols_succeeded': symbols_succeeded,
             'symbols_failed': symbols_failed,
         }
 

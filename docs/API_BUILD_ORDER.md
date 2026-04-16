@@ -80,7 +80,8 @@
 ## EOD freshness read-layer notes
 - `GET /eod/freshness` is the compact web-facing read API for EOD ingestion freshness.
 - It reports the current Seoul trade date, today's stage-specific status for price, technical analysis, action summary, and fundamentals, plus the latest stored dates for price bars, technical snapshots, and action summaries.
-- Today's price, technical-analysis, and action-summary stage totals are based on the current active symbol universe. Today's fundamentals total is based on symbols refreshed by the DART daily fundamentals run for the current trade date.
+- Today's price, technical-analysis, and action-summary stage totals are based on the current active symbol universe. Their succeeded counts come from same-day persisted rows for active symbols; once a stage has same-day rows, failed counts represent active symbols still missing that persisted data.
+- Today's fundamentals counts come from persisted DART data updated during the current Seoul day: succeeded is distinct symbols with updated fundamentals snapshots, and failed is distinct financial-report symbols whose capture attempt failed that day.
 - The `latest` block also reports EOD run status and symbol counts for `latest.price_trade_date`, so clients can show the latest stored run result before today's run exists.
 - `latest.eod_status` falls back to all stored price bars for `latest.price_trade_date`, including symbols that are no longer in the current active universe.
 - The `today` block is scoped only to the current Seoul trade date; previous-day historical availability is surfaced through `latest.*`, not copied into `today.*`.
