@@ -179,3 +179,5 @@
 - Curated DART ownership or dividend read slices built on top of the current disclosure backbone
 - KIS balance inquiry
 - KIS account positions
+
+- Automatic daily EOD capture can optionally chain into DART fundamentals daily refresh when `EOD_TRIGGER_FUNDAMENTALS_AFTER_CAPTURE=true`, so price -> technical -> action -> fundamentals -> agent feedback can run as one daily cycle.
