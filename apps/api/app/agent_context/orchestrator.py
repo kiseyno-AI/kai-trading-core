@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
 import json
 import logging
 import time
@@ -63,6 +64,12 @@ class AgentDispatchRetryableError(AgentOrchestratorError):
 
 class AgentDispatchTerminalError(AgentOrchestratorError):
     pass
+
+
+def _stable_slot_for_value(*, value: str, pool_size: int) -> int:
+    normalized = value.strip() or 'default'
+    digest = hashlib.sha256(normalized.encode('utf-8')).hexdigest()
+    return int(digest[:8], 16) % max(1, pool_size)
 
 
 class OpenClawAgentClient:
@@ -184,7 +191,7 @@ class OpenClawAgentClient:
 
     def dispatch(self, *, spec: AgentDispatchSpec, payload: dict[str, Any]) -> dict[str, Any]:
         url = f'{self.base_url}/v1/responses'
-        request_session_key = f"feedback/{spec.agent_name}/{payload.get('request_id') or uuid.uuid4().hex}"
+        request_session_key = str(payload.get('session_key') or f"feedback/{spec.agent_name}/{payload.get('request_id') or uuid.uuid4().hex}")
         body = {
             'model': f'openclaw/{spec.agent_name}',
             'input': self._build_message(spec=spec, payload=payload),
@@ -247,8 +254,10 @@ class OpenClawAgentClient:
         batch_items: Sequence[dict[str, Any]],
     ) -> dict[str, Any]:
         url = f'{self.base_url}/v1/responses'
-        batch_request_id = uuid.uuid4().hex
-        request_session_key = f"feedback/{spec.agent_name}/{market_date.isoformat()}/{batch_request_id}"
+        request_session_key = None
+        if batch_items:
+            request_session_key = batch_items[0].get('session_key')
+        request_session_key = str(request_session_key or f"feedback/{spec.agent_name}/{market_date.isoformat()}/{uuid.uuid4().hex}")
         body = {
             'model': f'openclaw/{spec.agent_name}',
             'input': self._build_batch_message(spec=spec, market_date=market_date, batch_items=batch_items),
@@ -545,7 +554,14 @@ class AgentFeedbackOrchestrator:
                         }
                     )
                     continue
-                dispatch_items.append(item)
+                session_pool_size = max(1, min(max_workers, settings.openclaw_agent_parallel_subtasks))
+                slot = _stable_slot_for_value(value=item['symbol'], pool_size=session_pool_size) + 1
+                dispatch_items.append(
+                    {
+                        **item,
+                        'session_key': f"feedback/{spec.agent_name}/{normalized_market_date.isoformat()}/slot-{slot:02d}",
+                    }
+                )
             role_batches = [dispatch_items[i:i + batch_size] for i in range(0, len(dispatch_items), batch_size)]
             for batch in role_batches:
                 batch_jobs.append((spec, batch))
