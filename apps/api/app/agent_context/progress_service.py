@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timezone
 from typing import Any, Sequence
 
 from sqlalchemy import func, select
@@ -9,6 +9,9 @@ from app.agent_context.feedback_service import _normalize_market_date, _normaliz
 from app.agent_context.status_service import EXPECTED_AGENT_NAMES, EXPECTED_AGENT_SET
 from app.db import session_scope
 from app.db_models import AgentContextFeedback, Symbol
+
+
+STALL_THRESHOLD_SECONDS = 300
 
 
 class AgentContextProgressService:
@@ -30,6 +33,11 @@ class AgentContextProgressService:
             if normalized_symbols:
                 universe_symbols_stmt = universe_symbols_stmt.where(Symbol.symbol.in_(normalized_symbols))
             universe_symbols = [str(symbol) for symbol in session.execute(universe_symbols_stmt).scalars().all()]
+
+            latest_feedback_at = session.execute(
+                select(func.max(AgentContextFeedback.received_at))
+                .where(AgentContextFeedback.market_date == normalized_market_date)
+            ).scalar_one()
 
             rows_stmt = (
                 select(
@@ -63,6 +71,13 @@ class AgentContextProgressService:
         grouped: dict[str, list[dict[str, Any]]] = {}
         for row in rows:
             grouped.setdefault(str(row['symbol']), []).append(row)
+
+        latest_feedback_at = latest_feedback_at.isoformat() if latest_feedback_at else None
+        latest_feedback_dt = None
+        if latest_feedback_at:
+            latest_feedback_dt = datetime.fromisoformat(str(latest_feedback_at))
+            if latest_feedback_dt.tzinfo is None:
+                latest_feedback_dt = latest_feedback_dt.replace(tzinfo=timezone.utc)
 
         completed_symbols = 0
         in_progress_symbols = 0
@@ -103,6 +118,22 @@ class AgentContextProgressService:
         )
         expected_feedback_count = requested_symbol_count * len(EXPECTED_AGENT_NAMES)
 
+        seconds_since_last_feedback = None
+        if latest_feedback_dt is not None:
+            seconds_since_last_feedback = max(
+                0,
+                int((datetime.now(timezone.utc) - latest_feedback_dt.astimezone(timezone.utc)).total_seconds()),
+            )
+
+        if completed_symbols == requested_symbol_count and requested_symbol_count > 0:
+            run_status = 'completed'
+        elif latest_feedback_dt is None:
+            run_status = 'pending'
+        elif seconds_since_last_feedback is not None and seconds_since_last_feedback <= STALL_THRESHOLD_SECONDS:
+            run_status = 'running'
+        else:
+            run_status = 'stalled'
+
         return {
             'request': {
                 'market_date': normalized_market_date.isoformat(),
@@ -110,6 +141,11 @@ class AgentContextProgressService:
                 'expected_agents': list(EXPECTED_AGENT_NAMES),
             },
             'summary': {
+                'run_status': run_status,
+                'is_live': run_status == 'running',
+                'latest_feedback_at': latest_feedback_at,
+                'seconds_since_last_feedback': seconds_since_last_feedback,
+                'stalled_threshold_seconds': STALL_THRESHOLD_SECONDS,
                 'total_symbols': requested_symbol_count,
                 'processed_symbols': processed_symbols,
                 'completed_symbols': completed_symbols,
