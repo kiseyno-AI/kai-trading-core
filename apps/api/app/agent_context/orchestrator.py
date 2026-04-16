@@ -8,6 +8,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from typing import Any, Sequence
+from urllib.parse import quote
 
 import httpx
 
@@ -80,6 +81,55 @@ class OpenClawAgentClient:
         self.max_retries = max(0, max_retries)
         self.retry_backoff_seconds = max(0.0, retry_backoff_seconds)
 
+    def _extract_session_ref(self, parsed: dict[str, Any], *, explicit_session_key: str | None = None) -> dict[str, Any] | None:
+        if explicit_session_key:
+            return {
+                'session_key': explicit_session_key,
+                'response_id': parsed.get('id'),
+            }
+        session_key = parsed.get('session_key') or parsed.get('sessionKey')
+        if isinstance(session_key, str) and session_key.strip():
+            return {
+                'session_key': session_key.strip(),
+                'response_id': parsed.get('id'),
+            }
+        return None
+
+    def cleanup_session(self, session_ref: dict[str, Any] | None) -> dict[str, Any]:
+        if not session_ref or not session_ref.get('session_key'):
+            return {'status': 'skipped', 'reason': 'missing_session_key'}
+        session_key = str(session_ref['session_key']).strip()
+        url = f"{self.base_url}/sessions/{quote(session_key, safe='')}/kill"
+        try:
+            with httpx.Client(timeout=max(10.0, min(self.timeout_seconds, 30.0)), headers=self._headers()) as client:
+                response = client.post(url)
+            if response.status_code == 404:
+                return {
+                    'status': 'not_found',
+                    'status_code': response.status_code,
+                    'session_key': session_key,
+                }
+            if response.status_code >= 400:
+                return {
+                    'status': 'failed',
+                    'status_code': response.status_code,
+                    'session_key': session_key,
+                    'error': response.text[:300],
+                }
+            parsed = response.json()
+            return {
+                'status': 'completed' if parsed.get('killed') else 'not_killed',
+                'status_code': response.status_code,
+                'session_key': session_key,
+                'killed': bool(parsed.get('killed')),
+            }
+        except Exception as exc:  # noqa: BLE001
+            return {
+                'status': 'failed',
+                'session_key': session_key,
+                'error': str(exc),
+            }
+
     def _headers(self) -> dict[str, str]:
         return {
             'Authorization': f'Bearer {self.gateway_token}',
@@ -134,6 +184,7 @@ class OpenClawAgentClient:
 
     def dispatch(self, *, spec: AgentDispatchSpec, payload: dict[str, Any]) -> dict[str, Any]:
         url = f'{self.base_url}/v1/responses'
+        request_session_key = f"feedback/{spec.agent_name}/{payload.get('request_id') or uuid.uuid4().hex}"
         body = {
             'model': f'openclaw/{spec.agent_name}',
             'input': self._build_message(spec=spec, payload=payload),
@@ -144,7 +195,8 @@ class OpenClawAgentClient:
             attempt += 1
             started_at = datetime.now(timezone.utc)
             try:
-                with httpx.Client(timeout=self.timeout_seconds, headers=self._headers()) as client:
+                headers = self._headers() | {'x-openclaw-session-key': request_session_key}
+                with httpx.Client(timeout=self.timeout_seconds, headers=headers) as client:
                     response = client.post(url, json=body)
                 if response.status_code >= 500:
                     raise AgentDispatchRetryableError(f'OpenClaw server error {response.status_code}: {response.text[:300]}')
@@ -170,6 +222,7 @@ class OpenClawAgentClient:
                     'completed_at': datetime.now(timezone.utc).isoformat(),
                     'response': parsed,
                     'output_text': output_text,
+                    'session_ref': self._extract_session_ref(parsed, explicit_session_key=request_session_key),
                     'normalized_feedback': normalize_agent_response(
                         role=spec.role,
                         output_text=output_text,
@@ -194,12 +247,15 @@ class OpenClawAgentClient:
         batch_items: Sequence[dict[str, Any]],
     ) -> dict[str, Any]:
         url = f'{self.base_url}/v1/responses'
+        batch_request_id = uuid.uuid4().hex
+        request_session_key = f"feedback/{spec.agent_name}/{market_date.isoformat()}/{batch_request_id}"
         body = {
             'model': f'openclaw/{spec.agent_name}',
             'input': self._build_batch_message(spec=spec, market_date=market_date, batch_items=batch_items),
         }
         started_at = datetime.now(timezone.utc)
-        with httpx.Client(timeout=max(self.timeout_seconds, settings.openclaw_agent_subtask_timeout_seconds), headers=self._headers()) as client:
+        headers = self._headers() | {'x-openclaw-session-key': request_session_key}
+        with httpx.Client(timeout=max(self.timeout_seconds, settings.openclaw_agent_subtask_timeout_seconds), headers=headers) as client:
             response = client.post(url, json=body)
         if response.status_code >= 400:
             raise AgentDispatchTerminalError(f'OpenClaw batch failed {response.status_code}: {response.text[:300]}')
@@ -262,6 +318,7 @@ class OpenClawAgentClient:
             'completed_at': datetime.now(timezone.utc).isoformat(),
             'response': parsed,
             'output_text': output_text,
+            'session_ref': self._extract_session_ref(parsed, explicit_session_key=request_session_key),
             'decoded': decoded,
         }
 
@@ -326,6 +383,8 @@ class AgentFeedbackOrchestrator:
                         'attempt': response.get('attempt'),
                         'started_at': response.get('started_at'),
                         'completed_at': response.get('completed_at'),
+                        'session_ref': response.get('session_ref'),
+                        'cleanup': response.get('cleanup'),
                     },
                     'normalized_feedback': response.get('normalized_feedback'),
                 },
@@ -365,17 +424,22 @@ class AgentFeedbackOrchestrator:
         items: list[dict[str, Any]] = []
         failures: list[dict[str, Any]] = []
         for spec in specs:
+            response: dict[str, Any] | None = None
+            role_payload = payloads[spec.role]
             try:
-                role_payload = payloads[spec.role]
                 response = self._get_client().dispatch(spec=spec, payload=role_payload)
                 stored = self._store_feedback(
                     market_date=market_date,
                     agent_name=spec.agent_name,
                     run_id=request_run_id,
                     payload=role_payload,
-                    response=response,
+                    response={
+                        **response,
+                        'cleanup': {'status': 'pending'},
+                    },
                     context=role_payload,
                 )
+                response['cleanup'] = self._get_client().cleanup_session(response.get('session_ref'))
                 if symbol != '__MARKET__':
                     with session_scope() as session:
                         record = session.get(AgentContextFeedback, stored['id'])
@@ -393,9 +457,9 @@ class AgentFeedbackOrchestrator:
                     }
                 )
             except AgentDispatchTerminalError as exc:
-                failures.append({'role': spec.role, 'agent_name': spec.agent_name, 'symbol': symbol, 'status': 'failed', 'retryable': False, 'error': str(exc)})
+                failures.append({'role': spec.role, 'agent_name': spec.agent_name, 'symbol': symbol, 'status': 'failed', 'retryable': False, 'error': str(exc), 'cleanup': self._get_client().cleanup_session(response.get('session_ref') if response else None)})
             except Exception as exc:  # noqa: BLE001
-                failures.append({'role': spec.role, 'agent_name': spec.agent_name, 'symbol': symbol, 'status': 'failed', 'retryable': True, 'error': str(exc)})
+                failures.append({'role': spec.role, 'agent_name': spec.agent_name, 'symbol': symbol, 'status': 'failed', 'retryable': True, 'error': str(exc), 'cleanup': self._get_client().cleanup_session(response.get('session_ref') if response else None)})
         return items, failures
 
     def dispatch_for_eod_run(self, *, eod_run_id: int, roles: Sequence[str] | None = None) -> dict[str, Any]:
@@ -498,6 +562,7 @@ class AgentFeedbackOrchestrator:
             }
             for future in concurrent.futures.as_completed(future_map):
                 spec, batch = future_map[future]
+                batch_result: dict[str, Any] | None = None
                 try:
                     batch_result = future.result()
                     decoded_items = batch_result.get('decoded', {}).get('items', [])
@@ -530,6 +595,8 @@ class AgentFeedbackOrchestrator:
                                 'attempt': 1,
                                 'started_at': batch_result.get('started_at'),
                                 'completed_at': batch_result.get('completed_at'),
+                                'session_ref': batch_result.get('session_ref'),
+                                'cleanup': batch_result.get('cleanup'),
                                 'normalized_feedback': normalized_feedback,
                             },
                             context=source_item,
@@ -550,6 +617,7 @@ class AgentFeedbackOrchestrator:
                             }
                         )
                 except Exception as exc:  # noqa: BLE001
+                    cleanup = self._get_client().cleanup_session(batch_result.get('session_ref') if batch_result else None)
                     for source_item in batch:
                         failures.append(
                             {
@@ -559,8 +627,12 @@ class AgentFeedbackOrchestrator:
                                 'status': 'failed',
                                 'retryable': True,
                                 'error': str(exc),
+                                'cleanup': cleanup,
                             }
                         )
+                finally:
+                    if batch_result is not None:
+                        batch_result['cleanup'] = self._get_client().cleanup_session(batch_result.get('session_ref'))
 
         status = 'completed'
         if failures and items:
