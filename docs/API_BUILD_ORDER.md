@@ -139,6 +139,8 @@
 - The current dispatch phase targets only `eod-summarizer`, `technical-summarizer`, and `fundamental-summarizer`.
 - Latest reusable feedback lookup is bounded to feedback rows with `market_date <= requested market_date`, so prior-day reusable feedback can carry forward when the source inputs are unchanged.
 - Fundamental freshness checks are bounded to DART filings and captured fundamentals eligible up to the requested `market_date`, so historical reads do not get marked stale by future filings.
+- Recommended daily operations pattern is retry cycles: one full-universe pass, then one or more bounded follow-up cycles over only the remaining incomplete symbols, so transient gateway or agent failures do not require rerunning the whole universe.
+- Repo helper entrypoint for that pattern: from `apps/api`, run `python3.11 -m scripts.run_feedback_retry_cycles`.
 - Each role now receives a different JSON payload built for its job instead of one shared generic blob: market breadth and trending context for EOD summary, technical/state windows for technical summary, and disclosure plus fundamentals windows for fundamental summary.
 - Dispatch requires `OPENCLAW_BASE_URL` and `OPENCLAW_GATEWAY_TOKEN` configuration, retries retryable failures, and persists successful responses into `agent_context_feedback` as either market-level rows with symbol `__MARKET__` or symbol-level rows for symbol dispatch.
 - Stored normalized feedback now includes a shared top-level contract: `role`, `summary`, `confidence`, `risk_flags`, `details`, and `improvement_notes` so later jobs can mine repeated data/algorithm gaps.
