@@ -65,7 +65,26 @@ async def _await_with_refresh_heartbeat(
     interval_seconds: float | None = None,
 ) -> Any:
     heartbeat()
-    return await operation()
+    resolved_interval_seconds = (
+        DART_FUNDAMENTALS_REFRESH_HEARTBEAT_SECONDS
+        if interval_seconds is None
+        else interval_seconds
+    )
+    if resolved_interval_seconds <= 0:
+        return await operation()
+
+    async def heartbeat_loop() -> None:
+        while True:
+            await asyncio.sleep(resolved_interval_seconds)
+            heartbeat()
+
+    task = asyncio.create_task(heartbeat_loop())
+    try:
+        return await operation()
+    finally:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
 
 
 def infer_fundamentals_request(
@@ -1007,10 +1026,13 @@ class DartFundamentalsCaptureService:
         latest_resolved_date_by_symbol: dict[str, date | None] = {}
         terminal_resolved_symbols: dict[str, str] = {}
 
+        refresh_progress_state: dict[str, Any] = {}
+
         def update_refresh_progress(
             *,
             stage: str,
             extra_metadata: dict[str, Any] | None = None,
+            persist: bool = True,
         ) -> None:
             metadata = {
                 **run_metadata,
@@ -1022,6 +1044,10 @@ class DartFundamentalsCaptureService:
             }
             if extra_metadata:
                 metadata.update(extra_metadata)
+            refresh_progress_state.clear()
+            refresh_progress_state.update(metadata)
+            if not persist:
+                return
             self.repository.update_refresh_run_progress(
                 run_id,
                 symbols_checked=symbols_checked,
@@ -1033,7 +1059,7 @@ class DartFundamentalsCaptureService:
                 events_detected=events_detected,
                 events_captured=events_captured,
                 events_failed=events_failed,
-                run_metadata=metadata,
+                run_metadata=dict(refresh_progress_state),
             )
 
         try:
@@ -1149,6 +1175,7 @@ class DartFundamentalsCaptureService:
                     heartbeat=lambda: update_refresh_progress(
                         stage='syncing_disclosures',
                         extra_metadata=sync_group_metadata,
+                        persist=False,
                     ),
                 )
                 sync_results.append(
@@ -1247,6 +1274,7 @@ class DartFundamentalsCaptureService:
                     heartbeat=lambda: update_refresh_progress(
                         stage='capturing_fundamentals',
                         extra_metadata=capture_metadata,
+                        persist=False,
                     ),
                 )
             else:
