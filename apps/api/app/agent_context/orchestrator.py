@@ -13,6 +13,7 @@ import httpx
 
 from app.agent_context.payload_builder import agent_payload_builder
 from app.agent_context.read_service import agent_context_read_service
+from app.agent_context.reuse_service import agent_context_reuse_service
 from app.agent_context.response_contract import build_contract_prompt_suffix, normalize_agent_response
 from app.core.settings import settings
 from app.db import session_scope
@@ -439,6 +440,7 @@ class AgentFeedbackOrchestrator:
         roles: Sequence[str] | None = None,
         fs_div: str | None = None,
         disclosures_limit: int = 5,
+        reuse_existing: bool = True,
     ) -> dict[str, Any]:
         normalized_market_date = market_date if isinstance(market_date, date) else date.fromisoformat(market_date)
         symbol_context = agent_context_read_service.get_symbol_day_context(
@@ -448,15 +450,39 @@ class AgentFeedbackOrchestrator:
             disclosures_limit=disclosures_limit,
         )
         specs = self._select_specs(roles=roles)
+        requested_roles = [spec.role for spec in specs]
         request_run_id = f'symbol-run-{normalized_market_date.isoformat()}-{uuid.uuid4().hex[:10]}'
         items: list[dict[str, Any]] = []
         failures: list[dict[str, Any]] = []
         batch_size = max(1, settings.openclaw_agent_symbol_chunk_size)
         max_workers = max(1, settings.openclaw_agent_parallel_subtasks)
 
+        reuse_decisions = agent_context_reuse_service.build_latest_decisions(
+            market_date=normalized_market_date,
+            symbols=symbols,
+            roles=requested_roles,
+        ) if reuse_existing else {}
+
         batch_jobs: list[tuple[AgentDispatchSpec, list[dict[str, Any]]]] = []
         for spec in specs:
-            role_batches = [symbol_context['items'][i:i + batch_size] for i in range(0, len(symbol_context['items']), batch_size)]
+            dispatch_items = []
+            for item in symbol_context['items']:
+                decision = reuse_decisions.get(item['symbol'], {}).get(spec.role) if reuse_existing else None
+                if decision and not decision.should_dispatch and decision.latest_feedback is not None:
+                    items.append(
+                        {
+                            'role': spec.role,
+                            'agent_name': spec.agent_name,
+                            'symbol': item['symbol'],
+                            'status': 'reused',
+                            'reuse_reason': decision.reason,
+                            'storage': {'id': decision.latest_feedback_id, 'agent_name': spec.agent_name, 'run_id': decision.latest_feedback.get('run_id')},
+                            'response': {'normalized_feedback': decision.latest_feedback.get('feedback_payload')},
+                        }
+                    )
+                    continue
+                dispatch_items.append(item)
+            role_batches = [dispatch_items[i:i + batch_size] for i in range(0, len(dispatch_items), batch_size)]
             for batch in role_batches:
                 batch_jobs.append((spec, batch))
 
@@ -552,6 +578,7 @@ class AgentFeedbackOrchestrator:
                 'disclosures_limit': disclosures_limit,
                 'symbol_chunk_size': batch_size,
                 'parallel_subtasks': max_workers,
+                'reuse_existing': reuse_existing,
             },
             'summary': {
                 'status': status,

@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from app.agent_context.feedback_service import agent_context_feedback_service
 from app.agent_context.orchestrator import agent_feedback_orchestrator
 from app.agent_context.progress_service import agent_context_progress_service
+from app.agent_context.reuse_service import agent_context_reuse_service
 from app.agent_context.read_service import agent_context_read_service
 from app.agent_context.status_service import agent_context_status_service
 
@@ -48,6 +49,7 @@ class AgentSymbolFeedbackDispatchRequest(BaseModel):
     roles: list[str] | None = None
     fs_div: str | None = None
     disclosures_limit: int = Field(default=5, ge=0, le=20)
+    reuse_existing: bool = True
 
 
 @router.get('/symbol-day')
@@ -112,6 +114,7 @@ async def dispatch_symbol_agent_feedback(payload: AgentSymbolFeedbackDispatchReq
             roles=payload.roles,
             fs_div=payload.fs_div,
             disclosures_limit=payload.disclosures_limit,
+            reuse_existing=payload.reuse_existing,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -191,6 +194,24 @@ async def get_agent_feedback_progress(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f'Agent feedback progress read failed: {exc}') from exc
+
+
+@router.get('/feedback/latest')
+async def get_latest_agent_feedback_bundle(
+    market_date: date = Query(...),
+    symbols: list[str] = Query(...),
+    roles: list[str] | None = Query(default=None),
+) -> dict:
+    try:
+        return agent_context_reuse_service.build_latest_feedback_bundle(
+            market_date=market_date,
+            symbols=symbols,
+            roles=roles,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'Latest agent feedback read failed: {exc}') from exc
 
 
 @router.get('/feedback')
