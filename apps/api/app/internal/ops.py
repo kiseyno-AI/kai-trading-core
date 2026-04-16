@@ -80,6 +80,7 @@ def run_dart_fundamentals_daily_if_due(
     symbol_limit: int | None = None,
     symbol_offset: int = 0,
     capture_limit: int = 500,
+    retry_cycles: int | None = None,
     force: bool = False,
     fs_div: str | None = None,
 ) -> dict[str, Any]:
@@ -90,6 +91,7 @@ def run_dart_fundamentals_daily_if_due(
             symbol_limit=symbol_limit,
             symbol_offset=symbol_offset,
             capture_limit=capture_limit,
+            retry_cycles=retry_cycles,
             force=force,
             fs_div=fs_div,
             trigger='internal_ops_cli',
@@ -184,6 +186,7 @@ def _build_parser() -> argparse.ArgumentParser:
     dart_daily_parser.add_argument('--symbol-limit', type=int)
     dart_daily_parser.add_argument('--symbol-offset', type=int, default=0)
     dart_daily_parser.add_argument('--capture-limit', type=int, default=500)
+    dart_daily_parser.add_argument('--retry-cycles', type=int)
     dart_daily_parser.add_argument('--force', action='store_true')
     dart_daily_parser.add_argument('--fs-div')
 
@@ -241,6 +244,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             symbol_limit=args.symbol_limit,
             symbol_offset=args.symbol_offset,
             capture_limit=args.capture_limit,
+            retry_cycles=args.retry_cycles,
             force=args.force,
             fs_div=args.fs_div,
         )

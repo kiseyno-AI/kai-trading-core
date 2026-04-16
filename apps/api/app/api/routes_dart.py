@@ -177,7 +177,7 @@ async def run_dart_fundamentals_daily_refresh_if_due(
     symbol_limit: Optional[int] = Query(default=None, ge=1, le=20000),
     symbol_offset: int = Query(default=0, ge=0, le=20000),
     capture_limit: int = Query(default=500, ge=1, le=5000),
-    retry_cycles: int = Query(default=3, ge=1, le=10),
+    retry_cycles: Optional[int] = Query(default=None, ge=1, le=10),
     force: bool = False,
     fs_div: Optional[str] = Query(default=None),
 ) -> dict:

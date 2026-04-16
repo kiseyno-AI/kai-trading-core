@@ -61,6 +61,7 @@ class Settings(BaseSettings):
     dart_fundamentals_min_business_year: int = 2015
     dart_fundamentals_default_report_code: str = '11011'
     dart_fundamentals_default_fs_div: str = 'CFS'
+    dart_fundamentals_daily_retry_cycles: int = 3
     dart_fundamentals_event_timeout_seconds: int = 60
     dart_fundamentals_stale_run_minutes: int = 60
 

@@ -932,7 +932,7 @@ class DartFundamentalsCaptureService:
         force: bool = False,
         fs_div: str | None = None,
         trigger: str = 'manual_daily_api',
-        retry_cycles: int = 1,
+        retry_cycles: int | None = None,
     ) -> dict[str, Any]:
         if symbol_offset < 0:
             raise ValueError('symbol_offset must be greater than or equal to 0')
@@ -940,7 +940,8 @@ class DartFundamentalsCaptureService:
             raise ValueError('symbol_limit must be greater than or equal to 1')
         if capture_limit is not None and capture_limit < 1:
             raise ValueError('capture_limit must be greater than or equal to 1')
-        if retry_cycles < 1:
+        resolved_retry_cycles = retry_cycles or settings.dart_fundamentals_daily_retry_cycles
+        if resolved_retry_cycles < 1:
             raise ValueError('retry_cycles must be greater than or equal to 1')
 
         resolved_market_date = _normalize_refresh_date(market_date, default=date.today())
@@ -995,7 +996,7 @@ class DartFundamentalsCaptureService:
             'symbol_offset': symbol_offset,
             'symbol_limit': symbol_limit,
             'capture_limit': capture_limit,
-            'retry_cycles_requested': retry_cycles,
+            'retry_cycles_requested': resolved_retry_cycles,
             'selected_symbols_sample': _limited_sample(selected_stock_codes),
             'stale_refresh_run_ids_failed': stale_refresh_run_ids,
             'last_progress_at': _utcnow().isoformat(),
@@ -1273,7 +1274,7 @@ class DartFundamentalsCaptureService:
                 candidate_receipt_date_from = (
                     min(check_start_by_symbol.values()) if check_start_by_symbol else None
                 )
-                max_retry_cycles = max(1, retry_cycles)
+                max_retry_cycles = max(1, resolved_retry_cycles)
                 for cycle_index in range(max_retry_cycles):
                     if not pending_event_ids:
                         break
@@ -1428,7 +1429,7 @@ class DartFundamentalsCaptureService:
                     limit=100,
                 ),
                 'remaining_candidate_events': remaining_candidate_events,
-                'retry_cycles_requested': retry_cycles,
+                'retry_cycles_requested': resolved_retry_cycles,
                 'retry_cycles_completed': retry_cycles_completed,
                 'partial_reasons': partial_reasons,
                 'terminal_outcomes': {
@@ -1492,7 +1493,7 @@ class DartFundamentalsCaptureService:
                     ),
                 },
                 'capture': capture_result,
-                'retry_cycles_requested': retry_cycles,
+                'retry_cycles_requested': resolved_retry_cycles,
                 'retry_cycles_completed': retry_cycles_completed,
                 'remaining_retryable_events': remaining_candidate_events,
                 'samples': {

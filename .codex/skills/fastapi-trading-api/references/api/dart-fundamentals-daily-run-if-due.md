@@ -1,10 +1,10 @@
 # POST /disclosures/dart/fundamentals/daily/run-if-due
 
 ## Summary
-Runs the daily incremental DART fundamentals refresh for the requested market date, and can continue retryable capture events for multiple in-run cycles.
+Runs the daily incremental DART fundamentals refresh for the requested market date, and can continue retryable capture events for multiple in-run cycles. When `retry_cycles` is omitted, the service uses the configured daily automatic retry count.
 
 ## Example request
-`POST /disclosures/dart/fundamentals/daily/run-if-due?market_date=2026-04-16&capture_limit=500&retry_cycles=3&force=false&fs_div=CFS`
+`POST /disclosures/dart/fundamentals/daily/run-if-due?market_date=2026-04-16&capture_limit=500&force=false&fs_div=CFS`
 
 ## Example response
 ```json
