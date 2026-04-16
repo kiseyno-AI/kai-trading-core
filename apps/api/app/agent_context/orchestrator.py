@@ -72,8 +72,8 @@ def _stable_slot_for_value(*, value: str, pool_size: int) -> int:
     return int(digest[:8], 16) % max(1, pool_size)
 
 
-def _feedback_session_key(*, agent_name: str, market_date: date, slot: int) -> str:
-    return f"feedback/{agent_name}/{market_date.isoformat()}/slot-{slot:02d}"
+def _feedback_session_key(*, agent_name: str, slot: int) -> str:
+    return f"feedback/{agent_name}/slot-{slot:02d}"
 
 
 class OpenClawAgentClient:
@@ -340,18 +340,6 @@ class AgentFeedbackOrchestrator:
     def __init__(self) -> None:
         self.client: OpenClawAgentClient | None = None
 
-    def _cleanup_symbol_feedback_pool(self, *, market_date: date, specs: Sequence[AgentDispatchSpec], max_workers: int) -> list[dict[str, Any]]:
-        client = self._get_client()
-        cleanup_results: list[dict[str, Any]] = []
-        pool_size = max(1, max_workers)
-        for spec in specs:
-            for slot in range(1, pool_size + 1):
-                session_key = _feedback_session_key(agent_name=spec.agent_name, market_date=market_date, slot=slot)
-                cleanup = client.cleanup_session({'session_key': session_key})
-                cleanup_results.append({'role': spec.role, 'agent_name': spec.agent_name, 'session_key': session_key, 'cleanup': cleanup})
-                logger.info('Agent feedback pool cleanup attempted', extra={'agent_name': spec.agent_name, 'session_key': session_key, 'cleanup': cleanup})
-        return cleanup_results
-
     def _validate_config(self) -> None:
         if not settings.openclaw_base_url:
             raise AgentDispatchConfigError('OPENCLAW_BASE_URL is required')
@@ -459,8 +447,6 @@ class AgentFeedbackOrchestrator:
                     response=response,
                     context=role_payload,
                 )
-                cleanup_result = self._get_client().cleanup_session(response.get('session_ref'))
-                logger.info('Agent feedback session cleanup finished', extra={'agent_name': spec.agent_name, 'symbol': symbol, 'session_ref': response.get('session_ref'), 'cleanup': cleanup_result})
                 if symbol != '__MARKET__':
                     with session_scope() as session:
                         record = session.get(AgentContextFeedback, stored['id'])
@@ -478,12 +464,10 @@ class AgentFeedbackOrchestrator:
                     }
                 )
             except AgentDispatchTerminalError as exc:
-                cleanup_result = self._get_client().cleanup_session(response.get('session_ref') if response else None)
-                logger.warning('Agent feedback dispatch failed after cleanup attempt', extra={'agent_name': spec.agent_name, 'symbol': symbol, 'session_ref': response.get('session_ref') if response else None, 'cleanup': cleanup_result, 'error': str(exc)})
+                logger.warning('Agent feedback dispatch failed', extra={'agent_name': spec.agent_name, 'symbol': symbol, 'session_ref': response.get('session_ref') if response else None, 'error': str(exc)})
                 failures.append({'role': spec.role, 'agent_name': spec.agent_name, 'symbol': symbol, 'status': 'failed', 'retryable': False, 'error': str(exc)})
             except Exception as exc:  # noqa: BLE001
-                cleanup_result = self._get_client().cleanup_session(response.get('session_ref') if response else None)
-                logger.warning('Agent feedback dispatch raised after cleanup attempt', extra={'agent_name': spec.agent_name, 'symbol': symbol, 'session_ref': response.get('session_ref') if response else None, 'cleanup': cleanup_result, 'error': str(exc)})
+                logger.warning('Agent feedback dispatch raised', extra={'agent_name': spec.agent_name, 'symbol': symbol, 'session_ref': response.get('session_ref') if response else None, 'error': str(exc)})
                 failures.append({'role': spec.role, 'agent_name': spec.agent_name, 'symbol': symbol, 'status': 'failed', 'retryable': True, 'error': str(exc)})
         return items, failures
 
@@ -575,7 +559,7 @@ class AgentFeedbackOrchestrator:
                 dispatch_items.append(
                     {
                         **item,
-                        'session_key': _feedback_session_key(agent_name=spec.agent_name, market_date=normalized_market_date, slot=slot),
+                        'session_key': _feedback_session_key(agent_name=spec.agent_name, slot=slot),
                     }
                 )
             role_batches = [dispatch_items[i:i + batch_size] for i in range(0, len(dispatch_items), batch_size)]
@@ -671,8 +655,6 @@ class AgentFeedbackOrchestrator:
         elif failures and not items:
             status = 'failed'
 
-        cleanup_results = self._cleanup_symbol_feedback_pool(market_date=normalized_market_date, specs=specs, max_workers=max_workers)
-
         return {
             'request': {
                 'market_date': normalized_market_date.isoformat(),
@@ -692,7 +674,6 @@ class AgentFeedbackOrchestrator:
             },
             'items': items,
             'failures': failures,
-            'cleanup': cleanup_results,
         }
 
 
