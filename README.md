@@ -435,11 +435,16 @@ curl "http://127.0.0.1:8000/agent-context/feedback/requests?market_date=2026-04-
 curl "http://127.0.0.1:8000/agent-context/feedback/status?market_date=2026-04-15&symbols=005930&symbols=000660&symbols=012450"
 ```
 
+```bash
+curl "http://127.0.0.1:8000/agent-context/feedback/progress?market_date=2026-04-15"
+```
+
 Notes:
 
 - `feedback/payloads` returns what the agents answered, using stored `feedback_payload` rows.
 - `feedback/requests` returns what Core sent to the agents, using stored `context_payload` rows.
 - `feedback/status` returns workflow state for the expected three-agent set: `eod-summarizer`, `technical-summarizer`, `fundamental-summarizer`.
+- `feedback/progress` returns aggregate workflow counters such as total symbols, processed/completed/pending symbols, progress ratio/percent, failed items, and completed versus expected feedback rows. Without `symbols`, it derives the requested universe from distinct `daily_price_bars` symbols on the requested market date.
 - Symbol status becomes `pending`, `in_progress`, `partial`, or `completed` based on how many of those three agent rows have been stored.
 - These endpoints are historical reads over `agent_context_feedback`, newest rows first.
 
