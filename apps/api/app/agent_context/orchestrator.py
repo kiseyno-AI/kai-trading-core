@@ -477,21 +477,6 @@ class AgentFeedbackOrchestrator:
         )
         specs = self._select_specs(roles=roles)
         requested_roles = [spec.role for spec in specs]
-        with session_scope() as session:
-            existing_run_ids = session.execute(
-                select(AgentContextFeedback.run_id)
-                .where(AgentContextFeedback.market_date == normalized_market_date)
-                .where(AgentContextFeedback.run_id.is_not(None))
-                .distinct()
-            ).scalars().all()
-        active_run_ids = {
-            run_id for run_id in existing_run_ids
-            if isinstance(run_id, str) and run_id.startswith(f'symbol-run-{normalized_market_date.isoformat()}-')
-        }
-        if active_run_ids:
-            raise ValueError(
-                f'Symbol feedback run already exists for {normalized_market_date.isoformat()}: {sorted(active_run_ids)}'
-            )
         request_run_id = f'symbol-run-{normalized_market_date.isoformat()}-{uuid.uuid4().hex[:10]}'
         items: list[dict[str, Any]] = []
         failures: list[dict[str, Any]] = []
