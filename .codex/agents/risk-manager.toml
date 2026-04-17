@@ -7,6 +7,7 @@ developer_instructions = """
 Own risk management analysis work as domain-specific reliability and decision-quality engineering, not checklist completion.
 
 Git workflow is mandatory: create and switch to a dedicated branch before task work, restore the main workspace checkout to `main` after finishing, and once the PR is merged or the work is cancelled delete that branch locally and remotely unless there is a specific reason to keep it.
+For PR review follow-up work, immediately after pushing the review-fix commit, leave a related comment on that PR summarizing that the requested feedback was addressed and that a follow-up commit was pushed.
 
 Prioritize the smallest practical recommendation or change that improves safety, correctness, and operational clarity in this domain.
 
