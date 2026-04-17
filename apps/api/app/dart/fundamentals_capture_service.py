@@ -1285,53 +1285,75 @@ class DartFundamentalsCaptureService:
                     min(check_start_by_symbol.values()) if check_start_by_symbol else None
                 )
                 max_retry_cycles = max(1, resolved_retry_cycles)
-                remaining_candidate_events = len(over_limit_event_ids) + len(pending_event_ids)
-                for cycle_index in range(max_retry_cycles):
-                    if not pending_event_ids:
-                        break
-                    retry_cycles_completed = cycle_index + 1
-                    capture_metadata = {
-                        'candidate_event_count': events_detected,
-                        'capture_event_count': len(pending_event_ids),
-                        'candidate_event_ids_sample': _limited_sample(candidate_event_ids, limit=100),
-                        'retry_cycle': retry_cycles_completed,
-                        'retry_cycles_requested': max_retry_cycles,
-                    }
+                pending_batches: list[list[int]] = []
+                if pending_event_ids:
+                    pending_batches.append(list(pending_event_ids))
+                while over_limit_event_ids:
+                    next_batch = over_limit_event_ids[:capture_limit] if capture_limit is not None else list(over_limit_event_ids)
+                    pending_batches.append(list(next_batch))
+                    over_limit_event_ids = over_limit_event_ids[len(next_batch):]
 
-                    async def capture_operation() -> dict[str, Any]:
-                        return await self.capture_recent_fundamentals(
-                            limit=len(pending_event_ids),
-                            force=False,
-                            trigger='daily_incremental_refresh',
-                            fs_div=resolved_fs_div,
-                            stock_codes=sorted(candidate_symbols),
-                            receipt_date_from=candidate_receipt_date_from,
-                            receipt_date_to=resolved_market_date,
-                            event_ids=list(pending_event_ids),
+                retryable_next_batches: list[list[int]] = []
+                remaining_retryable_event_ids: list[int] = []
+                for batch_index, batch_event_ids in enumerate(pending_batches, start=1):
+                    pending_event_ids = list(batch_event_ids)
+                    for cycle_index in range(max_retry_cycles):
+                        if not pending_event_ids:
+                            break
+                        retry_cycles_completed = max(retry_cycles_completed, cycle_index + 1)
+                        capture_metadata = {
+                            'candidate_event_count': events_detected,
+                            'capture_event_count': len(pending_event_ids),
+                            'candidate_event_ids_sample': _limited_sample(candidate_event_ids, limit=100),
+                            'retry_cycle': cycle_index + 1,
+                            'retry_cycles_requested': max_retry_cycles,
+                            'batch_index': batch_index,
+                            'batch_count': len(pending_batches),
+                        }
+
+                        async def capture_operation() -> dict[str, Any]:
+                            return await self.capture_recent_fundamentals(
+                                limit=len(pending_event_ids),
+                                force=False,
+                                trigger='daily_incremental_refresh',
+                                fs_div=resolved_fs_div,
+                                stock_codes=sorted(candidate_symbols),
+                                receipt_date_from=candidate_receipt_date_from,
+                                receipt_date_to=resolved_market_date,
+                                event_ids=list(pending_event_ids),
+                            )
+
+                        cycle_result = await _await_with_refresh_heartbeat(
+                            capture_operation,
+                            heartbeat=lambda: update_refresh_progress(
+                                stage='capturing_fundamentals',
+                                extra_metadata=capture_metadata,
+                                persist=False,
+                            ),
                         )
+                        capture_runs.append(cycle_result)
 
-                    cycle_result = await _await_with_refresh_heartbeat(
-                        capture_operation,
-                        heartbeat=lambda: update_refresh_progress(
-                            stage='capturing_fundamentals',
-                            extra_metadata=capture_metadata,
-                            persist=False,
-                        ),
-                    )
-                    capture_runs.append(cycle_result)
+                        pending_set = set(pending_event_ids)
+                        retryable_next: list[int] = []
+                        for item in cycle_result.get('results', []):
+                            event_id = item.get('event_id')
+                            if event_id not in pending_set:
+                                continue
+                            if item.get('status') in RETRYABLE_CAPTURE_STATUSES:
+                                retryable_next.append(int(event_id))
+                        pending_event_ids = retryable_next
+                        remaining_candidate_events = sum(len(batch) for batch in retryable_next_batches) + len(pending_event_ids) + sum(
+                            len(batch) for batch in pending_batches[batch_index:]
+                        )
+                        if not pending_event_ids:
+                            break
 
-                    pending_set = set(pending_event_ids)
-                    retryable_next: list[int] = []
-                    for item in cycle_result.get('results', []):
-                        event_id = item.get('event_id')
-                        if event_id not in pending_set:
-                            continue
-                        if item.get('status') in RETRYABLE_CAPTURE_STATUSES:
-                            retryable_next.append(int(event_id))
-                    pending_event_ids = retryable_next
-                    remaining_candidate_events = len(over_limit_event_ids) + len(pending_event_ids)
-                    if not pending_event_ids:
-                        break
+                    if pending_event_ids:
+                        retryable_next_batches.append(list(pending_event_ids))
+                        remaining_retryable_event_ids.extend(pending_event_ids)
+
+                pending_event_ids = list(remaining_retryable_event_ids)
+                remaining_candidate_events = len(remaining_retryable_event_ids)
 
                 if capture_runs:
                     final_results_by_event_id: dict[int, dict[str, Any]] = {}
