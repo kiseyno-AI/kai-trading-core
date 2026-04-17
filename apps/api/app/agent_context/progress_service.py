@@ -8,7 +8,7 @@ from sqlalchemy import func, select
 from app.agent_context.feedback_service import _normalize_market_date, _normalize_symbols
 from app.agent_context.status_service import EXPECTED_AGENT_NAMES, EXPECTED_AGENT_SET
 from app.db import session_scope
-from app.db_models import AgentContextFeedback, Symbol
+from app.db_models import AgentContextFeedback, DailyActionSummary, DailyPriceBar, DailySignalFeature, DailyTechnicalSnapshot, Symbol
 
 
 STALL_THRESHOLD_SECONDS = 300
@@ -25,14 +25,17 @@ class AgentContextProgressService:
         normalized_symbols = _normalize_symbols(symbols) if symbols is not None else None
 
         with session_scope() as session:
-            universe_symbols_stmt = (
+            available_symbol_stmt = (
                 select(Symbol.symbol)
+                .join(DailyPriceBar, DailyPriceBar.symbol_id == Symbol.id)
                 .where(Symbol.is_active.is_(True))
+                .where(DailyPriceBar.trade_date == normalized_market_date)
                 .order_by(Symbol.symbol.asc())
+                .distinct()
             )
             if normalized_symbols:
-                universe_symbols_stmt = universe_symbols_stmt.where(Symbol.symbol.in_(normalized_symbols))
-            universe_symbols = [str(symbol) for symbol in session.execute(universe_symbols_stmt).scalars().all()]
+                available_symbol_stmt = available_symbol_stmt.where(Symbol.symbol.in_(normalized_symbols))
+            available_symbols = [str(symbol) for symbol in session.execute(available_symbol_stmt).scalars().all()]
 
             latest_feedback_at = session.execute(
                 select(func.max(AgentContextFeedback.received_at))
@@ -84,7 +87,7 @@ class AgentContextProgressService:
         pending_symbols = 0
         failed_items = 0
 
-        target_symbols = universe_symbols
+        target_symbols = available_symbols
 
         for symbol in target_symbols:
             symbol_rows = grouped.get(symbol, [])
