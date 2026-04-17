@@ -418,19 +418,20 @@ class AgentFeedbackOrchestrator:
     def dispatch_for_eod_run(
         self,
         *,
-        run_id: int,
+        eod_run_id: int,
         roles: Sequence[str] | None = None,
     ) -> dict[str, Any]:
         with session_scope() as session:
-            run = session.get(EODCollectionRun, run_id)
+            run = session.get(EODCollectionRun, eod_run_id)
             if run is None:
-                raise ValueError(f'EOD run not found: {run_id}')
-
-        payloads = agent_payload_builder.build_market_payloads(market_date=run.trade_date)
+                raise ValueError(f'EOD run not found: {eod_run_id}')
+            payloads = agent_payload_builder.build_payloads(run=run)
+            trade_date = run.trade_date
+            resolved_run_id = run.id
         specs = self._select_specs(roles=roles, available_roles=payloads.keys())
-        request_run_id = f'eod-run-{run.id}-{uuid.uuid4().hex[:10]}'
+        request_run_id = f'eod-run-{resolved_run_id}-{uuid.uuid4().hex[:10]}'
         items, failures = self._dispatch_and_store(
-            market_date=run.trade_date,
+            market_date=trade_date,
             request_run_id=request_run_id,
             specs=specs,
             payloads=payloads,
@@ -444,8 +445,8 @@ class AgentFeedbackOrchestrator:
             status = 'failed'
         return {
             'request': {
-                'eod_run_id': run.id,
-                'trade_date': run.trade_date.isoformat(),
+                'eod_run_id': resolved_run_id,
+                'trade_date': trade_date.isoformat(),
                 'request_run_id': request_run_id,
                 'roles': [spec.role for spec in specs],
             },
