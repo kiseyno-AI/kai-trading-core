@@ -554,7 +554,7 @@ class AgentFeedbackOrchestrator:
             )
 
         total_max_workers = max(1, role_worker_count * max(1, len(specs)))
-        role_execution_limit = max(1, min(role_worker_count, 1))
+        role_execution_limit = max(1, role_worker_count)
         with concurrent.futures.ThreadPoolExecutor(max_workers=total_max_workers) as executor:
             future_map: dict[concurrent.futures.Future[dict[str, Any]], tuple[AgentDispatchSpec, list[dict[str, Any]]]] = {}
             future_specs: dict[concurrent.futures.Future[dict[str, Any]], AgentDispatchSpec] = {}
