@@ -271,6 +271,7 @@ class DailySignalFeature(Base, TimestampMixin):
 class AgentContextFeedback(Base, TimestampMixin):
     __tablename__ = 'agent_context_feedback'
     __table_args__ = (
+        UniqueConstraint('market_date', 'symbol', 'agent_name', name='uq_agent_context_feedback_market_symbol_agent'),
         Index(
             'ix_agent_context_feedback_market_symbol_agent_received',
             'market_date',

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import concurrent.futures
-import hashlib
 import json
 import logging
 import time
@@ -9,19 +8,32 @@ import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from typing import Any, Sequence
-from urllib.parse import quote
 
 import httpx
+from sqlalchemy import select
 
+from app.agent_context.feedback_service import agent_context_feedback_service
 from app.agent_context.payload_builder import agent_payload_builder
 from app.agent_context.read_service import agent_context_read_service
-from app.agent_context.reuse_service import agent_context_reuse_service
 from app.agent_context.response_contract import build_contract_prompt_suffix, normalize_agent_response
+from app.agent_context.reuse_service import agent_context_reuse_service
 from app.core.settings import settings
 from app.db import session_scope
 from app.db_models import AgentContextFeedback, EODCollectionRun
 
 logger = logging.getLogger(__name__)
+
+
+class AgentDispatchError(RuntimeError):
+    pass
+
+
+class AgentDispatchRetryableError(AgentDispatchError):
+    pass
+
+
+class AgentDispatchTerminalError(AgentDispatchError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -31,45 +43,32 @@ class AgentDispatchSpec:
     instruction: str
 
 
-DEFAULT_AGENT_ROLES: tuple[AgentDispatchSpec, ...] = (
+DISPATCH_SPECS: tuple[AgentDispatchSpec, ...] = (
     AgentDispatchSpec(
         role='eod-summarizer',
         agent_name='eod-summarizer',
-        instruction='Summarize the EOD market session, breadth, leaders, laggards, and notable anomalies conservatively.',
+        instruction='Summarize the latest end-of-day trading session conservatively, emphasizing breadth, leaders, laggards, anomalies, and data gaps.',
     ),
     AgentDispatchSpec(
         role='technical-summarizer',
         agent_name='technical-summarizer',
-        instruction='Review the EOD technical state, regime, breakouts, reversals, and technical risk flags conservatively.',
+        instruction='Summarize the technical setup conservatively using only the supplied inputs, including trend, momentum, support/resistance, and invalidation risks.',
     ),
     AgentDispatchSpec(
         role='fundamental-summarizer',
         agent_name='fundamental-summarizer',
-        instruction='Review DART and fundamentals context for the session, focusing on material disclosures, freshness, and caveats.',
+        instruction='Summarize the latest fundamentals conservatively, highlighting business quality, balance-sheet risks, cash-flow traits, and missing context.',
     ),
 )
 
 
-class AgentOrchestratorError(RuntimeError):
-    pass
-
-
-class AgentDispatchConfigError(AgentOrchestratorError):
-    pass
-
-
-class AgentDispatchRetryableError(AgentOrchestratorError):
-    pass
-
-
-class AgentDispatchTerminalError(AgentOrchestratorError):
-    pass
-
-
 def _stable_slot_for_value(*, value: str, pool_size: int) -> int:
-    normalized = value.strip() or 'default'
-    digest = hashlib.sha256(normalized.encode('utf-8')).hexdigest()
-    return int(digest[:8], 16) % max(1, pool_size)
+    import hashlib
+
+    if pool_size <= 1:
+        return 0
+    digest = hashlib.sha256(value.encode('utf-8')).hexdigest()
+    return int(digest[:8], 16) % pool_size
 
 
 def _feedback_session_key(*, agent_name: str, slot: int) -> str:
@@ -77,84 +76,40 @@ def _feedback_session_key(*, agent_name: str, slot: int) -> str:
 
 
 class OpenClawAgentClient:
-    def __init__(
-        self,
-        *,
-        base_url: str,
-        gateway_token: str,
-        timeout_seconds: float,
-        max_retries: int,
-        retry_backoff_seconds: float,
-    ) -> None:
-        self.base_url = base_url.rstrip('/')
-        self.gateway_token = gateway_token
-        self.timeout_seconds = timeout_seconds
-        self.max_retries = max(0, max_retries)
-        self.retry_backoff_seconds = max(0.0, retry_backoff_seconds)
-
-    def _extract_session_ref(self, parsed: dict[str, Any], *, explicit_session_key: str | None = None) -> dict[str, Any] | None:
-        if explicit_session_key:
-            return {
-                'session_key': explicit_session_key,
-                'response_id': parsed.get('id'),
-            }
-        session_key = parsed.get('session_key') or parsed.get('sessionKey')
-        if isinstance(session_key, str) and session_key.strip():
-            return {
-                'session_key': session_key.strip(),
-                'response_id': parsed.get('id'),
-            }
-        return None
-
-    def cleanup_session(self, session_ref: dict[str, Any] | None) -> dict[str, Any]:
-        if not session_ref or not session_ref.get('session_key'):
-            return {'status': 'skipped', 'reason': 'missing_session_key'}
-        session_key = str(session_ref['session_key']).strip()
-        url = f"{self.base_url}/sessions/{quote(session_key, safe='')}/kill"
-        try:
-            with httpx.Client(timeout=max(10.0, min(self.timeout_seconds, 30.0)), headers=self._headers()) as client:
-                response = client.post(url)
-            if response.status_code == 404:
-                return {
-                    'status': 'not_found',
-                    'status_code': response.status_code,
-                    'session_key': session_key,
-                }
-            if response.status_code >= 400:
-                return {
-                    'status': 'failed',
-                    'status_code': response.status_code,
-                    'session_key': session_key,
-                    'error': response.text[:300],
-                }
-            parsed = response.json()
-            return {
-                'status': 'completed' if parsed.get('killed') else 'not_killed',
-                'status_code': response.status_code,
-                'session_key': session_key,
-                'killed': bool(parsed.get('killed')),
-            }
-        except Exception as exc:  # noqa: BLE001
-            return {
-                'status': 'failed',
-                'session_key': session_key,
-                'error': str(exc),
-            }
+    def __init__(self) -> None:
+        self.base_url = settings.openclaw_base_url.rstrip('/')
+        self.gateway_token = settings.openclaw_gateway_token
+        self.timeout_seconds = max(1, settings.openclaw_agent_timeout_seconds)
+        self.max_retries = max(0, settings.openclaw_agent_max_retries)
+        self.retry_backoff_seconds = max(0, settings.openclaw_agent_retry_backoff_seconds)
 
     def _headers(self) -> dict[str, str]:
-        return {
-            'Authorization': f'Bearer {self.gateway_token}',
-            'Content-Type': 'application/json',
-            'Accept': 'application/json',
-        }
+        headers = {'Content-Type': 'application/json'}
+        if self.gateway_token:
+            headers['Authorization'] = f'Bearer {self.gateway_token}'
+        return headers
+
+    @staticmethod
+    def _extract_session_ref(parsed: dict[str, Any], *, explicit_session_key: str | None = None) -> dict[str, Any] | None:
+        session_key = explicit_session_key
+        session_id = parsed.get('id')
+        if not session_key and isinstance(parsed.get('session'), dict):
+            session_key = parsed['session'].get('key')
+        if not session_key and isinstance(parsed.get('metadata'), dict):
+            session_key = parsed['metadata'].get('session_key')
+        if session_key or session_id:
+            return {
+                'session_key': session_key,
+                'session_id': session_id,
+            }
+        return None
 
     def _build_message(self, *, spec: AgentDispatchSpec, payload: dict[str, Any]) -> str:
         return (
             f"Role: {spec.role}\n"
             f"Instruction: {spec.instruction}\n"
-            f"{build_contract_prompt_suffix()}\n"
-            "If data quality is degraded, say so explicitly in risk_flags/details.\n\n"
-            f"Context:\n{payload}"
+            f"{build_contract_prompt_suffix()}\n\n"
+            f"Payload:\n{json.dumps(payload, ensure_ascii=False)}"
         )
 
     def _build_batch_message(
@@ -166,7 +121,7 @@ class OpenClawAgentClient:
     ) -> str:
         example_feedback = {
             'role': spec.role,
-            'summary': 'Conservative one-paragraph summary for the symbols in this batch',
+            'summary': 'brief conservative summary',
             'confidence': 0.5,
             'risk_flags': ['example_risk_flag'],
             'details': {'note': 'brief structured evidence'},
@@ -271,112 +226,119 @@ class OpenClawAgentClient:
             'model': f'openclaw/{spec.agent_name}',
             'input': self._build_batch_message(spec=spec, market_date=market_date, batch_items=batch_items),
         }
-        started_at = datetime.now(timezone.utc)
-        headers = self._headers() | {'x-openclaw-session-key': request_session_key}
-        with httpx.Client(timeout=max(self.timeout_seconds, settings.openclaw_agent_subtask_timeout_seconds), headers=headers) as client:
-            response = client.post(url, json=body)
-        if response.status_code >= 400:
-            raise AgentDispatchTerminalError(f'OpenClaw batch failed {response.status_code}: {response.text[:300]}')
-        parsed = response.json()
-        output_text = None
-        for item in parsed.get('output', []):
-            if item.get('type') != 'message':
-                continue
-            for content in item.get('content', []):
-                if content.get('type') == 'output_text':
-                    output_text = content.get('text')
-                    break
-            if output_text:
-                break
-        if not output_text:
-            raise AgentDispatchTerminalError('OpenClaw batch returned no output_text')
-        normalized_text = output_text.strip()
-        if normalized_text.startswith('```'):
-            parts = normalized_text.split('```')
-            normalized_text = ''
-            for part in parts:
-                part = part.strip()
-                if not part:
-                    continue
-                if part.startswith('json'):
-                    part = part[4:].strip()
-                if part.startswith('{') and part.endswith('}'):
-                    normalized_text = part
-                    break
-        if not normalized_text.startswith('{'):
-            start = normalized_text.find('{')
-            end = normalized_text.rfind('}')
-            if start != -1 and end != -1 and end > start:
-                normalized_text = normalized_text[start:end + 1]
-        try:
-            decoded = json.loads(normalized_text)
-        except json.JSONDecodeError:
-            repaired_items: list[dict[str, Any]] = []
-            for batch_item in batch_items:
-                symbol = batch_item.get('symbol')
-                if not symbol:
-                    continue
-                repaired_items.append(
-                    {
-                        'symbol': symbol,
-                        'feedback': normalize_agent_response(
-                            role=spec.role,
-                            output_text=output_text,
-                            raw_response=parsed,
-                        ),
-                    }
+        attempt = 0
+        last_error: Exception | None = None
+        while attempt <= self.max_retries:
+            attempt += 1
+            started_at = datetime.now(timezone.utc)
+            response: httpx.Response | None = None
+            try:
+                headers = self._headers() | {'x-openclaw-session-key': request_session_key}
+                with httpx.Client(timeout=max(self.timeout_seconds, settings.openclaw_agent_subtask_timeout_seconds), headers=headers) as client:
+                    response = client.post(url, json=body)
+                if response.status_code >= 500:
+                    raise AgentDispatchRetryableError(f'OpenClaw batch server error {response.status_code}: {response.text[:300]}')
+                if response.status_code in (408, 409, 429):
+                    raise AgentDispatchRetryableError(f'OpenClaw batch retryable error {response.status_code}: {response.text[:300]}')
+                if response.status_code >= 400:
+                    raise AgentDispatchTerminalError(f'OpenClaw batch failed {response.status_code}: {response.text[:300]}')
+                parsed = response.json()
+                output_text = None
+                for item in parsed.get('output', []):
+                    if item.get('type') != 'message':
+                        continue
+                    for content in item.get('content', []):
+                        if content.get('type') == 'output_text':
+                            output_text = content.get('text')
+                            break
+                    if output_text:
+                        break
+                if not output_text:
+                    raise AgentDispatchTerminalError('OpenClaw batch returned no output_text')
+                normalized_text = output_text.strip()
+                if normalized_text.startswith('```'):
+                    parts = normalized_text.split('```')
+                    normalized_text = ''
+                    for part in parts:
+                        part = part.strip()
+                        if not part:
+                            continue
+                        if part.startswith('json'):
+                            part = part[4:].strip()
+                        if part.startswith('{') and part.endswith('}'):
+                            normalized_text = part
+                            break
+                if not normalized_text.startswith('{'):
+                    start = normalized_text.find('{')
+                    end = normalized_text.rfind('}')
+                    if start != -1 and end != -1 and end > start:
+                        normalized_text = normalized_text[start:end + 1]
+                try:
+                    decoded = json.loads(normalized_text)
+                except json.JSONDecodeError:
+                    repaired_items: list[dict[str, Any]] = []
+                    for batch_item in batch_items:
+                        symbol = batch_item.get('symbol')
+                        if not symbol:
+                            continue
+                        repaired_items.append(
+                            {
+                                'symbol': symbol,
+                                'feedback': normalize_agent_response(
+                                    role=spec.role,
+                                    output_text=output_text,
+                                    raw_response=parsed,
+                                ),
+                            }
+                        )
+                    if repaired_items:
+                        decoded = {'items': repaired_items}
+                    else:
+                        raise AgentDispatchTerminalError('OpenClaw batch returned invalid JSON and no repairable symbols were present')
+                return {
+                    'ok': True,
+                    'attempt': attempt,
+                    'started_at': started_at.isoformat(),
+                    'completed_at': datetime.now(timezone.utc).isoformat(),
+                    'response': parsed,
+                    'output_text': output_text,
+                    'session_ref': self._extract_session_ref(parsed, explicit_session_key=request_session_key),
+                    'decoded': decoded,
+                }
+            except AgentDispatchTerminalError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                logger.warning(
+                    'OpenClaw batch dispatch attempt failed',
+                    extra={
+                        'agent_name': spec.agent_name,
+                        'role': spec.role,
+                        'attempt': attempt,
+                        'max_retries': self.max_retries,
+                        'batch_size': len(batch_items),
+                        'session_key': request_session_key,
+                        'error_type': type(exc).__name__,
+                        'error': str(exc),
+                        'response_status_code': response.status_code if response is not None else None,
+                    },
+                    exc_info=True,
                 )
-            if repaired_items:
-                decoded = {'items': repaired_items}
-            else:
-                raise AgentDispatchTerminalError('OpenClaw batch returned invalid JSON and no repairable symbols were present')
-        return {
-            'ok': True,
-            'started_at': started_at.isoformat(),
-            'completed_at': datetime.now(timezone.utc).isoformat(),
-            'response': parsed,
-            'output_text': output_text,
-            'session_ref': self._extract_session_ref(parsed, explicit_session_key=request_session_key),
-            'decoded': decoded,
-        }
+                if attempt > self.max_retries:
+                    break
+                if self.retry_backoff_seconds > 0:
+                    time.sleep(self.retry_backoff_seconds * attempt)
+        raise AgentDispatchRetryableError(str(last_error) if last_error else 'unknown batch dispatch failure')
 
 
 class AgentFeedbackOrchestrator:
     def __init__(self) -> None:
         self.client: OpenClawAgentClient | None = None
 
-    def _validate_config(self) -> None:
-        if not settings.openclaw_base_url:
-            raise AgentDispatchConfigError('OPENCLAW_BASE_URL is required')
-        if not settings.openclaw_gateway_token:
-            raise AgentDispatchConfigError('OPENCLAW_GATEWAY_TOKEN is required')
-
     def _get_client(self) -> OpenClawAgentClient:
-        self._validate_config()
         if self.client is None:
-            self.client = OpenClawAgentClient(
-                base_url=str(settings.openclaw_base_url),
-                gateway_token=str(settings.openclaw_gateway_token),
-                timeout_seconds=settings.openclaw_agent_timeout_seconds,
-                max_retries=settings.openclaw_agent_max_retries,
-                retry_backoff_seconds=settings.openclaw_agent_retry_backoff_seconds,
-            )
+            self.client = OpenClawAgentClient()
         return self.client
-
-    def _get_run(self, *, eod_run_id: int) -> EODCollectionRun:
-        with session_scope() as session:
-            run = session.get(EODCollectionRun, eod_run_id)
-            if run is None:
-                raise ValueError(f'eod_run_id {eod_run_id} not found')
-            if run.status not in {'completed', 'completed_with_errors'}:
-                raise ValueError(f'eod_run_id {eod_run_id} is not finalized (status={run.status})')
-            session.expunge(run)
-            return run
-
-    def _build_payloads(self, *, run: EODCollectionRun) -> dict[str, dict[str, Any]]:
-        payloads = agent_payload_builder.build_payloads(run=run)
-        request_id = str(uuid.uuid4())
-        return {role: payload | {'request_id': request_id} for role, payload in payloads.items()}
 
     def _store_feedback(
         self,
@@ -388,45 +350,16 @@ class AgentFeedbackOrchestrator:
         response: dict[str, Any],
         context: dict[str, Any],
     ) -> dict[str, Any]:
-        with session_scope() as session:
-            record = AgentContextFeedback(
-                market_date=market_date,
-                symbol='__MARKET__',
-                agent_name=agent_name,
-                agent_version=None,
-                run_id=run_id,
-                summary_payload={
-                    'role': payload.get('role'),
-                    'dispatch': {
-                        'attempt': response.get('attempt'),
-                        'started_at': response.get('started_at'),
-                        'completed_at': response.get('completed_at'),
-                    },
-                    'normalized_feedback': response.get('normalized_feedback'),
-                },
-                feedback_payload=response.get('normalized_feedback') or response,
-                context_payload=context,
-                received_at=datetime.now(timezone.utc),
-            )
-            session.add(record)
-            session.flush()
-            return {
-                'id': record.id,
-                'agent_name': record.agent_name,
-                'run_id': record.run_id,
-            }
-
-    def _select_specs(self, *, roles: Sequence[str] | None, available_roles: Sequence[str] | None = None) -> list[AgentDispatchSpec]:
-        requested_roles = {item.strip().lower() for item in roles or [] if item and item.strip()}
-        specs = [
-            spec
-            for spec in DEFAULT_AGENT_ROLES
-            if (available_roles is None or spec.role in available_roles)
-            and (not requested_roles or spec.role in requested_roles or spec.agent_name in requested_roles)
-        ]
-        if not specs:
-            raise ValueError('No agent roles selected')
-        return specs
+        result = agent_context_feedback_service.submit_feedback(
+            market_date=market_date,
+            symbol=str(payload.get('symbol') or ''),
+            agent_name=agent_name,
+            run_id=run_id,
+            summary=response,
+            feedback=response.get('normalized_feedback') if isinstance(response, dict) else None,
+            context=context,
+        )
+        return result['item']
 
     def _dispatch_and_store(
         self,
@@ -435,29 +368,23 @@ class AgentFeedbackOrchestrator:
         request_run_id: str,
         specs: Sequence[AgentDispatchSpec],
         payloads: dict[str, dict[str, Any]],
-        symbol: str = '__MARKET__',
+        symbol: str,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         items: list[dict[str, Any]] = []
         failures: list[dict[str, Any]] = []
         for spec in specs:
+            payload = payloads[spec.role]
             response: dict[str, Any] | None = None
-            role_payload = payloads[spec.role]
             try:
-                response = self._get_client().dispatch(spec=spec, payload=role_payload)
+                response = self._get_client().dispatch(spec=spec, payload=payload)
                 stored = self._store_feedback(
                     market_date=market_date,
                     agent_name=spec.agent_name,
                     run_id=request_run_id,
-                    payload=role_payload,
+                    payload={'role': spec.role, 'symbol': symbol},
                     response=response,
-                    context=role_payload,
+                    context=payload,
                 )
-                if symbol != '__MARKET__':
-                    with session_scope() as session:
-                        record = session.get(AgentContextFeedback, stored['id'])
-                        if record is not None:
-                            record.symbol = symbol
-                            session.flush()
                 items.append(
                     {
                         'role': spec.role,
@@ -465,7 +392,7 @@ class AgentFeedbackOrchestrator:
                         'symbol': symbol,
                         'status': 'completed',
                         'storage': stored,
-                        'response': response,
+                        'response': {'normalized_feedback': response.get('normalized_feedback')},
                     }
                 )
             except AgentDispatchTerminalError as exc:
@@ -476,9 +403,30 @@ class AgentFeedbackOrchestrator:
                 failures.append({'role': spec.role, 'agent_name': spec.agent_name, 'symbol': symbol, 'status': 'failed', 'retryable': True, 'error': str(exc)})
         return items, failures
 
-    def dispatch_for_eod_run(self, *, eod_run_id: int, roles: Sequence[str] | None = None) -> dict[str, Any]:
-        run = self._get_run(eod_run_id=eod_run_id)
-        payloads = self._build_payloads(run=run)
+    def _select_specs(self, *, roles: Sequence[str] | None, available_roles: Sequence[str] | None = None) -> list[AgentDispatchSpec]:
+        requested = {role.strip() for role in roles} if roles else None
+        available = set(available_roles) if available_roles else None
+        specs = [
+            spec
+            for spec in DISPATCH_SPECS
+            if (requested is None or spec.role in requested) and (available is None or spec.role in available)
+        ]
+        if not specs:
+            raise ValueError('No matching agent feedback roles requested')
+        return specs
+
+    def dispatch_for_eod_run(
+        self,
+        *,
+        run_id: int,
+        roles: Sequence[str] | None = None,
+    ) -> dict[str, Any]:
+        with session_scope() as session:
+            run = session.get(EODCollectionRun, run_id)
+            if run is None:
+                raise ValueError(f'EOD run not found: {run_id}')
+
+        payloads = agent_payload_builder.build_market_payloads(market_date=run.trade_date)
         specs = self._select_specs(roles=roles, available_roles=payloads.keys())
         request_run_id = f'eod-run-{run.id}-{uuid.uuid4().hex[:10]}'
         items, failures = self._dispatch_and_store(
@@ -529,6 +477,21 @@ class AgentFeedbackOrchestrator:
         )
         specs = self._select_specs(roles=roles)
         requested_roles = [spec.role for spec in specs]
+        with session_scope() as session:
+            existing_run_ids = session.execute(
+                select(AgentContextFeedback.run_id)
+                .where(AgentContextFeedback.market_date == normalized_market_date)
+                .where(AgentContextFeedback.run_id.is_not(None))
+                .distinct()
+            ).scalars().all()
+        active_run_ids = {
+            run_id for run_id in existing_run_ids
+            if isinstance(run_id, str) and run_id.startswith(f'symbol-run-{normalized_market_date.isoformat()}-')
+        }
+        if active_run_ids:
+            raise ValueError(
+                f'Symbol feedback run already exists for {normalized_market_date.isoformat()}: {sorted(active_run_ids)}'
+            )
         request_run_id = f'symbol-run-{normalized_market_date.isoformat()}-{uuid.uuid4().hex[:10]}'
         items: list[dict[str, Any]] = []
         failures: list[dict[str, Any]] = []
@@ -543,6 +506,18 @@ class AgentFeedbackOrchestrator:
 
         role_worker_count = max_workers
         role_batch_jobs: dict[str, list[tuple[AgentDispatchSpec, list[dict[str, Any]]]]] = {}
+        logger.info(
+            'Agent feedback symbol run started',
+            extra={
+                'request_run_id': request_run_id,
+                'market_date': normalized_market_date.isoformat(),
+                'symbol_count': len(symbols),
+                'roles': requested_roles,
+                'batch_size': batch_size,
+                'role_parallel_subtasks': role_worker_count,
+                'reuse_existing': reuse_existing,
+            },
+        )
         for spec in specs:
             dispatch_items = []
             for item in symbol_context['items']:
@@ -580,92 +555,175 @@ class AgentFeedbackOrchestrator:
                     for i in range(0, len(session_items), batch_size)
                 )
             role_batch_jobs[spec.role] = [(spec, batch) for batch in role_batches]
+            logger.info(
+                'Agent feedback role batches prepared',
+                extra={
+                    'request_run_id': request_run_id,
+                    'role': spec.role,
+                    'agent_name': spec.agent_name,
+                    'dispatch_symbol_count': len(dispatch_items),
+                    'batch_count': len(role_batches),
+                    'session_slot_count': len(batches_by_session_key),
+                },
+            )
 
         total_max_workers = max(1, role_worker_count * max(1, len(specs)))
+        role_execution_limit = max(1, min(role_worker_count, 1))
         with concurrent.futures.ThreadPoolExecutor(max_workers=total_max_workers) as executor:
-            future_map = {
-                executor.submit(
+            future_map: dict[concurrent.futures.Future[dict[str, Any]], tuple[AgentDispatchSpec, list[dict[str, Any]]]] = {}
+            future_specs: dict[concurrent.futures.Future[dict[str, Any]], AgentDispatchSpec] = {}
+            pending_role_jobs: dict[str, list[tuple[AgentDispatchSpec, list[dict[str, Any]]]]] = {
+                role: list(jobs)
+                for role, jobs in role_batch_jobs.items()
+            }
+
+            def submit_next(role: str) -> None:
+                jobs = pending_role_jobs.get(role) or []
+                if not jobs:
+                    return
+                spec, batch = jobs.pop(0)
+                future = executor.submit(
                     self._get_client().dispatch_batch,
                     spec=spec,
                     market_date=normalized_market_date,
                     batch_items=batch,
-                ): (spec, batch)
-                for role_jobs in role_batch_jobs.values()
-                for spec, batch in role_jobs
-            }
-            for future in concurrent.futures.as_completed(future_map):
-                spec, batch = future_map[future]
-                batch_result: dict[str, Any] | None = None
-                try:
-                    batch_result = future.result()
-                    decoded_items = batch_result.get('decoded', {}).get('items', [])
-                    by_symbol = {
-                        item['symbol']: item
-                        for item in decoded_items
-                        if isinstance(item, dict) and item.get('symbol')
-                    }
-                    for source_item in batch:
-                        symbol = source_item['symbol']
-                        normalized_feedback = by_symbol.get(symbol, {}).get('feedback')
-                        if not normalized_feedback:
-                            normalized_feedback = {
+                )
+                future_map[future] = (spec, batch)
+                future_specs[future] = spec
+
+            for role in pending_role_jobs.keys():
+                for _ in range(role_execution_limit):
+                    submit_next(role)
+            logger.info(
+                'Agent feedback batch dispatch submitted',
+                extra={
+                    'request_run_id': request_run_id,
+                    'future_count': len(future_map),
+                    'total_parallel_subtasks': total_max_workers,
+                    'role_execution_limit': role_execution_limit,
+                },
+            )
+            completed_batches = 0
+            failed_batches = 0
+            stored_feedback_count = 0
+            while future_map:
+                done, _ = concurrent.futures.wait(
+                    list(future_map.keys()),
+                    return_when=concurrent.futures.FIRST_COMPLETED,
+                )
+                for future in done:
+                    spec, batch = future_map.pop(future)
+                    batch_result: dict[str, Any] | None = None
+                    try:
+                        batch_result = future.result()
+                        decoded_items = batch_result.get('decoded', {}).get('items', [])
+                        by_symbol = {
+                            item['symbol']: item
+                            for item in decoded_items
+                            if isinstance(item, dict) and item.get('symbol')
+                        }
+                        completed_batches += 1
+                        logger.info(
+                            'Agent feedback batch completed',
+                            extra={
+                                'request_run_id': request_run_id,
                                 'role': spec.role,
-                                'summary': f'{spec.role} batch did not return feedback for {symbol}',
-                                'confidence': 0.0,
-                                'risk_flags': ['missing_batch_feedback'],
-                                'details': {
-                                    'symbol': symbol,
-                                    'market_date': normalized_market_date.isoformat(),
-                                },
-                                'improvement_notes': ['Ensure every batch response returns one normalized feedback object per assigned symbol'],
-                            }
-                        stored = self._store_feedback(
-                            market_date=normalized_market_date,
-                            agent_name=spec.agent_name,
-                            run_id=request_run_id,
-                            payload={'role': spec.role, 'symbol': symbol},
-                            response={
-                                'attempt': 1,
-                                'started_at': batch_result.get('started_at'),
-                                'completed_at': batch_result.get('completed_at'),
-                                'normalized_feedback': normalized_feedback,
+                                'agent_name': spec.agent_name,
+                                'batch_size': len(batch),
+                                'session_ref': batch_result.get('session_ref'),
+                                'completed_batches': completed_batches,
+                                'failed_batches': failed_batches,
                             },
-                            context=source_item,
                         )
-                        with session_scope() as session:
-                            record = session.get(AgentContextFeedback, stored['id'])
-                            if record is not None:
-                                record.symbol = symbol
-                                session.flush()
-                        items.append(
-                            {
+                        for source_item in batch:
+                            symbol = source_item['symbol']
+                            normalized_feedback = by_symbol.get(symbol, {}).get('feedback')
+                            if not normalized_feedback:
+                                normalized_feedback = {
+                                    'role': spec.role,
+                                    'summary': f'{spec.role} batch did not return feedback for {symbol}',
+                                    'confidence': 0.0,
+                                    'risk_flags': ['missing_batch_feedback'],
+                                    'details': {
+                                        'symbol': symbol,
+                                        'market_date': normalized_market_date.isoformat(),
+                                    },
+                                    'improvement_notes': ['Ensure every batch response returns one normalized feedback object per assigned symbol'],
+                                }
+                            stored = self._store_feedback(
+                                market_date=normalized_market_date,
+                                agent_name=spec.agent_name,
+                                run_id=request_run_id,
+                                payload={'role': spec.role, 'symbol': symbol},
+                                response={
+                                    'attempt': batch_result.get('attempt', 1),
+                                    'started_at': batch_result.get('started_at'),
+                                    'completed_at': batch_result.get('completed_at'),
+                                    'normalized_feedback': normalized_feedback,
+                                },
+                                context=source_item,
+                            )
+                            stored_feedback_count += 1
+                            items.append(
+                                {
+                                    'role': spec.role,
+                                    'agent_name': spec.agent_name,
+                                    'symbol': symbol,
+                                    'status': 'completed',
+                                    'storage': stored,
+                                    'response': {'normalized_feedback': normalized_feedback},
+                                }
+                            )
+                    except Exception as exc:  # noqa: BLE001
+                        failed_batches += 1
+                        logger.warning(
+                            'Agent feedback batch failed',
+                            extra={
+                                'request_run_id': request_run_id,
                                 'role': spec.role,
                                 'agent_name': spec.agent_name,
-                                'symbol': symbol,
-                                'status': 'completed',
-                                'storage': stored,
-                                'response': {'normalized_feedback': normalized_feedback},
-                            }
-                        )
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning('Agent feedback batch failed', extra={'agent_name': spec.agent_name, 'session_ref': batch_result.get('session_ref') if batch_result else None, 'error': str(exc)})
-                    for source_item in batch:
-                        failures.append(
-                            {
-                                'role': spec.role,
-                                'agent_name': spec.agent_name,
-                                'symbol': source_item['symbol'],
-                                'status': 'failed',
-                                'retryable': True,
+                                'batch_size': len(batch),
+                                'session_ref': batch_result.get('session_ref') if batch_result else None,
+                                'failed_batches': failed_batches,
+                                'completed_batches': completed_batches,
+                                'error_type': type(exc).__name__,
                                 'error': str(exc),
-                            }
+                            },
+                            exc_info=True,
                         )
+                        for source_item in batch:
+                            failures.append(
+                                {
+                                    'role': spec.role,
+                                    'agent_name': spec.agent_name,
+                                    'symbol': source_item['symbol'],
+                                    'status': 'failed',
+                                    'retryable': True,
+                                    'error': f'{type(exc).__name__}: {exc}',
+                                }
+                            )
+                    finally:
+                        submit_next(spec.role)
 
         status = 'completed'
         if failures and items:
             status = 'partial'
         elif failures and not items:
             status = 'failed'
+
+        logger.info(
+            'Agent feedback symbol run finished',
+            extra={
+                'request_run_id': request_run_id,
+                'market_date': normalized_market_date.isoformat(),
+                'status': status,
+                'completed_items': len(items),
+                'failed_items': len(failures),
+                'stored_feedback_count': stored_feedback_count,
+                'completed_batches': completed_batches,
+                'failed_batches': failed_batches,
+            },
+        )
 
         return {
             'request': {

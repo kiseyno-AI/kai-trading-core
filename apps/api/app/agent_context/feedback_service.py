@@ -4,6 +4,7 @@ from datetime import date, datetime, timezone
 from typing import Any, Sequence
 
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Query
 
 from app.db import session_scope
@@ -116,7 +117,7 @@ class AgentContextFeedbackRepository:
     ) -> dict[str, Any]:
         received_at = datetime.now(timezone.utc)
         with session_scope() as session:
-            record = AgentContextFeedback(
+            stmt = insert(AgentContextFeedback).values(
                 market_date=market_date,
                 symbol=symbol,
                 agent_name=agent_name,
@@ -127,8 +128,22 @@ class AgentContextFeedbackRepository:
                 context_payload=context_payload,
                 received_at=received_at,
             )
-            session.add(record)
-            session.flush()
+            stmt = stmt.on_conflict_do_update(
+                constraint='uq_agent_context_feedback_market_symbol_agent',
+                set_={
+                    'agent_version': agent_version,
+                    'run_id': run_id,
+                    'summary_payload': summary_payload,
+                    'feedback_payload': feedback_payload,
+                    'context_payload': context_payload,
+                    'received_at': received_at,
+                    'updated_at': received_at,
+                },
+            ).returning(AgentContextFeedback.id)
+            record_id = session.execute(stmt).scalar_one()
+            record = session.get(AgentContextFeedback, record_id)
+            if record is None:
+                raise RuntimeError('Failed to load stored feedback record after upsert')
             return _serialize_feedback(record)
 
     def list_feedback(
