@@ -85,7 +85,7 @@ class Settings(BaseSettings):
     openclaw_feedback_retry_max_cycles: int = 3
     openclaw_feedback_retry_outer_batch_size: int = 20
     openclaw_agent_subtask_poll_seconds: float = 2.0
-    openclaw_agent_subtask_timeout_seconds: float = 900.0
+    openclaw_agent_subtask_timeout_seconds: float = 180.0
 
 
 settings = Settings()

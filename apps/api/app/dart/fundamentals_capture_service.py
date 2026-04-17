@@ -17,6 +17,7 @@ from app.db_models import DailyPriceBar
 from app.dart.fundamentals_store import (
     CAPTURE_STATUS_MAPPING_FAILED,
     CAPTURE_STATUS_NO_DATA,
+    RETRYABLE_CAPTURE_STATUSES,
     TERMINAL_CAPTURE_STATUSES,
     DartFundamentalsRepository,
     dart_fundamentals_repository,
@@ -1127,15 +1128,22 @@ class DartFundamentalsCaptureService:
                 try:
                     corp = await self.client.lookup_corp_code(stock_code=stock_code)
                 except Exception as exc:
+                    error_message = str(exc)
+                    if type(exc).__name__ == 'DartLookupError' and 'Unknown stock_code:' in error_message:
+                        terminal_resolved_symbols[stock_code] = CAPTURE_STATUS_MAPPING_FAILED
+                        symbol_result['state'] = _terminal_symbol_state(CAPTURE_STATUS_MAPPING_FAILED)
+                        symbol_result['terminal'] = True
+                        symbol_result['error'] = error_message
+                        continue
                     error = {
                         'stock_code': stock_code,
                         'error_type': type(exc).__name__,
-                        'error': str(exc),
+                        'error': error_message,
                     }
                     lookup_errors.append(error)
                     lookup_failed_symbols.add(stock_code)
                     symbol_result['state'] = 'lookup_failed'
-                    symbol_result['error'] = str(exc)
+                    symbol_result['error'] = error_message
                     continue
 
                 corp_record = {
