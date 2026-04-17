@@ -1294,6 +1294,7 @@ class DartFundamentalsCaptureService:
                     over_limit_event_ids = over_limit_event_ids[len(next_batch):]
 
                 retryable_next_batches: list[list[int]] = []
+                remaining_retryable_event_ids: list[int] = []
                 for batch_index, batch_event_ids in enumerate(pending_batches, start=1):
                     pending_event_ids = list(batch_event_ids)
                     for cycle_index in range(max_retry_cycles):
@@ -1349,8 +1350,10 @@ class DartFundamentalsCaptureService:
 
                     if pending_event_ids:
                         retryable_next_batches.append(list(pending_event_ids))
+                        remaining_retryable_event_ids.extend(pending_event_ids)
 
-                remaining_candidate_events = sum(len(batch) for batch in retryable_next_batches)
+                pending_event_ids = list(remaining_retryable_event_ids)
+                remaining_candidate_events = len(remaining_retryable_event_ids)
 
                 if capture_runs:
                     final_results_by_event_id: dict[int, dict[str, Any]] = {}
