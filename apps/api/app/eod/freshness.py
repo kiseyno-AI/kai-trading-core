@@ -9,7 +9,7 @@ from sqlalchemy import func, select
 
 from app.core.settings import settings
 from app.db import session_scope
-from app.db_models import DartDisclosureEvent, DartFundamentalsSnapshot
+from app.db_models import DartDisclosureEvent, DartFundamentalsRefreshRun, DartFundamentalsSnapshot, EODCollectionRun
 from app.market.clock import get_market_state
 from app.market_data_store import (
     count_daily_action_summaries_for_live_symbols,
@@ -90,21 +90,19 @@ class EODFreshnessService:
         fundamentals_counts = self.daily_fundamentals_count_loader(trade_date)
 
         if latest_price_trade_date:
-            latest_price_run = self.latest_run_loader(
-                market='KRX',
+            latest_price_run = self._select_freshness_run(
                 trade_date=latest_price_trade_date,
                 statuses=['completed', 'completed_with_errors'],
-            ) or self.latest_run_loader(market='KRX', trade_date=latest_price_trade_date)
+            ) or self._select_freshness_run(trade_date=latest_price_trade_date)
             latest_price_bar_count = self.latest_price_bar_count_loader(latest_price_trade_date)
         else:
             latest_price_run = None
             latest_price_bar_count = 0
 
-        today_run = self.latest_run_loader(
-            market='KRX',
+        today_run = self._select_freshness_run(
             trade_date=trade_date,
             statuses=['completed', 'completed_with_errors'],
-        ) or self.latest_run_loader(market='KRX', trade_date=trade_date)
+        ) or self._select_freshness_run(trade_date=trade_date)
         live_symbols_total = int((today_run or {}).get('symbols_total') or 0)
         if live_symbols_total == 0 and latest_price_run:
             live_symbols_total = int(latest_price_run.get('symbols_total') or 0)
@@ -142,6 +140,47 @@ class EODFreshnessService:
             },
         }
 
+    def _select_freshness_run(
+        self,
+        *,
+        trade_date: str,
+        statuses: list[str] | None = None,
+    ) -> dict | None:
+        candidate = self.latest_run_loader(market='KRX', trade_date=trade_date, statuses=statuses)
+        if not candidate:
+            return None
+        candidate_total = int(candidate.get('symbols_total') or 0)
+        candidate_succeeded = int(candidate.get('symbols_succeeded') or 0)
+        latest_bar_count = int(self.latest_price_bar_count_loader(trade_date) or 0)
+        if latest_bar_count > 0 and candidate_total > 0 and candidate_total < latest_bar_count and candidate_succeeded == 0:
+            with session_scope() as session:
+                fallback_row = session.execute(
+                    select(EODCollectionRun)
+                    .where(EODCollectionRun.market == 'KRX')
+                    .where(EODCollectionRun.trade_date == date.fromisoformat(trade_date))
+                    .where(EODCollectionRun.status.in_(statuses or ['completed', 'completed_with_errors', 'failed', 'running']))
+                    .where(EODCollectionRun.symbols_succeeded > 0)
+                    .order_by(EODCollectionRun.symbols_succeeded.desc(), EODCollectionRun.symbols_total.desc(), EODCollectionRun.started_at.desc(), EODCollectionRun.id.desc())
+                    .limit(1)
+                ).scalars().first()
+                if fallback_row is not None:
+                    return {
+                        'id': fallback_row.id,
+                        'market': fallback_row.market,
+                        'trade_date': fallback_row.trade_date.isoformat(),
+                        'source': fallback_row.source,
+                        'trigger': fallback_row.trigger,
+                        'status': fallback_row.status,
+                        'symbols_total': fallback_row.symbols_total,
+                        'symbols_succeeded': fallback_row.symbols_succeeded,
+                        'symbols_failed': fallback_row.symbols_failed,
+                        'error_message': fallback_row.error_message,
+                        'started_at': fallback_row.started_at.isoformat() if fallback_row.started_at else None,
+                        'completed_at': fallback_row.completed_at.isoformat() if fallback_row.completed_at else None,
+                        'run_metadata': fallback_row.run_metadata,
+                    }
+        return candidate
+
     @staticmethod
     def _build_live_symbol_stage(
         *,
@@ -166,11 +205,27 @@ class EODFreshnessService:
     def _build_fundamentals_stage(counts: dict[str, int]) -> dict:
         symbols_succeeded = int(counts.get('symbols_succeeded') or 0)
         symbols_failed = int(counts.get('symbols_failed') or 0)
-        status = 'ready' if symbols_succeeded > 0 else 'missing'
+        symbols_total = int(counts.get('symbols_total') or 0)
+
+        with session_scope() as session:
+            running_refresh = session.execute(
+                select(DartFundamentalsRefreshRun.id)
+                .where(DartFundamentalsRefreshRun.market_date == date.fromisoformat(get_market_state().server_time[:10]))
+                .where(DartFundamentalsRefreshRun.status == 'running')
+                .order_by(DartFundamentalsRefreshRun.started_at.desc(), DartFundamentalsRefreshRun.id.desc())
+                .limit(1)
+            ).scalar_one_or_none()
+
+        if running_refresh is not None:
+            status = 'running'
+        elif symbols_succeeded > 0:
+            status = 'ready'
+        else:
+            status = 'missing'
 
         return {
             'status': status,
-            'symbols_total': int(counts.get('symbols_total') or 0),
+            'symbols_total': symbols_total,
             'symbols_succeeded': symbols_succeeded,
             'symbols_failed': symbols_failed,
         }
