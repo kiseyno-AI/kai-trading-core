@@ -16,4 +16,6 @@ jobs:
         with:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           pullRequestOpened: |
-            @codex check it
+            @codex check it.
+            If no changes are needed, reply with exactly: "looks good to merge".
+            If changes are needed, reply with a short comment that clearly says changes are required.
