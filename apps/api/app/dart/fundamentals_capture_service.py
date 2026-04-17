@@ -1495,16 +1495,21 @@ class DartFundamentalsCaptureService:
                 run_metadata=metadata,
             )
             feedback_followup = None
+            feedback_followup_error = None
             if settings.openclaw_feedback_trigger_after_fundamentals_refresh and status in {'completed', 'partial'}:
-                feedback_followup = agent_feedback_retry_service.run_retry_cycles(
-                    config=FeedbackRetryCycleConfig(
-                        market_date=resolved_market_date,
-                        roles=EXPECTED_ROLES,
-                        max_cycles=settings.openclaw_feedback_retry_max_cycles,
-                        outer_batch_size=settings.openclaw_feedback_retry_outer_batch_size,
-                        reuse_existing=True,
+                try:
+                    feedback_followup = await asyncio.to_thread(
+                        agent_feedback_retry_service.run_retry_cycles,
+                        config=FeedbackRetryCycleConfig(
+                            market_date=resolved_market_date,
+                            roles=EXPECTED_ROLES,
+                            max_cycles=settings.openclaw_feedback_retry_max_cycles,
+                            outer_batch_size=settings.openclaw_feedback_retry_outer_batch_size,
+                            reuse_existing=True,
+                        ),
                     )
-                )
+                except Exception as exc:
+                    feedback_followup_error = str(exc)
 
             return {
                 'triggered': True,
@@ -1553,6 +1558,8 @@ class DartFundamentalsCaptureService:
                     ),
                 },
                 'operator_buckets': operator_buckets,
+                'feedback_followup': feedback_followup,
+                'feedback_followup_error': feedback_followup_error,
             }
         except Exception as exc:
             self.repository.complete_refresh_run(
