@@ -279,6 +279,10 @@ class OpenClawAgentClient:
                     end = normalized_text.rfind('}')
                     if start != -1 and end != -1 and end > start:
                         normalized_text = normalized_text[start:end + 1]
+                if parsed.get('status') in {'failed', 'aborted', 'cancelled', 'canceled'}:
+                    raise AgentDispatchRetryableError(
+                        f"OpenClaw batch ended with status={parsed.get('status')}"
+                    )
                 try:
                     decoded = json.loads(normalized_text)
                 except json.JSONDecodeError:
@@ -609,6 +613,7 @@ class AgentFeedbackOrchestrator:
             completed_batches = 0
             failed_batches = 0
             stored_feedback_count = 0
+            timed_out_futures: set[concurrent.futures.Future[dict[str, Any]]] = set()
             while True:
                 with future_lock:
                     active_futures = list(future_map.keys())
@@ -624,12 +629,34 @@ class AgentFeedbackOrchestrator:
                     now = time.monotonic()
                     with future_lock:
                         for future, (spec, slot, batch, started_monotonic) in list(future_map.items()):
+                            if future in timed_out_futures:
+                                continue
                             if now - started_monotonic < dispatch_future_timeout:
                                 continue
-                            future_map.pop(future, None)
                             timed_out_entries.append((future, spec, slot, batch))
                     for future, spec, slot, batch in timed_out_entries:
-                        future.cancel()
+                        if not future.cancel():
+                            timed_out_futures.add(future)
+                            logger.warning(
+                                'Agent feedback batch timed out but remains in flight',
+                                extra={
+                                    'request_run_id': request_run_id,
+                                    'role': spec.role,
+                                    'agent_name': spec.agent_name,
+                                    'session_slot': slot,
+                                    'batch_size': len(batch),
+                                    'failed_batches': failed_batches,
+                                    'completed_batches': completed_batches,
+                                    'timeout_seconds': dispatch_future_timeout,
+                                    'cancellation_succeeded': False,
+                                },
+                            )
+                            continue
+                        with future_lock:
+                            entry = future_map.pop(future, None)
+                        if entry is None:
+                            continue
+                        spec, slot, batch, _started_monotonic = entry
                         failed_batches += 1
                         logger.warning(
                             'Agent feedback batch timed out',
@@ -642,6 +669,7 @@ class AgentFeedbackOrchestrator:
                                 'failed_batches': failed_batches,
                                 'completed_batches': completed_batches,
                                 'timeout_seconds': dispatch_future_timeout,
+                                'cancellation_succeeded': True,
                             },
                         )
                         for source_item in batch:
@@ -658,6 +686,7 @@ class AgentFeedbackOrchestrator:
                         submit_next(spec.role, slot)
                     continue
                 for future in done:
+                    timed_out_futures.discard(future)
                     with future_lock:
                         entry = future_map.pop(future, None)
                     if entry is None:
