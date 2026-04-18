@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timezone, timedelta
+from math import ceil
 from typing import Any, Sequence
 
 from sqlalchemy import func, select
@@ -37,49 +38,53 @@ class AgentContextProgressService:
                 available_symbol_stmt = available_symbol_stmt.where(Symbol.symbol.in_(normalized_symbols))
             available_symbols = [str(symbol) for symbol in session.execute(available_symbol_stmt).scalars().all()]
 
-            first_feedback_stmt = (
-                select(func.min(AgentContextFeedback.received_at))
-                .where(AgentContextFeedback.market_date == normalized_market_date)
-            )
-            latest_feedback_stmt = (
-                select(func.max(AgentContextFeedback.received_at))
-                .where(AgentContextFeedback.market_date == normalized_market_date)
-            )
-            if normalized_symbols:
-                first_feedback_stmt = first_feedback_stmt.where(AgentContextFeedback.symbol.in_(normalized_symbols))
-                latest_feedback_stmt = latest_feedback_stmt.where(AgentContextFeedback.symbol.in_(normalized_symbols))
+            target_symbols = available_symbols
+            first_feedback_at = None
+            latest_feedback_at = None
+            rows: list[dict[str, Any]] = []
 
-            first_feedback_at = session.execute(first_feedback_stmt).scalar_one()
-            latest_feedback_at = session.execute(latest_feedback_stmt).scalar_one()
-
-            rows_stmt = (
-                select(
-                    AgentContextFeedback.symbol,
-                    AgentContextFeedback.agent_name,
-                    AgentContextFeedback.run_id,
-                    AgentContextFeedback.received_at,
-                    AgentContextFeedback.id,
+            if target_symbols:
+                first_feedback_stmt = (
+                    select(func.min(AgentContextFeedback.received_at))
+                    .where(AgentContextFeedback.market_date == normalized_market_date)
+                    .where(AgentContextFeedback.symbol.in_(target_symbols))
                 )
-                .where(AgentContextFeedback.market_date == normalized_market_date)
-                .order_by(
-                    AgentContextFeedback.symbol.asc(),
-                    AgentContextFeedback.received_at.desc(),
-                    AgentContextFeedback.id.desc(),
+                latest_feedback_stmt = (
+                    select(func.max(AgentContextFeedback.received_at))
+                    .where(AgentContextFeedback.market_date == normalized_market_date)
+                    .where(AgentContextFeedback.symbol.in_(target_symbols))
                 )
-            )
-            if normalized_symbols:
-                rows_stmt = rows_stmt.where(AgentContextFeedback.symbol.in_(normalized_symbols))
 
-            rows = [
-                {
-                    'symbol': row.symbol,
-                    'agent_name': row.agent_name,
-                    'run_id': row.run_id,
-                    'received_at': row.received_at.isoformat() if row.received_at else None,
-                    'id': row.id,
-                }
-                for row in session.execute(rows_stmt)
-            ]
+                first_feedback_at = session.execute(first_feedback_stmt).scalar_one()
+                latest_feedback_at = session.execute(latest_feedback_stmt).scalar_one()
+
+                rows_stmt = (
+                    select(
+                        AgentContextFeedback.symbol,
+                        AgentContextFeedback.agent_name,
+                        AgentContextFeedback.run_id,
+                        AgentContextFeedback.received_at,
+                        AgentContextFeedback.id,
+                    )
+                    .where(AgentContextFeedback.market_date == normalized_market_date)
+                    .where(AgentContextFeedback.symbol.in_(target_symbols))
+                    .order_by(
+                        AgentContextFeedback.symbol.asc(),
+                        AgentContextFeedback.received_at.desc(),
+                        AgentContextFeedback.id.desc(),
+                    )
+                )
+
+                rows = [
+                    {
+                        'symbol': row.symbol,
+                        'agent_name': row.agent_name,
+                        'run_id': row.run_id,
+                        'received_at': row.received_at.isoformat() if row.received_at else None,
+                        'id': row.id,
+                    }
+                    for row in session.execute(rows_stmt)
+                ]
 
         grouped: dict[str, list[dict[str, Any]]] = {}
         for row in rows:
@@ -103,8 +108,6 @@ class AgentContextProgressService:
         in_progress_symbols = 0
         pending_symbols = 0
         failed_items = 0
-
-        target_symbols = available_symbols
 
         for symbol in target_symbols:
             symbol_rows = grouped.get(symbol, [])
@@ -151,31 +154,34 @@ class AgentContextProgressService:
         completed_symbols_per_minute = None
         estimated_remaining_seconds = None
         estimated_completion_at = None
-        eta_confidence = 'low'
+        eta_confidence = None
+        is_complete = completed_symbols == requested_symbol_count and requested_symbol_count > 0
         if first_feedback_dt is not None:
+            elapsed_end_dt = latest_feedback_dt.astimezone(timezone.utc) if is_complete and latest_feedback_dt else now_utc
             elapsed_seconds = max(
                 0,
-                int((now_utc - first_feedback_dt.astimezone(timezone.utc)).total_seconds()),
+                int((elapsed_end_dt - first_feedback_dt.astimezone(timezone.utc)).total_seconds()),
             )
+            remaining_feedback_count = max(0, expected_feedback_count - completed_feedback_count)
             if elapsed_seconds > 0:
                 feedbacks_per_second = completed_feedback_count / elapsed_seconds
                 symbols_per_second = completed_symbols / elapsed_seconds if completed_symbols > 0 else 0.0
                 completed_feedback_per_minute = round(feedbacks_per_second * 60, 2)
                 completed_symbols_per_minute = round(symbols_per_second * 60, 2)
-                remaining_feedback_count = max(0, expected_feedback_count - completed_feedback_count)
                 if feedbacks_per_second > 0 and remaining_feedback_count > 0:
-                    estimated_remaining_seconds = int(remaining_feedback_count / feedbacks_per_second)
+                    estimated_remaining_seconds = ceil(remaining_feedback_count / feedbacks_per_second)
                     estimated_completion_at = (now_utc + timedelta(seconds=estimated_remaining_seconds)).isoformat()
+                    eta_confidence = 'low'
                     if completed_feedback_count >= 300:
                         eta_confidence = 'medium'
                     if completed_feedback_count >= 1000:
                         eta_confidence = 'high'
-                elif remaining_feedback_count == 0:
-                    estimated_remaining_seconds = 0
-                    estimated_completion_at = now_utc.isoformat()
-                    eta_confidence = 'high'
+            if remaining_feedback_count == 0:
+                estimated_remaining_seconds = 0
+                estimated_completion_at = elapsed_end_dt.isoformat()
+                eta_confidence = 'high'
 
-        if completed_symbols == requested_symbol_count and requested_symbol_count > 0:
+        if is_complete:
             run_status = 'completed'
         elif latest_feedback_dt is None:
             run_status = 'pending'
