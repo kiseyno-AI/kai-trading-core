@@ -4,9 +4,11 @@
 Reports aggregate progress for the three-role symbol feedback workflow.
 
 The response is now a stable coverage and liveness snapshot:
-- `total_symbols` uses the current active symbol universe (or the requested symbol subset), not partial `daily_price_bars` coverage for the day
+- `total_symbols` uses the active symbol set with `daily_price_bars` for the requested market date, optionally narrowed to requested symbols
 - `run_status` indicates whether feedback appears to be actively moving, stalled, pending, or completed
 - `latest_feedback_at` and `seconds_since_last_feedback` help operators tell whether a run is still alive
+- `first_feedback_at`, `elapsed_seconds`, rates, and ETA fields are calculated only from feedback rows for the same target symbol universe used by the progress counts
+- `estimated_completion_at` is an ETA for active runs and the latest feedback timestamp for already completed runs
 
 ## Example request
 ```http
@@ -28,7 +30,9 @@ GET /agent-context/feedback/progress?market_date=2026-04-16
   "summary": {
     "run_status": "stalled",
     "is_live": false,
+    "first_feedback_at": "2026-04-17T06:58:10.141902+09:00",
     "latest_feedback_at": "2026-04-17T07:16:28.988041+09:00",
+    "elapsed_seconds": 6330,
     "seconds_since_last_feedback": 5231,
     "stalled_threshold_seconds": 300,
     "total_symbols": 4331,
@@ -40,7 +44,12 @@ GET /agent-context/feedback/progress?market_date=2026-04-16
     "progress_percent": 9.17,
     "failed_items": 0,
     "completed_feedback_count": 402,
-    "expected_feedback_count": 12993
+    "expected_feedback_count": 12993,
+    "completed_feedback_per_minute": 3.81,
+    "completed_symbols_per_minute": 0.0,
+    "estimated_remaining_seconds": 198267,
+    "estimated_completion_at": "2026-04-19T15:59:15.210342+09:00",
+    "eta_confidence": "medium"
   }
 }
 ```
