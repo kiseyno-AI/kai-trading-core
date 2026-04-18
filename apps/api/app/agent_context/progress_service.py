@@ -37,15 +37,20 @@ class AgentContextProgressService:
                 available_symbol_stmt = available_symbol_stmt.where(Symbol.symbol.in_(normalized_symbols))
             available_symbols = [str(symbol) for symbol in session.execute(available_symbol_stmt).scalars().all()]
 
-            first_feedback_at = session.execute(
+            first_feedback_stmt = (
                 select(func.min(AgentContextFeedback.received_at))
                 .where(AgentContextFeedback.market_date == normalized_market_date)
-            ).scalar_one()
-
-            latest_feedback_at = session.execute(
+            )
+            latest_feedback_stmt = (
                 select(func.max(AgentContextFeedback.received_at))
                 .where(AgentContextFeedback.market_date == normalized_market_date)
-            ).scalar_one()
+            )
+            if normalized_symbols:
+                first_feedback_stmt = first_feedback_stmt.where(AgentContextFeedback.symbol.in_(normalized_symbols))
+                latest_feedback_stmt = latest_feedback_stmt.where(AgentContextFeedback.symbol.in_(normalized_symbols))
+
+            first_feedback_at = session.execute(first_feedback_stmt).scalar_one()
+            latest_feedback_at = session.execute(latest_feedback_stmt).scalar_one()
 
             rows_stmt = (
                 select(
