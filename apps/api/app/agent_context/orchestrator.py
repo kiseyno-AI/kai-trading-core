@@ -482,7 +482,7 @@ class AgentFeedbackOrchestrator:
         ) if reuse_existing else {}
 
         role_worker_count = max_workers
-        role_batch_jobs: dict[str, list[tuple[AgentDispatchSpec, list[dict[str, Any]]]]] = {}
+        role_batch_jobs: dict[str, dict[int, list[tuple[AgentDispatchSpec, list[dict[str, Any]]]]]] = {}
         logger.info(
             'Agent feedback symbol run started',
             extra={
@@ -515,6 +515,7 @@ class AgentFeedbackOrchestrator:
                 dispatch_items.append({**item})
 
             role_batches: list[tuple[int, list[dict[str, Any]]]] = []
+            role_slot_jobs: dict[int, list[tuple[AgentDispatchSpec, list[dict[str, Any]]]]] = {}
             if dispatch_items:
                 slot_count = max(1, role_worker_count)
                 indexed_batches = [
@@ -531,7 +532,8 @@ class AgentFeedbackOrchestrator:
                         for batch_item in batch
                     ]
                     role_batches.append((slot, batch_with_session))
-            role_batch_jobs[spec.role] = [(spec, batch) for _, batch in role_batches]
+                    role_slot_jobs.setdefault(slot, []).append((spec, batch_with_session))
+            role_batch_jobs[spec.role] = role_slot_jobs
             logger.info(
                 'Agent feedback role batches prepared',
                 extra={
@@ -540,22 +542,26 @@ class AgentFeedbackOrchestrator:
                     'agent_name': spec.agent_name,
                     'dispatch_symbol_count': len(dispatch_items),
                     'batch_count': len(role_batches),
-                    'session_slot_count': min(max(1, role_worker_count), len(role_batches)) if role_batches else 0,
+                    'session_slot_count': len(role_slot_jobs),
                 },
             )
 
         total_max_workers = max(1, role_worker_count * max(1, len(specs)))
         role_execution_limit = max(1, role_worker_count)
         with concurrent.futures.ThreadPoolExecutor(max_workers=total_max_workers) as executor:
-            future_map: dict[concurrent.futures.Future[dict[str, Any]], tuple[AgentDispatchSpec, list[dict[str, Any]]]] = {}
+            future_map: dict[concurrent.futures.Future[dict[str, Any]], tuple[AgentDispatchSpec, int, list[dict[str, Any]]]] = {}
             future_specs: dict[concurrent.futures.Future[dict[str, Any]], AgentDispatchSpec] = {}
-            pending_role_jobs: dict[str, list[tuple[AgentDispatchSpec, list[dict[str, Any]]]]] = {
-                role: list(jobs)
-                for role, jobs in role_batch_jobs.items()
+            pending_role_jobs: dict[str, dict[int, list[tuple[AgentDispatchSpec, list[dict[str, Any]]]]]] = {
+                role: {
+                    slot: list(jobs)
+                    for slot, jobs in slot_jobs.items()
+                }
+                for role, slot_jobs in role_batch_jobs.items()
             }
 
-            def submit_next(role: str) -> None:
-                jobs = pending_role_jobs.get(role) or []
+            def submit_next(role: str, slot: int) -> None:
+                role_jobs = pending_role_jobs.get(role) or {}
+                jobs = role_jobs.get(slot) or []
                 if not jobs:
                     return
                 spec, batch = jobs.pop(0)
@@ -565,12 +571,12 @@ class AgentFeedbackOrchestrator:
                     market_date=normalized_market_date,
                     batch_items=batch,
                 )
-                future_map[future] = (spec, batch)
+                future_map[future] = (spec, slot, batch)
                 future_specs[future] = spec
 
-            for role in pending_role_jobs.keys():
-                for _ in range(role_execution_limit):
-                    submit_next(role)
+            for role, slot_jobs in pending_role_jobs.items():
+                for slot in sorted(slot_jobs.keys()):
+                    submit_next(role, slot)
             logger.info(
                 'Agent feedback batch dispatch submitted',
                 extra={
@@ -589,7 +595,7 @@ class AgentFeedbackOrchestrator:
                     return_when=concurrent.futures.FIRST_COMPLETED,
                 )
                 for future in done:
-                    spec, batch = future_map.pop(future)
+                    spec, slot, batch = future_map.pop(future)
                     batch_result: dict[str, Any] | None = None
                     try:
                         batch_result = future.result()
@@ -606,6 +612,7 @@ class AgentFeedbackOrchestrator:
                                 'request_run_id': request_run_id,
                                 'role': spec.role,
                                 'agent_name': spec.agent_name,
+                                'session_slot': slot,
                                 'batch_size': len(batch),
                                 'session_ref': batch_result.get('session_ref'),
                                 'completed_batches': completed_batches,
@@ -659,6 +666,7 @@ class AgentFeedbackOrchestrator:
                                 'request_run_id': request_run_id,
                                 'role': spec.role,
                                 'agent_name': spec.agent_name,
+                                'session_slot': slot,
                                 'batch_size': len(batch),
                                 'session_ref': batch_result.get('session_ref') if batch_result else None,
                                 'failed_batches': failed_batches,
@@ -680,7 +688,7 @@ class AgentFeedbackOrchestrator:
                                 }
                             )
                     finally:
-                        submit_next(spec.role)
+                        submit_next(spec.role, slot)
 
         status = 'completed'
         if failures and items:

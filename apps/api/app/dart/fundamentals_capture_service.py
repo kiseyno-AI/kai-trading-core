@@ -68,9 +68,12 @@ def _debug_refresh_log(stage: str, **payload: Any) -> None:
         **payload,
     }
     debug_path = Path(__file__).resolve().parents[2] / 'var' / 'log' / 'dart-fundamentals-refresh.log'
-    debug_path.parent.mkdir(parents=True, exist_ok=True)
-    with debug_path.open('a', encoding='utf-8') as fh:
-        fh.write(json.dumps(line, ensure_ascii=False, default=str) + '\n')
+    try:
+        debug_path.parent.mkdir(parents=True, exist_ok=True)
+        with debug_path.open('a', encoding='utf-8') as fh:
+            fh.write(json.dumps(line, ensure_ascii=False, default=str) + '\n')
+    except OSError:
+        pass
     try:
         log_fetch_event(
             source='dart_fundamentals_refresh',
