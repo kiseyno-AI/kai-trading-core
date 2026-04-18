@@ -78,21 +78,43 @@ class AgentFeedbackRetryService:
             batches: list[dict[str, Any]] = []
             for offset in range(0, len(remaining), config.outer_batch_size):
                 batch_symbols = remaining[offset:offset + config.outer_batch_size]
-                result = agent_feedback_orchestrator.dispatch_for_symbols(
-                    market_date=config.market_date,
-                    symbols=batch_symbols,
-                    roles=list(config.roles),
-                    reuse_existing=config.reuse_existing,
-                )
-                batches.append(
-                    {
-                        'offset': offset,
-                        'batch_size': len(batch_symbols),
-                        'symbols': batch_symbols,
-                        'summary': result['summary'],
-                        'request': result['request'],
-                    }
-                )
+                try:
+                    result = agent_feedback_orchestrator.dispatch_for_symbols(
+                        market_date=config.market_date,
+                        symbols=batch_symbols,
+                        roles=list(config.roles),
+                        reuse_existing=config.reuse_existing,
+                    )
+                    batches.append(
+                        {
+                            'offset': offset,
+                            'batch_size': len(batch_symbols),
+                            'symbols': batch_symbols,
+                            'summary': result['summary'],
+                            'request': result['request'],
+                        }
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    batches.append(
+                        {
+                            'offset': offset,
+                            'batch_size': len(batch_symbols),
+                            'symbols': batch_symbols,
+                            'summary': {
+                                'status': 'failed',
+                                'completed': 0,
+                                'failed': len(batch_symbols) * len(config.roles),
+                                'error_type': type(exc).__name__,
+                                'error': str(exc),
+                            },
+                            'request': {
+                                'market_date': config.market_date.isoformat(),
+                                'symbols': list(batch_symbols),
+                                'roles': list(config.roles),
+                                'reuse_existing': config.reuse_existing,
+                            },
+                        }
+                    )
 
             remaining = self.load_incomplete_symbols(market_date=config.market_date, roles=config.roles)
             cycles.append(

@@ -3,6 +3,7 @@ from __future__ import annotations
 import concurrent.futures
 import json
 import logging
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -548,9 +549,12 @@ class AgentFeedbackOrchestrator:
 
         total_max_workers = max(1, role_worker_count * max(1, len(specs)))
         role_execution_limit = max(1, role_worker_count)
+        dispatch_future_timeout = max(
+            settings.openclaw_agent_subtask_timeout_seconds,
+            settings.openclaw_agent_timeout_seconds,
+        ) + max(0, settings.openclaw_agent_retry_backoff_seconds * max(1, settings.openclaw_agent_max_retries)) + 30
         with concurrent.futures.ThreadPoolExecutor(max_workers=total_max_workers) as executor:
-            future_map: dict[concurrent.futures.Future[dict[str, Any]], tuple[AgentDispatchSpec, int, list[dict[str, Any]]]] = {}
-            future_specs: dict[concurrent.futures.Future[dict[str, Any]], AgentDispatchSpec] = {}
+            future_map: dict[concurrent.futures.Future[dict[str, Any]], tuple[AgentDispatchSpec, int, list[dict[str, Any]], float]] = {}
             pending_role_jobs: dict[str, dict[int, list[tuple[AgentDispatchSpec, list[dict[str, Any]]]]]] = {
                 role: {
                     slot: list(jobs)
@@ -558,6 +562,7 @@ class AgentFeedbackOrchestrator:
                 }
                 for role, slot_jobs in role_batch_jobs.items()
             }
+            future_lock = threading.Lock()
 
             def submit_next(role: str, slot: int) -> None:
                 role_jobs = pending_role_jobs.get(role) or {}
@@ -571,8 +576,8 @@ class AgentFeedbackOrchestrator:
                     market_date=normalized_market_date,
                     batch_items=batch,
                 )
-                future_map[future] = (spec, slot, batch)
-                future_specs[future] = spec
+                with future_lock:
+                    future_map[future] = (spec, slot, batch, time.monotonic())
 
             for role, slot_jobs in pending_role_jobs.items():
                 for slot in sorted(slot_jobs.keys()):
@@ -584,18 +589,66 @@ class AgentFeedbackOrchestrator:
                     'future_count': len(future_map),
                     'total_parallel_subtasks': total_max_workers,
                     'role_execution_limit': role_execution_limit,
+                    'dispatch_future_timeout_seconds': dispatch_future_timeout,
                 },
             )
             completed_batches = 0
             failed_batches = 0
             stored_feedback_count = 0
-            while future_map:
+            while True:
+                with future_lock:
+                    active_futures = list(future_map.keys())
+                if not active_futures:
+                    break
                 done, _ = concurrent.futures.wait(
-                    list(future_map.keys()),
+                    active_futures,
+                    timeout=1,
                     return_when=concurrent.futures.FIRST_COMPLETED,
                 )
+                timed_out_entries: list[tuple[concurrent.futures.Future[dict[str, Any]], AgentDispatchSpec, int, list[dict[str, Any]]]] = []
+                if not done:
+                    now = time.monotonic()
+                    with future_lock:
+                        for future, (spec, slot, batch, started_monotonic) in list(future_map.items()):
+                            if now - started_monotonic < dispatch_future_timeout:
+                                continue
+                            future_map.pop(future, None)
+                            timed_out_entries.append((future, spec, slot, batch))
+                    for future, spec, slot, batch in timed_out_entries:
+                        future.cancel()
+                        failed_batches += 1
+                        logger.warning(
+                            'Agent feedback batch timed out',
+                            extra={
+                                'request_run_id': request_run_id,
+                                'role': spec.role,
+                                'agent_name': spec.agent_name,
+                                'session_slot': slot,
+                                'batch_size': len(batch),
+                                'failed_batches': failed_batches,
+                                'completed_batches': completed_batches,
+                                'timeout_seconds': dispatch_future_timeout,
+                            },
+                        )
+                        for source_item in batch:
+                            failures.append(
+                                {
+                                    'role': spec.role,
+                                    'agent_name': spec.agent_name,
+                                    'symbol': source_item['symbol'],
+                                    'status': 'failed',
+                                    'retryable': True,
+                                    'error': f'batch_timeout_after_{int(dispatch_future_timeout)}s',
+                                }
+                            )
+                        submit_next(spec.role, slot)
+                    continue
                 for future in done:
-                    spec, slot, batch = future_map.pop(future)
+                    with future_lock:
+                        entry = future_map.pop(future, None)
+                    if entry is None:
+                        continue
+                    spec, slot, batch, _started_monotonic = entry
                     batch_result: dict[str, Any] | None = None
                     try:
                         batch_result = future.result()
