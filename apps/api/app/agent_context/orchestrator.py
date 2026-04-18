@@ -13,6 +13,20 @@ from typing import Any, Sequence
 import httpx
 from sqlalchemy import select
 
+ABORTLIKE_ERROR_MARKERS = (
+    'this operation was aborted',
+    'aborted',
+    'abortedlastrun',
+    'killed',
+    'failed',
+)
+
+
+def _is_abortlike_error(error: Any) -> bool:
+    text = str(error or '').lower()
+    return any(marker in text for marker in ABORTLIKE_ERROR_MARKERS)
+
+
 from app.agent_context.feedback_service import agent_context_feedback_service
 from app.agent_context.payload_builder import agent_payload_builder
 from app.agent_context.read_service import agent_context_read_service
