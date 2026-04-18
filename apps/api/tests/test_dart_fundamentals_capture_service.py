@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 from app.dart.fundamentals_capture_service import (
     DartFundamentalsCaptureService,
+    _debug_refresh_log,
     build_row_payloads,
     infer_fundamentals_request,
 )
@@ -330,6 +331,15 @@ class FakeCaptureRepository:
 
 
 class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
+    def test_debug_refresh_log_ignores_filesystem_permission_errors(self):
+        with patch(
+            'app.dart.fundamentals_capture_service.Path.mkdir',
+            side_effect=PermissionError('readonly filesystem'),
+        ), patch('app.dart.fundamentals_capture_service.log_fetch_event') as log_fetch_event:
+            _debug_refresh_log('sync_group_start', run_id=188)
+
+        log_fetch_event.assert_called_once()
+
     async def test_capture_recent_fundamentals_persists_snapshots_and_marks_event_status(self):
         client = FakeCaptureClient()
         repository = FakeCaptureRepository()
