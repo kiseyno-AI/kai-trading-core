@@ -7,6 +7,7 @@ from typing import Any, Sequence
 from sqlalchemy import select
 
 from app.agent_context.orchestrator import agent_feedback_orchestrator
+from app.agent_context.progress_service import agent_context_progress_service
 from app.agent_context.reuse_service import agent_context_reuse_service
 from app.db import session_scope
 from app.db_models import DailyPriceBar, Symbol
@@ -129,6 +130,11 @@ class AgentFeedbackRetryService:
             if not remaining:
                 break
 
+        progress = self._get_retry_progress(
+            market_date=config.market_date,
+            roles=config.roles,
+        )
+
         return {
             'market_date': config.market_date.isoformat(),
             'roles': list(config.roles),
@@ -138,7 +144,15 @@ class AgentFeedbackRetryService:
             'cycles': cycles,
             'final_pending': len(remaining),
             'completed': len(remaining) == 0,
+            'progress': progress,
         }
+
+    def _get_retry_progress(self, *, market_date: date, roles: Sequence[str]) -> dict[str, Any]:
+        return agent_context_progress_service.get_feedback_progress(
+            market_date=market_date,
+            symbols=None,
+            expected_agents=roles,
+        )
 
 
 agent_feedback_retry_service = AgentFeedbackRetryService()

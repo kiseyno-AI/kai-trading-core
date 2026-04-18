@@ -10,6 +10,11 @@ from app.agent_context.orchestrator import agent_feedback_orchestrator
 from app.agent_context.progress_service import agent_context_progress_service
 from app.agent_context.reuse_service import agent_context_reuse_service
 from app.agent_context.read_service import agent_context_read_service
+from app.agent_context.retry_service import (
+    EXPECTED_ROLES,
+    FeedbackRetryCycleConfig,
+    agent_feedback_retry_service,
+)
 from app.agent_context.status_service import agent_context_status_service
 
 router = APIRouter(prefix='/agent-context', tags=['agent-context'])
@@ -49,6 +54,16 @@ class AgentSymbolFeedbackDispatchRequest(BaseModel):
     roles: list[str] | None = None
     fs_div: str | None = None
     disclosures_limit: int = Field(default=5, ge=0, le=20)
+    reuse_existing: bool = True
+
+
+class AgentFeedbackRetryCyclesRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+    market_date: date
+    roles: list[str] | None = None
+    max_cycles: int = Field(default=3, ge=1, le=20)
+    outer_batch_size: int = Field(default=20, ge=1, le=200)
     reuse_existing: bool = True
 
 
@@ -122,6 +137,26 @@ async def dispatch_symbol_agent_feedback(payload: AgentSymbolFeedbackDispatchReq
         raise HTTPException(status_code=500, detail=f'Agent symbol feedback dispatch failed: {exc}') from exc
 
 
+@router.post('/feedback/retry-cycles')
+async def run_agent_feedback_retry_cycles(payload: AgentFeedbackRetryCyclesRequest) -> dict:
+    try:
+        config = FeedbackRetryCycleConfig(
+            market_date=payload.market_date,
+            roles=tuple(payload.roles or EXPECTED_ROLES),
+            max_cycles=payload.max_cycles,
+            outer_batch_size=payload.outer_batch_size,
+            reuse_existing=payload.reuse_existing,
+        )
+        return await run_in_threadpool(
+            agent_feedback_retry_service.run_retry_cycles,
+            config=config,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'Agent feedback retry cycles failed: {exc}') from exc
+
+
 @router.get('/feedback/payloads')
 async def list_agent_feedback_payloads(
     market_date: date = Query(...),
@@ -176,8 +211,6 @@ async def get_agent_feedback_status(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f'Agent feedback status read failed: {exc}') from exc
-
-
 
 
 @router.get('/feedback/progress')

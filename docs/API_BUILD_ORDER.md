@@ -70,6 +70,7 @@
 - `POST /agent-context/feedback`
 - `POST /agent-context/feedback/dispatch`
 - `POST /agent-context/feedback/dispatch/symbols`
+- `POST /agent-context/feedback/retry-cycles`
 - `GET /agent-context/feedback?market_date=YYYY-MM-DD&symbols=005930&agent_name=openclaw&limit=50`
 - `GET /agent-context/feedback/latest?market_date=YYYY-MM-DD&symbols=005930&symbols=000660`
 - `GET /agent-context/feedback/payloads?market_date=YYYY-MM-DD&symbols=005930`
@@ -139,6 +140,7 @@
 - `GET /agent-context/feedback/requests` reads the stored request/context payloads that were sent to the agents by symbol and date.
 - `GET /agent-context/feedback/status` reports whether the three-agent feedback workflow is pending, in progress, partial, or completed for requested symbols, plus completed counts and pending agents.
 - `GET /agent-context/feedback/progress` reports aggregate progress for the expected three-agent feedback workflow, including `total_symbols`, `processed_symbols`, `completed_symbols`, `in_progress_symbols`, `pending_symbols`, `progress_ratio`, `progress_percent`, `failed_items`, `completed_feedback_count`, `expected_feedback_count`, `first_feedback_at`, `elapsed_seconds`, `completed_feedback_per_minute`, `completed_symbols_per_minute`, `estimated_remaining_seconds`, `estimated_completion_at`, and `eta_confidence`. When `symbols` is omitted, the symbol universe is derived from distinct `daily_price_bars` symbols for the requested market date, and timing/rate fields are scoped to that same symbol universe.
+- `POST /agent-context/feedback/retry-cycles` runs bounded retry passes over incomplete symbol feedback and returns both cycle/batch results and a fresh `progress` snapshot with the same timing, rate, and ETA fields as `GET /agent-context/feedback/progress`.
 - The current dispatch phase targets only `eod-summarizer`, `technical-summarizer`, and `fundamental-summarizer`.
 - Latest reusable feedback lookup is bounded to feedback rows with `market_date <= requested market_date`, so prior-day reusable feedback can carry forward when the source inputs are unchanged.
 - Fundamental freshness checks are bounded to DART filings and captured fundamentals eligible up to the requested `market_date`, so historical reads do not get marked stale by future filings.
