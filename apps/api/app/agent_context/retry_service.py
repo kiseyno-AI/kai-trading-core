@@ -4,12 +4,17 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Any, Sequence
 
+import logging
+
 from sqlalchemy import select
 
 from app.agent_context.orchestrator import agent_feedback_orchestrator
 from app.agent_context.reuse_service import agent_context_reuse_service
 from app.db import session_scope
 from app.db_models import DailyPriceBar, Symbol
+
+logger = logging.getLogger(__name__)
+
 
 EXPECTED_ROLES: tuple[str, ...] = (
     'eod-summarizer',
@@ -76,6 +81,7 @@ class AgentFeedbackRetryService:
                 break
 
             batches: list[dict[str, Any]] = []
+            retry_queue: list[dict[str, Any]] = []
             for offset in range(0, len(remaining), config.outer_batch_size):
                 batch_symbols = remaining[offset:offset + config.outer_batch_size]
                 try:
@@ -85,6 +91,11 @@ class AgentFeedbackRetryService:
                         roles=list(config.roles),
                         reuse_existing=config.reuse_existing,
                     )
+                    batch_retry_items = [
+                        failure for failure in result.get('failures', [])
+                        if bool(failure.get('retryable', True))
+                    ]
+                    retry_queue.extend(batch_retry_items)
                     batches.append(
                         {
                             'offset': offset,
@@ -92,9 +103,36 @@ class AgentFeedbackRetryService:
                             'symbols': batch_symbols,
                             'summary': result['summary'],
                             'request': result['request'],
+                            'retry_queue_items': batch_retry_items,
                         }
                     )
                 except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        'Feedback retry cycle batch failed',
+                        extra={
+                            'market_date': config.market_date.isoformat(),
+                            'offset': offset,
+                            'batch_size': len(batch_symbols),
+                            'roles': list(config.roles),
+                            'error_type': type(exc).__name__,
+                            'error': str(exc),
+                        },
+                        exc_info=True,
+                    )
+                    batch_retry_items = [
+                        {
+                            'role': role,
+                            'agent_name': role,
+                            'symbol': symbol,
+                            'status': 'failed',
+                            'retryable': True,
+                            'error': f'{type(exc).__name__}: {exc}',
+                            'retry_stage': 'outer_cycle_exception',
+                        }
+                        for symbol in batch_symbols
+                        for role in config.roles
+                    ]
+                    retry_queue.extend(batch_retry_items)
                     batches.append(
                         {
                             'offset': offset,
@@ -113,6 +151,7 @@ class AgentFeedbackRetryService:
                                 'roles': list(config.roles),
                                 'reuse_existing': config.reuse_existing,
                             },
+                            'retry_queue_items': batch_retry_items,
                         }
                     )
 
@@ -124,6 +163,7 @@ class AgentFeedbackRetryService:
                     'start_pending': cycle_start_pending,
                     'end_pending': len(remaining),
                     'batches': batches,
+                    'retry_queue': retry_queue,
                 }
             )
             if not remaining:
