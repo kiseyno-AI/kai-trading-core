@@ -571,7 +571,6 @@ class AgentFeedbackOrchestrator:
             settings.openclaw_agent_subtask_timeout_seconds,
             settings.openclaw_agent_timeout_seconds,
         ) + max(0, settings.openclaw_agent_retry_backoff_seconds * max(1, settings.openclaw_agent_max_retries)) + 30
-        slot_cooldown_seconds = max(0.0, settings.openclaw_agent_slot_cooldown_seconds)
         with concurrent.futures.ThreadPoolExecutor(max_workers=total_max_workers) as executor:
             future_map: dict[concurrent.futures.Future[dict[str, Any]], tuple[AgentDispatchSpec, int, list[dict[str, Any]], float]] = {}
             pending_role_jobs: dict[str, dict[int, list[tuple[AgentDispatchSpec, list[dict[str, Any]]]]]] = {
@@ -581,14 +580,9 @@ class AgentFeedbackOrchestrator:
                 }
                 for role, slot_jobs in role_batch_jobs.items()
             }
-            slot_cooldowns_until: dict[tuple[str, int], float] = {}
             future_lock = threading.Lock()
 
             def submit_next(role: str, slot: int) -> None:
-                cooldown_key = (role, slot)
-                cooldown_until = slot_cooldowns_until.get(cooldown_key)
-                if cooldown_until is not None and cooldown_until > time.monotonic():
-                    return
                 role_jobs = pending_role_jobs.get(role) or {}
                 jobs = role_jobs.get(slot) or []
                 if not jobs:
@@ -602,53 +596,6 @@ class AgentFeedbackOrchestrator:
                 )
                 with future_lock:
                     future_map[future] = (spec, slot, batch, time.monotonic())
-                logger.info(
-                    'Agent feedback batch submitted',
-                    extra={
-                        'request_run_id': request_run_id,
-                        'role': spec.role,
-                        'agent_name': spec.agent_name,
-                        'session_slot': slot,
-                        'batch_size': len(batch),
-                        'symbols': [item.get('symbol') for item in batch],
-                    },
-                )
-
-            def set_slot_cooldown(role: str, slot: int, reason: str, batch: Sequence[dict[str, Any]]) -> None:
-                if slot_cooldown_seconds <= 0:
-                    submit_next(role, slot)
-                    return
-                slot_cooldowns_until[(role, slot)] = time.monotonic() + slot_cooldown_seconds
-                logger.warning(
-                    'Agent feedback slot cooldown started',
-                    extra={
-                        'request_run_id': request_run_id,
-                        'role': role,
-                        'session_slot': slot,
-                        'cooldown_seconds': slot_cooldown_seconds,
-                        'reason': reason,
-                        'symbols': [item.get('symbol') for item in batch],
-                    },
-                )
-
-            def release_cooled_slots() -> None:
-                if slot_cooldown_seconds <= 0:
-                    return
-                now = time.monotonic()
-                for cooldown_key, cooldown_until in list(slot_cooldowns_until.items()):
-                    if cooldown_until > now:
-                        continue
-                    del slot_cooldowns_until[cooldown_key]
-                    role, slot = cooldown_key
-                    logger.info(
-                        'Agent feedback slot cooldown finished',
-                        extra={
-                            'request_run_id': request_run_id,
-                            'role': role,
-                            'session_slot': slot,
-                        },
-                    )
-                    submit_next(role, slot)
 
             for role, slot_jobs in pending_role_jobs.items():
                 for slot in sorted(slot_jobs.keys()):
@@ -661,7 +608,6 @@ class AgentFeedbackOrchestrator:
                     'total_parallel_subtasks': total_max_workers,
                     'role_execution_limit': role_execution_limit,
                     'dispatch_future_timeout_seconds': dispatch_future_timeout,
-                    'slot_cooldown_seconds': slot_cooldown_seconds,
                 },
             )
             completed_batches = 0
@@ -669,19 +615,10 @@ class AgentFeedbackOrchestrator:
             stored_feedback_count = 0
             timed_out_futures: set[concurrent.futures.Future[dict[str, Any]]] = set()
             while True:
-                release_cooled_slots()
                 with future_lock:
                     active_futures = list(future_map.keys())
-                remaining_jobs = any(
-                    jobs
-                    for slot_jobs in pending_role_jobs.values()
-                    for jobs in slot_jobs.values()
-                )
-                if not active_futures and not remaining_jobs:
+                if not active_futures:
                     break
-                if not active_futures and remaining_jobs:
-                    time.sleep(1)
-                    continue
                 done, _ = concurrent.futures.wait(
                     active_futures,
                     timeout=1,
@@ -733,7 +670,6 @@ class AgentFeedbackOrchestrator:
                                 'completed_batches': completed_batches,
                                 'timeout_seconds': dispatch_future_timeout,
                                 'cancellation_succeeded': True,
-                                'symbols': [item.get('symbol') for item in batch],
                             },
                         )
                         for source_item in batch:
@@ -745,11 +681,9 @@ class AgentFeedbackOrchestrator:
                                     'status': 'failed',
                                     'retryable': True,
                                     'error': f'batch_timeout_after_{int(dispatch_future_timeout)}s',
-                                    'retry_stage': 'slot_timeout',
-                                    'session_slot': slot,
                                 }
                             )
-                        set_slot_cooldown(spec.role, slot, f'batch_timeout_after_{int(dispatch_future_timeout)}s', batch)
+                        submit_next(spec.role, slot)
                     continue
                 for future in done:
                     timed_out_futures.discard(future)
@@ -759,7 +693,6 @@ class AgentFeedbackOrchestrator:
                         continue
                     spec, slot, batch, _started_monotonic = entry
                     batch_result: dict[str, Any] | None = None
-                    batch_failed = False
                     try:
                         batch_result = future.result()
                         decoded_items = batch_result.get('decoded', {}).get('items', [])
@@ -780,7 +713,6 @@ class AgentFeedbackOrchestrator:
                                 'session_ref': batch_result.get('session_ref'),
                                 'completed_batches': completed_batches,
                                 'failed_batches': failed_batches,
-                                'symbols': [item.get('symbol') for item in batch],
                             },
                         )
                         for source_item in batch:
@@ -823,9 +755,7 @@ class AgentFeedbackOrchestrator:
                                 }
                             )
                     except Exception as exc:  # noqa: BLE001
-                        batch_failed = True
                         failed_batches += 1
-                        abortlike = _is_abortlike_error(exc)
                         logger.warning(
                             'Agent feedback batch failed',
                             extra={
@@ -839,8 +769,6 @@ class AgentFeedbackOrchestrator:
                                 'completed_batches': completed_batches,
                                 'error_type': type(exc).__name__,
                                 'error': str(exc),
-                                'abortlike': abortlike,
-                                'symbols': [item.get('symbol') for item in batch],
                             },
                             exc_info=True,
                         )
@@ -853,17 +781,10 @@ class AgentFeedbackOrchestrator:
                                     'status': 'failed',
                                     'retryable': True,
                                     'error': f'{type(exc).__name__}: {exc}',
-                                    'retry_stage': 'batch_exception',
-                                    'session_slot': slot,
                                 }
                             )
-                        if abortlike:
-                            set_slot_cooldown(spec.role, slot, str(exc), batch)
-                        else:
-                            submit_next(spec.role, slot)
                     finally:
-                        if not batch_failed:
-                            submit_next(spec.role, slot)
+                        submit_next(spec.role, slot)
 
         status = 'completed'
         if failures and items:
