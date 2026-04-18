@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timezone, timedelta
 from typing import Any, Sequence
 
 from sqlalchemy import func, select
@@ -36,6 +36,11 @@ class AgentContextProgressService:
             if normalized_symbols:
                 available_symbol_stmt = available_symbol_stmt.where(Symbol.symbol.in_(normalized_symbols))
             available_symbols = [str(symbol) for symbol in session.execute(available_symbol_stmt).scalars().all()]
+
+            first_feedback_at = session.execute(
+                select(func.min(AgentContextFeedback.received_at))
+                .where(AgentContextFeedback.market_date == normalized_market_date)
+            ).scalar_one()
 
             latest_feedback_at = session.execute(
                 select(func.max(AgentContextFeedback.received_at))
@@ -74,6 +79,13 @@ class AgentContextProgressService:
         grouped: dict[str, list[dict[str, Any]]] = {}
         for row in rows:
             grouped.setdefault(str(row['symbol']), []).append(row)
+
+        first_feedback_at = first_feedback_at.isoformat() if first_feedback_at else None
+        first_feedback_dt = None
+        if first_feedback_at:
+            first_feedback_dt = datetime.fromisoformat(str(first_feedback_at))
+            if first_feedback_dt.tzinfo is None:
+                first_feedback_dt = first_feedback_dt.replace(tzinfo=timezone.utc)
 
         latest_feedback_at = latest_feedback_at.isoformat() if latest_feedback_at else None
         latest_feedback_dt = None
@@ -121,12 +133,42 @@ class AgentContextProgressService:
         )
         expected_feedback_count = requested_symbol_count * len(EXPECTED_AGENT_NAMES)
 
+        now_utc = datetime.now(timezone.utc)
         seconds_since_last_feedback = None
         if latest_feedback_dt is not None:
             seconds_since_last_feedback = max(
                 0,
-                int((datetime.now(timezone.utc) - latest_feedback_dt.astimezone(timezone.utc)).total_seconds()),
+                int((now_utc - latest_feedback_dt.astimezone(timezone.utc)).total_seconds()),
             )
+
+        elapsed_seconds = None
+        completed_feedback_per_minute = None
+        completed_symbols_per_minute = None
+        estimated_remaining_seconds = None
+        estimated_completion_at = None
+        eta_confidence = 'low'
+        if first_feedback_dt is not None:
+            elapsed_seconds = max(
+                0,
+                int((now_utc - first_feedback_dt.astimezone(timezone.utc)).total_seconds()),
+            )
+            if elapsed_seconds > 0:
+                feedbacks_per_second = completed_feedback_count / elapsed_seconds
+                symbols_per_second = completed_symbols / elapsed_seconds if completed_symbols > 0 else 0.0
+                completed_feedback_per_minute = round(feedbacks_per_second * 60, 2)
+                completed_symbols_per_minute = round(symbols_per_second * 60, 2)
+                remaining_feedback_count = max(0, expected_feedback_count - completed_feedback_count)
+                if feedbacks_per_second > 0 and remaining_feedback_count > 0:
+                    estimated_remaining_seconds = int(remaining_feedback_count / feedbacks_per_second)
+                    estimated_completion_at = (now_utc + timedelta(seconds=estimated_remaining_seconds)).isoformat()
+                    if completed_feedback_count >= 300:
+                        eta_confidence = 'medium'
+                    if completed_feedback_count >= 1000:
+                        eta_confidence = 'high'
+                elif remaining_feedback_count == 0:
+                    estimated_remaining_seconds = 0
+                    estimated_completion_at = now_utc.isoformat()
+                    eta_confidence = 'high'
 
         if completed_symbols == requested_symbol_count and requested_symbol_count > 0:
             run_status = 'completed'
@@ -146,7 +188,9 @@ class AgentContextProgressService:
             'summary': {
                 'run_status': run_status,
                 'is_live': run_status == 'running',
+                'first_feedback_at': first_feedback_at,
                 'latest_feedback_at': latest_feedback_at,
+                'elapsed_seconds': elapsed_seconds,
                 'seconds_since_last_feedback': seconds_since_last_feedback,
                 'stalled_threshold_seconds': STALL_THRESHOLD_SECONDS,
                 'total_symbols': requested_symbol_count,
@@ -159,6 +203,11 @@ class AgentContextProgressService:
                 'failed_items': failed_items,
                 'completed_feedback_count': completed_feedback_count,
                 'expected_feedback_count': expected_feedback_count,
+                'completed_feedback_per_minute': completed_feedback_per_minute,
+                'completed_symbols_per_minute': completed_symbols_per_minute,
+                'estimated_remaining_seconds': estimated_remaining_seconds,
+                'estimated_completion_at': estimated_completion_at,
+                'eta_confidence': eta_confidence,
             },
         }
 
