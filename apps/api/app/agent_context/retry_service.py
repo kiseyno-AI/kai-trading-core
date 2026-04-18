@@ -130,9 +130,9 @@ class AgentFeedbackRetryService:
             if not remaining:
                 break
 
-        progress = agent_context_progress_service.get_feedback_progress(
+        progress = self._get_retry_progress(
             market_date=config.market_date,
-            symbols=None,
+            roles=config.roles,
         )
 
         return {
@@ -146,6 +146,13 @@ class AgentFeedbackRetryService:
             'completed': len(remaining) == 0,
             'progress': progress,
         }
+
+    def _get_retry_progress(self, *, market_date: date, roles: Sequence[str]) -> dict[str, Any]:
+        return agent_context_progress_service.get_feedback_progress(
+            market_date=market_date,
+            symbols=None,
+            expected_agents=roles,
+        )
 
 
 agent_feedback_retry_service = AgentFeedbackRetryService()

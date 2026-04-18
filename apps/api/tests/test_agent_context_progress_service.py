@@ -91,7 +91,7 @@ class FakeProgressSession:
 
 
 class AgentContextProgressServiceTests(unittest.TestCase):
-    def _call_service(self, fake_session, *, symbols):
+    def _call_service(self, fake_session, *, symbols, expected_agents=None):
         @contextmanager
         def fake_session_scope():
             yield fake_session
@@ -100,6 +100,7 @@ class AgentContextProgressServiceTests(unittest.TestCase):
             return AgentContextProgressService().get_feedback_progress(
                 market_date='2026-04-14',
                 symbols=symbols,
+                expected_agents=expected_agents,
             )
 
     def test_feedback_progress_filters_first_feedback_timestamp_by_requested_symbols(self):
@@ -158,6 +159,26 @@ class AgentContextProgressServiceTests(unittest.TestCase):
         self.assertEqual(summary['estimated_remaining_seconds'], 0)
         self.assertEqual(summary['estimated_completion_at'], '2026-04-14T01:05:00+00:00')
         self.assertEqual(summary['eta_confidence'], 'high')
+
+    def test_feedback_progress_scopes_counts_to_expected_agents(self):
+        fake_session = FakeProgressSession()
+
+        result = self._call_service(
+            fake_session,
+            symbols=['005930'],
+            expected_agents=['technical-summarizer'],
+        )
+
+        first_feedback_sql = fake_session._compile(fake_session.statements[1])
+        rows_sql = fake_session._compile(fake_session.statements[3])
+        summary = result['summary']
+
+        self.assertIn('agent_context_feedback.agent_name IN', first_feedback_sql)
+        self.assertIn('agent_context_feedback.agent_name IN', rows_sql)
+        self.assertEqual(result['request']['expected_agents'], ['technical-summarizer'])
+        self.assertEqual(summary['completed_symbols'], 1)
+        self.assertEqual(summary['completed_feedback_count'], 1)
+        self.assertEqual(summary['expected_feedback_count'], 1)
 
 
 if __name__ == '__main__':

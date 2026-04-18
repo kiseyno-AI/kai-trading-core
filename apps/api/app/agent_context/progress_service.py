@@ -7,7 +7,7 @@ from typing import Any, Sequence
 from sqlalchemy import func, select
 
 from app.agent_context.feedback_service import _normalize_market_date, _normalize_symbols
-from app.agent_context.status_service import EXPECTED_AGENT_NAMES, EXPECTED_AGENT_SET
+from app.agent_context.status_service import EXPECTED_AGENT_NAMES
 from app.db import session_scope
 from app.db_models import AgentContextFeedback, DailyActionSummary, DailyPriceBar, DailySignalFeature, DailyTechnicalSnapshot, Symbol
 
@@ -21,9 +21,12 @@ class AgentContextProgressService:
         *,
         market_date: str | date,
         symbols: Sequence[str] | None = None,
+        expected_agents: Sequence[str] | None = None,
     ) -> dict[str, Any]:
         normalized_market_date = _normalize_market_date(market_date)
         normalized_symbols = _normalize_symbols(symbols) if symbols is not None else None
+        expected_agent_names = self._normalize_expected_agents(expected_agents)
+        expected_agent_set = set(expected_agent_names)
 
         with session_scope() as session:
             available_symbol_stmt = (
@@ -48,11 +51,13 @@ class AgentContextProgressService:
                     select(func.min(AgentContextFeedback.received_at))
                     .where(AgentContextFeedback.market_date == normalized_market_date)
                     .where(AgentContextFeedback.symbol.in_(target_symbols))
+                    .where(AgentContextFeedback.agent_name.in_(expected_agent_names))
                 )
                 latest_feedback_stmt = (
                     select(func.max(AgentContextFeedback.received_at))
                     .where(AgentContextFeedback.market_date == normalized_market_date)
                     .where(AgentContextFeedback.symbol.in_(target_symbols))
+                    .where(AgentContextFeedback.agent_name.in_(expected_agent_names))
                 )
 
                 first_feedback_at = session.execute(first_feedback_stmt).scalar_one()
@@ -68,6 +73,7 @@ class AgentContextProgressService:
                     )
                     .where(AgentContextFeedback.market_date == normalized_market_date)
                     .where(AgentContextFeedback.symbol.in_(target_symbols))
+                    .where(AgentContextFeedback.agent_name.in_(expected_agent_names))
                     .order_by(
                         AgentContextFeedback.symbol.asc(),
                         AgentContextFeedback.received_at.desc(),
@@ -121,25 +127,25 @@ class AgentContextProgressService:
             seen_agents = set()
             for row in run_rows:
                 agent_name = row['agent_name']
-                if agent_name in EXPECTED_AGENT_SET and agent_name not in seen_agents:
+                if agent_name in expected_agent_set and agent_name not in seen_agents:
                     seen_agents.add(agent_name)
                     agent_names.append(agent_name)
-            if len(agent_names) == len(EXPECTED_AGENT_NAMES):
+            if len(agent_names) == len(expected_agent_names):
                 completed_symbols += 1
             elif agent_names:
                 in_progress_symbols += 1
             else:
                 pending_symbols += 1
 
-            failed_items += sum(1 for row in run_rows if row['agent_name'] not in EXPECTED_AGENT_SET)
+            failed_items += sum(1 for row in run_rows if row['agent_name'] not in expected_agent_set)
 
         requested_symbol_count = len(target_symbols)
         processed_symbols = completed_symbols + in_progress_symbols
         progress_ratio = (processed_symbols / requested_symbol_count) if requested_symbol_count else 0.0
         completed_feedback_count = sum(
-            1 for row in rows if row['agent_name'] in EXPECTED_AGENT_SET
+            1 for row in rows if row['agent_name'] in expected_agent_set
         )
-        expected_feedback_count = requested_symbol_count * len(EXPECTED_AGENT_NAMES)
+        expected_feedback_count = requested_symbol_count * len(expected_agent_names)
 
         now_utc = datetime.now(timezone.utc)
         seconds_since_last_feedback = None
@@ -194,7 +200,7 @@ class AgentContextProgressService:
             'request': {
                 'market_date': normalized_market_date.isoformat(),
                 'symbols': normalized_symbols,
-                'expected_agents': list(EXPECTED_AGENT_NAMES),
+                'expected_agents': list(expected_agent_names),
             },
             'summary': {
                 'run_status': run_status,
@@ -221,6 +227,20 @@ class AgentContextProgressService:
                 'eta_confidence': eta_confidence,
             },
         }
+
+    @staticmethod
+    def _normalize_expected_agents(expected_agents: Sequence[str] | None) -> tuple[str, ...]:
+        source_agents = EXPECTED_AGENT_NAMES if expected_agents is None else expected_agents
+        normalized_agents: list[str] = []
+        seen: set[str] = set()
+        for agent_name in source_agents:
+            if agent_name in seen:
+                continue
+            seen.add(agent_name)
+            normalized_agents.append(agent_name)
+        if not normalized_agents:
+            raise ValueError('expected_agents is required')
+        return tuple(normalized_agents)
 
 
 agent_context_progress_service = AgentContextProgressService()

@@ -134,11 +134,50 @@ class FeedbackRetryCycleTests(unittest.TestCase):
         get_progress.assert_called_once_with(
             market_date=date.fromisoformat('2026-04-16'),
             symbols=None,
+            expected_agents=EXPECTED_ROLES,
         )
         self.assertTrue(result['completed'])
         self.assertEqual(result['progress']['summary']['first_feedback_at'], '2026-04-16T01:00:00+00:00')
         self.assertEqual(result['progress']['summary']['completed_feedback_per_minute'], 0.6)
         self.assertEqual(result['progress']['summary']['estimated_completion_at'], '2026-04-16T01:05:00+00:00')
+
+    def test_run_retry_cycles_scopes_progress_to_requested_roles(self):
+        service = AgentFeedbackRetryService()
+        progress = {
+            'request': {
+                'market_date': '2026-04-16',
+                'symbols': None,
+                'expected_agents': ['technical-summarizer'],
+            },
+            'summary': {
+                'completed_symbols': 10,
+                'expected_feedback_count': 10,
+                'estimated_remaining_seconds': 0,
+            },
+        }
+
+        with patch.object(service, 'load_incomplete_symbols', return_value=[]):
+            with patch(
+                'app.agent_context.retry_service.agent_context_progress_service.get_feedback_progress',
+                return_value=progress,
+            ) as get_progress:
+                result = service.run_retry_cycles(
+                    config=SimpleNamespace(
+                        market_date=date.fromisoformat('2026-04-16'),
+                        roles=('technical-summarizer',),
+                        max_cycles=3,
+                        outer_batch_size=20,
+                        reuse_existing=True,
+                    )
+                )
+
+        get_progress.assert_called_once_with(
+            market_date=date.fromisoformat('2026-04-16'),
+            symbols=None,
+            expected_agents=('technical-summarizer',),
+        )
+        self.assertEqual(result['progress']['request']['expected_agents'], ['technical-summarizer'])
+        self.assertEqual(result['progress']['summary']['expected_feedback_count'], 10)
 
 
 if __name__ == '__main__':
