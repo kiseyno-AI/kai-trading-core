@@ -62,15 +62,6 @@ DISPATCH_SPECS: tuple[AgentDispatchSpec, ...] = (
 )
 
 
-def _stable_slot_for_value(*, value: str, pool_size: int) -> int:
-    import hashlib
-
-    if pool_size <= 1:
-        return 0
-    digest = hashlib.sha256(value.encode('utf-8')).hexdigest()
-    return int(digest[:8], 16) % pool_size
-
-
 def _feedback_session_key(*, agent_name: str, slot: int) -> str:
     return f"feedback/{agent_name}/slot-{slot:02d}"
 
@@ -521,26 +512,26 @@ class AgentFeedbackOrchestrator:
                         }
                     )
                     continue
-                slot = _stable_slot_for_value(value=item['symbol'], pool_size=role_worker_count) + 1
-                dispatch_items.append(
-                    {
-                        **item,
-                        'session_key': _feedback_session_key(agent_name=spec.agent_name, slot=slot),
-                    }
-                )
-            batches_by_session_key: dict[str, list[dict[str, Any]]] = {}
-            for item in dispatch_items:
-                session_key = str(item['session_key'])
-                batches_by_session_key.setdefault(session_key, []).append(item)
+                dispatch_items.append({**item})
 
-            role_batches: list[list[dict[str, Any]]] = []
-            for session_key in sorted(batches_by_session_key.keys()):
-                session_items = batches_by_session_key[session_key]
-                role_batches.extend(
-                    session_items[i:i + batch_size]
-                    for i in range(0, len(session_items), batch_size)
-                )
-            role_batch_jobs[spec.role] = [(spec, batch) for batch in role_batches]
+            role_batches: list[tuple[int, list[dict[str, Any]]]] = []
+            if dispatch_items:
+                slot_count = max(1, role_worker_count)
+                indexed_batches = [
+                    dispatch_items[i:i + batch_size]
+                    for i in range(0, len(dispatch_items), batch_size)
+                ]
+                for batch_index, batch in enumerate(indexed_batches):
+                    slot = (batch_index % slot_count) + 1
+                    batch_with_session = [
+                        {
+                            **batch_item,
+                            'session_key': _feedback_session_key(agent_name=spec.agent_name, slot=slot),
+                        }
+                        for batch_item in batch
+                    ]
+                    role_batches.append((slot, batch_with_session))
+            role_batch_jobs[spec.role] = [(spec, batch) for _, batch in role_batches]
             logger.info(
                 'Agent feedback role batches prepared',
                 extra={
@@ -549,12 +540,12 @@ class AgentFeedbackOrchestrator:
                     'agent_name': spec.agent_name,
                     'dispatch_symbol_count': len(dispatch_items),
                     'batch_count': len(role_batches),
-                    'session_slot_count': len(batches_by_session_key),
+                    'session_slot_count': min(max(1, role_worker_count), len(role_batches)) if role_batches else 0,
                 },
             )
 
         total_max_workers = max(1, role_worker_count * max(1, len(specs)))
-        role_execution_limit = max(1, min(role_worker_count, 1))
+        role_execution_limit = max(1, role_worker_count)
         with concurrent.futures.ThreadPoolExecutor(max_workers=total_max_workers) as executor:
             future_map: dict[concurrent.futures.Future[dict[str, Any]], tuple[AgentDispatchSpec, list[dict[str, Any]]]] = {}
             future_specs: dict[concurrent.futures.Future[dict[str, Any]], AgentDispatchSpec] = {}
