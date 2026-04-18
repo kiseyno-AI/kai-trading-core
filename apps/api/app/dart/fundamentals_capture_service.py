@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import hashlib
 import re
 from collections import defaultdict
+from pathlib import Path
 from contextlib import suppress
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -57,6 +59,29 @@ class DartFundamentalsMappingError(TerminalFundamentalsCaptureError):
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _debug_refresh_log(stage: str, **payload: Any) -> None:
+    line = {
+        'scope': 'dart_fundamentals_refresh',
+        'stage': stage,
+        **payload,
+    }
+    debug_path = Path(__file__).resolve().parents[2] / 'var' / 'log' / 'dart-fundamentals-refresh.log'
+    try:
+        debug_path.parent.mkdir(parents=True, exist_ok=True)
+        with debug_path.open('a', encoding='utf-8') as fh:
+            fh.write(json.dumps(line, ensure_ascii=False, default=str) + '\n')
+    except OSError:
+        pass
+    try:
+        log_fetch_event(
+            source='dart_fundamentals_refresh',
+            event=stage,
+            metadata=payload,
+        )
+    except Exception:
+        pass
 
 
 async def _await_with_refresh_heartbeat(
@@ -655,7 +680,62 @@ class DartFundamentalsCaptureService:
                         }
                     )
                 except Exception as exc:
-                    self.repository.mark_event_capture_failed(event['id'], error_message=str(exc))
+                    error_message = str(exc)
+                    if f'DART fundamentals returned [{DART_NO_DATA_STATUS}]' in error_message:
+                        capture_status = CAPTURE_STATUS_NO_DATA
+                        self.repository.mark_event_capture_terminal(
+                            event['id'],
+                            capture_status=capture_status,
+                            error_message=error_message,
+                        )
+                        events_skipped += 1
+                        run_metadata_with_progress = {
+                            **run_metadata,
+                            'candidate_count': len(events),
+                            'last_event': {
+                                'event_id': event['id'],
+                                'rcept_no': event['rcept_no'],
+                                'status': capture_status,
+                                'terminal': True,
+                                'error': error_message,
+                            },
+                            'last_progress_at': _utcnow().isoformat(),
+                        }
+                        self.repository.update_capture_run_progress(
+                            run_id,
+                            events_seen=events_seen,
+                            events_captured=events_captured,
+                            events_failed=events_failed,
+                            events_skipped=events_skipped,
+                            run_metadata=run_metadata_with_progress,
+                        )
+                        log_fetch_event(
+                            service='dart',
+                            operation='capture_fundamentals_event',
+                            status=capture_status,
+                            run_id=run_id,
+                            event_id=event['id'],
+                            rcept_no=event['rcept_no'],
+                            corp_code=event['corp_code'],
+                            stock_code=event['stock_code'],
+                            fs_div=resolved_fs_div,
+                            terminal=True,
+                            error_type=type(exc).__name__,
+                            error_message=error_message,
+                        )
+                        results.append(
+                            {
+                                'event_id': event['id'],
+                                'rcept_no': event['rcept_no'],
+                                'stock_code': event['stock_code'],
+                                'status': capture_status,
+                                'terminal': True,
+                                'error': error_message,
+                            }
+                        )
+                        continue
+
+                    self.repository.mark_event_capture_failed(event['id'], error_message=error_message)
                     events_failed += 1
                     run_metadata_with_progress = {
                         **run_metadata,
@@ -664,7 +744,7 @@ class DartFundamentalsCaptureService:
                             'event_id': event['id'],
                             'rcept_no': event['rcept_no'],
                             'status': 'failed',
-                            'error': str(exc),
+                            'error': error_message,
                         },
                         'last_progress_at': _utcnow().isoformat(),
                     }
@@ -687,7 +767,7 @@ class DartFundamentalsCaptureService:
                         stock_code=event['stock_code'],
                         fs_div=resolved_fs_div,
                         error_type=type(exc).__name__,
-                        error_message=str(exc),
+                        error_message=error_message,
                     )
                     results.append(
                         {
@@ -695,7 +775,7 @@ class DartFundamentalsCaptureService:
                             'rcept_no': event['rcept_no'],
                             'stock_code': event['stock_code'],
                             'status': 'failed',
-                            'error': str(exc),
+                            'error': error_message,
                         }
                     )
 
@@ -1161,6 +1241,13 @@ class DartFundamentalsCaptureService:
                     'sync_group_count': len(sync_groups),
                 },
             )
+            _debug_refresh_log(
+                'sync_groups_prepared',
+                run_id=run_id,
+                sync_group_count=len(sync_groups),
+                selected_symbols=len(selected_stock_codes),
+                lookup_failed_symbols=len(lookup_failed_symbols),
+            )
 
             from app.dart.sync_service import dart_disclosure_sync_service
 
@@ -1183,14 +1270,18 @@ class DartFundamentalsCaptureService:
                         trigger='daily_incremental_refresh',
                     )
 
-                sync_result = await _await_with_refresh_heartbeat(
-                    sync_group_operation,
-                    heartbeat=lambda: update_refresh_progress(
-                        stage='syncing_disclosures',
-                        extra_metadata=sync_group_metadata,
-                        persist=False,
-                    ),
+                update_refresh_progress(
+                    stage='syncing_disclosures',
+                    extra_metadata=sync_group_metadata,
                 )
+                _debug_refresh_log(
+                    'sync_group_start',
+                    run_id=run_id,
+                    check_start_date=check_start_date.isoformat(),
+                    corporation_count=len(corporations),
+                    stock_codes_sample=_limited_sample([corporation['stock_code'] for corporation in corporations]),
+                )
+                sync_result = await sync_group_operation()
                 sync_results.append(
                     {
                         **sync_result,
@@ -1206,10 +1297,47 @@ class DartFundamentalsCaptureService:
                         'sync_status': sync_result.get('status'),
                     },
                 )
+                _debug_refresh_log(
+                    'sync_group_completed',
+                    run_id=run_id,
+                    check_start_date=check_start_date.isoformat(),
+                    sync_run_id=sync_result.get('run_id'),
+                    sync_status=sync_result.get('status'),
+                )
 
+            update_refresh_progress(
+                stage='sync_groups_finished',
+                extra_metadata={
+                    'sync_group_count': len(sync_groups),
+                    'sync_result_count': len(sync_results),
+                    'check_start_symbol_count': len(check_start_by_symbol),
+                },
+            )
+            _debug_refresh_log(
+                'sync_groups_finished',
+                run_id=run_id,
+                sync_group_count=len(sync_groups),
+                sync_result_count=len(sync_results),
+                check_start_symbol_count=len(check_start_by_symbol),
+            )
             sync_stock_codes = list(check_start_by_symbol.keys())
             candidate_events: list[dict[str, Any]] = []
             if sync_stock_codes:
+                update_refresh_progress(
+                    stage='loading_capture_candidates',
+                    extra_metadata={
+                        'sync_stock_code_count': len(sync_stock_codes),
+                        'candidate_receipt_date_from': min(check_start_by_symbol.values()).isoformat(),
+                        'candidate_receipt_date_to': resolved_market_date.isoformat(),
+                    },
+                )
+                _debug_refresh_log(
+                    'loading_capture_candidates',
+                    run_id=run_id,
+                    sync_stock_code_count=len(sync_stock_codes),
+                    candidate_receipt_date_from=min(check_start_by_symbol.values()).isoformat(),
+                    candidate_receipt_date_to=resolved_market_date.isoformat(),
+                )
                 pending_events = self.repository.list_capture_candidates(
                     limit=None,
                     force=False,
@@ -1217,6 +1345,22 @@ class DartFundamentalsCaptureService:
                     receipt_date_from=min(check_start_by_symbol.values()),
                     receipt_date_to=resolved_market_date,
                     oldest_first=True,
+                )
+                update_refresh_progress(
+                    stage='capture_candidates_loaded',
+                    extra_metadata={
+                        'pending_event_count': len(pending_events),
+                        'pending_event_sample': _limited_sample(
+                            [int(event['id']) for event in pending_events],
+                            limit=50,
+                        ),
+                    },
+                )
+                _debug_refresh_log(
+                    'capture_candidates_loaded',
+                    run_id=run_id,
+                    pending_event_count=len(pending_events),
+                    pending_event_sample=_limited_sample([int(event['id']) for event in pending_events], limit=50),
                 )
                 seen_event_ids: set[int] = set()
                 for event in pending_events:
@@ -1532,6 +1676,27 @@ class DartFundamentalsCaptureService:
                     )
                 except Exception as exc:
                     feedback_followup_error = str(exc)
+
+                metadata = {
+                    **metadata,
+                    'feedback_followup': feedback_followup,
+                    'feedback_followup_error': feedback_followup_error,
+                    'last_progress_at': _utcnow().isoformat(),
+                }
+                self.repository.complete_refresh_run(
+                    run_id,
+                    status=status,
+                    symbols_checked=symbols_checked,
+                    symbols_missing=symbols_missing,
+                    symbols_stale=symbols_stale,
+                    symbols_fresh=symbols_fresh,
+                    symbols_refreshed=symbols_refreshed,
+                    symbols_failed=symbols_failed,
+                    events_detected=events_detected,
+                    events_captured=events_captured,
+                    events_failed=events_failed,
+                    run_metadata=metadata,
+                )
 
             return {
                 'triggered': True,
