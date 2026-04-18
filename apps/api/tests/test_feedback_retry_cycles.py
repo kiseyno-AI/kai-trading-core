@@ -96,6 +96,50 @@ class FeedbackRetryCycleTests(unittest.TestCase):
 
         self.assertEqual(args.market_date, date.fromisoformat('2026-04-16'))
 
+    def test_run_retry_cycles_includes_progress_response_fields(self):
+        service = AgentFeedbackRetryService()
+
+        progress = {
+            'request': {
+                'market_date': '2026-04-16',
+                'symbols': None,
+                'expected_agents': list(EXPECTED_ROLES),
+            },
+            'summary': {
+                'first_feedback_at': '2026-04-16T01:00:00+00:00',
+                'elapsed_seconds': 300,
+                'completed_feedback_per_minute': 0.6,
+                'completed_symbols_per_minute': 0.2,
+                'estimated_remaining_seconds': 0,
+                'estimated_completion_at': '2026-04-16T01:05:00+00:00',
+                'eta_confidence': 'high',
+            },
+        }
+
+        with patch.object(service, 'load_incomplete_symbols', return_value=[]):
+            with patch(
+                'app.agent_context.retry_service.agent_context_progress_service.get_feedback_progress',
+                return_value=progress,
+            ) as get_progress:
+                result = service.run_retry_cycles(
+                    config=SimpleNamespace(
+                        market_date=date.fromisoformat('2026-04-16'),
+                        roles=EXPECTED_ROLES,
+                        max_cycles=3,
+                        outer_batch_size=20,
+                        reuse_existing=True,
+                    )
+                )
+
+        get_progress.assert_called_once_with(
+            market_date=date.fromisoformat('2026-04-16'),
+            symbols=None,
+        )
+        self.assertTrue(result['completed'])
+        self.assertEqual(result['progress']['summary']['first_feedback_at'], '2026-04-16T01:00:00+00:00')
+        self.assertEqual(result['progress']['summary']['completed_feedback_per_minute'], 0.6)
+        self.assertEqual(result['progress']['summary']['estimated_completion_at'], '2026-04-16T01:05:00+00:00')
+
 
 if __name__ == '__main__':
     unittest.main()

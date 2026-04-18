@@ -74,6 +74,40 @@ class FakeAgentContextFeedbackService:
         }
 
 
+class FakeAgentFeedbackRetryService:
+    def __init__(self):
+        self.last_config = None
+
+    def run_retry_cycles(self, *, config):
+        self.last_config = config
+        return {
+            'market_date': config.market_date.isoformat(),
+            'roles': list(config.roles),
+            'max_cycles': config.max_cycles,
+            'outer_batch_size': config.outer_batch_size,
+            'reuse_existing': config.reuse_existing,
+            'cycles': [],
+            'final_pending': 0,
+            'completed': True,
+            'progress': {
+                'request': {
+                    'market_date': config.market_date.isoformat(),
+                    'symbols': None,
+                    'expected_agents': list(config.roles),
+                },
+                'summary': {
+                    'first_feedback_at': '2026-04-14T01:00:00+00:00',
+                    'elapsed_seconds': 300,
+                    'completed_feedback_per_minute': 0.6,
+                    'completed_symbols_per_minute': 0.2,
+                    'estimated_remaining_seconds': 0,
+                    'estimated_completion_at': '2026-04-14T01:05:00+00:00',
+                    'eta_confidence': 'high',
+                },
+            },
+        }
+
+
 class AgentContextRouteTests(unittest.TestCase):
     def setUp(self):
         self.app = FastAPI()
@@ -103,6 +137,36 @@ class AgentContextRouteTests(unittest.TestCase):
         self.assertEqual(fake_service.last_args['fs_div'], 'CFS')
         self.assertEqual(fake_service.last_args['disclosures_limit'], 3)
         self.assertEqual(response.json()['items'][0]['symbol'], '005930')
+
+    def test_feedback_retry_cycles_route_calls_service_and_returns_progress(self):
+        fake_service = FakeAgentFeedbackRetryService()
+        original_service = routes_agent_context.agent_feedback_retry_service
+        routes_agent_context.agent_feedback_retry_service = fake_service
+        try:
+            client = TestClient(self.app)
+            response = client.post(
+                '/agent-context/feedback/retry-cycles',
+                json={
+                    'market_date': '2026-04-14',
+                    'roles': ['technical-summarizer'],
+                    'max_cycles': 2,
+                    'outer_batch_size': 10,
+                    'reuse_existing': False,
+                },
+            )
+        finally:
+            routes_agent_context.agent_feedback_retry_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(fake_service.last_config.market_date.isoformat(), '2026-04-14')
+        self.assertEqual(fake_service.last_config.roles, ('technical-summarizer',))
+        self.assertEqual(fake_service.last_config.max_cycles, 2)
+        self.assertEqual(fake_service.last_config.outer_batch_size, 10)
+        self.assertFalse(fake_service.last_config.reuse_existing)
+        summary = response.json()['progress']['summary']
+        self.assertEqual(summary['first_feedback_at'], '2026-04-14T01:00:00+00:00')
+        self.assertEqual(summary['completed_feedback_per_minute'], 0.6)
+        self.assertEqual(summary['estimated_completion_at'], '2026-04-14T01:05:00+00:00')
 
     def test_symbol_day_context_route_maps_validation_error_to_400(self):
         original_service = routes_agent_context.agent_context_read_service
