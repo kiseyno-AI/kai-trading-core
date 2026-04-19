@@ -95,10 +95,6 @@ def _subagent_test_session_key(*, agent_name: str, request_run_id: str, symbol: 
     return f"subagent-test/{agent_name}/{request_run_id}/{safe_symbol}-{uuid.uuid4().hex[:8]}"
 
 
-def _collector_session_key(*, agent_name: str) -> str:
-    return _feedback_session_key(agent_name=agent_name, slot=1)
-
-
 def _trim_batch_item_for_prompt(item: dict[str, Any]) -> dict[str, Any]:
     trimmed = json.loads(json.dumps(item, ensure_ascii=False))
     technical_snapshot = trimmed.get('technical_snapshot')
@@ -717,6 +713,58 @@ class AgentFeedbackOrchestrator:
             self.client = OpenClawAgentClient()
         return self.client
 
+    @staticmethod
+    def _session_key_from_response(response: dict[str, Any] | None) -> str | None:
+        session_ref = response.get('session_ref') if isinstance(response, dict) else None
+        if not isinstance(session_ref, dict):
+            return None
+        session_key = session_ref.get('session_key')
+        if not isinstance(session_key, str) or not session_key.strip():
+            return None
+        return session_key.strip()
+
+    def _cleanup_feedback_session(
+        self,
+        *,
+        market_date: date,
+        symbol: str,
+        agent_name: str,
+        run_id: str | None,
+        response: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        session_key = self._session_key_from_response(response)
+        if session_key is None:
+            return None
+        return agent_feedback_session_cleanup_service.delete_now(
+            target=SessionCleanupTarget(
+                market_date=market_date,
+                symbol=symbol,
+                agent_name=agent_name,
+                run_id=run_id,
+                session_key=session_key,
+            )
+        )
+
+    def _cleanup_buffered_feedback_sessions(self, *, rows: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+        cleanup_results: list[dict[str, Any]] = []
+        seen_session_keys: set[str] = set()
+        for row in rows:
+            response = row.get('summary') if isinstance(row.get('summary'), dict) else None
+            session_key = self._session_key_from_response(response)
+            if session_key is None or session_key in seen_session_keys:
+                continue
+            cleanup_result = self._cleanup_feedback_session(
+                market_date=row['market_date'],
+                symbol=str(row.get('symbol') or ''),
+                agent_name=str(row.get('agent_name') or ''),
+                run_id=row.get('run_id'),
+                response=response,
+            )
+            if cleanup_result is not None:
+                cleanup_results.append(cleanup_result)
+            seen_session_keys.add(session_key)
+        return cleanup_results
+
     def _store_feedback(
         self,
         *,
@@ -738,20 +786,15 @@ class AgentFeedbackOrchestrator:
             feedback=serializable_response.get('normalized_feedback') if isinstance(serializable_response, dict) else None,
             context=serializable_context,
         )
-        session_ref = response.get('session_ref') if isinstance(response, dict) else None
-        if isinstance(session_ref, dict):
-            session_key = session_ref.get('session_key')
-            if isinstance(session_key, str) and session_key.strip():
-                cleanup_result = agent_feedback_session_cleanup_service.delete_now(
-                    target=SessionCleanupTarget(
-                        market_date=market_date,
-                        symbol=str(payload.get('symbol') or ''),
-                        agent_name=agent_name,
-                        run_id=run_id,
-                        session_key=session_key.strip(),
-                    )
-                )
-                result['item']['session_cleanup'] = cleanup_result
+        cleanup_result = self._cleanup_feedback_session(
+            market_date=market_date,
+            symbol=str(payload.get('symbol') or ''),
+            agent_name=agent_name,
+            run_id=run_id,
+            response=response,
+        )
+        if cleanup_result is not None:
+            result['item']['session_cleanup'] = cleanup_result
         return result['item']
 
     def _dispatch_and_store(
@@ -872,6 +915,15 @@ class AgentFeedbackOrchestrator:
         specs = self._select_specs(roles=roles)
         request_run_id = f'symbol-run-{normalized_market_date.isoformat()}-{uuid.uuid4().hex[:10]}'
         requested_symbols = [str(item['symbol']) for item in symbol_context['items']]
+        reuse_decisions = (
+            agent_context_reuse_service.build_latest_decisions(
+                market_date=normalized_market_date,
+                symbols=requested_symbols,
+                roles=[spec.role for spec in specs],
+            )
+            if reuse_existing and requested_symbols
+            else {}
+        )
         batch_size = max(1, settings.openclaw_agent_symbol_chunk_size)
         role_parallelism = 10
         state = RuntimeFeedbackRunState(
@@ -940,7 +992,13 @@ class AgentFeedbackOrchestrator:
         for spec in specs:
             role = spec.role
             state.current_role = role
-            dispatch_items = [{**item} for item in symbol_context['items']]
+            dispatch_items = []
+            for item in symbol_context['items']:
+                symbol = str(item['symbol'])
+                decision = reuse_decisions.get(symbol, {}).get(role)
+                if decision is not None and not decision.should_dispatch:
+                    continue
+                dispatch_items.append({**item})
             indexed_batches = [dispatch_items[i:i + batch_size] for i in range(0, len(dispatch_items), batch_size)]
             queue: list[tuple[int, list[dict[str, Any]]]] = []
             for batch_index, batch in enumerate(indexed_batches):
@@ -1052,6 +1110,7 @@ class AgentFeedbackOrchestrator:
             for row in buffered_rows
         ]
         flush_result = agent_context_feedback_service.bulk_submit_feedback(items=flush_payload)
+        self._cleanup_buffered_feedback_sessions(rows=buffered_rows)
         completed_count = len(buffered_rows)
         failed_count = len(final_state.buffered_failures)
         final_status = 'completed' if failed_count == 0 else ('partial' if completed_count > 0 else 'failed')
@@ -1111,19 +1170,20 @@ class AgentFeedbackOrchestrator:
         items: list[dict[str, Any]] = []
         failures: list[dict[str, Any]] = []
         batch_size = 2
-        role_worker_count = 1
-        total_max_workers = max(1, len(specs))
+        role_worker_count = max(1, int(per_role_parallelism))
+        total_max_workers = max(1, len(specs) * role_worker_count)
 
         role_batches: list[tuple[AgentDispatchSpec, list[dict[str, Any]]]] = []
         for spec in specs:
             dispatch_items = [{**item} for item in symbol_context['items']]
-            for start in range(0, len(dispatch_items), batch_size):
+            for batch_index, start in enumerate(range(0, len(dispatch_items), batch_size)):
+                slot = (batch_index % role_worker_count) + 1
                 batch = dispatch_items[start:start + batch_size]
                 batch_with_session = [
                     {
                         **batch_item,
-                        'session_slot': 1,
-                        'session_key': _collector_session_key(agent_name=spec.agent_name),
+                        'session_slot': slot,
+                        'session_key': _feedback_session_key(agent_name=spec.agent_name, slot=slot),
                     }
                     for batch_item in batch
                 ]
