@@ -343,5 +343,15 @@ class AgentContextFeedbackService:
             'items': items,
         }
 
+    def bulk_submit_feedback(
+        self,
+        *,
+        items: Sequence[dict[str, Any]],
+    ) -> dict[str, Any]:
+        accepted = []
+        for item in items:
+            accepted.append(self.submit_feedback(**item)['item'])
+        return {'accepted': True, 'count': len(accepted), 'items': accepted}
+
 
 agent_context_feedback_service = AgentContextFeedbackService()

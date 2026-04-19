@@ -293,6 +293,73 @@ class AgentContextFeedback(Base, TimestampMixin):
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
 
 
+class AgentContextFeedbackFailure(Base, TimestampMixin):
+    __tablename__ = 'agent_context_feedback_failures'
+    __table_args__ = (
+        UniqueConstraint('market_date', 'symbol', 'agent_name', name='uq_agent_context_feedback_failures_market_symbol_agent'),
+        Index(
+            'ix_agent_context_feedback_failures_market_symbol_agent_received',
+            'market_date',
+            'symbol',
+            'agent_name',
+            'received_at',
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    market_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    symbol: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    agent_name: Mapped[str] = mapped_column(String(64), nullable=False, default='openclaw', index=True)
+    run_id: Mapped[str | None] = mapped_column(String(128), index=True)
+    failure_kind: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    retryable: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, index=True)
+    summary_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    context_payload: Mapped[dict | None] = mapped_column(JSON)
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+
+
+class AgentContextFeedbackRun(Base, TimestampMixin):
+    __tablename__ = 'agent_context_feedback_runs'
+    __table_args__ = (
+        Index('ix_agent_context_feedback_runs_market_date_status_started', 'market_date', 'status', 'started_at'),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[str] = mapped_column(String(128), nullable=False, unique=True, index=True)
+    market_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default='running', index=True)
+    symbols_total: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    completed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    failed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    request_payload: Mapped[dict | None] = mapped_column(JSON)
+    summary_payload: Mapped[dict | None] = mapped_column(JSON)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class AgentFeedbackSessionCleanupFailure(Base, TimestampMixin):
+    __tablename__ = 'agent_feedback_session_cleanup_failures'
+    __table_args__ = (
+        UniqueConstraint('session_key', name='uq_agent_feedback_session_cleanup_failures_session_key'),
+        Index('ix_agent_feedback_session_cleanup_failures_next_attempt', 'next_attempt_at'),
+        Index('ix_agent_feedback_session_cleanup_failures_market_agent', 'market_date', 'agent_name'),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    market_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    symbol: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    agent_name: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    run_id: Mapped[str | None] = mapped_column(String(128), index=True)
+    session_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    provider: Mapped[str] = mapped_column(String(32), nullable=False, default='openclaw')
+    delete_transcript: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    emit_lifecycle_hooks: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    cleanup_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    last_error: Mapped[str | None] = mapped_column(Text)
+    cleanup_result: Mapped[dict | None] = mapped_column(JSON)
+
 class DartDisclosureSyncRun(Base):
     __tablename__ = 'dart_disclosure_sync_runs'
 

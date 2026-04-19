@@ -3,37 +3,21 @@ from __future__ import annotations
 import argparse
 import json
 
+from app.agent_context.session_cleanup_service import agent_feedback_session_cleanup_service
+
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description='Inspect legacy cleanup targets for feedback sessions. Runtime session cleanup is currently disabled because pooled session reuse is intentional and OpenClaw session deletion remains auth-blocked.'
-    )
-    parser.add_argument('--minutes', type=int, default=30, help='Retained for CLI compatibility only')
-    parser.add_argument('--limit', type=int, default=200, help='Retained for CLI compatibility only')
-    parser.add_argument('--agent-name', action='append', dest='agent_names', help='Retained for CLI compatibility only')
+    parser = argparse.ArgumentParser(description='Delete queued OpenClaw feedback sessions after DB persistence and keep failed deletions retryable.')
+    parser.add_argument('--limit', type=int, default=100, help='Maximum queued session deletions to attempt in one run')
     return parser.parse_args()
 
 
 def main() -> int:
     args = _parse_args()
-    print(
-        json.dumps(
-            {
-                'ok': True,
-                'action': 'noop',
-                'reason': 'feedback session cleanup is disabled',
-                'details': {
-                    'pooled_sessions': True,
-                    'runtime_session_deletion_blocked': True,
-                    'minutes': args.minutes,
-                    'limit': args.limit,
-                    'agent_names': args.agent_names or [],
-                },
-            },
-            ensure_ascii=False,
-        )
-    )
-    return 0
+    result = agent_feedback_session_cleanup_service.run_pending_cleanup(limit=max(1, args.limit))
+    print(json.dumps(result, ensure_ascii=False))
+    failed = int(result.get('summary', {}).get('failed', 0))
+    return 1 if failed > 0 else 0
 
 
 if __name__ == '__main__':

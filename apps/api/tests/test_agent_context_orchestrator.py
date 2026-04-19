@@ -1,3 +1,4 @@
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -75,7 +76,166 @@ class FakeOpenClawClient:
         raise AssertionError('fake executor should not call dispatch_batch')
 
 
+class DynamicFakeAgentContextReadService:
+    def get_symbol_day_context(self, **kwargs):
+        return {'items': [{'symbol': symbol} for symbol in kwargs['symbols']]}
+
+
+class RecordingBatchClient:
+    def __init__(self):
+        self.calls = []
+        self._lock = threading.Lock()
+
+    def dispatch_batch(self, **kwargs):
+        with self._lock:
+            self.calls.append(kwargs)
+        spec = kwargs['spec']
+        return {
+            'decoded': {
+                'items': [
+                    {
+                        'symbol': item['symbol'],
+                        'feedback': {
+                            'role': spec.role,
+                            'summary': f"{item['symbol']} {spec.role} summary",
+                            'confidence': 0.7,
+                            'risk_flags': [],
+                            'details': {},
+                            'improvement_notes': [],
+                        },
+                    }
+                    for item in kwargs['batch_items']
+                ]
+            },
+            'attempt': 1,
+            'started_at': '2026-04-14T01:00:00+00:00',
+            'completed_at': '2026-04-14T01:01:00+00:00',
+            'session_ref': {'session_key': kwargs['batch_items'][0]['session_key']},
+        }
+
+
+class FakeFeedbackService:
+    def __init__(self):
+        self.bulk_items = []
+        self.submitted = []
+
+    def bulk_submit_feedback(self, *, items):
+        self.bulk_items = list(items)
+        return {'accepted': True, 'count': len(self.bulk_items), 'items': self.bulk_items}
+
+    def submit_feedback(self, **kwargs):
+        self.submitted.append(kwargs)
+        return {
+            'accepted': True,
+            'item': {
+                'id': len(self.submitted),
+                'agent_name': kwargs['agent_name'],
+                'run_id': kwargs['run_id'],
+            },
+        }
+
+
+class FakeSessionCleanupService:
+    def __init__(self):
+        self.targets = []
+
+    def delete_now(self, *, target):
+        self.targets.append(target)
+        return {'status': 'deleted', 'session_key': target.session_key}
+
+
+def _reuse_decision(should_dispatch: bool):
+    return SimpleNamespace(should_dispatch=should_dispatch)
+
+
 class AgentFeedbackOrchestratorTests(unittest.TestCase):
+    def test_reuse_existing_skips_reusable_symbol_role_pairs(self):
+        service = AgentFeedbackOrchestrator()
+        client = RecordingBatchClient()
+        service.client = client
+        feedback_service = FakeFeedbackService()
+        cleanup_service = FakeSessionCleanupService()
+        reuse_service = SimpleNamespace(
+            build_latest_decisions=lambda **kwargs: {
+                '005930': {'eod-summarizer': _reuse_decision(False)},
+                '000660': {'eod-summarizer': _reuse_decision(True)},
+            }
+        )
+        fake_settings = SimpleNamespace(openclaw_agent_symbol_chunk_size=1)
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            with patch.object(orchestrator_module, 'agent_context_read_service', DynamicFakeAgentContextReadService()):
+                with patch.object(orchestrator_module, 'agent_context_reuse_service', reuse_service):
+                    with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
+                        with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
+                            result = service.dispatch_for_symbols(
+                                market_date='2026-04-14',
+                                symbols=['005930', '000660'],
+                                roles=['eod-summarizer'],
+                                reuse_existing=True,
+                            )
+
+        dispatched_symbols = [
+            item['symbol']
+            for call in client.calls
+            for item in call['batch_items']
+        ]
+        self.assertEqual(dispatched_symbols, ['000660'])
+        self.assertEqual([item['symbol'] for item in feedback_service.bulk_items], ['000660'])
+        self.assertEqual([target.symbol for target in cleanup_service.targets], ['000660'])
+        self.assertEqual(result['summary']['completed'], 1)
+
+    def test_buffered_symbol_dispatch_cleans_each_batch_session_once(self):
+        service = AgentFeedbackOrchestrator()
+        client = RecordingBatchClient()
+        service.client = client
+        feedback_service = FakeFeedbackService()
+        cleanup_service = FakeSessionCleanupService()
+        fake_settings = SimpleNamespace(openclaw_agent_symbol_chunk_size=2)
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            with patch.object(orchestrator_module, 'agent_context_read_service', DynamicFakeAgentContextReadService()):
+                with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
+                    with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
+                        result = service.dispatch_for_symbols(
+                            market_date='2026-04-14',
+                            symbols=['005930', '000660'],
+                            roles=['eod-summarizer'],
+                            reuse_existing=False,
+                        )
+
+        self.assertEqual([item['symbol'] for item in feedback_service.bulk_items], ['005930', '000660'])
+        self.assertEqual(len(cleanup_service.targets), 1)
+        self.assertEqual(cleanup_service.targets[0].session_key, client.calls[0]['batch_items'][0]['session_key'])
+        self.assertEqual(result['summary']['flushed_to_db'], 2)
+
+    def test_subagent_dispatch_uses_requested_per_role_parallelism(self):
+        service = AgentFeedbackOrchestrator()
+        client = RecordingBatchClient()
+        service.client = client
+        feedback_service = FakeFeedbackService()
+        cleanup_service = FakeSessionCleanupService()
+        symbols = ['000001', '000002', '000003', '000004', '000005', '000006']
+
+        with patch.object(orchestrator_module, 'agent_context_read_service', DynamicFakeAgentContextReadService()):
+            with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
+                with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
+                    result = service.dispatch_for_symbols_via_subagents(
+                        market_date='2026-04-14',
+                        symbols=symbols,
+                        roles=['eod-summarizer'],
+                        per_role_parallelism=3,
+                    )
+
+        slots = sorted(
+            call['batch_items'][0]['session_slot']
+            for call in client.calls
+        )
+        self.assertEqual(slots, [1, 2, 3])
+        self.assertEqual(result['request']['per_role_parallelism'], 3)
+        self.assertEqual(result['request']['total_parallel_subtasks'], 3)
+        self.assertEqual(result['summary']['completed'], 6)
+
     def test_timed_out_running_future_keeps_slot_until_it_completes(self):
         first_future = FakeFuture(result=_batch_result('005930'), cancel_result=False)
         second_future = FakeFuture(result=_batch_result('000660'), cancel_result=True)
