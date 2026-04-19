@@ -911,8 +911,8 @@ class AgentFeedbackOrchestrator:
         request_run_id = f'symbol-run-{normalized_market_date.isoformat()}-{uuid.uuid4().hex[:10]}'
         print(f'[feedback-dispatch] start run_id={request_run_id} market_date={normalized_market_date.isoformat()} requested_symbols={len(normalized_symbols)} roles={[spec.role for spec in specs]} reuse_existing={reuse_existing}', flush=True)
 
-        batch_size = 1
-        role_parallelism = 20
+        batch_size = max(1, settings.openclaw_agent_symbol_chunk_size)
+        role_parallelism = max(1, settings.openclaw_agent_parallel_subtasks)
         state = RuntimeFeedbackRunState(
             run_id=request_run_id,
             market_date=normalized_market_date,
@@ -980,59 +980,58 @@ class AgentFeedbackOrchestrator:
             role = spec.role
             print(f'[feedback-dispatch] run_id={request_run_id} role={role} entering role wave', flush=True)
             role_symbols = list(normalized_symbols)
+            role_decisions = {}
             if reuse_existing and role_symbols:
-                decisions = agent_context_reuse_service.build_latest_decisions(
+                role_decisions = agent_context_reuse_service.build_latest_decisions(
                     market_date=normalized_market_date,
                     symbols=role_symbols,
                     roles=[role],
                 )
-                role_symbols = [symbol for symbol in role_symbols if decisions.get(symbol, {}).get(role) is None or decisions[symbol][role].should_dispatch]
+                role_symbols = [symbol for symbol in role_symbols if role_decisions.get(symbol, {}).get(role) is None or role_decisions[symbol][role].should_dispatch]
 
-            queue: list[tuple[int, str]] = []
-            for index, symbol in enumerate(role_symbols):
-                slot = (index % role_parallelism) + 1
-                queue.append((slot, symbol))
+            queue: list[tuple[int, list[str]]] = []
+            for index in range(0, len(role_symbols), batch_size):
+                batch_symbols = role_symbols[index:index + batch_size]
+                slot = (len(queue) % role_parallelism) + 1
+                queue.append((slot, batch_symbols))
 
-            def build_single_symbol_batch(symbol: str, slot: int) -> list[dict[str, Any]]:
+            def build_symbol_batch(batch_symbols: list[str], slot: int) -> list[dict[str, Any]]:
                 symbol_context = agent_context_read_service.get_symbol_day_context(
                     market_date=normalized_market_date,
-                    symbols=[symbol],
+                    symbols=batch_symbols,
                     fs_div=fs_div,
                     disclosures_limit=disclosures_limit,
                 )
                 items = symbol_context.get('items') if isinstance(symbol_context, dict) else None
-                if not isinstance(items, list) or not items:
-                    raise ValueError(f'missing_symbol_context: {symbol}')
-                fresh_session_key = _fresh_feedback_session_key(
-                    agent_name=spec.agent_name,
-                    request_run_id=request_run_id,
-                    slot=slot,
-                )
+                if not isinstance(items, list) or len(items) != len(batch_symbols):
+                    raise ValueError(f'missing_symbol_context_batch: {batch_symbols}')
+                session_key = _feedback_session_key(agent_name=spec.agent_name, slot=slot)
                 return [
                     {
-                        **items[0],
+                        **item,
                         'session_slot': slot,
-                        'session_key': fresh_session_key,
+                        'session_key': session_key,
                     }
+                    for item in items
                 ]
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=role_parallelism) as executor:
-                future_map: dict[concurrent.futures.Future[dict[str, Any]], tuple[int, str]] = {}
+                future_map: dict[concurrent.futures.Future[dict[str, Any]], tuple[int, list[str]]] = {}
 
                 def submit_next() -> None:
                     if not queue:
                         return
-                    slot, symbol = queue.pop(0)
-                    mark_activity(role, slot, [symbol], done=False)
+                    slot, batch_symbols = queue.pop(0)
+                    mark_activity(role, slot, batch_symbols, done=False)
                     future = executor.submit(
                         self._dispatch_role_symbol_batch,
                         spec=spec,
                         market_date=normalized_market_date,
-                        symbol=symbol,
+                        symbols=batch_symbols,
                         slot=slot,
-                        build_batch=build_single_symbol_batch,
+                        build_batch=build_symbol_batch,
                     )
-                    future_map[future] = (slot, symbol)
+                    future_map[future] = (slot, batch_symbols)
 
                 for _ in range(min(role_parallelism, len(queue))):
                     submit_next()
@@ -1040,33 +1039,36 @@ class AgentFeedbackOrchestrator:
                 while future_map:
                     done, _ = concurrent.futures.wait(list(future_map.keys()), return_when=concurrent.futures.FIRST_COMPLETED)
                     for future in done:
-                        slot, symbol = future_map.pop(future)
+                        slot, batch_symbols = future_map.pop(future)
                         try:
                             result = future.result()
-                            response_payload = result['response_payload']
-                            context_payload = result['context_payload']
-                            buffer_success(spec.agent_name, symbol, context_payload, response_payload)
-                            all_items.append(
-                                {
-                                    'role': role,
-                                    'agent_name': spec.agent_name,
-                                    'symbol': symbol,
-                                    'status': 'completed',
-                                    'response': {'normalized_feedback': response_payload.get('normalized_feedback')},
-                                }
-                            )
+                            for completed_item in result['items']:
+                                symbol = completed_item['symbol']
+                                response_payload = completed_item['response_payload']
+                                context_payload = completed_item['context_payload']
+                                buffer_success(spec.agent_name, symbol, context_payload, response_payload)
+                                all_items.append(
+                                    {
+                                        'role': role,
+                                        'agent_name': spec.agent_name,
+                                        'symbol': symbol,
+                                        'status': 'completed',
+                                        'response': {'normalized_feedback': response_payload.get('normalized_feedback')},
+                                    }
+                                )
                         except Exception as exc:
-                            all_failures.append(
-                                {
-                                    'role': role,
-                                    'agent_name': spec.agent_name,
-                                    'symbol': symbol,
-                                    'status': 'failed',
-                                    'retryable': True,
-                                    'error': f'{type(exc).__name__}: {exc}',
-                                }
-                            )
-                            buffer_failure(role, symbol, f'{type(exc).__name__}: {exc}', True)
+                            for symbol in batch_symbols:
+                                all_failures.append(
+                                    {
+                                        'role': role,
+                                        'agent_name': spec.agent_name,
+                                        'symbol': symbol,
+                                        'status': 'failed',
+                                        'retryable': True,
+                                        'error': f'{type(exc).__name__}: {exc}',
+                                    }
+                                )
+                                buffer_failure(role, symbol, f'{type(exc).__name__}: {exc}', True)
                         finally:
                             mark_activity(role, slot, done=True)
                             submit_next()
@@ -1085,8 +1087,28 @@ class AgentFeedbackOrchestrator:
             }
             for row in buffered_rows
         ]
-        flush_result = agent_context_feedback_service.bulk_submit_feedback(items=flush_payload)
-        self._cleanup_buffered_feedback_sessions(rows=buffered_rows)
+        flush_result = {'accepted': True, 'count': 0, 'items': []}
+        cleanup_results: list[dict[str, Any]] = []
+        for role in [spec.role for spec in specs]:
+            role_rows = [row for row in buffered_rows if row['agent_name'] == role]
+            if not role_rows:
+                continue
+            role_payload = [
+                {
+                    'market_date': row['market_date'],
+                    'symbol': row['symbol'],
+                    'agent_name': row['agent_name'],
+                    'run_id': row['run_id'],
+                    'summary': row['summary'],
+                    'feedback': row['feedback'],
+                    'context': row['context'],
+                }
+                for row in role_rows
+            ]
+            role_flush_result = agent_context_feedback_service.bulk_submit_feedback(items=role_payload)
+            flush_result['count'] += role_flush_result.get('count', 0)
+            flush_result['items'].extend(role_flush_result.get('items', []))
+            cleanup_results.extend(self._cleanup_buffered_feedback_sessions(rows=role_rows))
         completed_count = len(buffered_rows)
         failed_count = len(final_state.buffered_failures)
         final_status = 'completed' if failed_count == 0 else ('partial' if completed_count > 0 else 'failed')
@@ -1112,7 +1134,7 @@ class AgentFeedbackOrchestrator:
                 'role_parallel_subtasks': role_parallelism,
                 'total_parallel_subtasks': role_parallelism,
                 'reuse_existing': reuse_existing,
-                'mode': 'role_sequential_streaming_single_symbol',
+                'mode': 'role_sequential_streaming_slot_reuse',
             },
             'summary': {
                 'status': final_status,
@@ -1129,11 +1151,11 @@ class AgentFeedbackOrchestrator:
         *,
         spec: AgentDispatchSpec,
         market_date: date,
-        symbol: str,
+        symbols: list[str],
         slot: int,
         build_batch,
     ) -> dict[str, Any]:
-        batch = build_batch(symbol, slot)
+        batch = build_batch(symbols, slot)
         batch_result = self._get_client().dispatch_batch(
             spec=spec,
             market_date=market_date,
@@ -1143,20 +1165,27 @@ class AgentFeedbackOrchestrator:
         by_symbol = {
             item['symbol']: item for item in decoded_items if isinstance(item, dict) and item.get('symbol')
         }
-        normalized_feedback = by_symbol.get(symbol, {}).get('feedback')
-        if not normalized_feedback:
-            raise AgentDispatchRetryableError('missing_batch_feedback')
-        response_payload = {
-            'attempt': batch_result.get('attempt', 1),
-            'started_at': batch_result.get('started_at'),
-            'completed_at': batch_result.get('completed_at'),
-            'normalized_feedback': normalized_feedback,
-            'session_ref': batch_result.get('session_ref'),
-        }
-        return {
-            'response_payload': response_payload,
-            'context_payload': batch[0],
-        }
+        completed_items: list[dict[str, Any]] = []
+        for source_item in batch:
+            symbol = str(source_item['symbol'])
+            normalized_feedback = by_symbol.get(symbol, {}).get('feedback')
+            if not normalized_feedback:
+                raise AgentDispatchRetryableError(f'missing_batch_feedback:{symbol}')
+            response_payload = {
+                'attempt': batch_result.get('attempt', 1),
+                'started_at': batch_result.get('started_at'),
+                'completed_at': batch_result.get('completed_at'),
+                'normalized_feedback': normalized_feedback,
+                'session_ref': batch_result.get('session_ref'),
+            }
+            completed_items.append(
+                {
+                    'symbol': symbol,
+                    'response_payload': response_payload,
+                    'context_payload': source_item,
+                }
+            )
+        return {'items': completed_items}
 
     def dispatch_for_symbols_via_subagents(
         self,

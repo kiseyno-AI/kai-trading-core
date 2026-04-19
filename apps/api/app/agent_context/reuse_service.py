@@ -40,6 +40,11 @@ ROLE_TO_AGENT = {
 }
 
 
+def _chunked(values: Sequence[str], size: int) -> list[list[str]]:
+    normalized = [str(value) for value in values]
+    return [normalized[index:index + size] for index in range(0, len(normalized), size)]
+
+
 class AgentContextReuseService:
     def build_latest_decisions(
         self,
@@ -65,26 +70,40 @@ class AgentContextReuseService:
             ).all()
             symbol_id_map = {str(row.symbol): int(row.id) for row in symbol_rows}
 
+            latest_feedback_map: dict[tuple[str, str], AgentContextFeedback] = {}
+            latest_failure_map: dict[tuple[str, str], AgentContextFeedbackFailure] = {}
+            for role in requested_roles:
+                agent_name = ROLE_TO_AGENT[role]
+                for chunk in _chunked(normalized_symbols, 500):
+                    feedback_rows = session.execute(
+                        select(AgentContextFeedback)
+                        .where(AgentContextFeedback.market_date <= normalized_market_date)
+                        .where(AgentContextFeedback.symbol.in_(chunk))
+                        .where(AgentContextFeedback.agent_name == agent_name)
+                        .order_by(AgentContextFeedback.symbol.asc(), AgentContextFeedback.market_date.desc(), AgentContextFeedback.received_at.desc(), AgentContextFeedback.id.desc())
+                    ).scalars().all()
+                    for row in feedback_rows:
+                        key = (row.symbol, agent_name)
+                        if key not in latest_feedback_map:
+                            latest_feedback_map[key] = row
+                    failure_rows = session.execute(
+                        select(AgentContextFeedbackFailure)
+                        .where(AgentContextFeedbackFailure.market_date <= normalized_market_date)
+                        .where(AgentContextFeedbackFailure.symbol.in_(chunk))
+                        .where(AgentContextFeedbackFailure.agent_name == agent_name)
+                        .order_by(AgentContextFeedbackFailure.symbol.asc(), AgentContextFeedbackFailure.market_date.desc(), AgentContextFeedbackFailure.received_at.desc(), AgentContextFeedbackFailure.id.desc())
+                    ).scalars().all()
+                    for row in failure_rows:
+                        key = (row.symbol, agent_name)
+                        if key not in latest_failure_map:
+                            latest_failure_map[key] = row
+
             for symbol in normalized_symbols:
                 symbol_id = symbol_id_map.get(symbol)
                 for role in requested_roles:
                     agent_name = ROLE_TO_AGENT[role]
-                    latest_feedback = session.execute(
-                        select(AgentContextFeedback)
-                        .where(AgentContextFeedback.market_date <= normalized_market_date)
-                        .where(AgentContextFeedback.symbol == symbol)
-                        .where(AgentContextFeedback.agent_name == agent_name)
-                        .order_by(AgentContextFeedback.market_date.desc(), AgentContextFeedback.received_at.desc(), AgentContextFeedback.id.desc())
-                        .limit(1)
-                    ).scalar_one_or_none()
-                    latest_failure = session.execute(
-                        select(AgentContextFeedbackFailure)
-                        .where(AgentContextFeedbackFailure.market_date <= normalized_market_date)
-                        .where(AgentContextFeedbackFailure.symbol == symbol)
-                        .where(AgentContextFeedbackFailure.agent_name == agent_name)
-                        .order_by(AgentContextFeedbackFailure.market_date.desc(), AgentContextFeedbackFailure.received_at.desc(), AgentContextFeedbackFailure.id.desc())
-                        .limit(1)
-                    ).scalar_one_or_none()
+                    latest_feedback = latest_feedback_map.get((symbol, agent_name))
+                    latest_failure = latest_failure_map.get((symbol, agent_name))
 
                     latest_source_updated_at = self._get_latest_source_updated_at(
                         session=session,
