@@ -71,6 +71,16 @@ class AgentFeedbackRetryCyclesRequest(BaseModel):
     reuse_existing: bool = True
 
 
+class AgentFeedbackFollowupRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+    market_date: date
+    roles: list[str] | None = None
+    max_cycles: int = Field(default=3, ge=1, le=20)
+    outer_batch_size: int = Field(default=20, ge=1, le=500)
+    reuse_existing: bool = True
+
+
 class AgentFeedbackCleanupRunRequest(BaseModel):
     model_config = ConfigDict(extra='forbid')
 
@@ -177,6 +187,26 @@ async def run_agent_feedback_retry_cycles(payload: AgentFeedbackRetryCyclesReque
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f'Agent feedback retry cycles failed: {exc}') from exc
+
+
+@router.post('/feedback/followup')
+async def run_agent_feedback_followup(payload: AgentFeedbackFollowupRequest) -> dict:
+    try:
+        config = FeedbackRetryCycleConfig(
+            market_date=payload.market_date,
+            roles=tuple(payload.roles or EXPECTED_ROLES),
+            max_cycles=payload.max_cycles,
+            outer_batch_size=payload.outer_batch_size,
+            reuse_existing=payload.reuse_existing,
+        )
+        return await run_in_threadpool(
+            agent_feedback_retry_service.run_retry_cycles,
+            config=config,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'Agent feedback followup failed: {exc}') from exc
 
 
 @router.post('/feedback/session-cleanup/run')

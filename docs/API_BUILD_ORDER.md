@@ -151,6 +151,7 @@
 - Recommended daily operations pattern is retry cycles: one full-universe pass, then one or more bounded follow-up cycles over only the remaining incomplete symbols, so transient gateway or agent failures do not require rerunning the whole universe.
 - Repo helper entrypoint for that pattern: from `apps/api`, run `python3.11 -m scripts.run_feedback_retry_cycles`.
 - Repo helper entrypoint for session deletion retries: from `apps/api`, run `python3.11 scripts/cleanup_stale_feedback_sessions.py --limit 100`. Successful immediate deletions are not persisted; only failed deletions remain queued.
+- End-to-end one-command smoke path: from `apps/api`, run `python3.11 -m app.internal.ops agent-feedback-symbol-cleanup-smoke --market-date YYYY-MM-DD --symbols 005930,000660,...`.
 - Optional orchestration hook: the daily DART fundamentals refresh path can automatically trigger the feedback retry-cycle workflow after refresh completion when `OPENCLAW_FEEDBACK_TRIGGER_AFTER_FUNDAMENTALS_REFRESH=true`.
 - Each role now receives a different JSON payload built for its job instead of one shared generic blob: market breadth and trending context for EOD summary, technical/state windows for technical summary, and disclosure plus fundamentals windows for fundamental summary.
 - Dispatch requires `OPENCLAW_BASE_URL` and `OPENCLAW_GATEWAY_TOKEN` configuration, retries retryable failures, and persists successful responses into `agent_context_feedback` as either market-level rows with symbol `__MARKET__` or symbol-level rows for symbol dispatch.

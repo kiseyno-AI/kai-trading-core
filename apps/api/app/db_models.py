@@ -318,6 +318,25 @@ class AgentContextFeedbackFailure(Base, TimestampMixin):
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
 
 
+class AgentContextFeedbackRun(Base, TimestampMixin):
+    __tablename__ = 'agent_context_feedback_runs'
+    __table_args__ = (
+        Index('ix_agent_context_feedback_runs_market_date_status_started', 'market_date', 'status', 'started_at'),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[str] = mapped_column(String(128), nullable=False, unique=True, index=True)
+    market_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default='running', index=True)
+    symbols_total: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    completed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    failed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    request_payload: Mapped[dict | None] = mapped_column(JSON)
+    summary_payload: Mapped[dict | None] = mapped_column(JSON)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 class AgentFeedbackSessionCleanupFailure(Base, TimestampMixin):
     __tablename__ = 'agent_feedback_session_cleanup_failures'
     __table_args__ = (
