@@ -941,7 +941,7 @@ class AgentFeedbackOrchestrator:
             started_at=datetime.now(timezone.utc),
             current_role=specs[0].role if specs else None,
         )
-        runtime_feedback_state_store.start_run(state)
+        runtime_feedback_state_store.start_run(state, replace=False)
 
         def mark_activity(role: str, slot: int, batch_symbols: list[str] | None = None, done: bool = False) -> None:
             def _update(current: RuntimeFeedbackRunState) -> None:

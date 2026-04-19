@@ -111,9 +111,13 @@ class RuntimeFeedbackStateStore:
         self._lock = threading.RLock()
         self._runs_by_market_date: dict[str, RuntimeFeedbackRunState] = {}
 
-    def start_run(self, state: RuntimeFeedbackRunState) -> None:
+    def start_run(self, state: RuntimeFeedbackRunState, *, replace: bool = True) -> RuntimeFeedbackRunState:
         with self._lock:
-            self._runs_by_market_date[state.market_date.isoformat()] = state
+            key = state.market_date.isoformat()
+            if not replace and key in self._runs_by_market_date:
+                return self._runs_by_market_date[key]
+            self._runs_by_market_date[key] = state
+            return state
 
     def get_run(self, market_date: str | date) -> RuntimeFeedbackRunState | None:
         key = market_date if isinstance(market_date, str) else market_date.isoformat()
