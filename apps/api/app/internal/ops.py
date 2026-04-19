@@ -3,8 +3,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+from pathlib import Path
 from typing import Any, Iterable
 
+from app.agent_context.orchestrator import agent_feedback_orchestrator
+from app.agent_context.session_cleanup_service import agent_feedback_session_cleanup_service
 from app.core.settings import settings
 from app.dart.fundamentals_capture_service import dart_fundamentals_capture_service
 from app.db import init_database
@@ -160,6 +163,39 @@ def compute_trending_ranks(*, market_date: str, periods: str | None = None) -> d
     )
 
 
+def run_agent_feedback_symbol_cleanup_smoke(
+    *,
+    market_date: str,
+    symbols: str,
+    roles: str | None = None,
+    fs_div: str | None = None,
+    disclosures_limit: int = 5,
+    cleanup_retry_limit: int = 100,
+    dump_json_path: str | None = None,
+) -> dict[str, Any]:
+    bootstrap_runtime()
+    parsed_symbols = [item.strip() for item in symbols.split(',') if item.strip()]
+    parsed_roles = [item.strip() for item in roles.split(',') if item.strip()] if roles else None
+    dispatch_result = agent_feedback_orchestrator.dispatch_for_symbols(
+        market_date=market_date,
+        symbols=parsed_symbols,
+        roles=parsed_roles,
+        fs_div=fs_div,
+        disclosures_limit=disclosures_limit,
+        reuse_existing=False,
+    )
+    cleanup_result = agent_feedback_session_cleanup_service.run_pending_cleanup(limit=cleanup_retry_limit)
+    result = {
+        'dispatch': dispatch_result,
+        'cleanup_retry': cleanup_result,
+    }
+    if dump_json_path:
+        dump_path = Path(dump_json_path)
+        dump_path.parent.mkdir(parents=True, exist_ok=True)
+        dump_path.write_text(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+    return result
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description='Internal kai-trading-core operations without self-HTTP.')
     subparsers = parser.add_subparsers(dest='command', required=True)
@@ -214,6 +250,18 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     trending_parser.add_argument('--market-date', required=True)
     trending_parser.add_argument('--periods')
+
+    feedback_smoke_parser = subparsers.add_parser(
+        'agent-feedback-symbol-cleanup-smoke',
+        help='Dispatch symbol feedback, store rows, attempt immediate session deletion, then retry failed deletions once',
+    )
+    feedback_smoke_parser.add_argument('--market-date', required=True)
+    feedback_smoke_parser.add_argument('--symbols', required=True)
+    feedback_smoke_parser.add_argument('--roles')
+    feedback_smoke_parser.add_argument('--fs-div')
+    feedback_smoke_parser.add_argument('--disclosures-limit', type=int, default=5)
+    feedback_smoke_parser.add_argument('--cleanup-retry-limit', type=int, default=100)
+    feedback_smoke_parser.add_argument('--dump-json-path')
     return parser
 
 
@@ -262,6 +310,16 @@ def main(argv: Iterable[str] | None = None) -> int:
         payload = compute_action_summaries(market_date=args.market_date, symbols=args.symbols)
     elif args.command == 'eod-trending-ranks-compute':
         payload = compute_trending_ranks(market_date=args.market_date, periods=args.periods)
+    elif args.command == 'agent-feedback-symbol-cleanup-smoke':
+        payload = run_agent_feedback_symbol_cleanup_smoke(
+            market_date=args.market_date,
+            symbols=args.symbols,
+            roles=args.roles,
+            fs_div=args.fs_div,
+            disclosures_limit=args.disclosures_limit,
+            cleanup_retry_limit=args.cleanup_retry_limit,
+            dump_json_path=args.dump_json_path,
+        )
     else:
         parser.error(f'Unsupported command: {args.command}')
 

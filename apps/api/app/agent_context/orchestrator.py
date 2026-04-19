@@ -1090,6 +1090,13 @@ class AgentFeedbackOrchestrator:
                             if isinstance(item, dict) and item.get('symbol')
                         }
                         completed_batches += 1
+                        assigned_symbols = [item.get('symbol') for item in batch if item.get('symbol')]
+                        returned_symbols = [
+                            item.get('symbol')
+                            for item in decoded_items
+                            if isinstance(item, dict) and item.get('symbol')
+                        ]
+                        missing_symbols = [symbol for symbol in assigned_symbols if symbol not in by_symbol]
                         logger.info(
                             'Agent feedback batch completed',
                             extra={
@@ -1098,25 +1105,22 @@ class AgentFeedbackOrchestrator:
                                 'agent_name': spec.agent_name,
                                 'session_slot': slot,
                                 'batch_size': len(batch),
+                                'assigned_symbols': assigned_symbols,
+                                'returned_symbols': returned_symbols,
+                                'missing_symbols': missing_symbols,
+                                'decoded_item_count': len(decoded_items),
+                                'output_text_preview': (batch_result.get('output_text') or '')[:1200],
                                 'session_ref': batch_result.get('session_ref'),
                                 'completed_batches': completed_batches,
                                 'failed_batches': failed_batches,
                             },
                         )
+                        missing_source_items: list[dict[str, Any]] = []
                         for source_item in batch:
                             symbol = source_item['symbol']
                             normalized_feedback = by_symbol.get(symbol, {}).get('feedback')
                             if not normalized_feedback:
-                                failures.append(
-                                    {
-                                        'role': spec.role,
-                                        'agent_name': spec.agent_name,
-                                        'symbol': symbol,
-                                        'status': 'failed',
-                                        'retryable': True,
-                                        'error': 'missing_batch_feedback',
-                                    }
-                                )
+                                missing_source_items.append(source_item)
                                 continue
                             stored = self._store_feedback(
                                 market_date=normalized_market_date,
@@ -1143,6 +1147,46 @@ class AgentFeedbackOrchestrator:
                                     'response': {'normalized_feedback': normalized_feedback},
                                 }
                             )
+                        if missing_source_items:
+                            logger.warning(
+                                'Agent feedback batch missing symbols, retrying individually',
+                                extra={
+                                    'request_run_id': request_run_id,
+                                    'role': spec.role,
+                                    'agent_name': spec.agent_name,
+                                    'session_slot': slot,
+                                    'missing_symbols': [item['symbol'] for item in missing_source_items],
+                                    'batch_size': len(batch),
+                                },
+                            )
+                            for source_item in missing_source_items:
+                                single_session_key = _fresh_feedback_session_key(
+                                    agent_name=spec.agent_name,
+                                    request_run_id=request_run_id,
+                                    slot=slot,
+                                )
+                                single_payload = {
+                                    **source_item,
+                                    'session_slot': slot,
+                                    'session_key': single_session_key,
+                                }
+                                single_items, single_failures = self._dispatch_and_store(
+                                    market_date=normalized_market_date,
+                                    request_run_id=request_run_id,
+                                    specs=[spec],
+                                    payloads={spec.role: single_payload},
+                                    symbol=source_item['symbol'],
+                                )
+                                items.extend(single_items)
+                                stored_feedback_count += len(single_items)
+                                failures.extend(single_failures if single_failures else [{
+                                    'role': spec.role,
+                                    'agent_name': spec.agent_name,
+                                    'symbol': source_item['symbol'],
+                                    'status': 'failed',
+                                    'retryable': True,
+                                    'error': 'missing_batch_feedback',
+                                }] if not single_items else [])
                     except Exception as exc:  # noqa: BLE001
                         failed_batches += 1
                         logger.warning(
