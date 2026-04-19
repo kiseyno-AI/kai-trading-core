@@ -11,6 +11,7 @@ from app.agent_context.status_service import EXPECTED_AGENT_NAMES
 from app.db import session_scope
 from app.db_models import (
     AgentContextFeedback,
+    AgentContextFeedbackFailure,
     DailyActionSummary,
     DailyPriceBar,
     DailyTechnicalSnapshot,
@@ -76,6 +77,14 @@ class AgentContextReuseService:
                         .order_by(AgentContextFeedback.market_date.desc(), AgentContextFeedback.received_at.desc(), AgentContextFeedback.id.desc())
                         .limit(1)
                     ).scalar_one_or_none()
+                    latest_failure = session.execute(
+                        select(AgentContextFeedbackFailure)
+                        .where(AgentContextFeedbackFailure.market_date <= normalized_market_date)
+                        .where(AgentContextFeedbackFailure.symbol == symbol)
+                        .where(AgentContextFeedbackFailure.agent_name == agent_name)
+                        .order_by(AgentContextFeedbackFailure.market_date.desc(), AgentContextFeedbackFailure.received_at.desc(), AgentContextFeedbackFailure.id.desc())
+                        .limit(1)
+                    ).scalar_one_or_none()
 
                     latest_source_updated_at = self._get_latest_source_updated_at(
                         session=session,
@@ -90,7 +99,7 @@ class AgentContextReuseService:
                             symbol=symbol,
                             agent_name=agent_name,
                             should_dispatch=True,
-                            reason='missing_feedback',
+                            reason='latest_failure_pending_retry' if latest_failure is not None else 'missing_feedback',
                             latest_feedback_id=None,
                             latest_feedback_received_at=None,
                             latest_source_updated_at=latest_source_updated_at.isoformat() if latest_source_updated_at else None,
@@ -99,12 +108,20 @@ class AgentContextReuseService:
                         continue
 
                     feedback_received_at = latest_feedback.received_at
-                    should_dispatch = latest_source_updated_at is not None and feedback_received_at is not None and latest_source_updated_at > feedback_received_at
+                    latest_feedback_payload = latest_feedback.feedback_payload if isinstance(latest_feedback.feedback_payload, dict) else {}
+                    latest_risk_flags = latest_feedback_payload.get('risk_flags') if isinstance(latest_feedback_payload.get('risk_flags'), list) else []
+                    has_retryable_feedback_gap = any(
+                        isinstance(flag, str) and flag in {'missing_batch_feedback', 'unstructured_response'}
+                        for flag in latest_risk_flags
+                    )
+                    should_dispatch = has_retryable_feedback_gap or (
+                        latest_source_updated_at is not None and feedback_received_at is not None and latest_source_updated_at > feedback_received_at
+                    )
                     decisions[symbol][role] = FeedbackReuseDecision(
                         symbol=symbol,
                         agent_name=agent_name,
                         should_dispatch=should_dispatch,
-                        reason='source_updated' if should_dispatch else 'reuse_latest_feedback',
+                        reason='retryable_feedback_gap' if has_retryable_feedback_gap else ('source_updated' if should_dispatch else 'reuse_latest_feedback'),
                         latest_feedback_id=latest_feedback.id,
                         latest_feedback_received_at=feedback_received_at.isoformat() if feedback_received_at else None,
                         latest_source_updated_at=latest_source_updated_at.isoformat() if latest_source_updated_at else None,

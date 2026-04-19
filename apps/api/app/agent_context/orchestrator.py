@@ -85,6 +85,10 @@ def _feedback_session_key(*, agent_name: str, slot: int) -> str:
     return f"feedback/{agent_name}/slot-{slot:02d}"
 
 
+def _fresh_feedback_session_key(*, agent_name: str, request_run_id: str, slot: int) -> str:
+    return f"feedback/{agent_name}/{request_run_id}/slot-{slot:02d}/{uuid.uuid4().hex[:10]}"
+
+
 def _subagent_test_session_key(*, agent_name: str, request_run_id: str, symbol: str) -> str:
     safe_symbol = ''.join(ch for ch in symbol if ch.isalnum())[:24] or 'symbol'
     return f"subagent-test/{agent_name}/{request_run_id}/{safe_symbol}-{uuid.uuid4().hex[:8]}"
@@ -276,14 +280,14 @@ class OpenClawAgentClient:
             f"Request marker: {request_marker}\n"
             f"Role: {spec.role}\n"
             f"Instruction: {spec.instruction}\n"
-            "You are the role-level parent collector for this batch.\n"
-            "Do not analyze all symbols directly in one answer. Spawn one subagent per assigned symbol, with at most the assigned batch size in flight.\n"
-            "Each child must analyze only one symbol and return JSON only.\n"
-            "Wait for all spawned children to complete, collect all child results, and then return one aggregated JSON object.\n"
+            "Analyze each assigned symbol directly using only the supplied payload.\n"
+            "Return one aggregated JSON object for the whole batch.\n"
             "Return JSON only with top-level shape {\"items\": [{\"symbol\": \"...\", \"feedback\": {...}}]}.\n"
-            "Do not omit symbols. If one child fails or returns weak output, still include that symbol with conservative failure-oriented feedback.\n"
+            "Each symbol must appear exactly once. Do not omit symbols.\n"
+            "For each symbol, feedback must use top-level keys role, summary, confidence, risk_flags, details, improvement_notes.\n"
+            "If some inputs are weak or missing, still return conservative structured feedback for that symbol instead of prose or placeholders.\n"
+            "Do not mention subagents, children, spawning, waiting, or internal orchestration.\n"
             "No markdown fences. No prose before or after JSON.\n"
-            "Read SUBAGENT_WORKER.md in your agent directory before spawning children, and instruct each child to follow it exactly.\n"
             f"{build_contract_prompt_suffix()}\n"
             f"JSON example:\n{json.dumps(example, ensure_ascii=False)}\n\n"
             f"Market date: {market_date.isoformat()}\n"
@@ -297,7 +301,8 @@ class OpenClawAgentClient:
                 f"Request marker: {request_marker}\n"
                 f"Role: {spec.role}\n"
                 f"Instruction: {spec.instruction}\n"
-                "You are the role-level parent collector for this batch. Spawn one subagent per assigned symbol, wait for completion, and return aggregated JSON only.\n"
+                "Analyze each assigned symbol directly and return aggregated JSON only.\n"
+                "Each symbol must appear exactly once in {\"items\": [...]} with structured feedback.\n"
                 f"{build_contract_prompt_suffix()}\n"
                 f"Market date: {market_date.isoformat()}\n"
                 f"Assigned batch payload:\n{json.dumps(list(prepared_items), ensure_ascii=False)}"
@@ -307,7 +312,8 @@ class OpenClawAgentClient:
         return (
             f"Role: {spec.role}\n"
             f"Instruction: {spec.instruction}\n"
-            "Spawn one child, wait for completion, and return aggregated JSON only.\n"
+            "Analyze the assigned symbol directly and return aggregated JSON only.\n"
+            "Return {\"items\": [{\"symbol\": \"...\", \"feedback\": {...}}]} with exactly one item.\n"
             f"{build_contract_prompt_suffix()}\n"
             f"Market date: {market_date.isoformat()}\n"
             f"Assigned batch payload:\n{json.dumps([_trim_batch_item_for_prompt(batch_items[0])], ensure_ascii=False)}"
@@ -639,25 +645,7 @@ class OpenClawAgentClient:
                                 output_text = candidate_text
                                 break
                 if decoded is None:
-                    repaired_items: list[dict[str, Any]] = []
-                    for batch_item in batch_items:
-                        symbol = batch_item.get('symbol')
-                        if not symbol:
-                            continue
-                        repaired_items.append(
-                            {
-                                'symbol': symbol,
-                                'feedback': normalize_agent_response(
-                                    role=spec.role,
-                                    output_text=output_text,
-                                    raw_response=parsed,
-                                ),
-                            }
-                        )
-                    if repaired_items:
-                        decoded = {'items': repaired_items}
-                    else:
-                        raise AgentDispatchTerminalError('OpenClaw batch returned invalid JSON and no repairable symbols were present')
+                    raise AgentDispatchRetryableError('OpenClaw batch returned invalid JSON')
                 return {
                     'ok': True,
                     'attempt': attempt,
@@ -937,11 +925,16 @@ class AgentFeedbackOrchestrator:
                 ]
                 for batch_index, batch in enumerate(indexed_batches):
                     slot = (batch_index % slot_count) + 1
+                    fresh_session_key = _fresh_feedback_session_key(
+                        agent_name=spec.agent_name,
+                        request_run_id=request_run_id,
+                        slot=slot,
+                    )
                     batch_with_session = [
                         {
                             **batch_item,
                             'session_slot': slot,
-                            'session_key': _feedback_session_key(agent_name=spec.agent_name, slot=slot),
+                            'session_key': fresh_session_key,
                         }
                         for batch_item in batch
                     ]
@@ -1114,17 +1107,17 @@ class AgentFeedbackOrchestrator:
                             symbol = source_item['symbol']
                             normalized_feedback = by_symbol.get(symbol, {}).get('feedback')
                             if not normalized_feedback:
-                                normalized_feedback = {
-                                    'role': spec.role,
-                                    'summary': f'{spec.role} batch did not return feedback for {symbol}',
-                                    'confidence': 0.0,
-                                    'risk_flags': ['missing_batch_feedback'],
-                                    'details': {
+                                failures.append(
+                                    {
+                                        'role': spec.role,
+                                        'agent_name': spec.agent_name,
                                         'symbol': symbol,
-                                        'market_date': normalized_market_date.isoformat(),
-                                    },
-                                    'improvement_notes': ['Ensure every batch response returns one normalized feedback object per assigned symbol'],
-                                }
+                                        'status': 'failed',
+                                        'retryable': True,
+                                        'error': 'missing_batch_feedback',
+                                    }
+                                )
+                                continue
                             stored = self._store_feedback(
                                 market_date=normalized_market_date,
                                 agent_name=spec.agent_name,
@@ -1135,6 +1128,7 @@ class AgentFeedbackOrchestrator:
                                     'started_at': batch_result.get('started_at'),
                                     'completed_at': batch_result.get('completed_at'),
                                     'normalized_feedback': normalized_feedback,
+                                    'session_ref': batch_result.get('session_ref'),
                                 },
                                 context=source_item,
                             )

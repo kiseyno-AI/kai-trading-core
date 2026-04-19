@@ -293,6 +293,31 @@ class AgentContextFeedback(Base, TimestampMixin):
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
 
 
+class AgentContextFeedbackFailure(Base, TimestampMixin):
+    __tablename__ = 'agent_context_feedback_failures'
+    __table_args__ = (
+        UniqueConstraint('market_date', 'symbol', 'agent_name', name='uq_agent_context_feedback_failures_market_symbol_agent'),
+        Index(
+            'ix_agent_context_feedback_failures_market_symbol_agent_received',
+            'market_date',
+            'symbol',
+            'agent_name',
+            'received_at',
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    market_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    symbol: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    agent_name: Mapped[str] = mapped_column(String(64), nullable=False, default='openclaw', index=True)
+    run_id: Mapped[str | None] = mapped_column(String(128), index=True)
+    failure_kind: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    retryable: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, index=True)
+    summary_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    context_payload: Mapped[dict | None] = mapped_column(JSON)
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+
+
 class AgentFeedbackSessionCleanupFailure(Base, TimestampMixin):
     __tablename__ = 'agent_feedback_session_cleanup_failures'
     __table_args__ = (
