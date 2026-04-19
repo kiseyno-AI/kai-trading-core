@@ -179,10 +179,14 @@ async def run_agent_feedback_retry_cycles(payload: AgentFeedbackRetryCyclesReque
             outer_batch_size=payload.outer_batch_size,
             reuse_existing=payload.reuse_existing,
         )
-        return await run_in_threadpool(
+        print(f'[feedback-followup-route] built config market_date={config.market_date.isoformat()} roles={list(config.roles)}', flush=True)
+        print('[feedback-followup-route] about to enter run_in_threadpool', flush=True)
+        result = await run_in_threadpool(
             agent_feedback_retry_service.run_retry_cycles,
             config=config,
         )
+        print('[feedback-followup-route] run_in_threadpool returned', flush=True)
+        return result
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
@@ -191,6 +195,7 @@ async def run_agent_feedback_retry_cycles(payload: AgentFeedbackRetryCyclesReque
 
 @router.post('/feedback/followup')
 async def run_agent_feedback_followup(payload: AgentFeedbackFollowupRequest) -> dict:
+    print(f'[feedback-followup-route] entered market_date={payload.market_date.isoformat()} max_cycles={payload.max_cycles} outer_batch_size={payload.outer_batch_size} reuse_existing={payload.reuse_existing} roles={payload.roles}', flush=True)
     try:
         config = FeedbackRetryCycleConfig(
             market_date=payload.market_date,
@@ -199,10 +204,14 @@ async def run_agent_feedback_followup(payload: AgentFeedbackFollowupRequest) -> 
             outer_batch_size=payload.outer_batch_size,
             reuse_existing=payload.reuse_existing,
         )
-        return await run_in_threadpool(
+        print(f'[feedback-followup-route] built config market_date={config.market_date.isoformat()} roles={list(config.roles)}', flush=True)
+        print('[feedback-followup-route] about to enter run_in_threadpool', flush=True)
+        result = await run_in_threadpool(
             agent_feedback_retry_service.run_retry_cycles,
             config=config,
         )
+        print('[feedback-followup-route] run_in_threadpool returned', flush=True)
+        return result
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:

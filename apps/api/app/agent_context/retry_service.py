@@ -59,8 +59,10 @@ class AgentFeedbackRetryService:
         return incomplete
 
     def run_retry_cycles(self, *, config: FeedbackRetryCycleConfig) -> dict[str, Any]:
+        print(f'[feedback-followup] start run_retry_cycles market_date={config.market_date.isoformat()} roles={list(config.roles)} max_cycles={config.max_cycles} reuse_existing={config.reuse_existing}', flush=True)
         cycles: list[dict[str, Any]] = []
         remaining = self.load_incomplete_symbols(market_date=config.market_date, roles=config.roles)
+        print(f'[feedback-followup] loaded remaining symbols count={len(remaining)}', flush=True)
 
         for cycle_number in range(1, config.max_cycles + 1):
             cycle_start_pending = len(remaining)
@@ -78,6 +80,7 @@ class AgentFeedbackRetryService:
                 break
 
             try:
+                print(f'[feedback-followup] cycle={cycle_number} dispatching all remaining symbols count={len(remaining)}', flush=True)
                 result = agent_feedback_orchestrator.dispatch_for_symbols(
                     market_date=config.market_date,
                     symbols=remaining,
@@ -118,6 +121,7 @@ class AgentFeedbackRetryService:
                 ]
 
             remaining = self.load_incomplete_symbols(market_date=config.market_date, roles=config.roles)
+            print(f'[feedback-followup] cycle={cycle_number} end remaining={len(remaining)}', flush=True)
             cycles.append(
                 {
                     'cycle': cycle_number,

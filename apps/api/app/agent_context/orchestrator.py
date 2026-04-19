@@ -915,6 +915,7 @@ class AgentFeedbackOrchestrator:
         specs = self._select_specs(roles=roles)
         request_run_id = f'symbol-run-{normalized_market_date.isoformat()}-{uuid.uuid4().hex[:10]}'
         requested_symbols = [str(item['symbol']) for item in symbol_context['items']]
+        print(f'[feedback-dispatch] start run_id={request_run_id} market_date={normalized_market_date.isoformat()} requested_symbols={len(requested_symbols)} roles={[spec.role for spec in specs]} reuse_existing={reuse_existing}', flush=True)
         reuse_decisions = (
             agent_context_reuse_service.build_latest_decisions(
                 market_date=normalized_market_date,
@@ -992,6 +993,7 @@ class AgentFeedbackOrchestrator:
         for spec in specs:
             role = spec.role
             state.current_role = role
+            print(f'[feedback-dispatch] run_id={request_run_id} role={role} entering role wave', flush=True)
             dispatch_items = []
             for item in symbol_context['items']:
                 symbol = str(item['symbol'])
