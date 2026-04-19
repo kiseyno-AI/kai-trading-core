@@ -71,6 +71,8 @@
 - `POST /agent-context/feedback/dispatch`
 - `POST /agent-context/feedback/dispatch/symbols`
 - `POST /agent-context/feedback/retry-cycles`
+- `POST /agent-context/feedback/session-cleanup/run`
+- `GET /agent-context/feedback/session-cleanup?market_date=YYYY-MM-DD&agent_name=eod-summarizer`
 - `GET /agent-context/feedback?market_date=YYYY-MM-DD&symbols=005930&agent_name=openclaw&limit=50`
 - `GET /agent-context/feedback/latest?market_date=YYYY-MM-DD&symbols=005930&symbols=000660`
 - `GET /agent-context/feedback/payloads?market_date=YYYY-MM-DD&symbols=005930`
@@ -141,11 +143,14 @@
 - `GET /agent-context/feedback/status` reports whether the three-agent feedback workflow is pending, in progress, partial, or completed for requested symbols, plus completed counts and pending agents.
 - `GET /agent-context/feedback/progress` reports aggregate progress for the expected three-agent feedback workflow, including `total_symbols`, `processed_symbols`, `completed_symbols`, `in_progress_symbols`, `pending_symbols`, `progress_ratio`, `progress_percent`, `failed_items`, `completed_feedback_count`, `expected_feedback_count`, `first_feedback_at`, `elapsed_seconds`, `completed_feedback_per_minute`, `completed_symbols_per_minute`, `estimated_remaining_seconds`, `estimated_completion_at`, and `eta_confidence`. When `symbols` is omitted, the symbol universe is derived from distinct `daily_price_bars` symbols for the requested market date, and timing/rate fields are scoped to that same symbol universe.
 - `POST /agent-context/feedback/retry-cycles` runs bounded retry passes over incomplete symbol feedback and returns both cycle/batch results and a fresh `progress` snapshot with the same timing, rate, and ETA fields as `GET /agent-context/feedback/progress`.
+- `POST /agent-context/feedback/session-cleanup/run` retries only previously failed OpenClaw session deletions after feedback rows are already stored.
+- `GET /agent-context/feedback/session-cleanup` exposes only the retained failed-deletion records so operators can confirm what still needs retry.
 - The current dispatch phase targets only `eod-summarizer`, `technical-summarizer`, and `fundamental-summarizer`.
 - Latest reusable feedback lookup is bounded to feedback rows with `market_date <= requested market_date`, so prior-day reusable feedback can carry forward when the source inputs are unchanged.
 - Fundamental freshness checks are bounded to DART filings and captured fundamentals eligible up to the requested `market_date`, so historical reads do not get marked stale by future filings.
 - Recommended daily operations pattern is retry cycles: one full-universe pass, then one or more bounded follow-up cycles over only the remaining incomplete symbols, so transient gateway or agent failures do not require rerunning the whole universe.
 - Repo helper entrypoint for that pattern: from `apps/api`, run `python3.11 -m scripts.run_feedback_retry_cycles`.
+- Repo helper entrypoint for session deletion retries: from `apps/api`, run `python3.11 scripts/cleanup_stale_feedback_sessions.py --limit 100`. Successful immediate deletions are not persisted; only failed deletions remain queued.
 - Optional orchestration hook: the daily DART fundamentals refresh path can automatically trigger the feedback retry-cycle workflow after refresh completion when `OPENCLAW_FEEDBACK_TRIGGER_AFTER_FUNDAMENTALS_REFRESH=true`.
 - Each role now receives a different JSON payload built for its job instead of one shared generic blob: market breadth and trending context for EOD summary, technical/state windows for technical summary, and disclosure plus fundamentals windows for fundamental summary.
 - Dispatch requires `OPENCLAW_BASE_URL` and `OPENCLAW_GATEWAY_TOKEN` configuration, retries retryable failures, and persists successful responses into `agent_context_feedback` as either market-level rows with symbol `__MARKET__` or symbol-level rows for symbol dispatch.

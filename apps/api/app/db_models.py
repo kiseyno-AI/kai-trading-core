@@ -293,6 +293,29 @@ class AgentContextFeedback(Base, TimestampMixin):
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
 
 
+class AgentFeedbackSessionCleanupFailure(Base, TimestampMixin):
+    __tablename__ = 'agent_feedback_session_cleanup_failures'
+    __table_args__ = (
+        UniqueConstraint('session_key', name='uq_agent_feedback_session_cleanup_failures_session_key'),
+        Index('ix_agent_feedback_session_cleanup_failures_next_attempt', 'next_attempt_at'),
+        Index('ix_agent_feedback_session_cleanup_failures_market_agent', 'market_date', 'agent_name'),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    market_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    symbol: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    agent_name: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    run_id: Mapped[str | None] = mapped_column(String(128), index=True)
+    session_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    provider: Mapped[str] = mapped_column(String(32), nullable=False, default='openclaw')
+    delete_transcript: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    emit_lifecycle_hooks: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    cleanup_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    last_error: Mapped[str | None] = mapped_column(Text)
+    cleanup_result: Mapped[dict | None] = mapped_column(JSON)
+
 class DartDisclosureSyncRun(Base):
     __tablename__ = 'dart_disclosure_sync_runs'
 

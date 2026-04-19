@@ -81,12 +81,15 @@ class Settings(BaseSettings):
     openclaw_agent_retry_backoff_seconds: float = 2.0
     openclaw_agent_parallel_subtasks: int = 4
     openclaw_agent_symbol_chunk_size: int = 5
+    openclaw_agent_max_prompt_chars: int = 24000
     openclaw_feedback_trigger_after_fundamentals_refresh: bool = False
     openclaw_feedback_retry_max_cycles: int = 3
     openclaw_feedback_retry_outer_batch_size: int = 20
     openclaw_agent_subtask_poll_seconds: float = 2.0
     openclaw_agent_subtask_timeout_seconds: float = 300.0
     openclaw_agent_slot_cooldown_seconds: float = 600.0
+    openclaw_session_cleanup_batch_limit: int = 100
+
 
 
 settings = Settings()
