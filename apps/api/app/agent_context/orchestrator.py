@@ -87,10 +87,6 @@ def _feedback_session_key(*, agent_name: str, slot: int) -> str:
     return f"feedback/{agent_name}/slot-{slot:02d}"
 
 
-def _fresh_feedback_session_key(*, agent_name: str, request_run_id: str, slot: int) -> str:
-    return f"feedback/{agent_name}/{request_run_id}/slot-{slot:02d}/{uuid.uuid4().hex[:10]}"
-
-
 def _subagent_test_session_key(*, agent_name: str, request_run_id: str, symbol: str) -> str:
     safe_symbol = ''.join(ch for ch in symbol if ch.isalnum())[:24] or 'symbol'
     return f"subagent-test/{agent_name}/{request_run_id}/{safe_symbol}-{uuid.uuid4().hex[:8]}"
