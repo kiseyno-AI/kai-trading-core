@@ -26,23 +26,37 @@ class RuntimeFeedbackRunState:
     failed_symbols_by_role: dict[str, set[str]] = field(default_factory=dict)
     in_flight_slots_by_role: dict[str, dict[int, dict[str, Any]]] = field(default_factory=dict)
     last_activity_at: datetime | None = None
+    logical_total_symbols: int | None = None
+    logical_expected_feedback_count: int | None = None
+    logical_completed_symbols: int | None = None
+    logical_in_progress_symbols: int | None = None
+    logical_pending_symbols: int | None = None
+    logical_completed_feedback_count: int | None = None
+    logical_failed_items: int | None = None
 
     def to_progress_summary(self) -> dict[str, Any]:
-        expected_feedback_count = len(self.requested_symbols) * len(self.requested_roles)
-        completed_feedback_count = len(self.buffered_feedback_rows)
-        completed_symbols = 0
-        in_progress_symbols = 0
-        pending_symbols = 0
-        for symbol in self.requested_symbols:
-            role_hits = sum(1 for role in self.requested_roles if symbol in self.completed_symbols_by_role.get(role, set()))
-            if role_hits == len(self.requested_roles):
-                completed_symbols += 1
-            elif role_hits > 0:
-                in_progress_symbols += 1
-            else:
-                pending_symbols += 1
+        expected_feedback_count = self.logical_expected_feedback_count if self.logical_expected_feedback_count is not None else len(self.requested_symbols) * len(self.requested_roles)
+        completed_feedback_count = self.logical_completed_feedback_count if self.logical_completed_feedback_count is not None else len(self.buffered_feedback_rows)
+        if self.logical_completed_symbols is not None or self.logical_in_progress_symbols is not None or self.logical_pending_symbols is not None:
+            completed_symbols = max(0, int(self.logical_completed_symbols or 0))
+            in_progress_symbols = max(0, int(self.logical_in_progress_symbols or 0))
+            pending_symbols = max(0, int(self.logical_pending_symbols or 0))
+            total_symbols = self.logical_total_symbols if self.logical_total_symbols is not None else completed_symbols + in_progress_symbols + pending_symbols
+        else:
+            completed_symbols = 0
+            in_progress_symbols = 0
+            pending_symbols = 0
+            for symbol in self.requested_symbols:
+                role_hits = sum(1 for role in self.requested_roles if symbol in self.completed_symbols_by_role.get(role, set()))
+                if role_hits == len(self.requested_roles):
+                    completed_symbols += 1
+                elif role_hits > 0:
+                    in_progress_symbols += 1
+                else:
+                    pending_symbols += 1
+            total_symbols = len(self.requested_symbols)
         processed_symbols = completed_symbols + in_progress_symbols
-        progress_ratio = (processed_symbols / len(self.requested_symbols)) if self.requested_symbols else 0.0
+        progress_ratio = (processed_symbols / total_symbols) if total_symbols else 0.0
         now = datetime.now(timezone.utc)
         elapsed_seconds = max(0, int((now - self.started_at.astimezone(timezone.utc)).total_seconds()))
         seconds_since_last_feedback = None
@@ -74,14 +88,14 @@ class RuntimeFeedbackRunState:
             'elapsed_seconds': elapsed_seconds,
             'seconds_since_last_feedback': seconds_since_last_feedback,
             'stalled_threshold_seconds': 300,
-            'total_symbols': len(self.requested_symbols),
+            'total_symbols': total_symbols,
             'processed_symbols': processed_symbols,
             'completed_symbols': completed_symbols,
             'in_progress_symbols': in_progress_symbols,
             'pending_symbols': pending_symbols,
             'progress_ratio': round(progress_ratio, 6),
             'progress_percent': round(progress_ratio * 100, 2),
-            'failed_items': len(self.buffered_failures),
+            'failed_items': self.logical_failed_items if self.logical_failed_items is not None else len(self.buffered_failures),
             'completed_feedback_count': completed_feedback_count,
             'expected_feedback_count': expected_feedback_count,
             'completed_feedback_per_minute': completed_feedback_per_minute,
