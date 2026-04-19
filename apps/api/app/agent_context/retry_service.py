@@ -71,51 +71,51 @@ class AgentFeedbackRetryService:
                         'status': 'skipped',
                         'start_pending': 0,
                         'end_pending': 0,
+                        'dispatch_scope': 'all_remaining_symbols',
                         'batches': [],
                     }
                 )
                 break
 
-            batches: list[dict[str, Any]] = []
-            for offset in range(0, len(remaining), config.outer_batch_size):
-                batch_symbols = remaining[offset:offset + config.outer_batch_size]
-                try:
-                    result = agent_feedback_orchestrator.dispatch_for_symbols(
-                        market_date=config.market_date,
-                        symbols=batch_symbols,
-                        roles=list(config.roles),
-                        reuse_existing=config.reuse_existing,
-                    )
-                    batches.append(
-                        {
-                            'offset': offset,
-                            'batch_size': len(batch_symbols),
-                            'symbols': batch_symbols,
-                            'summary': result['summary'],
-                            'request': result['request'],
-                        }
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    batches.append(
-                        {
-                            'offset': offset,
-                            'batch_size': len(batch_symbols),
-                            'symbols': batch_symbols,
-                            'summary': {
-                                'status': 'failed',
-                                'completed': 0,
-                                'failed': len(batch_symbols) * len(config.roles),
-                                'error_type': type(exc).__name__,
-                                'error': str(exc),
-                            },
-                            'request': {
-                                'market_date': config.market_date.isoformat(),
-                                'symbols': list(batch_symbols),
-                                'roles': list(config.roles),
-                                'reuse_existing': config.reuse_existing,
-                            },
-                        }
-                    )
+            try:
+                result = agent_feedback_orchestrator.dispatch_for_symbols(
+                    market_date=config.market_date,
+                    symbols=remaining,
+                    roles=list(config.roles),
+                    reuse_existing=config.reuse_existing,
+                )
+                batches = [
+                    {
+                        'offset': 0,
+                        'batch_size': len(remaining),
+                        'symbols_count': len(remaining),
+                        'dispatch_scope': 'all_remaining_symbols',
+                        'summary': result['summary'],
+                        'request': result['request'],
+                    }
+                ]
+            except Exception as exc:  # noqa: BLE001
+                batches = [
+                    {
+                        'offset': 0,
+                        'batch_size': len(remaining),
+                        'symbols_count': len(remaining),
+                        'dispatch_scope': 'all_remaining_symbols',
+                        'summary': {
+                            'status': 'failed',
+                            'completed': 0,
+                            'failed': len(remaining) * len(config.roles),
+                            'error_type': type(exc).__name__,
+                            'error': str(exc),
+                        },
+                        'request': {
+                            'market_date': config.market_date.isoformat(),
+                            'symbols_count': len(remaining),
+                            'roles': list(config.roles),
+                            'reuse_existing': config.reuse_existing,
+                        },
+                    }
+                ]
 
             remaining = self.load_incomplete_symbols(market_date=config.market_date, roles=config.roles)
             cycles.append(
@@ -124,6 +124,7 @@ class AgentFeedbackRetryService:
                     'status': 'completed' if not remaining else 'partial',
                     'start_pending': cycle_start_pending,
                     'end_pending': len(remaining),
+                    'dispatch_scope': 'all_remaining_symbols',
                     'batches': batches,
                 }
             )
