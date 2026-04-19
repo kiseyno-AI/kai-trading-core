@@ -184,14 +184,24 @@ class AgentFeedbackSessionCleanupService:
 
     @staticmethod
     def _extract_json(stdout: str) -> dict[str, Any] | None:
-        lines = [line.strip() for line in stdout.splitlines() if line.strip()]
-        for line in reversed(lines):
-            if not line.startswith('{'):
+        lines = [line.rstrip() for line in stdout.splitlines() if line.strip()]
+        for start_index in range(len(lines)):
+            candidate = '\n'.join(lines[start_index:]).strip()
+            if not candidate.startswith('{'):
                 continue
             try:
-                parsed = json.loads(line)
+                parsed = json.loads(candidate)
             except json.JSONDecodeError:
                 continue
+            if isinstance(parsed, dict):
+                return parsed
+        start = stdout.find('{')
+        if start != -1:
+            candidate = stdout[start:].strip()
+            try:
+                parsed = json.loads(candidate)
+            except json.JSONDecodeError:
+                parsed = None
             if isinstance(parsed, dict):
                 return parsed
         try:
