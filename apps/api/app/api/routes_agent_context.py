@@ -321,6 +321,13 @@ async def dispatch_symbol_agent_feedback_via_subagents(payload: AgentSubagentExp
         raise HTTPException(status_code=500, detail=f'Subagent experiment dispatch failed: {exc}') from exc
 
 
+
+
+@router.post('/feedback/ping')
+async def ping_agent_feedback_post() -> dict:
+    print('[feedback-post-ping] entered', flush=True)
+    return {'ok': True, 'route': 'feedback/ping'}
+
 @router.get('/feedback/payloads')
 async def list_agent_feedback_payloads(
     market_date: date = Query(...),
