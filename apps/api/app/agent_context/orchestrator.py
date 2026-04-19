@@ -1037,7 +1037,8 @@ class AgentFeedbackOrchestrator:
                             mark_activity(role, slot, done=True)
                             submit_next()
 
-        buffered_rows = list(state.buffered_feedback_rows)
+        final_state = runtime_feedback_state_store.get_run(normalized_market_date) or state
+        buffered_rows = list(final_state.buffered_feedback_rows)
         flush_payload = [
             {
                 'market_date': row['market_date'],
@@ -1052,13 +1053,15 @@ class AgentFeedbackOrchestrator:
         ]
         flush_result = agent_context_feedback_service.bulk_submit_feedback(items=flush_payload)
         completed_count = len(buffered_rows)
-        failed_count = len(state.buffered_failures)
+        failed_count = len(final_state.buffered_failures)
         final_status = 'completed' if failed_count == 0 else ('partial' if completed_count > 0 else 'failed')
 
         def _finish(current: RuntimeFeedbackRunState) -> None:
             current.status = final_status
             current.completed_at = datetime.now(timezone.utc)
             current.last_activity_at = current.completed_at
+            for role_slots in current.in_flight_slots_by_role.values():
+                role_slots.clear()
         runtime_feedback_state_store.update_run(normalized_market_date, _finish)
 
         return {
