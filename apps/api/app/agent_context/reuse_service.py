@@ -133,14 +133,21 @@ class AgentContextReuseService:
                         isinstance(flag, str) and flag in {'missing_batch_feedback', 'unstructured_response'}
                         for flag in latest_risk_flags
                     )
-                    should_dispatch = has_retryable_feedback_gap or (
+                    feedback_market_date = latest_feedback.market_date if latest_feedback is not None else None
+                    is_stale_market_feedback = feedback_market_date is None or feedback_market_date != normalized_market_date
+                    should_dispatch = is_stale_market_feedback or has_retryable_feedback_gap or (
                         latest_source_updated_at is not None and feedback_received_at is not None and latest_source_updated_at > feedback_received_at
+                    )
+                    reason = (
+                        'stale_market_feedback' if is_stale_market_feedback else (
+                            'retryable_feedback_gap' if has_retryable_feedback_gap else ('source_updated' if should_dispatch else 'reuse_latest_feedback')
+                        )
                     )
                     decisions[symbol][role] = FeedbackReuseDecision(
                         symbol=symbol,
                         agent_name=agent_name,
                         should_dispatch=should_dispatch,
-                        reason='retryable_feedback_gap' if has_retryable_feedback_gap else ('source_updated' if should_dispatch else 'reuse_latest_feedback'),
+                        reason=reason,
                         latest_feedback_id=latest_feedback.id,
                         latest_feedback_received_at=feedback_received_at.isoformat() if feedback_received_at else None,
                         latest_source_updated_at=latest_source_updated_at.isoformat() if latest_source_updated_at else None,
