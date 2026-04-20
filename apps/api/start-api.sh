@@ -33,4 +33,5 @@ fi
 set -a
 source .env
 set +a
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
 exec "$PYTHON_BIN" -m uvicorn app.main:app --host "$HOST" --port "$PORT"

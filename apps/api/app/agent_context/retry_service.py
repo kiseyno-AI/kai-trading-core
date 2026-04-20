@@ -87,10 +87,6 @@ class AgentFeedbackRetryService:
         try:
             for cycle_number in range(1, config.max_cycles + 1):
                 cycle_start_pending = len(remaining)
-                runtime_feedback_state_store.update_run(
-                    config.market_date,
-                    lambda current: setattr(current, 'logical_pending_symbols', cycle_start_pending) if current else None,
-                )
                 if cycle_start_pending == 0:
                     cycles.append(
                         {
@@ -103,59 +99,73 @@ class AgentFeedbackRetryService:
                     )
                     break
 
-                batches: list[dict[str, Any]] = []
-                total_batches = (len(remaining) + config.outer_batch_size - 1) // config.outer_batch_size
-                for batch_index, offset in enumerate(range(0, len(remaining), config.outer_batch_size), start=1):
-                    batch_symbols = remaining[offset:offset + config.outer_batch_size]
+                role_batches: list[dict[str, Any]] = []
+                for current_role in config.roles:
+                    role_remaining = self.load_incomplete_symbols(market_date=config.market_date, roles=[current_role])
+                    total_batches = (len(role_remaining) + config.outer_batch_size - 1) // config.outer_batch_size if role_remaining else 0
                     runtime_feedback_state_store.update_run(
                         config.market_date,
-                        lambda current, batch_index=batch_index, total_batches=total_batches: self._set_logical_batch_context(current, config.roles, batch_index, total_batches),
+                        lambda current, current_role=current_role: self._set_logical_role_context(current, current_role),
                     )
-                    try:
-                        result = agent_feedback_orchestrator.dispatch_for_symbols(
-                            market_date=config.market_date,
-                            symbols=batch_symbols,
-                            roles=list(config.roles),
-                            reuse_existing=config.reuse_existing,
-                        )
-                        batches.append(
-                            {
-                                'offset': offset,
-                                'batch_size': len(batch_symbols),
-                                'symbols': batch_symbols,
-                                'summary': result['summary'],
-                                'request': result['request'],
-                            }
-                        )
+                    batches: list[dict[str, Any]] = []
+                    for batch_index, offset in enumerate(range(0, len(role_remaining), config.outer_batch_size), start=1):
+                        batch_symbols = role_remaining[offset:offset + config.outer_batch_size]
                         runtime_feedback_state_store.update_run(
                             config.market_date,
-                            lambda current, result=result, batch_symbols=batch_symbols: self._merge_batch_progress(current, result, batch_symbols),
+                            lambda current, current_role=current_role, batch_index=batch_index, total_batches=total_batches: self._set_logical_batch_context(current, current_role, batch_index, total_batches),
                         )
-                    except Exception as exc:  # noqa: BLE001
-                        batches.append(
-                            {
-                                'offset': offset,
-                                'batch_size': len(batch_symbols),
-                                'symbols': batch_symbols,
-                                'summary': {
-                                    'status': 'failed',
-                                    'completed': 0,
-                                    'failed': len(batch_symbols) * len(config.roles),
-                                    'error_type': type(exc).__name__,
-                                    'error': str(exc),
-                                },
-                                'request': {
-                                    'market_date': config.market_date.isoformat(),
-                                    'symbols': list(batch_symbols),
-                                    'roles': list(config.roles),
-                                    'reuse_existing': config.reuse_existing,
-                                },
-                            }
-                        )
-                        runtime_feedback_state_store.update_run(
-                            config.market_date,
-                            lambda current, batch_symbols=batch_symbols: self._merge_batch_exception(current, batch_symbols, config.roles),
-                        )
+                        try:
+                            result = agent_feedback_orchestrator.dispatch_for_symbols(
+                                market_date=config.market_date,
+                                symbols=batch_symbols,
+                                roles=[current_role],
+                                reuse_existing=config.reuse_existing,
+                            )
+                            batches.append(
+                                {
+                                    'offset': offset,
+                                    'batch_size': len(batch_symbols),
+                                    'symbols': batch_symbols,
+                                    'summary': result['summary'],
+                                    'request': result['request'],
+                                }
+                            )
+                            runtime_feedback_state_store.update_run(
+                                config.market_date,
+                                lambda current, result=result, batch_symbols=batch_symbols: self._merge_batch_progress(current, result, batch_symbols),
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            batches.append(
+                                {
+                                    'offset': offset,
+                                    'batch_size': len(batch_symbols),
+                                    'symbols': batch_symbols,
+                                    'summary': {
+                                        'status': 'failed',
+                                        'completed': 0,
+                                        'failed': len(batch_symbols),
+                                        'error_type': type(exc).__name__,
+                                        'error': str(exc),
+                                    },
+                                    'request': {
+                                        'market_date': config.market_date.isoformat(),
+                                        'symbols': list(batch_symbols),
+                                        'roles': [current_role],
+                                        'reuse_existing': config.reuse_existing,
+                                    },
+                                }
+                            )
+                            runtime_feedback_state_store.update_run(
+                                config.market_date,
+                                lambda current, batch_symbols=batch_symbols: self._merge_batch_exception(current, batch_symbols, [current_role]),
+                            )
+                    role_batches.append(
+                        {
+                            'role': current_role,
+                            'batch_count': len(batches),
+                            'batches': batches,
+                        }
+                    )
 
                 remaining = self.load_incomplete_symbols(market_date=config.market_date, roles=config.roles)
                 runtime_feedback_state_store.update_run(
@@ -168,7 +178,7 @@ class AgentFeedbackRetryService:
                         'status': 'completed' if not remaining else 'partial',
                         'start_pending': cycle_start_pending,
                         'end_pending': len(remaining),
-                        'batches': batches,
+                        'role_batches': role_batches,
                     }
                 )
                 if not remaining:
@@ -197,12 +207,20 @@ class AgentFeedbackRetryService:
         }
 
     @staticmethod
-    def _set_logical_batch_context(current: RuntimeFeedbackRunState | None, roles: Sequence[str], batch_index: int, total_batches: int) -> None:
+    def _set_logical_role_context(current: RuntimeFeedbackRunState | None, current_role: str | None) -> None:
+        if current is None:
+            return
+        current.status = 'running'
+        current.current_role = current_role or current.current_role
+        current.last_activity_at = datetime.now(timezone.utc)
+
+    @staticmethod
+    def _set_logical_batch_context(current: RuntimeFeedbackRunState | None, current_role: str | None, batch_index: int, total_batches: int) -> None:
         if current is None:
             return
         current.parallel_per_role = current.parallel_per_role or 0
         current.status = 'running'
-        current.current_role = roles[0] if roles else current.current_role
+        current.current_role = current_role or current.current_role
         current.last_activity_at = datetime.now(timezone.utc)
 
     @staticmethod
@@ -215,10 +233,13 @@ class AgentFeedbackRetryService:
         roles = request.get('roles') if isinstance(request.get('roles'), list) else None
         if roles:
             current.current_role = str(roles[0])
-        current.logical_completed_feedback_count = (current.logical_completed_feedback_count or 0) + int(summary.get('completed', 0))
-        current.logical_failed_items = (current.logical_failed_items or 0) + int(summary.get('failed', 0))
-        completed_now = max(0, len(batch_symbols) - int(summary.get('failed', 0)))
-        current.logical_completed_symbols = min(current.logical_total_symbols or 0, (current.logical_completed_symbols or 0) + completed_now)
+        completed_items = summary.get('items') if isinstance(summary.get('items'), list) else []
+        completed_now = len([item for item in completed_items if isinstance(item, dict) and item.get('status') == 'completed'])
+        failed_now = len([item for item in completed_items if isinstance(item, dict) and item.get('status') == 'failed']) + int(summary.get('failed', 0))
+        current.logical_completed_feedback_count = (current.logical_completed_feedback_count or 0) + completed_now
+        current.logical_failed_items = (current.logical_failed_items or 0) + failed_now
+        completed_symbol_count = min(len(batch_symbols), completed_now)
+        current.logical_completed_symbols = min(current.logical_total_symbols or 0, (current.logical_completed_symbols or 0) + completed_symbol_count)
         current.logical_pending_symbols = max(0, (current.logical_total_symbols or 0) - (current.logical_completed_symbols or 0))
         current.logical_in_progress_symbols = 0 if current.logical_pending_symbols == 0 else min(current.parallel_per_role or 0, current.logical_pending_symbols)
         current.last_activity_at = datetime.now(timezone.utc)
