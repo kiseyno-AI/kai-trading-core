@@ -924,7 +924,7 @@ class AgentFeedbackOrchestrator:
                 roles=[spec.role for spec in specs],
             )
         batch_size = max(1, settings.openclaw_agent_symbol_chunk_size)
-        role_parallelism = 20
+        role_parallelism = max(1, settings.openclaw_agent_parallel_subtasks)
         state = RuntimeFeedbackRunState(
             run_id=request_run_id,
             market_date=normalized_market_date,
