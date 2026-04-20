@@ -81,6 +81,15 @@ class DynamicFakeAgentContextReadService:
         return {'items': [{'symbol': symbol} for symbol in kwargs['symbols']]}
 
 
+class RecordingAgentContextReadService(DynamicFakeAgentContextReadService):
+    def __init__(self):
+        self.calls = []
+
+    def get_symbol_day_context(self, **kwargs):
+        self.calls.append(kwargs)
+        return super().get_symbol_day_context(**kwargs)
+
+
 class RecordingBatchClient:
     def __init__(self):
         self.calls = []
@@ -155,6 +164,7 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         service.client = client
         feedback_service = FakeFeedbackService()
         cleanup_service = FakeSessionCleanupService()
+        read_service = RecordingAgentContextReadService()
         reuse_service = SimpleNamespace(
             build_latest_decisions=lambda **kwargs: {
                 '005930': {'eod-summarizer': _reuse_decision(False)},
@@ -164,7 +174,7 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         fake_settings = SimpleNamespace(openclaw_agent_symbol_chunk_size=1, openclaw_agent_parallel_subtasks=20)
 
         with patch.object(orchestrator_module, 'settings', fake_settings):
-            with patch.object(orchestrator_module, 'agent_context_read_service', DynamicFakeAgentContextReadService()):
+            with patch.object(orchestrator_module, 'agent_context_read_service', read_service):
                 with patch.object(orchestrator_module, 'agent_context_reuse_service', reuse_service):
                     with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
                         with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
@@ -180,10 +190,46 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
             for call in client.calls
             for item in call['batch_items']
         ]
+        self.assertEqual(len(read_service.calls), 1)
+        self.assertEqual(read_service.calls[0]['symbols'], ['000660'])
         self.assertEqual(dispatched_symbols, ['000660'])
         self.assertEqual([item['symbol'] for item in feedback_service.bulk_items], ['000660'])
         self.assertEqual([target.symbol for target in cleanup_service.targets], ['000660'])
         self.assertEqual(result['summary']['completed'], 1)
+
+    def test_reuse_existing_skips_context_load_when_all_symbols_are_reusable(self):
+        service = AgentFeedbackOrchestrator()
+        client = RecordingBatchClient()
+        service.client = client
+        feedback_service = FakeFeedbackService()
+        cleanup_service = FakeSessionCleanupService()
+        read_service = RecordingAgentContextReadService()
+        reuse_service = SimpleNamespace(
+            build_latest_decisions=lambda **kwargs: {
+                '005930': {'eod-summarizer': _reuse_decision(False)},
+                '000660': {'eod-summarizer': _reuse_decision(False)},
+            }
+        )
+        fake_settings = SimpleNamespace(openclaw_agent_symbol_chunk_size=1, openclaw_agent_parallel_subtasks=20)
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            with patch.object(orchestrator_module, 'agent_context_read_service', read_service):
+                with patch.object(orchestrator_module, 'agent_context_reuse_service', reuse_service):
+                    with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
+                        with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
+                            result = service.dispatch_for_symbols(
+                                market_date='2026-04-14',
+                                symbols=['005930', '000660'],
+                                roles=['eod-summarizer'],
+                                reuse_existing=True,
+                            )
+
+        self.assertEqual(read_service.calls, [])
+        self.assertEqual(client.calls, [])
+        self.assertEqual(feedback_service.bulk_items, [])
+        self.assertEqual(cleanup_service.targets, [])
+        self.assertEqual(result['summary']['completed'], 0)
+        self.assertEqual(result['summary']['failed'], 0)
 
     def test_buffered_symbol_dispatch_cleans_each_batch_session_once(self):
         service = AgentFeedbackOrchestrator()
