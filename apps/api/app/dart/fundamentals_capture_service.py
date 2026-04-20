@@ -1668,7 +1668,7 @@ class DartFundamentalsCaptureService:
                         agent_feedback_retry_service.run_retry_cycles,
                         config=FeedbackRetryCycleConfig(
                             market_date=resolved_market_date,
-                            roles=('eod-summarizer',),
+                            roles=EXPECTED_ROLES,
                             max_cycles=settings.openclaw_feedback_retry_max_cycles,
                             outer_batch_size=settings.openclaw_feedback_retry_outer_batch_size,
                             reuse_existing=True,

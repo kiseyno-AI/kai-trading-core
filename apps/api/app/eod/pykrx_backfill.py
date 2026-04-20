@@ -1031,7 +1031,7 @@ class PykrxBackfillService:
         }
         should_chain_fundamentals = (
             settings.eod_trigger_fundamentals_after_capture
-            and mode == 'daily_collection'
+            and mode == 'daily_auto'
             and status in {'completed', 'completed_with_errors'}
         )
         if should_chain_fundamentals:
