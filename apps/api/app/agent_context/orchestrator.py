@@ -33,7 +33,7 @@ def _is_abortlike_error(error: Any) -> bool:
 from app.agent_context.feedback_service import agent_context_feedback_service
 from app.agent_context.runtime_state import RuntimeFeedbackRunState, runtime_feedback_state_store
 from app.agent_context.payload_builder import agent_payload_builder
-from app.agent_context.read_service import agent_context_read_service
+from app.agent_context.read_service import _normalize_fs_div, agent_context_read_service
 from app.agent_context.response_contract import build_contract_prompt_suffix, normalize_agent_response
 from app.agent_context.reuse_service import agent_context_reuse_service
 from app.agent_context.session_cleanup_service import SessionCleanupTarget, agent_feedback_session_cleanup_service
@@ -942,12 +942,13 @@ class AgentFeedbackOrchestrator:
                     for spec in specs
                 )
             ]
+        normalized_fs_div = _normalize_fs_div(fs_div)
         symbol_context = {'items': []}
         if dispatch_symbols:
             symbol_context = agent_context_read_service.get_symbol_day_context(
                 market_date=normalized_market_date,
                 symbols=dispatch_symbols,
-                fs_div=fs_div,
+                fs_div=normalized_fs_div,
                 disclosures_limit=disclosures_limit,
             )
         batch_size = max(1, settings.openclaw_agent_symbol_chunk_size)
