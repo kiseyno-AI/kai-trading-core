@@ -1,7 +1,7 @@
 # GET /agent-context/symbol-day
 
 ## Summary
-Returns compact symbol/day analysis context for downstream agents.
+Returns compact symbol/day analysis context for downstream agents. The `price_context` block is read from persisted `daily_price_contexts`, not derived on request.
 
 ## Example request
 ```http

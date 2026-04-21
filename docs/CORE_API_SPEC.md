@@ -505,6 +505,7 @@ Authorization: Bearer <token>
 - Stored rows are keyed by symbol and market date.
 - The current persisted sources are `volume-power`, `overtime-volume`, and `overtime-fluctuation`.
 - `POST /eod/signal-features/collect` is the operator path that calls KIS and upserts these rows.
+- The same collect path also refreshes the persisted market-wide participation block used by the EOD summarizer payload, so participation context is no longer derived from signal rows during payload build time.
 
 ---
 
@@ -741,6 +742,8 @@ It is a composed read payload intended for:
 - agent reasoning,
 - summary card generation,
 - low-roundtrip consumers.
+
+`price_context` is read from persisted `daily_price_contexts`, which the EOD pipeline derives from stored `daily_price_bars` for the same market date.
 
 ### Important nullability
 Each subsection can be absent independently.
