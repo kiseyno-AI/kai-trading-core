@@ -1,5 +1,6 @@
 import unittest
 from datetime import date, timedelta
+from unittest.mock import patch
 
 from app.eod.technical_snapshots import DailyTechnicalSnapshotService
 
@@ -82,3 +83,33 @@ class DailyTechnicalSnapshotServiceTests(unittest.TestCase):
                 market_date='2026-04-29',
                 bars=bars,
             )
+
+    def test_compute_and_persist_ignores_progress_callback_failures(self):
+        service = DailyTechnicalSnapshotService()
+        progress_updates: list[dict] = []
+
+        def _failing_progress_callback(progress: dict) -> None:
+            progress_updates.append(progress)
+            raise RuntimeError('progress store unavailable')
+
+        with (
+            patch(
+                'app.eod.technical_snapshots.list_symbols_with_daily_bar_on_date',
+                return_value=['005930'],
+            ),
+            patch(
+                'app.eod.technical_snapshots.load_daily_bars_for_symbol',
+                return_value=_bars(),
+            ),
+            patch('app.eod.technical_snapshots.upsert_daily_technical_snapshot') as upsert_mock,
+        ):
+            result = service.compute_and_persist_for_market_date(
+                market_date='2026-04-29',
+                progress_callback=_failing_progress_callback,
+            )
+
+        self.assertEqual(result['snapshots_persisted'], 1)
+        self.assertEqual(result['snapshots_failed'], 0)
+        self.assertEqual(result['failed_symbols'], [])
+        self.assertEqual([item['status'] for item in progress_updates], ['running', 'completed'])
+        upsert_mock.assert_called_once()

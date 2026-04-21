@@ -214,9 +214,18 @@ class DailyTechnicalSnapshotService:
         snapshots: list[dict] = []
         failed_symbols: list[str] = []
 
+        def _emit_progress(payload: dict) -> None:
+            if not progress_callback:
+                return
+            try:
+                progress_callback(payload)
+            except Exception:
+                # Progress persistence is best-effort and must not interrupt snapshot processing.
+                return
+
         if progress_callback:
             first_symbol = target_symbols[0] if target_symbols else None
-            progress_callback(
+            _emit_progress(
                 {
                     'status': 'running' if first_symbol else 'completed',
                     'processed': 0,
@@ -243,7 +252,7 @@ class DailyTechnicalSnapshotService:
                 failed_symbols.append(symbol)
             if progress_callback:
                 next_symbol = target_symbols[index + 1] if index + 1 < len(target_symbols) else None
-                progress_callback(
+                _emit_progress(
                     {
                         'status': (
                             'running'
