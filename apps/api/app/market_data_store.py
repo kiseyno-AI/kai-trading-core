@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from decimal import Decimal
+from typing import Callable
 
 from sqlalchemy import Numeric, cast, delete, func, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -504,6 +505,7 @@ def update_eod_collection_run_progress(
     *,
     symbols_succeeded: int,
     symbols_failed: int,
+    run_metadata: dict | None = None,
 ) -> None:
     with session_scope() as session:
         run = session.get(EODCollectionRun, run_id)
@@ -511,6 +513,8 @@ def update_eod_collection_run_progress(
             return
         run.symbols_succeeded = symbols_succeeded
         run.symbols_failed = symbols_failed
+        if run_metadata is not None:
+            run.run_metadata = run_metadata
 
 
 def count_eod_run_persisted_symbols(run_id: int) -> int:
@@ -534,6 +538,63 @@ def load_eod_run_persisted_symbols(run_id: int) -> list[str]:
             .order_by(Symbol.symbol.asc())
         ).all()
         return [row[0] for row in rows]
+
+
+def load_eod_run_stage_counts(run_id: int) -> dict[str, dict]:
+    with session_scope() as session:
+        price_persisted, price_updated_at = session.execute(
+            select(
+                func.count(func.distinct(DailyPriceBar.symbol_id)),
+                func.max(DailyPriceBar.captured_at),
+            )
+            .select_from(DailyPriceBar)
+            .where(DailyPriceBar.eod_run_id == run_id)
+        ).one()
+        technical_persisted, technical_updated_at = session.execute(
+            select(
+                func.count(func.distinct(DailyTechnicalSnapshot.symbol_id)),
+                func.max(DailyTechnicalSnapshot.captured_at),
+            )
+            .select_from(DailyTechnicalSnapshot)
+            .where(DailyTechnicalSnapshot.eod_run_id == run_id)
+        ).one()
+        action_persisted, action_updated_at = session.execute(
+            select(
+                func.count(func.distinct(DailyActionSummary.symbol_id)),
+                func.max(DailyActionSummary.captured_at),
+            )
+            .select_from(DailyActionSummary)
+            .where(DailyActionSummary.eod_run_id == run_id)
+        ).one()
+        trending_rows, trending_periods, trending_updated_at = session.execute(
+            select(
+                func.count(DailyTrendingRank.id),
+                func.count(func.distinct(DailyTrendingRank.period)),
+                func.max(DailyTrendingRank.captured_at),
+            )
+            .select_from(DailyTrendingRank)
+            .where(DailyTrendingRank.eod_run_id == run_id)
+        ).one()
+
+    return {
+        'price_collection': {
+            'persisted': int(price_persisted or 0),
+            'updated_at': price_updated_at.isoformat() if price_updated_at else None,
+        },
+        'technical_snapshots': {
+            'persisted': int(technical_persisted or 0),
+            'updated_at': technical_updated_at.isoformat() if technical_updated_at else None,
+        },
+        'action_summaries': {
+            'persisted': int(action_persisted or 0),
+            'updated_at': action_updated_at.isoformat() if action_updated_at else None,
+        },
+        'trending_ranks': {
+            'persisted': int(trending_rows or 0),
+            'periods_persisted': int(trending_periods or 0),
+            'updated_at': trending_updated_at.isoformat() if trending_updated_at else None,
+        },
+    }
 
 
 @contextmanager
@@ -1467,6 +1528,7 @@ def compute_and_persist_daily_trending_ranks(
     periods: list[str] | tuple[str, ...] | None = None,
     source: str = 'pykrx',
     run_id: int | None = None,
+    progress_callback: Callable[[dict], None] | None = None,
 ) -> dict:
     normalized_market_date = _normalize_trade_date(market_date)
     normalized_periods = [period.strip().lower() for period in (periods or DAY_BASED_TRENDING_PERIODS)]
@@ -1482,6 +1544,28 @@ def compute_and_persist_daily_trending_ranks(
 
     period_results: list[dict] = []
     total_persisted = 0
+    if progress_callback:
+        first_period = deduped_periods[0] if deduped_periods else None
+        progress_callback(
+            {
+                'status': 'running' if first_period else 'completed',
+                'processed': 0,
+                'succeeded': 0,
+                'failed': 0,
+                'total': len(deduped_periods),
+                'current_period': first_period,
+                'current_step': 'computing_trending_period' if first_period else 'trending_ranks_completed',
+                'current_activity': (
+                    f'Computing daily trending ranks for {first_period}'
+                    if first_period
+                    else 'No day-based trending periods configured'
+                ),
+                'details': {
+                    'rows_persisted': 0,
+                    'periods_persisted': 0,
+                },
+            }
+        )
     for period in deduped_periods:
         if period == '1d':
             items = _load_trending_stocks_from_daily_price_bars(
@@ -1513,6 +1597,29 @@ def compute_and_persist_daily_trending_ranks(
                 'trending_ranks_persisted': persisted_count,
             }
         )
+        if progress_callback:
+            processed_periods = len(period_results)
+            next_period = deduped_periods[processed_periods] if processed_periods < len(deduped_periods) else None
+            progress_callback(
+                {
+                    'status': 'running' if next_period is not None else 'completed',
+                    'processed': processed_periods,
+                    'succeeded': processed_periods,
+                    'failed': 0,
+                    'total': len(deduped_periods),
+                    'current_period': next_period,
+                    'current_step': 'computing_trending_period' if next_period is not None else 'trending_ranks_completed',
+                    'current_activity': (
+                        f'Computing daily trending ranks for {next_period}'
+                        if next_period is not None
+                        else 'Completed daily trending ranks'
+                    ),
+                    'details': {
+                        'rows_persisted': total_persisted,
+                        'periods_persisted': processed_periods,
+                    },
+                }
+            )
 
     return {
         'market_date': normalized_market_date.isoformat(),

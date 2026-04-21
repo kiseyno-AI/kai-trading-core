@@ -128,6 +128,76 @@ def _dedupe_symbol_codes(symbols: Sequence[object]) -> list[str]:
     return list(deduped.keys())
 
 
+def _utcnow_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _update_run_stage_metadata(
+    metadata: dict | None,
+    *,
+    stage: str,
+    status: str,
+    current_step: str,
+    current_activity: str,
+    processed: int | None = None,
+    total: int | None = None,
+    succeeded: int | None = None,
+    failed: int | None = None,
+    current_symbol: str | None = None,
+    current_period: str | None = None,
+    extra: dict | None = None,
+) -> dict:
+    updated = dict(metadata or {})
+    now = _utcnow_iso()
+
+    stage_progress = dict(updated.get('stage_progress') or {})
+    entry = dict(stage_progress.get(stage) or {})
+    entry.setdefault('started_at', now)
+    entry['updated_at'] = now
+    entry['status'] = status
+    entry['current_step'] = current_step
+    entry['current_activity'] = current_activity
+
+    if processed is not None:
+        entry['processed'] = int(processed)
+    if total is not None:
+        entry['total'] = int(total)
+    if succeeded is not None:
+        entry['succeeded'] = int(succeeded)
+    if failed is not None:
+        entry['failed'] = int(failed)
+    if current_symbol is not None:
+        entry['current_symbol'] = current_symbol
+    else:
+        entry.pop('current_symbol', None)
+    if current_period is not None:
+        entry['current_period'] = current_period
+    else:
+        entry.pop('current_period', None)
+    if extra:
+        entry.update(extra)
+    if status in {'completed', 'partial', 'failed'}:
+        entry['completed_at'] = now
+
+    stage_progress[stage] = entry
+    updated['stage'] = stage
+    updated['current_step'] = current_step
+    updated['current_activity'] = current_activity
+    updated['last_progress_at'] = now
+    updated['stage_progress'] = stage_progress
+
+    if current_symbol is not None:
+        updated['current_symbol'] = current_symbol
+    else:
+        updated.pop('current_symbol', None)
+    if current_period is not None:
+        updated['current_period'] = current_period
+    else:
+        updated.pop('current_period', None)
+
+    return updated
+
+
 class PykrxBackfillService:
     symbol_pause_seconds = 0.02
     name_pause_seconds = 0.005
@@ -805,6 +875,24 @@ class PykrxBackfillService:
         if retry_context is not None:
             run_metadata['retry'] = retry_context
             run_metadata['requested_symbols'] = [item.symbol for item in symbols]
+        first_symbol = symbols[0].symbol if symbols else None
+        run_metadata = _update_run_stage_metadata(
+            run_metadata,
+            stage='price_collection',
+            status='running',
+            current_step='fetch_symbol_ohlcv',
+            current_activity=(
+                f'Collecting pykrx daily prices for {first_symbol}'
+                if first_symbol
+                else 'Collecting pykrx daily prices'
+            ),
+            processed=0,
+            total=len(symbols),
+            succeeded=0,
+            failed=0,
+            current_symbol=first_symbol,
+            extra={'bars_upserted': 0},
+        )
         run_id = create_eod_collection_run(
             market='KRX',
             trade_date=latest_trade_date,
@@ -819,8 +907,44 @@ class PykrxBackfillService:
         failed_symbols: list[str] = []
         bars_upserted = 0
 
+        def persist_stage_progress(
+            *,
+            stage: str,
+            status: str,
+            current_step: str,
+            current_activity: str,
+            processed: int | None = None,
+            total: int | None = None,
+            succeeded: int | None = None,
+            failed: int | None = None,
+            current_symbol: str | None = None,
+            current_period: str | None = None,
+            extra: dict | None = None,
+        ) -> None:
+            nonlocal run_metadata
+            run_metadata = _update_run_stage_metadata(
+                run_metadata,
+                stage=stage,
+                status=status,
+                current_step=current_step,
+                current_activity=current_activity,
+                processed=processed,
+                total=total,
+                succeeded=succeeded,
+                failed=failed,
+                current_symbol=current_symbol,
+                current_period=current_period,
+                extra=extra,
+            )
+            update_eod_collection_run_progress(
+                run_id,
+                symbols_succeeded=symbols_succeeded,
+                symbols_failed=symbols_failed,
+                run_metadata=run_metadata,
+            )
+
         try:
-            for item in symbols:
+            for index, item in enumerate(symbols):
                 symbol_started_at = time.perf_counter()
                 try:
                     frame = _get_market_ohlcv_by_date(normalized_start, normalized_end, item.symbol)
@@ -867,10 +991,22 @@ class PykrxBackfillService:
                         error_message=str(exc),
                     )
                 try:
-                    update_eod_collection_run_progress(
-                        run_id,
-                        symbols_succeeded=symbols_succeeded,
-                        symbols_failed=symbols_failed,
+                    next_symbol = symbols[index + 1].symbol if index + 1 < len(symbols) else None
+                    persist_stage_progress(
+                        stage='price_collection',
+                        status='running' if next_symbol is not None else ('completed' if not failed_symbols else 'partial'),
+                        current_step='fetch_symbol_ohlcv' if next_symbol is not None else 'price_collection_completed',
+                        current_activity=(
+                            f'Collecting pykrx daily prices for {next_symbol}'
+                            if next_symbol is not None
+                            else 'Completed pykrx daily price collection'
+                        ),
+                        processed=symbols_succeeded + symbols_failed,
+                        total=len(symbols),
+                        succeeded=symbols_succeeded,
+                        failed=symbols_failed,
+                        current_symbol=next_symbol,
+                        extra={'bars_upserted': bars_upserted},
                     )
                 except Exception as exc:
                     logger.warning('pykrx progress update failed for run %s after %s: %s', run_id, item.symbol, exc)
@@ -903,16 +1039,28 @@ class PykrxBackfillService:
                 error_type=type(exc).__name__,
                 error_message=str(exc),
             )
-            complete_kwargs = {}
+            run_metadata = _update_run_stage_metadata(
+                run_metadata,
+                stage='price_collection',
+                status='failed',
+                current_step='price_collection_failed',
+                current_activity='pykrx daily price collection failed',
+                processed=symbols_succeeded + symbols_failed,
+                total=len(symbols),
+                succeeded=symbols_succeeded,
+                failed=symbols_failed,
+                current_symbol=None,
+                extra={'bars_upserted': bars_upserted},
+            )
             if failed_symbols:
-                complete_kwargs['run_metadata'] = self._run_metadata_with_failed_symbols(run_metadata, failed_symbols)
+                run_metadata = self._run_metadata_with_failed_symbols(run_metadata, failed_symbols)
             complete_eod_collection_run(
                 run_id,
                 status='failed',
                 symbols_succeeded=symbols_succeeded,
                 symbols_failed=symbols_failed,
                 error_message=str(exc),
-                **complete_kwargs,
+                run_metadata=run_metadata,
             )
             raise
 
@@ -924,6 +1072,18 @@ class PykrxBackfillService:
                 symbols=[item.symbol for item in symbols],
                 source='pykrx',
                 run_id=run_id,
+                progress_callback=lambda progress: persist_stage_progress(
+                    stage='technical_snapshots',
+                    status=str(progress.get('status') or 'running'),
+                    current_step=str(progress.get('current_step') or 'computing_symbol_snapshot'),
+                    current_activity=str(progress.get('current_activity') or 'Computing daily technical snapshots'),
+                    processed=progress.get('processed'),
+                    total=progress.get('total'),
+                    succeeded=progress.get('succeeded'),
+                    failed=progress.get('failed'),
+                    current_symbol=progress.get('current_symbol'),
+                    extra=progress.get('details') if isinstance(progress.get('details'), dict) else None,
+                ),
             )
         except Exception as exc:
             technical_snapshot_result = {
@@ -937,6 +1097,16 @@ class PykrxBackfillService:
                 'error': str(exc),
             }
             snapshot_error_message = f'Technical snapshot persistence failed: {exc}'
+            persist_stage_progress(
+                stage='technical_snapshots',
+                status='failed',
+                current_step='technical_snapshots_failed',
+                current_activity='Daily technical snapshot persistence failed',
+                processed=0,
+                total=len(symbols),
+                succeeded=0,
+                failed=len(symbols),
+            )
 
         action_summary_result: dict
         action_summary_error_message: str | None = None
@@ -946,6 +1116,18 @@ class PykrxBackfillService:
                 symbols=[item.symbol for item in symbols],
                 source='pykrx',
                 run_id=run_id,
+                progress_callback=lambda progress: persist_stage_progress(
+                    stage='action_summaries',
+                    status=str(progress.get('status') or 'running'),
+                    current_step=str(progress.get('current_step') or 'computing_action_summary'),
+                    current_activity=str(progress.get('current_activity') or 'Computing daily action summaries'),
+                    processed=progress.get('processed'),
+                    total=progress.get('total'),
+                    succeeded=progress.get('succeeded'),
+                    failed=progress.get('failed'),
+                    current_symbol=progress.get('current_symbol'),
+                    extra=progress.get('details') if isinstance(progress.get('details'), dict) else None,
+                ),
             )
         except Exception as exc:
             action_summary_result = {
@@ -959,6 +1141,16 @@ class PykrxBackfillService:
                 'error': str(exc),
             }
             action_summary_error_message = f'Action summary persistence failed: {exc}'
+            persist_stage_progress(
+                stage='action_summaries',
+                status='failed',
+                current_step='action_summaries_failed',
+                current_activity='Daily action summary persistence failed',
+                processed=0,
+                total=len(symbols),
+                succeeded=0,
+                failed=len(symbols),
+            )
 
         trending_rank_result: dict
         trending_rank_error_message: str | None = None
@@ -967,6 +1159,18 @@ class PykrxBackfillService:
                 market_date=latest_trade_date,
                 source='pykrx',
                 run_id=run_id,
+                progress_callback=lambda progress: persist_stage_progress(
+                    stage='trending_ranks',
+                    status=str(progress.get('status') or 'running'),
+                    current_step=str(progress.get('current_step') or 'computing_trending_period'),
+                    current_activity=str(progress.get('current_activity') or 'Computing daily trending ranks'),
+                    processed=progress.get('processed'),
+                    total=progress.get('total'),
+                    succeeded=progress.get('succeeded'),
+                    failed=progress.get('failed'),
+                    current_period=progress.get('current_period'),
+                    extra=progress.get('details') if isinstance(progress.get('details'), dict) else None,
+                ),
             )
         except Exception as exc:
             trending_rank_result = {
@@ -977,6 +1181,16 @@ class PykrxBackfillService:
                 'error': str(exc),
             }
             trending_rank_error_message = f'Trending rank persistence failed: {exc}'
+            persist_stage_progress(
+                stage='trending_ranks',
+                status='failed',
+                current_step='trending_ranks_failed',
+                current_activity='Daily trending rank persistence failed',
+                processed=0,
+                total=0,
+                succeeded=0,
+                failed=1,
+            )
 
         run_errors: list[str] = []
         if failed_symbols:
@@ -999,16 +1213,15 @@ class PykrxBackfillService:
             run_errors.append(trending_rank_error_message)
 
         status = 'completed' if not run_errors else 'completed_with_errors'
-        complete_kwargs = {}
         if failed_symbols:
-            complete_kwargs['run_metadata'] = self._run_metadata_with_failed_symbols(run_metadata, failed_symbols)
+            run_metadata = self._run_metadata_with_failed_symbols(run_metadata, failed_symbols)
         complete_eod_collection_run(
             run_id,
             status=status,
             symbols_succeeded=symbols_succeeded,
             symbols_failed=symbols_failed,
             error_message=' | '.join(run_errors) if run_errors else None,
-            **complete_kwargs,
+            run_metadata=run_metadata,
         )
         result = {
             'run_id': run_id,

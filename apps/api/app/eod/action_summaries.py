@@ -4,7 +4,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from datetime import date
-from typing import Iterable, Sequence
+from typing import Callable, Iterable, Sequence
 
 from app.market_data_store import (
     load_daily_action_summaries,
@@ -332,6 +332,7 @@ class DailyActionSummaryService:
         symbols: Sequence[str] | None = None,
         source: str = 'pykrx',
         run_id: int | None = None,
+        progress_callback: Callable[[dict], None] | None = None,
     ) -> dict:
         requested_symbols = list(symbols or [])
         snapshots = load_daily_technical_snapshot_inputs(
@@ -346,7 +347,26 @@ class DailyActionSummaryService:
         items: list[dict] = []
         failed_symbols: list[str] = [symbol for symbol in requested_symbols if symbol not in available_symbols]
 
-        for snapshot in snapshots:
+        if progress_callback:
+            first_symbol = snapshots[0]['symbol'] if snapshots else None
+            progress_callback(
+                {
+                    'status': 'running' if first_symbol else ('completed' if not failed_symbols else 'partial'),
+                    'processed': len(failed_symbols),
+                    'succeeded': 0,
+                    'failed': len(failed_symbols),
+                    'total': len(requested_symbols),
+                    'current_symbol': first_symbol,
+                    'current_step': 'computing_action_summary' if first_symbol else 'action_summaries_completed',
+                    'current_activity': (
+                        f'Computing daily action summaries for {first_symbol}'
+                        if first_symbol
+                        else 'No technical snapshots available for daily action summaries'
+                    ),
+                }
+            )
+
+        for index, snapshot in enumerate(snapshots):
             try:
                 summary = self.compute_summary(snapshot)
                 row = summary.to_row()
@@ -355,6 +375,32 @@ class DailyActionSummaryService:
                 items.append(row)
             except Exception:
                 failed_symbols.append(snapshot['symbol'])
+            if progress_callback:
+                next_symbol = snapshots[index + 1]['symbol'] if index + 1 < len(snapshots) else None
+                progress_callback(
+                    {
+                        'status': (
+                            'running'
+                            if next_symbol is not None
+                            else ('completed' if not failed_symbols else 'partial')
+                        ),
+                        'processed': len(items) + len(failed_symbols),
+                        'succeeded': len(items),
+                        'failed': len(failed_symbols),
+                        'total': len(requested_symbols),
+                        'current_symbol': next_symbol,
+                        'current_step': (
+                            'computing_action_summary'
+                            if next_symbol is not None
+                            else 'action_summaries_completed'
+                        ),
+                        'current_activity': (
+                            f'Computing daily action summaries for {next_symbol}'
+                            if next_symbol is not None
+                            else 'Completed daily action summaries'
+                        ),
+                    }
+                )
 
         deduped_failed = list(dict.fromkeys(failed_symbols))
         return {

@@ -7,6 +7,7 @@ from app.eod.action_summaries import daily_action_summary_service
 from app.eod.auto_pykrx import auto_pykrx_eod_scheduler
 from app.eod.freshness import eod_freshness_service
 from app.eod.master import refresh_master_if_due
+from app.eod.pipeline_status import eod_pipeline_status_service
 from app.eod.pykrx_backfill import DEFAULT_MARKETS, PYKRX_BACKFILL_SERVICE
 from app.eod.master_state import master_refresh_state
 from app.eod.service import EOD_SERVICE
@@ -30,6 +31,23 @@ async def get_eod_status() -> dict:
 @router.get('/freshness')
 async def get_eod_freshness() -> dict:
     return eod_freshness_service.read()
+
+
+@router.get('/pipeline/status')
+async def get_eod_pipeline_status(
+    market_date: str | None = None,
+    fs_div: str | None = None,
+) -> dict:
+    try:
+        return await asyncio.to_thread(
+            eod_pipeline_status_service.read,
+            market_date=market_date,
+            fs_div=fs_div,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'EOD pipeline status read failed: {exc}') from exc
 
 
 @router.post('/master/refresh-if-due')
