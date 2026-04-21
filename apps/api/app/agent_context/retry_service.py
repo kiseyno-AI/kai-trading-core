@@ -84,6 +84,7 @@ class AgentFeedbackRetryService:
             logical_failed_items=0,
         )
         runtime_feedback_state_store.start_run(logical_state, replace=True)
+        logical_run_id = logical_state.run_id
 
         try:
             for cycle_number in range(1, config.max_cycles + 1):
@@ -107,12 +108,14 @@ class AgentFeedbackRetryService:
                     runtime_feedback_state_store.update_run(
                         config.market_date,
                         lambda current, current_role=current_role: self._set_logical_role_context(current, current_role),
+                        run_id=logical_run_id,
                     )
                     batches: list[dict[str, Any]] = []
                     if role_remaining:
                         runtime_feedback_state_store.update_run(
                             config.market_date,
                             lambda current, current_role=current_role, total_symbols=total_symbols: self._set_single_symbol_slot_context(current, current_role, total_symbols),
+                            run_id=logical_run_id,
                         )
                         try:
                             result = agent_feedback_orchestrator.dispatch_for_symbols(
@@ -134,6 +137,7 @@ class AgentFeedbackRetryService:
                             runtime_feedback_state_store.update_run(
                                 config.market_date,
                                 lambda current, result=result, role_remaining=role_remaining: self._merge_batch_progress(current, result, role_remaining),
+                                run_id=logical_run_id,
                             )
                         except Exception as exc:  # noqa: BLE001
                             batches.append(
@@ -160,6 +164,7 @@ class AgentFeedbackRetryService:
                             runtime_feedback_state_store.update_run(
                                 config.market_date,
                                 lambda current, role_remaining=role_remaining: self._merge_batch_exception(current, role_remaining, [current_role]),
+                                run_id=logical_run_id,
                             )
                     role_batches.append(
                         {
@@ -174,6 +179,7 @@ class AgentFeedbackRetryService:
                 runtime_feedback_state_store.update_run(
                     config.market_date,
                     lambda current, remaining=remaining: self._refresh_logical_pending(current, remaining),
+                    run_id=logical_run_id,
                 )
                 cycles.append(
                     {
@@ -190,6 +196,7 @@ class AgentFeedbackRetryService:
             runtime_feedback_state_store.update_run(
                 config.market_date,
                 self._finalize_logical_run,
+                run_id=logical_run_id,
             )
 
         progress = self._get_retry_progress(
