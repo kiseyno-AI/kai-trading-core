@@ -1,4 +1,7 @@
 from datetime import date
+import os
+import signal
+import subprocess
 from typing import Any
 
 import logging
@@ -420,3 +423,65 @@ async def list_agent_feedback(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f'Agent feedback read failed: {exc}') from exc
+
+
+class CoreControlRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+    action: str = Field(default='kill', pattern=r'^(kill|restart)$')
+    signal_name: str = Field(default='SIGKILL', pattern=r'^SIG(?:TERM|KILL)$')
+    port: int = Field(default=8000, ge=1, le=65535)
+
+
+@router.post('/internal/core/control')
+async def control_core_api(payload: CoreControlRequest) -> dict:
+    try:
+        result = subprocess.run(
+            ['lsof', '-ti', f':{payload.port}'],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        pid_text = result.stdout.strip()
+        pids = []
+        if pid_text:
+            for piece in pid_text.splitlines():
+                piece = piece.strip()
+                if not piece:
+                    continue
+                pids.append(int(piece))
+        sig = signal.SIGKILL if payload.signal_name == 'SIGKILL' else signal.SIGTERM
+        killed = []
+        for pid in pids:
+            os.kill(pid, sig)
+            killed.append(pid)
+        if payload.action == 'restart':
+            plist = '/Users/shawn/kai-trading-core/apps/api/com.kiseyno.kai-trading-core-api.plist'
+            uid = str(os.getuid())
+            subprocess.run(['launchctl', 'bootout', f'gui/{uid}', plist], check=False, capture_output=True, text=True)
+            restarted = subprocess.run(['launchctl', 'bootstrap', f'gui/{uid}', plist], check=True, capture_output=True, text=True)
+            logger.warning('core api control endpoint invoked', extra={'action': payload.action, 'port': payload.port, 'signal': payload.signal_name, 'killed_pids': killed})
+            return {
+                'status': 'restarted',
+                'port': payload.port,
+                'signal': payload.signal_name,
+                'killed_pids': killed,
+                'launchctl_stdout': restarted.stdout.strip(),
+                'launchctl_stderr': restarted.stderr.strip(),
+            }
+        status = 'killed' if killed else 'no_process'
+        logger.warning('core api control endpoint invoked', extra={'action': payload.action, 'port': payload.port, 'signal': payload.signal_name, 'killed_pids': killed})
+        return {
+            'status': status,
+            'port': payload.port,
+            'signal': payload.signal_name,
+            'pids': killed,
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ProcessLookupError as exc:
+        raise HTTPException(status_code=404, detail=f'Process already exited: {exc}') from exc
+    except subprocess.CalledProcessError as exc:
+        raise HTTPException(status_code=500, detail=f'Core api restart failed: {exc.stderr or exc.stdout or exc}') from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'Core api control failed: {exc}') from exc
