@@ -44,6 +44,21 @@ from app.db_models import AgentContextFeedback, EODCollectionRun
 logger = logging.getLogger(__name__)
 
 
+def _feedback_runtime_log(stage: str, **payload: Any) -> None:
+    line = {
+        'scope': 'agent_feedback_runtime',
+        'stage': stage,
+        **payload,
+    }
+    debug_path = __import__('pathlib').Path(__file__).resolve().parents[2] / 'var' / 'log' / 'agent-feedback-runtime.log'
+    try:
+        debug_path.parent.mkdir(parents=True, exist_ok=True)
+        with debug_path.open('a', encoding='utf-8') as fh:
+            fh.write(json.dumps(line, ensure_ascii=False, default=str) + '\n')
+    except OSError:
+        pass
+
+
 class AgentDispatchError(RuntimeError):
     pass
 
@@ -591,6 +606,15 @@ class OpenClawAgentClient:
             try:
                 request_session_key = fixed_session_key
                 headers = self._headers() | {'x-openclaw-session-key': request_session_key}
+                _feedback_runtime_log(
+                    'dispatch_batch_request',
+                    agent_name=spec.agent_name,
+                    role=spec.role,
+                    market_date=market_date.isoformat(),
+                    session_key=request_session_key,
+                    batch_symbols=[str(item.get('symbol')) for item in batch_items],
+                    request_body=body,
+                )
                 with httpx.Client(timeout=max(self.timeout_seconds, settings.openclaw_agent_subtask_timeout_seconds), headers=headers) as client:
                     response = client.post(url, json=body)
                 if response.status_code >= 500:
@@ -600,6 +624,15 @@ class OpenClawAgentClient:
                 if response.status_code >= 400:
                     raise AgentDispatchTerminalError(f'OpenClaw batch failed {response.status_code}: {response.text[:300]}')
                 parsed = response.json()
+                _feedback_runtime_log(
+                    'dispatch_batch_response',
+                    agent_name=spec.agent_name,
+                    role=spec.role,
+                    market_date=market_date.isoformat(),
+                    session_key=request_session_key,
+                    status_code=response.status_code,
+                    response_body=parsed,
+                )
                 output_text = None
                 for item in parsed.get('output', []):
                     if item.get('type') != 'message':
@@ -1109,6 +1142,16 @@ class AgentFeedbackOrchestrator:
                                     }
                                     all_failures.append(failure)
                                     buffer_failure(role, symbol, 'missing_batch_feedback', True)
+                                    _feedback_runtime_log(
+                                        'buffer_failure',
+                                        market_date=normalized_market_date.isoformat(),
+                                        request_run_id=request_run_id,
+                                        role=role,
+                                        agent_name=spec.agent_name,
+                                        symbol=symbol,
+                                        error='missing_batch_feedback',
+                                        batch_result=batch_result,
+                                    )
                                     continue
                                 response_payload = {
                                     'attempt': batch_result.get('attempt', 1),
@@ -1118,6 +1161,16 @@ class AgentFeedbackOrchestrator:
                                     'session_ref': batch_result.get('session_ref'),
                                 }
                                 buffer_success(spec.agent_name, symbol, source_item, response_payload)
+                                _feedback_runtime_log(
+                                    'buffer_success',
+                                    market_date=normalized_market_date.isoformat(),
+                                    request_run_id=request_run_id,
+                                    role=role,
+                                    agent_name=spec.agent_name,
+                                    symbol=symbol,
+                                    response_payload=response_payload,
+                                    source_item=source_item,
+                                )
                                 all_items.append(
                                     {
                                         'role': role,
@@ -1139,6 +1192,16 @@ class AgentFeedbackOrchestrator:
                                 }
                                 all_failures.append(failure)
                                 buffer_failure(role, source_item['symbol'], f'{type(exc).__name__}: {exc}', True)
+                                _feedback_runtime_log(
+                                    'buffer_exception',
+                                    market_date=normalized_market_date.isoformat(),
+                                    request_run_id=request_run_id,
+                                    role=role,
+                                    agent_name=spec.agent_name,
+                                    symbol=source_item['symbol'],
+                                    error_type=type(exc).__name__,
+                                    error=str(exc),
+                                )
                         finally:
                             mark_activity(role, slot, done=True)
                             submit_next()
@@ -1157,7 +1220,24 @@ class AgentFeedbackOrchestrator:
             }
             for row in buffered_rows
         ]
+        _feedback_runtime_log(
+            'flush_begin',
+            market_date=normalized_market_date.isoformat(),
+            request_run_id=request_run_id,
+            buffered_feedback_count=len(buffered_rows),
+            buffered_failure_count=len(final_state.buffered_failures),
+            flush_payload=flush_payload,
+            buffered_failures=final_state.buffered_failures,
+        )
         flush_result = agent_context_feedback_service.bulk_submit_feedback(items=flush_payload)
+        _feedback_runtime_log(
+            'flush_complete',
+            market_date=normalized_market_date.isoformat(),
+            request_run_id=request_run_id,
+            buffered_feedback_count=len(buffered_rows),
+            persisted_count=len(flush_result),
+            persisted_rows=flush_result,
+        )
         self._cleanup_buffered_feedback_sessions(rows=buffered_rows)
         completed_count = len(buffered_rows)
         failed_count = len(final_state.buffered_failures)
