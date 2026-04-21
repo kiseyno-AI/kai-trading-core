@@ -128,6 +128,7 @@
 ## Agent context read-layer notes
 - `GET /agent-context/symbol-day` is the current machine-consumption read layer for symbol/day analysis. It does not rank names or emit final trading decisions.
 - The route aggregates persisted symbol metadata, same-day technical snapshot, same-day deterministic action summary, same-day KIS ranking signal features, latest stored DART fundamentals summary, and recent disclosure events up to the requested `market_date`.
+- Symbol-day context now also includes `price_context` derived only from stored `daily_price_bars`: OHLC, intraday range, candle body and wick interpretation, close location inside the day's range, and gap-versus-previous-close fields when a prior stored close exists.
 - Symbol-day context now uses exact-date technical snapshots for downstream agent dispatch and does not silently fall back to older technical snapshot rows.
 - The response is intentionally block-oriented and compact so downstream agents can prioritize and interpret instead of re-querying multiple endpoints or parsing prose-heavy summaries.
 
@@ -153,7 +154,7 @@
 - Repo helper entrypoint for session deletion retries: from `apps/api`, run `python3.11 scripts/cleanup_stale_feedback_sessions.py --limit 100`. Successful immediate deletions are not persisted; only failed deletions remain queued.
 - End-to-end one-command smoke path: from `apps/api`, run `python3.11 -m app.internal.ops agent-feedback-symbol-cleanup-smoke --market-date YYYY-MM-DD --symbols 005930,000660,...`.
 - The default daily EOD steady-state loop now includes DART daily incremental fundamentals refresh immediately after successful daily pykrx capture when `EOD_TRIGGER_FUNDAMENTALS_AFTER_CAPTURE=true` (the repo default). That refresh can then automatically trigger the feedback retry-cycle workflow after refresh completion when `OPENCLAW_FEEDBACK_TRIGGER_AFTER_FUNDAMENTALS_REFRESH=true`.
-- Each role now receives a different JSON payload built for its job instead of one shared generic blob: market breadth and trending context for EOD summary, technical/state windows for technical summary, and disclosure plus fundamentals windows for fundamental summary.
+- Each role now receives a different JSON payload built for its job instead of one shared generic blob: the EOD summary payload includes market breadth, stored trending leaders, and KIS ranking participation context; the technical summary payload carries technical/state windows; and the fundamental summary payload carries disclosure plus fundamentals windows.
 - Dispatch requires `OPENCLAW_BASE_URL` and `OPENCLAW_GATEWAY_TOKEN` configuration, retries retryable failures, and persists successful responses into `agent_context_feedback` as either market-level rows with symbol `__MARKET__` or symbol-level rows for symbol dispatch.
 - Stored normalized feedback now includes a shared top-level contract: `role`, `summary`, `confidence`, `risk_flags`, `details`, and `improvement_notes` so later jobs can mine repeated data/algorithm gaps.
 - Feedback is append-only and stored separately from deterministic `daily_action_summaries`; it does not create orders, positions, or live-trading behavior.

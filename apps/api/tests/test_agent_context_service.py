@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import patch
 
-from app.agent_context.read_service import AgentContextReadService
+from app.agent_context.read_service import AgentContextReadService, _build_price_context
 
 
 class FakeFundamentalsRepository:
@@ -101,6 +101,7 @@ class FakeDisclosureRepository:
 
 
 class AgentContextReadServiceTests(unittest.TestCase):
+    @patch('app.agent_context.read_service._load_recent_price_bars_by_symbol')
     @patch('app.agent_context.read_service.load_daily_action_summaries')
     @patch('app.agent_context.read_service.load_daily_signal_features')
     @patch('app.agent_context.read_service.load_daily_technical_snapshots')
@@ -111,6 +112,7 @@ class AgentContextReadServiceTests(unittest.TestCase):
         load_technical_mock,
         load_signal_features_mock,
         load_actions_mock,
+        load_price_bars_mock,
     ):
         load_symbols_mock.return_value = [
             {
@@ -180,6 +182,33 @@ class AgentContextReadServiceTests(unittest.TestCase):
                 'captured_at': '2026-04-08T15:00:00+09:00',
             }
         ]
+        load_price_bars_mock.return_value = {
+            '005930': [
+                {
+                    'trade_date': '2026-04-08',
+                    'open_price': 70000,
+                    'high_price': 72000,
+                    'low_price': 69950,
+                    'close_price': 71500,
+                    'volume': 123456,
+                    'turnover': 8800000000,
+                    'source': 'pykrx',
+                    'captured_at': '2026-04-08T15:30:00+09:00',
+                },
+                {
+                    'trade_date': '2026-04-07',
+                    'open_price': 69000,
+                    'high_price': 70500,
+                    'low_price': 68800,
+                    'close_price': 69800,
+                    'volume': 111111,
+                    'turnover': 7600000000,
+                    'source': 'pykrx',
+                    'captured_at': '2026-04-07T15:30:00+09:00',
+                },
+            ],
+            '000660': [],
+        }
 
         service = AgentContextReadService(
             fundamentals_repository=FakeFundamentalsRepository(),
@@ -193,10 +222,11 @@ class AgentContextReadServiceTests(unittest.TestCase):
             disclosures_limit=3,
         )
 
-        self.assertEqual(load_technical_mock.call_args.kwargs['fallback_window_days'], 3)
+        self.assertEqual(load_technical_mock.call_args.kwargs['fallback_window_days'], 0)
 
         self.assertEqual(result['summary']['requested_symbol_count'], 2)
         self.assertEqual(result['summary']['matched_symbol_count'], 1)
+        self.assertEqual(result['summary']['price_context_count'], 1)
         self.assertEqual(result['summary']['technical_snapshot_count'], 1)
         self.assertEqual(result['summary']['action_summary_count'], 1)
         self.assertEqual(result['summary']['signal_feature_count'], 1)
@@ -207,19 +237,28 @@ class AgentContextReadServiceTests(unittest.TestCase):
         self.assertEqual(first_item['symbol'], '005930')
         self.assertEqual(first_item['company']['name_ko'], '삼성전자')
         self.assertEqual(first_item['company']['dart']['corp_code'], '00126380')
+        self.assertEqual(first_item['price_context']['open_price'], 70000)
+        self.assertEqual(first_item['price_context']['gap']['previous_close_price'], 69800)
+        self.assertEqual(first_item['price_context']['gap']['direction'], 'up')
+        self.assertFalse(first_item['price_context']['gap']['filled_intraday'])
+        self.assertEqual(first_item['price_context']['session_range']['close_position_label'], 'upper_half')
+        self.assertEqual(first_item['price_context']['candle']['wick_bias'], 'upper')
         self.assertEqual(first_item['technical_snapshot']['trend_state'], 'uptrend')
         self.assertEqual(first_item['action_summary']['action_label'], 'long_breakout')
         self.assertEqual(first_item['signal_features']['signal_count'], 2)
         self.assertEqual(first_item['fundamentals']['latest_snapshot']['period']['period_end_date'], '2024-12-31')
         self.assertEqual(first_item['fundamentals']['latest_snapshot']['statement']['row_count'], 1)
         self.assertEqual(first_item['recent_disclosures']['count'], 1)
+        self.assertTrue(first_item['availability']['price_context'])
 
         second_item = result['items'][1]
         self.assertEqual(second_item['symbol'], '000660')
+        self.assertIsNone(second_item['price_context'])
         self.assertIsNone(second_item['technical_snapshot'])
         self.assertIsNone(second_item['signal_features'])
         self.assertIsNone(second_item['fundamentals']['latest_snapshot'])
         self.assertEqual(second_item['recent_disclosures']['count'], 0)
+        self.assertFalse(second_item['availability']['price_context'])
 
     def test_get_symbol_day_context_requires_at_least_one_symbol(self):
         service = AgentContextReadService(
@@ -229,3 +268,37 @@ class AgentContextReadServiceTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, 'At least one symbol is required'):
             service.get_symbol_day_context(market_date='2026-04-08', symbols=[])
+
+    def test_build_price_context_marks_gap_fill_and_flat_candle_conservatively(self):
+        context = _build_price_context(
+            [
+                {
+                    'trade_date': '2026-04-08',
+                    'open_price': 100,
+                    'high_price': 108,
+                    'low_price': 95,
+                    'close_price': 100,
+                    'volume': 10,
+                    'turnover': 1000,
+                    'source': 'pykrx',
+                    'captured_at': '2026-04-08T15:30:00+09:00',
+                },
+                {
+                    'trade_date': '2026-04-07',
+                    'open_price': 95,
+                    'high_price': 99,
+                    'low_price': 94,
+                    'close_price': 96,
+                    'volume': 12,
+                    'turnover': 1200,
+                    'source': 'pykrx',
+                    'captured_at': '2026-04-07T15:30:00+09:00',
+                },
+            ]
+        )
+
+        self.assertEqual(context['candle']['direction'], 'flat')
+        self.assertEqual(context['candle']['body_points'], 0)
+        self.assertEqual(context['gap']['direction'], 'up')
+        self.assertTrue(context['gap']['filled_intraday'])
+        self.assertEqual(context['session_range']['close_position_label'], 'lower_half')
