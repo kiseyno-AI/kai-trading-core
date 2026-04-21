@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 from datetime import date, timedelta
 from decimal import Decimal
@@ -8,6 +9,7 @@ from typing import Any
 from sqlalchemy import and_, desc, func, or_, select
 
 from app.agent_context.derived_contexts import (
+    DEFAULT_DERIVED_CONTEXT_HISTORY_DAYS,
     SIGNAL_PARTICIPATION_SOURCES,
     apply_participation_run_coverage,
     build_signal_participation_context as build_persisted_signal_participation_context,
@@ -25,6 +27,9 @@ from app.db_models import (
     Symbol,
 )
 from app.market_data_store import load_daily_market_participation_context
+from app.market_data_store import load_daily_market_participation_context_history
+
+PARTICIPATION_CONTEXT_HISTORY_DAYS = DEFAULT_DERIVED_CONTEXT_HISTORY_DAYS
 
 
 def _to_float(value: Any) -> float | None:
@@ -39,6 +44,34 @@ def _to_float(value: Any) -> float | None:
 
 def _safe_date(value: date | None) -> str | None:
     return value.isoformat() if value else None
+
+
+def _limit_participation_context_leaders(context: dict[str, Any], *, limit: int) -> dict[str, Any]:
+    limited = dict(context)
+    limited['leaders_by_source'] = {
+        source: list((limited.get('leaders_by_source') or {}).get(source) or [])[:limit]
+        for source, _, _ in SIGNAL_PARTICIPATION_SOURCES
+    }
+    return limited
+
+
+def _build_participation_context_history(
+    rows: list[dict[str, Any]],
+    *,
+    limit: int,
+) -> list[dict[str, Any]]:
+    return [
+        {
+            'market_date': row['market_date'],
+            'source': row['source'],
+            'captured_at': row['captured_at'],
+            'participation_context': _limit_participation_context_leaders(
+                dict(row.get('context_payload') or {}),
+                limit=limit,
+            ),
+        }
+        for row in rows
+    ]
 
 
 def _build_signal_feature_leader_rows(rows: list[dict[str, Any]], *, limit: int) -> list[dict[str, Any]]:
@@ -210,20 +243,30 @@ class AgentPayloadBuilder:
             market_date=run.trade_date,
             market=market,
         )
+        stored_participation_history = load_daily_market_participation_context_history(
+            market_date=run.trade_date,
+            market=market,
+            history_days=PARTICIPATION_CONTEXT_HISTORY_DAYS,
+        )
         participation_context = apply_participation_run_coverage(
             stored_participation_context.get('context_payload') if stored_participation_context else None,
             symbols_total=run.symbols_total,
             symbols_succeeded=run.symbols_succeeded,
         )
-        participation_context['leaders_by_source'] = {
-            source: list(items[: self.windows.top_n])
-            for source, items in participation_context['leaders_by_source'].items()
-        }
+        participation_context = _limit_participation_context_leaders(
+            participation_context,
+            limit=self.windows.top_n,
+        )
+        participation_context_history = _build_participation_context_history(
+            stored_participation_history,
+            limit=self.windows.top_n,
+        )
 
         return {
             'top_trending': grouped,
             'signal_feature_leaders': signal_rows,
             'participation_context': participation_context,
+            'participation_context_history': participation_context_history,
             'breadth_window': price_rows[-self.windows.market_breadth_days :],
         }
 

@@ -101,6 +101,7 @@ Useful limited-scope runs:
 - API-triggered technical snapshot rerun: `curl -X POST "http://127.0.0.1:8000/eod/technical-snapshots/compute?market_date=2026-04-07"`
 - API-triggered action summary rerun: `curl -X POST "http://127.0.0.1:8000/eod/action-summaries/compute?market_date=2026-04-07"`
 - KIS ranking signal-feature collection: `python3.11 -m app.internal.ops kis-daily-signal-features-collect --market-date 2026-04-14`
+- Recent derived-context backfill: `python3.11 -m app.internal.ops agent-derived-contexts-backfill-recent`
 - API-triggered KIS ranking signal-feature collection: `curl -X POST "http://127.0.0.1:8000/eod/signal-features/collect?market_date=2026-04-14"`
 
 Internal ops commands from `apps/api`:
@@ -114,6 +115,7 @@ Internal ops commands from `apps/api`:
 - `python3.11 -m app.internal.ops eod-trending-ranks-compute --market-date 2026-04-08`
 - `python3.11 -m app.internal.ops dart-fundamentals-daily-run-if-due --market-date 2026-04-14 --symbol-limit 250 --capture-limit 500`
 - `python3.11 -m app.internal.ops kis-daily-signal-features-collect --market-date 2026-04-14`
+- `python3.11 -m app.internal.ops agent-derived-contexts-backfill-recent`
 - `python3.11 -m app.internal.index_audit`
 
 Performance audit note:
@@ -134,11 +136,12 @@ Notes:
 - The automatic pykrx daily ingestion path now also persists `daily_price_contexts`, `daily_technical_snapshots`, `daily_action_summaries`, and day-based `daily_trending_ranks` after the day bar write completes.
 - KIS ranking signal-feature collection is a separate ops path because it calls KIS ranking endpoints (`volume-power`, `overtime-volume`, and `overtime-fluctuation`) rather than pykrx bars.
 - The KIS ranking signal-feature collection path also rebuilds `daily_market_participation_contexts` from the stored `daily_signal_features` rows for that market date.
+- `python3.11 -m app.internal.ops agent-derived-contexts-backfill-recent` is the repo-owned bootstrap path for the new derived-context tables. It backfills the recent seven trading days ending yesterday from existing stored `daily_price_bars` and `daily_signal_features`, and it skips participation dates that do not yet have stored signal-feature rows.
 - Duplicate bar writes are harmless because `daily_price_bars` upserts on `(symbol_id, trade_date)`, and the scheduler checks `eod_collection_runs` plus a Postgres advisory lock before starting.
 - When pykrx market-wide universe endpoints are empty, the command falls back to the existing KIS master universe so delisted names are still excluded.
 - Historical bars use pykrx's default adjusted OHLCV series because long-range `adjusted=False` calls returned empty data during local verification.
 - `--limit` runs do not deactivate missing symbols in the DB, so they are safe for small smoke tests.
-- The backfill writes into `symbols`, `daily_price_bars`, `eod_collection_runs`, `daily_price_contexts`, `daily_technical_snapshots`, `daily_action_summaries`, and day-based `daily_trending_ranks`.
+- The historical pykrx backfill writes into `symbols`, `daily_price_bars`, `eod_collection_runs`, `daily_price_contexts`, `daily_technical_snapshots`, `daily_action_summaries`, and day-based `daily_trending_ranks`.
 
 Local overrides:
 

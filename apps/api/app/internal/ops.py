@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from typing import Any, Iterable
 
+from app.agent_context.derived_contexts import derived_context_backfill_service
 from app.agent_context.orchestrator import agent_feedback_orchestrator
 from app.agent_context.session_cleanup_service import agent_feedback_session_cleanup_service
 from app.core.settings import settings
@@ -196,6 +197,20 @@ def run_agent_feedback_symbol_cleanup_smoke(
     return result
 
 
+def backfill_recent_derived_contexts(
+    *,
+    end_date: str | None = None,
+    trading_days: int = 7,
+    market: str = 'KRX',
+) -> dict[str, Any]:
+    bootstrap_runtime()
+    return derived_context_backfill_service.backfill_recent_history(
+        end_date=end_date,
+        trading_days=trading_days,
+        market=market,
+    )
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description='Internal kai-trading-core operations without self-HTTP.')
     subparsers = parser.add_subparsers(dest='command', required=True)
@@ -262,6 +277,14 @@ def _build_parser() -> argparse.ArgumentParser:
     feedback_smoke_parser.add_argument('--disclosures-limit', type=int, default=5)
     feedback_smoke_parser.add_argument('--cleanup-retry-limit', type=int, default=100)
     feedback_smoke_parser.add_argument('--dump-json-path')
+
+    derived_context_backfill_parser = subparsers.add_parser(
+        'agent-derived-contexts-backfill-recent',
+        help='Backfill persisted price and participation context rows for the recent trading window ending yesterday',
+    )
+    derived_context_backfill_parser.add_argument('--end-date')
+    derived_context_backfill_parser.add_argument('--trading-days', type=int, default=7)
+    derived_context_backfill_parser.add_argument('--market', default='KRX')
     return parser
 
 
@@ -319,6 +342,12 @@ def main(argv: Iterable[str] | None = None) -> int:
             disclosures_limit=args.disclosures_limit,
             cleanup_retry_limit=args.cleanup_retry_limit,
             dump_json_path=args.dump_json_path,
+        )
+    elif args.command == 'agent-derived-contexts-backfill-recent':
+        payload = backfill_recent_derived_contexts(
+            end_date=args.end_date,
+            trading_days=args.trading_days,
+            market=args.market,
         )
     else:
         parser.error(f'Unsupported command: {args.command}')

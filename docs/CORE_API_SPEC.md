@@ -680,6 +680,28 @@ Authorization: Bearer <token>
           "filled_intraday": true
         }
       },
+      "price_context_history": [
+        {
+          "market_date": "2026-04-08",
+          "source": "pykrx",
+          "captured_at": "2026-04-08T15:30:00+09:00",
+          "price_context": {
+            "trade_date": "2026-04-08",
+            "close_price": 69800,
+            "candle": {"direction": "bullish"}
+          }
+        },
+        {
+          "market_date": "2026-04-09",
+          "source": "pykrx",
+          "captured_at": "2026-04-09T15:30:00+09:00",
+          "price_context": {
+            "trade_date": "2026-04-09",
+            "close_price": 71500,
+            "candle": {"direction": "bullish"}
+          }
+        }
+      ],
       "technical_snapshot": {
         "symbol": "005930",
         "market_date": "2026-04-09",
@@ -743,7 +765,7 @@ It is a composed read payload intended for:
 - summary card generation,
 - low-roundtrip consumers.
 
-`price_context` is read from persisted `daily_price_contexts`, which the EOD pipeline derives from stored `daily_price_bars` for the same market date.
+`price_context` is read from persisted `daily_price_contexts`, which the EOD pipeline derives from stored `daily_price_bars` for the same market date. `price_context_history` carries up to the latest seven persisted rows ending at the requested `market_date`.
 
 ### Important nullability
 Each subsection can be absent independently.

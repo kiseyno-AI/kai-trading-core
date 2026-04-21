@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 from typing import Any, Sequence
 
 from app.market_data_store import (
     list_symbols_with_daily_bar_on_date,
     load_daily_signal_feature_context_rows,
+    load_recent_daily_price_trade_dates,
     load_recent_price_bars_by_symbol,
     upsert_daily_market_participation_context,
     upsert_daily_price_context,
@@ -19,6 +20,7 @@ SIGNAL_PARTICIPATION_SOURCES: tuple[tuple[str, str, str], ...] = (
     ('overtime-fluctuation', 'overtime_fluctuation_rank', 'overtime_fluctuation_rate'),
 )
 PARTICIPATION_CONTEXT_LEADER_LIMIT = 20
+DEFAULT_DERIVED_CONTEXT_HISTORY_DAYS = 7
 
 
 def _to_float(value: Any) -> float | None:
@@ -266,6 +268,8 @@ class DailyPriceContextService:
 
         items: list[dict[str, Any]] = []
         failed_symbols: list[str] = []
+        items: list[dict[str, Any]] = []
+        failed_symbols: list[str] = []
         expected_trade_date = normalized_market_date.isoformat()
         for symbol in target_symbols:
             price_bars = price_bars_by_symbol.get(symbol, [])
@@ -274,6 +278,9 @@ class DailyPriceContextService:
                 continue
 
             context_payload = build_price_context(price_bars)
+            if context_payload is None:
+                failed_symbols.append(symbol)
+                continue
             if context_payload is None:
                 failed_symbols.append(symbol)
                 continue
@@ -306,16 +313,16 @@ class DailyPriceContextService:
 
 
 class DailyMarketParticipationContextService:
-    def compute_and_persist_for_market_date(
+    def compute_and_persist_from_rows(
         self,
         *,
         market_date: str | date,
+        rows: list[dict[str, Any]],
         market: str = 'KRX',
         source: str = 'kis_ranking',
         leader_limit: int = PARTICIPATION_CONTEXT_LEADER_LIMIT,
     ) -> dict[str, Any]:
         normalized_market_date = market_date if isinstance(market_date, date) else date.fromisoformat(market_date)
-        rows = load_daily_signal_feature_context_rows(market_date=normalized_market_date)
         context_payload = build_signal_participation_context(rows, limit=leader_limit)
         upsert_daily_market_participation_context(
             market_date=normalized_market_date,
@@ -331,6 +338,140 @@ class DailyMarketParticipationContextService:
             'context_payload': context_payload,
         }
 
+    def compute_and_persist_for_market_date(
+        self,
+        *,
+        market_date: str | date,
+        market: str = 'KRX',
+        source: str = 'kis_ranking',
+        leader_limit: int = PARTICIPATION_CONTEXT_LEADER_LIMIT,
+    ) -> dict[str, Any]:
+        normalized_market_date = market_date if isinstance(market_date, date) else date.fromisoformat(market_date)
+        rows = load_daily_signal_feature_context_rows(market_date=normalized_market_date)
+        return self.compute_and_persist_from_rows(
+            market_date=normalized_market_date,
+            rows=rows,
+            market=market,
+            source=source,
+            leader_limit=leader_limit,
+        )
+
+
+class DerivedContextBackfillService:
+    def backfill_recent_history(
+        self,
+        *,
+        end_date: str | date | None = None,
+        trading_days: int = DEFAULT_DERIVED_CONTEXT_HISTORY_DAYS,
+        market: str = 'KRX',
+        price_context_source: str = 'pykrx',
+        participation_context_source: str = 'kis_ranking',
+    ) -> dict[str, Any]:
+        if trading_days <= 0:
+            raise ValueError('trading_days must be greater than 0')
+
+        normalized_end_date = (
+            end_date
+            if isinstance(end_date, date)
+            else date.fromisoformat(end_date)
+            if end_date
+            else (date.today() - timedelta(days=1))
+        )
+        market_dates = load_recent_daily_price_trade_dates(
+            end_date=normalized_end_date,
+            limit=trading_days,
+        )
+        if not market_dates:
+            return {
+                'market': market,
+                'requested_trading_days': trading_days,
+                'end_date': normalized_end_date.isoformat(),
+                'market_dates': [],
+                'price_contexts': {
+                    'dates_processed': 0,
+                    'contexts_persisted': 0,
+                    'contexts_failed': 0,
+                },
+                'participation_contexts': {
+                    'dates_processed': 0,
+                    'dates_skipped': 0,
+                    'captured_symbol_count': 0,
+                    'skipped_dates': [],
+                },
+                'items': [],
+            }
+
+        items: list[dict[str, Any]] = []
+        price_contexts_persisted = 0
+        price_contexts_failed = 0
+        participation_dates_processed = 0
+        participation_dates_skipped = 0
+        participation_captured_symbol_count = 0
+        skipped_participation_dates: list[dict[str, str]] = []
+
+        for market_date in market_dates:
+            price_result = daily_price_context_service.compute_and_persist_for_market_date(
+                market_date=market_date,
+                source=price_context_source,
+            )
+            price_contexts_persisted += int(price_result.get('contexts_persisted') or 0)
+            price_contexts_failed += int(price_result.get('contexts_failed') or 0)
+
+            participation_rows = load_daily_signal_feature_context_rows(market_date=market_date)
+            participation_result: dict[str, Any]
+            if participation_rows:
+                participation_result = daily_market_participation_context_service.compute_and_persist_from_rows(
+                    market_date=market_date,
+                    rows=participation_rows,
+                    market=market,
+                    source=participation_context_source,
+                )
+                participation_dates_processed += 1
+                participation_captured_symbol_count += int(participation_result.get('captured_symbol_count') or 0)
+            else:
+                participation_dates_skipped += 1
+                participation_result = {
+                    'market': market,
+                    'market_date': market_date,
+                    'source': participation_context_source,
+                    'skipped': True,
+                    'reason': 'no_signal_features_for_market_date',
+                }
+                skipped_participation_dates.append(
+                    {
+                        'market_date': market_date,
+                        'reason': 'no_signal_features_for_market_date',
+                    }
+                )
+
+            items.append(
+                {
+                    'market_date': market_date,
+                    'price_contexts': price_result,
+                    'participation_context': participation_result,
+                }
+            )
+
+        return {
+            'market': market,
+            'requested_trading_days': trading_days,
+            'end_date': normalized_end_date.isoformat(),
+            'market_dates': market_dates,
+            'price_contexts': {
+                'dates_processed': len(market_dates),
+                'contexts_persisted': price_contexts_persisted,
+                'contexts_failed': price_contexts_failed,
+            },
+            'participation_contexts': {
+                'dates_processed': participation_dates_processed,
+                'dates_skipped': participation_dates_skipped,
+                'captured_symbol_count': participation_captured_symbol_count,
+                'skipped_dates': skipped_participation_dates,
+            },
+            'items': items,
+        }
+
 
 daily_price_context_service = DailyPriceContextService()
 daily_market_participation_context_service = DailyMarketParticipationContextService()
+derived_context_backfill_service = DerivedContextBackfillService()

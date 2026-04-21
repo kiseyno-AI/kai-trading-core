@@ -286,17 +286,20 @@ class PykrxBackfillServiceTests(TestCase):
             symbols=['005930'],
             source='pykrx',
             run_id=12,
+            progress_callback=ANY,
         )
         action_summaries.assert_called_once_with(
             market_date='2026-04-03',
             symbols=['005930'],
             source='pykrx',
             run_id=12,
+            progress_callback=ANY,
         )
         trending_ranks.assert_called_once_with(
             market_date='2026-04-03',
             source='pykrx',
             run_id=12,
+            progress_callback=ANY,
         )
         self.assertTrue(
             any(
@@ -311,6 +314,7 @@ class PykrxBackfillServiceTests(TestCase):
             symbols_succeeded=1,
             symbols_failed=0,
             error_message=None,
+            run_metadata=ANY,
         )
 
     def test_run_collection_keeps_retryable_status_when_snapshot_persistence_has_failures(self) -> None:
@@ -381,6 +385,7 @@ class PykrxBackfillServiceTests(TestCase):
             symbols_succeeded=1,
             symbols_failed=0,
             error_message='Technical snapshot persistence incomplete for symbols: 005930 | Action summary persistence incomplete for symbols: 005930',
+            run_metadata=ANY,
         )
 
     def test_run_daily_collection_skips_completed_with_errors_without_failed_symbols(self) -> None:
@@ -574,10 +579,10 @@ class PykrxBackfillServiceTests(TestCase):
                 'app.eod.pykrx_backfill.daily_price_context_service.compute_and_persist_for_market_date',
                 return_value={
                     'contexts_persisted': 0,
-                    'contexts_failed': 1,
-                    'failed_symbols': ['005930'],
+                    'contexts_failed': 0,
+                    'failed_symbols': [],
                 },
-            ),
+            ) as price_contexts,
             patch(
                 'app.eod.pykrx_backfill.daily_technical_snapshot_service.compute_and_persist_for_market_date',
                 return_value={'snapshots_persisted': 0, 'snapshots_failed': 1},
@@ -599,11 +604,19 @@ class PykrxBackfillServiceTests(TestCase):
             )
 
         self.assertEqual(result['status'], 'completed_with_errors')
+        self.assertEqual(result['failed_symbols'], ['005930'])
+        price_contexts.assert_called_once_with(
+            market_date='2026-04-03',
+            symbols=[],
+            source='pykrx',
+            run_id=12,
+        )
         technical_snapshots.assert_called_once_with(
             market_date='2026-04-03',
             symbols=['005930'],
             source='pykrx',
             run_id=12,
+            progress_callback=ANY,
         )
         self.assertTrue(
             any(

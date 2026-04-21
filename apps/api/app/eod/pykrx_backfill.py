@@ -1065,12 +1065,13 @@ class PykrxBackfillService:
             )
             raise
 
+        price_context_symbols = [item.symbol for item in symbols if item.symbol not in set(failed_symbols)]
         price_context_result: dict
         price_context_error_message: str | None = None
         try:
             price_context_result = daily_price_context_service.compute_and_persist_for_market_date(
                 market_date=latest_trade_date,
-                symbols=[item.symbol for item in symbols],
+                symbols=price_context_symbols,
                 source='pykrx',
                 run_id=run_id,
             )
@@ -1078,10 +1079,10 @@ class PykrxBackfillService:
             price_context_result = {
                 'market_date': latest_trade_date,
                 'source': 'pykrx',
-                'requested_symbols': len(symbols),
+                'requested_symbols': len(price_context_symbols),
                 'contexts_persisted': 0,
-                'contexts_failed': len(symbols),
-                'failed_symbols': [item.symbol for item in symbols][:50],
+                'contexts_failed': len(price_context_symbols),
+                'failed_symbols': price_context_symbols[:50],
                 'items': [],
                 'error': str(exc),
             }
