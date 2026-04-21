@@ -82,7 +82,6 @@ class AgentFeedbackRetryService:
             logical_pending_symbols=len(remaining),
             logical_completed_feedback_count=0,
             logical_failed_items=0,
-            normalized_response_count=0,
         )
         runtime_feedback_state_store.start_run(logical_state, replace=True)
 

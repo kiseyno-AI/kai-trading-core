@@ -33,7 +33,6 @@ class RuntimeFeedbackRunState:
     logical_pending_symbols: int | None = None
     logical_completed_feedback_count: int | None = None
     logical_failed_items: int | None = None
-    normalized_response_count: int | None = None
 
     def to_progress_summary(self) -> dict[str, Any]:
         expected_feedback_count = self.logical_expected_feedback_count if self.logical_expected_feedback_count is not None else len(self.requested_symbols) * len(self.requested_roles)
@@ -98,7 +97,6 @@ class RuntimeFeedbackRunState:
             'progress_percent': round(progress_ratio * 100, 2),
             'failed_items': self.logical_failed_items if self.logical_failed_items is not None else len(self.buffered_failures),
             'completed_feedback_count': completed_feedback_count,
-            'normalized_response_count': self.normalized_response_count if self.normalized_response_count is not None else completed_feedback_count,
             'expected_feedback_count': expected_feedback_count,
             'completed_feedback_per_minute': completed_feedback_per_minute,
             'completed_symbols_per_minute': None,
