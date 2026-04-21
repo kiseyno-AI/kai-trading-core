@@ -656,6 +656,26 @@ class OpenClawAgentClient:
                                 decoded = candidate_decoded
                                 output_text = candidate_text
                                 break
+                if isinstance(decoded, dict) and not isinstance(decoded.get('items'), list):
+                    normalized_feedback = normalize_agent_response(
+                        role=spec.role,
+                        output_text=output_text or json.dumps(decoded, ensure_ascii=False),
+                        raw_response=decoded,
+                    )
+                    symbol_items = []
+                    for batch_item in batch_items:
+                        symbol = str(batch_item.get('symbol') or '').strip()
+                        if not symbol:
+                            continue
+                        symbol_items.append(
+                            {
+                                'symbol': symbol,
+                                'feedback': normalized_feedback,
+                            }
+                        )
+                    decoded = {
+                        'items': symbol_items,
+                    }
                 if decoded is None:
                     raise AgentDispatchRetryableError('OpenClaw batch returned invalid JSON')
                 return {
