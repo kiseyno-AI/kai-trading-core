@@ -30,7 +30,7 @@ class SequentialFakeSession:
 
 
 class AgentPayloadBuilderTests(unittest.TestCase):
-    def test_build_signal_participation_context_uses_kis_source_counts_and_sorted_leaders(self):
+    def test_build_signal_participation_context_uses_full_row_source_counts_and_sorted_leaders(self):
         rows = [
             {
                 'symbol': '005930',
@@ -86,10 +86,84 @@ class AgentPayloadBuilderTests(unittest.TestCase):
         self.assertEqual(result['coverage_ratio_vs_run_total'], 0.025)
         self.assertEqual(result['coverage_ratio_vs_run_succeeded'], 0.03)
         self.assertEqual(result['signal_count_distribution'], {'1': 1, '2': 1, '3': 1})
-        self.assertEqual(result['source_counts']['volume-power'], 50)
+        self.assertEqual(
+            result['source_counts'],
+            {
+                'volume-power': 2,
+                'overtime-volume': 2,
+                'overtime-fluctuation': 2,
+            },
+        )
         self.assertEqual(result['leaders_by_source']['volume-power'][0]['symbol'], '000660')
         self.assertEqual(result['leaders_by_source']['overtime-volume'][0]['symbol'], '035420')
         self.assertEqual(result['leaders_by_source']['overtime-fluctuation'][0]['symbol'], '000660')
+
+    def test_build_signal_participation_context_is_order_independent_when_payload_source_counts_are_mixed(self):
+        rows = [
+            {
+                'symbol': '005930',
+                'name_ko': '삼성전자',
+                'market': 'KOSPI',
+                'signal_count': 2,
+                'volume_power_rank': 2,
+                'volume_power': 145.2,
+                'overtime_volume_rank': None,
+                'overtime_volume': None,
+                'overtime_fluctuation_rank': 3,
+                'overtime_fluctuation_rate': 2.4,
+                'feature_payload': {'source_counts': {'volume-power': 50}},
+            },
+            {
+                'symbol': '000660',
+                'name_ko': 'SK하이닉스',
+                'market': 'KOSPI',
+                'signal_count': 2,
+                'volume_power_rank': 1,
+                'volume_power': 151.5,
+                'overtime_volume_rank': 2,
+                'overtime_volume': 88000,
+                'overtime_fluctuation_rank': None,
+                'overtime_fluctuation_rate': None,
+                'feature_payload': {'source_counts': {'overtime-volume': 35}},
+            },
+            {
+                'symbol': '035420',
+                'name_ko': 'NAVER',
+                'market': 'KOSPI',
+                'signal_count': 2,
+                'volume_power_rank': None,
+                'volume_power': None,
+                'overtime_volume_rank': 1,
+                'overtime_volume': 99000,
+                'overtime_fluctuation_rank': 1,
+                'overtime_fluctuation_rate': 3.1,
+                'feature_payload': {},
+            },
+        ]
+        run = SimpleNamespace(symbols_total=120, symbols_succeeded=100)
+
+        result = _build_signal_participation_context(rows, limit=2, run=run)
+        reversed_result = _build_signal_participation_context(list(reversed(rows)), limit=2, run=run)
+
+        expected_source_counts = {
+            'volume-power': 2,
+            'overtime-volume': 2,
+            'overtime-fluctuation': 2,
+        }
+        self.assertEqual(result['source_counts'], expected_source_counts)
+        self.assertEqual(reversed_result['source_counts'], expected_source_counts)
+        self.assertEqual(
+            result['source_coverage_ratio_vs_run_succeeded'],
+            {
+                'volume-power': 0.02,
+                'overtime-volume': 0.02,
+                'overtime-fluctuation': 0.02,
+            },
+        )
+        self.assertEqual(
+            reversed_result['leaders_by_source']['overtime-volume'][0]['symbol'],
+            '035420',
+        )
 
     def test_build_market_payload_includes_participation_context(self):
         builder = AgentPayloadBuilder(
@@ -174,9 +248,9 @@ class AgentPayloadBuilderTests(unittest.TestCase):
         self.assertEqual(
             payload['participation_context']['source_counts'],
             {
-                'volume-power': 50,
-                'overtime-volume': 35,
-                'overtime-fluctuation': 25,
+                'volume-power': 2,
+                'overtime-volume': 1,
+                'overtime-fluctuation': 2,
             },
         )
         self.assertEqual(

@@ -75,22 +75,12 @@ def _build_signal_participation_context(
 ) -> dict[str, Any]:
     distribution = Counter(str(int(row['signal_count'])) for row in rows if row.get('signal_count') is not None)
 
-    source_counts: dict[str, int] = {}
-    for row in rows:
-        payload = row.get('feature_payload')
-        candidate = payload.get('source_counts') if isinstance(payload, dict) else None
-        if isinstance(candidate, dict) and candidate:
-            source_counts = {
-                str(source): int(count)
-                for source, count in candidate.items()
-                if count is not None
-            }
-            break
-    if not source_counts:
-        source_counts = {
-            source: sum(1 for row in rows if row.get(rank_key) is not None)
-            for source, rank_key, _ in SIGNAL_PARTICIPATION_SOURCES
-        }
+    # Derive counts from the persisted row set itself so coverage stays
+    # consistent with the leaders built from those same rows.
+    source_counts = {
+        source: sum(1 for row in rows if row.get(rank_key) is not None)
+        for source, rank_key, _ in SIGNAL_PARTICIPATION_SOURCES
+    }
 
     leaders_by_source: dict[str, list[dict[str, Any]]] = {}
     for source, rank_key, value_key in SIGNAL_PARTICIPATION_SOURCES:
