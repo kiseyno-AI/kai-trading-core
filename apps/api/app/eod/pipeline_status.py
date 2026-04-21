@@ -68,14 +68,17 @@ def _serialize_eod_collection_run(row: EODCollectionRun) -> dict[str, Any]:
 
 def _load_latest_pipeline_pykrx_run(*, trade_date: str) -> dict[str, Any] | None:
     with session_scope() as session:
-        rows = session.execute(
-            select(EODCollectionRun)
-            .where(EODCollectionRun.market == 'KRX')
-            .where(EODCollectionRun.trade_date == date.fromisoformat(trade_date))
-            .where(EODCollectionRun.source == 'pykrx')
-            .order_by(EODCollectionRun.started_at.desc(), EODCollectionRun.id.desc())
-            .limit(10)
-        ).scalars().all()
+        rows = [
+            _serialize_eod_collection_run(row)
+            for row in session.execute(
+                select(EODCollectionRun)
+                .where(EODCollectionRun.market == 'KRX')
+                .where(EODCollectionRun.trade_date == date.fromisoformat(trade_date))
+                .where(EODCollectionRun.source == 'pykrx')
+                .order_by(EODCollectionRun.started_at.desc(), EODCollectionRun.id.desc())
+                .limit(10)
+            ).scalars().all()
+        ]
 
     if not rows:
         return None
@@ -84,11 +87,11 @@ def _load_latest_pipeline_pykrx_run(*, trade_date: str) -> dict[str, Any] | None
         (
             row
             for row in rows
-            if (row.run_metadata or {}).get('mode') != 'historical_backfill'
+            if (row.get('run_metadata') or {}).get('mode') != 'historical_backfill'
         ),
         rows[0],
     )
-    return _serialize_eod_collection_run(preferred)
+    return preferred
 
 
 def _load_latest_fundamentals_refresh_run(*, market_date: str, fs_div: str) -> dict[str, Any] | None:
