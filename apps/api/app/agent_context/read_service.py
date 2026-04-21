@@ -4,17 +4,20 @@ from calendar import monthrange
 from datetime import date
 from typing import Any, Sequence
 
-from app.agent_context.derived_contexts import build_price_context
+from app.agent_context.derived_contexts import DEFAULT_DERIVED_CONTEXT_HISTORY_DAYS, build_price_context
 from app.dart.fundamentals_store import DartFundamentalsRepository, dart_fundamentals_repository
 from app.dart.service import FS_DIV_TO_STATEMENT_TYPE, REPORT_CODE_METADATA
 from app.dart.store import DartSyncRepository, dart_sync_repository
 from app.market_data_store import (
     load_daily_action_summaries,
+    load_daily_price_context_history,
     load_daily_price_contexts,
     load_daily_signal_features,
     load_daily_technical_snapshots,
     load_symbols,
 )
+
+PRICE_CONTEXT_HISTORY_DAYS = DEFAULT_DERIVED_CONTEXT_HISTORY_DAYS
 
 
 def _normalize_symbols(symbols: Sequence[str]) -> list[str]:
@@ -193,6 +196,27 @@ def _serialize_disclosure(item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _group_price_context_history(
+    rows: list[dict[str, Any]],
+    *,
+    symbols: list[str],
+) -> dict[str, list[dict[str, Any]]]:
+    grouped: dict[str, list[dict[str, Any]]] = {symbol: [] for symbol in symbols}
+    for row in rows:
+        symbol = row['symbol']
+        if symbol not in grouped:
+            grouped[symbol] = []
+        grouped[symbol].append(
+            {
+                'market_date': row['market_date'],
+                'source': row['source'],
+                'captured_at': row['captured_at'],
+                'price_context': row['context_payload'],
+            }
+        )
+    return grouped
+
+
 class AgentContextReadService:
     def __init__(
         self,
@@ -237,6 +261,11 @@ class AgentContextReadService:
             symbols=normalized_symbols,
             limit=max(len(normalized_symbols), 1000),
         )
+        price_context_history_rows = load_daily_price_context_history(
+            market_date=normalized_market_date,
+            symbols=normalized_symbols,
+            history_days=PRICE_CONTEXT_HISTORY_DAYS,
+        )
         fundamentals_rows = self.fundamentals_repository.list_stored_fundamentals_summary(
             stock_codes=normalized_symbols,
             fs_div=normalized_fs_div,
@@ -252,6 +281,10 @@ class AgentContextReadService:
         action_map = {item['symbol']: item for item in action_rows}
         signal_feature_map = {item['symbol']: item for item in signal_feature_rows}
         price_context_map = {item['symbol']: item['context_payload'] for item in price_context_rows}
+        price_context_history_map = _group_price_context_history(
+            price_context_history_rows,
+            symbols=normalized_symbols,
+        )
         fundamentals_map: dict[str, list[dict[str, Any]]] = {symbol: [] for symbol in normalized_symbols}
         for item in fundamentals_rows:
             stock_code = item.get('stock_code')
@@ -264,6 +297,7 @@ class AgentContextReadService:
 
         for symbol in normalized_symbols:
             price_context = price_context_map.get(symbol)
+            price_context_history = price_context_history_map.get(symbol, [])
             technical_snapshot = technical_map.get(symbol)
             action_summary = action_map.get(symbol)
             signal_features = signal_feature_map.get(symbol)
@@ -325,6 +359,7 @@ class AgentContextReadService:
                     'market_date': normalized_market_date.isoformat(),
                     'company': company,
                     'price_context': price_context,
+                    'price_context_history': price_context_history,
                     'technical_snapshot': technical_snapshot,
                     'action_summary': action_summary,
                     'signal_features': signal_features,

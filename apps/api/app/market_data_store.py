@@ -975,6 +975,54 @@ def load_daily_price_contexts(
         ]
 
 
+def load_daily_price_context_history(
+    *,
+    market_date: str | date,
+    symbols: list[str],
+    history_days: int,
+) -> list[dict]:
+    if history_days <= 0 or not symbols:
+        return []
+
+    normalized_market_date = _normalize_trade_date(market_date)
+    normalized_symbols = list(dict.fromkeys(symbols))
+    with session_scope() as session:
+        ranked = (
+            select(
+                DailyPriceContext.market_date.label('market_date'),
+                DailyPriceContext.source.label('source'),
+                DailyPriceContext.context_payload.label('context_payload'),
+                DailyPriceContext.captured_at.label('captured_at'),
+                Symbol.symbol.label('symbol'),
+                func.row_number()
+                .over(partition_by=DailyPriceContext.symbol_id, order_by=DailyPriceContext.market_date.desc())
+                .label('context_rank'),
+            )
+            .join(Symbol, Symbol.id == DailyPriceContext.symbol_id)
+            .where(
+                Symbol.symbol.in_(normalized_symbols),
+                DailyPriceContext.market_date <= normalized_market_date,
+            )
+            .subquery()
+        )
+        rows = session.execute(
+            select(ranked)
+            .where(ranked.c.context_rank <= history_days)
+            .order_by(ranked.c.symbol.asc(), ranked.c.market_date.asc())
+        ).all()
+
+    return [
+        {
+            'symbol': row.symbol,
+            'market_date': row.market_date.isoformat(),
+            'source': row.source,
+            'context_payload': row.context_payload,
+            'captured_at': row.captured_at.isoformat() if row.captured_at else None,
+        }
+        for row in rows
+    ]
+
+
 def upsert_daily_technical_snapshot(snapshot: dict, *, run_id: int | None = None) -> None:
     refreshed_at = datetime.utcnow()
     with session_scope() as session:
@@ -2041,6 +2089,58 @@ def load_daily_market_participation_context(
             'context_payload': row.context_payload,
             'captured_at': row.captured_at.isoformat() if row.captured_at else None,
         }
+
+
+def load_daily_market_participation_context_history(
+    *,
+    market_date: str | date,
+    market: str = 'KRX',
+    history_days: int,
+) -> list[dict]:
+    if history_days <= 0:
+        return []
+
+    normalized_market_date = _normalize_trade_date(market_date)
+    with session_scope() as session:
+        rows = session.execute(
+            select(DailyMarketParticipationContext)
+            .where(DailyMarketParticipationContext.market == market)
+            .where(DailyMarketParticipationContext.market_date <= normalized_market_date)
+            .order_by(DailyMarketParticipationContext.market_date.desc())
+            .limit(history_days)
+        ).scalars().all()
+
+    return [
+        {
+            'market': row.market,
+            'market_date': row.market_date.isoformat(),
+            'source': row.source,
+            'context_payload': row.context_payload,
+            'captured_at': row.captured_at.isoformat() if row.captured_at else None,
+        }
+        for row in reversed(rows)
+    ]
+
+
+def load_recent_daily_price_trade_dates(
+    *,
+    end_date: str | date,
+    limit: int,
+) -> list[str]:
+    if limit <= 0:
+        return []
+
+    normalized_end_date = _normalize_trade_date(end_date)
+    with session_scope() as session:
+        rows = session.execute(
+            select(DailyPriceBar.trade_date)
+            .where(DailyPriceBar.trade_date <= normalized_end_date)
+            .group_by(DailyPriceBar.trade_date)
+            .order_by(DailyPriceBar.trade_date.desc())
+            .limit(limit)
+        ).all()
+
+    return [row.trade_date.isoformat() for row in reversed(rows)]
 
 
 def count_daily_price_bars_for_date(trade_date: str | date) -> int:
