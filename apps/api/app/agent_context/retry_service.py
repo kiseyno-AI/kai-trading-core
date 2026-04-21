@@ -83,7 +83,7 @@ class AgentFeedbackRetryService:
             logical_completed_feedback_count=0,
             logical_failed_items=0,
         )
-        runtime_feedback_state_store.start_run(logical_state, replace=True)
+        runtime_feedback_state_store.start_run(logical_state, replace=True, logical=True)
         logical_run_id = logical_state.run_id
 
         try:
@@ -202,6 +202,7 @@ class AgentFeedbackRetryService:
         progress = self._get_retry_progress(
             market_date=config.market_date,
             roles=config.roles,
+            run_id=logical_run_id,
         )
 
         return {
@@ -306,11 +307,12 @@ class AgentFeedbackRetryService:
         current.status = 'completed' if (current.logical_pending_symbols or 0) == 0 else 'partial'
         current.completed_at = datetime.now(timezone.utc)
         current.in_flight_slots_by_role = {}
-    def _get_retry_progress(self, *, market_date: date, roles: Sequence[str]) -> dict[str, Any]:
+    def _get_retry_progress(self, *, market_date: date, roles: Sequence[str], run_id: str | None = None) -> dict[str, Any]:
         return agent_context_progress_service.get_feedback_progress(
             market_date=market_date,
             symbols=None,
             expected_agents=roles,
+            run_id=run_id,
         )
 
 
