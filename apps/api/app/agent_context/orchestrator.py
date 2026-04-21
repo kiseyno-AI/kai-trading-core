@@ -1032,16 +1032,15 @@ class AgentFeedbackOrchestrator:
             queue: list[tuple[int, list[dict[str, Any]]]] = []
             for batch_index, batch in enumerate(indexed_batches):
                 slot = (batch_index % role_parallelism) + 1
-                fresh_session_key = _fresh_feedback_session_key(
+                stable_session_key = _feedback_session_key(
                     agent_name=spec.agent_name,
-                    request_run_id=request_run_id,
                     slot=slot,
                 )
                 batch_with_session = [
                     {
                         **batch_item,
                         'session_slot': slot,
-                        'session_key': fresh_session_key,
+                        'session_key': stable_session_key,
                     }
                     for batch_item in batch
                 ]
