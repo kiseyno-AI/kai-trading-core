@@ -101,7 +101,7 @@ class FakeDisclosureRepository:
 
 
 class AgentContextReadServiceTests(unittest.TestCase):
-    @patch('app.agent_context.read_service._load_recent_price_bars_by_symbol')
+    @patch('app.agent_context.read_service.load_daily_price_contexts')
     @patch('app.agent_context.read_service.load_daily_action_summaries')
     @patch('app.agent_context.read_service.load_daily_signal_features')
     @patch('app.agent_context.read_service.load_daily_technical_snapshots')
@@ -112,7 +112,7 @@ class AgentContextReadServiceTests(unittest.TestCase):
         load_technical_mock,
         load_signal_features_mock,
         load_actions_mock,
-        load_price_bars_mock,
+        load_price_contexts_mock,
     ):
         load_symbols_mock.return_value = [
             {
@@ -182,33 +182,49 @@ class AgentContextReadServiceTests(unittest.TestCase):
                 'captured_at': '2026-04-08T15:00:00+09:00',
             }
         ]
-        load_price_bars_mock.return_value = {
-            '005930': [
-                {
+        load_price_contexts_mock.return_value = [
+            {
+                'symbol': '005930',
+                'market_date': '2026-04-08',
+                'source': 'pykrx',
+                'context_payload': {
                     'trade_date': '2026-04-08',
+                    'source': 'pykrx',
+                    'captured_at': '2026-04-08T15:30:00+09:00',
                     'open_price': 70000,
                     'high_price': 72000,
                     'low_price': 69950,
                     'close_price': 71500,
                     'volume': 123456,
                     'turnover': 8800000000,
-                    'source': 'pykrx',
-                    'captured_at': '2026-04-08T15:30:00+09:00',
+                    'candle': {
+                        'direction': 'bullish',
+                        'body_points': 1500,
+                        'body_percent_of_open': 2.1429,
+                        'body_percent_of_range': 73.1707,
+                        'body_size': 'large',
+                        'upper_wick_points': 500,
+                        'lower_wick_points': 50,
+                        'wick_bias': 'upper',
+                    },
+                    'session_range': {
+                        'points': 2050,
+                        'percent_of_open': 2.9286,
+                        'close_position_in_range': 0.7561,
+                        'close_position_label': 'upper_half',
+                    },
+                    'gap': {
+                        'previous_trade_date': '2026-04-07',
+                        'previous_close_price': 69800,
+                        'gap_points': 200,
+                        'gap_percent': 0.2865,
+                        'direction': 'up',
+                        'filled_intraday': False,
+                    },
                 },
-                {
-                    'trade_date': '2026-04-07',
-                    'open_price': 69000,
-                    'high_price': 70500,
-                    'low_price': 68800,
-                    'close_price': 69800,
-                    'volume': 111111,
-                    'turnover': 7600000000,
-                    'source': 'pykrx',
-                    'captured_at': '2026-04-07T15:30:00+09:00',
-                },
-            ],
-            '000660': [],
-        }
+                'captured_at': '2026-04-08T15:30:00+09:00',
+            }
+        ]
 
         service = AgentContextReadService(
             fundamentals_repository=FakeFundamentalsRepository(),

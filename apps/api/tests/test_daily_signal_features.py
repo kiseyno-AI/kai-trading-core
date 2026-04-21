@@ -117,7 +117,13 @@ class DailySignalFeatureServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_collect_and_persist_for_market_date_calls_kis_sources_and_upserts_rows(self):
         service = DailySignalFeatureService(client=FakeKISRankingClient())
 
-        with patch('app.signals.daily_signal_features.upsert_daily_signal_feature') as upsert:
+        with (
+            patch('app.signals.daily_signal_features.upsert_daily_signal_feature') as upsert,
+            patch(
+                'app.signals.daily_signal_features.daily_market_participation_context_service.compute_and_persist_for_market_date',
+                return_value={'captured_symbol_count': 2},
+            ) as persist_participation,
+        ):
             result = await service.collect_and_persist_for_market_date(market_date='2026-04-14')
 
         self.assertEqual(result['market_date'], '2026-04-14')
@@ -129,6 +135,12 @@ class DailySignalFeatureServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(upsert.call_count, 2)
         persisted_symbols = {call.args[0]['symbol'] for call in upsert.call_args_list}
         self.assertEqual(persisted_symbols, {'005930', '000660'})
+        self.assertEqual(result['participation_context'], {'captured_symbol_count': 2})
+        persist_participation.assert_called_once_with(
+            market_date='2026-04-14',
+            market='KRX',
+            source='kis_ranking',
+        )
 
     async def test_collect_features_can_scope_to_one_source(self):
         service = DailySignalFeatureService(client=FakeKISRankingClient())

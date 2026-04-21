@@ -245,6 +245,10 @@ class PykrxBackfillServiceTests(TestCase):
             patch('app.eod.pykrx_backfill._get_market_ohlcv_by_date', return_value=type('Frame', (), {'empty': False})()),
             patch('app.eod.pykrx_backfill.persist_daily_price_bars', return_value=1),
             patch(
+                'app.eod.pykrx_backfill.daily_price_context_service.compute_and_persist_for_market_date',
+                return_value={'contexts_persisted': 1, 'contexts_failed': 0},
+            ) as price_contexts,
+            patch(
                 'app.eod.pykrx_backfill.daily_technical_snapshot_service.compute_and_persist_for_market_date',
                 return_value={'snapshots_persisted': 1, 'snapshots_failed': 0},
             ) as technical_snapshots,
@@ -267,9 +271,16 @@ class PykrxBackfillServiceTests(TestCase):
 
         self.assertEqual(result['status'], 'completed')
         self.assertEqual(result['symbols_succeeded'], 1)
+        self.assertEqual(result['price_contexts']['contexts_persisted'], 1)
         self.assertEqual(result['technical_snapshots']['snapshots_persisted'], 1)
         self.assertEqual(result['action_summaries']['action_summaries_persisted'], 1)
         self.assertEqual(result['trending_ranks']['trending_ranks_persisted'], 3)
+        price_contexts.assert_called_once_with(
+            market_date='2026-04-03',
+            symbols=['005930'],
+            source='pykrx',
+            run_id=12,
+        )
         technical_snapshots.assert_called_once_with(
             market_date='2026-04-03',
             symbols=['005930'],
@@ -325,6 +336,14 @@ class PykrxBackfillServiceTests(TestCase):
             patch('app.eod.pykrx_backfill._get_market_ohlcv_by_date', return_value=type('Frame', (), {'empty': False})()),
             patch('app.eod.pykrx_backfill.persist_daily_price_bars', return_value=1),
             patch('app.eod.pykrx_backfill.update_eod_collection_run_progress'),
+            patch(
+                'app.eod.pykrx_backfill.daily_price_context_service.compute_and_persist_for_market_date',
+                return_value={
+                    'contexts_persisted': 1,
+                    'contexts_failed': 0,
+                    'failed_symbols': [],
+                },
+            ),
             patch(
                 'app.eod.pykrx_backfill.daily_technical_snapshot_service.compute_and_persist_for_market_date',
                 return_value={
@@ -551,6 +570,14 @@ class PykrxBackfillServiceTests(TestCase):
                 side_effect=RuntimeError('pykrx timeout'),
             ),
             patch('app.eod.pykrx_backfill.update_eod_collection_run_progress'),
+            patch(
+                'app.eod.pykrx_backfill.daily_price_context_service.compute_and_persist_for_market_date',
+                return_value={
+                    'contexts_persisted': 0,
+                    'contexts_failed': 1,
+                    'failed_symbols': ['005930'],
+                },
+            ),
             patch(
                 'app.eod.pykrx_backfill.daily_technical_snapshot_service.compute_and_persist_for_market_date',
                 return_value={'snapshots_persisted': 0, 'snapshots_failed': 1},

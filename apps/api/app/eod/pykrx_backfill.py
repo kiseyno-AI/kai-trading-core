@@ -13,6 +13,7 @@ from typing import Iterable, Sequence
 from pykrx import stock
 from pykrx.website.comm import webio
 
+from app.agent_context.derived_contexts import daily_price_context_service
 from app.core.audit_logging import log_fetch_event
 from app.core.settings import settings
 from app.eod.master import get_master_symbols
@@ -916,6 +917,28 @@ class PykrxBackfillService:
             )
             raise
 
+        price_context_result: dict
+        price_context_error_message: str | None = None
+        try:
+            price_context_result = daily_price_context_service.compute_and_persist_for_market_date(
+                market_date=latest_trade_date,
+                symbols=[item.symbol for item in symbols],
+                source='pykrx',
+                run_id=run_id,
+            )
+        except Exception as exc:
+            price_context_result = {
+                'market_date': latest_trade_date,
+                'source': 'pykrx',
+                'requested_symbols': len(symbols),
+                'contexts_persisted': 0,
+                'contexts_failed': len(symbols),
+                'failed_symbols': [item.symbol for item in symbols][:50],
+                'items': [],
+                'error': str(exc),
+            }
+            price_context_error_message = f'Price context persistence failed: {exc}'
+
         technical_snapshot_result: dict
         snapshot_error_message: str | None = None
         try:
@@ -981,6 +1004,17 @@ class PykrxBackfillService:
         run_errors: list[str] = []
         if failed_symbols:
             run_errors.append(f'Failed symbols: {",".join(failed_symbols[:20])}')
+        if price_context_error_message:
+            run_errors.append(price_context_error_message)
+        else:
+            price_context_failed_symbols = [
+                symbol for symbol in price_context_result.get('failed_symbols', []) if symbol not in set(failed_symbols)
+            ]
+            if price_context_failed_symbols:
+                run_errors.append(
+                    'Price context persistence incomplete for symbols: '
+                    + ','.join(price_context_failed_symbols[:20])
+                )
         if snapshot_error_message:
             run_errors.append(snapshot_error_message)
         elif technical_snapshot_result.get('snapshots_failed'):
@@ -1023,6 +1057,7 @@ class PykrxBackfillService:
             'symbols_failed': symbols_failed,
             'failed_symbols': failed_symbols[:50],
             'bars_upserted': bars_upserted,
+            'price_contexts': price_context_result,
             'technical_snapshots': technical_snapshot_result,
             'action_summaries': action_summary_result,
             'trending_ranks': trending_rank_result,
