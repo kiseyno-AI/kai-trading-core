@@ -1020,6 +1020,15 @@ class AgentFeedbackOrchestrator:
             current_role=specs[0].role if specs else None,
         )
         runtime_feedback_state_store.start_run(state)
+        _feedback_runtime_log(
+            'run_started',
+            market_date=normalized_market_date.isoformat(),
+            request_run_id=request_run_id,
+            requested_symbols=requested_symbols,
+            requested_roles=[spec.role for spec in specs],
+            batch_size=batch_size,
+            parallel_subtasks=role_parallelism,
+        )
 
         def mark_activity(role: str, slot: int, batch_symbols: list[str] | None = None, done: bool = False) -> None:
             def _update(current: RuntimeFeedbackRunState) -> None:
@@ -1034,6 +1043,15 @@ class AgentFeedbackOrchestrator:
                         'updated_at': current.last_activity_at.isoformat(),
                     }
             runtime_feedback_state_store.update_run(normalized_market_date, _update)
+            _feedback_runtime_log(
+                'slot_activity',
+                market_date=normalized_market_date.isoformat(),
+                request_run_id=request_run_id,
+                role=role,
+                slot=slot,
+                batch_symbols=batch_symbols or [],
+                done=done,
+            )
 
         def buffer_success(role: str, symbol: str, context: dict[str, Any], response: dict[str, Any]) -> None:
             normalized_feedback = response.get('normalized_feedback')
@@ -1052,6 +1070,17 @@ class AgentFeedbackOrchestrator:
                 )
                 current.completed_symbols_by_role.setdefault(role, set()).add(symbol)
             runtime_feedback_state_store.update_run(normalized_market_date, _update)
+            snapshot = runtime_feedback_state_store.get_run(normalized_market_date)
+            _feedback_runtime_log(
+                'buffer_state_after_success',
+                market_date=normalized_market_date.isoformat(),
+                request_run_id=request_run_id,
+                role=role,
+                symbol=symbol,
+                buffered_feedback_count=len(snapshot.buffered_feedback_rows) if snapshot else None,
+                buffered_failure_count=len(snapshot.buffered_failures) if snapshot else None,
+                completed_symbols_by_role={k: len(v) for k, v in snapshot.completed_symbols_by_role.items()} if snapshot else None,
+            )
 
         def buffer_failure(role: str, symbol: str, error: str, retryable: bool) -> None:
             def _update(current: RuntimeFeedbackRunState) -> None:
@@ -1068,6 +1097,19 @@ class AgentFeedbackOrchestrator:
                 )
                 current.failed_symbols_by_role.setdefault(role, set()).add(symbol)
             runtime_feedback_state_store.update_run(normalized_market_date, _update)
+            snapshot = runtime_feedback_state_store.get_run(normalized_market_date)
+            _feedback_runtime_log(
+                'buffer_state_after_failure',
+                market_date=normalized_market_date.isoformat(),
+                request_run_id=request_run_id,
+                role=role,
+                symbol=symbol,
+                error=error,
+                retryable=retryable,
+                buffered_feedback_count=len(snapshot.buffered_feedback_rows) if snapshot else None,
+                buffered_failure_count=len(snapshot.buffered_failures) if snapshot else None,
+                failed_symbols_by_role={k: len(v) for k, v in snapshot.failed_symbols_by_role.items()} if snapshot else None,
+            )
 
         all_items: list[dict[str, Any]] = []
         all_failures: list[dict[str, Any]] = []
@@ -1098,6 +1140,15 @@ class AgentFeedbackOrchestrator:
                     for batch_item in batch
                 ]
                 queue.append((slot, batch_with_session))
+                _feedback_runtime_log(
+                    'queue_batch',
+                    market_date=normalized_market_date.isoformat(),
+                    request_run_id=request_run_id,
+                    role=role,
+                    slot=slot,
+                    session_key=stable_session_key,
+                    batch_symbols=[str(item.get('symbol')) for item in batch_with_session],
+                )
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=role_parallelism) as executor:
                 future_map: dict[concurrent.futures.Future[dict[str, Any]], tuple[int, list[dict[str, Any]]]] = {}
@@ -1249,7 +1300,24 @@ class AgentFeedbackOrchestrator:
             current.last_activity_at = current.completed_at
             for role_slots in current.in_flight_slots_by_role.values():
                 role_slots.clear()
+        _feedback_runtime_log(
+            'run_finish_pending',
+            market_date=normalized_market_date.isoformat(),
+            request_run_id=request_run_id,
+            final_status=final_status,
+            completed_count=completed_count,
+            failed_count=failed_count,
+        )
         runtime_feedback_state_store.update_run(normalized_market_date, _finish)
+        final_snapshot = runtime_feedback_state_store.get_run(normalized_market_date)
+        _feedback_runtime_log(
+            'run_finished',
+            market_date=normalized_market_date.isoformat(),
+            request_run_id=request_run_id,
+            final_status=final_status,
+            completed_at=final_snapshot.completed_at.isoformat() if final_snapshot and final_snapshot.completed_at else None,
+            run_summary=final_snapshot.to_progress_summary() if final_snapshot else None,
+        )
 
         return {
             'request': {
