@@ -266,6 +266,8 @@ class DailyPriceContextService:
 
         items: list[dict[str, Any]] = []
         failed_symbols: list[str] = []
+        items: list[dict[str, Any]] = []
+        failed_symbols: list[str] = []
         expected_trade_date = normalized_market_date.isoformat()
         for symbol in target_symbols:
             price_bars = price_bars_by_symbol.get(symbol, [])
@@ -274,6 +276,9 @@ class DailyPriceContextService:
                 continue
 
             context_payload = build_price_context(price_bars)
+            if context_payload is None:
+                failed_symbols.append(symbol)
+                continue
             if context_payload is None:
                 failed_symbols.append(symbol)
                 continue
