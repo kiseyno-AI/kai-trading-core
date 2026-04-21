@@ -839,6 +839,23 @@ def update_daily_price_bar_fundamentals(
         return updated_count
 
 
+
+
+def list_symbols_with_daily_bars_in_range(*, start_date: str | date | None = None, end_date: str | date | None = None) -> list[str]:
+    with session_scope() as session:
+        stmt = (
+            select(Symbol.symbol)
+            .join(DailyPriceBar, DailyPriceBar.symbol_id == Symbol.id)
+            .group_by(Symbol.symbol)
+            .order_by(Symbol.symbol.asc())
+        )
+        if start_date is not None:
+            stmt = stmt.where(DailyPriceBar.trade_date >= _normalize_trade_date(start_date))
+        if end_date is not None:
+            stmt = stmt.where(DailyPriceBar.trade_date <= _normalize_trade_date(end_date))
+        rows = session.execute(stmt).all()
+        return [row.symbol for row in rows]
+
 def list_symbols_with_daily_bar_on_date(trade_date: str) -> list[str]:
     with session_scope() as session:
         rows = session.execute(

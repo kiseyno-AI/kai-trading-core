@@ -29,6 +29,7 @@ from app.market_data_store import (
     complete_eod_collection_run,
     create_eod_collection_run,
     load_daily_price_bar_dates_for_symbol,
+    list_symbols_with_daily_bars_in_range,
     load_eod_run_persisted_symbols,
     load_symbols,
     load_latest_eod_collection_run,
@@ -231,7 +232,7 @@ class PykrxBackfillService:
         result = {
             'source': 'pykrx',
             'markets': list(markets),
-            'symbol_count': len(symbols),
+            'symbol_count': len(target_symbols),
             'persisted_count': persisted,
             'latest_trade_date': snapshot['latest_trade_date'],
             'universe_source': snapshot['universe_source'],
@@ -850,7 +851,7 @@ class PykrxBackfillService:
             universe_snapshot = {
                 'source': 'pykrx',
                 'markets': list(markets),
-                'symbol_count': len(symbols),
+                'symbol_count': len(target_symbols),
                 'persisted_count': persisted,
                 'latest_trade_date': snapshot['latest_trade_date'],
                 'universe_source': snapshot['universe_source'],
@@ -1476,12 +1477,23 @@ class PykrxBackfillService:
     ) -> dict:
         normalized_start = _normalize_yyyymmdd(start_date)
         normalized_end = _normalize_yyyymmdd(end_date, default=date.today().strftime('%Y%m%d'))
-        symbols = self.load_active_universe(markets=markets, symbol=symbol, limit=limit)
+        if symbol:
+            target_symbols = [symbol]
+        else:
+            target_symbols = list_symbols_with_daily_bars_in_range(
+                start_date=_normalize_iso_date(normalized_start),
+                end_date=_normalize_iso_date(normalized_end),
+            )
+        if limit is not None:
+            target_symbols = target_symbols[:limit]
+
+        universe_by_symbol = {item.symbol: item for item in self.load_active_universe(markets=markets, limit=None)}
         updated_symbols = 0
         updated_rows = 0
         failed_symbols: list[str] = []
 
-        for item in symbols:
+        for symbol_code in target_symbols:
+            item = universe_by_symbol.get(symbol_code) or PykrxSymbol(symbol=symbol_code, market='KRX', name_ko=symbol_code)
             try:
                 trade_dates = load_daily_price_bar_dates_for_symbol(
                     item.symbol,
@@ -1522,7 +1534,7 @@ class PykrxBackfillService:
             'source': 'pykrx',
             'start_date': _normalize_iso_date(normalized_start),
             'end_date': _normalize_iso_date(normalized_end),
-            'symbol_count': len(symbols),
+            'symbol_count': len(target_symbols),
             'updated_symbols': updated_symbols,
             'updated_rows': updated_rows,
             'failed_symbols': failed_symbols,
