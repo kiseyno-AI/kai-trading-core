@@ -95,6 +95,21 @@ def _subagent_test_session_key(*, agent_name: str, request_run_id: str, symbol: 
     return f"subagent-test/{agent_name}/{request_run_id}/{safe_symbol}-{uuid.uuid4().hex[:8]}"
 
 
+def _normalize_requested_symbols(symbols: Sequence[str]) -> list[str]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw_symbol in symbols:
+        for piece in (raw_symbol or '').split(','):
+            symbol = piece.strip().upper()
+            if not symbol or symbol in seen:
+                continue
+            seen.add(symbol)
+            normalized.append(symbol)
+    if not normalized:
+        raise ValueError('At least one symbol is required')
+    return normalized
+
+
 def _trim_batch_item_for_prompt(item: dict[str, Any]) -> dict[str, Any]:
     trimmed = json.loads(json.dumps(item, ensure_ascii=False))
     technical_snapshot = trimmed.get('technical_snapshot')
@@ -906,15 +921,9 @@ class AgentFeedbackOrchestrator:
         reuse_existing: bool = True,
     ) -> dict[str, Any]:
         normalized_market_date = market_date if isinstance(market_date, date) else date.fromisoformat(market_date)
-        symbol_context = agent_context_read_service.get_symbol_day_context(
-            market_date=normalized_market_date,
-            symbols=symbols,
-            fs_div=fs_div,
-            disclosures_limit=disclosures_limit,
-        )
         specs = self._select_specs(roles=roles)
+        requested_symbols = _normalize_requested_symbols(symbols)
         request_run_id = f'symbol-run-{normalized_market_date.isoformat()}-{uuid.uuid4().hex[:10]}'
-        requested_symbols = [str(item['symbol']) for item in symbol_context['items']]
         existing_feedback_symbols: set[str] = set()
         reuse_decisions = {}
         if reuse_existing and requested_symbols:
@@ -922,6 +931,27 @@ class AgentFeedbackOrchestrator:
                 market_date=normalized_market_date,
                 symbols=requested_symbols,
                 roles=[spec.role for spec in specs],
+            )
+        symbols_requiring_context = requested_symbols
+        if reuse_decisions:
+            symbols_requiring_context = [
+                symbol
+                for symbol in requested_symbols
+                if any(
+                    decision is None or decision.should_dispatch
+                    for decision in (
+                        reuse_decisions.get(symbol, {}).get(spec.role)
+                        for spec in specs
+                    )
+                )
+            ]
+        symbol_context = {'items': []}
+        if symbols_requiring_context:
+            symbol_context = agent_context_read_service.get_symbol_day_context(
+                market_date=normalized_market_date,
+                symbols=symbols_requiring_context,
+                fs_div=fs_div,
+                disclosures_limit=disclosures_limit,
             )
         batch_size = max(1, settings.openclaw_agent_symbol_chunk_size)
         role_parallelism = max(1, settings.openclaw_agent_parallel_subtasks)

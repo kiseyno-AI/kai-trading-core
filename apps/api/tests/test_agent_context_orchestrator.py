@@ -81,6 +81,15 @@ class DynamicFakeAgentContextReadService:
         return {'items': [{'symbol': symbol} for symbol in kwargs['symbols']]}
 
 
+class RecordingAgentContextReadService:
+    def __init__(self):
+        self.calls = []
+
+    def get_symbol_day_context(self, **kwargs):
+        self.calls.append(kwargs)
+        return {'items': [{'symbol': symbol} for symbol in kwargs['symbols']]}
+
+
 class RecordingBatchClient:
     def __init__(self):
         self.calls = []
@@ -155,6 +164,7 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         service.client = client
         feedback_service = FakeFeedbackService()
         cleanup_service = FakeSessionCleanupService()
+        read_service = RecordingAgentContextReadService()
         reuse_service = SimpleNamespace(
             build_latest_decisions=lambda **kwargs: {
                 '005930': {'eod-summarizer': _reuse_decision(False)},
@@ -164,7 +174,7 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         fake_settings = SimpleNamespace(openclaw_agent_symbol_chunk_size=1, openclaw_agent_parallel_subtasks=20)
 
         with patch.object(orchestrator_module, 'settings', fake_settings):
-            with patch.object(orchestrator_module, 'agent_context_read_service', DynamicFakeAgentContextReadService()):
+            with patch.object(orchestrator_module, 'agent_context_read_service', read_service):
                 with patch.object(orchestrator_module, 'agent_context_reuse_service', reuse_service):
                     with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
                         with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
@@ -180,6 +190,7 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
             for call in client.calls
             for item in call['batch_items']
         ]
+        self.assertEqual(read_service.calls[0]['symbols'], ['000660'])
         self.assertEqual(dispatched_symbols, ['000660'])
         self.assertEqual([item['symbol'] for item in feedback_service.bulk_items], ['000660'])
         self.assertEqual([target.symbol for target in cleanup_service.targets], ['000660'])
