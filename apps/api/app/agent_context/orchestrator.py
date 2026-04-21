@@ -45,6 +45,8 @@ logger = logging.getLogger(__name__)
 
 
 def _feedback_runtime_log(stage: str, **payload: Any) -> None:
+    if 'headers' in payload and isinstance(payload['headers'], dict):
+        payload['headers_snapshot'] = dict(payload['headers'])
     line = {
         'scope': 'agent_feedback_runtime',
         'stage': stage,
@@ -348,7 +350,7 @@ class OpenClawAgentClient:
 
     def dispatch(self, *, spec: AgentDispatchSpec, payload: dict[str, Any]) -> dict[str, Any]:
         url = f'{self.base_url}/v1/responses'
-        request_session_key = str(payload.get('session_key') or f"feedback/{spec.agent_name}/{payload.get('request_id') or uuid.uuid4().hex}")
+        request_session_key = str(payload.get('session_key') or f"agent:{spec.agent_name}:feedback/{spec.agent_name}/{payload.get('request_id') or uuid.uuid4().hex}")
         body = {
             'model': f'openclaw/{spec.agent_name}',
             'input': self._build_message(spec=spec, payload=payload),
@@ -359,7 +361,19 @@ class OpenClawAgentClient:
             attempt += 1
             started_at = datetime.now(timezone.utc)
             try:
-                headers = self._headers() | {'x-openclaw-session-key': request_session_key}
+                headers = self._headers() | {
+                    'x-openclaw-session-key': request_session_key,
+                    'x-openclaw-agent-id': spec.agent_name,
+                }
+                _feedback_runtime_log(
+                    'dispatch_single_http_target',
+                    agent_name=spec.agent_name,
+                    role=spec.role,
+                    url=url,
+                    headers=headers,
+                    session_key=request_session_key,
+                    request_body=body,
+                )
                 with httpx.Client(timeout=self.timeout_seconds, headers=headers) as client:
                     response = client.post(url, json=body)
                 if response.status_code >= 500:
@@ -615,7 +629,18 @@ class OpenClawAgentClient:
                     role=spec.role,
                     market_date=market_date.isoformat(),
                     session_key=request_session_key,
+                    headers=headers,
                     batch_symbols=[str(item.get('symbol')) for item in batch_items],
+                    request_body=body,
+                )
+                _feedback_runtime_log(
+                    'dispatch_batch_http_target',
+                    agent_name=spec.agent_name,
+                    role=spec.role,
+                    market_date=market_date.isoformat(),
+                    url=url,
+                    headers=headers,
+                    session_key=request_session_key,
                     request_body=body,
                 )
                 with httpx.Client(timeout=max(self.timeout_seconds, settings.openclaw_agent_subtask_timeout_seconds), headers=headers) as client:
@@ -1130,10 +1155,7 @@ class AgentFeedbackOrchestrator:
             queue: list[tuple[int, list[dict[str, Any]]]] = []
             for batch_index, batch in enumerate(indexed_batches):
                 slot = (batch_index % role_parallelism) + 1
-                stable_session_key = _feedback_session_key(
-                    agent_name=spec.agent_name,
-                    slot=slot,
-                )
+                stable_session_key = f"agent:{spec.agent_name}:{_feedback_session_key(agent_name=spec.agent_name, slot=slot)}"
                 batch_with_session = [
                     {
                         **batch_item,
