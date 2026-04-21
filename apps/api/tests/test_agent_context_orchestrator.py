@@ -304,7 +304,6 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         fake_settings = SimpleNamespace(
             openclaw_agent_symbol_chunk_size=1,
             openclaw_agent_parallel_subtasks=1,
-            openclaw_agent_subtask_timeout_seconds=1,
             openclaw_agent_timeout_seconds=1,
             openclaw_agent_retry_backoff_seconds=0,
             openclaw_agent_max_retries=0,
