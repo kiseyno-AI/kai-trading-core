@@ -101,6 +101,7 @@ class FakeDisclosureRepository:
 
 
 class AgentContextReadServiceTests(unittest.TestCase):
+    @patch('app.agent_context.read_service.load_daily_price_context_history')
     @patch('app.agent_context.read_service.load_daily_price_contexts')
     @patch('app.agent_context.read_service.load_daily_action_summaries')
     @patch('app.agent_context.read_service.load_daily_signal_features')
@@ -113,6 +114,7 @@ class AgentContextReadServiceTests(unittest.TestCase):
         load_signal_features_mock,
         load_actions_mock,
         load_price_contexts_mock,
+        load_price_context_history_mock,
     ):
         load_symbols_mock.return_value = [
             {
@@ -225,6 +227,36 @@ class AgentContextReadServiceTests(unittest.TestCase):
                 'captured_at': '2026-04-08T15:30:00+09:00',
             }
         ]
+        load_price_context_history_mock.return_value = [
+            {
+                'symbol': '005930',
+                'market_date': '2026-04-07',
+                'source': 'pykrx',
+                'context_payload': {
+                    'trade_date': '2026-04-07',
+                    'open_price': 69400,
+                    'close_price': 69800,
+                    'candle': {'direction': 'bullish'},
+                    'session_range': {'close_position_label': 'upper_half'},
+                    'gap': {'direction': 'flat'},
+                },
+                'captured_at': '2026-04-07T15:30:00+09:00',
+            },
+            {
+                'symbol': '005930',
+                'market_date': '2026-04-08',
+                'source': 'pykrx',
+                'context_payload': {
+                    'trade_date': '2026-04-08',
+                    'open_price': 70000,
+                    'close_price': 71500,
+                    'candle': {'direction': 'bullish'},
+                    'session_range': {'close_position_label': 'upper_half'},
+                    'gap': {'direction': 'up'},
+                },
+                'captured_at': '2026-04-08T15:30:00+09:00',
+            },
+        ]
 
         service = AgentContextReadService(
             fundamentals_repository=FakeFundamentalsRepository(),
@@ -259,6 +291,10 @@ class AgentContextReadServiceTests(unittest.TestCase):
         self.assertFalse(first_item['price_context']['gap']['filled_intraday'])
         self.assertEqual(first_item['price_context']['session_range']['close_position_label'], 'upper_half')
         self.assertEqual(first_item['price_context']['candle']['wick_bias'], 'upper')
+        self.assertEqual(len(first_item['price_context_history']), 2)
+        self.assertEqual(first_item['price_context_history'][0]['market_date'], '2026-04-07')
+        self.assertEqual(first_item['price_context_history'][1]['market_date'], '2026-04-08')
+        self.assertEqual(first_item['price_context_history'][1]['price_context']['trade_date'], '2026-04-08')
         self.assertEqual(first_item['technical_snapshot']['trend_state'], 'uptrend')
         self.assertEqual(first_item['action_summary']['action_label'], 'long_breakout')
         self.assertEqual(first_item['signal_features']['signal_count'], 2)
@@ -270,6 +306,7 @@ class AgentContextReadServiceTests(unittest.TestCase):
         second_item = result['items'][1]
         self.assertEqual(second_item['symbol'], '000660')
         self.assertIsNone(second_item['price_context'])
+        self.assertEqual(second_item['price_context_history'], [])
         self.assertIsNone(second_item['technical_snapshot'])
         self.assertIsNone(second_item['signal_features'])
         self.assertIsNone(second_item['fundamentals']['latest_snapshot'])

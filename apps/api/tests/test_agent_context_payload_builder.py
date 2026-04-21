@@ -303,15 +303,67 @@ class AgentPayloadBuilderTests(unittest.TestCase):
                 },
             }
         }
+        persisted_history = [
+            {
+                'market_date': '2026-04-14',
+                'source': 'kis_ranking',
+                'captured_at': '2026-04-14T15:00:00+09:00',
+                'context_payload': {
+                    'captured_symbol_count': 1,
+                    'signal_count_distribution': {'1': 1},
+                    'source_counts': {
+                        'volume-power': 1,
+                        'overtime-volume': 0,
+                        'overtime-fluctuation': 1,
+                    },
+                    'leaders_by_source': {
+                        'volume-power': [
+                            {
+                                'symbol': '005930',
+                                'name_ko': '삼성전자',
+                                'market': 'KOSPI',
+                                'rank': 1,
+                                'metric_name': 'volume_power',
+                                'metric_value': 140.5,
+                                'signal_count': 1,
+                            }
+                        ],
+                        'overtime-volume': [],
+                        'overtime-fluctuation': [
+                            {
+                                'symbol': '005930',
+                                'name_ko': '삼성전자',
+                                'market': 'KOSPI',
+                                'rank': 2,
+                                'metric_name': 'overtime_fluctuation_rate',
+                                'metric_value': 1.1,
+                                'signal_count': 1,
+                            }
+                        ],
+                    },
+                },
+            },
+            {
+                'market_date': '2026-04-15',
+                'source': 'kis_ranking',
+                'captured_at': '2026-04-15T15:00:00+09:00',
+                'context_payload': persisted_context['context_payload'],
+            },
+        ]
 
         with patch('app.agent_context.payload_builder.session_scope', fake_session_scope):
             with patch(
                 'app.agent_context.payload_builder.load_daily_market_participation_context',
                 return_value=persisted_context,
             ):
-                payload = builder._build_market_payload(run=run)
+                with patch(
+                    'app.agent_context.payload_builder.load_daily_market_participation_context_history',
+                    return_value=persisted_history,
+                ):
+                    payload = builder._build_market_payload(run=run)
 
         self.assertIn('participation_context', payload)
+        self.assertIn('participation_context_history', payload)
         self.assertEqual(payload['signal_feature_leaders'][0]['symbol'], '005930')
         self.assertEqual(payload['participation_context']['captured_symbol_count'], 2)
         self.assertEqual(
@@ -325,6 +377,12 @@ class AgentPayloadBuilderTests(unittest.TestCase):
         self.assertEqual(
             payload['participation_context']['leaders_by_source']['volume-power'][0]['symbol'],
             '000660',
+        )
+        self.assertEqual(len(payload['participation_context_history']), 2)
+        self.assertEqual(payload['participation_context_history'][0]['market_date'], '2026-04-14')
+        self.assertEqual(
+            payload['participation_context_history'][1]['participation_context']['captured_symbol_count'],
+            2,
         )
 
 

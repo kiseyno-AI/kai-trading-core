@@ -1,7 +1,8 @@
+from datetime import date
 import unittest
 from unittest.mock import patch
 
-from app.agent_context.derived_contexts import DailyPriceContextService
+from app.agent_context.derived_contexts import DailyPriceContextService, DerivedContextBackfillService
 
 
 class DailyPriceContextServiceTests(unittest.TestCase):
@@ -93,6 +94,75 @@ class DailyPriceContextServiceTests(unittest.TestCase):
         self.assertEqual(result['contexts_failed'], 0)
         self.assertEqual(result['failed_symbols'], [])
         upsert_daily_price_context_mock.assert_called_once()
+
+
+class DerivedContextBackfillServiceTests(unittest.TestCase):
+    @patch('app.agent_context.derived_contexts.daily_market_participation_context_service.compute_and_persist_from_rows')
+    @patch('app.agent_context.derived_contexts.load_daily_signal_feature_context_rows')
+    @patch('app.agent_context.derived_contexts.daily_price_context_service.compute_and_persist_for_market_date')
+    @patch('app.agent_context.derived_contexts.load_recent_daily_price_trade_dates')
+    def test_backfill_recent_history_processes_recent_trading_dates_and_skips_missing_participation_rows(
+        self,
+        load_recent_trade_dates_mock,
+        compute_price_contexts_mock,
+        load_signal_rows_mock,
+        compute_participation_context_mock,
+    ):
+        load_recent_trade_dates_mock.return_value = ['2026-04-10', '2026-04-11']
+        compute_price_contexts_mock.side_effect = [
+            {'market_date': '2026-04-10', 'contexts_persisted': 2, 'contexts_failed': 0},
+            {'market_date': '2026-04-11', 'contexts_persisted': 3, 'contexts_failed': 1},
+        ]
+        load_signal_rows_mock.side_effect = [
+            [{'symbol': '005930', 'signal_count': 1}],
+            [],
+        ]
+        compute_participation_context_mock.return_value = {
+            'market': 'KRX',
+            'market_date': '2026-04-10',
+            'source': 'kis_ranking',
+            'captured_symbol_count': 1,
+            'context_payload': {'captured_symbol_count': 1},
+        }
+
+        service = DerivedContextBackfillService()
+        result = service.backfill_recent_history(
+            end_date='2026-04-11',
+            trading_days=2,
+            market='KRX',
+        )
+
+        load_recent_trade_dates_mock.assert_called_once_with(end_date=date.fromisoformat('2026-04-11'), limit=2)
+        self.assertEqual(
+            compute_price_contexts_mock.call_args_list[0].kwargs,
+            {'market_date': '2026-04-10', 'source': 'pykrx'},
+        )
+        self.assertEqual(
+            compute_price_contexts_mock.call_args_list[1].kwargs,
+            {'market_date': '2026-04-11', 'source': 'pykrx'},
+        )
+        compute_participation_context_mock.assert_called_once_with(
+            market_date='2026-04-10',
+            rows=[{'symbol': '005930', 'signal_count': 1}],
+            market='KRX',
+            source='kis_ranking',
+        )
+        self.assertEqual(result['market_dates'], ['2026-04-10', '2026-04-11'])
+        self.assertEqual(result['price_contexts']['dates_processed'], 2)
+        self.assertEqual(result['price_contexts']['contexts_persisted'], 5)
+        self.assertEqual(result['price_contexts']['contexts_failed'], 1)
+        self.assertEqual(result['participation_contexts']['dates_processed'], 1)
+        self.assertEqual(result['participation_contexts']['dates_skipped'], 1)
+        self.assertEqual(
+            result['participation_contexts']['skipped_dates'],
+            [{'market_date': '2026-04-11', 'reason': 'no_signal_features_for_market_date'}],
+        )
+
+    def test_backfill_recent_history_requires_positive_trading_days(self):
+        service = DerivedContextBackfillService()
+
+        with self.assertRaisesRegex(ValueError, 'trading_days must be greater than 0'):
+            service.backfill_recent_history(trading_days=0)
 
 
 if __name__ == '__main__':

@@ -286,17 +286,20 @@ class PykrxBackfillServiceTests(TestCase):
             symbols=['005930'],
             source='pykrx',
             run_id=12,
+            progress_callback=ANY,
         )
         action_summaries.assert_called_once_with(
             market_date='2026-04-03',
             symbols=['005930'],
             source='pykrx',
             run_id=12,
+            progress_callback=ANY,
         )
         trending_ranks.assert_called_once_with(
             market_date='2026-04-03',
             source='pykrx',
             run_id=12,
+            progress_callback=ANY,
         )
         self.assertTrue(
             any(
@@ -311,6 +314,7 @@ class PykrxBackfillServiceTests(TestCase):
             symbols_succeeded=1,
             symbols_failed=0,
             error_message=None,
+            run_metadata=ANY,
         )
 
     def test_run_collection_keeps_retryable_status_when_snapshot_persistence_has_failures(self) -> None:
@@ -381,6 +385,7 @@ class PykrxBackfillServiceTests(TestCase):
             symbols_succeeded=1,
             symbols_failed=0,
             error_message='Technical snapshot persistence incomplete for symbols: 005930 | Action summary persistence incomplete for symbols: 005930',
+            run_metadata=ANY,
         )
 
     def test_run_daily_collection_skips_completed_with_errors_without_failed_symbols(self) -> None:
@@ -604,6 +609,7 @@ class PykrxBackfillServiceTests(TestCase):
             symbols=['005930'],
             source='pykrx',
             run_id=12,
+            progress_callback=ANY,
         )
         self.assertTrue(
             any(

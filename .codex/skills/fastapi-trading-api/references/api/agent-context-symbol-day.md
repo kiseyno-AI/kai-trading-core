@@ -1,7 +1,7 @@
 # GET /agent-context/symbol-day
 
 ## Summary
-Returns compact symbol/day analysis context for downstream agents. The `price_context` block is read from persisted `daily_price_contexts`, not derived on request.
+Returns compact symbol/day analysis context for downstream agents. The `price_context` block is read from persisted `daily_price_contexts`, not derived on request, and `price_context_history` carries up to the latest seven stored rows ending at the requested `market_date`.
 
 ## Example request
 ```http
@@ -49,6 +49,28 @@ GET /agent-context/symbol-day?market_date=2026-04-15&symbols=005930&fs_div=CFS&d
           "filled_intraday": true
         }
       },
+      "price_context_history": [
+        {
+          "market_date": "2026-04-14",
+          "source": "pykrx",
+          "captured_at": "2026-04-14T15:30:00+09:00",
+          "price_context": {
+            "trade_date": "2026-04-14",
+            "close_price": 70400,
+            "candle": {"direction": "bullish"}
+          }
+        },
+        {
+          "market_date": "2026-04-15",
+          "source": "pykrx",
+          "captured_at": "2026-04-15T15:30:00+09:00",
+          "price_context": {
+            "trade_date": "2026-04-15",
+            "close_price": 72100,
+            "candle": {"direction": "bullish"}
+          }
+        }
+      ],
       "technical_snapshot": {"market_date": "2026-04-15", "trend_state": "uptrend"},
       "action_summary": {"market_date": "2026-04-15", "action_label": "hold"},
       "fundamentals": {"latest_business_year": 2025},
