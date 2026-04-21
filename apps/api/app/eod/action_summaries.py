@@ -347,9 +347,18 @@ class DailyActionSummaryService:
         items: list[dict] = []
         failed_symbols: list[str] = [symbol for symbol in requested_symbols if symbol not in available_symbols]
 
+        def _emit_progress(payload: dict) -> None:
+            if not progress_callback:
+                return
+            try:
+                progress_callback(payload)
+            except Exception:
+                # Progress persistence is best-effort and must not interrupt action summary processing.
+                return
+
         if progress_callback:
             first_symbol = snapshots[0]['symbol'] if snapshots else None
-            progress_callback(
+            _emit_progress(
                 {
                     'status': 'running' if first_symbol else ('completed' if not failed_symbols else 'partial'),
                     'processed': len(failed_symbols),
@@ -377,7 +386,7 @@ class DailyActionSummaryService:
                 failed_symbols.append(snapshot['symbol'])
             if progress_callback:
                 next_symbol = snapshots[index + 1]['symbol'] if index + 1 < len(snapshots) else None
-                progress_callback(
+                _emit_progress(
                     {
                         'status': (
                             'running'

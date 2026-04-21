@@ -1,11 +1,12 @@
 import unittest
 from datetime import date
+from unittest.mock import patch
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.api import routes_scanner
-from app.market_data_store import build_daily_trending_rank_items
+from app.market_data_store import build_daily_trending_rank_items, compute_and_persist_daily_trending_ranks
 from app.scanner.trending import TrendingStocksService
 
 
@@ -138,6 +139,39 @@ class TrendingRankBuilderTests(unittest.TestCase):
         self.assertEqual(ranks_by_symbol['BBB']['up_rank'], 2)
         self.assertIsNone(ranks_by_symbol['CCC']['up_rank'])
         self.assertIsNone(ranks_by_symbol['CCC']['down_rank'])
+
+
+class DailyTrendingRankPersistenceTests(unittest.TestCase):
+    def test_compute_and_persist_ignores_progress_callback_failures(self):
+        progress_updates: list[dict] = []
+
+        def _failing_progress_callback(progress: dict) -> None:
+            progress_updates.append(progress)
+            raise RuntimeError('progress store unavailable')
+
+        with (
+            patch(
+                'app.market_data_store._load_trending_stocks_from_daily_price_bars',
+                return_value=[{'symbol': '005930'}],
+            ),
+            patch(
+                'app.market_data_store._load_trending_stocks_from_snapshots',
+                return_value=[{'symbol': '000660'}],
+            ),
+            patch(
+                'app.market_data_store.replace_daily_trending_ranks',
+                side_effect=[1, 1],
+            ) as replace_mock,
+        ):
+            result = compute_and_persist_daily_trending_ranks(
+                market_date='2026-04-29',
+                periods=['1d', '5d'],
+                progress_callback=_failing_progress_callback,
+            )
+
+        self.assertEqual(result['trending_ranks_persisted'], 2)
+        self.assertEqual([item['status'] for item in progress_updates], ['running', 'running', 'completed'])
+        self.assertEqual(replace_mock.call_count, 2)
 
 
 class FakeTrendingStocksService:
