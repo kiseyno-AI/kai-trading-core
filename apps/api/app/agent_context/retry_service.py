@@ -12,6 +12,7 @@ from app.agent_context.progress_service import agent_context_progress_service
 from app.agent_context.reuse_service import agent_context_reuse_service
 from app.agent_context.runtime_state import RuntimeFeedbackRunState, runtime_feedback_state_store
 from app.db import session_scope
+from app.core.settings import settings
 from app.db_models import DailyPriceBar, Symbol
 
 EXPECTED_ROLES: tuple[str, ...] = (
@@ -81,6 +82,7 @@ class AgentFeedbackRetryService:
             logical_pending_symbols=len(remaining),
             logical_completed_feedback_count=0,
             logical_failed_items=0,
+            normalized_response_count=0,
         )
         runtime_feedback_state_store.start_run(logical_state, replace=True)
 
@@ -229,13 +231,14 @@ class AgentFeedbackRetryService:
     def _set_single_symbol_slot_context(current: RuntimeFeedbackRunState | None, current_role: str | None, total_symbols: int) -> None:
         if current is None:
             return
-        current.parallel_per_role = 20
+        configured_parallelism = max(1, int(settings.openclaw_agent_parallel_subtasks))
+        current.parallel_per_role = configured_parallelism
         current.batch_size = 1
         current.status = 'running'
         current.current_role = current_role or current.current_role
         current.logical_total_symbols = total_symbols
         current.logical_pending_symbols = total_symbols
-        current.logical_in_progress_symbols = min(20, total_symbols)
+        current.logical_in_progress_symbols = min(configured_parallelism, total_symbols)
         current.last_activity_at = datetime.now(timezone.utc)
 
     @staticmethod
@@ -249,9 +252,16 @@ class AgentFeedbackRetryService:
         if roles:
             current.current_role = str(roles[0])
         completed_items = summary.get('items') if isinstance(summary.get('items'), list) else []
-        completed_now = len([item for item in completed_items if isinstance(item, dict) and item.get('status') == 'completed'])
+        normalized_now = len([
+            item for item in completed_items
+            if isinstance(item, dict)
+            and item.get('status') == 'completed'
+            and isinstance((item.get('response') or {}).get('normalized_feedback'), dict)
+        ])
+        completed_now = normalized_now
         failed_now = len([item for item in completed_items if isinstance(item, dict) and item.get('status') == 'failed']) + int(summary.get('failed', 0))
         current.logical_completed_feedback_count = (current.logical_completed_feedback_count or 0) + completed_now
+        current.normalized_response_count = (current.normalized_response_count or 0) + normalized_now
         current.logical_failed_items = (current.logical_failed_items or 0) + failed_now
         completed_symbol_count = min(len(batch_symbols), completed_now)
         current.logical_completed_symbols = min(current.logical_total_symbols or 0, (current.logical_completed_symbols or 0) + completed_symbol_count)
