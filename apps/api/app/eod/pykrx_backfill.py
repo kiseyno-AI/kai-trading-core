@@ -20,6 +20,7 @@ from app.eod.master import get_master_symbols
 from app.dart.fundamentals_capture_service import dart_fundamentals_capture_service
 from app.eod.action_summaries import daily_action_summary_service
 from app.eod.technical_snapshots import daily_technical_snapshot_service
+from app.signals.daily_signal_features import daily_signal_feature_service
 from app.market_data_store import (
     advisory_eod_collection_lock,
     compute_and_persist_daily_trending_ranks,
@@ -1216,6 +1217,64 @@ class PykrxBackfillService:
                 failed=1,
             )
 
+        signal_feature_result: dict
+        signal_feature_error_message: str | None = None
+        try:
+            persist_stage_progress(
+                stage='signal_features',
+                status='running',
+                current_step='collecting_daily_signal_features',
+                current_activity='Collecting daily KIS signal features',
+                processed=0,
+                total=3,
+                succeeded=0,
+                failed=0,
+            )
+            signal_feature_result = asyncio.run(
+                daily_signal_feature_service.collect_and_persist_for_market_date(
+                    market_date=latest_trade_date,
+                )
+            )
+            signal_total = int(signal_feature_result.get('features_persisted', 0)) + int(signal_feature_result.get('features_failed', 0))
+            persist_stage_progress(
+                stage='signal_features',
+                status='completed' if not signal_feature_result.get('features_failed') else 'partial',
+                current_step='signal_features_completed',
+                current_activity='Daily KIS signal features collected',
+                processed=signal_total,
+                total=signal_total,
+                succeeded=signal_feature_result.get('features_persisted'),
+                failed=signal_feature_result.get('features_failed'),
+                extra={
+                    'sources': signal_feature_result.get('sources'),
+                    'source_counts': signal_feature_result.get('source_counts'),
+                },
+            )
+        except Exception as exc:
+            signal_feature_result = {
+                'market_date': latest_trade_date,
+                'source': 'kis_ranking',
+                'sources': [],
+                'source_counts': {},
+                'features_persisted': 0,
+                'features_failed': 0,
+                'failed_symbols': [],
+                'participation_context': {'error': str(exc)},
+                'items': [],
+                'error': str(exc),
+            }
+            signal_feature_error_message = f'Daily signal feature collection failed: {exc}'
+            persist_stage_progress(
+                stage='signal_features',
+                status='failed',
+                current_step='signal_features_failed',
+                current_activity='Daily KIS signal feature collection failed',
+                processed=0,
+                total=3,
+                succeeded=0,
+                failed=1,
+            )
+
         run_errors: list[str] = []
         if failed_symbols:
             run_errors.append(f'Failed symbols: {",".join(failed_symbols[:20])}')
@@ -1246,6 +1305,13 @@ class PykrxBackfillService:
             )
         if trending_rank_error_message:
             run_errors.append(trending_rank_error_message)
+        if signal_feature_error_message:
+            run_errors.append(signal_feature_error_message)
+        elif signal_feature_result.get('features_failed'):
+            run_errors.append(
+                'Daily signal feature persistence incomplete for symbols: '
+                + ','.join((signal_feature_result.get('failed_symbols') or [])[:20])
+            )
 
         status = 'completed' if not run_errors else 'completed_with_errors'
         if failed_symbols:
@@ -1275,6 +1341,7 @@ class PykrxBackfillService:
             'technical_snapshots': technical_snapshot_result,
             'action_summaries': action_summary_result,
             'trending_ranks': trending_rank_result,
+            'signal_features': signal_feature_result,
             'refresh_universe': effective_refresh_universe,
             'universe_snapshot': universe_snapshot,
         }
