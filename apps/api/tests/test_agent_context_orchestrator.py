@@ -158,6 +158,24 @@ def _reuse_decision(should_dispatch: bool):
 
 
 class AgentFeedbackOrchestratorTests(unittest.TestCase):
+    def test_reuse_existing_still_validates_fs_div_when_everything_is_reusable(self):
+        service = AgentFeedbackOrchestrator()
+        reuse_service = SimpleNamespace(
+            build_latest_decisions=lambda **kwargs: {
+                '005930': {'eod-summarizer': _reuse_decision(False)},
+            }
+        )
+
+        with patch.object(orchestrator_module, 'agent_context_reuse_service', reuse_service):
+            with self.assertRaisesRegex(ValueError, 'fs_div must be one of CFS or OFS'):
+                service.dispatch_for_symbols(
+                    market_date='2026-04-14',
+                    symbols=['005930'],
+                    roles=['eod-summarizer'],
+                    fs_div='bad',
+                    reuse_existing=True,
+                )
+
     def test_reuse_existing_skips_reusable_symbol_role_pairs(self):
         service = AgentFeedbackOrchestrator()
         client = RecordingBatchClient()

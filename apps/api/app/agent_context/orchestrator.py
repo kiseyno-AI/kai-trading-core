@@ -40,6 +40,7 @@ from app.agent_context.session_cleanup_service import SessionCleanupTarget, agen
 from app.core.settings import settings
 from app.db import session_scope
 from app.db_models import AgentContextFeedback, EODCollectionRun
+from app.dart.service import FS_DIV_TO_STATEMENT_TYPE
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +109,16 @@ def _normalize_requested_symbols(symbols: Sequence[str]) -> list[str]:
     if not normalized:
         raise ValueError('At least one symbol is required')
     return normalized
+
+
+def _validate_fs_div(fs_div: str | None) -> None:
+    if fs_div is None:
+        return
+    normalized = fs_div.strip().upper()
+    if not normalized:
+        return
+    if normalized not in FS_DIV_TO_STATEMENT_TYPE:
+        raise ValueError('fs_div must be one of CFS or OFS')
 
 
 def _trim_batch_item_for_prompt(item: dict[str, Any]) -> dict[str, Any]:
@@ -923,6 +934,7 @@ class AgentFeedbackOrchestrator:
         normalized_market_date = market_date if isinstance(market_date, date) else date.fromisoformat(market_date)
         specs = self._select_specs(roles=roles)
         requested_symbols = _normalize_requested_symbols(symbols)
+        _validate_fs_div(fs_div)
         request_run_id = f'symbol-run-{normalized_market_date.isoformat()}-{uuid.uuid4().hex[:10]}'
         existing_feedback_symbols: set[str] = set()
         reuse_decisions = {}
