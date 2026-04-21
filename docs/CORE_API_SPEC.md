@@ -626,6 +626,7 @@ Authorization: Bearer <token>
     "requested_symbol_count": 1,
     "matched_symbol_count": 1,
     "missing_symbols": [],
+    "price_context_count": 1,
     "technical_snapshot_count": 1,
     "action_summary_count": 1,
     "signal_feature_count": 1,
@@ -644,6 +645,38 @@ Authorization: Bearer <token>
         "dart": {
           "corp_code": null,
           "corp_name": null
+        }
+      },
+      "price_context": {
+        "trade_date": "2026-04-09",
+        "source": "pykrx",
+        "open_price": 70000,
+        "high_price": 72000,
+        "low_price": 69500,
+        "close_price": 71500,
+        "candle": {
+          "direction": "bullish",
+          "body_points": 1500,
+          "body_percent_of_open": 2.1429,
+          "body_percent_of_range": 60.0,
+          "body_size": "large",
+          "upper_wick_points": 500,
+          "lower_wick_points": 500,
+          "wick_bias": "balanced"
+        },
+        "session_range": {
+          "points": 2500,
+          "percent_of_open": 3.5714,
+          "close_position_in_range": 0.8,
+          "close_position_label": "near_high"
+        },
+        "gap": {
+          "previous_trade_date": "2026-04-08",
+          "previous_close_price": 69800,
+          "gap_points": 200,
+          "gap_percent": 0.2865,
+          "direction": "up",
+          "filled_intraday": true
         }
       },
       "technical_snapshot": {
@@ -689,6 +722,7 @@ Authorization: Bearer <token>
       },
       "availability": {
         "company": true,
+        "price_context": true,
         "technical_snapshot": true,
         "action_summary": true,
         "signal_features": true,

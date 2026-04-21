@@ -128,6 +128,7 @@
 ## Agent context read-layer notes
 - `GET /agent-context/symbol-day` is the current machine-consumption read layer for symbol/day analysis. It does not rank names or emit final trading decisions.
 - The route aggregates persisted symbol metadata, same-day technical snapshot, same-day deterministic action summary, same-day KIS ranking signal features, latest stored DART fundamentals summary, and recent disclosure events up to the requested `market_date`.
+- Symbol-day context now also includes `price_context` derived only from stored `daily_price_bars`: OHLC, intraday range, candle body and wick interpretation, close location inside the day's range, and gap-versus-previous-close fields when a prior stored close exists.
 - Symbol-day context now uses exact-date technical snapshots for downstream agent dispatch and does not silently fall back to older technical snapshot rows.
 - The response is intentionally block-oriented and compact so downstream agents can prioritize and interpret instead of re-querying multiple endpoints or parsing prose-heavy summaries.
 
