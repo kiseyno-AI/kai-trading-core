@@ -76,12 +76,12 @@ class Settings(BaseSettings):
 
     openclaw_base_url: str = 'http://127.0.0.1:18789'
     openclaw_gateway_token: Optional[str] = None
-    openclaw_agent_timeout_seconds: float = 120.0
+    openclaw_agent_timeout_seconds: float = 0.0
     openclaw_agent_max_retries: int = 2
     openclaw_agent_retry_backoff_seconds: float = 2.0
     openclaw_agent_parallel_subtasks: int = 10
     openclaw_agent_symbol_chunk_size: int = 1
-    openclaw_agent_max_prompt_chars: int = 24000
+    openclaw_agent_max_prompt_chars: int = 0
     openclaw_feedback_trigger_after_fundamentals_refresh: bool = False
     openclaw_feedback_retry_max_cycles: int = 3
     openclaw_feedback_retry_outer_batch_size: int = 20

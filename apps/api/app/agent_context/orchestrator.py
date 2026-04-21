@@ -207,7 +207,7 @@ class OpenClawAgentClient:
     def __init__(self) -> None:
         self.base_url = settings.openclaw_base_url.rstrip('/')
         self.gateway_token = settings.openclaw_gateway_token
-        self.timeout_seconds = max(1, settings.openclaw_agent_timeout_seconds)
+        self.timeout_seconds = settings.openclaw_agent_timeout_seconds if settings.openclaw_agent_timeout_seconds > 0 else None
         self.max_retries = max(0, settings.openclaw_agent_max_retries)
         self.retry_backoff_seconds = max(0, settings.openclaw_agent_retry_backoff_seconds)
 
@@ -322,7 +322,8 @@ class OpenClawAgentClient:
             f"Market date: {market_date.isoformat()}\n"
             f"Assigned batch payload:\n{json.dumps(list(prepared_items), ensure_ascii=False)}"
         )
-        if len(base_message) <= settings.openclaw_agent_max_prompt_chars:
+        max_chars = int(settings.openclaw_agent_max_prompt_chars or 0)
+        if max_chars <= 0 or len(base_message) <= max_chars:
             return base_message
         while len(prepared_items) > 1:
             prepared_items = prepared_items[:-1]
@@ -336,7 +337,7 @@ class OpenClawAgentClient:
                 f"Market date: {market_date.isoformat()}\n"
                 f"Assigned batch payload:\n{json.dumps(list(prepared_items), ensure_ascii=False)}"
             )
-            if len(candidate) <= settings.openclaw_agent_max_prompt_chars:
+            if max_chars <= 0 or len(candidate) <= max_chars:
                 return candidate
         return (
             f"Role: {spec.role}\n"
