@@ -10,6 +10,8 @@ from sqlalchemy.orm import Query
 from app.db import session_scope
 from app.db_models import AgentContextFeedback
 
+BULK_UPSERT_CHUNK_SIZE = 100
+
 
 def _normalize_market_date(value: str | date) -> date:
     if isinstance(value, date):
@@ -146,6 +148,72 @@ class AgentContextFeedbackRepository:
                 raise RuntimeError('Failed to load stored feedback record after upsert')
             return _serialize_feedback(record)
 
+    def bulk_upsert_feedback(
+        self,
+        *,
+        items: Sequence[dict[str, Any]],
+        chunk_size: int = BULK_UPSERT_CHUNK_SIZE,
+    ) -> list[dict[str, Any]]:
+        if not items:
+            return []
+
+        resolved_chunk_size = max(1, chunk_size)
+        accepted: list[dict[str, Any]] = []
+        with session_scope() as session:
+            for start in range(0, len(items), resolved_chunk_size):
+                chunk = list(items[start:start + resolved_chunk_size])
+                received_at = datetime.now(timezone.utc)
+                chunk_rows = [{**item, 'received_at': received_at} for item in chunk]
+                stmt = insert(AgentContextFeedback).values(chunk_rows)
+                excluded = stmt.excluded
+                stmt = stmt.on_conflict_do_update(
+                    constraint='uq_agent_context_feedback_market_symbol_agent',
+                    set_={
+                        'agent_version': excluded.agent_version,
+                        'run_id': excluded.run_id,
+                        'summary_payload': excluded.summary_payload,
+                        'feedback_payload': excluded.feedback_payload,
+                        'context_payload': excluded.context_payload,
+                        'received_at': excluded.received_at,
+                        'updated_at': received_at,
+                    },
+                ).returning(
+                    AgentContextFeedback.id,
+                    AgentContextFeedback.market_date,
+                    AgentContextFeedback.symbol,
+                    AgentContextFeedback.agent_name,
+                    AgentContextFeedback.agent_version,
+                    AgentContextFeedback.run_id,
+                    AgentContextFeedback.summary_payload,
+                    AgentContextFeedback.feedback_payload,
+                    AgentContextFeedback.context_payload,
+                    AgentContextFeedback.received_at,
+                )
+                returned_rows = session.execute(stmt).mappings().all()
+                rows_by_key = {
+                    (row['market_date'], row['symbol'], row['agent_name']): row
+                    for row in returned_rows
+                }
+                for item in chunk:
+                    row = rows_by_key[(item['market_date'], item['symbol'], item['agent_name'])]
+                    accepted.append(
+                        {
+                            'id': row['id'],
+                            'market_date': row['market_date'].isoformat(),
+                            'symbol': row['symbol'],
+                            'agent': {
+                                'name': row['agent_name'],
+                                'version': row['agent_version'],
+                                'run_id': row['run_id'],
+                            },
+                            'summary': row['summary_payload'],
+                            'feedback': row['feedback_payload'],
+                            'context': row['context_payload'],
+                            'received_at': row['received_at'].isoformat() if row['received_at'] else None,
+                        }
+                    )
+        return accepted
+
     def list_feedback(
         self,
         *,
@@ -219,7 +287,7 @@ class AgentContextFeedbackService:
     def __init__(self, *, repository: AgentContextFeedbackRepository | None = None) -> None:
         self.repository = repository or AgentContextFeedbackRepository()
 
-    def submit_feedback(
+    def _normalize_feedback_item(
         self,
         *,
         market_date: str | date,
@@ -236,23 +304,46 @@ class AgentContextFeedbackService:
         context_payload = _normalize_json_object(context, field_name='context') if context is not None else None
         if not summary_payload and not feedback_payload:
             raise ValueError('Either summary or feedback must be provided')
+        return {
+            'market_date': _normalize_market_date(market_date),
+            'symbol': _normalize_symbol(symbol),
+            'agent_name': _normalize_agent_name(agent_name),
+            'agent_version': _normalize_optional_text(agent_version, field_name='agent_version', max_length=64),
+            'run_id': _normalize_optional_text(run_id, field_name='run_id', max_length=128),
+            'summary_payload': summary_payload,
+            'feedback_payload': feedback_payload,
+            'context_payload': context_payload,
+        }
 
-        item = self.repository.create_feedback(
-            market_date=_normalize_market_date(market_date),
-            symbol=_normalize_symbol(symbol),
-            agent_name=_normalize_agent_name(agent_name),
-            agent_version=_normalize_optional_text(agent_version, field_name='agent_version', max_length=64),
-            run_id=_normalize_optional_text(run_id, field_name='run_id', max_length=128),
-            summary_payload=summary_payload,
-            feedback_payload=feedback_payload,
-            context_payload=context_payload,
+    def submit_feedback(
+        self,
+        *,
+        market_date: str | date,
+        symbol: str,
+        agent_name: str | None = None,
+        agent_version: str | None = None,
+        run_id: str | None = None,
+        summary: dict[str, Any] | None = None,
+        feedback: dict[str, Any] | None = None,
+        context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        normalized_item = self._normalize_feedback_item(
+            market_date=market_date,
+            symbol=symbol,
+            agent_name=agent_name,
+            agent_version=agent_version,
+            run_id=run_id,
+            summary=summary,
+            feedback=feedback,
+            context=context,
         )
+        item = self.repository.create_feedback(**normalized_item)
         return {
             'accepted': True,
             'item': item,
             'summary': {
-                'summary_keys': sorted(summary_payload.keys()),
-                'feedback_keys': sorted(feedback_payload.keys()),
+                'summary_keys': sorted(normalized_item['summary_payload'].keys()),
+                'feedback_keys': sorted(normalized_item['feedback_payload'].keys()),
             },
         }
 
@@ -348,9 +439,8 @@ class AgentContextFeedbackService:
         *,
         items: Sequence[dict[str, Any]],
     ) -> dict[str, Any]:
-        accepted = []
-        for item in items:
-            accepted.append(self.submit_feedback(**item)['item'])
+        normalized_items = [self._normalize_feedback_item(**item) for item in items]
+        accepted = self.repository.bulk_upsert_feedback(items=normalized_items)
         return {'accepted': True, 'count': len(accepted), 'items': accepted}
 
 
