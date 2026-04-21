@@ -1,4 +1,5 @@
 from datetime import date
+from pathlib import Path
 import os
 import signal
 import subprocess
@@ -451,31 +452,39 @@ async def control_core_api(payload: CoreControlRequest) -> dict:
                     continue
                 pids.append(int(piece))
         sig = signal.SIGKILL if payload.signal_name == 'SIGKILL' else signal.SIGTERM
-        killed = []
-        for pid in pids:
-            os.kill(pid, sig)
-            killed.append(pid)
+        current_pid = os.getpid()
+        target_pids = [pid for pid in pids if pid != current_pid]
+        self_targeted = current_pid in pids
         if payload.action == 'restart':
-            plist = '/Users/shawn/kai-trading-core/apps/api/com.kiseyno.kai-trading-core-api.plist'
+            plist = Path(__file__).resolve().parents[2] / 'com.kiseyno.kai-trading-core-api.plist'
             uid = str(os.getuid())
-            subprocess.run(['launchctl', 'bootout', f'gui/{uid}', plist], check=False, capture_output=True, text=True)
-            restarted = subprocess.run(['launchctl', 'bootstrap', f'gui/{uid}', plist], check=True, capture_output=True, text=True)
-            logger.warning('core api control endpoint invoked', extra={'action': payload.action, 'port': payload.port, 'signal': payload.signal_name, 'killed_pids': killed})
+            subprocess.run(['launchctl', 'bootout', f'gui/{uid}', str(plist)], check=False, capture_output=True, text=True)
+            restarted = subprocess.run(['launchctl', 'bootstrap', f'gui/{uid}', str(plist)], check=True, capture_output=True, text=True)
+            logger.warning('core api control endpoint invoked', extra={'action': payload.action, 'port': payload.port, 'signal': payload.signal_name, 'killed_pids': target_pids, 'self_targeted': self_targeted})
             return {
                 'status': 'restarted',
                 'port': payload.port,
                 'signal': payload.signal_name,
-                'killed_pids': killed,
+                'killed_pids': target_pids,
+                'self_targeted': self_targeted,
                 'launchctl_stdout': restarted.stdout.strip(),
                 'launchctl_stderr': restarted.stderr.strip(),
+                'plist_path': str(plist),
             }
-        status = 'killed' if killed else 'no_process'
-        logger.warning('core api control endpoint invoked', extra={'action': payload.action, 'port': payload.port, 'signal': payload.signal_name, 'killed_pids': killed})
+        killed = []
+        for pid in target_pids:
+            os.kill(pid, sig)
+            killed.append(pid)
+        if self_targeted:
+            os.kill(current_pid, sig)
+        status = 'killed' if (killed or self_targeted) else 'no_process'
+        logger.warning('core api control endpoint invoked', extra={'action': payload.action, 'port': payload.port, 'signal': payload.signal_name, 'killed_pids': killed, 'self_targeted': self_targeted})
         return {
             'status': status,
             'port': payload.port,
             'signal': payload.signal_name,
             'pids': killed,
+            'self_targeted': self_targeted,
         }
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
