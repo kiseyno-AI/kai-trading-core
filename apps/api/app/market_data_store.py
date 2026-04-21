@@ -663,6 +663,12 @@ def persist_daily_price_bar(snapshot: dict, *, run_id: int | None = None) -> Non
                 close_price=snapshot['close_price'],
                 volume=snapshot['volume'],
                 turnover=snapshot['turnover'],
+                per=_as_decimal(snapshot['per']) if snapshot.get('per') is not None else None,
+                pbr=_as_decimal(snapshot['pbr']) if snapshot.get('pbr') is not None else None,
+                bps=_as_decimal(snapshot['bps']) if snapshot.get('bps') is not None else None,
+                eps=_as_decimal(snapshot['eps']) if snapshot.get('eps') is not None else None,
+                dividend_yield=_as_decimal(snapshot['dividend_yield']) if snapshot.get('dividend_yield') is not None else None,
+                dps=_as_decimal(snapshot['dps']) if snapshot.get('dps') is not None else None,
                 source=snapshot.get('source', 'kis'),
             )
             session.add(row)
@@ -675,6 +681,12 @@ def persist_daily_price_bar(snapshot: dict, *, run_id: int | None = None) -> Non
         row.close_price = snapshot['close_price']
         row.volume = snapshot['volume']
         row.turnover = snapshot['turnover']
+        row.per = _as_decimal(snapshot['per']) if snapshot.get('per') is not None else None
+        row.pbr = _as_decimal(snapshot['pbr']) if snapshot.get('pbr') is not None else None
+        row.bps = _as_decimal(snapshot['bps']) if snapshot.get('bps') is not None else None
+        row.eps = _as_decimal(snapshot['eps']) if snapshot.get('eps') is not None else None
+        row.dividend_yield = _as_decimal(snapshot['dividend_yield']) if snapshot.get('dividend_yield') is not None else None
+        row.dps = _as_decimal(snapshot['dps']) if snapshot.get('dps') is not None else None
         row.source = snapshot.get('source', 'kis')
         row.captured_at = datetime.utcnow()
 
@@ -730,6 +742,12 @@ def persist_daily_price_bars(
                 'close_price': int(item['close_price']),
                 'volume': int(item['volume']),
                 'turnover': int(item['turnover']),
+                'per': _as_decimal(item['per']) if item.get('per') is not None else None,
+                'pbr': _as_decimal(item['pbr']) if item.get('pbr') is not None else None,
+                'bps': _as_decimal(item['bps']) if item.get('bps') is not None else None,
+                'eps': _as_decimal(item['eps']) if item.get('eps') is not None else None,
+                'dividend_yield': _as_decimal(item['dividend_yield']) if item.get('dividend_yield') is not None else None,
+                'dps': _as_decimal(item['dps']) if item.get('dps') is not None else None,
                 'source': source,
             }
             for item in bars
@@ -746,6 +764,12 @@ def persist_daily_price_bars(
                     'close_price': statement.excluded.close_price,
                     'volume': statement.excluded.volume,
                     'turnover': statement.excluded.turnover,
+                    'per': statement.excluded.per,
+                    'pbr': statement.excluded.pbr,
+                    'bps': statement.excluded.bps,
+                    'eps': statement.excluded.eps,
+                    'dividend_yield': statement.excluded.dividend_yield,
+                    'dps': statement.excluded.dps,
                     'source': statement.excluded.source,
                     'captured_at': refreshed_at,
                 },
@@ -781,6 +805,12 @@ def load_daily_bars_for_symbol(
                 DailyPriceBar.close_price,
                 DailyPriceBar.volume,
                 DailyPriceBar.turnover,
+                DailyPriceBar.per,
+                DailyPriceBar.pbr,
+                DailyPriceBar.bps,
+                DailyPriceBar.eps,
+                DailyPriceBar.dividend_yield,
+                DailyPriceBar.dps,
             )
             .join(Symbol, Symbol.id == DailyPriceBar.symbol_id)
             .where(
@@ -799,6 +829,12 @@ def load_daily_bars_for_symbol(
                 'close_price': int(row.close_price),
                 'volume': int(row.volume),
                 'turnover': int(row.turnover),
+                'per': _round_float(row.per, 6),
+                'pbr': _round_float(row.pbr, 6),
+                'bps': _round_float(row.bps, 6),
+                'eps': _round_float(row.eps, 6),
+                'dividend_yield': _round_float(row.dividend_yield, 6),
+                'dps': _round_float(row.dps, 6),
             }
             for row in reversed(rows)
         ]
@@ -823,6 +859,12 @@ def load_daily_bars_for_symbol_range(
                 DailyPriceBar.close_price,
                 DailyPriceBar.volume,
                 DailyPriceBar.turnover,
+                DailyPriceBar.per,
+                DailyPriceBar.pbr,
+                DailyPriceBar.bps,
+                DailyPriceBar.eps,
+                DailyPriceBar.dividend_yield,
+                DailyPriceBar.dps,
                 DailyPriceBar.source,
                 DailyPriceBar.captured_at,
             )
@@ -848,6 +890,12 @@ def load_daily_bars_for_symbol_range(
                 'close_price': int(row.close_price),
                 'volume': int(row.volume),
                 'turnover': int(row.turnover),
+                'per': _round_float(row.per, 6),
+                'pbr': _round_float(row.pbr, 6),
+                'bps': _round_float(row.bps, 6),
+                'eps': _round_float(row.eps, 6),
+                'dividend_yield': _round_float(row.dividend_yield, 6),
+                'dps': _round_float(row.dps, 6),
                 'source': row.source,
                 'captured_at': row.captured_at.isoformat() if row.captured_at else None,
             }
@@ -875,6 +923,12 @@ def load_recent_price_bars_by_symbol(
                 DailyPriceBar.close_price.label('close_price'),
                 DailyPriceBar.volume.label('volume'),
                 DailyPriceBar.turnover.label('turnover'),
+                DailyPriceBar.per.label('per'),
+                DailyPriceBar.pbr.label('pbr'),
+                DailyPriceBar.bps.label('bps'),
+                DailyPriceBar.eps.label('eps'),
+                DailyPriceBar.dividend_yield.label('dividend_yield'),
+                DailyPriceBar.dps.label('dps'),
                 DailyPriceBar.source.label('source'),
                 DailyPriceBar.captured_at.label('captured_at'),
                 func.row_number()
@@ -906,6 +960,12 @@ def load_recent_price_bars_by_symbol(
                 'close_price': int(mapping['close_price']) if mapping['close_price'] is not None else None,
                 'volume': int(mapping['volume']) if mapping['volume'] is not None else None,
                 'turnover': int(mapping['turnover']) if mapping['turnover'] is not None else None,
+                'per': _round_float(mapping['per'], 6),
+                'pbr': _round_float(mapping['pbr'], 6),
+                'bps': _round_float(mapping['bps'], 6),
+                'eps': _round_float(mapping['eps'], 6),
+                'dividend_yield': _round_float(mapping['dividend_yield'], 6),
+                'dps': _round_float(mapping['dps'], 6),
                 'source': mapping['source'],
                 'captured_at': mapping['captured_at'].isoformat() if mapping['captured_at'] else None,
             }
