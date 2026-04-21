@@ -33,6 +33,7 @@ class RuntimeFeedbackRunState:
     logical_pending_symbols: int | None = None
     logical_completed_feedback_count: int | None = None
     logical_failed_items: int | None = None
+    normalized_response_count: int | None = None
 
     def to_progress_summary(self) -> dict[str, Any]:
         expected_feedback_count = self.logical_expected_feedback_count if self.logical_expected_feedback_count is not None else len(self.requested_symbols) * len(self.requested_roles)
@@ -109,29 +110,73 @@ class RuntimeFeedbackRunState:
 class RuntimeFeedbackStateStore:
     def __init__(self) -> None:
         self._lock = threading.RLock()
-        self._runs_by_market_date: dict[str, RuntimeFeedbackRunState] = {}
+        self._runs_by_market_date: dict[str, dict[str, RuntimeFeedbackRunState]] = {}
+        self._active_run_id_by_market_date: dict[str, str] = {}
+        self._logical_run_id_by_market_date: dict[str, str] = {}
+        self._max_runs_per_market_date = 8
 
-    def start_run(self, state: RuntimeFeedbackRunState, *, replace: bool = True) -> RuntimeFeedbackRunState:
+    def start_run(self, state: RuntimeFeedbackRunState, *, replace: bool = True, set_active: bool = True, logical: bool = False) -> RuntimeFeedbackRunState:
         with self._lock:
-            key = state.market_date.isoformat()
-            if not replace and key in self._runs_by_market_date:
-                return self._runs_by_market_date[key]
-            self._runs_by_market_date[key] = state
+            market_key = state.market_date.isoformat()
+            runs = self._runs_by_market_date.setdefault(market_key, {})
+            if not replace and state.run_id in runs:
+                return runs[state.run_id]
+            runs[state.run_id] = state
+            if set_active:
+                self._active_run_id_by_market_date[market_key] = state.run_id
+            if logical:
+                self._logical_run_id_by_market_date[market_key] = state.run_id
+                self._active_run_id_by_market_date[market_key] = state.run_id
+            self._prune_runs_locked(market_key)
             return state
 
-    def get_run(self, market_date: str | date) -> RuntimeFeedbackRunState | None:
-        key = market_date if isinstance(market_date, str) else market_date.isoformat()
+    def get_run(self, market_date: str | date, run_id: str | None = None, logical: bool = False) -> RuntimeFeedbackRunState | None:
+        market_key = market_date if isinstance(market_date, str) else market_date.isoformat()
         with self._lock:
-            return self._runs_by_market_date.get(key)
+            runs = self._runs_by_market_date.get(market_key, {})
+            resolved_run_id = run_id
+            if resolved_run_id is None and logical:
+                resolved_run_id = self._logical_run_id_by_market_date.get(market_key)
+            if resolved_run_id is None:
+                resolved_run_id = self._active_run_id_by_market_date.get(market_key)
+            if resolved_run_id is None:
+                return None
+            return runs.get(resolved_run_id)
 
-    def update_run(self, market_date: str | date, updater) -> RuntimeFeedbackRunState | None:
-        key = market_date if isinstance(market_date, str) else market_date.isoformat()
+    def update_run(self, market_date: str | date, updater, run_id: str | None = None, logical: bool = False) -> RuntimeFeedbackRunState | None:
+        market_key = market_date if isinstance(market_date, str) else market_date.isoformat()
         with self._lock:
-            state = self._runs_by_market_date.get(key)
+            runs = self._runs_by_market_date.get(market_key, {})
+            resolved_run_id = run_id
+            if resolved_run_id is None and logical:
+                resolved_run_id = self._logical_run_id_by_market_date.get(market_key)
+            if resolved_run_id is None:
+                resolved_run_id = self._active_run_id_by_market_date.get(market_key)
+            if resolved_run_id is None:
+                return None
+            state = runs.get(resolved_run_id)
             if state is None:
                 return None
             updater(state)
+            self._prune_runs_locked(market_key)
             return state
+
+    def _prune_runs_locked(self, market_key: str) -> None:
+        runs = self._runs_by_market_date.get(market_key)
+        if not runs or len(runs) <= self._max_runs_per_market_date:
+            return
+        protected = {
+            self._active_run_id_by_market_date.get(market_key),
+            self._logical_run_id_by_market_date.get(market_key),
+        }
+        removable = [
+            run for run in runs.values()
+            if run.run_id not in protected and run.completed_at is not None
+        ]
+        removable.sort(key=lambda run: run.completed_at or run.started_at)
+        while len(runs) > self._max_runs_per_market_date and removable:
+            victim = removable.pop(0)
+            runs.pop(victim.run_id, None)
 
 
 runtime_feedback_state_store = RuntimeFeedbackStateStore()

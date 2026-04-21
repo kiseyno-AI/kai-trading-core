@@ -15,17 +15,19 @@ class AgentContextProgressService:
         market_date: str | date,
         symbols: Sequence[str] | None = None,
         expected_agents: Sequence[str] | None = None,
+        run_id: str | None = None,
     ) -> dict[str, Any]:
         normalized_market_date = _normalize_market_date(market_date)
         normalized_symbols = _normalize_symbols(symbols) if symbols is not None else None
         expected_agent_names = self._normalize_expected_agents(expected_agents)
-        state = runtime_feedback_state_store.get_run(normalized_market_date)
+        state = runtime_feedback_state_store.get_run(normalized_market_date, run_id=run_id, logical=(run_id is None))
         if state is None:
             return {
                 'request': {
                     'market_date': normalized_market_date.isoformat(),
                     'symbols': normalized_symbols,
                     'expected_agents': list(expected_agent_names),
+                    'run_id': run_id,
                 },
                 'summary': {
                     'run_id': None,
@@ -63,6 +65,7 @@ class AgentContextProgressService:
                 'market_date': normalized_market_date.isoformat(),
                 'symbols': normalized_symbols,
                 'expected_agents': list(expected_agent_names),
+                'run_id': run_id,
             },
             'summary': state.to_progress_summary(),
         }
