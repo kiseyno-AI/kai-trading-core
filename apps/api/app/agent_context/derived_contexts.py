@@ -266,8 +266,14 @@ class DailyPriceContextService:
 
         items: list[dict[str, Any]] = []
         failed_symbols: list[str] = []
+        expected_trade_date = normalized_market_date.isoformat()
         for symbol in target_symbols:
-            context_payload = build_price_context(price_bars_by_symbol.get(symbol, []))
+            price_bars = price_bars_by_symbol.get(symbol, [])
+            if not price_bars or price_bars[0].get('trade_date') != expected_trade_date:
+                failed_symbols.append(symbol)
+                continue
+
+            context_payload = build_price_context(price_bars)
             if context_payload is None:
                 failed_symbols.append(symbol)
                 continue
