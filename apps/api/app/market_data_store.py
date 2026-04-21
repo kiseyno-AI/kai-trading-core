@@ -1714,9 +1714,19 @@ def compute_and_persist_daily_trending_ranks(
 
     period_results: list[dict] = []
     total_persisted = 0
+
+    def _emit_progress(payload: dict) -> None:
+        if not progress_callback:
+            return
+        try:
+            progress_callback(payload)
+        except Exception:
+            # Progress persistence is best-effort and must not interrupt trending rank rebuilds.
+            return
+
     if progress_callback:
         first_period = deduped_periods[0] if deduped_periods else None
-        progress_callback(
+        _emit_progress(
             {
                 'status': 'running' if first_period else 'completed',
                 'processed': 0,
@@ -1770,7 +1780,7 @@ def compute_and_persist_daily_trending_ranks(
         if progress_callback:
             processed_periods = len(period_results)
             next_period = deduped_periods[processed_periods] if processed_periods < len(deduped_periods) else None
-            progress_callback(
+            _emit_progress(
                 {
                     'status': 'running' if next_period is not None else 'completed',
                     'processed': processed_periods,

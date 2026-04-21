@@ -1,5 +1,6 @@
 
 import unittest
+from unittest.mock import patch
 
 from app.eod.action_summaries import DailyActionSummaryService
 
@@ -110,3 +111,29 @@ class DailyActionSummaryServiceTests(unittest.TestCase):
         self.assertEqual(result.action_label, 'insufficient_data')
         self.assertEqual(result.confidence_tier, 'low')
         self.assertEqual(result.risk_tier, 'unknown')
+
+    def test_compute_and_persist_ignores_progress_callback_failures(self):
+        service = DailyActionSummaryService()
+        progress_updates: list[dict] = []
+
+        def _failing_progress_callback(progress: dict) -> None:
+            progress_updates.append(progress)
+            raise RuntimeError('progress store unavailable')
+
+        with (
+            patch(
+                'app.eod.action_summaries.load_daily_technical_snapshot_inputs',
+                return_value=[_snapshot()],
+            ),
+            patch('app.eod.action_summaries.upsert_daily_action_summary') as upsert_mock,
+        ):
+            result = service.compute_and_persist_for_market_date(
+                market_date='2026-04-29',
+                progress_callback=_failing_progress_callback,
+            )
+
+        self.assertEqual(result['action_summaries_persisted'], 1)
+        self.assertEqual(result['action_summaries_failed'], 0)
+        self.assertEqual(result['failed_symbols'], [])
+        self.assertEqual([item['status'] for item in progress_updates], ['running', 'completed'])
+        upsert_mock.assert_called_once()
