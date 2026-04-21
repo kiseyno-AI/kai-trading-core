@@ -8,6 +8,7 @@ from typing import Any, Iterable
 
 from app.agent_context.derived_contexts import derived_context_backfill_service
 from app.agent_context.orchestrator import agent_feedback_orchestrator
+from app.agent_context.retry_service import EXPECTED_ROLES, FeedbackRetryCycleConfig, agent_feedback_retry_service
 from app.agent_context.session_cleanup_service import agent_feedback_session_cleanup_service
 from app.core.settings import settings
 from app.dart.fundamentals_capture_service import dart_fundamentals_capture_service
@@ -164,6 +165,27 @@ def compute_trending_ranks(*, market_date: str, periods: str | None = None) -> d
     )
 
 
+def run_agent_feedback_retry_cycles(
+    *,
+    market_date: str,
+    roles: str | None = None,
+    max_cycles: int = 3,
+    outer_batch_size: int = 20,
+    reuse_existing: bool = True,
+) -> dict[str, Any]:
+    bootstrap_runtime()
+    parsed_roles = tuple(item.strip() for item in roles.split(',') if item.strip()) if roles else EXPECTED_ROLES
+    return agent_feedback_retry_service.run_retry_cycles(
+        config=FeedbackRetryCycleConfig(
+            market_date=__import__('datetime').date.fromisoformat(market_date),
+            roles=parsed_roles,
+            max_cycles=max_cycles,
+            outer_batch_size=outer_batch_size,
+            reuse_existing=reuse_existing,
+        )
+    )
+
+
 def run_agent_feedback_symbol_cleanup_smoke(
     *,
     market_date: str,
@@ -266,6 +288,16 @@ def _build_parser() -> argparse.ArgumentParser:
     trending_parser.add_argument('--market-date', required=True)
     trending_parser.add_argument('--periods')
 
+    feedback_retry_parser = subparsers.add_parser(
+        'agent-feedback-retry-cycles',
+        help='Run the same agent feedback retry-cycle engine used by fundamentals follow-up',
+    )
+    feedback_retry_parser.add_argument('--market-date', required=True)
+    feedback_retry_parser.add_argument('--roles')
+    feedback_retry_parser.add_argument('--max-cycles', type=int, default=3)
+    feedback_retry_parser.add_argument('--outer-batch-size', type=int, default=20)
+    feedback_retry_parser.add_argument('--reuse-existing', choices=('true', 'false'), default='true')
+
     feedback_smoke_parser = subparsers.add_parser(
         'agent-feedback-symbol-cleanup-smoke',
         help='Dispatch symbol feedback, store rows, attempt immediate session deletion, then retry failed deletions once',
@@ -333,6 +365,14 @@ def main(argv: Iterable[str] | None = None) -> int:
         payload = compute_action_summaries(market_date=args.market_date, symbols=args.symbols)
     elif args.command == 'eod-trending-ranks-compute':
         payload = compute_trending_ranks(market_date=args.market_date, periods=args.periods)
+    elif args.command == 'agent-feedback-retry-cycles':
+        payload = run_agent_feedback_retry_cycles(
+            market_date=args.market_date,
+            roles=args.roles,
+            max_cycles=args.max_cycles,
+            outer_batch_size=args.outer_batch_size,
+            reuse_existing=args.reuse_existing == 'true',
+        )
     elif args.command == 'agent-feedback-symbol-cleanup-smoke':
         payload = run_agent_feedback_symbol_cleanup_smoke(
             market_date=args.market_date,

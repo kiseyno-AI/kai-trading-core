@@ -3,6 +3,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from secrets import compare_digest
+import asyncio
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -39,8 +40,8 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     try:
-        init_database()
-        tracked_symbols = load_tracked_symbols()
+        await asyncio.to_thread(init_database)
+        tracked_symbols = await asyncio.to_thread(load_tracked_symbols)
         scanner_state.hydrate(tracked_symbols)
     except Exception as exc:
         logger.warning('Database initialization failed; starting in degraded mode: %s', exc)
