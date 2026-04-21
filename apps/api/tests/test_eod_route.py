@@ -118,6 +118,34 @@ class FakeSignalFeatureService:
         }
 
 
+class FakePipelineStatusService:
+    def __init__(self):
+        self.read_args = None
+
+    def read(self, **kwargs):
+        self.read_args = kwargs
+        return {
+            'market_date': kwargs.get('market_date') or '2026-04-21',
+            'fs_div': kwargs.get('fs_div') or 'CFS',
+            'status': 'running',
+            'stage_order': ['price_collection', 'technical_snapshots', 'fundamentals_daily_refresh'],
+            'stages': {
+                'price_collection': {
+                    'status': 'completed',
+                    'source_run_ids': {'eod_run_id': 101},
+                },
+                'technical_snapshots': {
+                    'status': 'running',
+                    'current_activity': 'Computing daily technical snapshots for 000660',
+                },
+                'fundamentals_daily_refresh': {
+                    'status': 'pending',
+                    'source_run_ids': {},
+                },
+            },
+        }
+
+
 class EODRouteTests(unittest.TestCase):
     def setUp(self):
         self.app = FastAPI()
@@ -141,6 +169,29 @@ class EODRouteTests(unittest.TestCase):
         self.assertEqual(payload['today']['fundamentals']['symbols_total'], 1)
         self.assertEqual(payload['latest']['symbols_succeeded'], 3)
         self.assertEqual(payload['latest']['action_market_date'], '2026-04-10')
+
+    def test_get_eod_pipeline_status_route_returns_service_payload(self):
+        fake_service = FakePipelineStatusService()
+        original_service = routes_eod.eod_pipeline_status_service
+        routes_eod.eod_pipeline_status_service = fake_service
+        try:
+            client = TestClient(self.app)
+            response = client.get(
+                '/eod/pipeline/status',
+                params={'market_date': '2026-04-21', 'fs_div': 'OFS'},
+            )
+        finally:
+            routes_eod.eod_pipeline_status_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(fake_service.read_args, {'market_date': '2026-04-21', 'fs_div': 'OFS'})
+        payload = response.json()
+        self.assertEqual(payload['status'], 'running')
+        self.assertEqual(payload['stages']['price_collection']['source_run_ids']['eod_run_id'], 101)
+        self.assertEqual(
+            payload['stages']['technical_snapshots']['current_activity'],
+            'Computing daily technical snapshots for 000660',
+        )
 
     def test_compute_technical_snapshots_route_calls_service(self):
         fake_service = FakeTechnicalSnapshotService()

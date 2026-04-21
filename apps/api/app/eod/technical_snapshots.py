@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from datetime import date
-from typing import Iterable, Sequence
+from typing import Callable, Iterable, Sequence
 
 from app.market_data_store import (
     list_symbols_with_daily_bar_on_date,
@@ -208,12 +208,41 @@ class DailyTechnicalSnapshotService:
         symbols: Sequence[str] | None = None,
         source: str = 'pykrx',
         run_id: int | None = None,
+        progress_callback: Callable[[dict], None] | None = None,
     ) -> dict:
         target_symbols = list(symbols) if symbols else list_symbols_with_daily_bar_on_date(market_date)
         snapshots: list[dict] = []
         failed_symbols: list[str] = []
 
-        for symbol in target_symbols:
+        def _emit_progress(payload: dict) -> None:
+            if not progress_callback:
+                return
+            try:
+                progress_callback(payload)
+            except Exception:
+                # Progress persistence is best-effort and must not interrupt snapshot processing.
+                return
+
+        if progress_callback:
+            first_symbol = target_symbols[0] if target_symbols else None
+            _emit_progress(
+                {
+                    'status': 'running' if first_symbol else 'completed',
+                    'processed': 0,
+                    'succeeded': 0,
+                    'failed': 0,
+                    'total': len(target_symbols),
+                    'current_symbol': first_symbol,
+                    'current_step': 'computing_symbol_snapshot' if first_symbol else 'technical_snapshots_completed',
+                    'current_activity': (
+                        f'Computing daily technical snapshots for {first_symbol}'
+                        if first_symbol
+                        else 'No symbols available for daily technical snapshots'
+                    ),
+                }
+            )
+
+        for index, symbol in enumerate(target_symbols):
             try:
                 bars = load_daily_bars_for_symbol(symbol, end_date=market_date, limit=self.history_window)
                 snapshot = self.compute_snapshot(symbol=symbol, market_date=market_date, bars=bars, source=source)
@@ -221,6 +250,32 @@ class DailyTechnicalSnapshotService:
                 snapshots.append(snapshot.to_row())
             except Exception:
                 failed_symbols.append(symbol)
+            if progress_callback:
+                next_symbol = target_symbols[index + 1] if index + 1 < len(target_symbols) else None
+                _emit_progress(
+                    {
+                        'status': (
+                            'running'
+                            if next_symbol is not None
+                            else ('completed' if not failed_symbols else 'partial')
+                        ),
+                        'processed': len(snapshots) + len(failed_symbols),
+                        'succeeded': len(snapshots),
+                        'failed': len(failed_symbols),
+                        'total': len(target_symbols),
+                        'current_symbol': next_symbol,
+                        'current_step': (
+                            'computing_symbol_snapshot'
+                            if next_symbol is not None
+                            else 'technical_snapshots_completed'
+                        ),
+                        'current_activity': (
+                            f'Computing daily technical snapshots for {next_symbol}'
+                            if next_symbol is not None
+                            else 'Completed daily technical snapshots'
+                        ),
+                    }
+                )
 
         return {
             'market_date': market_date,

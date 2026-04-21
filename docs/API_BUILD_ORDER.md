@@ -54,6 +54,7 @@
 - `GET /disclosures/dart/filings/xbrl?rcept_no=20250312000123&report_code=11011`
 - `GET /eod/status`
 - `GET /eod/freshness`
+- `GET /eod/pipeline/status?market_date=YYYY-MM-DD&fs_div=CFS`
 - `POST /eod/master/refresh-if-due?force=false`
 - `POST /eod/capture-if-due`
 - `POST /eod/capture?market_date=YYYY-MM-DD`
@@ -88,6 +89,13 @@
 - The `latest` block also reports EOD run status and symbol counts for `latest.price_trade_date`, so clients can show the latest stored run result before today's run exists.
 - `latest.eod_status` falls back to all stored price bars for `latest.price_trade_date`, including symbols that are no longer in the current active universe.
 - The `today` block is scoped only to the current Seoul trade date; previous-day historical availability is surfaced through `latest.*`, not copied into `today.*`.
+
+## EOD pipeline status notes
+- `GET /eod/pipeline/status` is the operator-facing live status API for the post-close EOD pipeline.
+- It stays separate from `GET /eod/freshness`: freshness answers whether the stored data is available, while pipeline status answers which stage is running now and what work is currently in progress.
+- The pykrx stage breakdown reuses the existing `eod_collection_runs` row plus downstream rows linked by `eod_run_id`, and records lightweight per-stage progress in `eod_collection_runs.run_metadata`.
+- The current pykrx pipeline stages are `price_collection`, `technical_snapshots`, `action_summaries`, and `trending_ranks`. The same payload also reports the latest DART `fundamentals_daily_refresh` run for the requested `market_date` and `fs_div`.
+- Stage payloads include normalized status, timestamps, processed or total or failed counts where available, current step or activity text, and linked source run IDs so operators can correlate the live run with existing inspect routes.
 
 ## EOD technical snapshot notes
 - `daily_technical_snapshots` is the DB-backed post-EOD signal layer keyed by `symbol_id + market_date`.
