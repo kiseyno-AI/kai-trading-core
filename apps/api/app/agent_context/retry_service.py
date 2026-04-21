@@ -246,7 +246,12 @@ class AgentFeedbackRetryService:
             return
         request = result.get('request') if isinstance(result, dict) else {}
         summary = result.get('summary') if isinstance(result, dict) else {}
-        current.parallel_per_role = int(request.get('parallel_subtasks') or current.parallel_per_role or 0)
+        requested_parallel = int(request.get('parallel_subtasks') or 0)
+        if requested_parallel > 0:
+            current.parallel_per_role = min(
+                max(1, int(settings.openclaw_agent_parallel_subtasks)),
+                requested_parallel,
+            )
         roles = request.get('roles') if isinstance(request.get('roles'), list) else None
         if roles:
             current.current_role = str(roles[0])

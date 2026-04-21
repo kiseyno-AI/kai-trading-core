@@ -208,6 +208,7 @@ class OpenClawAgentClient:
         self.base_url = settings.openclaw_base_url.rstrip('/')
         self.gateway_token = settings.openclaw_gateway_token
         self.timeout_seconds = settings.openclaw_agent_timeout_seconds if settings.openclaw_agent_timeout_seconds > 0 else None
+        self.http_timeout_seconds = self.timeout_seconds
         self.max_retries = max(0, settings.openclaw_agent_max_retries)
         self.retry_backoff_seconds = max(0, settings.openclaw_agent_retry_backoff_seconds)
 
@@ -233,7 +234,7 @@ class OpenClawAgentClient:
                 'includeTools': include_tools,
             },
         }
-        with httpx.Client(timeout=max(self.timeout_seconds, settings.openclaw_agent_subtask_timeout_seconds), headers=self._headers()) as client:
+        with httpx.Client(timeout=self.http_timeout_seconds, headers=self._headers()) as client:
             response = client.post(url, json=body)
         if response.status_code >= 400:
             raise AgentDispatchTerminalError(f'OpenClaw sessions_history failed {response.status_code}: {response.text[:300]}')
@@ -458,8 +459,8 @@ class OpenClawAgentClient:
                 'cleanup': 'delete',
                 'task': task,
                 'label': child_label,
-                'timeoutSeconds': max(self.timeout_seconds, settings.openclaw_agent_subtask_timeout_seconds),
-                'runTimeoutSeconds': max(self.timeout_seconds, settings.openclaw_agent_subtask_timeout_seconds),
+                'timeoutSeconds': self.http_timeout_seconds,
+                'runTimeoutSeconds': self.http_timeout_seconds,
                 'lightContext': True,
             },
             'sessionKey': child_session_key,
@@ -471,7 +472,7 @@ class OpenClawAgentClient:
             attempt += 1
             started_at = datetime.now(timezone.utc)
             try:
-                with httpx.Client(timeout=max(self.timeout_seconds, settings.openclaw_agent_subtask_timeout_seconds) + 30, headers=headers) as client:
+                with httpx.Client(timeout=self.http_timeout_seconds + 30, headers=headers) as client:
                     response = client.post(url, json=body)
                 if response.status_code >= 500:
                     raise AgentDispatchRetryableError(f'sessions_spawn server error {response.status_code}: {response.text[:300]}')
@@ -644,7 +645,7 @@ class OpenClawAgentClient:
                     session_key=request_session_key,
                     request_body=body,
                 )
-                with httpx.Client(timeout=max(self.timeout_seconds, settings.openclaw_agent_subtask_timeout_seconds), headers=headers) as client:
+                with httpx.Client(timeout=self.http_timeout_seconds, headers=headers) as client:
                     response = client.post(url, json=body)
                 if response.status_code >= 500:
                     raise AgentDispatchRetryableError(f'OpenClaw batch server error {response.status_code}: {response.text[:300]}')

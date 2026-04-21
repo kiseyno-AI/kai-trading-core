@@ -6,8 +6,6 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file='.env',
-        env_file_encoding='utf-8',
         case_sensitive=False,
         extra='ignore',
     )
@@ -86,7 +84,6 @@ class Settings(BaseSettings):
     openclaw_feedback_retry_max_cycles: int = 3
     openclaw_feedback_retry_outer_batch_size: int = 20
     openclaw_agent_subtask_poll_seconds: float = 2.0
-    openclaw_agent_subtask_timeout_seconds: float = 300.0
     openclaw_agent_slot_cooldown_seconds: float = 600.0
     openclaw_session_cleanup_batch_limit: int = 100
 
