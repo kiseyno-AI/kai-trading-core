@@ -104,6 +104,25 @@ def _apply_feedback_filters(
     return stmt
 
 
+def _feedback_conflict_key(item: dict[str, Any]) -> tuple[date, str, str]:
+    return (item['market_date'], item['symbol'], item['agent_name'])
+
+
+def _dedupe_feedback_items_for_upsert(items: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    deduped_reversed: list[dict[str, Any]] = []
+    seen_keys: set[tuple[date, str, str]] = set()
+
+    for item in reversed(items):
+        key = _feedback_conflict_key(item)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        deduped_reversed.append(item)
+
+    deduped_reversed.reverse()
+    return deduped_reversed
+
+
 class AgentContextFeedbackRepository:
     def create_feedback(
         self,
@@ -154,14 +173,15 @@ class AgentContextFeedbackRepository:
         items: Sequence[dict[str, Any]],
         chunk_size: int = BULK_UPSERT_CHUNK_SIZE,
     ) -> list[dict[str, Any]]:
-        if not items:
+        deduped_items = _dedupe_feedback_items_for_upsert(items)
+        if not deduped_items:
             return []
 
         resolved_chunk_size = max(1, chunk_size)
         accepted: list[dict[str, Any]] = []
         with session_scope() as session:
-            for start in range(0, len(items), resolved_chunk_size):
-                chunk = list(items[start:start + resolved_chunk_size])
+            for start in range(0, len(deduped_items), resolved_chunk_size):
+                chunk = list(deduped_items[start:start + resolved_chunk_size])
                 received_at = datetime.now(timezone.utc)
                 chunk_rows = [{**item, 'received_at': received_at} for item in chunk]
                 stmt = insert(AgentContextFeedback).values(chunk_rows)

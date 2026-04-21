@@ -1,6 +1,10 @@
+from datetime import date
 import unittest
 
-from app.agent_context.feedback_service import AgentContextFeedbackService
+from app.agent_context.feedback_service import (
+    AgentContextFeedbackService,
+    _dedupe_feedback_items_for_upsert,
+)
 
 
 class FakeFeedbackRepository:
@@ -65,6 +69,36 @@ class FakeFeedbackRepository:
 
 
 class AgentContextFeedbackServiceTests(unittest.TestCase):
+    def test_dedupe_feedback_items_for_upsert_keeps_last_duplicate_per_conflict_key(self):
+        items = [
+            {'market_date': date(2026, 4, 14), 'symbol': '005930', 'agent_name': 'openclaw'},
+            {'market_date': date(2026, 4, 14), 'symbol': '000660', 'agent_name': 'openclaw'},
+            {'market_date': date(2026, 4, 14), 'symbol': '005930', 'agent_name': 'openclaw'},
+            {'market_date': date(2026, 4, 14), 'symbol': '005930', 'agent_name': 'technical-summarizer'},
+        ]
+
+        deduped = _dedupe_feedback_items_for_upsert(items)
+
+        self.assertEqual(
+            [(item['symbol'], item['agent_name'], item.get('run_id')) for item in deduped],
+            [
+                ('000660', 'openclaw', None),
+                ('005930', 'openclaw', None),
+                ('005930', 'technical-summarizer', None),
+            ],
+        )
+
+    def test_dedupe_feedback_items_for_upsert_leaves_unique_items_unchanged(self):
+        items = [
+            {'market_date': date(2026, 4, 14), 'symbol': '005930', 'agent_name': 'openclaw'},
+            {'market_date': date(2026, 4, 14), 'symbol': '000660', 'agent_name': 'openclaw'},
+            {'market_date': date(2026, 4, 14), 'symbol': '035420', 'agent_name': 'openclaw'},
+        ]
+
+        deduped = _dedupe_feedback_items_for_upsert(items)
+
+        self.assertEqual([item['symbol'] for item in deduped], ['005930', '000660', '035420'])
+
     def test_submit_feedback_normalizes_and_persists_json_payload(self):
         repository = FakeFeedbackRepository()
         service = AgentContextFeedbackService(repository=repository)
