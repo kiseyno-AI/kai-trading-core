@@ -79,6 +79,25 @@ def run_pykrx_daily_if_due(
     )
 
 
+def backfill_pykrx_daily_bar_fundamentals(
+    *,
+    start_date: str,
+    end_date: str | None = None,
+    markets: str | None = None,
+    limit: int | None = None,
+    symbol: str | None = None,
+) -> dict[str, Any]:
+    bootstrap_runtime()
+    parsed_markets = tuple(item.strip().upper() for item in (markets or settings.eod_auto_pykrx_markets).split(',') if item.strip())
+    return PYKRX_BACKFILL_SERVICE.backfill_daily_bar_fundamentals(
+        start_date=start_date,
+        end_date=end_date,
+        markets=parsed_markets or DEFAULT_MARKETS,
+        limit=limit,
+        symbol=symbol,
+    )
+
+
 def run_dart_fundamentals_daily_if_due(
     *,
     market_date: str | None = None,
@@ -251,6 +270,16 @@ def _build_parser() -> argparse.ArgumentParser:
     pykrx_daily_parser.add_argument('--force', action='store_true')
     pykrx_daily_parser.add_argument('--refresh-universe', choices=('true', 'false'))
 
+    pykrx_fundamentals_backfill_parser = subparsers.add_parser(
+        'eod-pykrx-daily-bar-fundamentals-backfill',
+        help='Backfill pykrx fundamentals columns onto existing daily_price_bars rows',
+    )
+    pykrx_fundamentals_backfill_parser.add_argument('--start-date', required=True)
+    pykrx_fundamentals_backfill_parser.add_argument('--end-date')
+    pykrx_fundamentals_backfill_parser.add_argument('--markets')
+    pykrx_fundamentals_backfill_parser.add_argument('--limit', type=int)
+    pykrx_fundamentals_backfill_parser.add_argument('--symbol')
+
     dart_daily_parser = subparsers.add_parser(
         'dart-fundamentals-daily-run-if-due',
         help='Run DART fundamentals daily incremental refresh directly',
@@ -340,6 +369,14 @@ def main(argv: Iterable[str] | None = None) -> int:
             markets=args.markets,
             force=args.force,
             refresh_universe=None if args.refresh_universe is None else args.refresh_universe == 'true',
+        )
+    elif args.command == 'eod-pykrx-daily-bar-fundamentals-backfill':
+        payload = backfill_pykrx_daily_bar_fundamentals(
+            start_date=args.start_date,
+            end_date=args.end_date,
+            markets=args.markets,
+            limit=args.limit,
+            symbol=args.symbol,
         )
     elif args.command == 'dart-fundamentals-daily-run-if-due':
         payload = run_dart_fundamentals_daily_if_due(

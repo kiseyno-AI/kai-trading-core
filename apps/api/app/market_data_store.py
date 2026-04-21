@@ -5,7 +5,7 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Callable
 
-from sqlalchemy import Numeric, cast, delete, func, select, text, update
+from sqlalchemy import Numeric, and_, cast, delete, func, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import aliased
 
@@ -776,6 +776,67 @@ def persist_daily_price_bars(
             )
         )
     return len(values)
+
+
+def load_daily_price_bar_dates_for_symbol(
+    symbol: str,
+    *,
+    start_date: str | date | None = None,
+    end_date: str | date | None = None,
+) -> list[date]:
+    with session_scope() as session:
+        stmt = (
+            select(DailyPriceBar.trade_date)
+            .join(Symbol, Symbol.id == DailyPriceBar.symbol_id)
+            .where(Symbol.symbol == symbol)
+            .order_by(DailyPriceBar.trade_date.asc())
+        )
+        if start_date is not None:
+            stmt = stmt.where(DailyPriceBar.trade_date >= _normalize_trade_date(start_date))
+        if end_date is not None:
+            stmt = stmt.where(DailyPriceBar.trade_date <= _normalize_trade_date(end_date))
+        rows = session.execute(stmt).all()
+        return [row.trade_date for row in rows]
+
+
+def update_daily_price_bar_fundamentals(
+    symbol: str,
+    fundamentals_by_date: dict[date, dict[str, float | None]],
+    *,
+    source: str = 'pykrx',
+) -> int:
+    if not fundamentals_by_date:
+        return 0
+
+    refreshed_at = datetime.utcnow()
+    with session_scope() as session:
+        record = _get_symbol(session, symbol)
+        if record is None:
+            return 0
+
+        updated_count = 0
+        for trade_date, fundamentals in fundamentals_by_date.items():
+            result = session.execute(
+                update(DailyPriceBar)
+                .where(
+                    and_(
+                        DailyPriceBar.symbol_id == record.id,
+                        DailyPriceBar.trade_date == _normalize_trade_date(trade_date),
+                    )
+                )
+                .values(
+                    per=_as_decimal(fundamentals['per']) if fundamentals.get('per') is not None else None,
+                    pbr=_as_decimal(fundamentals['pbr']) if fundamentals.get('pbr') is not None else None,
+                    bps=_as_decimal(fundamentals['bps']) if fundamentals.get('bps') is not None else None,
+                    eps=_as_decimal(fundamentals['eps']) if fundamentals.get('eps') is not None else None,
+                    dividend_yield=_as_decimal(fundamentals['dividend_yield']) if fundamentals.get('dividend_yield') is not None else None,
+                    dps=_as_decimal(fundamentals['dps']) if fundamentals.get('dps') is not None else None,
+                    source=source,
+                    captured_at=refreshed_at,
+                )
+            )
+            updated_count += int(result.rowcount or 0)
+        return updated_count
 
 
 def list_symbols_with_daily_bar_on_date(trade_date: str) -> list[str]:
