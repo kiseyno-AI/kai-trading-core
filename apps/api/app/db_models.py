@@ -165,6 +165,19 @@ class DailyPriceBar(Base):
     captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
+class DailyPriceContext(Base, TimestampMixin):
+    __tablename__ = 'daily_price_contexts'
+    __table_args__ = (UniqueConstraint('symbol_id', 'market_date', name='uq_daily_price_contexts_symbol_market_date'),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol_id: Mapped[int] = mapped_column(ForeignKey('symbols.id', ondelete='CASCADE'), nullable=False, index=True)
+    eod_run_id: Mapped[int | None] = mapped_column(ForeignKey('eod_collection_runs.id', ondelete='SET NULL'), index=True)
+    market_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default='pykrx')
+    context_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
 class DailyTechnicalSnapshot(Base, TimestampMixin):
     __tablename__ = 'daily_technical_snapshots'
     __table_args__ = (UniqueConstraint('symbol_id', 'market_date', name='uq_daily_technical_snapshots_symbol_market_date'),)
@@ -265,6 +278,24 @@ class DailySignalFeature(Base, TimestampMixin):
     overtime_fluctuation_rank: Mapped[int | None] = mapped_column(Integer, index=True)
     overtime_fluctuation_rate: Mapped[float | None] = mapped_column(Numeric(12, 4))
     feature_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class DailyMarketParticipationContext(Base, TimestampMixin):
+    __tablename__ = 'daily_market_participation_contexts'
+    __table_args__ = (
+        UniqueConstraint(
+            'market',
+            'market_date',
+            name='uq_daily_market_participation_contexts_market_market_date',
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    market: Mapped[str] = mapped_column(String(32), nullable=False, default='KRX', index=True)
+    market_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default='kis_ranking')
+    context_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
     captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 

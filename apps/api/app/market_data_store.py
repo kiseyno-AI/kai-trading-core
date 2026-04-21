@@ -13,7 +13,9 @@ from app.db import engine, session_scope
 from app.db_models import (
     CurrentQuoteCache,
     DailyActionSummary,
+    DailyMarketParticipationContext,
     DailyPriceBar,
+    DailyPriceContext,
     DailySignalFeature,
     DailyTechnicalSnapshot,
     DailyTrendingRank,
@@ -850,6 +852,126 @@ def load_daily_bars_for_symbol_range(
                 'captured_at': row.captured_at.isoformat() if row.captured_at else None,
             }
             for row in ordered_rows
+        ]
+
+
+def load_recent_price_bars_by_symbol(
+    *,
+    market_date: str | date,
+    symbols: list[str],
+) -> dict[str, list[dict]]:
+    if not symbols:
+        return {}
+
+    normalized_symbols = list(dict.fromkeys(symbols))
+    with session_scope() as session:
+        ranked = (
+            select(
+                Symbol.symbol.label('symbol'),
+                DailyPriceBar.trade_date.label('trade_date'),
+                DailyPriceBar.open_price.label('open_price'),
+                DailyPriceBar.high_price.label('high_price'),
+                DailyPriceBar.low_price.label('low_price'),
+                DailyPriceBar.close_price.label('close_price'),
+                DailyPriceBar.volume.label('volume'),
+                DailyPriceBar.turnover.label('turnover'),
+                DailyPriceBar.source.label('source'),
+                DailyPriceBar.captured_at.label('captured_at'),
+                func.row_number()
+                .over(partition_by=DailyPriceBar.symbol_id, order_by=DailyPriceBar.trade_date.desc())
+                .label('bar_rank'),
+            )
+            .join(Symbol, Symbol.id == DailyPriceBar.symbol_id)
+            .where(
+                Symbol.symbol.in_(normalized_symbols),
+                DailyPriceBar.trade_date <= _normalize_trade_date(market_date),
+            )
+            .subquery()
+        )
+        rows = session.execute(
+            select(ranked)
+            .where(ranked.c.bar_rank <= 2)
+            .order_by(ranked.c.symbol.asc(), ranked.c.trade_date.desc())
+        ).all()
+
+    grouped: dict[str, list[dict]] = {symbol: [] for symbol in normalized_symbols}
+    for row in rows:
+        mapping = row._mapping
+        grouped.setdefault(mapping['symbol'], []).append(
+            {
+                'trade_date': mapping['trade_date'].isoformat() if mapping['trade_date'] else None,
+                'open_price': int(mapping['open_price']) if mapping['open_price'] is not None else None,
+                'high_price': int(mapping['high_price']) if mapping['high_price'] is not None else None,
+                'low_price': int(mapping['low_price']) if mapping['low_price'] is not None else None,
+                'close_price': int(mapping['close_price']) if mapping['close_price'] is not None else None,
+                'volume': int(mapping['volume']) if mapping['volume'] is not None else None,
+                'turnover': int(mapping['turnover']) if mapping['turnover'] is not None else None,
+                'source': mapping['source'],
+                'captured_at': mapping['captured_at'].isoformat() if mapping['captured_at'] else None,
+            }
+        )
+    return grouped
+
+
+def upsert_daily_price_context(item: dict, *, run_id: int | None = None) -> None:
+    refreshed_at = datetime.utcnow()
+    with session_scope() as session:
+        symbol = _get_symbol(session, item['symbol'])
+        if symbol is None:
+            raise ValueError(f"Unknown symbol for daily price context: {item['symbol']}")
+
+        values = {
+            'symbol_id': symbol.id,
+            'eod_run_id': run_id,
+            'market_date': _normalize_trade_date(item['market_date']),
+            'source': item.get('source', 'pykrx'),
+            'context_payload': item['context_payload'],
+            'captured_at': refreshed_at,
+            'updated_at': refreshed_at,
+        }
+        statement = pg_insert(DailyPriceContext).values(values)
+        session.execute(
+            statement.on_conflict_do_update(
+                constraint='uq_daily_price_contexts_symbol_market_date',
+                set_={
+                    'eod_run_id': statement.excluded.eod_run_id,
+                    'source': statement.excluded.source,
+                    'context_payload': statement.excluded.context_payload,
+                    'captured_at': statement.excluded.captured_at,
+                    'updated_at': refreshed_at,
+                },
+            )
+        )
+
+
+def load_daily_price_contexts(
+    *,
+    market_date: str | date,
+    symbols: list[str] | None = None,
+    limit: int = 100,
+) -> list[dict]:
+    normalized_market_date = _normalize_trade_date(market_date)
+    with session_scope() as session:
+        stmt = (
+            select(DailyPriceContext, Symbol.symbol)
+            .join(Symbol, Symbol.id == DailyPriceContext.symbol_id)
+            .where(DailyPriceContext.market_date == normalized_market_date)
+            .order_by(Symbol.symbol.asc())
+            .limit(limit)
+        )
+        if symbols:
+            stmt = stmt.where(Symbol.symbol.in_(symbols))
+
+        rows = session.execute(stmt).all()
+        return [
+            {
+                'symbol': symbol,
+                'market_date': context.market_date.isoformat(),
+                'source': context.source,
+                'context_payload': context.context_payload,
+                'captured_at': context.captured_at.isoformat() if context.captured_at else None,
+            }
+            for context, symbol in rows
         ]
 
 
@@ -1793,6 +1915,43 @@ def upsert_daily_signal_feature(feature: dict) -> None:
         )
 
 
+def load_daily_signal_feature_context_rows(
+    *,
+    market_date: str | date,
+) -> list[dict]:
+    normalized_market_date = _normalize_trade_date(market_date)
+    with session_scope() as session:
+        rows = session.execute(
+            select(DailySignalFeature, Symbol)
+            .join(Symbol, Symbol.id == DailySignalFeature.symbol_id)
+            .where(DailySignalFeature.market_date == normalized_market_date)
+            .order_by(
+                DailySignalFeature.signal_count.desc(),
+                DailySignalFeature.volume_power_rank.asc().nullslast(),
+                DailySignalFeature.overtime_volume_rank.asc().nullslast(),
+                DailySignalFeature.overtime_fluctuation_rank.asc().nullslast(),
+                Symbol.symbol.asc(),
+            )
+        ).all()
+
+        return [
+            {
+                'symbol': symbol.symbol,
+                'name_ko': symbol.name_ko,
+                'market': symbol.market,
+                'signal_count': feature.signal_count,
+                'volume_power_rank': feature.volume_power_rank,
+                'volume_power': _decimal_to_float(feature.volume_power),
+                'overtime_volume_rank': feature.overtime_volume_rank,
+                'overtime_volume': int(feature.overtime_volume) if feature.overtime_volume is not None else None,
+                'overtime_fluctuation_rank': feature.overtime_fluctuation_rank,
+                'overtime_fluctuation_rate': _decimal_to_float(feature.overtime_fluctuation_rate),
+                'feature_payload': feature.feature_payload or {},
+            }
+            for feature, symbol in rows
+        ]
+
+
 def load_daily_signal_features(
     *,
     market_date: str | date,
@@ -1828,6 +1987,60 @@ def load_daily_signal_features(
             }
             for feature, symbol in rows
         ]
+
+
+def upsert_daily_market_participation_context(
+    *,
+    market_date: str | date,
+    context_payload: dict,
+    market: str = 'KRX',
+    source: str = 'kis_ranking',
+) -> None:
+    refreshed_at = datetime.utcnow()
+    with session_scope() as session:
+        values = {
+            'market': market,
+            'market_date': _normalize_trade_date(market_date),
+            'source': source,
+            'context_payload': context_payload,
+            'captured_at': refreshed_at,
+            'updated_at': refreshed_at,
+        }
+        statement = pg_insert(DailyMarketParticipationContext).values(values)
+        session.execute(
+            statement.on_conflict_do_update(
+                constraint='uq_daily_market_participation_contexts_market_market_date',
+                set_={
+                    'source': statement.excluded.source,
+                    'context_payload': statement.excluded.context_payload,
+                    'captured_at': statement.excluded.captured_at,
+                    'updated_at': refreshed_at,
+                },
+            )
+        )
+
+
+def load_daily_market_participation_context(
+    *,
+    market_date: str | date,
+    market: str = 'KRX',
+) -> dict | None:
+    normalized_market_date = _normalize_trade_date(market_date)
+    with session_scope() as session:
+        row = session.execute(
+            select(DailyMarketParticipationContext)
+            .where(DailyMarketParticipationContext.market == market)
+            .where(DailyMarketParticipationContext.market_date == normalized_market_date)
+        ).scalar_one_or_none()
+        if row is None:
+            return None
+        return {
+            'market': row.market,
+            'market_date': row.market_date.isoformat(),
+            'source': row.source,
+            'context_payload': row.context_payload,
+            'captured_at': row.captured_at.isoformat() if row.captured_at else None,
+        }
 
 
 def count_daily_price_bars_for_date(trade_date: str | date) -> int:

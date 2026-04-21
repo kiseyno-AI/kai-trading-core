@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Any, Iterable, Sequence
 
+from app.agent_context.derived_contexts import daily_market_participation_context_service
 from app.brokers.kis.provider import kis_client
 from app.market_data_store import load_daily_signal_features, upsert_daily_signal_feature
 
@@ -335,6 +336,20 @@ class DailySignalFeatureService:
             except Exception:
                 failed_symbols.append(item['symbol'])
 
+        try:
+            participation_context = daily_market_participation_context_service.compute_and_persist_for_market_date(
+                market_date=collection.market_date,
+                market='KRX',
+                source=SIGNAL_FEATURE_SOURCE,
+            )
+        except Exception as exc:
+            participation_context = {
+                'market': 'KRX',
+                'market_date': collection.market_date,
+                'source': SIGNAL_FEATURE_SOURCE,
+                'error': str(exc),
+            }
+
         return {
             'market_date': collection.market_date,
             'source': SIGNAL_FEATURE_SOURCE,
@@ -343,6 +358,7 @@ class DailySignalFeatureService:
             'features_persisted': len(persisted_items),
             'features_failed': len(failed_symbols),
             'failed_symbols': failed_symbols[:50],
+            'participation_context': participation_context,
             'items': persisted_items,
         }
 

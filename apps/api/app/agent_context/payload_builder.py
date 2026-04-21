@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections import Counter
 from dataclasses import dataclass
 from datetime import date, timedelta
 from decimal import Decimal
@@ -8,6 +7,11 @@ from typing import Any
 
 from sqlalchemy import and_, desc, func, or_, select
 
+from app.agent_context.derived_contexts import (
+    SIGNAL_PARTICIPATION_SOURCES,
+    apply_participation_run_coverage,
+    build_signal_participation_context as build_persisted_signal_participation_context,
+)
 from app.db import session_scope
 from app.db_models import (
     DailyActionSummary,
@@ -20,6 +24,7 @@ from app.db_models import (
     EODCollectionRun,
     Symbol,
 )
+from app.market_data_store import load_daily_market_participation_context
 
 
 def _to_float(value: Any) -> float | None:
@@ -34,19 +39,6 @@ def _to_float(value: Any) -> float | None:
 
 def _safe_date(value: date | None) -> str | None:
     return value.isoformat() if value else None
-
-
-def _ratio(value: int | float | None, total: int | float | None) -> float | None:
-    if value is None or total in (None, 0):
-        return None
-    return round(float(value) / float(total), 4)
-
-
-SIGNAL_PARTICIPATION_SOURCES: tuple[tuple[str, str, str], ...] = (
-    ('volume-power', 'volume_power_rank', 'volume_power'),
-    ('overtime-volume', 'overtime_volume_rank', 'overtime_volume'),
-    ('overtime-fluctuation', 'overtime_fluctuation_rank', 'overtime_fluctuation_rate'),
-)
 
 
 def _build_signal_feature_leader_rows(rows: list[dict[str, Any]], *, limit: int) -> list[dict[str, Any]]:
@@ -73,45 +65,12 @@ def _build_signal_participation_context(
     limit: int,
     run: EODCollectionRun,
 ) -> dict[str, Any]:
-    distribution = Counter(str(int(row['signal_count'])) for row in rows if row.get('signal_count') is not None)
-
-    # Derive counts from the persisted row set itself so coverage stays
-    # consistent with the leaders built from those same rows.
-    source_counts = {
-        source: sum(1 for row in rows if row.get(rank_key) is not None)
-        for source, rank_key, _ in SIGNAL_PARTICIPATION_SOURCES
-    }
-
-    leaders_by_source: dict[str, list[dict[str, Any]]] = {}
-    for source, rank_key, value_key in SIGNAL_PARTICIPATION_SOURCES:
-        source_rows = [
-            {
-                'symbol': row['symbol'],
-                'name_ko': row['name_ko'],
-                'market': row['market'],
-                'rank': row[rank_key],
-                'metric_name': value_key,
-                'metric_value': row[value_key],
-                'signal_count': row['signal_count'],
-            }
-            for row in rows
-            if row.get(rank_key) is not None
-        ]
-        source_rows.sort(key=lambda item: (item['rank'], item['symbol']))
-        leaders_by_source[source] = source_rows[:limit]
-
-    return {
-        'captured_symbol_count': len(rows),
-        'coverage_ratio_vs_run_total': _ratio(len(rows), run.symbols_total),
-        'coverage_ratio_vs_run_succeeded': _ratio(len(rows), run.symbols_succeeded),
-        'signal_count_distribution': dict(sorted(distribution.items())),
-        'source_counts': source_counts,
-        'source_coverage_ratio_vs_run_succeeded': {
-            source: _ratio(count, run.symbols_succeeded)
-            for source, count in source_counts.items()
-        },
-        'leaders_by_source': leaders_by_source,
-    }
+    base_context = build_persisted_signal_participation_context(rows, limit=limit)
+    return apply_participation_run_coverage(
+        base_context,
+        symbols_total=run.symbols_total,
+        symbols_succeeded=run.symbols_succeeded,
+    )
 
 
 @dataclass(frozen=True)
@@ -170,6 +129,7 @@ class AgentPayloadBuilder:
         }
 
     def _build_market_payload(self, *, run: EODCollectionRun) -> dict[str, Any]:
+        market = getattr(run, 'market', 'KRX') or 'KRX'
         with session_scope() as session:
             period_rows = [
                 {
@@ -246,11 +206,19 @@ class AgentPayloadBuilder:
             grouped.setdefault(row['period'], []).append({k: v for k, v in row.items() if k != 'period'})
 
         signal_rows = _build_signal_feature_leader_rows(market_signal_rows, limit=self.windows.top_n)
-        participation_context = _build_signal_participation_context(
-            market_signal_rows,
-            limit=self.windows.top_n,
-            run=run,
+        stored_participation_context = load_daily_market_participation_context(
+            market_date=run.trade_date,
+            market=market,
         )
+        participation_context = apply_participation_run_coverage(
+            stored_participation_context.get('context_payload') if stored_participation_context else None,
+            symbols_total=run.symbols_total,
+            symbols_succeeded=run.symbols_succeeded,
+        )
+        participation_context['leaders_by_source'] = {
+            source: list(items[: self.windows.top_n])
+            for source, items in participation_context['leaders_by_source'].items()
+        }
 
         return {
             'top_trending': grouped,

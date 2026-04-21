@@ -4,15 +4,13 @@ from calendar import monthrange
 from datetime import date
 from typing import Any, Sequence
 
-from sqlalchemy import func, select
-
+from app.agent_context.derived_contexts import build_price_context
 from app.dart.fundamentals_store import DartFundamentalsRepository, dart_fundamentals_repository
 from app.dart.service import FS_DIV_TO_STATEMENT_TYPE, REPORT_CODE_METADATA
 from app.dart.store import DartSyncRepository, dart_sync_repository
-from app.db import session_scope
-from app.db_models import DailyPriceBar, Symbol
 from app.market_data_store import (
     load_daily_action_summaries,
+    load_daily_price_contexts,
     load_daily_signal_features,
     load_daily_technical_snapshots,
     load_symbols,
@@ -112,194 +110,7 @@ def _build_fundamentals_snapshot(item: dict[str, Any], *, period_end_date: date 
     }
 
 
-def _round_float(value: float | None, *, digits: int = 4) -> float | None:
-    if value is None:
-        return None
-    return round(value, digits)
-
-
-def _percent(value: int | float | None, base: int | float | None) -> float | None:
-    if value is None or base in (None, 0):
-        return None
-    return _round_float((float(value) / float(base)) * 100.0)
-
-
-def _classify_body_size(body_percent_of_range: float | None) -> str | None:
-    if body_percent_of_range is None:
-        return None
-    if body_percent_of_range <= 10.0:
-        return 'small'
-    if body_percent_of_range <= 40.0:
-        return 'medium'
-    return 'large'
-
-
-def _classify_wick_bias(*, upper_wick_points: int, lower_wick_points: int) -> str:
-    if upper_wick_points == 0 and lower_wick_points == 0:
-        return 'none'
-    larger = max(upper_wick_points, lower_wick_points)
-    smaller = min(upper_wick_points, lower_wick_points)
-    if smaller == 0:
-        return 'upper' if upper_wick_points > lower_wick_points else 'lower'
-    if larger / smaller < 1.25:
-        return 'balanced'
-    return 'upper' if upper_wick_points > lower_wick_points else 'lower'
-
-
-def _classify_close_position(position: float | None) -> str | None:
-    if position is None:
-        return None
-    if position <= 0.2:
-        return 'near_low'
-    if position <= 0.4:
-        return 'lower_half'
-    if position < 0.6:
-        return 'middle'
-    if position < 0.8:
-        return 'upper_half'
-    return 'near_high'
-
-
-def _load_recent_price_bars_by_symbol(*, market_date: date, symbols: Sequence[str]) -> dict[str, list[dict[str, Any]]]:
-    if not symbols:
-        return {}
-
-    normalized_symbols = list(dict.fromkeys(symbols))
-    with session_scope() as session:
-        ranked = (
-            select(
-                Symbol.symbol.label('symbol'),
-                DailyPriceBar.trade_date.label('trade_date'),
-                DailyPriceBar.open_price.label('open_price'),
-                DailyPriceBar.high_price.label('high_price'),
-                DailyPriceBar.low_price.label('low_price'),
-                DailyPriceBar.close_price.label('close_price'),
-                DailyPriceBar.volume.label('volume'),
-                DailyPriceBar.turnover.label('turnover'),
-                DailyPriceBar.source.label('source'),
-                DailyPriceBar.captured_at.label('captured_at'),
-                func.row_number()
-                .over(partition_by=DailyPriceBar.symbol_id, order_by=DailyPriceBar.trade_date.desc())
-                .label('bar_rank'),
-            )
-            .join(Symbol, Symbol.id == DailyPriceBar.symbol_id)
-            .where(
-                Symbol.symbol.in_(normalized_symbols),
-                DailyPriceBar.trade_date <= market_date,
-            )
-            .subquery()
-        )
-        rows = session.execute(
-            select(ranked)
-            .where(ranked.c.bar_rank <= 2)
-            .order_by(ranked.c.symbol.asc(), ranked.c.trade_date.desc())
-        ).all()
-
-    grouped: dict[str, list[dict[str, Any]]] = {symbol: [] for symbol in normalized_symbols}
-    for row in rows:
-        mapping = row._mapping
-        grouped.setdefault(mapping['symbol'], []).append(
-            {
-                'trade_date': mapping['trade_date'].isoformat() if mapping['trade_date'] else None,
-                'open_price': int(mapping['open_price']) if mapping['open_price'] is not None else None,
-                'high_price': int(mapping['high_price']) if mapping['high_price'] is not None else None,
-                'low_price': int(mapping['low_price']) if mapping['low_price'] is not None else None,
-                'close_price': int(mapping['close_price']) if mapping['close_price'] is not None else None,
-                'volume': int(mapping['volume']) if mapping['volume'] is not None else None,
-                'turnover': int(mapping['turnover']) if mapping['turnover'] is not None else None,
-                'source': mapping['source'],
-                'captured_at': mapping['captured_at'].isoformat() if mapping['captured_at'] else None,
-            }
-        )
-    return grouped
-
-
-def _build_price_context(price_bars: list[dict[str, Any]]) -> dict[str, Any] | None:
-    if not price_bars:
-        return None
-
-    current = price_bars[0]
-    previous = price_bars[1] if len(price_bars) > 1 else None
-
-    open_price = current.get('open_price')
-    high_price = current.get('high_price')
-    low_price = current.get('low_price')
-    close_price = current.get('close_price')
-    if None in (open_price, high_price, low_price, close_price):
-        return None
-
-    range_points = max(int(high_price) - int(low_price), 0)
-    body_points_signed = int(close_price) - int(open_price)
-    body_points = abs(body_points_signed)
-    upper_wick_points = max(int(high_price) - max(int(open_price), int(close_price)), 0)
-    lower_wick_points = max(min(int(open_price), int(close_price)) - int(low_price), 0)
-    close_position_in_range = (
-        _round_float((int(close_price) - int(low_price)) / range_points) if range_points > 0 else None
-    )
-    body_percent_of_range = _percent(body_points, range_points)
-    previous_close_price = previous.get('close_price') if previous else None
-    gap_points = int(open_price) - int(previous_close_price) if previous_close_price is not None else None
-    gap_percent = _percent(gap_points, previous_close_price) if gap_points is not None else None
-    gap_filled_intraday = None
-    if gap_points is not None and gap_points > 0:
-        gap_filled_intraday = int(low_price) <= int(previous_close_price)
-    elif gap_points is not None and gap_points < 0:
-        gap_filled_intraday = int(high_price) >= int(previous_close_price)
-
-    if body_points_signed > 0:
-        candle_direction = 'bullish'
-    elif body_points_signed < 0:
-        candle_direction = 'bearish'
-    else:
-        candle_direction = 'flat'
-
-    if gap_points is None:
-        gap_direction = None
-    elif gap_points > 0:
-        gap_direction = 'up'
-    elif gap_points < 0:
-        gap_direction = 'down'
-    else:
-        gap_direction = 'flat'
-
-    return {
-        'trade_date': current.get('trade_date'),
-        'source': current.get('source'),
-        'captured_at': current.get('captured_at'),
-        'open_price': int(open_price),
-        'high_price': int(high_price),
-        'low_price': int(low_price),
-        'close_price': int(close_price),
-        'volume': current.get('volume'),
-        'turnover': current.get('turnover'),
-        'candle': {
-            'direction': candle_direction,
-            'body_points': body_points,
-            'body_percent_of_open': _percent(body_points, open_price),
-            'body_percent_of_range': body_percent_of_range,
-            'body_size': _classify_body_size(body_percent_of_range),
-            'upper_wick_points': upper_wick_points,
-            'lower_wick_points': lower_wick_points,
-            'wick_bias': _classify_wick_bias(
-                upper_wick_points=upper_wick_points,
-                lower_wick_points=lower_wick_points,
-            ),
-        },
-        'session_range': {
-            'points': range_points,
-            'percent_of_open': _percent(range_points, open_price),
-            'close_position_in_range': close_position_in_range,
-            'close_position_label': _classify_close_position(close_position_in_range),
-        },
-        'gap': {
-            'previous_trade_date': previous.get('trade_date') if previous else None,
-            'previous_close_price': int(previous_close_price) if previous_close_price is not None else None,
-            'gap_points': gap_points,
-            'gap_percent': gap_percent,
-            'direction': gap_direction,
-            'filled_intraday': gap_filled_intraday,
-        },
-    }
+_build_price_context = build_price_context
 
 
 def _build_fundamentals_summary(items: list[dict[str, Any]], *, market_date: date) -> dict[str, Any]:
@@ -421,9 +232,10 @@ class AgentContextReadService:
             symbols=normalized_symbols,
             limit=max(len(normalized_symbols), 1000),
         )
-        price_bars_by_symbol = _load_recent_price_bars_by_symbol(
+        price_context_rows = load_daily_price_contexts(
             market_date=normalized_market_date,
             symbols=normalized_symbols,
+            limit=max(len(normalized_symbols), 1000),
         )
         fundamentals_rows = self.fundamentals_repository.list_stored_fundamentals_summary(
             stock_codes=normalized_symbols,
@@ -439,6 +251,7 @@ class AgentContextReadService:
         technical_map = {item['symbol']: item for item in technical_rows}
         action_map = {item['symbol']: item for item in action_rows}
         signal_feature_map = {item['symbol']: item for item in signal_feature_rows}
+        price_context_map = {item['symbol']: item['context_payload'] for item in price_context_rows}
         fundamentals_map: dict[str, list[dict[str, Any]]] = {symbol: [] for symbol in normalized_symbols}
         for item in fundamentals_rows:
             stock_code = item.get('stock_code')
@@ -450,7 +263,7 @@ class AgentContextReadService:
         missing_symbols: list[str] = []
 
         for symbol in normalized_symbols:
-            price_context = _build_price_context(price_bars_by_symbol.get(symbol, []))
+            price_context = price_context_map.get(symbol)
             technical_snapshot = technical_map.get(symbol)
             action_summary = action_map.get(symbol)
             signal_features = signal_feature_map.get(symbol)

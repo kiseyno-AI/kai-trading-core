@@ -239,8 +239,77 @@ class AgentPayloadBuilderTests(unittest.TestCase):
         def fake_session_scope():
             yield fake_session
 
+        persisted_context = {
+            'context_payload': {
+                'captured_symbol_count': 2,
+                'signal_count_distribution': {'2': 1, '3': 1},
+                'source_counts': {
+                    'volume-power': 2,
+                    'overtime-volume': 1,
+                    'overtime-fluctuation': 2,
+                },
+                'leaders_by_source': {
+                    'volume-power': [
+                        {
+                            'symbol': '000660',
+                            'name_ko': 'SK하이닉스',
+                            'market': 'KOSPI',
+                            'rank': 1,
+                            'metric_name': 'volume_power',
+                            'metric_value': 151.5,
+                            'signal_count': 2,
+                        },
+                        {
+                            'symbol': '005930',
+                            'name_ko': '삼성전자',
+                            'market': 'KOSPI',
+                            'rank': 2,
+                            'metric_name': 'volume_power',
+                            'metric_value': 145.2,
+                            'signal_count': 3,
+                        },
+                    ],
+                    'overtime-volume': [
+                        {
+                            'symbol': '005930',
+                            'name_ko': '삼성전자',
+                            'market': 'KOSPI',
+                            'rank': 4,
+                            'metric_name': 'overtime_volume',
+                            'metric_value': 120000,
+                            'signal_count': 3,
+                        }
+                    ],
+                    'overtime-fluctuation': [
+                        {
+                            'symbol': '000660',
+                            'name_ko': 'SK하이닉스',
+                            'market': 'KOSPI',
+                            'rank': 3,
+                            'metric_name': 'overtime_fluctuation_rate',
+                            'metric_value': 3.9,
+                            'signal_count': 2,
+                        },
+                        {
+                            'symbol': '005930',
+                            'name_ko': '삼성전자',
+                            'market': 'KOSPI',
+                            'rank': 7,
+                            'metric_name': 'overtime_fluctuation_rate',
+                            'metric_value': 2.4,
+                            'signal_count': 3,
+                        },
+                    ],
+                },
+            }
+        }
+
         with patch('app.agent_context.payload_builder.session_scope', fake_session_scope):
-            payload = builder._build_market_payload(run=run)
+            with patch(
+                'app.agent_context.payload_builder.load_daily_market_participation_context',
+                return_value=persisted_context,
+            ):
+                payload = builder._build_market_payload(run=run)
 
         self.assertIn('participation_context', payload)
         self.assertEqual(payload['signal_feature_leaders'][0]['symbol'], '005930')
