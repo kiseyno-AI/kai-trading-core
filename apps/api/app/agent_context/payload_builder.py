@@ -36,6 +36,94 @@ def _safe_date(value: date | None) -> str | None:
     return value.isoformat() if value else None
 
 
+def _ratio(value: int | float | None, total: int | float | None) -> float | None:
+    if value is None or total in (None, 0):
+        return None
+    return round(float(value) / float(total), 4)
+
+
+SIGNAL_PARTICIPATION_SOURCES: tuple[tuple[str, str, str], ...] = (
+    ('volume-power', 'volume_power_rank', 'volume_power'),
+    ('overtime-volume', 'overtime_volume_rank', 'overtime_volume'),
+    ('overtime-fluctuation', 'overtime_fluctuation_rank', 'overtime_fluctuation_rate'),
+)
+
+
+def _build_signal_feature_leader_rows(rows: list[dict[str, Any]], *, limit: int) -> list[dict[str, Any]]:
+    return [
+        {
+            'symbol': row['symbol'],
+            'name_ko': row['name_ko'],
+            'market': row['market'],
+            'signal_count': row['signal_count'],
+            'volume_power_rank': row['volume_power_rank'],
+            'volume_power': row['volume_power'],
+            'overtime_volume_rank': row['overtime_volume_rank'],
+            'overtime_volume': row['overtime_volume'],
+            'overtime_fluctuation_rank': row['overtime_fluctuation_rank'],
+            'overtime_fluctuation_rate': row['overtime_fluctuation_rate'],
+        }
+        for row in rows[:limit]
+    ]
+
+
+def _build_signal_participation_context(
+    rows: list[dict[str, Any]],
+    *,
+    limit: int,
+    run: EODCollectionRun,
+) -> dict[str, Any]:
+    distribution = Counter(str(int(row['signal_count'])) for row in rows if row.get('signal_count') is not None)
+
+    source_counts: dict[str, int] = {}
+    for row in rows:
+        payload = row.get('feature_payload')
+        candidate = payload.get('source_counts') if isinstance(payload, dict) else None
+        if isinstance(candidate, dict) and candidate:
+            source_counts = {
+                str(source): int(count)
+                for source, count in candidate.items()
+                if count is not None
+            }
+            break
+    if not source_counts:
+        source_counts = {
+            source: sum(1 for row in rows if row.get(rank_key) is not None)
+            for source, rank_key, _ in SIGNAL_PARTICIPATION_SOURCES
+        }
+
+    leaders_by_source: dict[str, list[dict[str, Any]]] = {}
+    for source, rank_key, value_key in SIGNAL_PARTICIPATION_SOURCES:
+        source_rows = [
+            {
+                'symbol': row['symbol'],
+                'name_ko': row['name_ko'],
+                'market': row['market'],
+                'rank': row[rank_key],
+                'metric_name': value_key,
+                'metric_value': row[value_key],
+                'signal_count': row['signal_count'],
+            }
+            for row in rows
+            if row.get(rank_key) is not None
+        ]
+        source_rows.sort(key=lambda item: (item['rank'], item['symbol']))
+        leaders_by_source[source] = source_rows[:limit]
+
+    return {
+        'captured_symbol_count': len(rows),
+        'coverage_ratio_vs_run_total': _ratio(len(rows), run.symbols_total),
+        'coverage_ratio_vs_run_succeeded': _ratio(len(rows), run.symbols_succeeded),
+        'signal_count_distribution': dict(sorted(distribution.items())),
+        'source_counts': source_counts,
+        'source_coverage_ratio_vs_run_succeeded': {
+            source: _ratio(count, run.symbols_succeeded)
+            for source, count in source_counts.items()
+        },
+        'leaders_by_source': leaders_by_source,
+    }
+
+
 @dataclass(frozen=True)
 class PayloadWindows:
     technical_days: int = 252
@@ -119,7 +207,7 @@ class AgentPayloadBuilder:
                 ).all()
             ]
 
-            signal_rows = [
+            market_signal_rows = [
                 {
                     'symbol': symbol.symbol,
                     'name_ko': symbol.name_ko,
@@ -131,13 +219,19 @@ class AgentPayloadBuilder:
                     'overtime_volume': feature.overtime_volume,
                     'overtime_fluctuation_rank': feature.overtime_fluctuation_rank,
                     'overtime_fluctuation_rate': _to_float(feature.overtime_fluctuation_rate),
+                    'feature_payload': feature.feature_payload or {},
                 }
                 for feature, symbol in session.execute(
                     select(DailySignalFeature, Symbol)
                     .join(Symbol, Symbol.id == DailySignalFeature.symbol_id)
                     .where(DailySignalFeature.market_date == run.trade_date)
-                    .order_by(DailySignalFeature.signal_count.desc(), Symbol.symbol.asc())
-                    .limit(self.windows.top_n)
+                    .order_by(
+                        DailySignalFeature.signal_count.desc(),
+                        DailySignalFeature.volume_power_rank.asc().nullslast(),
+                        DailySignalFeature.overtime_volume_rank.asc().nullslast(),
+                        DailySignalFeature.overtime_fluctuation_rank.asc().nullslast(),
+                        Symbol.symbol.asc(),
+                    )
                 ).all()
             ]
 
@@ -161,9 +255,17 @@ class AgentPayloadBuilder:
         for row in period_rows:
             grouped.setdefault(row['period'], []).append({k: v for k, v in row.items() if k != 'period'})
 
+        signal_rows = _build_signal_feature_leader_rows(market_signal_rows, limit=self.windows.top_n)
+        participation_context = _build_signal_participation_context(
+            market_signal_rows,
+            limit=self.windows.top_n,
+            run=run,
+        )
+
         return {
             'top_trending': grouped,
             'signal_feature_leaders': signal_rows,
+            'participation_context': participation_context,
             'breadth_window': price_rows[-self.windows.market_breadth_days :],
         }
 
