@@ -605,7 +605,10 @@ class OpenClawAgentClient:
             response: httpx.Response | None = None
             try:
                 request_session_key = fixed_session_key
-                headers = self._headers() | {'x-openclaw-session-key': request_session_key}
+                headers = self._headers() | {
+                    'x-openclaw-session-key': request_session_key,
+                    'x-openclaw-agent-id': spec.agent_name,
+                }
                 _feedback_runtime_log(
                     'dispatch_batch_request',
                     agent_name=spec.agent_name,
