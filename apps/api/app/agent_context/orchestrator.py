@@ -175,6 +175,12 @@ def _extract_json_object(text: str | None) -> str | None:
             candidate = _extract_json_object(part)
             if candidate:
                 return candidate
+    if normalized.startswith('[intent:'):
+        newline_index = normalized.find("\n")
+        if newline_index != -1:
+            candidate = _extract_json_object(normalized[newline_index + 1:])
+            if candidate:
+                return candidate
     if '[tool_code]' in normalized and '[/tool_code]' in normalized:
         start_marker = normalized.find('[tool_code]') + len('[tool_code]')
         end_marker = normalized.find('[/tool_code]', start_marker)
@@ -330,9 +336,9 @@ class OpenClawAgentClient:
             "For each symbol, feedback must use top-level keys role, summary, confidence, risk_flags, details, improvement_notes.\n"
             "If some inputs are weak or missing, still return conservative structured feedback for that symbol instead of prose or placeholders.\n"
             "Do not mention subagents, children, spawning, waiting, or internal orchestration.\n"
-            "Do not output tool_code, python, print(...), json.dumps(...), markdown fences, code blocks, or explanatory prose.\n"
+            "Do not output tool_code, python, print(...), json.dumps(...), markdown fences, code blocks, intent tags, or explanatory prose.\n"
+            "Do not prepend labels like [intent:...], do not wrap JSON in tags, and do not add any text before or after the JSON.\n"
             "Your final answer must be a raw JSON object only, beginning with { and ending with }.\n"
-            "Do not wrap JSON in any tags or wrapper text.\n"
             f"{build_contract_prompt_suffix()}\n"
             f"JSON example:\n{json.dumps(example, ensure_ascii=False)}\n\n"
             f"Market date: {market_date.isoformat()}\n"
@@ -349,7 +355,7 @@ class OpenClawAgentClient:
                 f"Instruction: {spec.instruction}\n"
                 "Analyze each assigned symbol directly and return aggregated JSON only.\n"
                 "Each symbol must appear exactly once in {\"items\": [...]} with structured feedback.\n"
-                "No tool_code, no print(json.dumps(...)), no markdown fences, no prose, raw JSON object only.\n"
+                "No tool_code, no print(json.dumps(...)), no markdown fences, no intent tags, no prose, raw JSON object only.\n"
                 f"{build_contract_prompt_suffix()}\n"
                 f"Market date: {market_date.isoformat()}\n"
                 f"Assigned batch payload:\n{json.dumps(list(prepared_items), ensure_ascii=False)}"
@@ -361,7 +367,7 @@ class OpenClawAgentClient:
             f"Instruction: {spec.instruction}\n"
             "Analyze the assigned symbol directly and return aggregated JSON only.\n"
             "Return {\"items\": [{\"symbol\": \"...\", \"feedback\": {...}}]} with exactly one item.\n"
-            "No tool_code, no print(json.dumps(...)), no markdown fences, no prose, raw JSON object only.\n"
+            "No tool_code, no print(json.dumps(...)), no markdown fences, no intent tags, no prose, raw JSON object only.\n"
             f"{build_contract_prompt_suffix()}\n"
             f"Market date: {market_date.isoformat()}\n"
             f"Assigned batch payload:\n{json.dumps([_trim_batch_item_for_prompt(batch_items[0])], ensure_ascii=False)}"
