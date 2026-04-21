@@ -37,6 +37,7 @@ What it does:
 - `GET /fx/koreaexim/rates?search_date=20260406&currency=USD`
 - `GET /scanner/trending-stocks?period=5d&direction=both&limit=20`
 - `GET /eod/status`
+- `GET /eod/pipeline/status`
 - `POST /eod/master/refresh-if-due`
 - `POST /eod/pykrx/universe/refresh`
 - `POST /eod/pykrx/backfill`
