@@ -239,6 +239,11 @@ class DartClient:
         )
         return payload
 
+    async def has_supported_stock_code(self, stock_code: str) -> bool:
+        normalized_stock_code = stock_code.strip().zfill(6)
+        corp_codes = await self._load_corp_codes()
+        return any(item['stock_code'] == normalized_stock_code for item in corp_codes)
+
     async def lookup_corp_code(
         self,
         *,
