@@ -16,7 +16,7 @@ from app.db_models import (
     DartFundamentalsSnapshot,
     Symbol,
 )
-from app.market_data_store import upsert_daily_piotroski_filter_result
+from app.market_data_store import load_daily_piotroski_filter_results, upsert_daily_piotroski_filter_result
 
 FILTER_SOURCE = 'strategy_piotroski_v1'
 LOW_PBR_PERCENTILE = 0.30
@@ -206,6 +206,52 @@ class DailyPiotroskiFilterService:
             'failed_symbols': failed_symbols,
             'failed_symbol_errors': failed_symbol_errors,
         }
+
+    def inspect(
+        self,
+        *,
+        market_date: str | date,
+        symbol: str | None = None,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        normalized_market_date = date.fromisoformat(market_date) if isinstance(market_date, str) else market_date
+        normalized_symbol = self._normalize_symbol(symbol)
+        requested_symbols = [normalized_symbol] if normalized_symbol else []
+        items = load_daily_piotroski_filter_results(
+            market_date=normalized_market_date,
+            symbols=requested_symbols or None,
+            limit=(1 if normalized_symbol else limit),
+        )
+        matched_symbols = [item['symbol'] for item in items]
+        matched_symbol_set = set(matched_symbols)
+        summary = {
+            'entries': len(items),
+            'requested_symbol': normalized_symbol,
+            'matched_symbols': matched_symbols,
+            'missing_symbols': [candidate for candidate in requested_symbols if candidate not in matched_symbol_set],
+            'passed_count': sum(1 for item in items if item.get('passed_filter')),
+            'not_passed_count': sum(1 for item in items if not item.get('passed_filter')),
+        }
+        payload: dict[str, Any] = {
+            'market_date': normalized_market_date.isoformat(),
+            'summary': summary,
+        }
+        if normalized_symbol:
+            payload['item'] = items[0] if items else None
+        else:
+            payload['items'] = items
+        return payload
+
+    @staticmethod
+    def _normalize_symbol(symbol: str | None) -> str | None:
+        if symbol is None:
+            return None
+        normalized = symbol.strip().upper()
+        if not normalized:
+            raise ValueError('symbol must not be blank')
+        if normalized.isdigit():
+            normalized = normalized.zfill(6)
+        return normalized
 
     def _load_inputs(self, market_date: date, *, annual_year: int, prior_annual_year: int) -> list[PiotroskiInputs]:
         with session_scope() as session:

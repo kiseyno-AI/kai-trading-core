@@ -118,6 +118,49 @@ class FakeSignalFeatureService:
         }
 
 
+class FakePiotroskiFilterService:
+    def __init__(self):
+        self.inspect_args = None
+
+    def inspect(self, **kwargs):
+        self.inspect_args = kwargs
+        market_date = kwargs['market_date']
+        symbol = kwargs.get('symbol')
+        if symbol:
+            return {
+                'market_date': market_date,
+                'summary': {
+                    'entries': 1,
+                    'requested_symbol': symbol,
+                    'matched_symbols': [symbol],
+                    'missing_symbols': [],
+                    'passed_count': 1,
+                    'not_passed_count': 0,
+                },
+                'item': {
+                    'symbol': symbol,
+                    'market_date': market_date,
+                    'passed_filter': True,
+                    'piotroski_score': 8,
+                },
+            }
+        return {
+            'market_date': market_date,
+            'summary': {
+                'entries': 2,
+                'requested_symbol': None,
+                'matched_symbols': ['005930', '000660'],
+                'missing_symbols': [],
+                'passed_count': 1,
+                'not_passed_count': 1,
+            },
+            'items': [
+                {'symbol': '005930', 'market_date': market_date, 'passed_filter': True, 'piotroski_score': 8},
+                {'symbol': '000660', 'market_date': market_date, 'passed_filter': False, 'piotroski_score': 5},
+            ],
+        }
+
+
 class FakePipelineStatusService:
     def __init__(self):
         self.read_args = None
@@ -302,3 +345,43 @@ class EODRouteTests(unittest.TestCase):
         self.assertEqual(fake_service.inspect_args['symbols'], ['005930'])
         self.assertEqual(fake_service.inspect_args['limit'], 5)
         self.assertEqual(response.json()['items'][0]['signal_count'], 2)
+
+    def test_inspect_piotroski_filter_results_route_returns_all_items(self):
+        fake_service = FakePiotroskiFilterService()
+        original_service = routes_eod.daily_piotroski_filter_service
+        routes_eod.daily_piotroski_filter_service = fake_service
+        try:
+            client = TestClient(self.app)
+            response = client.get('/eod/piotroski-filter-results', params={'market_date': '2026-04-14'})
+        finally:
+            routes_eod.daily_piotroski_filter_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            fake_service.inspect_args,
+            {'market_date': '2026-04-14', 'symbol': None, 'limit': None},
+        )
+        self.assertEqual(response.json()['summary']['entries'], 2)
+        self.assertEqual(response.json()['summary']['passed_count'], 1)
+        self.assertEqual(response.json()['items'][0]['symbol'], '005930')
+
+    def test_inspect_piotroski_filter_results_route_returns_single_item_for_symbol(self):
+        fake_service = FakePiotroskiFilterService()
+        original_service = routes_eod.daily_piotroski_filter_service
+        routes_eod.daily_piotroski_filter_service = fake_service
+        try:
+            client = TestClient(self.app)
+            response = client.get(
+                '/eod/piotroski-filter-results',
+                params={'market_date': '2026-04-14', 'symbol': '005930', 'limit': 10},
+            )
+        finally:
+            routes_eod.daily_piotroski_filter_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            fake_service.inspect_args,
+            {'market_date': '2026-04-14', 'symbol': '005930', 'limit': 10},
+        )
+        self.assertEqual(response.json()['summary']['requested_symbol'], '005930')
+        self.assertEqual(response.json()['item']['piotroski_score'], 8)
