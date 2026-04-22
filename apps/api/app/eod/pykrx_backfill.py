@@ -28,10 +28,13 @@ from app.market_data_store import (
     count_eod_collection_runs,
     complete_eod_collection_run,
     create_eod_collection_run,
+    load_daily_price_bar_dates_for_symbol,
+    list_symbols_with_daily_bars_in_range,
     load_eod_run_persisted_symbols,
     load_symbols,
     load_latest_eod_collection_run,
     persist_daily_price_bars,
+    update_daily_price_bar_fundamentals,
     update_eod_collection_run_progress,
     upsert_symbol_universe,
 )
@@ -111,6 +114,11 @@ def _call_pykrx(func, *args, **kwargs):
 
 def _get_market_ohlcv_by_date(start_date: str, end_date: str, symbol: str):
     getter = getattr(stock, 'get_market_ohlcv_by_date', None) or getattr(stock, 'get_market_ohlcv')
+    return _call_pykrx(getter, start_date, end_date, symbol)
+
+
+def _get_market_fundamental_by_date(start_date: str, end_date: str, symbol: str):
+    getter = getattr(stock, 'get_market_fundamental_by_date', None) or getattr(stock, 'get_market_fundamental')
     return _call_pykrx(getter, start_date, end_date, symbol)
 
 
@@ -952,7 +960,12 @@ class PykrxBackfillService:
                     frame = _get_market_ohlcv_by_date(normalized_start, normalized_end, item.symbol)
                     if frame.empty:
                         raise RuntimeError('No OHLCV rows returned.')
-                    bars = self._map_symbol_bars(frame)
+                    fundamentals_frame = self._load_symbol_fundamentals(
+                        symbol=item.symbol,
+                        start_date=normalized_start,
+                        end_date=normalized_end,
+                    )
+                    bars = self._map_symbol_bars(frame, fundamentals_frame=fundamentals_frame)
                     persisted_count = persist_daily_price_bars(
                         item.symbol,
                         bars,
@@ -1363,10 +1376,77 @@ class PykrxBackfillService:
         _log_pykrx_fetch('run_collection', status, **{key: value for key, value in result.items() if key != 'status'})
         return result
 
-    def _map_symbol_bars(self, frame) -> list[dict]:
-        items: list[dict] = []
+    def _load_symbol_fundamentals(self, *, symbol: str, start_date: str, end_date: str):
+        try:
+            frame = _get_market_fundamental_by_date(start_date, end_date, symbol)
+        except Exception as exc:
+            logger.warning('pykrx fundamentals fetch failed for %s between %s and %s: %s', symbol, start_date, end_date, exc)
+            _log_pykrx_fetch(
+                'fetch_symbol_fundamentals',
+                'failed',
+                symbol=symbol,
+                start_date=start_date,
+                end_date=end_date,
+                error_type=type(exc).__name__,
+                error_message=str(exc),
+            )
+            return None
+        if getattr(frame, 'empty', True):
+            _log_pykrx_fetch(
+                'fetch_symbol_fundamentals',
+                'empty',
+                symbol=symbol,
+                start_date=start_date,
+                end_date=end_date,
+            )
+            return None
+        _log_pykrx_fetch(
+            'fetch_symbol_fundamentals',
+            'completed',
+            symbol=symbol,
+            start_date=start_date,
+            end_date=end_date,
+            row_count=len(frame.index),
+        )
+        return frame
+
+    @staticmethod
+    def _normalize_fundamental_columns(frame):
+        if frame is None or getattr(frame, 'empty', True):
+            return {}
+        normalized: dict[date, dict[str, float | None]] = {}
         for trade_date, row in frame.sort_index().iterrows():
             normalized_trade_date = trade_date.date() if hasattr(trade_date, 'date') else trade_date
+            normalized[normalized_trade_date] = {
+                'per': PykrxBackfillService._to_optional_float(row.get('PER')),
+                'pbr': PykrxBackfillService._to_optional_float(row.get('PBR')),
+                'bps': PykrxBackfillService._to_optional_float(row.get('BPS')),
+                'eps': PykrxBackfillService._to_optional_float(row.get('EPS')),
+                'dividend_yield': PykrxBackfillService._to_optional_float(row.get('DIV')),
+                'dps': PykrxBackfillService._to_optional_float(row.get('DPS')),
+            }
+        return normalized
+
+    @staticmethod
+    def _to_optional_float(value) -> float | None:
+        if value is None:
+            return None
+        try:
+            if hasattr(value, 'item'):
+                value = value.item()
+            converted = float(value)
+        except (TypeError, ValueError):
+            return None
+        if converted != converted:
+            return None
+        return converted
+
+    def _map_symbol_bars(self, frame, *, fundamentals_frame=None) -> list[dict]:
+        items: list[dict] = []
+        fundamentals_by_date = self._normalize_fundamental_columns(fundamentals_frame)
+        for trade_date, row in frame.sort_index().iterrows():
+            normalized_trade_date = trade_date.date() if hasattr(trade_date, 'date') else trade_date
+            fundamentals = fundamentals_by_date.get(normalized_trade_date, {})
             items.append(
                 {
                     'trade_date': normalized_trade_date,
@@ -1376,9 +1456,91 @@ class PykrxBackfillService:
                     'close_price': int(row.get('종가', 0) or 0),
                     'volume': int(row.get('거래량', 0) or 0),
                     'turnover': int(row.get('거래대금', 0) or 0),
+                    'per': fundamentals.get('per'),
+                    'pbr': fundamentals.get('pbr'),
+                    'bps': fundamentals.get('bps'),
+                    'eps': fundamentals.get('eps'),
+                    'dividend_yield': fundamentals.get('dividend_yield'),
+                    'dps': fundamentals.get('dps'),
                 }
             )
         return items
+
+    def backfill_daily_bar_fundamentals(
+        self,
+        *,
+        start_date: str,
+        end_date: str | None = None,
+        markets: Sequence[str] = DEFAULT_MARKETS,
+        limit: int | None = None,
+        symbol: str | None = None,
+    ) -> dict:
+        normalized_start = _normalize_yyyymmdd(start_date)
+        normalized_end = _normalize_yyyymmdd(end_date, default=date.today().strftime('%Y%m%d'))
+        if symbol:
+            target_symbols = [symbol]
+        else:
+            target_symbols = list_symbols_with_daily_bars_in_range(
+                start_date=_normalize_iso_date(normalized_start),
+                end_date=_normalize_iso_date(normalized_end),
+            )
+        if limit is not None:
+            target_symbols = target_symbols[:limit]
+
+        universe_by_symbol = {item.symbol: item for item in self.load_active_universe(markets=markets, limit=None)}
+        updated_symbols = 0
+        updated_rows = 0
+        failed_symbols: list[str] = []
+
+        for symbol_code in target_symbols:
+            item = universe_by_symbol.get(symbol_code) or PykrxSymbol(symbol=symbol_code, market='KRX', name_ko=symbol_code)
+            try:
+                trade_dates = load_daily_price_bar_dates_for_symbol(
+                    item.symbol,
+                    start_date=_normalize_iso_date(normalized_start),
+                    end_date=_normalize_iso_date(normalized_end),
+                )
+                if not trade_dates:
+                    continue
+                fundamentals_frame = self._load_symbol_fundamentals(
+                    symbol=item.symbol,
+                    start_date=normalized_start,
+                    end_date=normalized_end,
+                )
+                fundamentals_by_date = self._normalize_fundamental_columns(fundamentals_frame)
+                matched = {trade_date: fundamentals_by_date.get(trade_date, {}) for trade_date in trade_dates if trade_date in fundamentals_by_date}
+                if not matched:
+                    continue
+                updated_count = update_daily_price_bar_fundamentals(item.symbol, matched, source='pykrx')
+                if updated_count > 0:
+                    updated_symbols += 1
+                    updated_rows += updated_count
+            except Exception as exc:
+                failed_symbols.append(item.symbol)
+                logger.warning('pykrx fundamentals backfill failed for %s: %s', item.symbol, exc)
+                _log_pykrx_fetch(
+                    'backfill_daily_bar_fundamentals',
+                    'failed',
+                    symbol=item.symbol,
+                    start_date=normalized_start,
+                    end_date=normalized_end,
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
+                )
+            if self.symbol_pause_seconds:
+                time.sleep(self.symbol_pause_seconds)
+
+        result = {
+            'source': 'pykrx',
+            'start_date': _normalize_iso_date(normalized_start),
+            'end_date': _normalize_iso_date(normalized_end),
+            'symbol_count': len(target_symbols),
+            'updated_symbols': updated_symbols,
+            'updated_rows': updated_rows,
+            'failed_symbols': failed_symbols,
+        }
+        _log_pykrx_fetch('backfill_daily_bar_fundamentals', 'completed', **result)
+        return result
 
 
 PYKRX_BACKFILL_SERVICE = PykrxBackfillService()

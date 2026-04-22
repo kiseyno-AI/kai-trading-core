@@ -161,6 +161,12 @@ class DailyPriceBar(Base):
     close_price: Mapped[int] = mapped_column(BigInteger, nullable=False)
     volume: Mapped[int] = mapped_column(BigInteger, nullable=False)
     turnover: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    per: Mapped[float | None] = mapped_column(Numeric(18, 6))
+    pbr: Mapped[float | None] = mapped_column(Numeric(18, 6))
+    bps: Mapped[float | None] = mapped_column(Numeric(18, 6))
+    eps: Mapped[float | None] = mapped_column(Numeric(18, 6))
+    dividend_yield: Mapped[float | None] = mapped_column(Numeric(18, 6))
+    dps: Mapped[float | None] = mapped_column(Numeric(18, 6))
     source: Mapped[str] = mapped_column(String(32), nullable=False, default='kis')
     captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
