@@ -89,12 +89,12 @@ DISPATCH_SPECS: tuple[AgentDispatchSpec, ...] = (
     AgentDispatchSpec(
         role='technical-summarizer',
         agent_name='technical-summarizer',
-        instruction='Summarize the technical setup conservatively using only the supplied inputs, including trend, momentum, support/resistance, and invalidation risks.',
+        instruction='Summarize the latest technical setup conservatively using only the supplied inputs, emphasizing trend, momentum, support/resistance, invalidation risks, anomalies, and data gaps.',
     ),
     AgentDispatchSpec(
         role='fundamental-summarizer',
         agent_name='fundamental-summarizer',
-        instruction='Summarize the latest fundamentals conservatively, highlighting business quality, balance-sheet risks, cash-flow traits, and missing context.',
+        instruction='Summarize the latest fundamentals conservatively, emphasizing business quality, balance-sheet risks, cash-flow traits, anomalies, and data gaps.',
     ),
 )
 
@@ -339,6 +339,9 @@ class OpenClawAgentClient:
             "Return JSON only with top-level shape {\"items\": [{\"symbol\": \"...\", \"feedback\": {...}}]}.\n"
             "Each symbol must appear exactly once. Do not omit symbols.\n"
             "For each symbol, feedback must use top-level keys role, summary, confidence, risk_flags, details, improvement_notes.\n"
+            "Inside details, do not repeat raw payload facts or echo numeric/source fields already present in the request.\n"
+            "Use details only for compact interpretation, relationships, anomalies, conservative takeaways, and missing-context notes that add new value beyond the payload.\n"
+            "Prefer derived judgments over restating inputs; if a field is already in the payload, reference its implication instead of copying it.\n"
             "If some inputs are weak or missing, still return conservative structured feedback for that symbol instead of prose or placeholders.\n"
             "Do not mention subagents, children, spawning, waiting, or internal orchestration.\n"
             "Do not output tool_code, python, print(...), json.dumps(...), markdown fences, code blocks, intent tags, analysis, reasoning, or explanatory prose.\n"
