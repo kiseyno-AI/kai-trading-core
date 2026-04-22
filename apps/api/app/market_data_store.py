@@ -2134,6 +2134,8 @@ def upsert_daily_piotroski_filter_result(result: dict) -> None:
             'market_date': _normalize_trade_date(result['market_date']),
             'source': result.get('source', 'strategy_piotroski_v1'),
             'pbr': result.get('pbr'),
+            'valuation_available': bool(result.get('valuation_available', True)),
+            'valuation_source_status': result.get('valuation_source_status'),
             'pbr_percentile_rank': result.get('pbr_percentile_rank'),
             'is_low_pbr': bool(result.get('is_low_pbr')),
             'has_profitability_issue': bool(result.get('has_profitability_issue')),
@@ -2155,6 +2157,8 @@ def upsert_daily_piotroski_filter_result(result: dict) -> None:
                 set_={
                     'source': statement.excluded.source,
                     'pbr': statement.excluded.pbr,
+                    'valuation_available': statement.excluded.valuation_available,
+                    'valuation_source_status': statement.excluded.valuation_source_status,
                     'pbr_percentile_rank': statement.excluded.pbr_percentile_rank,
                     'is_low_pbr': statement.excluded.is_low_pbr,
                     'has_profitability_issue': statement.excluded.has_profitability_issue,

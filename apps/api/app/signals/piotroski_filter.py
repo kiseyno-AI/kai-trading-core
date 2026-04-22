@@ -117,6 +117,8 @@ class DailyPiotroskiFilterService:
         failed_symbol_errors: list[dict[str, str]] = []
 
         for item in inputs:
+            valuation_available = item.pbr is not None and item.pbr > 0
+            valuation_source_status = 'available' if valuation_available else 'missing_pbr'
             pbr_rank = _percentile_rank(pbr_values, item.pbr, ascending=True) if item.pbr in pbr_values else None
             momentum_rank = _percentile_rank(momentum_values, item.return_20d, ascending=True) if item.return_20d in momentum_values else None
             signals, score, available_signal_count = _compute_signals(item)
@@ -127,7 +129,7 @@ class DailyPiotroskiFilterService:
             score_ratio = (score / available_signal_count) if available_signal_count else 0.0
             passes_piotroski_score = available_signal_count > 0 and score_ratio >= (PIOTROSKI_PASS_SCORE / 9.0)
             is_bottom_momentum = momentum_rank is not None and momentum_rank <= BOTTOM_MOMENTUM_PERCENTILE
-            passed_filter = all([
+            passed_filter = valuation_available and all([
                 is_low_pbr,
                 not has_profitability_issue,
                 not has_capital_impairment,
@@ -142,6 +144,8 @@ class DailyPiotroskiFilterService:
                 'market_date': normalized_market_date.isoformat(),
                 'source': FILTER_SOURCE,
                 'pbr': item.pbr,
+                'valuation_available': valuation_available,
+                'valuation_source_status': valuation_source_status,
                 'pbr_percentile_rank': pbr_rank,
                 'is_low_pbr': is_low_pbr,
                 'has_profitability_issue': has_profitability_issue,
@@ -168,6 +172,11 @@ class DailyPiotroskiFilterService:
                         'bottom_momentum_percentile': BOTTOM_MOMENTUM_PERCENTILE,
                         'annual_year': annual_year,
                         'prior_annual_year': prior_annual_year,
+                    },
+                    'valuation': {
+                        'available': valuation_available,
+                        'source_status': valuation_source_status,
+                        'excluded_from_filter_universe': not valuation_available,
                     },
                     'inputs': {
                         'return_20d': item.return_20d,
@@ -199,6 +208,7 @@ class DailyPiotroskiFilterService:
             'market_date': normalized_market_date.isoformat(),
             'source': FILTER_SOURCE,
             'symbols_evaluated': len(inputs),
+            'symbols_excluded_missing_valuation': sum(1 for item in inputs if item.pbr is None or item.pbr <= 0),
             'symbols_passed': passed_count,
             'symbols_not_passed': len(inputs) - passed_count,
             'results_persisted': persisted_count,
@@ -206,6 +216,9 @@ class DailyPiotroskiFilterService:
             'failed_symbols': failed_symbols,
             'failed_symbol_errors': failed_symbol_errors,
         }
+
+    def rebuild_for_market_date(self, *, market_date: str | date) -> dict[str, Any]:
+        return self.collect_and_persist_for_market_date(market_date=market_date)
 
     def inspect(
         self,
