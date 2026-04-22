@@ -310,7 +310,7 @@ class DailySignalFeatureService:
             items=items,
         )
 
-    async def collect_and_persist_for_market_date(
+    async def refresh_for_market_date(
         self,
         *,
         market_date: str | date,
@@ -337,7 +337,7 @@ class DailySignalFeatureService:
                 failed_symbols.append(item['symbol'])
 
         try:
-            participation_context = daily_market_participation_context_service.compute_and_persist_for_market_date(
+            participation_context = daily_market_participation_context_service.rebuild_for_market_date(
                 market_date=collection.market_date,
                 market='KRX',
                 source=SIGNAL_FEATURE_SOURCE,
@@ -403,7 +403,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 async def _run_from_args(args: argparse.Namespace) -> dict[str, Any]:
-    return await daily_signal_feature_service.collect_and_persist_for_market_date(
+    return await daily_signal_feature_service.refresh_for_market_date(
         market_date=args.market_date,
         sources=args.sources,
         max_pages=args.max_pages,

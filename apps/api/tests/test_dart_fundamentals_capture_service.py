@@ -332,7 +332,7 @@ class FakeCaptureRepository:
 class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.piotroski_filter_patcher = patch(
-            'app.dart.fundamentals_capture_service.daily_piotroski_filter_service.collect_and_persist_for_market_date',
+            'app.dart.fundamentals_capture_service.daily_piotroski_filter_service.rebuild_for_market_date',
             return_value={
                 'market_date': '2026-04-14',
                 'source': 'strategy_piotroski_v1',

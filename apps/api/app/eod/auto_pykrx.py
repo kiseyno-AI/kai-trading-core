@@ -73,7 +73,7 @@ class AutoPykrxEODScheduler:
             self._task = None
         self._state.active_task = False
 
-    async def maybe_schedule(self) -> None:
+    async def schedule_daily_pipeline_if_due(self) -> None:
         self._state.enabled = settings.eod_auto_pykrx_enabled
         market = get_market_state()
         self._state.last_checked_at = _utcnow()
@@ -121,12 +121,15 @@ class AutoPykrxEODScheduler:
         self._state.last_started_at = _utcnow()
         self._state.last_status = 'running'
         self._state.last_reason = 'scheduled'
-        self._task = asyncio.create_task(self._run_for_market_date(market.server_time[:10]), name='auto-pykrx-eod')
+        self._task = asyncio.create_task(
+            self._run_scheduled_daily_pipeline(market.server_time[:10]),
+            name='auto-pykrx-eod',
+        )
 
-    async def _run_for_market_date(self, market_date: str) -> None:
+    async def _run_scheduled_daily_pipeline(self, market_date: str) -> None:
         try:
             result = await asyncio.to_thread(
-                PYKRX_BACKFILL_SERVICE.run_daily_collection_if_due,
+                PYKRX_BACKFILL_SERVICE.run_daily_pipeline_if_due,
                 market_date=market_date,
                 markets=_parse_markets(settings.eod_auto_pykrx_markets),
                 trigger='auto_close_scheduler',

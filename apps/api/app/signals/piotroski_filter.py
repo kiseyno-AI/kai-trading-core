@@ -104,7 +104,7 @@ def _compute_signals(item: PiotroskiInputs) -> tuple[dict[str, PiotroskiSignalRe
 
 
 class DailyPiotroskiFilterService:
-    def collect_and_persist_for_market_date(self, *, market_date: str | date) -> dict[str, Any]:
+    def rebuild_for_market_date(self, *, market_date: str | date) -> dict[str, Any]:
         normalized_market_date = date.fromisoformat(market_date) if isinstance(market_date, str) else market_date
         annual_year = normalized_market_date.year - 1
         prior_annual_year = annual_year - 1

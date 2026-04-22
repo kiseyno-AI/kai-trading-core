@@ -1746,7 +1746,7 @@ class DartFundamentalsCaptureService:
             if status in {'completed', 'partial'}:
                 try:
                     piotroski_filter_followup = await asyncio.to_thread(
-                        daily_piotroski_filter_service.collect_and_persist_for_market_date,
+                        daily_piotroski_filter_service.rebuild_for_market_date,
                         market_date=resolved_market_date,
                     )
                     if int(piotroski_filter_followup.get('results_failed') or 0) > 0:

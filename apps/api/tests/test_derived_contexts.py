@@ -8,7 +8,7 @@ from app.agent_context.derived_contexts import DailyPriceContextService, Derived
 class DailyPriceContextServiceTests(unittest.TestCase):
     @patch('app.agent_context.derived_contexts.upsert_daily_price_context')
     @patch('app.agent_context.derived_contexts.load_recent_price_bars_by_symbol')
-    def test_compute_and_persist_skips_symbols_without_bar_for_requested_market_date(
+    def test_rebuild_skips_symbols_without_bar_for_requested_market_date(
         self,
         load_recent_price_bars_by_symbol_mock,
         upsert_daily_price_context_mock,
@@ -40,7 +40,7 @@ class DailyPriceContextServiceTests(unittest.TestCase):
             ]
         }
 
-        result = DailyPriceContextService().compute_and_persist_for_market_date(
+        result = DailyPriceContextService().rebuild_for_market_date(
             market_date='2026-04-08',
             symbols=['005930'],
         )
@@ -53,7 +53,7 @@ class DailyPriceContextServiceTests(unittest.TestCase):
 
     @patch('app.agent_context.derived_contexts.upsert_daily_price_context')
     @patch('app.agent_context.derived_contexts.load_recent_price_bars_by_symbol')
-    def test_compute_and_persist_persists_when_latest_bar_matches_requested_market_date(
+    def test_rebuild_persists_when_latest_bar_matches_requested_market_date(
         self,
         load_recent_price_bars_by_symbol_mock,
         upsert_daily_price_context_mock,
@@ -85,7 +85,7 @@ class DailyPriceContextServiceTests(unittest.TestCase):
             ]
         }
 
-        result = DailyPriceContextService().compute_and_persist_for_market_date(
+        result = DailyPriceContextService().rebuild_for_market_date(
             market_date='2026-04-08',
             symbols=['005930'],
         )
@@ -97,9 +97,9 @@ class DailyPriceContextServiceTests(unittest.TestCase):
 
 
 class DerivedContextBackfillServiceTests(unittest.TestCase):
-    @patch('app.agent_context.derived_contexts.daily_market_participation_context_service.compute_and_persist_from_rows')
+    @patch('app.agent_context.derived_contexts.daily_market_participation_context_service.rebuild_from_rows')
     @patch('app.agent_context.derived_contexts.load_daily_signal_feature_context_rows')
-    @patch('app.agent_context.derived_contexts.daily_price_context_service.compute_and_persist_for_market_date')
+    @patch('app.agent_context.derived_contexts.daily_price_context_service.rebuild_for_market_date')
     @patch('app.agent_context.derived_contexts.load_recent_daily_price_trade_dates')
     def test_backfill_recent_history_processes_recent_trading_dates_and_skips_missing_participation_rows(
         self,
