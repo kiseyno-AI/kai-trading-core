@@ -1157,6 +1157,61 @@ class DartFundamentalsCaptureService:
             for symbol in selected_symbols
             if (symbol.get('symbol') or '').strip()
         ]
+        if not selected_stock_codes:
+            return {
+                'scope': 'current_active_universe',
+                'active_symbols_total': len(active_symbols),
+                'symbol_offset': symbol_offset,
+                'symbol_limit': symbol_limit,
+                'symbols_selected': 0,
+                'symbols_resolved': 0,
+                'symbol_lookup_error_count': 0,
+                'symbol_lookup_errors': [],
+                'terminal_unsupported_symbol_count': 0,
+                'terminal_unsupported_symbols': [],
+                'requested_start_date': None,
+                'effective_start_date': None,
+                'effective_end_date': resolved_market_date.isoformat(),
+                'daily_price_bar_min_trade_date': None,
+                'daily_price_bar_max_trade_date': None,
+                'dart_min_start_date': DART_FUNDAMENTALS_MIN_START_DATE.isoformat(),
+                'sync': {
+                    'status': 'completed',
+                    'run_id': None,
+                    'events_seen': 0,
+                    'events_inserted': 0,
+                    'events_updated': 0,
+                    'financial_report_events': 0,
+                    'corporations_requested': 0,
+                    'corporations_processed': 0,
+                    'corporations_failed': 0,
+                    'corporation_errors': [],
+                },
+                'capture': {
+                    'status': 'completed',
+                    'run_id': None,
+                    'fs_div': resolved_fs_div,
+                    'events_seen': 0,
+                    'events_captured': 0,
+                    'events_failed': 0,
+                    'events_skipped': 0,
+                    'results': [],
+                    'operator_buckets': {
+                        'lookup_or_mapping_errors': {'count': 0, 'items_sample': [], 'symbols_sample': []},
+                        'retryable_capture_failures': {'count': 0, 'items_sample': [], 'symbols_sample': []},
+                        'terminal_no_data': {'event_count': 0, 'symbol_count': 0, 'items_sample': [], 'symbols_sample': []},
+                        'terminal_mapping_failed': {'event_count': 0, 'symbol_count': 0, 'items_sample': [], 'symbols_sample': []},
+                        'remaining_retryable_events': {'count': 0},
+                    },
+                },
+                'operator_buckets': {
+                    'lookup_or_mapping_errors': {'count': 0, 'items_sample': [], 'symbols_sample': []},
+                    'retryable_capture_failures': {'count': 0, 'items_sample': [], 'symbols_sample': []},
+                    'terminal_no_data': {'event_count': 0, 'symbol_count': 0, 'items_sample': [], 'symbols_sample': []},
+                    'terminal_mapping_failed': {'event_count': 0, 'symbol_count': 0, 'items_sample': [], 'symbols_sample': []},
+                    'remaining_retryable_events': {'count': 0},
+                },
+            }
         states = self.repository.list_symbol_fundamentals_states(
             stock_codes=selected_stock_codes,
             fs_div=resolved_fs_div,

@@ -104,6 +104,9 @@ async def _run_batches(args: argparse.Namespace, *, log_path: Path) -> dict[str,
             events_inserted=result['sync']['events_inserted'],
             events_captured=result['capture']['events_captured'],
             events_failed=result['capture']['events_failed'],
+            events_skipped=result['capture']['events_skipped'],
+            sync_status=result['sync']['status'],
+            capture_status=result['capture']['status'],
         )
 
         if args.max_batches is not None and batches_completed >= args.max_batches:
