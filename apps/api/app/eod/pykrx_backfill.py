@@ -232,7 +232,7 @@ class PykrxBackfillService:
         result = {
             'source': 'pykrx',
             'markets': list(markets),
-            'symbol_count': len(target_symbols),
+            'symbol_count': len(symbols),
             'persisted_count': persisted,
             'latest_trade_date': snapshot['latest_trade_date'],
             'universe_source': snapshot['universe_source'],
@@ -851,7 +851,7 @@ class PykrxBackfillService:
             universe_snapshot = {
                 'source': 'pykrx',
                 'markets': list(markets),
-                'symbol_count': len(target_symbols),
+                'symbol_count': len(symbols),
                 'persisted_count': persisted,
                 'latest_trade_date': snapshot['latest_trade_date'],
                 'universe_source': snapshot['universe_source'],
