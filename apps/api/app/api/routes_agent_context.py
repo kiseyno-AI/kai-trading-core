@@ -11,6 +11,7 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException, Query
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from app.agent_context.eod_summaries_service import agent_context_eod_summaries_service
 from app.agent_context.feedback_service import agent_context_feedback_service
 from app.agent_context.orchestrator import agent_feedback_orchestrator
 from app.agent_context.progress_service import agent_context_progress_service
@@ -404,6 +405,22 @@ async def get_latest_agent_feedback_bundle(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f'Latest agent feedback read failed: {exc}') from exc
+
+
+@router.get('/feedback/eod-summaries')
+async def inspect_eod_summarizer_feedback(
+    market_date: date = Query(...),
+    symbol: str | None = Query(default=None),
+) -> dict:
+    try:
+        return agent_context_eod_summaries_service.inspect(
+            market_date=market_date,
+            symbol=symbol,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'EOD summarizer feedback read failed: {exc}') from exc
 
 
 @router.get('/feedback')
