@@ -657,9 +657,10 @@ class DartFundamentalsRepository:
                     )
                 )
             if highlight_payloads:
+                normalized_highlights = _normalize_highlight_payloads(highlight_payloads)
                 session.execute(
                     pg_insert(DartFundamentalsHighlight).values(
-                        [{**payload, 'snapshot_id': snapshot_id} for payload in highlight_payloads]
+                        [{**payload, 'snapshot_id': snapshot_id} for payload in normalized_highlights]
                     )
                 )
             return snapshot_id
@@ -872,6 +873,42 @@ class DartFundamentalsRepository:
             'order': row.row_order,
             'currency': row.currency,
         }
+
+
+def _normalize_highlight_payloads(highlight_payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    normalized_by_key: dict[str, dict[str, Any]] = {}
+    ordered_keys: list[str] = []
+    for payload in highlight_payloads:
+        metric_key = str(payload.get('metric_key') or '').strip()
+        if not metric_key:
+            continue
+        existing = normalized_by_key.get(metric_key)
+        if existing is None:
+            normalized_by_key[metric_key] = payload.copy()
+            ordered_keys.append(metric_key)
+            continue
+        normalized_by_key[metric_key] = _merge_highlight_payload(existing, payload)
+    return [normalized_by_key[metric_key] for metric_key in ordered_keys]
+
+
+def _merge_highlight_payload(existing: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
+    merged = existing.copy()
+    for key, value in incoming.items():
+        if key == 'metric_key':
+            continue
+        if _is_meaningful_highlight_value(merged.get(key)):
+            continue
+        if _is_meaningful_highlight_value(value):
+            merged[key] = value
+    return merged
+
+
+def _is_meaningful_highlight_value(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return value.strip() != ''
+    return True
 
 
 dart_fundamentals_repository = DartFundamentalsRepository()

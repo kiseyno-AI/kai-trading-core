@@ -34,10 +34,12 @@ from app.market_data_store import load_symbols
 from sqlalchemy import func, select
 
 _REPORT_PERIOD_PATTERN = re.compile(r'\((\d{4})\.(\d{2})\)')
+_DIRECT_BACKFILL_REPORT_PATTERN = re.compile(r'direct_backfill_(\d{4})_(\d{5})', re.IGNORECASE)
 
 _FILING_CATEGORY_TO_REPORT_CODE = {
     'annual_report': '11011',
     'semiannual_report': '11012',
+    'direct_backfill': '11011',
 }
 
 DART_FUNDAMENTALS_MIN_START_DATE = date(settings.dart_fundamentals_min_business_year, 1, 1)
@@ -121,6 +123,21 @@ def infer_fundamentals_request(
 ) -> dict[str, Any]:
     filing_category = event['filing_category']
     report_name = event['report_nm']
+
+    direct_backfill_match = _DIRECT_BACKFILL_REPORT_PATTERN.search(report_name)
+    if direct_backfill_match is not None:
+        business_year = int(direct_backfill_match.group(1))
+        report_code = direct_backfill_match.group(2)
+        period_end_month = _period_end_month_for_report_code(report_code)
+        return {
+            'business_year': business_year,
+            'report_code': report_code,
+            'period_end_month': period_end_month,
+            'period_type': REPORT_CODE_METADATA[report_code]['period'],
+            'statement_type': FS_DIV_TO_STATEMENT_TYPE[fs_div],
+            'fs_div': fs_div,
+        }
+
     period_match = _REPORT_PERIOD_PATTERN.search(report_name)
     if period_match is None:
         raise ValueError(f'Unable to infer report period from disclosure name: {report_name}')
@@ -146,6 +163,18 @@ def infer_fundamentals_request(
         'statement_type': FS_DIV_TO_STATEMENT_TYPE[fs_div],
         'fs_div': fs_div,
     }
+
+
+def _period_end_month_for_report_code(report_code: str) -> int:
+    if report_code == '11011':
+        return 12
+    if report_code == '11012':
+        return 6
+    if report_code == '11013':
+        return 3
+    if report_code == '11014':
+        return 9
+    raise ValueError(f'Unsupported report_code for period-end lookup: {report_code}')
 
 
 def _infer_quarterly_report_code(
