@@ -336,6 +336,51 @@ def _parse_decimal(value: str | None) -> Decimal | None:
         return None
 
 
+async def resolve_supported_dart_corp_record(
+    client: DartClient,
+    *,
+    stock_code: str,
+) -> tuple[dict[str, str] | None, dict[str, Any] | None]:
+    normalized_stock_code = stock_code.strip().zfill(6)
+    try:
+        is_supported = await client.has_supported_stock_code(normalized_stock_code)
+    except Exception:
+        is_supported = True
+    if not is_supported:
+        return None, {
+            'stock_code': normalized_stock_code,
+            'error_type': 'DartLookupUnsupported',
+            'error': f'unsupported stock code for DART lookup: {normalized_stock_code}',
+            'terminal': True,
+            'status': CAPTURE_STATUS_MAPPING_FAILED,
+            'reason': UNSUPPORTED_CODE_REASON,
+        }
+    try:
+        corp = await client.lookup_corp_code(stock_code=normalized_stock_code)
+    except Exception as exc:
+        error_type = type(exc).__name__
+        error_message = str(exc)
+        if error_type == 'DartLookupError' and 'Unknown stock_code:' in error_message:
+            return None, {
+                'stock_code': normalized_stock_code,
+                'error_type': error_type,
+                'error': error_message,
+                'terminal': True,
+                'status': CAPTURE_STATUS_MAPPING_FAILED,
+                'reason': UNSUPPORTED_CODE_REASON,
+            }
+        return None, {
+            'stock_code': normalized_stock_code,
+            'error_type': error_type,
+            'error': error_message,
+        }
+    return {
+        'stock_code': normalized_stock_code,
+        'corp_code': corp['corp_code'],
+        'corp_name': corp['corp_name'],
+    }, None
+
+
 def _load_active_symbols() -> list[dict[str, Any]]:
     return [item for item in load_symbols(is_active=True) if (item.get('symbol') or '').strip().isdigit()]
 
@@ -980,49 +1025,12 @@ class DartFundamentalsCaptureService:
 
         for symbol in selected_symbols:
             stock_code = (symbol.get('symbol') or '').strip().zfill(6)
-            try:
-                is_supported = await self.client.has_supported_stock_code(stock_code)
-            except Exception:
-                is_supported = True
-            if not is_supported:
-                symbol_lookup_errors.append(
-                    {
-                        'stock_code': stock_code,
-                        'error_type': 'DartLookupUnsupported',
-                        'error': f'unsupported stock code for DART lookup: {stock_code}',
-                        'terminal': True,
-                        'status': CAPTURE_STATUS_MAPPING_FAILED,
-                        'reason': UNSUPPORTED_CODE_REASON,
-                    }
-                )
+            corp_record, lookup_error = await resolve_supported_dart_corp_record(self.client, stock_code=stock_code)
+            if corp_record is not None:
+                corp_records.append(corp_record)
                 continue
-            try:
-                corp = await self.client.lookup_corp_code(stock_code=stock_code)
-                corp_records.append(
-                    {
-                        'stock_code': stock_code,
-                        'corp_code': corp['corp_code'],
-                        'corp_name': corp['corp_name'],
-                    }
-                )
-            except Exception as exc:
-                error_type = type(exc).__name__
-                error_message = str(exc)
-                if error_type == 'DartLookupError' and 'Unknown stock_code:' in error_message:
-                    symbol_lookup_errors.append(
-                        {
-                            'stock_code': stock_code,
-                            'error_type': error_type,
-                            'error': error_message,
-                            'terminal': True,
-                            'status': CAPTURE_STATUS_MAPPING_FAILED,
-                            'reason': UNSUPPORTED_CODE_REASON,
-                        }
-                    )
-                    continue
-                symbol_lookup_errors.append(
-                    {'stock_code': stock_code, 'error_type': error_type, 'error': error_message}
-                )
+            if lookup_error is not None:
+                symbol_lookup_errors.append(lookup_error)
 
         from app.dart.sync_service import dart_disclosure_sync_service
 
@@ -1290,44 +1298,23 @@ class DartFundamentalsCaptureService:
                     )
                     continue
 
-                try:
-                    is_supported = await self.client.has_supported_stock_code(stock_code)
-                except Exception:
-                    is_supported = True
-                if not is_supported:
-                    error_message = f'unsupported stock code for DART lookup: {stock_code}'
-                    terminal_resolved_symbols[stock_code] = CAPTURE_STATUS_MAPPING_FAILED
-                    symbol_result['state'] = _terminal_symbol_state(CAPTURE_STATUS_MAPPING_FAILED)
-                    symbol_result['terminal'] = True
-                    symbol_result['error'] = error_message
-                    continue
-
-                try:
-                    corp = await self.client.lookup_corp_code(stock_code=stock_code)
-                except Exception as exc:
-                    error_message = str(exc)
-                    if type(exc).__name__ == 'DartLookupError' and 'Unknown stock_code:' in error_message:
+                corp_record, lookup_error = await resolve_supported_dart_corp_record(
+                    self.client,
+                    stock_code=stock_code,
+                )
+                if lookup_error is not None:
+                    error_message = lookup_error.get('error') or ''
+                    if lookup_error.get('terminal') and lookup_error.get('status') == CAPTURE_STATUS_MAPPING_FAILED:
                         terminal_resolved_symbols[stock_code] = CAPTURE_STATUS_MAPPING_FAILED
                         symbol_result['state'] = _terminal_symbol_state(CAPTURE_STATUS_MAPPING_FAILED)
                         symbol_result['terminal'] = True
                         symbol_result['error'] = error_message
                         continue
-                    error = {
-                        'stock_code': stock_code,
-                        'error_type': type(exc).__name__,
-                        'error': error_message,
-                    }
-                    lookup_errors.append(error)
+                    lookup_errors.append(lookup_error)
                     lookup_failed_symbols.add(stock_code)
                     symbol_result['state'] = 'lookup_failed'
                     symbol_result['error'] = error_message
                     continue
-
-                corp_record = {
-                    'stock_code': stock_code,
-                    'corp_code': corp['corp_code'],
-                    'corp_name': corp['corp_name'],
-                }
                 check_start_by_symbol[stock_code] = check_start_date
                 sync_groups.setdefault(check_start_date, []).append(corp_record)
 
