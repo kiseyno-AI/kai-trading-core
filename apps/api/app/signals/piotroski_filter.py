@@ -112,6 +112,9 @@ class DailyPiotroskiFilterService:
         pbr_values = [item.pbr for item in inputs if item.pbr is not None and item.pbr > 0]
         momentum_values = [item.return_20d for item in inputs if item.return_20d is not None]
         passed_count = 0
+        persisted_count = 0
+        failed_symbols: list[str] = []
+        failed_symbol_errors: list[dict[str, str]] = []
 
         for item in inputs:
             pbr_rank = _percentile_rank(pbr_values, item.pbr, ascending=True) if item.pbr in pbr_values else None
@@ -134,65 +137,74 @@ class DailyPiotroskiFilterService:
             ])
             if passed_filter:
                 passed_count += 1
-            upsert_daily_piotroski_filter_result(
-                {
-                    'symbol': item.symbol,
-                    'market_date': normalized_market_date.isoformat(),
-                    'source': FILTER_SOURCE,
-                    'pbr': item.pbr,
-                    'pbr_percentile_rank': pbr_rank,
-                    'is_low_pbr': is_low_pbr,
-                    'has_profitability_issue': has_profitability_issue,
-                    'has_capital_impairment': has_capital_impairment,
-                    'has_audit_issue': has_audit_issue,
-                    'piotroski_score': score,
-                    'passes_piotroski_score': passes_piotroski_score,
-                    'momentum_percentile_rank': momentum_rank,
-                    'is_bottom_momentum': is_bottom_momentum,
-                    'passed_filter': passed_filter,
-                    'filter_payload': {
-                        'filter_name': 'piotroski_filter_d',
-                        'name_ko': item.name_ko,
-                        'signals': {key: {'value': result.value, 'available': result.available} for key, result in signals.items()},
-                        'score_summary': {
-                            'score': score,
-                            'available_signal_count': available_signal_count,
-                            'score_ratio': score_ratio,
-                            'normalized_pass_ratio': PIOTROSKI_PASS_SCORE / 9.0,
-                        },
-                        'thresholds': {
-                            'low_pbr_percentile': LOW_PBR_PERCENTILE,
-                            'piotroski_min_score': PIOTROSKI_PASS_SCORE,
-                            'bottom_momentum_percentile': BOTTOM_MOMENTUM_PERCENTILE,
-                            'annual_year': annual_year,
-                            'prior_annual_year': prior_annual_year,
-                        },
-                        'inputs': {
-                            'return_20d': item.return_20d,
-                            'total_equity': item.total_equity,
-                            'net_income': item.net_income,
-                            'operating_cash_flow': item.operating_cash_flow,
-                            'total_assets': item.total_assets,
-                            'prior_total_assets': item.prior_total_assets,
-                            'debt_ratio': item.debt_ratio,
-                            'prior_debt_ratio': item.prior_debt_ratio,
-                            'current_ratio': item.current_ratio,
-                            'prior_current_ratio': item.prior_current_ratio,
-                            'gross_margin': item.gross_margin,
-                            'prior_gross_margin': item.prior_gross_margin,
-                            'asset_turnover': item.asset_turnover,
-                            'prior_asset_turnover': item.prior_asset_turnover,
-                            'has_dilution_signal': item.has_dilution_signal,
-                        },
+            payload = {
+                'symbol': item.symbol,
+                'market_date': normalized_market_date.isoformat(),
+                'source': FILTER_SOURCE,
+                'pbr': item.pbr,
+                'pbr_percentile_rank': pbr_rank,
+                'is_low_pbr': is_low_pbr,
+                'has_profitability_issue': has_profitability_issue,
+                'has_capital_impairment': has_capital_impairment,
+                'has_audit_issue': has_audit_issue,
+                'piotroski_score': score,
+                'passes_piotroski_score': passes_piotroski_score,
+                'momentum_percentile_rank': momentum_rank,
+                'is_bottom_momentum': is_bottom_momentum,
+                'passed_filter': passed_filter,
+                'filter_payload': {
+                    'filter_name': 'piotroski_filter_d',
+                    'name_ko': item.name_ko,
+                    'signals': {key: {'value': result.value, 'available': result.available} for key, result in signals.items()},
+                    'score_summary': {
+                        'score': score,
+                        'available_signal_count': available_signal_count,
+                        'score_ratio': score_ratio,
+                        'normalized_pass_ratio': PIOTROSKI_PASS_SCORE / 9.0,
                     },
-                }
-            )
+                    'thresholds': {
+                        'low_pbr_percentile': LOW_PBR_PERCENTILE,
+                        'piotroski_min_score': PIOTROSKI_PASS_SCORE,
+                        'bottom_momentum_percentile': BOTTOM_MOMENTUM_PERCENTILE,
+                        'annual_year': annual_year,
+                        'prior_annual_year': prior_annual_year,
+                    },
+                    'inputs': {
+                        'return_20d': item.return_20d,
+                        'total_equity': item.total_equity,
+                        'net_income': item.net_income,
+                        'operating_cash_flow': item.operating_cash_flow,
+                        'total_assets': item.total_assets,
+                        'prior_total_assets': item.prior_total_assets,
+                        'debt_ratio': item.debt_ratio,
+                        'prior_debt_ratio': item.prior_debt_ratio,
+                        'current_ratio': item.current_ratio,
+                        'prior_current_ratio': item.prior_current_ratio,
+                        'gross_margin': item.gross_margin,
+                        'prior_gross_margin': item.prior_gross_margin,
+                        'asset_turnover': item.asset_turnover,
+                        'prior_asset_turnover': item.prior_asset_turnover,
+                        'has_dilution_signal': item.has_dilution_signal,
+                    },
+                },
+            }
+            try:
+                upsert_daily_piotroski_filter_result(payload)
+                persisted_count += 1
+            except Exception as exc:
+                failed_symbols.append(item.symbol)
+                failed_symbol_errors.append({'symbol': item.symbol, 'error': str(exc)})
 
         return {
             'market_date': normalized_market_date.isoformat(),
             'source': FILTER_SOURCE,
             'symbols_evaluated': len(inputs),
             'symbols_passed': passed_count,
+            'symbols_not_passed': len(inputs) - passed_count,
+            'results_persisted': persisted_count,
+            'results_failed': len(failed_symbols),
+            'failed_symbols': failed_symbols,
+            'failed_symbol_errors': failed_symbol_errors,
         }
 
     def _load_inputs(self, market_date: date, *, annual_year: int, prior_annual_year: int) -> list[PiotroskiInputs]:
