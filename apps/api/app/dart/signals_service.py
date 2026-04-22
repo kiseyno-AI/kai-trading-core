@@ -29,6 +29,22 @@ _AUDIT_ROW_PATTERN = re.compile(r'<TR[^>]*>(.*?)</TR>', re.IGNORECASE | re.DOTAL
 _AUDIT_CELL_PATTERN = re.compile(r'<T[EDHU][^>]*>(.*?)</T[EDHU]>', re.IGNORECASE | re.DOTALL)
 _TAG_PATTERN = re.compile(r'<[^>]+>')
 _WS_PATTERN = re.compile(r'\s+')
+_ENCODING_DECLARATION_PATTERN = re.compile(
+    r'(?:encoding|charset)\s*=\s*["\']?\s*([A-Za-z0-9._-]+)',
+    re.IGNORECASE,
+)
+_ENCODING_ALIASES = {
+    'cp949': 'cp949',
+    'euc-kr': 'euc-kr',
+    'euckr': 'euc-kr',
+    'ks_c_5601-1987': 'euc-kr',
+    'ks_c_5601-1989': 'euc-kr',
+    'ksc5601': 'euc-kr',
+    'ms949': 'cp949',
+    'uhc': 'cp949',
+    'utf-8': 'utf-8',
+    'utf8': 'utf-8',
+}
 
 _DILUTION_RULES = [
     ('유상증자', 'paid_increase', 'equity'),
@@ -85,14 +101,15 @@ class DartSignalsService:
             return None
         artifact = await self.client.download_document(rcept_no=event['rcept_no'])
         with zipfile.ZipFile(io.BytesIO(artifact['content'])) as archive:
-            for name in archive.namelist()[:20]:
-                try:
-                    content = archive.read(name).decode('utf-8', errors='ignore')
-                except Exception:
+            for info in archive.infolist():
+                if info.is_dir():
+                    continue
+                content = _decode_document_text(archive.read(info))
+                if content is None:
                     continue
                 parsed = self._parse_audit_from_document(content)
                 if parsed is not None:
-                    parsed.source_section = name
+                    parsed.source_section = info.filename
                     return parsed
         return None
 
@@ -201,6 +218,38 @@ def _clean_html_text(value: str) -> str:
     text = unescape(text)
     text = _WS_PATTERN.sub(' ', text)
     return text.strip()
+
+
+def _decode_document_text(raw_bytes: bytes) -> str | None:
+    for encoding in _iter_document_encodings(raw_bytes):
+        try:
+            return raw_bytes.decode(encoding)
+        except (LookupError, UnicodeDecodeError):
+            continue
+    return None
+
+
+def _iter_document_encodings(raw_bytes: bytes) -> list[str]:
+    declared_encoding = _detect_declared_encoding(raw_bytes)
+    encodings: list[str] = []
+    seen: set[str] = set()
+    for encoding in (declared_encoding, 'utf-8', 'cp949', 'euc-kr'):
+        if not encoding:
+            continue
+        normalized = encoding.lower()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        encodings.append(encoding)
+    return encodings
+
+
+def _detect_declared_encoding(raw_bytes: bytes) -> str | None:
+    header = raw_bytes[:2048].decode('ascii', errors='ignore')
+    match = _ENCODING_DECLARATION_PATTERN.search(header)
+    if not match:
+        return None
+    return _ENCODING_ALIASES.get(match.group(1).strip().lower(), match.group(1).strip())
 
 
 dart_signals_service = DartSignalsService()
