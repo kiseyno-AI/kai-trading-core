@@ -128,7 +128,10 @@ def infer_fundamentals_request(
     if direct_backfill_match is not None:
         business_year = int(direct_backfill_match.group(1))
         report_code = direct_backfill_match.group(2)
-        period_end_month = _period_end_month_for_report_code(report_code)
+        period_end_month = _period_end_month_for_report_code(
+            report_code,
+            fiscal_year_end_month=fiscal_year_end_month,
+        )
         return {
             'business_year': business_year,
             'report_code': report_code,
@@ -165,7 +168,18 @@ def infer_fundamentals_request(
     }
 
 
-def _period_end_month_for_report_code(report_code: str) -> int:
+def _period_end_month_for_report_code(
+    report_code: str,
+    *,
+    fiscal_year_end_month: int | str | None = None,
+) -> int:
+    normalized_fiscal_year_end_month = _normalize_month(fiscal_year_end_month)
+    if normalized_fiscal_year_end_month is not None:
+        quarter = REPORT_CODE_METADATA.get(report_code, {}).get('quarter')
+        if quarter is None:
+            raise ValueError(f'Unsupported report_code for period-end lookup: {report_code}')
+        return _month_after(normalized_fiscal_year_end_month, quarter * 3)
+
     if report_code == '11011':
         return 12
     if report_code == '11012':
