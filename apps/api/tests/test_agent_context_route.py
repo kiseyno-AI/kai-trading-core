@@ -287,6 +287,55 @@ class AgentContextRouteTests(unittest.TestCase):
         self.assertEqual(fake_service.list_args['limit'], 10)
         self.assertEqual(response.json()['items'][0]['symbol'], '005930')
 
+    def test_inspect_technical_summarizer_feedback_route_calls_service(self):
+        fake_service = FakeAgentContextFeedbackService()
+        original_service = routes_agent_context.agent_context_feedback_service
+        routes_agent_context.agent_context_feedback_service = fake_service
+        try:
+            client = TestClient(self.app)
+            response = client.get(
+                '/agent-context/feedback/technical-summaries',
+                params={
+                    'market_date': '2026-04-21',
+                    'symbol': '005930',
+                    'limit': '15',
+                },
+            )
+        finally:
+            routes_agent_context.agent_context_feedback_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            fake_service.list_args,
+            {
+                'market_date': date.fromisoformat('2026-04-21'),
+                'symbols': ['005930'],
+                'agent_name': 'technical-summarizer',
+                'limit': 15,
+            },
+        )
+        self.assertEqual(response.json()['request']['agent_name'], 'technical-summarizer')
+        self.assertEqual(response.json()['items'][0]['symbol'], '005930')
+
+    def test_inspect_technical_summarizer_feedback_route_uses_default_limit(self):
+        fake_service = FakeAgentContextFeedbackService()
+        original_service = routes_agent_context.agent_context_feedback_service
+        routes_agent_context.agent_context_feedback_service = fake_service
+        try:
+            client = TestClient(self.app)
+            response = client.get(
+                '/agent-context/feedback/technical-summaries',
+                params={'market_date': '2026-04-21'},
+            )
+        finally:
+            routes_agent_context.agent_context_feedback_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(fake_service.list_args['market_date'], date.fromisoformat('2026-04-21'))
+        self.assertIsNone(fake_service.list_args['symbols'])
+        self.assertEqual(fake_service.list_args['agent_name'], 'technical-summarizer')
+        self.assertEqual(fake_service.list_args['limit'], 50)
+
     def test_inspect_eod_summarizer_feedback_route_returns_all_items(self):
         fake_service = FakeAgentContextEodSummariesService()
         original_service = routes_agent_context.agent_context_eod_summaries_service
