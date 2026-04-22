@@ -522,7 +522,6 @@ class EODPipelineStatusService:
                 'source_run_ids': {},
                 'details': {
                     'fs_div': fs_div,
-                    'trigger_after_capture_enabled': bool(settings.eod_trigger_fundamentals_after_capture),
                 },
             }
 
@@ -589,7 +588,6 @@ class EODPipelineStatusService:
                 'pending_event_count': metadata.get('pending_event_count'),
                 'capture_event_count': metadata.get('capture_event_count') or metadata.get('candidate_event_count'),
                 'partial_reasons': metadata.get('partial_reasons'),
-                'trigger_after_capture_enabled': bool(settings.eod_trigger_fundamentals_after_capture),
             },
         }
 

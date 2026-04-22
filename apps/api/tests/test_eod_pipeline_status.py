@@ -30,6 +30,10 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
         self.assertEqual(result['stages']['price_collection']['total'], 3579)
         self.assertEqual(result['stages']['trending_ranks']['total'], 3)
         self.assertEqual(result['stages']['fundamentals_daily_refresh']['status'], 'pending')
+        self.assertEqual(
+            result['stages']['fundamentals_daily_refresh']['details'],
+            {'fs_div': 'CFS'},
+        )
 
     def test_read_reports_live_stage_progress_for_pykrx_and_fundamentals(self):
         pykrx_run = {
@@ -148,4 +152,7 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
             'Capturing DART fundamentals for 75 events, retry cycle 2/3, batch 1/2',
         )
         self.assertEqual(result['stages']['fundamentals_daily_refresh']['source_run_ids']['capture_run_ids'], [699, 700])
-
+        self.assertNotIn(
+            'trigger_after_capture_enabled',
+            result['stages']['fundamentals_daily_refresh']['details'],
+        )
