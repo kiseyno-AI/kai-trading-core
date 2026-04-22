@@ -414,7 +414,7 @@ async def inspect_fundamental_summarizer_feedback(
     limit: int = Query(default=50, ge=1, le=200),
 ) -> dict:
     try:
-        symbols = [symbol] if symbol else None
+        symbols = [symbol] if symbol is not None else None
         return agent_context_feedback_service.list_feedback(
             market_date=market_date,
             symbols=symbols,
