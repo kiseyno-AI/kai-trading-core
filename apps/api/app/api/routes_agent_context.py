@@ -407,6 +407,26 @@ async def get_latest_agent_feedback_bundle(
         raise HTTPException(status_code=500, detail=f'Latest agent feedback read failed: {exc}') from exc
 
 
+@router.get('/feedback/fundamental-summaries')
+async def inspect_fundamental_summarizer_feedback(
+    market_date: date = Query(...),
+    symbol: str | None = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=200),
+) -> dict:
+    try:
+        symbols = [symbol] if symbol is not None else None
+        return agent_context_feedback_service.list_feedback(
+            market_date=market_date,
+            symbols=symbols,
+            agent_name='fundamental-summarizer',
+            limit=limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'Fundamental summarizer feedback read failed: {exc}') from exc
+
+
 @router.get('/feedback/eod-summaries')
 async def inspect_eod_summarizer_feedback(
     market_date: date = Query(...),
