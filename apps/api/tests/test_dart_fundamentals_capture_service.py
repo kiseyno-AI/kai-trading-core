@@ -880,6 +880,21 @@ class InferFundamentalsRequestTests(unittest.TestCase):
                 fs_div='CFS',
             )
 
+    def test_infer_fundamentals_request_uses_fiscal_year_end_for_direct_backfill_period_end(self):
+        annual_backfill = infer_fundamentals_request(
+            {'report_nm': 'direct_backfill_2025_11011', 'filing_category': 'direct_backfill'},
+            fs_div='CFS',
+            fiscal_year_end_month=3,
+        )
+        half_backfill = infer_fundamentals_request(
+            {'report_nm': 'direct_backfill_2025_11012', 'filing_category': 'direct_backfill'},
+            fs_div='CFS',
+            fiscal_year_end_month=3,
+        )
+
+        self.assertEqual(annual_backfill['period_end_month'], 3)
+        self.assertEqual(half_backfill['period_end_month'], 9)
+
 
 class BuildRowPayloadsTests(unittest.TestCase):
     def test_build_row_payloads_disambiguates_same_account_rows_with_distinct_details(self):
