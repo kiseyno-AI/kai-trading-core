@@ -305,6 +305,8 @@ class DailyPiotroskiFilterResult(Base, TimestampMixin):
     market_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
     source: Mapped[str] = mapped_column(String(32), nullable=False, default='strategy_piotroski_v1')
     pbr: Mapped[float | None] = mapped_column(Numeric(18, 6))
+    valuation_available: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    valuation_source_status: Mapped[str | None] = mapped_column(String(32))
     pbr_percentile_rank: Mapped[float | None] = mapped_column(Numeric(12, 6))
     is_low_pbr: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     has_profitability_issue: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
