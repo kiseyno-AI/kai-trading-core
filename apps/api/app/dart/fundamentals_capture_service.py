@@ -1056,6 +1056,11 @@ class DartFundamentalsCaptureService:
         terminal_lookup_statuses = [
             item for item in symbol_lookup_errors if item.get('terminal') and item.get('status') == CAPTURE_STATUS_MAPPING_FAILED
         ]
+        terminal_lookup_symbols = {
+            item['stock_code']: CAPTURE_STATUS_MAPPING_FAILED
+            for item in terminal_lookup_statuses
+            if item.get('stock_code')
+        }
         retryable_lookup_errors = [item for item in symbol_lookup_errors if not item.get('terminal')]
         return {
             'scope': 'current_active_universe',
@@ -1077,9 +1082,9 @@ class DartFundamentalsCaptureService:
             'sync': sync_result,
             'capture': capture_result,
             'operator_buckets': _build_operator_buckets(
-                lookup_errors=symbol_lookup_errors,
+                lookup_errors=retryable_lookup_errors,
                 capture_results=capture_result.get('results', []),
-                terminal_resolved_symbols={},
+                terminal_resolved_symbols=terminal_lookup_symbols,
             ),
         }
 
