@@ -470,7 +470,7 @@ class DartFundamentalsRepository:
                 .over(
                     partition_by=DartFundamentalsSnapshot.stock_code,
                     order_by=(
-                        DartDisclosureEvent.receipt_date.desc(),
+                        DartDisclosureEvent.receipt_date.desc().nullslast(),
                         DartFundamentalsSnapshot.business_year.desc(),
                         DartFundamentalsSnapshot.report_code.desc(),
                         DartFundamentalsSnapshot.id.desc(),
