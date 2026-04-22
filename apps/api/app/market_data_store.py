@@ -2157,6 +2157,8 @@ def upsert_daily_piotroski_filter_result(result: dict) -> None:
                 set_={
                     'source': statement.excluded.source,
                     'pbr': statement.excluded.pbr,
+                    'valuation_available': statement.excluded.valuation_available,
+                    'valuation_source_status': statement.excluded.valuation_source_status,
                     'pbr_percentile_rank': statement.excluded.pbr_percentile_rank,
                     'is_low_pbr': statement.excluded.is_low_pbr,
                     'has_profitability_issue': statement.excluded.has_profitability_issue,
