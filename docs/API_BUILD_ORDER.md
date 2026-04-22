@@ -77,6 +77,7 @@
 - `POST /agent-context/feedback/session-cleanup/run`
 - `GET /agent-context/feedback/session-cleanup?market_date=YYYY-MM-DD&agent_name=eod-summarizer`
 - `GET /agent-context/feedback?market_date=YYYY-MM-DD&symbols=005930&agent_name=openclaw&limit=50`
+- `GET /agent-context/feedback/eod-summaries?market_date=YYYY-MM-DD&symbol=005930`
 - `GET /agent-context/feedback/latest?market_date=YYYY-MM-DD&symbols=005930&symbols=000660`
 - `GET /agent-context/feedback/payloads?market_date=YYYY-MM-DD&symbols=005930`
 - `GET /agent-context/feedback/requests?market_date=YYYY-MM-DD&symbols=005930`
@@ -169,6 +170,8 @@
 - Stored normalized feedback now includes a shared top-level contract: `role`, `summary`, `confidence`, `risk_flags`, `details`, and `improvement_notes` so later jobs can mine repeated data/algorithm gaps.
 - Feedback is append-only and stored separately from deterministic `daily_action_summaries`; it does not create orders, positions, or live-trading behavior.
 - `GET /agent-context/feedback` reads stored feedback for a requested `market_date`, optionally filtered by symbol and `agent_name`, so operators or later jobs can inspect the summaries Core received.
+- `GET /agent-context/feedback/eod-summaries` is the consumer-facing persisted read for the `eod-summarizer` role. `market_date` is required, `symbol` is optional, and the response returns only the stored eod-summarizer result rows for that date.
+- The dedicated eod-summaries payload exposes the persisted consumer-useful fields from `agent_context_feedback`: role-level summary/confidence/risk flags plus the stored detail slices such as `breadth_context`, `leaders_laggards`, `price_action`, `anomalies_and_gaps`, `data_gaps`, `conservative_take`, and `improvement_notes`.
 
 ## Daily signal feature notes
 - `daily_signal_features` is the DB-backed KIS ranking feature layer keyed by `symbol_id + market_date`.
