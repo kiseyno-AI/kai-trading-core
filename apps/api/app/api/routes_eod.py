@@ -1,6 +1,6 @@
 import asyncio
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 
 from app.core.settings import settings
 from app.eod.action_summaries import daily_action_summary_service
@@ -15,6 +15,7 @@ from app.eod.state import job_state
 from app.eod.technical_snapshots import daily_technical_snapshot_service
 from app.market.clock import get_market_state
 from app.signals.daily_signal_features import daily_signal_feature_service
+from app.signals.piotroski_filter import daily_piotroski_filter_service
 
 router = APIRouter(prefix='/eod', tags=['eod'])
 
@@ -178,8 +179,6 @@ async def inspect_daily_technical_snapshots(
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f'Daily technical snapshot inspect failed: {exc}') from exc
 
-
-
 @router.post('/action-summaries/compute')
 async def compute_daily_action_summaries(
     market_date: str,
@@ -261,3 +260,22 @@ async def inspect_daily_signal_features(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f'Daily signal feature inspect failed: {exc}') from exc
+
+
+@router.get('/piotroski-filter-results')
+async def inspect_daily_piotroski_filter_results(
+    market_date: str,
+    symbol: str | None = None,
+    limit: int | None = Query(default=None, ge=1, le=20000),
+) -> dict:
+    try:
+        return await asyncio.to_thread(
+            daily_piotroski_filter_service.inspect,
+            market_date=market_date,
+            symbol=symbol,
+            limit=limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'Daily Piotroski filter result read failed: {exc}') from exc

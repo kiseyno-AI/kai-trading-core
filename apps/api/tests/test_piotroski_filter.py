@@ -88,3 +88,66 @@ class DailyPiotroskiFilterServiceTests(unittest.TestCase):
         self.assertEqual(result['results_persisted'], 1)
         self.assertEqual(result['results_failed'], 1)
         self.assertEqual(result['failed_symbols'], ['000660'])
+
+    def test_inspect_returns_all_items_for_market_date_without_symbol(self):
+        service = DailyPiotroskiFilterService()
+        stored_items = [
+            {
+                'symbol': '005930',
+                'market_date': '2026-04-14',
+                'passed_filter': True,
+            },
+            {
+                'symbol': '000660',
+                'market_date': '2026-04-14',
+                'passed_filter': False,
+            },
+        ]
+
+        with patch(
+            'app.signals.piotroski_filter.load_daily_piotroski_filter_results',
+            return_value=stored_items,
+        ) as loader:
+            result = service.inspect(market_date='2026-04-14')
+
+        loader.assert_called_once_with(
+            market_date=date(2026, 4, 14),
+            symbols=None,
+            limit=None,
+        )
+        self.assertEqual(result['market_date'], '2026-04-14')
+        self.assertEqual(result['summary']['entries'], 2)
+        self.assertEqual(result['summary']['passed_count'], 1)
+        self.assertEqual(result['summary']['not_passed_count'], 1)
+        self.assertEqual(result['items'], stored_items)
+
+    def test_inspect_returns_single_item_when_symbol_is_requested(self):
+        service = DailyPiotroskiFilterService()
+        stored_items = [
+            {
+                'symbol': '005930',
+                'market_date': '2026-04-14',
+                'passed_filter': True,
+            }
+        ]
+
+        with patch(
+            'app.signals.piotroski_filter.load_daily_piotroski_filter_results',
+            return_value=stored_items,
+        ) as loader:
+            result = service.inspect(market_date='2026-04-14', symbol='5930', limit=25)
+
+        loader.assert_called_once_with(
+            market_date=date(2026, 4, 14),
+            symbols=['005930'],
+            limit=1,
+        )
+        self.assertEqual(result['summary']['requested_symbol'], '005930')
+        self.assertEqual(result['summary']['missing_symbols'], [])
+        self.assertEqual(result['item'], stored_items[0])
+
+    def test_inspect_rejects_blank_symbol(self):
+        service = DailyPiotroskiFilterService()
+
+        with self.assertRaisesRegex(ValueError, 'symbol must not be blank'):
+            service.inspect(market_date='2026-04-14', symbol='   ')

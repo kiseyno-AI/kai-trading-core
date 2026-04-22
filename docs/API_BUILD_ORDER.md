@@ -20,8 +20,9 @@
 17. Stored trending stocks read route
 18. KIS realtime trending route
 19. KIS daily ranking signal-feature collect/inspect routes
-20. Agent feedback intake/read routes for OpenClaw summaries
-21. Role-specific post-EOD agent feedback dispatch route
+20. Daily Piotroski filter result read route
+21. Agent feedback intake/read routes for OpenClaw summaries
+22. Role-specific post-EOD agent feedback dispatch route
 
 ## Current routes
 - `POST /broker/kis/token`
@@ -67,6 +68,7 @@
 - `GET /eod/action-summaries?market_date=YYYY-MM-DD&symbols=005930,000660`
 - `POST /eod/signal-features/collect?market_date=YYYY-MM-DD&sources=volume-power,overtime-volume,overtime-fluctuation`
 - `GET /eod/signal-features?market_date=YYYY-MM-DD&symbols=005930,000660`
+- `GET /eod/piotroski-filter-results?market_date=YYYY-MM-DD&symbol=005930`
 - `GET /agent-context/symbol-day?market_date=YYYY-MM-DD&symbols=005930&symbols=000660&fs_div=CFS&disclosures_limit=5`
 - `POST /agent-context/feedback`
 - `POST /agent-context/feedback/dispatch`
@@ -175,6 +177,13 @@
 - The same collect path now also rebuilds `daily_market_participation_contexts` for that market date from the stored `daily_signal_features` rows, so market-summary payloads no longer derive participation context on demand.
 - Repo-owned bootstrap/backfill for the new derived-context tables is the internal ops command `python3.11 -m app.internal.ops agent-derived-contexts-backfill-recent`, which fills the recent seven trading days ending yesterday from existing `daily_price_bars` and stored `daily_signal_features` without changing the steady-state daily EOD scope.
 - For shell-driven operations, prefer `python3.11 -m app.internal.ops kis-daily-signal-features-collect --market-date YYYY-MM-DD` from `apps/api`.
+
+## Piotroski filter read-layer notes
+- `GET /eod/piotroski-filter-results` is the persisted read API for `daily_piotroski_filter_results`.
+- `market_date` is required. When `symbol` is provided, the route returns a single `item` for that symbol and date. Without `symbol`, it returns `items` for every stored result on that date by default.
+- The read path intentionally returns both passed and not-passed rows because the DART daily fundamentals refresh stores one persisted result per evaluated symbol, not just the winners.
+- Results are ordered with passed names first, then lower PBR percentile ranks first, so callers can consume the returned list directly without applying a second client-side sort.
+- The `summary` block reports the number of returned entries, passed vs not-passed counts, and any requested symbol that did not have a stored row for the requested date.
 
 ## Trending stocks read-layer notes
 - `GET /scanner/trending-stocks` is the compact web-facing read API for stored trending-stock candidates.
