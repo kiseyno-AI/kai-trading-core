@@ -1374,8 +1374,10 @@ class PykrxBackfillService:
             'refresh_universe': effective_refresh_universe,
             'universe_snapshot': universe_snapshot,
         }
+        dart_auto_followup_enabled = bool((settings.dart_api_key or '').strip())
         should_chain_fundamentals = (
-            mode == 'daily_auto'
+            dart_auto_followup_enabled
+            and mode == 'daily_auto'
             and status in {'completed', 'completed_with_errors'}
         )
         if should_chain_fundamentals:
@@ -1386,6 +1388,12 @@ class PykrxBackfillService:
                     trigger='eod_pykrx_followup',
                 )
             )
+        elif mode == 'daily_auto' and status in {'completed', 'completed_with_errors'}:
+            result['fundamentals_followup'] = {
+                'triggered': False,
+                'reason': 'dart_api_key_not_configured',
+                'market_date': latest_trade_date,
+            }
         if retry_context is not None:
             result['retry'] = retry_context
         _log_pykrx_fetch('run_collection', status, **{key: value for key, value in result.items() if key != 'status'})

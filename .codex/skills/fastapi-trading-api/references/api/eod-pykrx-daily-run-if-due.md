@@ -1,7 +1,7 @@
 # POST /eod/pykrx/daily/run-if-due
 
 ## Summary
-Runs the daily pykrx EOD pipeline only when due, including persisted price-context refresh after bar writes and the chained DART daily fundamentals refresh that follows successful daily-auto completion.
+Runs the daily pykrx EOD pipeline only when due, including persisted price-context refresh after bar writes. When `DART_API_KEY` is configured, the same daily-auto path also chains the DART daily fundamentals refresh after successful completion.
 
 ## Example request
 ```http
