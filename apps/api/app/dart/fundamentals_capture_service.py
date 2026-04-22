@@ -45,6 +45,7 @@ _FILING_CATEGORY_TO_REPORT_CODE = {
 DART_FUNDAMENTALS_MIN_START_DATE = date(settings.dart_fundamentals_min_business_year, 1, 1)
 DART_FUNDAMENTALS_REFRESH_HEARTBEAT_SECONDS = 30.0
 DART_NO_DATA_STATUS = '013'
+UNSUPPORTED_CODE_REASON = 'code_unsupported:dart_lookup'
 
 
 class TerminalFundamentalsCaptureError(RuntimeError):
@@ -980,6 +981,22 @@ class DartFundamentalsCaptureService:
         for symbol in selected_symbols:
             stock_code = (symbol.get('symbol') or '').strip().zfill(6)
             try:
+                is_supported = await self.client.has_supported_stock_code(stock_code)
+            except Exception:
+                is_supported = True
+            if not is_supported:
+                symbol_lookup_errors.append(
+                    {
+                        'stock_code': stock_code,
+                        'error_type': 'DartLookupUnsupported',
+                        'error': f'unsupported stock code for DART lookup: {stock_code}',
+                        'terminal': True,
+                        'status': CAPTURE_STATUS_MAPPING_FAILED,
+                        'reason': UNSUPPORTED_CODE_REASON,
+                    }
+                )
+                continue
+            try:
                 corp = await self.client.lookup_corp_code(stock_code=stock_code)
                 corp_records.append(
                     {
@@ -989,8 +1006,22 @@ class DartFundamentalsCaptureService:
                     }
                 )
             except Exception as exc:
+                error_type = type(exc).__name__
+                error_message = str(exc)
+                if error_type == 'DartLookupError' and 'Unknown stock_code:' in error_message:
+                    symbol_lookup_errors.append(
+                        {
+                            'stock_code': stock_code,
+                            'error_type': error_type,
+                            'error': error_message,
+                            'terminal': True,
+                            'status': CAPTURE_STATUS_MAPPING_FAILED,
+                            'reason': UNSUPPORTED_CODE_REASON,
+                        }
+                    )
+                    continue
                 symbol_lookup_errors.append(
-                    {'stock_code': stock_code, 'error_type': type(exc).__name__, 'error': str(exc)}
+                    {'stock_code': stock_code, 'error_type': error_type, 'error': error_message}
                 )
 
         from app.dart.sync_service import dart_disclosure_sync_service
@@ -1022,6 +1053,15 @@ class DartFundamentalsCaptureService:
                 'events_skipped': 0,
                 'results': [],
             }
+        terminal_lookup_statuses = [
+            item for item in symbol_lookup_errors if item.get('terminal') and item.get('status') == CAPTURE_STATUS_MAPPING_FAILED
+        ]
+        terminal_lookup_symbols = {
+            item['stock_code']: CAPTURE_STATUS_MAPPING_FAILED
+            for item in terminal_lookup_statuses
+            if item.get('stock_code')
+        }
+        retryable_lookup_errors = [item for item in symbol_lookup_errors if not item.get('terminal')]
         return {
             'scope': 'current_active_universe',
             'active_symbols_total': len(active_symbols),
@@ -1029,8 +1069,10 @@ class DartFundamentalsCaptureService:
             'symbol_limit': symbol_limit,
             'symbols_selected': len(selected_symbols),
             'symbols_resolved': len(corp_records),
-            'symbol_lookup_error_count': len(symbol_lookup_errors),
-            'symbol_lookup_errors': symbol_lookup_errors,
+            'symbol_lookup_error_count': len(retryable_lookup_errors),
+            'symbol_lookup_errors': retryable_lookup_errors,
+            'terminal_unsupported_symbol_count': len(terminal_lookup_statuses),
+            'terminal_unsupported_symbols': terminal_lookup_statuses,
             'requested_start_date': candidate_start_date.isoformat() if candidate_start_date else None,
             'effective_start_date': effective_start_date.isoformat(),
             'effective_end_date': resolved_end_date.isoformat(),
@@ -1040,9 +1082,9 @@ class DartFundamentalsCaptureService:
             'sync': sync_result,
             'capture': capture_result,
             'operator_buckets': _build_operator_buckets(
-                lookup_errors=symbol_lookup_errors,
+                lookup_errors=retryable_lookup_errors,
                 capture_results=capture_result.get('results', []),
-                terminal_resolved_symbols={},
+                terminal_resolved_symbols=terminal_lookup_symbols,
             ),
         }
 
@@ -1246,6 +1288,18 @@ class DartFundamentalsCaptureService:
                         if latest_fundamentals_date is None and latest_terminal_status in TERMINAL_CAPTURE_STATUSES
                         else 'fresh'
                     )
+                    continue
+
+                try:
+                    is_supported = await self.client.has_supported_stock_code(stock_code)
+                except Exception:
+                    is_supported = True
+                if not is_supported:
+                    error_message = f'unsupported stock code for DART lookup: {stock_code}'
+                    terminal_resolved_symbols[stock_code] = CAPTURE_STATUS_MAPPING_FAILED
+                    symbol_result['state'] = _terminal_symbol_state(CAPTURE_STATUS_MAPPING_FAILED)
+                    symbol_result['terminal'] = True
+                    symbol_result['error'] = error_message
                     continue
 
                 try:
