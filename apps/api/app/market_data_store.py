@@ -13,6 +13,7 @@ from app.db import engine, session_scope
 from app.db_models import (
     CurrentQuoteCache,
     DailyActionSummary,
+    DailyPiotroskiFilterResult,
     DailyMarketParticipationContext,
     DailyPriceBar,
     DailyPriceContext,
@@ -2109,6 +2110,115 @@ def upsert_daily_signal_feature(feature: dict) -> None:
                 },
             )
         )
+
+
+def upsert_daily_piotroski_filter_result(result: dict) -> None:
+    refreshed_at = datetime.utcnow()
+    with session_scope() as session:
+        symbol = _get_symbol(session, result['symbol'])
+        if symbol is None:
+            symbol = Symbol(
+                symbol=result['symbol'],
+                market='KRX',
+                name_ko=(result.get('filter_payload') or {}).get('name_ko') or result['symbol'],
+                instrument_type='equity',
+                source=result.get('source', 'strategy_piotroski_v1'),
+                is_active=True,
+                last_refreshed_at=refreshed_at,
+            )
+            session.add(symbol)
+            session.flush()
+
+        values = {
+            'symbol_id': symbol.id,
+            'market_date': _normalize_trade_date(result['market_date']),
+            'source': result.get('source', 'strategy_piotroski_v1'),
+            'pbr': result.get('pbr'),
+            'pbr_percentile_rank': result.get('pbr_percentile_rank'),
+            'is_low_pbr': bool(result.get('is_low_pbr')),
+            'has_profitability_issue': bool(result.get('has_profitability_issue')),
+            'has_capital_impairment': bool(result.get('has_capital_impairment')),
+            'has_audit_issue': bool(result.get('has_audit_issue')),
+            'piotroski_score': result.get('piotroski_score'),
+            'passes_piotroski_score': bool(result.get('passes_piotroski_score')),
+            'momentum_percentile_rank': result.get('momentum_percentile_rank'),
+            'is_bottom_momentum': bool(result.get('is_bottom_momentum')),
+            'passed_filter': bool(result.get('passed_filter')),
+            'filter_payload': result['filter_payload'],
+            'captured_at': refreshed_at,
+            'updated_at': refreshed_at,
+        }
+        statement = pg_insert(DailyPiotroskiFilterResult).values(values)
+        session.execute(
+            statement.on_conflict_do_update(
+                constraint='uq_daily_piotroski_filter_results_symbol_market_date',
+                set_={
+                    'source': statement.excluded.source,
+                    'pbr': statement.excluded.pbr,
+                    'pbr_percentile_rank': statement.excluded.pbr_percentile_rank,
+                    'is_low_pbr': statement.excluded.is_low_pbr,
+                    'has_profitability_issue': statement.excluded.has_profitability_issue,
+                    'has_capital_impairment': statement.excluded.has_capital_impairment,
+                    'has_audit_issue': statement.excluded.has_audit_issue,
+                    'piotroski_score': statement.excluded.piotroski_score,
+                    'passes_piotroski_score': statement.excluded.passes_piotroski_score,
+                    'momentum_percentile_rank': statement.excluded.momentum_percentile_rank,
+                    'is_bottom_momentum': statement.excluded.is_bottom_momentum,
+                    'passed_filter': statement.excluded.passed_filter,
+                    'filter_payload': statement.excluded.filter_payload,
+                    'captured_at': statement.excluded.captured_at,
+                    'updated_at': refreshed_at,
+                },
+            )
+        )
+
+
+def load_daily_piotroski_filter_results(
+    *,
+    market_date: str | date,
+    symbols: list[str] | None = None,
+    passed_filter: bool | None = None,
+    limit: int = 100,
+) -> list[dict]:
+    with session_scope() as session:
+        stmt = (
+            select(DailyPiotroskiFilterResult, Symbol.symbol)
+            .join(Symbol, Symbol.id == DailyPiotroskiFilterResult.symbol_id)
+            .where(DailyPiotroskiFilterResult.market_date == _normalize_trade_date(market_date))
+            .order_by(
+                DailyPiotroskiFilterResult.passed_filter.desc(),
+                DailyPiotroskiFilterResult.pbr_percentile_rank.asc().nullslast(),
+                Symbol.symbol.asc(),
+            )
+            .limit(limit)
+        )
+        if symbols:
+            stmt = stmt.where(Symbol.symbol.in_(symbols))
+        if passed_filter is not None:
+            stmt = stmt.where(DailyPiotroskiFilterResult.passed_filter == passed_filter)
+
+        rows = session.execute(stmt).all()
+        return [
+            {
+                'symbol': symbol,
+                'market_date': item.market_date.isoformat(),
+                'source': item.source,
+                'pbr': _decimal_to_float(item.pbr),
+                'pbr_percentile_rank': _round_float(item.pbr_percentile_rank, 6),
+                'is_low_pbr': item.is_low_pbr,
+                'has_profitability_issue': item.has_profitability_issue,
+                'has_capital_impairment': item.has_capital_impairment,
+                'has_audit_issue': item.has_audit_issue,
+                'piotroski_score': item.piotroski_score,
+                'passes_piotroski_score': item.passes_piotroski_score,
+                'momentum_percentile_rank': _round_float(item.momentum_percentile_rank, 6),
+                'is_bottom_momentum': item.is_bottom_momentum,
+                'passed_filter': item.passed_filter,
+                'filter_payload': item.filter_payload,
+                'captured_at': item.captured_at.isoformat() if item.captured_at else None,
+            }
+            for item, symbol in rows
+        ]
 
 
 def load_daily_signal_feature_context_rows(

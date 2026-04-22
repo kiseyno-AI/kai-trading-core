@@ -31,6 +31,7 @@ from app.dart.service import (
 )
 from app.integrations.dart.client import DartClient, dart_client
 from app.market_data_store import load_symbols
+from app.signals.piotroski_filter import daily_piotroski_filter_service
 from sqlalchemy import func, select
 
 _REPORT_PERIOD_PATTERN = re.compile(r'\((\d{4})\.(\d{2})\)')
@@ -1365,7 +1366,13 @@ class DartFundamentalsCaptureService:
                     corporation_count=len(corporations),
                     stock_codes_sample=_limited_sample([corporation['stock_code'] for corporation in corporations]),
                 )
-                sync_result = await sync_group_operation()
+                sync_result = await _await_with_refresh_heartbeat(
+                    sync_group_operation,
+                    heartbeat=lambda: update_refresh_progress(
+                        stage='syncing_disclosures',
+                        extra_metadata=sync_group_metadata,
+                    ),
+                )
                 sync_results.append(
                     {
                         **sync_result,
@@ -1556,7 +1563,6 @@ class DartFundamentalsCaptureService:
                             heartbeat=lambda: update_refresh_progress(
                                 stage='capturing_fundamentals',
                                 extra_metadata=capture_metadata,
-                                persist=False,
                             ),
                         )
                         capture_runs.append(cycle_result)
@@ -1680,6 +1686,21 @@ class DartFundamentalsCaptureService:
 
             status = 'partial' if partial_reasons else 'completed'
 
+            piotroski_filter_followup = None
+            piotroski_filter_followup_error = None
+            if status in {'completed', 'partial'}:
+                try:
+                    piotroski_filter_followup = await asyncio.to_thread(
+                        daily_piotroski_filter_service.collect_and_persist_for_market_date,
+                        market_date=resolved_market_date,
+                    )
+                    if int(piotroski_filter_followup.get('results_failed') or 0) > 0:
+                        partial_reasons.append('piotroski_filter_persistence_incomplete')
+                except Exception as exc:
+                    piotroski_filter_followup_error = str(exc)
+                    partial_reasons.append('piotroski_filter_followup_failed')
+                status = 'partial' if partial_reasons else 'completed'
+
             metadata = {
                 **run_metadata,
                 'lookup_error_count': len(lookup_errors),
@@ -1724,6 +1745,8 @@ class DartFundamentalsCaptureService:
                 'retry_cycles_requested': resolved_retry_cycles,
                 'retry_cycles_completed': retry_cycles_completed,
                 'partial_reasons': partial_reasons,
+                'piotroski_filter_followup': piotroski_filter_followup,
+                'piotroski_filter_followup_error': piotroski_filter_followup_error,
                 'terminal_outcomes': {
                     'no_data': len(terminal_symbols_by_status.get(CAPTURE_STATUS_NO_DATA, set())),
                     'mapping_failed': len(terminal_symbols_by_status.get(CAPTURE_STATUS_MAPPING_FAILED, set())),
@@ -1829,6 +1852,8 @@ class DartFundamentalsCaptureService:
                     ),
                 },
                 'operator_buckets': operator_buckets,
+                'piotroski_filter': piotroski_filter_followup,
+                'piotroski_filter_error': piotroski_filter_followup_error,
                 'feedback_followup': feedback_followup,
                 'feedback_followup_error': feedback_followup_error,
             }

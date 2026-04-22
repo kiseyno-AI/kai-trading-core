@@ -190,7 +190,7 @@
 - Fundamentals capture treats `pending` and `failed` disclosure events as retryable. DART financial-statement `[013]` responses are persisted as terminal `no_data`, and filing/request inference problems are persisted as terminal `mapping_failed`, so normal daily retries do not re-hammer those events.
 - For operator-driven continuation batches, prefer `python3.11 -m app.dart.backfill_current_universe ...` or a quoted `curl` URL. Unquoted shell query strings can turn `?` and `&` into zsh parsing issues before the request reaches the API.
 - For unattended full-universe continuation, use `python3.11 -m app.dart.backfill_current_universe_runner ...`; it is the repo-owned long-run path with per-batch log-file progress and failure offsets.
-- Daily incremental fundamentals refresh is the EOD-style steady-state operator path. It reads each selected active symbol's latest resolved DART fundamentals receipt date, syncs only that symbol's newer DART financial-report disclosure window, captures only stale or missing symbols' exact pending/failed event IDs, and records a high-level `dart_fundamentals_refresh_runs` row for inspection. Candidate capture events are ordered by fewest attempts and oldest receipt date first so limited runs drain retryable backlog predictably.
+- Daily incremental fundamentals refresh is the EOD-style steady-state operator path. It reads each selected active symbol's latest resolved DART fundamentals receipt date, syncs only that symbol's newer DART financial-report disclosure window, captures only stale or missing symbols' exact pending/failed event IDs, records a high-level `dart_fundamentals_refresh_runs` row for inspection, and then rebuilds persisted `daily_piotroski_filter_results` for that market date so both passed and not-passed symbols are stored.
 - Daily refresh and backfill responses include `operator_buckets` for lookup/mapping errors, retryable capture failures, terminal no-data events, terminal mapping failures, and remaining retryable events. `GET /disclosures/dart/fundamentals/capture/inspect?capture_status=no_data` can be used to inspect terminal no-data events directly.
 
 ## Next routes
@@ -199,4 +199,4 @@
 - KIS balance inquiry
 - KIS account positions
 
-- Automatic daily EOD capture can optionally chain into DART fundamentals daily refresh when `EOD_TRIGGER_FUNDAMENTALS_AFTER_CAPTURE=true`, so price -> technical -> action -> fundamentals -> agent feedback can run as one daily cycle.
+- Automatic daily EOD capture can optionally chain into DART fundamentals daily refresh when `EOD_TRIGGER_FUNDAMENTALS_AFTER_CAPTURE=true`, so price -> technical -> action -> fundamentals -> piotroski filter -> agent feedback can run as one daily cycle.

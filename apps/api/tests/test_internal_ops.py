@@ -144,6 +144,20 @@ class InternalOpsTests(unittest.TestCase):
         self.assertEqual(collect_features.call_args.kwargs['sources'], ['volume-power', 'overtime-volume'])
         self.assertEqual(collect_features.call_args.kwargs['max_pages'], 2)
 
+    def test_collect_daily_piotroski_filter_results_uses_direct_service_call(self) -> None:
+        with (
+            patch('app.internal.ops.bootstrap_runtime') as bootstrap_runtime,
+            patch(
+                'app.internal.ops.daily_piotroski_filter_service.collect_and_persist_for_market_date',
+                return_value={'symbols_evaluated': 2},
+            ) as collect_filter,
+        ):
+            result = ops.collect_daily_piotroski_filter_results(market_date='2026-04-14')
+
+        bootstrap_runtime.assert_called_once_with()
+        self.assertEqual(result, {'symbols_evaluated': 2})
+        self.assertEqual(collect_filter.call_args.kwargs['market_date'], '2026-04-14')
+
     def test_cli_quotes_tracked_outputs_json(self) -> None:
         stdout = io.StringIO()
         with (

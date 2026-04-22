@@ -28,6 +28,7 @@ from app.market_data_store import (
     persist_market_status_snapshot,
 )
 from app.quotes.service import QuoteService
+from app.signals.piotroski_filter import daily_piotroski_filter_service
 from app.scanner.state import scanner_state
 from app.signals.daily_signal_features import daily_signal_feature_service
 
@@ -147,6 +148,16 @@ def collect_kis_daily_signal_features(
             overtime_volume_rank_sort_cls_code=overtime_volume_rank_sort_cls_code,
             overtime_fluctuation_div_cls_code=overtime_fluctuation_div_cls_code,
         )
+    )
+
+
+def collect_daily_piotroski_filter_results(
+    *,
+    market_date: str | None = None,
+) -> dict[str, Any]:
+    bootstrap_runtime()
+    return daily_piotroski_filter_service.collect_and_persist_for_market_date(
+        market_date=market_date or get_market_state().server_time[:10],
     )
 
 
@@ -314,6 +325,12 @@ def _build_parser() -> argparse.ArgumentParser:
     signal_features_parser.add_argument('--overtime-volume-rank-sort-cls-code', default='2')
     signal_features_parser.add_argument('--overtime-fluctuation-div-cls-code', default='2')
 
+    piotroski_filter_parser = subparsers.add_parser(
+        'eod-piotroski-filter-collect',
+        help='Compute and persist daily Piotroski filter results directly',
+    )
+    piotroski_filter_parser.add_argument('--market-date')
+
     technical_parser = subparsers.add_parser('eod-technical-snapshots-compute', help='Compute technical snapshots directly')
     technical_parser.add_argument('--market-date', required=True)
     technical_parser.add_argument('--symbols')
@@ -410,6 +427,8 @@ def main(argv: Iterable[str] | None = None) -> int:
             overtime_volume_rank_sort_cls_code=args.overtime_volume_rank_sort_cls_code,
             overtime_fluctuation_div_cls_code=args.overtime_fluctuation_div_cls_code,
         )
+    elif args.command == 'eod-piotroski-filter-collect':
+        payload = collect_daily_piotroski_filter_results(market_date=args.market_date)
     elif args.command == 'eod-technical-snapshots-compute':
         payload = compute_technical_snapshots(market_date=args.market_date, symbols=args.symbols)
     elif args.command == 'eod-action-summaries-compute':
