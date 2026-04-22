@@ -112,6 +112,16 @@ class FakeCaptureService:
             'symbols_checked': kwargs['symbol_limit'],
             'symbols_stale': 1,
             'events_captured': 1,
+            'piotroski_filter': {
+                'market_date': kwargs['market_date'].isoformat(),
+                'symbols_evaluated': kwargs['symbol_limit'],
+                'symbols_passed': 1,
+                'symbols_not_passed': max(kwargs['symbol_limit'] - 1, 0),
+                'results_persisted': kwargs['symbol_limit'],
+                'results_failed': 0,
+                'failed_symbols': [],
+            },
+            'piotroski_filter_error': None,
         }
 
     def inspect_capture_status(self, **kwargs):
@@ -449,6 +459,8 @@ class DartRouteTests(unittest.TestCase):
         self.assertTrue(response.json()['triggered'])
         self.assertEqual(response.json()['run_id'], 15)
         self.assertEqual(response.json()['symbols_stale'], 1)
+        self.assertEqual(response.json()['piotroski_filter']['symbols_evaluated'], 5)
+        self.assertIsNone(response.json()['piotroski_filter_error'])
 
     def test_daily_incremental_refresh_inspect_route_returns_runs(self):
         original_service = routes_dart.dart_fundamentals_capture_service

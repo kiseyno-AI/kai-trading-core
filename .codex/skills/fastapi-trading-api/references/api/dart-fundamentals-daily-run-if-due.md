@@ -1,7 +1,7 @@
 # POST /disclosures/dart/fundamentals/daily/run-if-due
 
 ## Summary
-Runs the daily incremental DART fundamentals refresh for the requested market date, and can continue retryable capture events for multiple in-run cycles. When `retry_cycles` is omitted, the service uses the configured daily automatic retry count.
+Runs the daily incremental DART fundamentals refresh for the requested market date, and can continue retryable capture events for multiple in-run cycles. When `retry_cycles` is omitted, the service uses the configured daily automatic retry count. A successful run also rebuilds persisted daily Piotroski filter rows for the same market date and returns that follow-up summary.
 
 ## Example request
 `POST /disclosures/dart/fundamentals/daily/run-if-due?market_date=2026-04-16&capture_limit=500&force=false&fs_div=CFS`
@@ -31,6 +31,17 @@ Runs the daily incremental DART fundamentals refresh for the requested market da
     "retry_cycles_completed": 3,
     "runs": []
   },
+  "piotroski_filter": {
+    "market_date": "2026-04-16",
+    "source": "strategy_piotroski_v1",
+    "symbols_evaluated": 3512,
+    "symbols_passed": 84,
+    "symbols_not_passed": 3428,
+    "results_persisted": 3512,
+    "results_failed": 0,
+    "failed_symbols": []
+  },
+  "piotroski_filter_error": null,
   "partial_reasons": ["remaining_retryable_events"]
 }
 ```

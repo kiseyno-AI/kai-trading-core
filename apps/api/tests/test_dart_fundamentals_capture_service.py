@@ -330,6 +330,23 @@ class FakeCaptureRepository:
 
 
 class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.piotroski_filter_patcher = patch(
+            'app.dart.fundamentals_capture_service.daily_piotroski_filter_service.collect_and_persist_for_market_date',
+            return_value={
+                'market_date': '2026-04-14',
+                'source': 'strategy_piotroski_v1',
+                'symbols_evaluated': 3,
+                'symbols_passed': 1,
+                'symbols_not_passed': 2,
+                'results_persisted': 3,
+                'results_failed': 0,
+                'failed_symbols': [],
+            },
+        )
+        self.mock_piotroski_filter = self.piotroski_filter_patcher.start()
+        self.addCleanup(self.piotroski_filter_patcher.stop)
+
     async def test_capture_recent_fundamentals_persists_snapshots_and_marks_event_status(self):
         client = FakeCaptureClient()
         repository = FakeCaptureRepository()
@@ -564,10 +581,13 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['symbols_fresh'], 1)
         self.assertEqual(result['events_detected'], 2)
         self.assertEqual(result['events_captured'], 2)
+        self.assertEqual(result['piotroski_filter']['symbols_evaluated'], 3)
+        self.assertIsNone(result['piotroski_filter_error'])
         self.assertEqual(repository.successes, [4, 5])
         self.assertEqual([call['start_date'] for call in sync_calls], [date(2015, 1, 1), date(2026, 4, 2)])
         self.assertEqual(repository.candidate_call_kwargs[-1]['event_ids'], [4, 5])
         self.assertEqual(repository.completed_refresh_runs[-1][1]['status'], 'completed')
+        self.mock_piotroski_filter.assert_called_once_with(market_date=date(2026, 4, 14))
 
     async def test_daily_incremental_refresh_retries_failed_event_when_baseline_is_missing(self):
         client = FakeCaptureClient()
@@ -608,6 +628,44 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['events_captured'], 1)
         self.assertEqual(repository.candidate_call_kwargs[-1]['event_ids'], [7])
         self.assertEqual(repository.successes, [7])
+
+    async def test_daily_incremental_refresh_marks_partial_when_piotroski_followup_fails(self):
+        client = FakeCaptureClient()
+        repository = FakeCaptureRepository()
+        repository.symbol_states = {
+            '005930': {
+                'stock_code': '005930',
+                'has_fundamentals': True,
+                'latest_fundamentals_receipt_date': '2026-04-01',
+                'latest_snapshot': {'id': 100},
+            },
+        }
+        service = DartFundamentalsCaptureService(
+            client=client,
+            repository=repository,
+            active_symbol_loader=lambda: [{'symbol': '005930'}],
+        )
+        self.mock_piotroski_filter.side_effect = RuntimeError('piotroski table unavailable')
+
+        with patch(
+            'app.dart.sync_service.dart_disclosure_sync_service.sync_disclosures_for_corporations',
+            return_value={
+                'run_id': 77,
+                'status': 'completed',
+                'financial_report_events': 1,
+            },
+        ):
+            result = await service.run_daily_incremental_refresh(
+                market_date=date(2026, 4, 14),
+                capture_limit=10,
+                fs_div='CFS',
+                trigger='test_daily',
+            )
+
+        self.assertEqual(result['status'], 'partial')
+        self.assertIn('piotroski_filter_followup_failed', result['partial_reasons'])
+        self.assertIsNone(result['piotroski_filter'])
+        self.assertIn('piotroski table unavailable', result['piotroski_filter_error'])
 
     async def test_daily_incremental_refresh_filters_candidates_by_symbol_resolved_baseline(self):
         client = FakeCaptureClient()

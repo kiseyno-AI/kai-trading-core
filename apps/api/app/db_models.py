@@ -287,6 +287,38 @@ class DailySignalFeature(Base, TimestampMixin):
     captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
+class DailyPiotroskiFilterResult(Base, TimestampMixin):
+    __tablename__ = 'daily_piotroski_filter_results'
+    __table_args__ = (
+        UniqueConstraint(
+            'symbol_id',
+            'market_date',
+            name='uq_daily_piotroski_filter_results_symbol_market_date',
+        ),
+        Index('ix_daily_piotroski_filter_results_market_passed', 'market_date', 'passed_filter'),
+        Index('ix_daily_piotroski_filter_results_market_pbr_rank', 'market_date', 'pbr_percentile_rank'),
+        Index('ix_daily_piotroski_filter_results_market_score', 'market_date', 'piotroski_score'),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol_id: Mapped[int] = mapped_column(ForeignKey('symbols.id', ondelete='CASCADE'), nullable=False, index=True)
+    market_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default='strategy_piotroski_v1')
+    pbr: Mapped[float | None] = mapped_column(Numeric(18, 6))
+    pbr_percentile_rank: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    is_low_pbr: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    has_profitability_issue: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    has_capital_impairment: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    has_audit_issue: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    piotroski_score: Mapped[int | None] = mapped_column(Integer, index=True)
+    passes_piotroski_score: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    momentum_percentile_rank: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    is_bottom_momentum: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    passed_filter: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, index=True)
+    filter_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
 class DailyMarketParticipationContext(Base, TimestampMixin):
     __tablename__ = 'daily_market_participation_contexts'
     __table_args__ = (

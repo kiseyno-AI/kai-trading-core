@@ -113,6 +113,7 @@ Internal ops commands from `apps/api`:
 - `python3.11 -m app.internal.ops eod-master-refresh-if-due --force`
 - `python3.11 -m app.internal.ops eod-pykrx-daily-run-if-due --market-date 2026-04-08 --force`
 - `python3.11 -m app.internal.ops eod-trending-ranks-compute --market-date 2026-04-08`
+- `python3.11 -m app.internal.ops eod-piotroski-filter-collect --market-date 2026-04-08`
 - `python3.11 -m app.internal.ops dart-fundamentals-daily-run-if-due --market-date 2026-04-14 --symbol-limit 250 --capture-limit 500`
 - `python3.11 -m app.internal.ops kis-daily-signal-features-collect --market-date 2026-04-14`
 - `python3.11 -m app.internal.ops agent-derived-contexts-backfill-recent`
@@ -180,6 +181,7 @@ Set this up under a long-running process manager (LaunchAgent, systemd, pm2, or 
 - `POST /disclosures/dart/fundamentals/backfill/current-universe` batches over the current active symbol universe, clamps the start boundary to 2015-01-01 or later, syncs only financial report events for that slice, and then captures only that slice's pending/failed fundamentals.
 - DART fundamentals capture statuses are operationally meaningful: `pending` and `failed` are retryable; DART `[013]` financial-statement no-data responses become terminal `no_data`; filing/request inference problems become terminal `mapping_failed`.
 - `POST /disclosures/dart/fundamentals/daily/run-if-due` is the steady-state incremental refresh path: for each selected active symbol it checks the latest resolved fundamentals receipt date, syncs only newer DART financial disclosures for that symbol, captures exact pending/failed event IDs for stale or missing symbols, and skips an already completed market date unless `force=true`. Limited daily runs prefer retryable events with fewer attempts and older receipt dates first.
+- The daily fundamentals refresh path now also computes and upserts `daily_piotroski_filter_results` for the same market date. It stores one row for every evaluated symbol, including both passed and not-passed results, and returns `piotroski_filter` plus `piotroski_filter_error` in the refresh response.
 - `GET /disclosures/dart/fundamentals/daily/inspect` reads persisted `dart_fundamentals_refresh_runs` summaries, including counts, sync run IDs, capture run IDs, and bounded symbol/event samples for operator review.
 - Daily refresh and backfill results include `operator_buckets` so lookup/mapping errors such as `Unknown stock_code`, retryable capture failures, terminal no-data events, and remaining retryable backlog can be reviewed separately.
 - For shell-driven continuation batches, prefer `python3.11 -m app.dart.backfill_current_universe ...` or keep the full `curl` URL quoted. Unquoted `?` / `&` query strings can be eaten by the shell before the API request is sent.
