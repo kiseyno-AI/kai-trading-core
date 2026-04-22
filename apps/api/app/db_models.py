@@ -608,3 +608,48 @@ class DartFundamentalsHighlight(Base, TimestampMixin):
     pre_prior_amount: Mapped[int | None] = mapped_column(BigInteger)
     currency: Mapped[str | None] = mapped_column(String(16))
     ratio_value: Mapped[float | None] = mapped_column(Numeric(18, 4))
+
+
+class DartAuditSignal(Base, TimestampMixin):
+    __tablename__ = 'dart_audit_signals'
+    __table_args__ = (
+        UniqueConstraint('rcept_no', name='uq_dart_audit_signals_rcept_no'),
+        Index('ix_dart_audit_signals_stock_receipt', 'stock_code', 'receipt_date'),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    disclosure_event_id: Mapped[int | None] = mapped_column(ForeignKey('dart_disclosure_events.id', ondelete='SET NULL'), index=True)
+    rcept_no: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    corp_code: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    stock_code: Mapped[str | None] = mapped_column(String(16), index=True)
+    corp_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    receipt_date: Mapped[date | None] = mapped_column(Date, index=True)
+    report_nm: Mapped[str | None] = mapped_column(String(255))
+    opinion_code: Mapped[str | None] = mapped_column(String(32), index=True)
+    opinion_label: Mapped[str | None] = mapped_column(String(64), index=True)
+    has_audit_issue: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, index=True)
+    source_section: Mapped[str | None] = mapped_column(String(255))
+    evidence_text: Mapped[str | None] = mapped_column(Text)
+    payload: Mapped[dict | None] = mapped_column(JSON)
+
+
+class DartDilutionSignal(Base, TimestampMixin):
+    __tablename__ = 'dart_dilution_signals'
+    __table_args__ = (
+        UniqueConstraint('rcept_no', name='uq_dart_dilution_signals_rcept_no'),
+        Index('ix_dart_dilution_signals_stock_receipt', 'stock_code', 'receipt_date'),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    disclosure_event_id: Mapped[int | None] = mapped_column(ForeignKey('dart_disclosure_events.id', ondelete='SET NULL'), index=True)
+    rcept_no: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    corp_code: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    stock_code: Mapped[str | None] = mapped_column(String(16), index=True)
+    corp_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    receipt_date: Mapped[date | None] = mapped_column(Date, index=True)
+    report_nm: Mapped[str | None] = mapped_column(String(255))
+    signal_type: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    has_dilution_signal: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, index=True)
+    security_type: Mapped[str | None] = mapped_column(String(64))
+    reason: Mapped[str | None] = mapped_column(String(255))
+    payload: Mapped[dict | None] = mapped_column(JSON)

@@ -12,6 +12,7 @@ from app.agent_context.retry_service import EXPECTED_ROLES, FeedbackRetryCycleCo
 from app.agent_context.session_cleanup_service import agent_feedback_session_cleanup_service
 from app.core.settings import settings
 from app.dart.fundamentals_capture_service import dart_fundamentals_capture_service
+from app.dart.signals_service import dart_signals_service
 from app.db import init_database
 from app.eod.action_summaries import daily_action_summary_service
 from app.eod.auto_pykrx import auto_pykrx_eod_scheduler
@@ -121,6 +122,11 @@ def run_dart_fundamentals_daily_if_due(
             trigger='internal_ops_cli',
         )
     )
+
+
+def capture_dart_signals(*, rcept_no: str) -> dict[str, Any]:
+    bootstrap_runtime()
+    return asyncio.run(dart_signals_service.capture_signals_for_event(rcept_no=rcept_no))
 
 
 def collect_kis_daily_signal_features(
@@ -292,6 +298,12 @@ def _build_parser() -> argparse.ArgumentParser:
     dart_daily_parser.add_argument('--force', action='store_true')
     dart_daily_parser.add_argument('--fs-div')
 
+    dart_signal_parser = subparsers.add_parser(
+        'dart-signals-capture',
+        help='Capture audit opinion and dilution signals for a DART disclosure event',
+    )
+    dart_signal_parser.add_argument('--rcept-no', required=True)
+
     signal_features_parser = subparsers.add_parser(
         'kis-daily-signal-features-collect',
         help='Collect daily KIS ranking signal features directly',
@@ -388,6 +400,8 @@ def main(argv: Iterable[str] | None = None) -> int:
             force=args.force,
             fs_div=args.fs_div,
         )
+    elif args.command == 'dart-signals-capture':
+        payload = capture_dart_signals(rcept_no=args.rcept_no)
     elif args.command == 'kis-daily-signal-features-collect':
         payload = collect_kis_daily_signal_features(
             market_date=args.market_date,
