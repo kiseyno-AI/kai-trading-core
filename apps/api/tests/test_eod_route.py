@@ -54,7 +54,7 @@ class FakeTechnicalSnapshotService:
         self.compute_args = None
         self.inspect_args = None
 
-    def compute_and_persist_for_market_date(self, **kwargs):
+    def rebuild_for_market_date(self, **kwargs):
         self.compute_args = kwargs
         return {
             'market_date': kwargs['market_date'],
@@ -77,7 +77,7 @@ class FakeActionSummaryService:
         self.compute_args = None
         self.inspect_args = None
 
-    def compute_and_persist_for_market_date(self, **kwargs):
+    def rebuild_for_market_date(self, **kwargs):
         self.compute_args = kwargs
         return {
             'market_date': kwargs['market_date'],
@@ -100,7 +100,7 @@ class FakeSignalFeatureService:
         self.collect_args = None
         self.inspect_args = None
 
-    async def collect_and_persist_for_market_date(self, **kwargs):
+    async def refresh_for_market_date(self, **kwargs):
         self.collect_args = kwargs
         return {
             'market_date': kwargs['market_date'],

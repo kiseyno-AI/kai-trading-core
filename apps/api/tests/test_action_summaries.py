@@ -112,7 +112,7 @@ class DailyActionSummaryServiceTests(unittest.TestCase):
         self.assertEqual(result.confidence_tier, 'low')
         self.assertEqual(result.risk_tier, 'unknown')
 
-    def test_compute_and_persist_ignores_progress_callback_failures(self):
+    def test_rebuild_ignores_progress_callback_failures(self):
         service = DailyActionSummaryService()
         progress_updates: list[dict] = []
 
@@ -127,7 +127,7 @@ class DailyActionSummaryServiceTests(unittest.TestCase):
             ),
             patch('app.eod.action_summaries.upsert_daily_action_summary') as upsert_mock,
         ):
-            result = service.compute_and_persist_for_market_date(
+            result = service.rebuild_for_market_date(
                 market_date='2026-04-29',
                 progress_callback=_failing_progress_callback,
             )

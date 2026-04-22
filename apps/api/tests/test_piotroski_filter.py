@@ -49,7 +49,7 @@ class DailyPiotroskiFilterServiceTests(unittest.TestCase):
             patch.object(service, '_load_inputs', return_value=inputs),
             patch('app.signals.piotroski_filter.upsert_daily_piotroski_filter_result') as upsert,
         ):
-            result = service.collect_and_persist_for_market_date(market_date='2026-04-14')
+            result = service.rebuild_for_market_date(market_date='2026-04-14')
 
         self.assertEqual(result['symbols_evaluated'], 2)
         self.assertEqual(result['symbols_passed'], 1)
@@ -82,7 +82,7 @@ class DailyPiotroskiFilterServiceTests(unittest.TestCase):
                 side_effect=failing_upsert,
             ),
         ):
-            result = service.collect_and_persist_for_market_date(market_date='2026-04-14')
+            result = service.rebuild_for_market_date(market_date='2026-04-14')
 
         self.assertEqual(result['symbols_evaluated'], 2)
         self.assertEqual(result['results_persisted'], 1)

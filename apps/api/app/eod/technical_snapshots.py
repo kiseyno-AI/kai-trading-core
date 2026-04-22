@@ -201,7 +201,7 @@ class DailyTechnicalSnapshotService:
             signal_payload=signal_payload,
         )
 
-    def compute_and_persist_for_market_date(
+    def rebuild_for_market_date(
         self,
         *,
         market_date: str,
@@ -323,7 +323,7 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: Iterable[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
-    result = daily_technical_snapshot_service.compute_and_persist_for_market_date(
+    result = daily_technical_snapshot_service.rebuild_for_market_date(
         market_date=date.fromisoformat(args.market_date).isoformat(),
         symbols=args.symbols,
         source=args.source,

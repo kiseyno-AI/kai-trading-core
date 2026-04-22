@@ -524,7 +524,7 @@ class PykrxBackfillService:
     ) -> dict:
         normalized_start = _normalize_yyyymmdd(start_date)
         normalized_end = _normalize_yyyymmdd(end_date, default=date.today().strftime('%Y%m%d'))
-        return self._run_collection(
+        return self._run_market_data_pipeline(
             start_date=normalized_start,
             end_date=normalized_end,
             markets=markets,
@@ -535,7 +535,7 @@ class PykrxBackfillService:
             mode='historical_backfill',
         )
 
-    def run_daily_collection_if_due(
+    def run_daily_pipeline_if_due(
         self,
         *,
         market_date: str,
@@ -556,7 +556,7 @@ class PykrxBackfillService:
                 'latest_available_trade_date': latest_trade_date,
                 'source': 'pykrx',
             }
-            _log_pykrx_fetch('run_daily_collection_if_due', 'skipped', **result)
+            _log_pykrx_fetch('run_daily_pipeline_if_due', 'skipped', **result)
             return result
 
         with advisory_eod_collection_lock(market='KRX', trade_date=market_date_iso, source='pykrx') as lock_acquired:
@@ -568,7 +568,7 @@ class PykrxBackfillService:
                     'latest_available_trade_date': latest_trade_date,
                     'source': 'pykrx',
                 }
-                _log_pykrx_fetch('run_daily_collection_if_due', 'skipped', **result)
+                _log_pykrx_fetch('run_daily_pipeline_if_due', 'skipped', **result)
                 return result
 
             latest_run = load_latest_eod_collection_run(
@@ -588,7 +588,7 @@ class PykrxBackfillService:
                         'source': 'pykrx',
                         'existing_run': latest_run,
                     }
-                    _log_pykrx_fetch('run_daily_collection_if_due', 'skipped', **result)
+                    _log_pykrx_fetch('run_daily_pipeline_if_due', 'skipped', **result)
                     return result
                 latest_run = load_latest_eod_collection_run(
                     market='KRX',
@@ -604,7 +604,7 @@ class PykrxBackfillService:
                     'source': 'pykrx',
                     'existing_run': latest_run,
                 }
-                _log_pykrx_fetch('run_daily_collection_if_due', 'skipped', **result)
+                _log_pykrx_fetch('run_daily_pipeline_if_due', 'skipped', **result)
                 return result
             symbols_override: list[PykrxSymbol] | None = None
             retry_context: dict | None = None
@@ -620,7 +620,7 @@ class PykrxBackfillService:
                         'source': 'pykrx',
                         'existing_run': latest_run,
                     }
-                    _log_pykrx_fetch('run_daily_collection_if_due', 'skipped', **result)
+                    _log_pykrx_fetch('run_daily_pipeline_if_due', 'skipped', **result)
                     return result
                 if latest_status == 'completed_with_errors' and latest_failed == 0:
                     result = {
@@ -631,7 +631,7 @@ class PykrxBackfillService:
                         'source': 'pykrx',
                         'existing_run': latest_run,
                     }
-                    _log_pykrx_fetch('run_daily_collection_if_due', 'skipped', **result)
+                    _log_pykrx_fetch('run_daily_pipeline_if_due', 'skipped', **result)
                     return result
                 if _is_auto_daily_trigger(trigger) and self._is_retryable_daily_run(latest_run):
                     automatic_run_count = count_eod_collection_runs(
@@ -653,7 +653,7 @@ class PykrxBackfillService:
                                 'max_attempts': MAX_AUTO_PYKRX_DAILY_RUNS_PER_TRADE_DATE,
                             },
                         }
-                        _log_pykrx_fetch('run_daily_collection_if_due', 'skipped', **result)
+                        _log_pykrx_fetch('run_daily_pipeline_if_due', 'skipped', **result)
                         return result
                     symbols_override = self._load_retry_symbols_for_run(latest_run, markets=markets)
                     if not symbols_override:
@@ -669,7 +669,7 @@ class PykrxBackfillService:
                                 'max_attempts': MAX_AUTO_PYKRX_DAILY_RUNS_PER_TRADE_DATE,
                             },
                         }
-                        _log_pykrx_fetch('run_daily_collection_if_due', 'skipped', **result)
+                        _log_pykrx_fetch('run_daily_pipeline_if_due', 'skipped', **result)
                         return result
                     retry_context = {
                         'retry_of_run_id': latest_run.get('id'),
@@ -680,7 +680,7 @@ class PykrxBackfillService:
                         'symbol_count': len(symbols_override),
                     }
 
-            result = self._run_collection(
+            result = self._run_market_data_pipeline(
                 start_date=normalized_market_date,
                 end_date=normalized_market_date,
                 markets=markets,
@@ -692,7 +692,7 @@ class PykrxBackfillService:
             )
             result['triggered'] = True
             _log_pykrx_fetch(
-                'run_daily_collection_if_due',
+                'run_daily_pipeline_if_due',
                 result['status'],
                 **{key: value for key, value in result.items() if key != 'status'},
             )
@@ -808,7 +808,7 @@ class PykrxBackfillService:
             **complete_kwargs,
         )
 
-    def _run_collection(
+    def _run_market_data_pipeline(
         self,
         *,
         start_date: str,
@@ -946,12 +946,28 @@ class PykrxBackfillService:
                 current_period=current_period,
                 extra=extra,
             )
-            update_eod_collection_run_progress(
-                run_id,
-                symbols_succeeded=symbols_succeeded,
-                symbols_failed=symbols_failed,
-                run_metadata=run_metadata,
-            )
+            try:
+                update_eod_collection_run_progress(
+                    run_id,
+                    symbols_succeeded=symbols_succeeded,
+                    symbols_failed=symbols_failed,
+                    run_metadata=run_metadata,
+                )
+            except Exception as exc:
+                logger.warning('pykrx progress update failed for run %s during %s: %s', run_id, stage, exc)
+                _log_pykrx_fetch(
+                    'update_collection_progress',
+                    'failed',
+                    run_id=run_id,
+                    stage=stage,
+                    current_step=current_step,
+                    current_symbol=current_symbol,
+                    current_period=current_period,
+                    symbols_succeeded=symbols_succeeded,
+                    symbols_failed=symbols_failed,
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
+                )
 
         try:
             for index, item in enumerate(symbols):
@@ -1083,7 +1099,7 @@ class PykrxBackfillService:
         price_context_result: dict
         price_context_error_message: str | None = None
         try:
-            price_context_result = daily_price_context_service.compute_and_persist_for_market_date(
+            price_context_result = daily_price_context_service.rebuild_for_market_date(
                 market_date=latest_trade_date,
                 symbols=price_context_symbols,
                 source='pykrx',
@@ -1105,7 +1121,7 @@ class PykrxBackfillService:
         technical_snapshot_result: dict
         snapshot_error_message: str | None = None
         try:
-            technical_snapshot_result = daily_technical_snapshot_service.compute_and_persist_for_market_date(
+            technical_snapshot_result = daily_technical_snapshot_service.rebuild_for_market_date(
                 market_date=latest_trade_date,
                 symbols=[item.symbol for item in symbols],
                 source='pykrx',
@@ -1149,7 +1165,7 @@ class PykrxBackfillService:
         action_summary_result: dict
         action_summary_error_message: str | None = None
         try:
-            action_summary_result = daily_action_summary_service.compute_and_persist_for_market_date(
+            action_summary_result = daily_action_summary_service.rebuild_for_market_date(
                 market_date=latest_trade_date,
                 symbols=[item.symbol for item in symbols],
                 source='pykrx',
@@ -1244,7 +1260,7 @@ class PykrxBackfillService:
                 failed=0,
             )
             signal_feature_result = asyncio.run(
-                daily_signal_feature_service.collect_and_persist_for_market_date(
+                daily_signal_feature_service.refresh_for_market_date(
                     market_date=latest_trade_date,
                 )
             )

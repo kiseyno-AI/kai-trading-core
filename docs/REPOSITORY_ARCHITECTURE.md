@@ -348,9 +348,9 @@ flowchart TD
     PersistRun --> PersistBars["upsert_daily_price_bars() via market_data_store"]
     PersistBars --> Bars["daily_price_bars"]
     PersistRun --> Runs["eod_collection_runs"]
-    Bars --> Tech["daily_technical_snapshot_service.compute_and_persist_for_market_date()"]
+    Bars --> Tech["daily_technical_snapshot_service.rebuild_for_market_date()"]
     Tech --> TechTable["daily_technical_snapshots"]
-    TechTable --> Actions["daily_action_summary_service.compute_and_persist_for_market_date()"]
+    TechTable --> Actions["daily_action_summary_service.rebuild_for_market_date()"]
     Actions --> ActionTable["daily_action_summaries"]
 ```
 

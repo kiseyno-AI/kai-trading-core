@@ -74,7 +74,7 @@ class InternalOpsTests(unittest.TestCase):
     def test_run_pykrx_daily_if_due_uses_direct_service_call(self) -> None:
         with (
             patch('app.internal.ops.bootstrap_runtime') as bootstrap_runtime,
-            patch('app.internal.ops.PYKRX_BACKFILL_SERVICE.run_daily_collection_if_due', return_value={'triggered': True}) as run_daily,
+            patch('app.internal.ops.PYKRX_BACKFILL_SERVICE.run_daily_pipeline_if_due', return_value={'triggered': True}) as run_daily,
         ):
             result = ops.run_pykrx_daily_if_due(market_date='2026-04-08', force=True)
 
@@ -128,7 +128,7 @@ class InternalOpsTests(unittest.TestCase):
         with (
             patch('app.internal.ops.bootstrap_runtime') as bootstrap_runtime,
             patch(
-                'app.internal.ops.daily_signal_feature_service.collect_and_persist_for_market_date',
+                'app.internal.ops.daily_signal_feature_service.refresh_for_market_date',
                 new=AsyncMock(return_value={'features_persisted': 2}),
             ) as collect_features,
         ):
@@ -148,7 +148,7 @@ class InternalOpsTests(unittest.TestCase):
         with (
             patch('app.internal.ops.bootstrap_runtime') as bootstrap_runtime,
             patch(
-                'app.internal.ops.daily_piotroski_filter_service.collect_and_persist_for_market_date',
+                'app.internal.ops.daily_piotroski_filter_service.rebuild_for_market_date',
                 return_value={'symbols_evaluated': 2},
             ) as collect_filter,
         ):

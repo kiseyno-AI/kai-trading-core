@@ -72,7 +72,7 @@ def run_pykrx_daily_if_due(
 ) -> dict[str, Any]:
     bootstrap_runtime()
     parsed_markets = tuple(item.strip().upper() for item in (markets or settings.eod_auto_pykrx_markets).split(',') if item.strip())
-    return PYKRX_BACKFILL_SERVICE.run_daily_collection_if_due(
+    return PYKRX_BACKFILL_SERVICE.run_daily_pipeline_if_due(
         market_date=market_date or get_market_state().server_time[:10],
         markets=parsed_markets or DEFAULT_MARKETS,
         trigger='internal_ops_cli',
@@ -141,7 +141,7 @@ def collect_kis_daily_signal_features(
     bootstrap_runtime()
     parsed_sources = [item.strip() for item in sources.split(',') if item.strip()] if sources else None
     return asyncio.run(
-        daily_signal_feature_service.collect_and_persist_for_market_date(
+        daily_signal_feature_service.refresh_for_market_date(
             market_date=market_date or get_market_state().server_time[:10],
             sources=parsed_sources,
             max_pages=max_pages,
@@ -156,7 +156,7 @@ def collect_daily_piotroski_filter_results(
     market_date: str | None = None,
 ) -> dict[str, Any]:
     bootstrap_runtime()
-    return daily_piotroski_filter_service.collect_and_persist_for_market_date(
+    return daily_piotroski_filter_service.rebuild_for_market_date(
         market_date=market_date or get_market_state().server_time[:10],
     )
 
@@ -174,7 +174,7 @@ def refresh_master_if_due_internal(*, force: bool = False) -> dict[str, Any]:
 def compute_technical_snapshots(*, market_date: str, symbols: str | None = None) -> dict[str, Any]:
     bootstrap_runtime()
     parsed_symbols = [item.strip() for item in symbols.split(',') if item.strip()] if symbols else None
-    return daily_technical_snapshot_service.compute_and_persist_for_market_date(
+    return daily_technical_snapshot_service.rebuild_for_market_date(
         market_date=market_date,
         symbols=parsed_symbols,
         source='internal_ops_cli',
@@ -184,7 +184,7 @@ def compute_technical_snapshots(*, market_date: str, symbols: str | None = None)
 def compute_action_summaries(*, market_date: str, symbols: str | None = None) -> dict[str, Any]:
     bootstrap_runtime()
     parsed_symbols = [item.strip() for item in symbols.split(',') if item.strip()] if symbols else None
-    return daily_action_summary_service.compute_and_persist_for_market_date(
+    return daily_action_summary_service.rebuild_for_market_date(
         market_date=market_date,
         symbols=parsed_symbols,
         source='internal_ops_cli',

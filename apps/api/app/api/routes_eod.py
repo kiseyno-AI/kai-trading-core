@@ -129,7 +129,7 @@ async def run_pykrx_daily_if_due(
     try:
         parsed_markets = tuple(item.strip().upper() for item in (markets or settings.eod_auto_pykrx_markets).split(',') if item.strip())
         return await asyncio.to_thread(
-            PYKRX_BACKFILL_SERVICE.run_daily_collection_if_due,
+            PYKRX_BACKFILL_SERVICE.run_daily_pipeline_if_due,
             market_date=market_date or get_market_state().server_time[:10],
             markets=parsed_markets or DEFAULT_MARKETS,
             trigger='manual_daily_api',
@@ -149,7 +149,7 @@ async def compute_daily_technical_snapshots(
     try:
         parsed_symbols = [item.strip() for item in symbols.split(',') if item.strip()] if symbols else None
         return await asyncio.to_thread(
-            daily_technical_snapshot_service.compute_and_persist_for_market_date,
+            daily_technical_snapshot_service.rebuild_for_market_date,
             market_date=market_date,
             symbols=parsed_symbols,
             source=source,
@@ -188,7 +188,7 @@ async def compute_daily_action_summaries(
     try:
         parsed_symbols = [item.strip() for item in symbols.split(',') if item.strip()] if symbols else None
         return await asyncio.to_thread(
-            daily_action_summary_service.compute_and_persist_for_market_date,
+            daily_action_summary_service.rebuild_for_market_date,
             market_date=market_date,
             symbols=parsed_symbols,
             source=source,
@@ -229,7 +229,7 @@ async def collect_daily_signal_features(
 ) -> dict:
     try:
         parsed_sources = [item.strip() for item in sources.split(',') if item.strip()] if sources else None
-        return await daily_signal_feature_service.collect_and_persist_for_market_date(
+        return await daily_signal_feature_service.refresh_for_market_date(
             market_date=market_date,
             sources=parsed_sources,
             max_pages=max_pages,

@@ -103,7 +103,7 @@ class DailyTechnicalSnapshotServiceTests(unittest.TestCase):
             ),
             patch('app.eod.technical_snapshots.upsert_daily_technical_snapshot') as upsert_mock,
         ):
-            result = service.compute_and_persist_for_market_date(
+            result = service.rebuild_for_market_date(
                 market_date='2026-04-29',
                 progress_callback=_failing_progress_callback,
             )

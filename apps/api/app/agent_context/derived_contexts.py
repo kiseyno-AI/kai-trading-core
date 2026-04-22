@@ -251,7 +251,7 @@ def apply_participation_run_coverage(
 
 
 class DailyPriceContextService:
-    def compute_and_persist_for_market_date(
+    def rebuild_for_market_date(
         self,
         *,
         market_date: str | date,
@@ -313,7 +313,7 @@ class DailyPriceContextService:
 
 
 class DailyMarketParticipationContextService:
-    def compute_and_persist_from_rows(
+    def rebuild_from_rows(
         self,
         *,
         market_date: str | date,
@@ -338,7 +338,7 @@ class DailyMarketParticipationContextService:
             'context_payload': context_payload,
         }
 
-    def compute_and_persist_for_market_date(
+    def rebuild_for_market_date(
         self,
         *,
         market_date: str | date,
@@ -348,7 +348,7 @@ class DailyMarketParticipationContextService:
     ) -> dict[str, Any]:
         normalized_market_date = market_date if isinstance(market_date, date) else date.fromisoformat(market_date)
         rows = load_daily_signal_feature_context_rows(market_date=normalized_market_date)
-        return self.compute_and_persist_from_rows(
+        return self.rebuild_from_rows(
             market_date=normalized_market_date,
             rows=rows,
             market=market,
@@ -410,7 +410,7 @@ class DerivedContextBackfillService:
         skipped_participation_dates: list[dict[str, str]] = []
 
         for market_date in market_dates:
-            price_result = daily_price_context_service.compute_and_persist_for_market_date(
+            price_result = daily_price_context_service.rebuild_for_market_date(
                 market_date=market_date,
                 source=price_context_source,
             )
@@ -420,7 +420,7 @@ class DerivedContextBackfillService:
             participation_rows = load_daily_signal_feature_context_rows(market_date=market_date)
             participation_result: dict[str, Any]
             if participation_rows:
-                participation_result = daily_market_participation_context_service.compute_and_persist_from_rows(
+                participation_result = daily_market_participation_context_service.rebuild_from_rows(
                     market_date=market_date,
                     rows=participation_rows,
                     market=market,

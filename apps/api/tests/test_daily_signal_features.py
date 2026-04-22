@@ -114,17 +114,17 @@ class DailySignalFeatureBuilderTests(unittest.TestCase):
 
 
 class DailySignalFeatureServiceTests(unittest.IsolatedAsyncioTestCase):
-    async def test_collect_and_persist_for_market_date_calls_kis_sources_and_upserts_rows(self):
+    async def test_refresh_for_market_date_calls_kis_sources_and_upserts_rows(self):
         service = DailySignalFeatureService(client=FakeKISRankingClient())
 
         with (
             patch('app.signals.daily_signal_features.upsert_daily_signal_feature') as upsert,
             patch(
-                'app.signals.daily_signal_features.daily_market_participation_context_service.compute_and_persist_for_market_date',
+                'app.signals.daily_signal_features.daily_market_participation_context_service.rebuild_for_market_date',
                 return_value={'captured_symbol_count': 2},
             ) as persist_participation,
         ):
-            result = await service.collect_and_persist_for_market_date(market_date='2026-04-14')
+            result = await service.refresh_for_market_date(market_date='2026-04-14')
 
         self.assertEqual(result['market_date'], '2026-04-14')
         self.assertEqual(result['sources'], [VOLUME_POWER, OVERTIME_VOLUME, OVERTIME_FLUCTUATION])
