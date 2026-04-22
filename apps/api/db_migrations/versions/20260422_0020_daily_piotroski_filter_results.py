@@ -43,21 +43,9 @@ def upgrade() -> None:
     )
     op.create_index('ix_daily_piotroski_filter_results_market_date', 'daily_piotroski_filter_results', ['market_date'])
     op.create_index('ix_daily_piotroski_filter_results_symbol_id', 'daily_piotroski_filter_results', ['symbol_id'])
-    op.create_index(
-        'ix_daily_piotroski_filter_results_market_passed',
-        'daily_piotroski_filter_results',
-        ['market_date', 'passed_filter'],
-    )
-    op.create_index(
-        'ix_daily_piotroski_filter_results_market_pbr_rank',
-        'daily_piotroski_filter_results',
-        ['market_date', 'pbr_percentile_rank'],
-    )
-    op.create_index(
-        'ix_daily_piotroski_filter_results_market_score',
-        'daily_piotroski_filter_results',
-        ['market_date', 'piotroski_score'],
-    )
+    op.create_index('ix_daily_piotroski_filter_results_market_passed', 'daily_piotroski_filter_results', ['market_date', 'passed_filter'])
+    op.create_index('ix_daily_piotroski_filter_results_market_pbr_rank', 'daily_piotroski_filter_results', ['market_date', 'pbr_percentile_rank'])
+    op.create_index('ix_daily_piotroski_filter_results_market_score', 'daily_piotroski_filter_results', ['market_date', 'piotroski_score'])
 
 
 def downgrade() -> None:
