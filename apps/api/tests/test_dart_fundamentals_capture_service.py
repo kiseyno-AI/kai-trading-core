@@ -474,6 +474,29 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['summary']['financial_event_capture_status_counts']['captured'], 1)
         self.assertEqual(result['events'][0]['fundamentals_capture_status'], 'failed')
 
+    async def test_inspect_daily_refresh_status_fails_stale_runs_before_returning(self):
+        repository = FakeCaptureRepository()
+        repository.latest_refresh_run = {
+            'id': 144,
+            'market_date': '2026-04-14',
+            'status': 'failed',
+            'error_message': 'Marked failed after exceeding the stale running threshold before a daily refresh status read',
+        }
+        service = DartFundamentalsCaptureService(
+            client=FakeCaptureClient(),
+            repository=repository,
+        )
+
+        with patch.object(repository, 'fail_stale_refresh_runs', return_value=[144]) as fail_stale_refresh_runs:
+            result = service.inspect_daily_refresh_status(
+                market_date=date(2026, 4, 14),
+                fs_div='CFS',
+            )
+
+        fail_stale_refresh_runs.assert_called_once()
+        self.assertEqual(result['latest_run']['id'], 144)
+        self.assertEqual(result['latest_run']['status'], 'failed')
+
     async def test_backfill_current_universe_uses_2015_floor_and_selected_active_symbols(self):
         client = FakeCaptureClient()
         repository = FakeCaptureRepository()

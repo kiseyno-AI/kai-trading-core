@@ -222,6 +222,118 @@ class PykrxBackfillServiceTests(TestCase):
         )
         run_collection.assert_called_once()
 
+    def test_reconcile_latest_daily_run_status_uses_last_progress_heartbeat(self) -> None:
+        service = PykrxBackfillService()
+        stale_started_at = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+        recent_progress_at = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+        running_run = {
+            'id': 18,
+            'status': 'running',
+            'trade_date': '2026-04-03',
+            'symbols_total': 10,
+            'symbols_succeeded': 2,
+            'symbols_failed': 0,
+            'started_at': stale_started_at,
+            'run_metadata': {
+                'stage': 'technical_snapshots',
+                'last_progress_at': recent_progress_at,
+                'stage_progress': {
+                    'technical_snapshots': {
+                        'status': 'running',
+                        'current_step': 'computing_symbol_snapshot',
+                    },
+                },
+            },
+        }
+
+        with patch(
+            'app.eod.pykrx_backfill.load_latest_eod_collection_run',
+            return_value=running_run,
+        ), patch.object(service, '_fail_stale_running_run') as fail_stale_run:
+            result = service.reconcile_latest_daily_run_status(trade_date='2026-04-03')
+
+        self.assertEqual(result, running_run)
+        fail_stale_run.assert_not_called()
+
+    def test_reconcile_latest_daily_run_status_marks_stale_stage_progress_failed(self) -> None:
+        service = PykrxBackfillService()
+        stale_progress_at = (datetime.now(timezone.utc) - timedelta(minutes=45)).isoformat()
+        stale_run = {
+            'id': 19,
+            'status': 'running',
+            'trade_date': '2026-04-03',
+            'symbols_total': 4,
+            'symbols_succeeded': 1,
+            'symbols_failed': 0,
+            'started_at': (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat(),
+            'run_metadata': {
+                'stage': 'technical_snapshots',
+                'markets': ['KOSPI'],
+                'last_progress_at': stale_progress_at,
+                'stage_progress': {
+                    'price_collection': {
+                        'status': 'completed',
+                        'processed': 4,
+                        'total': 4,
+                        'succeeded': 4,
+                        'failed': 0,
+                    },
+                    'technical_snapshots': {
+                        'status': 'running',
+                        'processed': 1,
+                        'total': 4,
+                        'succeeded': 1,
+                        'failed': 0,
+                        'current_step': 'computing_symbol_snapshot',
+                        'current_activity': 'Computing daily technical snapshots for 000660',
+                        'current_symbol': '000660',
+                    },
+                },
+            },
+        }
+        failed_run = {
+            **stale_run,
+            'status': 'failed',
+            'symbols_failed': 3,
+            'error_message': 'Marked stale after 30 minutes without completion.',
+            'run_metadata': {
+                **stale_run['run_metadata'],
+                'stage_progress': {
+                    **stale_run['run_metadata']['stage_progress'],
+                    'technical_snapshots': {
+                        **stale_run['run_metadata']['stage_progress']['technical_snapshots'],
+                        'status': 'failed',
+                        'current_step': 'stale_run_failed',
+                        'current_activity': 'Marked stale after 30 minutes without completion.',
+                    },
+                },
+            },
+        }
+
+        with (
+            patch(
+                'app.eod.pykrx_backfill.load_latest_eod_collection_run',
+                side_effect=[stale_run, failed_run],
+            ),
+            patch('app.eod.pykrx_backfill.count_eod_run_persisted_symbols', return_value=1),
+            patch('app.eod.pykrx_backfill.load_eod_run_persisted_symbols', return_value=['000001']),
+            patch('app.eod.pykrx_backfill.complete_eod_collection_run') as complete_run,
+        ):
+            result = service.reconcile_latest_daily_run_status(trade_date='2026-04-03')
+
+        self.assertEqual(result['status'], 'failed')
+        complete_run.assert_called_once()
+        completed_metadata = complete_run.call_args.kwargs['run_metadata']
+        self.assertEqual(
+            completed_metadata['stage_progress']['technical_snapshots']['status'],
+            'failed',
+        )
+        self.assertEqual(
+            completed_metadata['stage_progress']['technical_snapshots']['current_activity'],
+            'Marked stale after 30 minutes without completion.',
+        )
+        self.assertEqual(completed_metadata['stale_failure_reason'], 'Marked stale after 30 minutes without completion.')
+
     def test_run_market_data_pipeline_continues_when_progress_update_fails(self) -> None:
         service = PykrxBackfillService()
 

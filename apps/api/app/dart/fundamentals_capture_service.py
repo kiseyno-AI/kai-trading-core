@@ -1121,11 +1121,8 @@ class DartFundamentalsCaptureService:
 
         resolved_market_date = _normalize_refresh_date(market_date, default=date.today())
         resolved_fs_div = (fs_div or settings.dart_fundamentals_default_fs_div).strip().upper()
-        stale_refresh_run_ids = self.repository.fail_stale_refresh_runs(
-            stale_before=_utcnow() - timedelta(minutes=self.stale_run_minutes),
-            error_message=(
-                'Marked failed after exceeding the stale running threshold before a new daily refresh started'
-            ),
+        stale_refresh_run_ids = self._fail_stale_refresh_runs(
+            error_message='Marked failed after exceeding the stale running threshold before a new daily refresh started'
         )
         latest_run = self.repository.get_latest_refresh_run(
             market_date=resolved_market_date,
@@ -1979,6 +1976,9 @@ class DartFundamentalsCaptureService:
         market_date: date | None = None,
         fs_div: str | None = None,
     ) -> dict[str, Any]:
+        self._fail_stale_refresh_runs(
+            error_message='Marked failed after exceeding the stale running threshold before a daily refresh status read'
+        )
         resolved_fs_div = fs_div.strip().upper() if fs_div else None
         return {
             'latest_run': self.repository.get_latest_refresh_run(
@@ -1991,6 +1991,12 @@ class DartFundamentalsCaptureService:
                 fs_div=resolved_fs_div,
             ),
         }
+
+    def _fail_stale_refresh_runs(self, *, error_message: str) -> list[int]:
+        return self.repository.fail_stale_refresh_runs(
+            stale_before=_utcnow() - timedelta(minutes=self.stale_run_minutes),
+            error_message=error_message,
+        )
 
 
 dart_fundamentals_capture_service = DartFundamentalsCaptureService()
