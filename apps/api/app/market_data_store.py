@@ -986,8 +986,9 @@ def load_recent_price_bars_by_symbol(
     *,
     market_date: str | date,
     symbols: list[str],
+    history_days: int = 2,
 ) -> dict[str, list[dict]]:
-    if not symbols:
+    if history_days <= 0 or not symbols:
         return {}
 
     normalized_symbols = list(dict.fromkeys(symbols))
@@ -1023,7 +1024,7 @@ def load_recent_price_bars_by_symbol(
         )
         rows = session.execute(
             select(ranked)
-            .where(ranked.c.bar_rank <= 2)
+            .where(ranked.c.bar_rank <= history_days)
             .order_by(ranked.c.symbol.asc(), ranked.c.trade_date.desc())
         ).all()
 
