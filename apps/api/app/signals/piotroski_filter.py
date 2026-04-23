@@ -217,9 +217,6 @@ class DailyPiotroskiFilterService:
             'failed_symbol_errors': failed_symbol_errors,
         }
 
-    def rebuild_for_market_date(self, *, market_date: str | date) -> dict[str, Any]:
-        return self.collect_and_persist_for_market_date(market_date=market_date)
-
     def inspect(
         self,
         *,
