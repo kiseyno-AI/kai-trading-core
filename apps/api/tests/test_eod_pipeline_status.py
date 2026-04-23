@@ -156,3 +156,112 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
             'trigger_after_capture_enabled',
             result['stages']['fundamentals_daily_refresh']['details'],
         )
+
+    def test_read_downgrades_failed_pykrx_stage_when_progress_row_was_left_running(self):
+        pykrx_run = {
+            'id': 202,
+            'market': 'KRX',
+            'trade_date': '2026-04-21',
+            'source': 'pykrx',
+            'trigger': 'manual_daily_api',
+            'status': 'failed',
+            'symbols_total': 3,
+            'symbols_succeeded': 1,
+            'symbols_failed': 2,
+            'error_message': 'Marked stale after 30 minutes without completion.',
+            'started_at': '2026-04-21T09:10:00+00:00',
+            'completed_at': '2026-04-21T10:00:00+00:00',
+            'run_metadata': {
+                'mode': 'daily_auto',
+                'stage': 'technical_snapshots',
+                'stage_progress': {
+                    'price_collection': {
+                        'status': 'completed',
+                        'processed': 3,
+                        'total': 3,
+                        'succeeded': 3,
+                        'failed': 0,
+                    },
+                    'technical_snapshots': {
+                        'status': 'running',
+                        'processed': 1,
+                        'total': 3,
+                        'succeeded': 1,
+                        'failed': 0,
+                        'current_symbol': '000660',
+                        'current_step': 'computing_symbol_snapshot',
+                        'current_activity': 'Computing daily technical snapshots for 000660',
+                    },
+                },
+            },
+        }
+        service = EODPipelineStatusService(
+            market_state_loader=lambda: _FakeMarketState(),
+            pykrx_run_loader=lambda **_: pykrx_run,
+            pykrx_stage_counts_loader=lambda *_: {},
+            live_symbol_count_loader=lambda: 3579,
+            fundamentals_refresh_loader=lambda **_: None,
+        )
+
+        result = service.read()
+
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['stages']['technical_snapshots']['status'], 'failed')
+        self.assertEqual(
+            result['stages']['technical_snapshots']['current_activity'],
+            'Marked stale after 30 minutes without completion.',
+        )
+
+    def test_read_uses_failed_refresh_error_message_instead_of_running_activity(self):
+        fundamentals_run = {
+            'id': 77,
+            'market_date': '2026-04-21',
+            'trigger': 'eod_pykrx_followup',
+            'status': 'failed',
+            'fs_div': 'CFS',
+            'force': False,
+            'symbol_limit': None,
+            'symbol_offset': 0,
+            'symbols_total': 3579,
+            'symbols_checked': 120,
+            'symbols_missing': 10,
+            'symbols_stale': 35,
+            'symbols_fresh': 60,
+            'symbols_refreshed': 15,
+            'symbols_failed': 2,
+            'events_detected': 440,
+            'events_captured': 37,
+            'events_failed': 1,
+            'error_message': 'Marked failed after exceeding the stale running threshold before a daily refresh status read',
+            'started_at': '2026-04-21T09:21:00+00:00',
+            'completed_at': '2026-04-21T10:21:00+00:00',
+            'run_metadata': {
+                'symbols_selected': 200,
+                'stage': 'capturing_fundamentals',
+                'capture_event_count': 75,
+                'retry_cycle': 2,
+                'retry_cycles_requested': 3,
+                'batch_index': 1,
+                'batch_count': 2,
+                'capture_run_id': 700,
+                'capture_run_ids': [699, 700],
+                'sync_runs': [{'run_id': 880}, {'run_id': 881}],
+                'remaining_candidate_events': 403,
+                'last_progress_at': '2026-04-21T09:22:10+00:00',
+            },
+        }
+        service = EODPipelineStatusService(
+            market_state_loader=lambda: _FakeMarketState(),
+            pykrx_run_loader=lambda **_: None,
+            pykrx_stage_counts_loader=lambda *_: {},
+            live_symbol_count_loader=lambda: 3579,
+            fundamentals_refresh_loader=lambda **_: fundamentals_run,
+        )
+
+        result = service.read()
+
+        self.assertEqual(result['stages']['fundamentals_daily_refresh']['status'], 'failed')
+        self.assertEqual(
+            result['stages']['fundamentals_daily_refresh']['current_activity'],
+            'Marked failed after exceeding the stale running threshold before a daily refresh status read',
+        )

@@ -10,7 +10,7 @@ from app.core.settings import settings
 from app.dart.fundamentals_capture_service import dart_fundamentals_capture_service
 from app.db import session_scope
 from app.db_models import EODCollectionRun
-from app.eod.pykrx_backfill import DEFAULT_MARKETS
+from app.eod.pykrx_backfill import DEFAULT_MARKETS, PYKRX_BACKFILL_SERVICE
 from app.market.clock import get_market_state
 from app.market_data_store import DAY_BASED_TRENDING_PERIODS, count_live_symbols, load_eod_run_stage_counts
 
@@ -67,6 +67,8 @@ def _serialize_eod_collection_run(row: EODCollectionRun) -> dict[str, Any]:
 
 
 def _load_latest_pipeline_pykrx_run(*, trade_date: str) -> dict[str, Any] | None:
+    PYKRX_BACKFILL_SERVICE.reconcile_latest_daily_run_status(trade_date=trade_date)
+
     with session_scope() as session:
         rows = [
             _serialize_eod_collection_run(row)
@@ -355,6 +357,8 @@ class EODPipelineStatusService:
         stage_index = PYKRX_STAGE_ORDER.index(stage_name)
         progress_status = _normalize_status(progress.get('status'))
         run_status = str(run.get('status') or '')
+        if progress_status == 'running' and run_status != 'running':
+            progress_status = 'failed' if run_status == 'failed' else None
 
         if stage_name == 'price_collection':
             total = int(progress.get('total') or run.get('symbols_total') or live_symbols_total or 0)
@@ -434,7 +438,10 @@ class EODPipelineStatusService:
             run_metadata.get('current_activity')
             if status == 'running' and current_stage == stage_name
             else progress.get('current_activity')
-        ) or _default_activity(STAGE_LABELS[stage_name], status)
+        )
+        if status == 'failed' and run.get('error_message'):
+            current_activity = str(run.get('error_message'))
+        current_activity = current_activity or _default_activity(STAGE_LABELS[stage_name], status)
         current_symbol = (
             run_metadata.get('current_symbol')
             if status == 'running' and current_stage == stage_name
@@ -533,7 +540,11 @@ class EODPipelineStatusService:
         failed = int(run.get('symbols_failed') or 0)
         status = _normalize_status(str(run.get('status') or '')) or 'pending'
         current_step = str(metadata.get('stage') or '') or None
-        current_activity = _build_fundamentals_activity(metadata, status)
+        current_activity = (
+            str(run.get('error_message'))
+            if status == 'failed' and run.get('error_message')
+            else _build_fundamentals_activity(metadata, status)
+        )
         remaining = max(total - processed, 0) if total else 0
         source_run_ids = {
             'refresh_run_id': run.get('id'),

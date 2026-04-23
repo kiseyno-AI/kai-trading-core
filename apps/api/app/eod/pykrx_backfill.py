@@ -142,6 +142,18 @@ def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _parse_activity_datetime(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
 def _update_run_stage_metadata(
     metadata: dict | None,
     *,
@@ -576,24 +588,10 @@ class PykrxBackfillService:
                 trade_date=market_date_iso,
                 source='pykrx',
             )
-            if latest_run and latest_run['status'] == 'running' and not force:
-                if self._is_stale_running_run(latest_run):
-                    self._fail_stale_running_run(latest_run)
-                else:
-                    result = {
-                        'triggered': False,
-                        'reason': 'already_running',
-                        'market_date': market_date_iso,
-                        'latest_available_trade_date': latest_trade_date,
-                        'source': 'pykrx',
-                        'existing_run': latest_run,
-                    }
-                    _log_pykrx_fetch('run_daily_pipeline_if_due', 'skipped', **result)
-                    return result
-                latest_run = load_latest_eod_collection_run(
-                    market='KRX',
+            if latest_run and not force:
+                latest_run = self.reconcile_latest_daily_run_status(
                     trade_date=market_date_iso,
-                    source='pykrx',
+                    latest_run=latest_run,
                 )
             if latest_run and latest_run['status'] == 'running' and not force:
                 result = {
@@ -698,6 +696,34 @@ class PykrxBackfillService:
             )
             return result
 
+    def reconcile_latest_daily_run_status(
+        self,
+        *,
+        trade_date: str | None = None,
+        latest_run: dict | None = None,
+    ) -> dict | None:
+        resolved_run = latest_run
+        resolved_trade_date = trade_date or (
+            str(latest_run.get('trade_date')) if latest_run is not None and latest_run.get('trade_date') else None
+        )
+        if resolved_trade_date is None:
+            raise ValueError('trade_date is required to reconcile pykrx daily run status')
+
+        if resolved_run is None:
+            resolved_run = load_latest_eod_collection_run(
+                market='KRX',
+                trade_date=resolved_trade_date,
+                source='pykrx',
+            )
+        if resolved_run and resolved_run.get('status') == 'running' and self._is_stale_running_run(resolved_run):
+            self._fail_stale_running_run(resolved_run)
+            resolved_run = load_latest_eod_collection_run(
+                market='KRX',
+                trade_date=resolved_trade_date,
+                source='pykrx',
+            )
+        return resolved_run
+
     def _is_retryable_daily_run(self, run: dict) -> bool:
         status = run.get('status')
         if status not in RETRYABLE_DAILY_STATUSES:
@@ -761,16 +787,71 @@ class PykrxBackfillService:
         updated['failed_symbols_count'] = len(failed_symbol_codes)
         return updated
 
+    def _run_activity_at(self, run: dict) -> datetime | None:
+        metadata = run.get('run_metadata') if isinstance(run.get('run_metadata'), dict) else {}
+        progress_at = metadata.get('last_progress_at')
+        activity_at = _parse_activity_datetime(progress_at)
+        if activity_at is not None:
+            return activity_at
+        return _parse_activity_datetime(run.get('started_at'))
+
     def _is_stale_running_run(self, run: dict) -> bool:
         stale_minutes = settings.eod_auto_pykrx_stale_run_minutes
-        started_at = run.get('started_at')
-        if run.get('status') != 'running' or stale_minutes <= 0 or not started_at:
+        activity_at = self._run_activity_at(run)
+        if run.get('status') != 'running' or stale_minutes <= 0 or activity_at is None:
             return False
-        started = datetime.fromisoformat(started_at)
-        if started.tzinfo is None:
-            started = started.replace(tzinfo=timezone.utc)
-        age = datetime.now(timezone.utc) - started.astimezone(timezone.utc)
+        age = datetime.now(timezone.utc) - activity_at
         return age >= timedelta(minutes=stale_minutes)
+
+    def _mark_stale_running_stage_progress_failed(
+        self,
+        metadata: dict | None,
+        *,
+        error_message: str,
+    ) -> dict:
+        updated = dict(metadata or {})
+        stage_progress = dict(updated.get('stage_progress') or {})
+        now = _utcnow_iso()
+        running_stage: str | None = None
+
+        for stage_name, raw_entry in list(stage_progress.items()):
+            if not isinstance(raw_entry, dict):
+                continue
+            entry = dict(raw_entry)
+            if str(entry.get('status') or '') != 'running':
+                continue
+            running_stage = stage_name
+            entry['status'] = 'failed'
+            entry['current_step'] = 'stale_run_failed'
+            entry['current_activity'] = error_message
+            entry['updated_at'] = now
+            entry['completed_at'] = now
+            stage_progress[stage_name] = entry
+
+        if running_stage is not None:
+            updated['stage_progress'] = stage_progress
+            updated['stage'] = running_stage
+            updated['current_step'] = 'stale_run_failed'
+            updated['current_activity'] = error_message
+            updated['last_progress_at'] = now
+        else:
+            current_stage = str(updated.get('stage') or '').strip()
+            if current_stage:
+                updated = _update_run_stage_metadata(
+                    updated,
+                    stage=current_stage,
+                    status='failed',
+                    current_step='stale_run_failed',
+                    current_activity=error_message,
+                    current_symbol=updated.get('current_symbol'),
+                    current_period=updated.get('current_period'),
+                )
+            else:
+                updated['last_progress_at'] = now
+
+        updated['stale_failure_reason'] = error_message
+        updated['stale_failed_at'] = now
+        return updated
 
     def _fail_stale_running_run(self, run: dict) -> None:
         persisted_symbols = count_eod_run_persisted_symbols(run['id'])
@@ -785,6 +866,7 @@ class PykrxBackfillService:
         error_message = (
             f"Marked stale after {settings.eod_auto_pykrx_stale_run_minutes} minutes without completion."
         )
+        metadata = self._mark_stale_running_stage_progress_failed(metadata, error_message=error_message)
         logger.warning('Marking stale pykrx EOD run %s as failed: %s', run['id'], error_message)
         _log_pykrx_fetch(
             'mark_stale_collection_run',
@@ -796,16 +878,15 @@ class PykrxBackfillService:
             symbols_failed=symbols_failed,
             error_message=error_message,
         )
-        complete_kwargs = {}
         if failed_symbols:
-            complete_kwargs['run_metadata'] = self._run_metadata_with_failed_symbols(metadata, failed_symbols)
+            metadata = self._run_metadata_with_failed_symbols(metadata, failed_symbols)
         complete_eod_collection_run(
             run['id'],
             status='failed',
             symbols_succeeded=symbols_succeeded,
             symbols_failed=symbols_failed,
             error_message=error_message,
-            **complete_kwargs,
+            run_metadata=metadata,
         )
 
     def _run_market_data_pipeline(

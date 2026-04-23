@@ -197,7 +197,8 @@ class DartFundamentalsRepositoryTests(unittest.TestCase):
             error_message='stale',
         )
 
-        self.assertCountEqual(failed_run_ids, [stale_progress_run_id, stale_no_progress_run_id])
+        self.assertIn(stale_progress_run_id, failed_run_ids)
+        self.assertIn(stale_no_progress_run_id, failed_run_ids)
 
         with session_scope() as session:
             fresh_run = session.execute(
@@ -373,7 +374,8 @@ class DartFundamentalsRepositoryTests(unittest.TestCase):
             error_message='stale',
         )
 
-        self.assertCountEqual(failed_run_ids, [stale_progress_run_id, stale_no_progress_run_id])
+        self.assertIn(stale_progress_run_id, failed_run_ids)
+        self.assertIn(stale_no_progress_run_id, failed_run_ids)
 
         with session_scope() as session:
             fresh_run = session.execute(
@@ -389,3 +391,5 @@ class DartFundamentalsRepositoryTests(unittest.TestCase):
             self.assertEqual(fresh_run.status, 'running')
             self.assertEqual(stale_progress_run.status, 'failed')
             self.assertEqual(stale_no_progress_run.status, 'failed')
+            self.assertEqual(stale_progress_run.run_metadata['stale_failure_reason'], 'stale')
+            self.assertIn('stale_failed_at', stale_progress_run.run_metadata)

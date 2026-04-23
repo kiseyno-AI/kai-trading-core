@@ -58,6 +58,17 @@ def _refresh_run_activity_at(row: DartFundamentalsRefreshRun) -> datetime:
     return row.started_at
 
 
+def _with_stale_failure_metadata(
+    run_metadata: dict[str, Any] | None,
+    *,
+    error_message: str,
+) -> dict[str, Any]:
+    updated = dict(run_metadata or {})
+    updated['stale_failure_reason'] = error_message
+    updated['stale_failed_at'] = _utcnow().isoformat()
+    return updated
+
+
 def _serialize_capture_run(row: DartFundamentalsCaptureRun) -> dict[str, Any]:
     return {
         'id': row.id,
@@ -354,6 +365,10 @@ class DartFundamentalsRepository:
                     continue
                 row.status = 'failed'
                 row.error_message = error_message
+                row.run_metadata = _with_stale_failure_metadata(
+                    row.run_metadata,
+                    error_message=error_message,
+                )
                 row.completed_at = _utcnow()
                 failed_run_ids.append(row.id)
             return failed_run_ids
