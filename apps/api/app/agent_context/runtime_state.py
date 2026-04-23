@@ -38,11 +38,14 @@ class RuntimeFeedbackRunState:
     def to_progress_summary(self) -> dict[str, Any]:
         expected_feedback_count = self.logical_expected_feedback_count if self.logical_expected_feedback_count is not None else len(self.requested_symbols) * len(self.requested_roles)
         completed_feedback_count = self.logical_completed_feedback_count if self.logical_completed_feedback_count is not None else len(self.buffered_feedback_rows)
+        total_symbols = self.logical_total_symbols if self.logical_total_symbols is not None else len(self.requested_symbols)
+
         if self.logical_completed_symbols is not None or self.logical_in_progress_symbols is not None or self.logical_pending_symbols is not None:
             completed_symbols = max(0, int(self.logical_completed_symbols or 0))
             in_progress_symbols = max(0, int(self.logical_in_progress_symbols or 0))
             pending_symbols = max(0, int(self.logical_pending_symbols or 0))
-            total_symbols = self.logical_total_symbols if self.logical_total_symbols is not None else completed_symbols + in_progress_symbols + pending_symbols
+            if self.logical_total_symbols is None:
+                total_symbols = completed_symbols + in_progress_symbols + pending_symbols
         else:
             completed_symbols = 0
             in_progress_symbols = 0
@@ -55,9 +58,40 @@ class RuntimeFeedbackRunState:
                     in_progress_symbols += 1
                 else:
                     pending_symbols += 1
-            total_symbols = len(self.requested_symbols)
+
         processed_symbols = completed_symbols + in_progress_symbols
         progress_ratio = (processed_symbols / total_symbols) if total_symbols else 0.0
+
+        role_progress: dict[str, dict[str, Any]] = {}
+        for role in self.requested_roles:
+            completed_for_role = len(self.completed_symbols_by_role.get(role, set()))
+            failed_for_role = len(self.failed_symbols_by_role.get(role, set()))
+            in_flight_symbols = set()
+            for slot in self.in_flight_slots_by_role.get(role, {}).values():
+                for symbol in slot.get('symbols') or []:
+                    if symbol not in self.completed_symbols_by_role.get(role, set()) and symbol not in self.failed_symbols_by_role.get(role, set()):
+                        in_flight_symbols.add(symbol)
+            processed_for_role = min(total_symbols, completed_for_role + len(in_flight_symbols) + failed_for_role)
+            pending_for_role = max(0, total_symbols - processed_for_role)
+            progress_ratio_for_role = (processed_for_role / total_symbols) if total_symbols else 0.0
+            role_status = 'pending'
+            if completed_for_role >= total_symbols and total_symbols > 0:
+                role_status = 'completed'
+            elif processed_for_role > 0 or in_flight_symbols:
+                role_status = 'running'
+            role_progress[role] = {
+                'role': role,
+                'status': role_status,
+                'total_symbols': total_symbols,
+                'processed_symbols': processed_for_role,
+                'completed_symbols': completed_for_role,
+                'in_progress_symbols': len(in_flight_symbols),
+                'pending_symbols': pending_for_role,
+                'failed_items': failed_for_role,
+                'progress_ratio': round(progress_ratio_for_role, 6),
+                'progress_percent': round(progress_ratio_for_role * 100, 2),
+            }
+
         now = datetime.now(timezone.utc)
         elapsed_seconds = max(0, int((now - self.started_at.astimezone(timezone.utc)).total_seconds()))
         seconds_since_last_feedback = None
@@ -104,6 +138,7 @@ class RuntimeFeedbackRunState:
             'estimated_remaining_seconds': estimated_remaining_seconds,
             'estimated_completion_at': estimated_completion_at,
             'eta_confidence': eta_confidence,
+            'role_progress': role_progress,
         }
 
 
