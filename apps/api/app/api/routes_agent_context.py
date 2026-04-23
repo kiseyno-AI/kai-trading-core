@@ -24,6 +24,10 @@ from app.agent_context.retry_service import (
     agent_feedback_retry_service,
 )
 from app.agent_context.status_service import agent_context_status_service
+from app.agent_context.runtime_state import runtime_feedback_state_store
+
+import threading
+import uuid
 
 router = APIRouter(prefix='/agent-context', tags=['agent-context'])
 logger = logging.getLogger(__name__)
@@ -59,11 +63,12 @@ class AgentSymbolFeedbackDispatchRequest(BaseModel):
     model_config = ConfigDict(extra='forbid')
 
     market_date: date
-    symbols: list[str] = Field(..., min_length=1, max_length=20)
+    symbols: list[str] = Field(..., min_length=1, max_length=500)
     roles: list[str] | None = None
     fs_div: str | None = None
     disclosures_limit: int = Field(default=5, ge=0, le=20)
     reuse_existing: bool = True
+    wait_for_completion: bool = True
 
 
 class AgentFeedbackRetryCyclesRequest(BaseModel):
@@ -158,16 +163,72 @@ async def dispatch_agent_feedback(payload: AgentFeedbackDispatchRequest) -> dict
 
 
 @router.post('/feedback/dispatch/symbols')
-async def dispatch_symbol_agent_feedback(payload: AgentSymbolFeedbackDispatchRequest) -> dict:
+async def dispatch_symbol_agent_feedback(
+    payload: AgentSymbolFeedbackDispatchRequest,
+    background_tasks: BackgroundTasks,
+) -> dict:
     try:
-        return agent_feedback_orchestrator.dispatch_for_symbols(
-            market_date=payload.market_date,
-            symbols=payload.symbols,
-            roles=payload.roles,
-            fs_div=payload.fs_div,
-            disclosures_limit=payload.disclosures_limit,
-            reuse_existing=payload.reuse_existing,
-        )
+        if payload.wait_for_completion:
+            return await run_in_threadpool(
+                agent_feedback_orchestrator.dispatch_for_symbols,
+                market_date=payload.market_date,
+                symbols=payload.symbols,
+                roles=payload.roles,
+                fs_div=payload.fs_div,
+                disclosures_limit=payload.disclosures_limit,
+                reuse_existing=payload.reuse_existing,
+            )
+
+        request_run_id = f"symbol-run-{payload.market_date.isoformat()}-{uuid.uuid4().hex[:10]}"
+        requested_roles = list(payload.roles or EXPECTED_ROLES)
+        requested_symbols = list(dict.fromkeys(payload.symbols))
+
+        def _bootstrap_placeholder() -> None:
+            from app.agent_context.runtime_state import RuntimeFeedbackRunState
+            from datetime import datetime, timezone
+
+            state = RuntimeFeedbackRunState(
+                run_id=request_run_id,
+                market_date=payload.market_date,
+                requested_symbols=requested_symbols,
+                requested_roles=requested_roles,
+                role_sequence=requested_roles,
+                parallel_per_role=0,
+                batch_size=max(1, len(requested_symbols)),
+                started_at=datetime.now(timezone.utc),
+                current_role=requested_roles[0] if requested_roles else None,
+            )
+            state.status = 'queued'
+            runtime_feedback_state_store.start_run(state)
+
+        def _run_dispatch() -> None:
+            agent_feedback_orchestrator.dispatch_for_symbols(
+                market_date=payload.market_date,
+                symbols=requested_symbols,
+                roles=requested_roles,
+                fs_div=payload.fs_div,
+                disclosures_limit=payload.disclosures_limit,
+                reuse_existing=payload.reuse_existing,
+            )
+
+        _bootstrap_placeholder()
+        background_tasks.add_task(_run_dispatch)
+        return {
+            'request': {
+                'market_date': payload.market_date.isoformat(),
+                'symbols': requested_symbols,
+                'roles': requested_roles,
+                'fs_div': payload.fs_div,
+                'disclosures_limit': payload.disclosures_limit,
+                'reuse_existing': payload.reuse_existing,
+                'request_run_id': request_run_id,
+                'wait_for_completion': False,
+            },
+            'summary': {
+                'status': 'queued',
+                'queued': len(requested_symbols),
+            },
+        }
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
