@@ -130,6 +130,55 @@ class AgentContextFeedbackServiceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'Either summary or feedback must be provided'):
             service.submit_feedback(market_date='2026-04-14', symbol='005930', summary={}, feedback={})
 
+    def test_submit_feedback_preserves_signal_decider_request_and_response_payloads(self):
+        repository = FakeFeedbackRepository()
+        service = AgentContextFeedbackService(repository=repository)
+
+        result = service.submit_feedback(
+            market_date='2026-04-23',
+            symbol='005930',
+            agent_name='signal-decider',
+            run_id='signal-run-1',
+            summary={
+                'model': 'openclaw/signal-decider',
+                'raw_response': {'id': 'resp-1'},
+            },
+            feedback={
+                'role': 'signal-decider',
+                'next_day_open_action': 'wait',
+                'preferred_action': 'wait',
+                'entry_price_basis': 'next_open',
+                'supporting_evidence': ['Breadth improved into the close.'],
+                'specialist_disagreement': ['Fundamentals were constructive but not decisive.'],
+                'details': {
+                    'decision_support': {
+                        'decision_support_only': True,
+                    }
+                },
+            },
+            context={
+                'symbol_day_context': {'symbol': '005930'},
+                'upstream_summaries': {
+                    'technical': {
+                        'details': {
+                            'support_resistance': {
+                                'support_levels': [80000],
+                            }
+                        }
+                    }
+                },
+            },
+        )
+
+        self.assertEqual(repository.created['agent_name'], 'signal-decider')
+        self.assertEqual(repository.created['summary_payload']['model'], 'openclaw/signal-decider')
+        self.assertEqual(
+            repository.created['context_payload']['upstream_summaries']['technical']['details']['support_resistance']['support_levels'],
+            [80000],
+        )
+        self.assertEqual(repository.created['feedback_payload']['specialist_disagreement'][0], 'Fundamentals were constructive but not decisive.')
+        self.assertTrue(result['accepted'])
+
     def test_bulk_submit_feedback_normalizes_and_uses_bulk_upsert(self):
         repository = FakeFeedbackRepository()
         service = AgentContextFeedbackService(repository=repository)

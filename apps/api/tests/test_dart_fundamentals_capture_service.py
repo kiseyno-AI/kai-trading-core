@@ -786,7 +786,10 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
 
         run_retry_cycles.assert_called_once()
         self.assertEqual(run_retry_cycles.call_args.kwargs['config'].market_date, date(2026, 4, 14))
-        self.assertEqual(run_retry_cycles.call_args.kwargs['config'].roles, ('eod-summarizer', 'technical-summarizer', 'fundamental-summarizer'))
+        self.assertEqual(
+            run_retry_cycles.call_args.kwargs['config'].roles,
+            ('eod-summarizer', 'technical-summarizer', 'fundamental-summarizer', 'signal-decider'),
+        )
         self.assertEqual(result['feedback_followup'], {'completed': True, 'final_pending': 0})
 
     async def test_daily_incremental_refresh_filters_candidates_by_symbol_resolved_baseline(self):

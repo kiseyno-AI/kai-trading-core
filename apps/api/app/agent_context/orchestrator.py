@@ -34,6 +34,7 @@ from app.agent_context.feedback_service import agent_context_feedback_service
 from app.agent_context.runtime_state import RuntimeFeedbackRunState, runtime_feedback_state_store
 from app.agent_context.payload_builder import agent_payload_builder
 from app.agent_context.read_service import agent_context_read_service
+from app.agent_context.roles import SIGNAL_DECIDER_AGENT_NAME, SUMMARIZER_AGENT_NAMES
 from app.agent_context.response_contract import build_contract_prompt_suffix, normalize_agent_response
 from app.agent_context.reuse_service import agent_context_reuse_service
 from app.agent_context.session_cleanup_service import SessionCleanupTarget, agent_feedback_session_cleanup_service
@@ -81,6 +82,9 @@ class AgentDispatchSpec:
     instruction: str
 
 
+UPSTREAM_SUMMARY_ROLES: tuple[str, ...] = SUMMARIZER_AGENT_NAMES
+
+
 DISPATCH_SPECS: tuple[AgentDispatchSpec, ...] = (
     AgentDispatchSpec(
         role='eod-summarizer',
@@ -96,6 +100,15 @@ DISPATCH_SPECS: tuple[AgentDispatchSpec, ...] = (
         role='fundamental-summarizer',
         agent_name='fundamental-summarizer',
         instruction='Summarize the latest fundamentals conservatively, emphasizing business quality, balance-sheet risks, cash-flow traits, anomalies, and data gaps.',
+    ),
+    AgentDispatchSpec(
+        role=SIGNAL_DECIDER_AGENT_NAME,
+        agent_name=SIGNAL_DECIDER_AGENT_NAME,
+        instruction=(
+            'Synthesize the three specialist summaries into conservative next-trading-day decision support only, '
+            'choosing buy, wait, or reject while surfacing evidence, disagreement, invalidation, data-quality warnings, '
+            'and realistic target or stop levels without execution logic, leverage, sizing, or fake precision.'
+        ),
     ),
 )
 
@@ -145,8 +158,54 @@ def _split_requested_symbols_by_piotroski_passed_filter(
     return eligible_symbols, skipped_symbols
 
 
+def _strip_runtime_session_fields(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in item.items()
+        if key not in {'session_slot', 'session_key'}
+    }
+
+
+def _feedback_row_lookup(rows: Sequence[dict[str, Any]]) -> dict[tuple[str, str], dict[str, Any]]:
+    lookup: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in rows:
+        symbol = str(row.get('symbol') or '').strip()
+        agent_name = str(row.get('agent_name') or '').strip()
+        if not symbol or not agent_name:
+            continue
+        lookup[(symbol, agent_name)] = row
+    return lookup
+
+
+def _build_response_storage_payload(
+    *,
+    spec: AgentDispatchSpec,
+    batch_result: dict[str, Any],
+    normalized_feedback: dict[str, Any],
+    collector_mode: str,
+) -> dict[str, Any]:
+    raw_response = batch_result.get('response') if isinstance(batch_result.get('response'), dict) else None
+    model_name = None
+    if raw_response is not None:
+        model_name = raw_response.get('model') or raw_response.get('model_name')
+    return {
+        'attempt': batch_result.get('attempt', 1),
+        'started_at': batch_result.get('started_at'),
+        'completed_at': batch_result.get('completed_at'),
+        'model': model_name or f'openclaw/{spec.agent_name}',
+        'output_text': batch_result.get('output_text'),
+        'raw_response': raw_response,
+        'normalized_feedback': normalized_feedback,
+        'session_ref': batch_result.get('session_ref'),
+        'collector_mode': collector_mode,
+    }
+
+
 def _trim_batch_item_for_prompt(item: dict[str, Any]) -> dict[str, Any]:
     trimmed = json.loads(json.dumps(item, ensure_ascii=False))
+    symbol_day_context = trimmed.get('symbol_day_context')
+    if isinstance(symbol_day_context, dict):
+        trimmed['symbol_day_context'] = _trim_batch_item_for_prompt(symbol_day_context)
     technical_snapshot = trimmed.get('technical_snapshot')
     if isinstance(technical_snapshot, dict):
         technical_snapshot.pop('signal_payload', None)
@@ -319,7 +378,7 @@ class OpenClawAgentClient:
         return (
             f"Role: {spec.role}\n"
             f"Instruction: {spec.instruction}\n"
-            f"{build_contract_prompt_suffix()}\n\n"
+            f"{build_contract_prompt_suffix(role=spec.role)}\n\n"
             f"Payload:\n{json.dumps(payload, ensure_ascii=False)}"
         )
 
@@ -331,14 +390,48 @@ class OpenClawAgentClient:
         batch_items: Sequence[dict[str, Any]],
         request_marker: str,
     ) -> str:
-        example_feedback = {
-            'role': spec.role,
-            'summary': 'brief conservative summary',
-            'confidence': 0.5,
-            'risk_flags': ['example_risk_flag'],
-            'details': {'note': 'brief structured evidence'},
-            'improvement_notes': ['brief note about missing or helpful extra data'],
-        }
+        example_symbol = str(batch_items[0].get('symbol') or '000000') if batch_items else '000000'
+        if spec.role == SIGNAL_DECIDER_AGENT_NAME:
+            example_feedback = {
+                'role': spec.role,
+                'agent_name': spec.agent_name,
+                'symbol': example_symbol,
+                'market_date': market_date.isoformat(),
+                'preferred_action': 'wait',
+                'next_day_open_action': 'wait',
+                'entry_price_basis': 'next_open',
+                'target_price': None,
+                'expected_return_pct': None,
+                'stop_loss_price': None,
+                'suggested_holding_period': '3-10 trading days',
+                'confidence_score_10': 6,
+                'conviction_score_10': 5,
+                'thesis_summary': 'brief conservative decision-support thesis',
+                'supporting_evidence': ['example evidence'],
+                'decision_risks': ['example decision risk'],
+                'invalidation_conditions': ['example invalidation'],
+                'data_quality_warnings': ['example warning'],
+                'specialist_disagreement': ['example disagreement'],
+                'traceability': {
+                    'agent_name': spec.agent_name,
+                    'symbol': example_symbol,
+                    'market_date': market_date.isoformat(),
+                },
+                'summary': 'brief conservative decision-support thesis',
+                'confidence': 0.6,
+                'risk_flags': ['example_warning'],
+                'details': {'decision_support': {'decision_support_only': True}},
+                'improvement_notes': ['example note about missing or helpful extra data'],
+            }
+        else:
+            example_feedback = {
+                'role': spec.role,
+                'summary': 'brief conservative summary',
+                'confidence': 0.5,
+                'risk_flags': ['example_risk_flag'],
+                'details': {'note': 'brief structured evidence'},
+                'improvement_notes': ['brief note about missing or helpful extra data'],
+            }
         prepared_items = [_trim_batch_item_for_prompt(item) for item in batch_items]
         example = {
             'items': [
@@ -356,7 +449,7 @@ class OpenClawAgentClient:
             "Return one aggregated JSON object for the whole batch.\n"
             "Return JSON only with top-level shape {\"items\": [{\"symbol\": \"...\", \"feedback\": {...}}]}.\n"
             "Each symbol must appear exactly once. Do not omit symbols.\n"
-            "For each symbol, feedback must use top-level keys role, summary, confidence, risk_flags, details, improvement_notes.\n"
+            "For each symbol, feedback must include role, summary, confidence, risk_flags, details, improvement_notes, and every additional role-specific field required by the contract.\n"
             "Inside details, do not repeat raw payload facts or echo numeric/source fields already present in the request.\n"
             "Use details only for compact interpretation, relationships, anomalies, conservative takeaways, and missing-context notes that add new value beyond the payload.\n"
             "Prefer derived judgments over restating inputs; if a field is already in the payload, reference its implication instead of copying it.\n"
@@ -366,7 +459,7 @@ class OpenClawAgentClient:
             "Do not prepend labels like [intent:...], do not wrap JSON in tags, and do not add any text before or after the JSON.\n"
             "Do not restate the request, do not describe what you will do, and do not explain the schema. Output the final JSON only.\n"
             "Your final answer must be a raw JSON object only, beginning with { and ending with }.\n"
-            f"{build_contract_prompt_suffix()}\n"
+            f"{build_contract_prompt_suffix(role=spec.role)}\n"
             f"JSON example:\n{json.dumps(example, ensure_ascii=False)}\n\n"
             f"Market date: {market_date.isoformat()}\n"
             f"Assigned batch payload:\n{json.dumps(list(prepared_items), ensure_ascii=False)}"
@@ -383,7 +476,7 @@ class OpenClawAgentClient:
                 "Analyze each assigned symbol directly and return aggregated JSON only.\n"
                 "Each symbol must appear exactly once in {\"items\": [...]} with structured feedback.\n"
                 "No tool_code, no print(json.dumps(...)), no markdown fences, no intent tags, no prose, no request restatement, raw JSON object only.\n"
-                f"{build_contract_prompt_suffix()}\n"
+                f"{build_contract_prompt_suffix(role=spec.role)}\n"
                 f"Market date: {market_date.isoformat()}\n"
                 f"Assigned batch payload:\n{json.dumps(list(prepared_items), ensure_ascii=False)}"
             )
@@ -395,7 +488,7 @@ class OpenClawAgentClient:
             "Analyze the assigned symbol directly and return aggregated JSON only.\n"
             "Return {\"items\": [{\"symbol\": \"...\", \"feedback\": {...}}]} with exactly one item.\n"
             "No tool_code, no print(json.dumps(...)), no markdown fences, no intent tags, no prose, no request restatement, raw JSON object only.\n"
-            f"{build_contract_prompt_suffix()}\n"
+            f"{build_contract_prompt_suffix(role=spec.role)}\n"
             f"Market date: {market_date.isoformat()}\n"
             f"Assigned batch payload:\n{json.dumps([_trim_batch_item_for_prompt(batch_items[0])], ensure_ascii=False)}"
         )
@@ -457,6 +550,9 @@ class OpenClawAgentClient:
                         role=spec.role,
                         output_text=output_text,
                         raw_response=parsed,
+                        market_date=payload.get('market_date') or payload.get('trade_date'),
+                        symbol=str(payload.get('symbol') or '') or None,
+                        agent_name=spec.agent_name,
                     ),
                 }
             except AgentDispatchTerminalError:
@@ -496,7 +592,7 @@ class OpenClawAgentClient:
             "Each assigned symbol must appear exactly once in items.\n"
             "Inside feedback, use top-level keys role, summary, confidence, risk_flags, details, improvement_notes.\n"
             "No markdown fences. No prose before or after JSON.\n"
-            f"{build_contract_prompt_suffix()}\n\n"
+            f"{build_contract_prompt_suffix(role=spec.role)}\n\n"
             f"Market date: {market_date.isoformat()}\n"
             f"Symbol payload:\n{json.dumps(task_payload, ensure_ascii=False)}"
         )
@@ -621,6 +717,9 @@ class OpenClawAgentClient:
                     role=spec.role,
                     output_text=output_text,
                     raw_response=assistant_message or parsed,
+                    market_date=parsed.get('market_date'),
+                    symbol=None,
+                    agent_name=spec.agent_name,
                 )
             return {
                 'done': done,
@@ -770,16 +869,19 @@ class OpenClawAgentClient:
                                 output_text = candidate_text
                                 break
                 if isinstance(decoded, dict) and not isinstance(decoded.get('items'), list):
-                    normalized_feedback = normalize_agent_response(
-                        role=spec.role,
-                        output_text=output_text or json.dumps(decoded, ensure_ascii=False),
-                        raw_response=decoded,
-                    )
                     symbol_items = []
                     for batch_item in batch_items:
                         symbol = str(batch_item.get('symbol') or '').strip()
                         if not symbol:
                             continue
+                        normalized_feedback = normalize_agent_response(
+                            role=spec.role,
+                            output_text=output_text or json.dumps(decoded, ensure_ascii=False),
+                            raw_response=decoded,
+                            market_date=batch_item.get('market_date') or market_date.isoformat(),
+                            symbol=symbol,
+                            agent_name=spec.agent_name,
+                        )
                         symbol_items.append(
                             {
                                 'symbol': symbol,
@@ -831,6 +933,166 @@ class OpenClawAgentClient:
 class AgentFeedbackOrchestrator:
     def __init__(self) -> None:
         self.client: OpenClawAgentClient | None = None
+
+    @staticmethod
+    def _build_upstream_feedback_bundle(
+        *,
+        symbol: str,
+        market_date: date,
+        buffered_lookup: dict[tuple[str, str], dict[str, Any]],
+        upstream_reuse_decisions: dict[str, dict[str, Any]],
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]], list[str]]:
+        upstream_summaries: dict[str, dict[str, Any]] = {}
+        upstream_traceability: dict[str, dict[str, Any]] = {}
+        missing_roles: list[str] = []
+        symbol_decisions = upstream_reuse_decisions.get(symbol, {})
+
+        for role in UPSTREAM_SUMMARY_ROLES:
+            buffered_row = buffered_lookup.get((symbol, role))
+            if buffered_row is not None:
+                feedback_payload = buffered_row.get('feedback') if isinstance(buffered_row.get('feedback'), dict) else None
+                if feedback_payload:
+                    upstream_summaries[role] = feedback_payload
+                    upstream_traceability[role] = {
+                        'agent_name': role,
+                        'run_id': buffered_row.get('run_id'),
+                        'market_date': market_date.isoformat(),
+                        'source': 'current_run_buffer',
+                    }
+                    continue
+
+            decision = symbol_decisions.get(role)
+            if decision is not None and bool(decision.should_dispatch):
+                missing_roles.append(role)
+                continue
+            latest_feedback = decision.latest_feedback if decision is not None else None
+            feedback_payload = latest_feedback.get('feedback_payload') if isinstance(latest_feedback, dict) else None
+            feedback_market_date = latest_feedback.get('market_date') if isinstance(latest_feedback, dict) else None
+            if isinstance(feedback_payload, dict) and feedback_market_date == market_date.isoformat():
+                upstream_summaries[role] = feedback_payload
+                upstream_traceability[role] = {
+                    'agent_name': role,
+                    'run_id': latest_feedback.get('run_id'),
+                    'market_date': feedback_market_date,
+                    'received_at': latest_feedback.get('received_at'),
+                    'feedback_id': latest_feedback.get('id'),
+                    'source': 'persisted_feedback',
+                }
+                continue
+
+            missing_roles.append(role)
+
+        return upstream_summaries, upstream_traceability, missing_roles
+
+    @staticmethod
+    def _build_signal_decider_payload(
+        *,
+        item: dict[str, Any],
+        market_date: date,
+        request_run_id: str,
+        upstream_summaries: dict[str, dict[str, Any]],
+        upstream_traceability: dict[str, dict[str, Any]],
+    ) -> dict[str, Any]:
+        symbol_day_context = jsonable_encoder(_strip_runtime_session_fields(item))
+        requested_at = datetime.now(timezone.utc).isoformat()
+        return {
+            'role': SIGNAL_DECIDER_AGENT_NAME,
+            'agent_name': SIGNAL_DECIDER_AGENT_NAME,
+            'symbol': str(item.get('symbol') or ''),
+            'market_date': market_date.isoformat(),
+            'symbol_day_context': symbol_day_context,
+            'upstream_summaries': jsonable_encoder(upstream_summaries),
+            'upstream_traceability': jsonable_encoder(upstream_traceability),
+            'decision_support_constraints': {
+                'decision_support_only': True,
+                'allow_execution_logic': False,
+                'allow_position_sizing': False,
+                'allow_leverage_guidance': False,
+                'avoid_fake_precision': True,
+            },
+            'orchestration': {
+                'request_run_id': request_run_id,
+                'requested_at': requested_at,
+                'request_model': f'openclaw/{SIGNAL_DECIDER_AGENT_NAME}',
+                'source': 'agent_feedback_orchestrator.dispatch_for_symbols',
+                'mode': 'role_sequential_runtime_buffered',
+                'required_upstream_roles': list(UPSTREAM_SUMMARY_ROLES),
+            },
+        }
+
+    def _prepare_role_dispatch_items(
+        self,
+        *,
+        role: str,
+        market_date: date,
+        request_run_id: str,
+        symbol_context_items: Sequence[dict[str, Any]],
+        reuse_decisions: dict[str, dict[str, Any]],
+        upstream_reuse_decisions: dict[str, dict[str, Any]],
+        all_failures: list[dict[str, Any]],
+        buffer_failure,
+    ) -> list[dict[str, Any]]:
+        buffered_lookup = {}
+        if role == SIGNAL_DECIDER_AGENT_NAME:
+            snapshot = runtime_feedback_state_store.get_run(market_date, run_id=request_run_id) or RuntimeFeedbackRunState(
+                run_id=request_run_id,
+                market_date=market_date,
+                requested_symbols=[],
+                requested_roles=[],
+                role_sequence=[],
+                parallel_per_role=0,
+                batch_size=1,
+                started_at=datetime.now(timezone.utc),
+            )
+            buffered_lookup = _feedback_row_lookup(snapshot.buffered_feedback_rows)
+
+        dispatch_items: list[dict[str, Any]] = []
+        for item in symbol_context_items:
+            symbol = str(item.get('symbol') or '')
+            decision = reuse_decisions.get(symbol, {}).get(role)
+            if decision is not None and not decision.should_dispatch:
+                continue
+            if role != SIGNAL_DECIDER_AGENT_NAME:
+                dispatch_items.append({**item})
+                continue
+
+            upstream_summaries, upstream_traceability, missing_roles = self._build_upstream_feedback_bundle(
+                symbol=symbol,
+                market_date=market_date,
+                buffered_lookup=buffered_lookup,
+                upstream_reuse_decisions=upstream_reuse_decisions,
+            )
+            if missing_roles:
+                error = f"missing_decider_upstream_summaries:{','.join(missing_roles)}"
+                failure = {
+                    'role': role,
+                    'agent_name': role,
+                    'symbol': symbol,
+                    'status': 'failed',
+                    'retryable': True,
+                    'error': error,
+                }
+                all_failures.append(failure)
+                buffer_failure(role, symbol, error, True)
+                _feedback_runtime_log(
+                    'decider_prerequisite_missing',
+                    market_date=market_date.isoformat(),
+                    request_run_id=request_run_id,
+                    role=role,
+                    symbol=symbol,
+                    missing_roles=missing_roles,
+                )
+                continue
+            dispatch_items.append(
+                self._build_signal_decider_payload(
+                    item=item,
+                    market_date=market_date,
+                    request_run_id=request_run_id,
+                    upstream_summaries=upstream_summaries,
+                    upstream_traceability=upstream_traceability,
+                )
+            )
+        return dispatch_items
 
     def _wait_for_subagent_feedback(
         self,
@@ -1092,13 +1354,19 @@ class AgentFeedbackOrchestrator:
                 'items': [],
                 'failures': [],
             }
-        existing_feedback_symbols: set[str] = set()
         reuse_decisions = {}
         if reuse_existing and dispatch_symbols:
             reuse_decisions = agent_context_reuse_service.build_latest_decisions(
                 market_date=normalized_market_date,
                 symbols=dispatch_symbols,
                 roles=[spec.role for spec in specs],
+            )
+        upstream_reuse_decisions = {}
+        if dispatch_symbols and any(spec.role == SIGNAL_DECIDER_AGENT_NAME for spec in specs):
+            upstream_reuse_decisions = agent_context_reuse_service.build_latest_decisions(
+                market_date=normalized_market_date,
+                symbols=dispatch_symbols,
+                roles=UPSTREAM_SUMMARY_ROLES,
             )
         symbols_requiring_context = dispatch_symbols
         if reuse_decisions:
@@ -1230,13 +1498,16 @@ class AgentFeedbackOrchestrator:
         for spec in specs:
             role = spec.role
             state.current_role = role
-            dispatch_items = []
-            for item in symbol_context['items']:
-                symbol = str(item['symbol'])
-                decision = reuse_decisions.get(symbol, {}).get(role)
-                if decision is not None and not decision.should_dispatch:
-                    continue
-                dispatch_items.append({**item})
+            dispatch_items = self._prepare_role_dispatch_items(
+                role=role,
+                market_date=normalized_market_date,
+                request_run_id=request_run_id,
+                symbol_context_items=symbol_context['items'],
+                reuse_decisions=reuse_decisions,
+                upstream_reuse_decisions=upstream_reuse_decisions,
+                all_failures=all_failures,
+                buffer_failure=buffer_failure,
+            )
             indexed_batches = [dispatch_items[i:i + batch_size] for i in range(0, len(dispatch_items), batch_size)]
             queue: list[tuple[int, list[dict[str, Any]]]] = []
             for batch_index, batch in enumerate(indexed_batches):
@@ -1292,8 +1563,8 @@ class AgentFeedbackOrchestrator:
                             }
                             for source_item in batch:
                                 symbol = source_item['symbol']
-                                normalized_feedback = by_symbol.get(symbol, {}).get('feedback')
-                                if not normalized_feedback:
+                                feedback_candidate = by_symbol.get(symbol, {}).get('feedback')
+                                if not feedback_candidate:
                                     failure = {
                                         'role': role,
                                         'agent_name': spec.agent_name,
@@ -1315,13 +1586,20 @@ class AgentFeedbackOrchestrator:
                                         batch_result=batch_result,
                                     )
                                     continue
-                                response_payload = {
-                                    'attempt': batch_result.get('attempt', 1),
-                                    'started_at': batch_result.get('started_at'),
-                                    'completed_at': batch_result.get('completed_at'),
-                                    'normalized_feedback': normalized_feedback,
-                                    'session_ref': batch_result.get('session_ref'),
-                                }
+                                normalized_feedback = normalize_agent_response(
+                                    role=spec.role,
+                                    output_text=json.dumps(feedback_candidate, ensure_ascii=False),
+                                    raw_response=feedback_candidate if isinstance(feedback_candidate, dict) else {'feedback': feedback_candidate},
+                                    market_date=source_item.get('market_date') or normalized_market_date.isoformat(),
+                                    symbol=symbol,
+                                    agent_name=spec.agent_name,
+                                )
+                                response_payload = _build_response_storage_payload(
+                                    spec=spec,
+                                    batch_result=batch_result,
+                                    normalized_feedback=normalized_feedback,
+                                    collector_mode='role_sequential_runtime_buffered',
+                                )
                                 buffer_success(spec.agent_name, symbol, source_item, response_payload)
                                 _feedback_runtime_log(
                                     'buffer_success',
@@ -1476,6 +1754,8 @@ class AgentFeedbackOrchestrator:
             requested_symbols=requested_symbols,
         )
         specs = self._select_specs(roles=roles)
+        if any(spec.role == SIGNAL_DECIDER_AGENT_NAME for spec in specs):
+            raise ValueError('signal-decider is not supported via subagent fanout; use dispatch_for_symbols so upstream summaries are available in-sequence')
         request_run_id = f'subagent-symbol-run-{normalized_market_date.isoformat()}-{uuid.uuid4().hex[:10]}'
         if not dispatch_symbols:
             return {
@@ -1553,8 +1833,8 @@ class AgentFeedbackOrchestrator:
                     }
                     for source_item in batch:
                         symbol = source_item['symbol']
-                        normalized_feedback = by_symbol.get(symbol, {}).get('feedback')
-                        if not normalized_feedback:
+                        feedback_candidate = by_symbol.get(symbol, {}).get('feedback')
+                        if not feedback_candidate:
                             failures.append(
                                 {
                                     'role': spec.role,
@@ -1566,19 +1846,25 @@ class AgentFeedbackOrchestrator:
                                 }
                             )
                             continue
+                        normalized_feedback = normalize_agent_response(
+                            role=spec.role,
+                            output_text=json.dumps(feedback_candidate, ensure_ascii=False),
+                            raw_response=feedback_candidate if isinstance(feedback_candidate, dict) else {'feedback': feedback_candidate},
+                            market_date=source_item.get('market_date') or normalized_market_date.isoformat(),
+                            symbol=symbol,
+                            agent_name=spec.agent_name,
+                        )
                         stored = self._store_feedback(
                             market_date=normalized_market_date,
                             agent_name=spec.agent_name,
                             run_id=request_run_id,
                             payload={'role': spec.role, 'symbol': symbol},
-                            response={
-                                'attempt': batch_result.get('attempt', 1),
-                                'started_at': batch_result.get('started_at'),
-                                'completed_at': batch_result.get('completed_at'),
-                                'normalized_feedback': normalized_feedback,
-                                'session_ref': batch_result.get('session_ref'),
-                                'collector_mode': 'slot_parent_subagent_fanout',
-                            },
+                            response=_build_response_storage_payload(
+                                spec=spec,
+                                batch_result=batch_result,
+                                normalized_feedback=normalized_feedback,
+                                collector_mode='slot_parent_subagent_fanout',
+                            ),
                             context=source_item,
                         )
                         items.append(

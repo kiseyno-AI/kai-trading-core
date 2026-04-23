@@ -90,6 +90,24 @@ class RecordingAgentContextReadService:
         return {'items': [{'symbol': symbol} for symbol in kwargs['symbols']]}
 
 
+class DeciderReadyAgentContextReadService:
+    def get_symbol_day_context(self, **kwargs):
+        return {
+            'items': [
+                {
+                    'symbol': symbol,
+                    'market_date': kwargs['market_date'].isoformat(),
+                    'price_context': {'close_price': 85700},
+                    'technical_snapshot': {'trend_state': 'uptrend'},
+                    'action_summary': {'action_label': 'watch_long'},
+                    'fundamentals': {'latest_snapshot': {'highlights': {'operating_income': {'current_amount': 10}}}},
+                    'recent_disclosures': {'count': 1, 'items': [{'rcept_no': '20260423000001'}]},
+                }
+                for symbol in kwargs['symbols']
+            ]
+        }
+
+
 class RecordingBatchClient:
     def __init__(self):
         self.calls = []
@@ -120,6 +138,99 @@ class RecordingBatchClient:
             'started_at': '2026-04-14T01:00:00+00:00',
             'completed_at': '2026-04-14T01:01:00+00:00',
             'session_ref': {'session_key': kwargs['batch_items'][0]['session_key']},
+        }
+
+
+class SignalDeciderBatchClient:
+    def __init__(self):
+        self.calls = []
+        self.decider_payloads = []
+        self._lock = threading.Lock()
+
+    def dispatch_batch(self, **kwargs):
+        with self._lock:
+            self.calls.append(kwargs)
+        spec = kwargs['spec']
+        batch_items = kwargs['batch_items']
+        if spec.role == 'eod-summarizer':
+            feedback_by_symbol = {
+                item['symbol']: {
+                    'role': spec.role,
+                    'summary': 'Breadth strengthened into the close.',
+                    'confidence': 0.7,
+                    'risk_flags': ['narrow_leadership'],
+                    'details': {'breadth_context': {'market_bias': 'constructive'}},
+                    'improvement_notes': ['Add sector breadth history.'],
+                }
+                for item in batch_items
+            }
+        elif spec.role == 'technical-summarizer':
+            feedback_by_symbol = {
+                item['symbol']: {
+                    'role': spec.role,
+                    'summary': 'Breakout attempt remains intact above support.',
+                    'confidence': 0.68,
+                    'risk_flags': [],
+                    'details': {'support_resistance': {'support_levels': [80000], 'resistance_levels': [91200]}},
+                    'improvement_notes': ['Add premarket gap data.'],
+                }
+                for item in batch_items
+            }
+        elif spec.role == 'fundamental-summarizer':
+            feedback_by_symbol = {
+                item['symbol']: {
+                    'role': spec.role,
+                    'summary': 'Fundamental backdrop is improving but still cyclical.',
+                    'confidence': 0.66,
+                    'risk_flags': [],
+                    'details': {'fundamental_backdrop': {'quality': 'improving'}},
+                    'improvement_notes': ['Add management guidance trend.'],
+                }
+                for item in batch_items
+            }
+        else:
+            self.decider_payloads.extend(batch_items)
+            feedback_by_symbol = {
+                item['symbol']: {
+                    'role': spec.role,
+                    'agent_name': spec.agent_name,
+                    'symbol': item['symbol'],
+                    'market_date': item['market_date'],
+                    'preferred_action': 'buy',
+                    'next_day_open_action': 'buy',
+                    'entry_price_basis': 'next_open',
+                    'target_price': 91200,
+                    'expected_return_pct': 6.4,
+                    'stop_loss_price': 82900,
+                    'suggested_holding_period': '3-10 trading days',
+                    'confidence_score_10': 7,
+                    'conviction_score_10': 6,
+                    'thesis_summary': 'Specialists align on a tactical next-day long setup.',
+                    'supporting_evidence': ['Breadth improved.', 'Support held above 80000.'],
+                    'decision_risks': ['Leadership remains narrow.'],
+                    'invalidation_conditions': ['Gap below 82900 at the next open.'],
+                    'data_quality_warnings': ['Signal-feature coverage was partial.'],
+                    'specialist_disagreement': ['Fundamental view was constructive but not emphatic.'],
+                    'improvement_notes': ['Add premarket gap context.'],
+                }
+                for item in batch_items
+            }
+        return {
+            'decoded': {
+                'items': [
+                    {
+                        'symbol': item['symbol'],
+                        'feedback': feedback_by_symbol[item['symbol']],
+                    }
+                    for item in batch_items
+                ]
+            },
+            'attempt': 1,
+            'started_at': '2026-04-14T01:00:00+00:00',
+            'completed_at': '2026-04-14T01:01:00+00:00',
+            'session_ref': {'session_key': batch_items[0]['session_key']},
+            'response': {'model': f"openclaw/{spec.agent_name}", 'id': f"resp-{spec.role}"},
+            'output_text': '{}',
         }
 
 
@@ -397,6 +508,91 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertEqual(result['request']['symbols'], ['005930'])
         self.assertEqual(result['request']['skipped_symbols'], ['000660'])
         self.assertEqual(result['summary']['skipped'], 1)
+
+    def test_default_symbol_dispatch_builds_signal_decider_payload_from_full_upstream_summaries(self):
+        service = AgentFeedbackOrchestrator()
+        client = SignalDeciderBatchClient()
+        service.client = client
+        feedback_service = FakeFeedbackService()
+        cleanup_service = FakeSessionCleanupService()
+        fake_settings = SimpleNamespace(openclaw_agent_symbol_chunk_size=1, openclaw_agent_parallel_subtasks=2)
+        reuse_service = SimpleNamespace(build_latest_decisions=lambda **kwargs: {})
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            with patch.object(orchestrator_module, 'agent_context_read_service', DeciderReadyAgentContextReadService()):
+                with patch.object(orchestrator_module, 'agent_context_reuse_service', reuse_service):
+                    with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
+                        with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
+                            with patch.object(
+                                orchestrator_module,
+                                'load_daily_piotroski_filter_results',
+                                return_value=_passed_filter_rows('005930'),
+                            ):
+                                result = service.dispatch_for_symbols(
+                                    market_date='2026-04-14',
+                                    symbols=['005930'],
+                                    reuse_existing=False,
+                                )
+
+        self.assertEqual(
+            result['request']['roles'],
+            ['eod-summarizer', 'technical-summarizer', 'fundamental-summarizer', 'signal-decider'],
+        )
+        self.assertEqual(len(client.decider_payloads), 1)
+        decider_payload = client.decider_payloads[0]
+        self.assertEqual(decider_payload['upstream_summaries']['eod-summarizer']['details']['breadth_context']['market_bias'], 'constructive')
+        self.assertEqual(
+            decider_payload['upstream_summaries']['technical-summarizer']['details']['support_resistance']['support_levels'],
+            [80000],
+        )
+        self.assertEqual(
+            decider_payload['upstream_summaries']['fundamental-summarizer']['details']['fundamental_backdrop']['quality'],
+            'improving',
+        )
+        self.assertEqual(decider_payload['orchestration']['request_model'], 'openclaw/signal-decider')
+
+        decider_row = next(item for item in feedback_service.bulk_items if item['agent_name'] == 'signal-decider')
+        self.assertEqual(decider_row['feedback']['next_day_open_action'], 'buy')
+        self.assertEqual(decider_row['feedback']['preferred_action'], 'buy')
+        self.assertEqual(decider_row['summary']['model'], 'openclaw/signal-decider')
+        self.assertIn('raw_response', decider_row['summary'])
+        self.assertEqual(result['summary']['completed'], 4)
+
+    def test_build_upstream_feedback_bundle_does_not_reuse_same_day_persisted_summary_when_role_requires_redispatch(self):
+        upstream_summaries, upstream_traceability, missing_roles = AgentFeedbackOrchestrator._build_upstream_feedback_bundle(
+            symbol='005930',
+            market_date=orchestrator_module.date.fromisoformat('2026-04-14'),
+            buffered_lookup={
+                ('005930', 'eod-summarizer'): {
+                    'feedback': {'role': 'eod-summarizer', 'summary': 'fresh eod'},
+                    'run_id': 'run-1',
+                },
+                ('005930', 'fundamental-summarizer'): {
+                    'feedback': {'role': 'fundamental-summarizer', 'summary': 'fresh fundamental'},
+                    'run_id': 'run-1',
+                },
+            },
+            upstream_reuse_decisions={
+                '005930': {
+                    'technical-summarizer': SimpleNamespace(
+                        should_dispatch=True,
+                        reason='source_updated',
+                        latest_feedback={
+                            'id': 99,
+                            'market_date': '2026-04-14',
+                            'run_id': 'stale-run',
+                            'received_at': '2026-04-14T01:00:00+00:00',
+                            'feedback_payload': {'role': 'technical-summarizer', 'summary': 'stale technical'},
+                        },
+                    )
+                }
+            },
+        )
+
+        self.assertEqual(set(upstream_summaries.keys()), {'eod-summarizer', 'fundamental-summarizer'})
+        self.assertNotIn('technical-summarizer', upstream_summaries)
+        self.assertEqual(missing_roles, ['technical-summarizer'])
+        self.assertEqual(upstream_traceability['eod-summarizer']['source'], 'current_run_buffer')
 
 
 if __name__ == '__main__':
