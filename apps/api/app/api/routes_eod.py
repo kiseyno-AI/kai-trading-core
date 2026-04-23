@@ -15,6 +15,7 @@ from app.eod.state import job_state
 from app.eod.technical_snapshots import daily_technical_snapshot_service
 from app.market.clock import get_market_state
 from app.signals.daily_signal_features import daily_signal_feature_service
+from app.signals.momentum_factor import daily_momentum_factor_service
 from app.signals.piotroski_filter import daily_piotroski_filter_service
 
 router = APIRouter(prefix='/eod', tags=['eod'])
@@ -260,6 +261,44 @@ async def inspect_daily_signal_features(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f'Daily signal feature inspect failed: {exc}') from exc
+
+
+@router.post('/momentum-factors/compute')
+async def compute_daily_momentum_factors(
+    market_date: str,
+    symbols: str | None = None,
+) -> dict:
+    try:
+        parsed_symbols = [item.strip() for item in symbols.split(',') if item.strip()] if symbols else None
+        return await asyncio.to_thread(
+            daily_momentum_factor_service.rebuild_for_market_date,
+            market_date=market_date,
+            symbols=parsed_symbols,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f'Daily momentum factor compute failed: {exc}') from exc
+
+
+@router.get('/momentum-factors')
+async def inspect_daily_momentum_factors(
+    market_date: str,
+    symbols: str | None = None,
+    limit: int = 100,
+) -> dict:
+    try:
+        parsed_symbols = [item.strip() for item in symbols.split(',') if item.strip()] if symbols else None
+        return await asyncio.to_thread(
+            daily_momentum_factor_service.inspect,
+            market_date=market_date,
+            symbols=parsed_symbols,
+            limit=limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'Daily momentum factor inspect failed: {exc}') from exc
 
 
 @router.get('/piotroski-filter-results')

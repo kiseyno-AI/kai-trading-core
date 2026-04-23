@@ -321,6 +321,39 @@ class DailyPiotroskiFilterResult(Base, TimestampMixin):
     captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
+class DailyMomentumFactorResult(Base, TimestampMixin):
+    __tablename__ = 'daily_momentum_factor_results'
+    __table_args__ = (
+        UniqueConstraint(
+            'symbol_id',
+            'market_date',
+            name='uq_daily_momentum_factor_results_symbol_market_date',
+        ),
+        Index('ix_daily_momentum_factor_results_market_rank', 'market_date', 'momentum_rank'),
+        Index('ix_daily_momentum_factor_results_market_percentile', 'market_date', 'momentum_percentile'),
+        Index('ix_daily_momentum_factor_results_market_eligible', 'market_date', 'is_momentum_eligible'),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol_id: Mapped[int] = mapped_column(ForeignKey('symbols.id', ondelete='CASCADE'), nullable=False, index=True)
+    market_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default='daily_price_bars')
+    close_price: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    ma_60: Mapped[float | None] = mapped_column(Numeric(18, 6))
+    ma_120: Mapped[float | None] = mapped_column(Numeric(18, 6))
+    momentum_12_1: Mapped[float | None] = mapped_column(Numeric(18, 6))
+    return_5d: Mapped[float | None] = mapped_column(Numeric(18, 6))
+    has_sufficient_history: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    is_price_above_ma120: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    is_ma60_above_ma120: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    is_recent_overheated: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    momentum_rank: Mapped[int | None] = mapped_column(Integer, index=True)
+    momentum_percentile: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    is_momentum_eligible: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    factor_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
 class DailyMarketParticipationContext(Base, TimestampMixin):
     __tablename__ = 'daily_market_participation_contexts'
     __table_args__ = (

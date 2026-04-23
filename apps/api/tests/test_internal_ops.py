@@ -158,6 +158,24 @@ class InternalOpsTests(unittest.TestCase):
         self.assertEqual(result, {'symbols_evaluated': 2})
         self.assertEqual(collect_filter.call_args.kwargs['market_date'], '2026-04-14')
 
+    def test_compute_momentum_factors_uses_direct_service_call(self) -> None:
+        with (
+            patch('app.internal.ops.bootstrap_runtime') as bootstrap_runtime,
+            patch(
+                'app.internal.ops.daily_momentum_factor_service.rebuild_for_market_date',
+                return_value={'results_persisted': 2},
+            ) as compute_momentum,
+        ):
+            result = ops.compute_momentum_factors(
+                market_date='2026-04-14',
+                symbols='005930,000660',
+            )
+
+        bootstrap_runtime.assert_called_once_with()
+        self.assertEqual(result, {'results_persisted': 2})
+        self.assertEqual(compute_momentum.call_args.kwargs['market_date'], '2026-04-14')
+        self.assertEqual(compute_momentum.call_args.kwargs['symbols'], ['005930', '000660'])
+
     def test_cli_quotes_tracked_outputs_json(self) -> None:
         stdout = io.StringIO()
         with (
