@@ -75,8 +75,13 @@ class RuntimeFeedbackRunState:
             pending_for_role = max(0, total_symbols - processed_for_role)
             progress_ratio_for_role = (processed_for_role / total_symbols) if total_symbols else 0.0
             role_status = 'pending'
-            if completed_for_role >= total_symbols and total_symbols > 0:
-                role_status = 'completed'
+            if pending_for_role == 0 and not in_flight_symbols:
+                if failed_for_role == 0:
+                    role_status = 'completed'
+                elif completed_for_role > 0:
+                    role_status = 'partial'
+                else:
+                    role_status = 'failed'
             elif processed_for_role > 0 or in_flight_symbols:
                 role_status = 'running'
             role_progress[role] = {
