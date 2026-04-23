@@ -66,11 +66,9 @@ def _serialize_eod_collection_run(row: EODCollectionRun) -> dict[str, Any]:
     }
 
 
-def _load_latest_pipeline_pykrx_run(*, trade_date: str) -> dict[str, Any] | None:
-    PYKRX_BACKFILL_SERVICE.reconcile_latest_daily_run_status(trade_date=trade_date)
-
+def _load_pipeline_pykrx_run_rows(*, trade_date: str) -> list[dict[str, Any]]:
     with session_scope() as session:
-        rows = [
+        return [
             _serialize_eod_collection_run(row)
             for row in session.execute(
                 select(EODCollectionRun)
@@ -82,10 +80,12 @@ def _load_latest_pipeline_pykrx_run(*, trade_date: str) -> dict[str, Any] | None
             ).scalars().all()
         ]
 
+
+def _select_pipeline_pykrx_run(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
     if not rows:
         return None
 
-    preferred = next(
+    return next(
         (
             row
             for row in rows
@@ -93,6 +93,17 @@ def _load_latest_pipeline_pykrx_run(*, trade_date: str) -> dict[str, Any] | None
         ),
         rows[0],
     )
+
+
+def _load_latest_pipeline_pykrx_run(*, trade_date: str) -> dict[str, Any] | None:
+    preferred = _select_pipeline_pykrx_run(_load_pipeline_pykrx_run_rows(trade_date=trade_date))
+    if preferred is None:
+        return None
+
+    if preferred.get('status') == 'running':
+        PYKRX_BACKFILL_SERVICE.reconcile_latest_daily_run_status(latest_run=preferred)
+        preferred = _select_pipeline_pykrx_run(_load_pipeline_pykrx_run_rows(trade_date=trade_date))
+
     return preferred
 
 

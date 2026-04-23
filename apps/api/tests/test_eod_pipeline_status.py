@@ -1,6 +1,7 @@
 import unittest
+from unittest.mock import patch
 
-from app.eod.pipeline_status import EODPipelineStatusService
+from app.eod.pipeline_status import EODPipelineStatusService, _load_latest_pipeline_pykrx_run
 
 
 class _FakeMarketState:
@@ -13,6 +14,67 @@ class _FakeMarketState:
 
 
 class EODPipelineStatusServiceTests(unittest.TestCase):
+    def test_load_latest_pipeline_pykrx_run_reconciles_selected_daily_run_instead_of_newer_historical_backfill(self):
+        historical_run = {
+            'id': 900,
+            'market': 'KRX',
+            'trade_date': '2026-04-21',
+            'source': 'pykrx',
+            'trigger': 'manual_backfill_api',
+            'status': 'running',
+            'symbols_total': 100,
+            'symbols_succeeded': 20,
+            'symbols_failed': 0,
+            'error_message': None,
+            'started_at': '2026-04-21T10:00:00+00:00',
+            'completed_at': None,
+            'run_metadata': {
+                'mode': 'historical_backfill',
+            },
+        }
+        daily_running_run = {
+            'id': 901,
+            'market': 'KRX',
+            'trade_date': '2026-04-21',
+            'source': 'pykrx',
+            'trigger': 'auto_close_scheduler',
+            'status': 'running',
+            'symbols_total': 3,
+            'symbols_succeeded': 1,
+            'symbols_failed': 0,
+            'error_message': None,
+            'started_at': '2026-04-21T09:00:00+00:00',
+            'completed_at': None,
+            'run_metadata': {
+                'mode': 'daily_auto',
+                'stage': 'technical_snapshots',
+            },
+        }
+        daily_failed_run = {
+            **daily_running_run,
+            'status': 'failed',
+            'symbols_failed': 2,
+            'error_message': 'Marked stale after 30 minutes without completion.',
+        }
+
+        with (
+            patch(
+                'app.eod.pipeline_status._load_pipeline_pykrx_run_rows',
+                side_effect=[
+                    [historical_run, daily_running_run],
+                    [historical_run, daily_failed_run],
+                ],
+            ),
+            patch(
+                'app.eod.pipeline_status.PYKRX_BACKFILL_SERVICE.reconcile_latest_daily_run_status',
+            ) as reconcile_run,
+        ):
+            result = _load_latest_pipeline_pykrx_run(trade_date='2026-04-21')
+
+        self.assertEqual(result['id'], daily_failed_run['id'])
+        self.assertEqual(result['status'], 'failed')
+        reconcile_run.assert_called_once_with(latest_run=daily_running_run)
+
     def test_read_returns_pending_when_no_runs_exist(self):
         service = EODPipelineStatusService(
             market_state_loader=lambda: _FakeMarketState(),
