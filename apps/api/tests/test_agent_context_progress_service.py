@@ -54,6 +54,13 @@ class FakeProgressSession:
                 id=3,
             ),
             SimpleNamespace(
+                symbol='005930',
+                agent_name='signal-decider',
+                run_id='run-1',
+                received_at=datetime(2026, 4, 14, 1, 4, tzinfo=timezone.utc),
+                id=30,
+            ),
+            SimpleNamespace(
                 symbol='000660',
                 agent_name='eod-summarizer',
                 run_id='run-1',
@@ -120,11 +127,12 @@ class AgentContextProgressServiceTests(unittest.TestCase):
             yield fake_session
 
         with patch('app.agent_context.progress_service.session_scope', fake_session_scope):
-            return AgentContextProgressService().get_feedback_progress(
-                market_date='2026-04-14',
-                symbols=symbols,
-                expected_agents=expected_agents,
-            )
+            with patch('app.agent_context.progress_service.runtime_feedback_state_store.get_run', return_value=None):
+                return AgentContextProgressService().get_feedback_progress(
+                    market_date='2026-04-14',
+                    symbols=symbols,
+                    expected_agents=expected_agents,
+                )
 
     def test_feedback_progress_result_scopes_role_counts_to_requested_symbols(self):
         fake_session = FakeProgressSession()
@@ -148,6 +156,10 @@ class AgentContextProgressServiceTests(unittest.TestCase):
         self.assertEqual(
             result['result']['roles']['fundamental-summarizer'],
             {'requested_count': 2, 'completed_count': 1, 'error_count': 1},
+        )
+        self.assertEqual(
+            result['result']['roles']['signal-decider'],
+            {'requested_count': 2, 'completed_count': 1, 'error_count': 0},
         )
         self.assertEqual(
             set(result['result']['roles']['technical-summarizer'].keys()),
@@ -185,7 +197,7 @@ class AgentContextProgressServiceTests(unittest.TestCase):
         self.assertEqual(summary['first_feedback_at'], '2026-04-14T01:00:00+00:00')
         self.assertEqual(summary['latest_feedback_at'], '2026-04-14T01:05:00+00:00')
         self.assertEqual(summary['elapsed_seconds'], 300)
-        self.assertEqual(summary['completed_feedback_per_minute'], 0.6)
+        self.assertEqual(summary['completed_feedback_per_minute'], 0.8)
         self.assertEqual(summary['completed_symbols_per_minute'], 0.2)
         self.assertEqual(summary['estimated_remaining_seconds'], 0)
         self.assertEqual(summary['estimated_completion_at'], '2026-04-14T01:05:00+00:00')

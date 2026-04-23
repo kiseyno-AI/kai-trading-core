@@ -7,6 +7,7 @@ from typing import Any, Sequence
 from sqlalchemy import func, or_, select
 
 from app.agent_context.feedback_service import _normalize_market_date, _normalize_symbols
+from app.agent_context.roles import DEFAULT_AGENT_NAMES, SIGNAL_DECIDER_AGENT_NAME
 from app.agent_context.status_service import EXPECTED_AGENT_NAMES
 from app.db import session_scope
 from app.db_models import (
@@ -34,9 +35,8 @@ class FeedbackReuseDecision:
 
 
 ROLE_TO_AGENT = {
-    'eod-summarizer': 'eod-summarizer',
-    'technical-summarizer': 'technical-summarizer',
-    'fundamental-summarizer': 'fundamental-summarizer',
+    role: role
+    for role in DEFAULT_AGENT_NAMES
 }
 
 
@@ -274,6 +274,19 @@ class AgentContextReuseService:
                         .where(DailyTechnicalSnapshot.market_date == market_date)
                     ).scalar_one()
                 )
+        elif role == SIGNAL_DECIDER_AGENT_NAME:
+            timestamps.append(
+                session.execute(
+                    select(func.max(AgentContextFeedback.received_at))
+                    .where(AgentContextFeedback.symbol == symbol)
+                    .where(AgentContextFeedback.market_date == market_date)
+                    .where(
+                        AgentContextFeedback.agent_name.in_(
+                            ['eod-summarizer', 'technical-summarizer', 'fundamental-summarizer']
+                        )
+                    )
+                ).scalar_one()
+            )
         valid = [item for item in timestamps if item is not None]
         return max(valid) if valid else None
 

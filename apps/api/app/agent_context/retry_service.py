@@ -8,15 +8,12 @@ from uuid import uuid4
 from app.agent_context.orchestrator import agent_feedback_orchestrator
 from app.agent_context.progress_service import agent_context_progress_service
 from app.agent_context.reuse_service import agent_context_reuse_service
+from app.agent_context.roles import DEFAULT_AGENT_NAMES
 from app.agent_context.runtime_state import RuntimeFeedbackRunState, runtime_feedback_state_store
 from app.core.settings import settings
 from app.market_data_store import load_daily_piotroski_filter_results
 
-EXPECTED_ROLES: tuple[str, ...] = (
-    'eod-summarizer',
-    'technical-summarizer',
-    'fundamental-summarizer',
-)
+EXPECTED_ROLES: tuple[str, ...] = DEFAULT_AGENT_NAMES
 
 
 @dataclass(frozen=True)

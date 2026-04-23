@@ -5,12 +5,13 @@ from typing import Any, Sequence
 
 from sqlalchemy import select
 
+from app.agent_context.roles import DEFAULT_AGENT_NAMES
 from app.agent_context.feedback_service import _normalize_market_date, _normalize_symbols
 from app.db import session_scope
 from app.db_models import AgentContextFeedback
 
 
-EXPECTED_AGENT_NAMES = ('eod-summarizer', 'technical-summarizer', 'fundamental-summarizer')
+EXPECTED_AGENT_NAMES = DEFAULT_AGENT_NAMES
 EXPECTED_AGENT_SET = set(EXPECTED_AGENT_NAMES)
 
 
