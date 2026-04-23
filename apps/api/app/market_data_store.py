@@ -2182,7 +2182,7 @@ def load_daily_piotroski_filter_results(
     market_date: str | date,
     symbols: list[str] | None = None,
     passed_filter: bool | None = None,
-    limit: int = 100,
+    limit: int | None = 100,
 ) -> list[dict]:
     with session_scope() as session:
         stmt = (
@@ -2194,8 +2194,9 @@ def load_daily_piotroski_filter_results(
                 DailyPiotroskiFilterResult.pbr_percentile_rank.asc().nullslast(),
                 Symbol.symbol.asc(),
             )
-            .limit(limit)
         )
+        if limit is not None:
+            stmt = stmt.limit(limit)
         if symbols:
             stmt = stmt.where(Symbol.symbol.in_(symbols))
         if passed_filter is not None:

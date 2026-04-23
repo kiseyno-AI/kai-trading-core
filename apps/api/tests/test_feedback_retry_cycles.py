@@ -1,27 +1,10 @@
 import unittest
-from contextlib import contextmanager
 from datetime import date
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 from app.agent_context.retry_service import AgentFeedbackRetryService, EXPECTED_ROLES
 from scripts import run_feedback_retry_cycles
-
-
-class FakeExecuteResult:
-    def __init__(self, rows):
-        self.rows = rows
-
-    def all(self):
-        return self.rows
-
-
-class FakeSession:
-    def __init__(self, symbols):
-        self.symbols = symbols
-
-    def execute(self, statement):
-        return FakeExecuteResult([SimpleNamespace(symbol=symbol) for symbol in self.symbols])
 
 
 def _decision(*, should_dispatch):
@@ -32,10 +15,6 @@ class FeedbackRetryCycleTests(unittest.TestCase):
     def test_load_incomplete_symbols_keeps_stale_feedback_retryable(self):
         service = AgentFeedbackRetryService()
 
-        @contextmanager
-        def fake_session_scope():
-            yield FakeSession(['005930'])
-
         decisions = {
             '005930': {
                 'eod-summarizer': _decision(should_dispatch=False),
@@ -44,7 +23,10 @@ class FeedbackRetryCycleTests(unittest.TestCase):
             }
         }
 
-        with patch('app.agent_context.retry_service.session_scope', fake_session_scope):
+        with patch(
+            'app.agent_context.retry_service.load_daily_piotroski_filter_results',
+            return_value=[{'symbol': '005930', 'passed_filter': True}],
+        ):
             with patch(
                 'app.agent_context.retry_service.agent_context_reuse_service.build_latest_decisions',
                 return_value=decisions,
@@ -59,10 +41,6 @@ class FeedbackRetryCycleTests(unittest.TestCase):
     def test_load_incomplete_symbols_drops_freshly_complete_symbols(self):
         service = AgentFeedbackRetryService()
 
-        @contextmanager
-        def fake_session_scope():
-            yield FakeSession(['005930'])
-
         decisions = {
             '005930': {
                 role: _decision(should_dispatch=False)
@@ -70,7 +48,10 @@ class FeedbackRetryCycleTests(unittest.TestCase):
             }
         }
 
-        with patch('app.agent_context.retry_service.session_scope', fake_session_scope):
+        with patch(
+            'app.agent_context.retry_service.load_daily_piotroski_filter_results',
+            return_value=[{'symbol': '005930', 'passed_filter': True}],
+        ):
             with patch(
                 'app.agent_context.retry_service.agent_context_reuse_service.build_latest_decisions',
                 return_value=decisions,
@@ -81,6 +62,40 @@ class FeedbackRetryCycleTests(unittest.TestCase):
                 )
 
         self.assertEqual(result, [])
+
+    def test_load_incomplete_symbols_uses_only_passed_piotroski_symbols(self):
+        service = AgentFeedbackRetryService()
+        decisions = {
+            '005930': {
+                role: _decision(should_dispatch=True)
+                for role in EXPECTED_ROLES
+            }
+        }
+
+        with patch(
+            'app.agent_context.retry_service.load_daily_piotroski_filter_results',
+            return_value=[{'symbol': '005930', 'passed_filter': True}],
+        ) as load_results:
+            with patch(
+                'app.agent_context.retry_service.agent_context_reuse_service.build_latest_decisions',
+                return_value=decisions,
+            ) as build_decisions:
+                result = service.load_incomplete_symbols(
+                    market_date=date.fromisoformat('2026-04-16'),
+                    roles=EXPECTED_ROLES,
+                )
+
+        load_results.assert_called_once_with(
+            market_date=date.fromisoformat('2026-04-16'),
+            passed_filter=True,
+            limit=None,
+        )
+        build_decisions.assert_called_once_with(
+            market_date=date.fromisoformat('2026-04-16'),
+            symbols=['005930'],
+            roles=EXPECTED_ROLES,
+        )
+        self.assertEqual(result, ['005930'])
 
     def test_parse_args_uses_env_market_date_default(self):
         with patch.dict('os.environ', {'FEEDBACK_RETRY_MARKET_DATE': '2026-04-16'}, clear=True):
@@ -135,6 +150,7 @@ class FeedbackRetryCycleTests(unittest.TestCase):
             market_date=date.fromisoformat('2026-04-16'),
             symbols=None,
             expected_agents=EXPECTED_ROLES,
+            run_id=ANY,
         )
         self.assertTrue(result['completed'])
         self.assertEqual(result['progress']['summary']['first_feedback_at'], '2026-04-16T01:00:00+00:00')
@@ -175,6 +191,7 @@ class FeedbackRetryCycleTests(unittest.TestCase):
             market_date=date.fromisoformat('2026-04-16'),
             symbols=None,
             expected_agents=('technical-summarizer',),
+            run_id=ANY,
         )
         self.assertEqual(result['progress']['request']['expected_agents'], ['technical-summarizer'])
         self.assertEqual(result['progress']['summary']['expected_feedback_count'], 10)

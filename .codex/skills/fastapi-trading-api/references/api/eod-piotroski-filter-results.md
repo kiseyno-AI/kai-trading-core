@@ -5,6 +5,8 @@ Read persisted daily Piotroski filter results for a required market date.
 
 When `symbol` is omitted, the endpoint returns stored rows for the requested date, optionally capped by `limit`. Rows are ordered with passed names first and then lower `pbr_percentile_rank` values first. When `symbol` is provided, the endpoint returns the single stored result for that symbol and date, or `null` if none exists.
 
+These persisted rows are also the source of truth for symbol-level agent feedback eligibility: only rows with `passed_filter=true` are eligible for daily feedback dispatch and retry on that same `market_date`.
+
 ## Query parameters
 - `market_date` (required): ISO date for the persisted filter snapshot to inspect.
 - `symbol` (optional): six-digit stock code to narrow the result to one symbol.
