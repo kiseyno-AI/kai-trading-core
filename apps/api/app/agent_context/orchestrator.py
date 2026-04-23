@@ -962,6 +962,9 @@ class AgentFeedbackOrchestrator:
                     continue
 
             decision = symbol_decisions.get(role)
+            if decision is not None and bool(decision.should_dispatch):
+                missing_roles.append(role)
+                continue
             latest_feedback = decision.latest_feedback if decision is not None else None
             feedback_payload = latest_feedback.get('feedback_payload') if isinstance(latest_feedback, dict) else None
             feedback_market_date = latest_feedback.get('market_date') if isinstance(latest_feedback, dict) else None

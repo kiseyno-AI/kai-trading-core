@@ -558,6 +558,42 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertIn('raw_response', decider_row['summary'])
         self.assertEqual(result['summary']['completed'], 4)
 
+    def test_build_upstream_feedback_bundle_does_not_reuse_same_day_persisted_summary_when_role_requires_redispatch(self):
+        upstream_summaries, upstream_traceability, missing_roles = AgentFeedbackOrchestrator._build_upstream_feedback_bundle(
+            symbol='005930',
+            market_date=orchestrator_module.date.fromisoformat('2026-04-14'),
+            buffered_lookup={
+                ('005930', 'eod-summarizer'): {
+                    'feedback': {'role': 'eod-summarizer', 'summary': 'fresh eod'},
+                    'run_id': 'run-1',
+                },
+                ('005930', 'fundamental-summarizer'): {
+                    'feedback': {'role': 'fundamental-summarizer', 'summary': 'fresh fundamental'},
+                    'run_id': 'run-1',
+                },
+            },
+            upstream_reuse_decisions={
+                '005930': {
+                    'technical-summarizer': SimpleNamespace(
+                        should_dispatch=True,
+                        reason='source_updated',
+                        latest_feedback={
+                            'id': 99,
+                            'market_date': '2026-04-14',
+                            'run_id': 'stale-run',
+                            'received_at': '2026-04-14T01:00:00+00:00',
+                            'feedback_payload': {'role': 'technical-summarizer', 'summary': 'stale technical'},
+                        },
+                    )
+                }
+            },
+        )
+
+        self.assertEqual(set(upstream_summaries.keys()), {'eod-summarizer', 'fundamental-summarizer'})
+        self.assertNotIn('technical-summarizer', upstream_summaries)
+        self.assertEqual(missing_roles, ['technical-summarizer'])
+        self.assertEqual(upstream_traceability['eod-summarizer']['source'], 'current_run_buffer')
+
 
 if __name__ == '__main__':
     unittest.main()
