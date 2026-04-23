@@ -273,6 +273,30 @@ class PykrxRiskFilterServiceTests(unittest.TestCase):
         self.assertEqual(item['low_liquidity_20d']['reason'], 'missing_market_date_bar')
         self.assertEqual(result['summary']['symbols_missing_market_date_bar'], 1)
 
+    def test_inspect_with_explicit_empty_symbols_returns_empty_result_without_loading(self) -> None:
+        service = PykrxRiskFilterService()
+        market_date = date(2026, 4, 23)
+
+        with (
+            patch('app.signals.pykrx_risk_filters.load_symbols') as load_symbols_mock,
+            patch(
+                'app.signals.pykrx_risk_filters.load_recent_price_bars_by_symbol'
+            ) as load_bars_mock,
+        ):
+            result = service.inspect(market_date=market_date, symbols=[])
+
+        load_symbols_mock.assert_not_called()
+        load_bars_mock.assert_not_called()
+        self.assertEqual(result['market_date'], '2026-04-23')
+        self.assertEqual(result['requested_symbols'], [])
+        self.assertEqual(result['matched_symbols'], [])
+        self.assertEqual(result['missing_symbols'], [])
+        self.assertEqual(result['summary']['requested_symbol_count'], 0)
+        self.assertEqual(result['summary']['matched_symbol_count'], 0)
+        self.assertEqual(result['summary']['trading_halt_like_count'], 0)
+        self.assertEqual(result['summary']['low_liquidity_count'], 0)
+        self.assertEqual(result['items'], [])
+
     def test_get_trading_halt_like_symbols_returns_stably_sorted_items(self) -> None:
         service = PykrxRiskFilterService()
         market_date = date(2026, 4, 23)

@@ -134,6 +134,28 @@ class PykrxRiskFilterService:
         normalized_symbols = _normalize_symbols(symbols)
         resolved_rule = liquidity_rule or LowLiquidityRuleConfig()
         requested_symbols = list(normalized_symbols or [])
+        if normalized_symbols == []:
+            market_date_iso = normalized_market_date.isoformat()
+            return {
+                'market_date': market_date_iso,
+                'source': RISK_FILTER_SOURCE,
+                'market': normalized_market,
+                'requested_symbols': [],
+                'matched_symbols': [],
+                'missing_symbols': [],
+                'liquidity_rule': resolved_rule.to_metadata(),
+                'summary': {
+                    'requested_symbol_count': 0,
+                    'matched_symbol_count': 0,
+                    'symbols_with_market_date_bar': 0,
+                    'symbols_missing_market_date_bar': 0,
+                    'trading_halt_like_count': 0,
+                    'liquidity_eligible_count': 0,
+                    'low_liquidity_count': 0,
+                    'insufficient_history_count': 0,
+                },
+                'items': [],
+            }
 
         universe = load_symbols(
             is_active=None if normalized_symbols else True,
