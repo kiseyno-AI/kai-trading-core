@@ -471,7 +471,7 @@ class PykrxBackfillService:
         symbol: str | None = None,
         limit: int | None = None,
     ) -> list[PykrxSymbol]:
-        rows = load_symbols(is_active=True, markets=list(markets), limit=limit)
+        rows = load_symbols(markets=list(markets), limit=limit)
         items: list[PykrxSymbol] = []
         seen: set[str] = set()
         allowed_markets = {market.upper() for market in markets}
