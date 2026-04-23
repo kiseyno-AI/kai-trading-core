@@ -5,6 +5,7 @@ Reports aggregate progress for the three-role symbol feedback workflow.
 
 The response is now a stable coverage and liveness snapshot:
 - `total_symbols` uses the active symbol set with `daily_price_bars` for the requested market date, optionally narrowed to requested symbols
+- `result.market_date` echoes the requested market date, and `result.roles[role]` reports durable persisted `requested_count`, `completed_count`, and `error_count`
 - `run_status` indicates whether feedback appears to be actively moving, stalled, pending, or completed
 - `latest_feedback_at` and `seconds_since_last_feedback` help operators tell whether a run is still alive
 - `first_feedback_at`, `elapsed_seconds`, rates, and ETA fields are calculated only from feedback rows for the same target symbol universe used by the progress counts
@@ -25,7 +26,28 @@ GET /agent-context/feedback/progress?market_date=2026-04-16
       "eod-summarizer",
       "technical-summarizer",
       "fundamental-summarizer"
-    ]
+    ],
+    "run_id": null
+  },
+  "result": {
+    "market_date": "2026-04-16",
+    "roles": {
+      "eod-summarizer": {
+        "requested_count": 4331,
+        "completed_count": 134,
+        "error_count": 0
+      },
+      "technical-summarizer": {
+        "requested_count": 4331,
+        "completed_count": 134,
+        "error_count": 2
+      },
+      "fundamental-summarizer": {
+        "requested_count": 4331,
+        "completed_count": 134,
+        "error_count": 1
+      }
+    }
   },
   "summary": {
     "run_status": "stalled",

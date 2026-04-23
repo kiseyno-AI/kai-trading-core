@@ -17,7 +17,7 @@ class FakeExecuteResult:
         return self
 
     def all(self):
-        return self._scalars
+        return self._scalars or self._rows
 
     def scalar_one(self):
         return self._scalar
@@ -29,10 +29,9 @@ class FakeExecuteResult:
 class FakeProgressSession:
     def __init__(self):
         self.statements = []
-        self.global_first_feedback_at = datetime(2026, 4, 14, 0, 0, tzinfo=timezone.utc)
         self.filtered_first_feedback_at = datetime(2026, 4, 14, 1, 0, tzinfo=timezone.utc)
         self.filtered_latest_feedback_at = datetime(2026, 4, 14, 1, 5, tzinfo=timezone.utc)
-        self.target_rows = [
+        self.feedback_rows = [
             SimpleNamespace(
                 symbol='005930',
                 agent_name='eod-summarizer',
@@ -54,36 +53,60 @@ class FakeProgressSession:
                 received_at=self.filtered_latest_feedback_at,
                 id=3,
             ),
-        ]
-        self.global_rows = [
             SimpleNamespace(
-                symbol='__MARKET__',
+                symbol='000660',
                 agent_name='eod-summarizer',
-                run_id='market-run',
-                received_at=self.global_first_feedback_at,
-                id=99,
+                run_id='run-1',
+                received_at=datetime(2026, 4, 14, 1, 6, tzinfo=timezone.utc),
+                id=4,
             ),
-            *self.target_rows,
+            SimpleNamespace(
+                symbol='035420',
+                agent_name='technical-summarizer',
+                run_id='other-run',
+                received_at=datetime(2026, 4, 14, 1, 7, tzinfo=timezone.utc),
+                id=5,
+            ),
+        ]
+        self.failure_rows = [
+            SimpleNamespace(
+                symbol='000660',
+                agent_name='technical-summarizer',
+                run_id='run-1',
+                received_at=datetime(2026, 4, 14, 1, 8, tzinfo=timezone.utc),
+                id=10,
+            ),
+            SimpleNamespace(
+                symbol='000660',
+                agent_name='fundamental-summarizer',
+                run_id='run-1',
+                received_at=datetime(2026, 4, 14, 1, 9, tzinfo=timezone.utc),
+                id=11,
+            ),
+            SimpleNamespace(
+                symbol='005930',
+                agent_name='technical-summarizer',
+                run_id='stale-failure',
+                received_at=datetime(2026, 4, 14, 1, 10, tzinfo=timezone.utc),
+                id=12,
+            ),
+            SimpleNamespace(
+                symbol='035420',
+                agent_name='technical-summarizer',
+                run_id='other-run',
+                received_at=datetime(2026, 4, 14, 1, 11, tzinfo=timezone.utc),
+                id=13,
+            ),
         ]
 
     def execute(self, statement):
         self.statements.append(statement)
-        call_index = len(self.statements)
-
-        if call_index == 1:
-            return FakeExecuteResult(scalars=['005930'])
-
-        if call_index == 2:
-            sql = self._compile(statement)
-            scalar = self.filtered_first_feedback_at if 'agent_context_feedback.symbol IN' in sql else self.global_first_feedback_at
-            return FakeExecuteResult(scalar=scalar)
-
-        if call_index == 3:
-            return FakeExecuteResult(scalar=self.filtered_latest_feedback_at)
-
         sql = self._compile(statement)
-        rows = self.target_rows if 'agent_context_feedback.symbol IN' in sql else self.global_rows
-        return FakeExecuteResult(rows=rows)
+        if 'daily_price_bars' in sql:
+            return FakeExecuteResult(scalars=['005930', '000660'])
+        if 'agent_context_feedback_failures' in sql:
+            return FakeExecuteResult(rows=self.failure_rows)
+        return FakeExecuteResult(rows=self.feedback_rows)
 
     @staticmethod
     def _compile(statement) -> str:
@@ -103,39 +126,47 @@ class AgentContextProgressServiceTests(unittest.TestCase):
                 expected_agents=expected_agents,
             )
 
-    def test_feedback_progress_filters_first_feedback_timestamp_by_requested_symbols(self):
+    def test_feedback_progress_result_scopes_role_counts_to_requested_symbols(self):
         fake_session = FakeProgressSession()
 
-        result = self._call_service(fake_session, symbols=['005930'])
+        result = self._call_service(fake_session, symbols=['005930', '000660'])
 
-        first_feedback_sql = fake_session._compile(fake_session.statements[1])
-        latest_feedback_sql = fake_session._compile(fake_session.statements[2])
+        feedback_sql = fake_session._compile(fake_session.statements[0])
+        failure_sql = fake_session._compile(fake_session.statements[1])
 
-        self.assertIn('agent_context_feedback.symbol IN', first_feedback_sql)
-        self.assertIn('agent_context_feedback.symbol IN', latest_feedback_sql)
+        self.assertIn('agent_context_feedback.symbol IN', feedback_sql)
+        self.assertIn('agent_context_feedback_failures.symbol IN', failure_sql)
+        self.assertEqual(result['result']['market_date'], '2026-04-14')
         self.assertEqual(
-            result['summary']['first_feedback_at'],
-            fake_session.filtered_first_feedback_at.isoformat(),
+            result['result']['roles']['eod-summarizer'],
+            {'requested_count': 2, 'completed_count': 2, 'error_count': 0},
+        )
+        self.assertEqual(
+            result['result']['roles']['technical-summarizer'],
+            {'requested_count': 2, 'completed_count': 1, 'error_count': 1},
+        )
+        self.assertEqual(
+            result['result']['roles']['fundamental-summarizer'],
+            {'requested_count': 2, 'completed_count': 1, 'error_count': 1},
+        )
+        self.assertEqual(
+            set(result['result']['roles']['technical-summarizer'].keys()),
+            {'requested_count', 'completed_count', 'error_count'},
         )
 
-    def test_feedback_progress_filters_timing_to_target_universe_when_symbols_omitted(self):
+    def test_feedback_progress_uses_market_date_symbol_universe_when_symbols_omitted(self):
         fake_session = FakeProgressSession()
 
         result = self._call_service(fake_session, symbols=None)
 
-        first_feedback_sql = fake_session._compile(fake_session.statements[1])
-        latest_feedback_sql = fake_session._compile(fake_session.statements[2])
-        rows_sql = fake_session._compile(fake_session.statements[3])
+        universe_sql = fake_session._compile(fake_session.statements[0])
+        feedback_sql = fake_session._compile(fake_session.statements[1])
 
-        self.assertIn('agent_context_feedback.symbol IN', first_feedback_sql)
-        self.assertIn('agent_context_feedback.symbol IN', latest_feedback_sql)
-        self.assertIn('agent_context_feedback.symbol IN', rows_sql)
-        self.assertEqual(result['summary']['total_symbols'], 1)
-        self.assertEqual(result['summary']['completed_feedback_count'], 3)
-        self.assertEqual(
-            result['summary']['first_feedback_at'],
-            fake_session.filtered_first_feedback_at.isoformat(),
-        )
+        self.assertIn('daily_price_bars', universe_sql)
+        self.assertIn('agent_context_feedback.symbol IN', feedback_sql)
+        self.assertEqual(result['summary']['total_symbols'], 2)
+        self.assertEqual(result['result']['roles']['technical-summarizer']['requested_count'], 2)
+        self.assertEqual(result['result']['roles']['technical-summarizer']['completed_count'], 1)
 
     def test_feedback_progress_returns_timing_rate_and_eta_fields(self):
         fake_session = FakeProgressSession()
@@ -169,13 +200,15 @@ class AgentContextProgressServiceTests(unittest.TestCase):
             expected_agents=['technical-summarizer'],
         )
 
-        first_feedback_sql = fake_session._compile(fake_session.statements[1])
-        rows_sql = fake_session._compile(fake_session.statements[3])
+        feedback_sql = fake_session._compile(fake_session.statements[0])
         summary = result['summary']
 
-        self.assertIn('agent_context_feedback.agent_name IN', first_feedback_sql)
-        self.assertIn('agent_context_feedback.agent_name IN', rows_sql)
+        self.assertIn('agent_context_feedback.agent_name IN', feedback_sql)
         self.assertEqual(result['request']['expected_agents'], ['technical-summarizer'])
+        self.assertEqual(
+            result['result']['roles']['technical-summarizer'],
+            {'requested_count': 1, 'completed_count': 1, 'error_count': 0},
+        )
         self.assertEqual(summary['completed_symbols'], 1)
         self.assertEqual(summary['completed_feedback_count'], 1)
         self.assertEqual(summary['expected_feedback_count'], 1)
