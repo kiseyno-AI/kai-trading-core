@@ -40,6 +40,7 @@ from app.agent_context.session_cleanup_service import SessionCleanupTarget, agen
 from app.core.settings import settings
 from app.db import session_scope
 from app.db_models import AgentContextFeedback, EODCollectionRun
+from app.market_data_store import load_daily_piotroski_filter_results
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +126,23 @@ def _normalize_requested_symbols(symbols: Sequence[str]) -> list[str]:
     if not normalized:
         raise ValueError('At least one symbol is required')
     return normalized
+
+
+def _split_requested_symbols_by_piotroski_passed_filter(
+    *,
+    market_date: date,
+    requested_symbols: Sequence[str],
+) -> tuple[list[str], list[str]]:
+    passed_rows = load_daily_piotroski_filter_results(
+        market_date=market_date,
+        symbols=list(requested_symbols),
+        passed_filter=True,
+        limit=None,
+    )
+    passed_symbol_set = {str(item['symbol']) for item in passed_rows}
+    eligible_symbols = [symbol for symbol in requested_symbols if symbol in passed_symbol_set]
+    skipped_symbols = [symbol for symbol in requested_symbols if symbol not in passed_symbol_set]
+    return eligible_symbols, skipped_symbols
 
 
 def _trim_batch_item_for_prompt(item: dict[str, Any]) -> dict[str, Any]:
@@ -1038,20 +1056,55 @@ class AgentFeedbackOrchestrator:
         normalized_market_date = market_date if isinstance(market_date, date) else date.fromisoformat(market_date)
         specs = self._select_specs(roles=roles)
         requested_symbols = _normalize_requested_symbols(symbols)
+        dispatch_symbols, skipped_symbols = _split_requested_symbols_by_piotroski_passed_filter(
+            market_date=normalized_market_date,
+            requested_symbols=requested_symbols,
+        )
         request_run_id = f'symbol-run-{normalized_market_date.isoformat()}-{uuid.uuid4().hex[:10]}'
+        batch_size = max(1, settings.openclaw_agent_symbol_chunk_size)
+        role_parallelism = max(1, settings.openclaw_agent_parallel_subtasks)
+        if not dispatch_symbols:
+            return {
+                'request': {
+                    'market_date': normalized_market_date.isoformat(),
+                    'symbols': [],
+                    'requested_symbols': requested_symbols,
+                    'request_run_id': request_run_id,
+                    'roles': [spec.role for spec in specs],
+                    'fs_div': fs_div,
+                    'disclosures_limit': disclosures_limit,
+                    'symbol_chunk_size': batch_size,
+                    'parallel_subtasks': role_parallelism,
+                    'role_parallel_subtasks': role_parallelism,
+                    'total_parallel_subtasks': role_parallelism,
+                    'reuse_existing': reuse_existing,
+                    'scope': 'piotroski_passed_symbols_only',
+                    'skipped_symbols': skipped_symbols,
+                    'mode': 'role_sequential_runtime_buffered',
+                },
+                'summary': {
+                    'status': 'skipped',
+                    'completed': 0,
+                    'failed': 0,
+                    'skipped': len(skipped_symbols),
+                    'flushed_to_db': 0,
+                },
+                'items': [],
+                'failures': [],
+            }
         existing_feedback_symbols: set[str] = set()
         reuse_decisions = {}
-        if reuse_existing and requested_symbols:
+        if reuse_existing and dispatch_symbols:
             reuse_decisions = agent_context_reuse_service.build_latest_decisions(
                 market_date=normalized_market_date,
-                symbols=requested_symbols,
+                symbols=dispatch_symbols,
                 roles=[spec.role for spec in specs],
             )
-        symbols_requiring_context = requested_symbols
+        symbols_requiring_context = dispatch_symbols
         if reuse_decisions:
             symbols_requiring_context = [
                 symbol
-                for symbol in requested_symbols
+                for symbol in dispatch_symbols
                 if any(
                     decision is None or decision.should_dispatch
                     for decision in (
@@ -1068,12 +1121,10 @@ class AgentFeedbackOrchestrator:
                 fs_div=fs_div,
                 disclosures_limit=disclosures_limit,
             )
-        batch_size = max(1, settings.openclaw_agent_symbol_chunk_size)
-        role_parallelism = max(1, settings.openclaw_agent_parallel_subtasks)
         state = RuntimeFeedbackRunState(
             run_id=request_run_id,
             market_date=normalized_market_date,
-            requested_symbols=requested_symbols,
+            requested_symbols=dispatch_symbols,
             requested_roles=[spec.role for spec in specs],
             role_sequence=[spec.role for spec in specs],
             parallel_per_role=role_parallelism,
@@ -1086,7 +1137,8 @@ class AgentFeedbackOrchestrator:
             'run_started',
             market_date=normalized_market_date.isoformat(),
             request_run_id=request_run_id,
-            requested_symbols=requested_symbols,
+            requested_symbols=dispatch_symbols,
+            skipped_symbols=skipped_symbols,
             requested_roles=[spec.role for spec in specs],
             batch_size=batch_size,
             parallel_subtasks=role_parallelism,
@@ -1381,7 +1433,8 @@ class AgentFeedbackOrchestrator:
         return {
             'request': {
                 'market_date': normalized_market_date.isoformat(),
-                'symbols': list(symbols),
+                'symbols': list(dispatch_symbols),
+                'requested_symbols': requested_symbols,
                 'request_run_id': request_run_id,
                 'roles': [spec.role for spec in specs],
                 'fs_div': fs_div,
@@ -1391,12 +1444,15 @@ class AgentFeedbackOrchestrator:
                 'role_parallel_subtasks': role_parallelism,
                 'total_parallel_subtasks': role_parallelism,
                 'reuse_existing': reuse_existing,
+                'scope': 'piotroski_passed_symbols_only',
+                'skipped_symbols': skipped_symbols,
                 'mode': 'role_sequential_runtime_buffered',
             },
             'summary': {
                 'status': final_status,
                 'completed': completed_count,
                 'failed': failed_count,
+                'skipped': len(skipped_symbols),
                 'flushed_to_db': flush_result.get('count', 0),
             },
             'items': all_items,
@@ -1414,14 +1470,45 @@ class AgentFeedbackOrchestrator:
         per_role_parallelism: int = 5,
     ) -> dict[str, Any]:
         normalized_market_date = market_date if isinstance(market_date, date) else date.fromisoformat(market_date)
-        symbol_context = agent_context_read_service.get_symbol_day_context(
+        requested_symbols = _normalize_requested_symbols(symbols)
+        dispatch_symbols, skipped_symbols = _split_requested_symbols_by_piotroski_passed_filter(
             market_date=normalized_market_date,
-            symbols=symbols,
-            fs_div=fs_div,
-            disclosures_limit=disclosures_limit,
+            requested_symbols=requested_symbols,
         )
         specs = self._select_specs(roles=roles)
         request_run_id = f'subagent-symbol-run-{normalized_market_date.isoformat()}-{uuid.uuid4().hex[:10]}'
+        if not dispatch_symbols:
+            return {
+                'request': {
+                    'market_date': normalized_market_date.isoformat(),
+                    'symbols': [],
+                    'requested_symbols': requested_symbols,
+                    'request_run_id': request_run_id,
+                    'roles': [spec.role for spec in specs],
+                    'fs_div': fs_div,
+                    'disclosures_limit': disclosures_limit,
+                    'per_role_parallelism': max(1, int(per_role_parallelism)),
+                    'batch_size': 2,
+                    'total_parallel_subtasks': max(1, len(specs) * max(1, int(per_role_parallelism))),
+                    'scope': 'piotroski_passed_symbols_only',
+                    'skipped_symbols': skipped_symbols,
+                    'mode': 'slot_parent_subagent_fanout',
+                },
+                'summary': {
+                    'status': 'skipped',
+                    'completed': 0,
+                    'failed': 0,
+                    'skipped': len(skipped_symbols),
+                },
+                'items': [],
+                'failures': [],
+            }
+        symbol_context = agent_context_read_service.get_symbol_day_context(
+            market_date=normalized_market_date,
+            symbols=dispatch_symbols,
+            fs_div=fs_div,
+            disclosures_limit=disclosures_limit,
+        )
         items: list[dict[str, Any]] = []
         failures: list[dict[str, Any]] = []
         batch_size = 2
@@ -1527,7 +1614,8 @@ class AgentFeedbackOrchestrator:
         return {
             'request': {
                 'market_date': normalized_market_date.isoformat(),
-                'symbols': list(symbols),
+                'symbols': list(dispatch_symbols),
+                'requested_symbols': requested_symbols,
                 'request_run_id': request_run_id,
                 'roles': [spec.role for spec in specs],
                 'fs_div': fs_div,
@@ -1535,12 +1623,15 @@ class AgentFeedbackOrchestrator:
                 'per_role_parallelism': role_worker_count,
                 'batch_size': batch_size,
                 'total_parallel_subtasks': total_max_workers,
+                'scope': 'piotroski_passed_symbols_only',
+                'skipped_symbols': skipped_symbols,
                 'mode': 'slot_parent_subagent_fanout',
             },
             'summary': {
                 'status': status,
                 'completed': len(items),
                 'failed': len(failures),
+                'skipped': len(skipped_symbols),
             },
             'items': items,
             'failures': failures,

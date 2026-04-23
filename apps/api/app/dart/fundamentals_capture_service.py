@@ -1824,7 +1824,20 @@ class DartFundamentalsCaptureService:
             )
             feedback_followup = None
             feedback_followup_error = None
-            if settings.openclaw_feedback_trigger_after_fundamentals_refresh and status in {'completed', 'partial'}:
+            should_trigger_feedback_followup = (
+                settings.openclaw_feedback_trigger_after_fundamentals_refresh
+                and status in {'completed', 'partial'}
+                and piotroski_filter_followup is not None
+                and not piotroski_filter_followup_error
+                and int(piotroski_filter_followup.get('results_failed') or 0) == 0
+            )
+            if settings.openclaw_feedback_trigger_after_fundamentals_refresh and not should_trigger_feedback_followup:
+                feedback_followup = {
+                    'triggered': False,
+                    'reason': 'piotroski_filter_followup_incomplete',
+                    'market_date': resolved_market_date.isoformat(),
+                }
+            if should_trigger_feedback_followup:
                 try:
                     feedback_followup = await asyncio.to_thread(
                         agent_feedback_retry_service.run_retry_cycles,

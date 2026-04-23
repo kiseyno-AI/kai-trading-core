@@ -5,15 +5,12 @@ from datetime import date, datetime, timezone
 from typing import Any, Sequence
 from uuid import uuid4
 
-from sqlalchemy import select
-
 from app.agent_context.orchestrator import agent_feedback_orchestrator
 from app.agent_context.progress_service import agent_context_progress_service
 from app.agent_context.reuse_service import agent_context_reuse_service
 from app.agent_context.runtime_state import RuntimeFeedbackRunState, runtime_feedback_state_store
-from app.db import session_scope
 from app.core.settings import settings
-from app.db_models import DailyPriceBar, Symbol
+from app.market_data_store import load_daily_piotroski_filter_results
 
 EXPECTED_ROLES: tuple[str, ...] = (
     'eod-summarizer',
@@ -34,15 +31,14 @@ class FeedbackRetryCycleConfig:
 class AgentFeedbackRetryService:
     def load_incomplete_symbols(self, *, market_date: date, roles: Sequence[str]) -> list[str]:
         expected_roles = tuple(roles)
-        with session_scope() as session:
-            rows = session.execute(
-                select(Symbol.symbol)
-                .join(DailyPriceBar, DailyPriceBar.symbol_id == Symbol.id)
-                .where(DailyPriceBar.trade_date == market_date)
-                .distinct()
-                .order_by(Symbol.symbol.asc())
-            ).all()
-        symbols = [str(row.symbol) for row in rows]
+        symbols = [
+            str(item['symbol'])
+            for item in load_daily_piotroski_filter_results(
+                market_date=market_date,
+                passed_filter=True,
+                limit=None,
+            )
+        ]
         if not symbols:
             return []
 

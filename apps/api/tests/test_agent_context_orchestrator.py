@@ -157,6 +157,16 @@ def _reuse_decision(should_dispatch: bool):
     return SimpleNamespace(should_dispatch=should_dispatch)
 
 
+def _passed_filter_rows(*symbols: str) -> list[dict]:
+    return [
+        {
+            'symbol': symbol,
+            'passed_filter': True,
+        }
+        for symbol in symbols
+    ]
+
+
 class AgentFeedbackOrchestratorTests(unittest.TestCase):
     def test_reuse_existing_skips_reusable_symbol_role_pairs(self):
         service = AgentFeedbackOrchestrator()
@@ -178,12 +188,17 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
                 with patch.object(orchestrator_module, 'agent_context_reuse_service', reuse_service):
                     with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
                         with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
-                            result = service.dispatch_for_symbols(
-                                market_date='2026-04-14',
-                                symbols=['005930', '000660'],
-                                roles=['eod-summarizer'],
-                                reuse_existing=True,
-                            )
+                            with patch.object(
+                                orchestrator_module,
+                                'load_daily_piotroski_filter_results',
+                                return_value=_passed_filter_rows('005930', '000660'),
+                            ):
+                                result = service.dispatch_for_symbols(
+                                    market_date='2026-04-14',
+                                    symbols=['005930', '000660'],
+                                    roles=['eod-summarizer'],
+                                    reuse_existing=True,
+                                )
 
         dispatched_symbols = [
             item['symbol']
@@ -208,12 +223,17 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
             with patch.object(orchestrator_module, 'agent_context_read_service', DynamicFakeAgentContextReadService()):
                 with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
                     with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
-                        result = service.dispatch_for_symbols(
-                            market_date='2026-04-14',
-                            symbols=['005930', '000660'],
-                            roles=['eod-summarizer'],
-                            reuse_existing=False,
-                        )
+                        with patch.object(
+                            orchestrator_module,
+                            'load_daily_piotroski_filter_results',
+                            return_value=_passed_filter_rows('005930', '000660'),
+                        ):
+                            result = service.dispatch_for_symbols(
+                                market_date='2026-04-14',
+                                symbols=['005930', '000660'],
+                                roles=['eod-summarizer'],
+                                reuse_existing=False,
+                            )
 
         self.assertEqual([item['symbol'] for item in feedback_service.bulk_items], ['005930', '000660'])
         self.assertEqual(len(cleanup_service.targets), 1)
@@ -233,12 +253,17 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
             with patch.object(orchestrator_module, 'agent_context_read_service', DynamicFakeAgentContextReadService()):
                 with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
                     with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
-                        result = service.dispatch_for_symbols(
-                            market_date='2026-04-14',
-                            symbols=symbols,
-                            roles=['eod-summarizer'],
-                            reuse_existing=False,
-                        )
+                        with patch.object(
+                            orchestrator_module,
+                            'load_daily_piotroski_filter_results',
+                            return_value=_passed_filter_rows(*symbols),
+                        ):
+                            result = service.dispatch_for_symbols(
+                                market_date='2026-04-14',
+                                symbols=symbols,
+                                roles=['eod-summarizer'],
+                                reuse_existing=False,
+                            )
 
         slots = sorted(call['batch_items'][0]['session_slot'] for call in client.calls)
         self.assertEqual(slots, [1, 1, 2, 2, 3, 3])
@@ -257,12 +282,17 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         with patch.object(orchestrator_module, 'agent_context_read_service', DynamicFakeAgentContextReadService()):
             with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
                 with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
-                    result = service.dispatch_for_symbols_via_subagents(
-                        market_date='2026-04-14',
-                        symbols=symbols,
-                        roles=['eod-summarizer'],
-                        per_role_parallelism=3,
-                    )
+                    with patch.object(
+                        orchestrator_module,
+                        'load_daily_piotroski_filter_results',
+                        return_value=_passed_filter_rows(*symbols),
+                    ):
+                        result = service.dispatch_for_symbols_via_subagents(
+                            market_date='2026-04-14',
+                            symbols=symbols,
+                            roles=['eod-summarizer'],
+                            per_role_parallelism=3,
+                        )
 
         slots = sorted(
             call['batch_items'][0]['session_slot']
@@ -279,7 +309,7 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         fake_executor = FakeThreadPoolExecutor([first_future, second_future])
         wait_calls = []
 
-        def fake_wait(active_futures, *, timeout, return_when):
+        def fake_wait(active_futures, *, timeout=None, return_when):
             wait_calls.append(list(active_futures))
             if len(wait_calls) == 1:
                 return set(), set(active_futures)
@@ -291,15 +321,10 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
                 return {second_future}, set()
             raise AssertionError('unexpected wait call')
 
-        stored_symbols = []
-
-        def fake_store_feedback(**kwargs):
-            stored_symbols.append(kwargs['payload']['symbol'])
-            return {'id': len(stored_symbols), 'agent_name': kwargs['agent_name'], 'run_id': kwargs['run_id']}
-
         service = AgentFeedbackOrchestrator()
         service.client = FakeOpenClawClient()
-        service._store_feedback = fake_store_feedback
+        feedback_service = FakeFeedbackService()
+        cleanup_service = FakeSessionCleanupService()
 
         fake_settings = SimpleNamespace(
             openclaw_agent_symbol_chunk_size=1,
@@ -308,16 +333,55 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
             openclaw_agent_retry_backoff_seconds=0,
             openclaw_agent_max_retries=0,
         )
-        monotonic_values = iter([0, 32, 33])
 
         with patch.object(orchestrator_module, 'settings', fake_settings):
             with patch.object(orchestrator_module, 'agent_context_read_service', FakeAgentContextReadService()):
-                with patch('app.agent_context.orchestrator.time.monotonic', side_effect=lambda: next(monotonic_values)):
-                    with patch(
-                        'app.agent_context.orchestrator.concurrent.futures.ThreadPoolExecutor',
-                        side_effect=lambda max_workers: fake_executor,
-                    ):
-                        with patch('app.agent_context.orchestrator.concurrent.futures.wait', side_effect=fake_wait):
+                with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
+                    with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
+                        with patch.object(
+                            orchestrator_module,
+                            'load_daily_piotroski_filter_results',
+                            return_value=_passed_filter_rows('005930', '000660'),
+                        ):
+                            with patch(
+                                'app.agent_context.orchestrator.concurrent.futures.ThreadPoolExecutor',
+                                side_effect=lambda max_workers: fake_executor,
+                            ):
+                                with patch('app.agent_context.orchestrator.concurrent.futures.wait', side_effect=fake_wait):
+                                    result = service.dispatch_for_symbols(
+                                        market_date='2026-04-14',
+                                        symbols=['005930', '000660'],
+                                        roles=['eod-summarizer'],
+                                        reuse_existing=False,
+                                    )
+
+        self.assertEqual(first_future.cancel_calls, 0)
+        self.assertEqual(
+            [submission['batch_items'][0]['symbol'] for submission in fake_executor.submissions],
+            ['005930', '000660'],
+        )
+        self.assertEqual([item['symbol'] for item in feedback_service.bulk_items], ['005930', '000660'])
+        self.assertEqual(len(cleanup_service.targets), 1)
+        self.assertEqual(result['summary']['failed'], 0)
+
+    def test_dispatch_for_symbols_skips_symbols_not_in_passed_filter(self):
+        service = AgentFeedbackOrchestrator()
+        client = RecordingBatchClient()
+        service.client = client
+        feedback_service = FakeFeedbackService()
+        cleanup_service = FakeSessionCleanupService()
+        read_service = RecordingAgentContextReadService()
+        fake_settings = SimpleNamespace(openclaw_agent_symbol_chunk_size=1, openclaw_agent_parallel_subtasks=20)
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            with patch.object(orchestrator_module, 'agent_context_read_service', read_service):
+                with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
+                    with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
+                        with patch.object(
+                            orchestrator_module,
+                            'load_daily_piotroski_filter_results',
+                            return_value=_passed_filter_rows('005930'),
+                        ):
                             result = service.dispatch_for_symbols(
                                 market_date='2026-04-14',
                                 symbols=['005930', '000660'],
@@ -325,13 +389,14 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
                                 reuse_existing=False,
                             )
 
-        self.assertEqual(first_future.cancel_calls, 1)
+        self.assertEqual(read_service.calls[0]['symbols'], ['005930'])
         self.assertEqual(
-            [submission['batch_items'][0]['symbol'] for submission in fake_executor.submissions],
-            ['005930', '000660'],
+            [item['symbol'] for call in client.calls for item in call['batch_items']],
+            ['005930'],
         )
-        self.assertEqual(stored_symbols, ['005930', '000660'])
-        self.assertEqual(result['summary']['failed'], 0)
+        self.assertEqual(result['request']['symbols'], ['005930'])
+        self.assertEqual(result['request']['skipped_symbols'], ['000660'])
+        self.assertEqual(result['summary']['skipped'], 1)
 
 
 if __name__ == '__main__':

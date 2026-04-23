@@ -667,6 +667,105 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(result['piotroski_filter'])
         self.assertIn('piotroski table unavailable', result['piotroski_filter_error'])
 
+    async def test_daily_incremental_refresh_skips_feedback_followup_when_piotroski_followup_is_incomplete(self):
+        client = FakeCaptureClient()
+        repository = FakeCaptureRepository()
+        repository.symbol_states = {
+            '005930': {
+                'stock_code': '005930',
+                'has_fundamentals': True,
+                'latest_fundamentals_receipt_date': '2026-04-01',
+                'latest_snapshot': {'id': 100},
+            },
+        }
+        service = DartFundamentalsCaptureService(
+            client=client,
+            repository=repository,
+            active_symbol_loader=lambda: [{'symbol': '005930'}],
+        )
+        self.mock_piotroski_filter.return_value = {
+            'market_date': '2026-04-14',
+            'source': 'strategy_piotroski_v1',
+            'symbols_evaluated': 1,
+            'symbols_passed': 1,
+            'symbols_not_passed': 0,
+            'results_persisted': 0,
+            'results_failed': 1,
+            'failed_symbols': ['005930'],
+        }
+
+        with patch(
+            'app.dart.sync_service.dart_disclosure_sync_service.sync_disclosures_for_corporations',
+            return_value={
+                'run_id': 77,
+                'status': 'completed',
+                'financial_report_events': 1,
+            },
+        ):
+            with patch.object(
+                __import__('app.dart.fundamentals_capture_service', fromlist=['settings']).settings,
+                'openclaw_feedback_trigger_after_fundamentals_refresh',
+                True,
+            ):
+                with patch(
+                    'app.dart.fundamentals_capture_service.agent_feedback_retry_service.run_retry_cycles',
+                ) as run_retry_cycles:
+                    result = await service.run_daily_incremental_refresh(
+                        market_date=date(2026, 4, 14),
+                        capture_limit=10,
+                        fs_div='CFS',
+                        trigger='test_daily',
+                    )
+
+        run_retry_cycles.assert_not_called()
+        self.assertEqual(result['feedback_followup']['reason'], 'piotroski_filter_followup_incomplete')
+
+    async def test_daily_incremental_refresh_triggers_feedback_followup_after_clean_piotroski_followup(self):
+        client = FakeCaptureClient()
+        repository = FakeCaptureRepository()
+        repository.symbol_states = {
+            '005930': {
+                'stock_code': '005930',
+                'has_fundamentals': True,
+                'latest_fundamentals_receipt_date': '2026-04-01',
+                'latest_snapshot': {'id': 100},
+            },
+        }
+        service = DartFundamentalsCaptureService(
+            client=client,
+            repository=repository,
+            active_symbol_loader=lambda: [{'symbol': '005930'}],
+        )
+
+        with patch(
+            'app.dart.sync_service.dart_disclosure_sync_service.sync_disclosures_for_corporations',
+            return_value={
+                'run_id': 77,
+                'status': 'completed',
+                'financial_report_events': 1,
+            },
+        ):
+            with patch.object(
+                __import__('app.dart.fundamentals_capture_service', fromlist=['settings']).settings,
+                'openclaw_feedback_trigger_after_fundamentals_refresh',
+                True,
+            ):
+                with patch(
+                    'app.dart.fundamentals_capture_service.agent_feedback_retry_service.run_retry_cycles',
+                    return_value={'completed': True, 'final_pending': 0},
+                ) as run_retry_cycles:
+                    result = await service.run_daily_incremental_refresh(
+                        market_date=date(2026, 4, 14),
+                        capture_limit=10,
+                        fs_div='CFS',
+                        trigger='test_daily',
+                    )
+
+        run_retry_cycles.assert_called_once()
+        self.assertEqual(run_retry_cycles.call_args.kwargs['config'].market_date, date(2026, 4, 14))
+        self.assertEqual(run_retry_cycles.call_args.kwargs['config'].roles, ('eod-summarizer', 'technical-summarizer', 'fundamental-summarizer'))
+        self.assertEqual(result['feedback_followup'], {'completed': True, 'final_pending': 0})
+
     async def test_daily_incremental_refresh_filters_candidates_by_symbol_resolved_baseline(self):
         client = FakeCaptureClient()
         repository = FakeCaptureRepository()
