@@ -202,7 +202,6 @@ async def dispatch_symbol_agent_feedback(
             runtime_feedback_state_store.start_run(state)
 
         def _run_dispatch() -> None:
-            runtime_feedback_state_store.clear_run(payload.market_date)
             agent_feedback_orchestrator.dispatch_for_symbols(
                 market_date=payload.market_date,
                 symbols=requested_symbols,
