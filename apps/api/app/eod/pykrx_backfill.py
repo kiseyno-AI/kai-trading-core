@@ -471,16 +471,28 @@ class PykrxBackfillService:
         symbol: str | None = None,
         limit: int | None = None,
     ) -> list[PykrxSymbol]:
-        rows = load_symbols(is_active=True, source='pykrx', markets=list(markets), limit=limit)
-        items = [
-            PykrxSymbol(
-                symbol=row['symbol'],
-                market=row['market'],
-                name_ko=row['name_ko'],
-                standard_code=row['standard_code'],
+        rows = load_symbols(is_active=True, markets=list(markets), limit=limit)
+        items: list[PykrxSymbol] = []
+        seen: set[str] = set()
+        allowed_markets = {market.upper() for market in markets}
+        for row in rows:
+            symbol_code = str(row['symbol']).strip()
+            market = str(row['market'] or '').strip()
+            if not symbol_code.isdigit() or len(symbol_code) != 6:
+                continue
+            if market.upper() not in allowed_markets:
+                continue
+            if symbol_code in seen:
+                continue
+            seen.add(symbol_code)
+            items.append(
+                PykrxSymbol(
+                    symbol=symbol_code,
+                    market=market,
+                    name_ko=row['name_ko'],
+                    standard_code=row['standard_code'],
+                )
             )
-            for row in rows
-        ]
         if symbol:
             items = [item for item in items if item.symbol == symbol]
         return items
