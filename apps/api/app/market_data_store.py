@@ -13,6 +13,7 @@ from app.db import engine, session_scope
 from app.db_models import (
     CurrentQuoteCache,
     DailyActionSummary,
+    DailyLowRiskFactorResult,
     DailyPiotroskiFilterResult,
     DailyMarketParticipationContext,
     DailyPriceBar,
@@ -2224,6 +2225,138 @@ def load_daily_piotroski_filter_results(
                 'captured_at': item.captured_at.isoformat() if item.captured_at else None,
             }
             for item, symbol in rows
+        ]
+
+
+def upsert_daily_low_risk_factor_result(result: dict) -> None:
+    refreshed_at = datetime.utcnow()
+    with session_scope() as session:
+        symbol = _get_symbol(session, result['symbol'])
+        if symbol is None:
+            symbol = Symbol(
+                symbol=result['symbol'],
+                market=result.get('market', 'KRX'),
+                name_ko=result.get('name_ko') or result['symbol'],
+                instrument_type='equity',
+                source=result.get('source', 'low_risk_v1'),
+                is_active=True,
+                last_refreshed_at=refreshed_at,
+            )
+            session.add(symbol)
+            session.flush()
+
+        values = {
+            'symbol_id': symbol.id,
+            'market_date': _normalize_trade_date(result['market_date']),
+            'source': result.get('source', 'low_risk_v1'),
+            'volatility_60d': result.get('volatility_60d'),
+            'volatility_120d': result.get('volatility_120d'),
+            'max_drawdown_120d': result.get('max_drawdown_120d'),
+            'avg_trading_value_20d': result.get('avg_trading_value_20d'),
+            'volatility_60d_rank': result.get('volatility_60d_rank'),
+            'volatility_120d_rank': result.get('volatility_120d_rank'),
+            'max_drawdown_120d_rank': result.get('max_drawdown_120d_rank'),
+            'liquidity_rank': result.get('liquidity_rank'),
+            'volatility_60d_percentile': result.get('volatility_60d_percentile'),
+            'volatility_120d_percentile': result.get('volatility_120d_percentile'),
+            'max_drawdown_120d_percentile': result.get('max_drawdown_120d_percentile'),
+            'liquidity_percentile': result.get('liquidity_percentile'),
+            'passes_liquidity_floor': result.get('passes_liquidity_floor'),
+            'low_risk_score': result.get('low_risk_score'),
+            'low_risk_classification': result.get('low_risk_classification', 'insufficient_history'),
+            'is_low_risk_eligible': bool(result.get('is_low_risk_eligible')),
+            'history_days_available': int(result.get('history_days_available') or 0),
+            'factor_payload': result['factor_payload'],
+            'captured_at': refreshed_at,
+            'updated_at': refreshed_at,
+        }
+        statement = pg_insert(DailyLowRiskFactorResult).values(values)
+        session.execute(
+            statement.on_conflict_do_update(
+                constraint='uq_daily_low_risk_factor_results_symbol_market_date',
+                set_={
+                    'source': statement.excluded.source,
+                    'volatility_60d': statement.excluded.volatility_60d,
+                    'volatility_120d': statement.excluded.volatility_120d,
+                    'max_drawdown_120d': statement.excluded.max_drawdown_120d,
+                    'avg_trading_value_20d': statement.excluded.avg_trading_value_20d,
+                    'volatility_60d_rank': statement.excluded.volatility_60d_rank,
+                    'volatility_120d_rank': statement.excluded.volatility_120d_rank,
+                    'max_drawdown_120d_rank': statement.excluded.max_drawdown_120d_rank,
+                    'liquidity_rank': statement.excluded.liquidity_rank,
+                    'volatility_60d_percentile': statement.excluded.volatility_60d_percentile,
+                    'volatility_120d_percentile': statement.excluded.volatility_120d_percentile,
+                    'max_drawdown_120d_percentile': statement.excluded.max_drawdown_120d_percentile,
+                    'liquidity_percentile': statement.excluded.liquidity_percentile,
+                    'passes_liquidity_floor': statement.excluded.passes_liquidity_floor,
+                    'low_risk_score': statement.excluded.low_risk_score,
+                    'low_risk_classification': statement.excluded.low_risk_classification,
+                    'is_low_risk_eligible': statement.excluded.is_low_risk_eligible,
+                    'history_days_available': statement.excluded.history_days_available,
+                    'factor_payload': statement.excluded.factor_payload,
+                    'captured_at': statement.excluded.captured_at,
+                    'updated_at': refreshed_at,
+                },
+            )
+        )
+
+
+def load_daily_low_risk_factor_results(
+    *,
+    market_date: str | date,
+    symbols: list[str] | None = None,
+    is_low_risk_eligible: bool | None = None,
+    limit: int | None = None,
+) -> list[dict]:
+    with session_scope() as session:
+        stmt = (
+            select(DailyLowRiskFactorResult, Symbol.symbol, Symbol.name_ko, Symbol.market)
+            .join(Symbol, Symbol.id == DailyLowRiskFactorResult.symbol_id)
+            .where(DailyLowRiskFactorResult.market_date == _normalize_trade_date(market_date))
+            .order_by(
+                DailyLowRiskFactorResult.is_low_risk_eligible.desc(),
+                DailyLowRiskFactorResult.low_risk_score.desc().nullslast(),
+                DailyLowRiskFactorResult.liquidity_percentile.desc().nullslast(),
+                Symbol.symbol.asc(),
+            )
+        )
+        if limit is not None:
+            stmt = stmt.limit(limit)
+        if symbols:
+            stmt = stmt.where(Symbol.symbol.in_(symbols))
+        if is_low_risk_eligible is not None:
+            stmt = stmt.where(DailyLowRiskFactorResult.is_low_risk_eligible == is_low_risk_eligible)
+
+        rows = session.execute(stmt).all()
+        return [
+            {
+                'symbol': symbol,
+                'name_ko': name_ko,
+                'market': market,
+                'market_date': item.market_date.isoformat(),
+                'source': item.source,
+                'feature_version': item.source,
+                'volatility_60d': _round_float(item.volatility_60d, 6),
+                'volatility_120d': _round_float(item.volatility_120d, 6),
+                'max_drawdown_120d': _round_float(item.max_drawdown_120d, 6),
+                'avg_trading_value_20d': _round_float(item.avg_trading_value_20d, 4),
+                'volatility_60d_rank': item.volatility_60d_rank,
+                'volatility_120d_rank': item.volatility_120d_rank,
+                'max_drawdown_120d_rank': item.max_drawdown_120d_rank,
+                'liquidity_rank': item.liquidity_rank,
+                'volatility_60d_percentile': _round_float(item.volatility_60d_percentile, 6),
+                'volatility_120d_percentile': _round_float(item.volatility_120d_percentile, 6),
+                'max_drawdown_120d_percentile': _round_float(item.max_drawdown_120d_percentile, 6),
+                'liquidity_percentile': _round_float(item.liquidity_percentile, 6),
+                'passes_liquidity_floor': item.passes_liquidity_floor,
+                'low_risk_score': _round_float(item.low_risk_score, 6),
+                'low_risk_classification': item.low_risk_classification,
+                'is_low_risk_eligible': item.is_low_risk_eligible,
+                'history_days_available': item.history_days_available,
+                'factor_payload': item.factor_payload,
+                'captured_at': item.captured_at.isoformat() if item.captured_at else None,
+            }
+            for item, symbol, name_ko, market in rows
         ]
 
 

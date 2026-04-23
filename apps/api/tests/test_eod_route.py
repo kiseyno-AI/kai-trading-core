@@ -161,6 +161,64 @@ class FakePiotroskiFilterService:
         }
 
 
+class FakeLowRiskFactorService:
+    def __init__(self):
+        self.compute_args = None
+        self.inspect_args = None
+
+    def rebuild_for_market_date(self, **kwargs):
+        self.compute_args = kwargs
+        return {
+            'market_date': kwargs['market_date'],
+            'feature_version': kwargs['source'],
+            'results_persisted': 2,
+            'results_failed': 0,
+            'items': [{'symbol': '005930', 'low_risk_score': 0.86}],
+        }
+
+    def inspect(self, **kwargs):
+        self.inspect_args = kwargs
+        market_date = kwargs['market_date']
+        symbol = kwargs.get('symbol')
+        if symbol:
+            return {
+                'market_date': market_date,
+                'feature_version': 'low_risk_v1',
+                'summary': {
+                    'entries': 1,
+                    'requested_symbol': symbol,
+                    'matched_symbols': [symbol],
+                    'missing_symbols': [],
+                    'eligible_count': 1,
+                    'liquidity_floor_pass_count': 1,
+                    'insufficient_history_count': 0,
+                },
+                'item': {
+                    'symbol': symbol,
+                    'market_date': market_date,
+                    'low_risk_score': 0.91,
+                    'is_low_risk_eligible': True,
+                },
+            }
+        return {
+            'market_date': market_date,
+            'feature_version': 'low_risk_v1',
+            'summary': {
+                'entries': 2,
+                'requested_symbol': None,
+                'matched_symbols': ['005930', '000660'],
+                'missing_symbols': [],
+                'eligible_count': 1,
+                'liquidity_floor_pass_count': 2,
+                'insufficient_history_count': 0,
+            },
+            'items': [
+                {'symbol': '005930', 'market_date': market_date, 'low_risk_score': 0.91, 'is_low_risk_eligible': True},
+                {'symbol': '000660', 'market_date': market_date, 'low_risk_score': 0.42, 'is_low_risk_eligible': False},
+            ],
+        }
+
+
 class FakePipelineStatusService:
     def __init__(self):
         self.read_args = None
@@ -345,6 +403,48 @@ class EODRouteTests(unittest.TestCase):
         self.assertEqual(fake_service.inspect_args['symbols'], ['005930'])
         self.assertEqual(fake_service.inspect_args['limit'], 5)
         self.assertEqual(response.json()['items'][0]['signal_count'], 2)
+
+    def test_compute_low_risk_factors_route_calls_service(self):
+        fake_service = FakeLowRiskFactorService()
+        original_service = routes_eod.daily_low_risk_factor_service
+        routes_eod.daily_low_risk_factor_service = fake_service
+        try:
+            client = TestClient(self.app)
+            response = client.post(
+                '/eod/low-risk-factors/compute',
+                params={
+                    'market_date': '2026-04-23',
+                    'symbols': '005930,000660',
+                    'source': 'low_risk_v1',
+                },
+            )
+        finally:
+            routes_eod.daily_low_risk_factor_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(fake_service.compute_args['market_date'], '2026-04-23')
+        self.assertEqual(fake_service.compute_args['symbols'], ['005930', '000660'])
+        self.assertEqual(fake_service.compute_args['source'], 'low_risk_v1')
+        self.assertEqual(response.json()['items'][0]['low_risk_score'], 0.86)
+
+    def test_inspect_low_risk_factors_route_returns_single_item_for_symbol(self):
+        fake_service = FakeLowRiskFactorService()
+        original_service = routes_eod.daily_low_risk_factor_service
+        routes_eod.daily_low_risk_factor_service = fake_service
+        try:
+            client = TestClient(self.app)
+            response = client.get(
+                '/eod/low-risk-factors',
+                params={'market_date': '2026-04-23', 'symbol': '005930'},
+            )
+        finally:
+            routes_eod.daily_low_risk_factor_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(fake_service.inspect_args['market_date'], '2026-04-23')
+        self.assertEqual(fake_service.inspect_args['symbol'], '005930')
+        self.assertEqual(response.json()['item']['low_risk_score'], 0.91)
+        self.assertTrue(response.json()['item']['is_low_risk_eligible'])
 
     def test_inspect_piotroski_filter_results_route_returns_all_items(self):
         fake_service = FakePiotroskiFilterService()

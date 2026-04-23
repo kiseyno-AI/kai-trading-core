@@ -28,6 +28,7 @@ from app.market_data_store import (
     persist_market_status_snapshot,
 )
 from app.quotes.service import QuoteService
+from app.signals.low_risk_factor import daily_low_risk_factor_service
 from app.signals.piotroski_filter import daily_piotroski_filter_service
 from app.scanner.state import scanner_state
 from app.signals.daily_signal_features import daily_signal_feature_service
@@ -158,6 +159,16 @@ def collect_daily_piotroski_filter_results(
     bootstrap_runtime()
     return daily_piotroski_filter_service.rebuild_for_market_date(
         market_date=market_date or get_market_state().server_time[:10],
+    )
+
+
+def compute_low_risk_factors(*, market_date: str, symbols: str | None = None) -> dict[str, Any]:
+    bootstrap_runtime()
+    parsed_symbols = [item.strip() for item in symbols.split(',') if item.strip()] if symbols else None
+    return daily_low_risk_factor_service.rebuild_for_market_date(
+        market_date=market_date,
+        symbols=parsed_symbols,
+        source='internal_ops_cli',
     )
 
 
@@ -331,6 +342,13 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     piotroski_filter_parser.add_argument('--market-date')
 
+    low_risk_factor_parser = subparsers.add_parser(
+        'eod-low-risk-factors-compute',
+        help='Compute and persist daily low-risk factor results directly',
+    )
+    low_risk_factor_parser.add_argument('--market-date', required=True)
+    low_risk_factor_parser.add_argument('--symbols')
+
     technical_parser = subparsers.add_parser('eod-technical-snapshots-compute', help='Compute technical snapshots directly')
     technical_parser.add_argument('--market-date', required=True)
     technical_parser.add_argument('--symbols')
@@ -429,6 +447,8 @@ def main(argv: Iterable[str] | None = None) -> int:
         )
     elif args.command == 'eod-piotroski-filter-collect':
         payload = collect_daily_piotroski_filter_results(market_date=args.market_date)
+    elif args.command == 'eod-low-risk-factors-compute':
+        payload = compute_low_risk_factors(market_date=args.market_date, symbols=args.symbols)
     elif args.command == 'eod-technical-snapshots-compute':
         payload = compute_technical_snapshots(market_date=args.market_date, symbols=args.symbols)
     elif args.command == 'eod-action-summaries-compute':

@@ -48,6 +48,8 @@ What it does:
 - `GET /eod/action-summaries`
 - `POST /eod/signal-features/collect`
 - `GET /eod/signal-features`
+- `POST /eod/low-risk-factors/compute`
+- `GET /eod/low-risk-factors`
 
 ## Current runtime expectations
 - Core server should stay up 24/7.
@@ -55,7 +57,7 @@ What it does:
 - A background runner checks market state every 60 seconds while the API process is alive.
 - During `PREOPEN`, it refreshes the daily master if needed.
 - During `CLOSED`, after `EOD_AUTO_PYKRX_AFTER_CLOSE_MINUTES`, it schedules a thread-based pykrx daily EOD run if that trade date is available and not already completed.
-- Database persistence stores symbol master data, tracked symbols, quote cache/history, market status snapshots, EOD bars, EOD run records, persisted daily price contexts, daily technical/action snapshots, KIS daily signal features, persisted daily market participation context, and stored day-based trending ranks.
+- Database persistence stores symbol master data, tracked symbols, quote cache/history, market status snapshots, EOD bars, EOD run records, persisted daily price contexts, daily technical/action snapshots, KIS daily signal features, persisted daily low-risk factor results, persisted daily market participation context, and stored day-based trending ranks.
 
 ## Database bootstrap
 
@@ -97,9 +99,12 @@ Useful limited-scope runs:
 - Preferred internal daily auto path: `python3.11 -m app.internal.ops eod-pykrx-daily-run-if-due --market-date 2026-04-03 --force`
 - Manual technical snapshot rerun after EOD: `python3.11 -m app.eod.technical_snapshots --market-date 2026-04-07`
 - Manual action summary rerun after EOD: `python3.11 -m app.eod.action_summaries --market-date 2026-04-07`
+- Manual low-risk factor rerun from stored bars: `python3.11 -m app.internal.ops eod-low-risk-factors-compute --market-date 2026-04-23`
 - Manual stored trending rank rebuild after EOD: `python3.11 -m app.internal.ops eod-trending-ranks-compute --market-date 2026-04-07`
 - API-triggered technical snapshot rerun: `curl -X POST "http://127.0.0.1:8000/eod/technical-snapshots/compute?market_date=2026-04-07"`
 - API-triggered action summary rerun: `curl -X POST "http://127.0.0.1:8000/eod/action-summaries/compute?market_date=2026-04-07"`
+- API-triggered low-risk factor rerun: `curl -X POST "http://127.0.0.1:8000/eod/low-risk-factors/compute?market_date=2026-04-23"`
+- Persisted low-risk factor inspect: `curl "http://127.0.0.1:8000/eod/low-risk-factors?market_date=2026-04-23&symbol=005930"`
 - KIS ranking signal-feature collection: `python3.11 -m app.internal.ops kis-daily-signal-features-collect --market-date 2026-04-14`
 - Recent derived-context backfill: `python3.11 -m app.internal.ops agent-derived-contexts-backfill-recent`
 - API-triggered KIS ranking signal-feature collection: `curl -X POST "http://127.0.0.1:8000/eod/signal-features/collect?market_date=2026-04-14"`
@@ -114,6 +119,7 @@ Internal ops commands from `apps/api`:
 - `python3.11 -m app.internal.ops eod-pykrx-daily-run-if-due --market-date 2026-04-08 --force`
 - `python3.11 -m app.internal.ops eod-trending-ranks-compute --market-date 2026-04-08`
 - `python3.11 -m app.internal.ops eod-piotroski-filter-collect --market-date 2026-04-08`
+- `python3.11 -m app.internal.ops eod-low-risk-factors-compute --market-date 2026-04-23`
 - `python3.11 -m app.internal.ops dart-fundamentals-daily-run-if-due --market-date 2026-04-14 --symbol-limit 250 --capture-limit 500`
 - `python3.11 -m app.internal.ops kis-daily-signal-features-collect --market-date 2026-04-14`
 - `python3.11 -m app.internal.ops agent-derived-contexts-backfill-recent`
