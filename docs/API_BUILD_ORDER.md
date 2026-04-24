@@ -207,9 +207,9 @@
 - `daily_momentum_factor_results` is the DB-backed price-factor layer keyed by `symbol_id + market_date`.
 - `POST /eod/momentum-factors/compute` reads only stored `daily_price_bars`; it does not fetch a new upstream price series during the request.
 - V1 uses exact stored trading-bar offsets for 12-1 momentum: `close[t-21] / close[t-252] - 1`. Symbols with fewer than 253 stored bars still get persisted rows with moving-average and overheat fields where available, but they do not receive a momentum rank or percentile.
-- The route also stores `ma_60`, `ma_120`, `is_price_above_ma120`, `is_ma60_above_ma120`, `return_5d`, and `is_recent_overheated`, plus rule metadata and input references in `factor_payload` for later audit.
+- The route stores `ma_60`, `ma_120`, `is_price_above_ma120`, `is_ma60_above_ma120`, `return_5d`, `return_5d_rank`, `return_5d_percentile`, `return_5d_realized_volatility_20d`, `return_5d_vol_adjusted`, `is_return_5d_extreme`, `is_volatility_adjusted_overheated`, `is_recent_overheated`, and `overheat_rule_version`. The same values remain available inside `factor_payload` with rule metadata and audit references.
 - Cross-sectional `momentum_rank` and `momentum_percentile` are computed only across symbols in the selected compute universe that have non-null 12-1 momentum. Higher momentum receives a lower rank number and a higher percentile.
-- The default 5-day overheat exclusion is an absolute decimal-return rule: `return_5d >= 0.15`. The persisted payload records the rule type, lookback window, comparison, and threshold so later threshold changes are auditable.
+- The default 5-day overheat exclusion is `momentum_overheat_v2`: a symbol is marked overheated only when its 5-day return is cross-sectionally extreme, its volatility-adjusted 5-day acceleration exceeds the configured shock threshold, and the raw 5-day return clears a minimum absolute move. The persisted payload records the percentile threshold, the volatility-adjusted formula, the minimum-universe guardrail, and the threshold values so later tuning remains auditable.
 - The current scope is intentionally manual or operator-triggered rather than part of the steady-state pykrx pipeline stages. For shell-driven operations, use `python3.11 -m app.internal.ops eod-momentum-factors-compute --market-date YYYY-MM-DD` from `apps/api`.
 
 ## Daily value factor notes

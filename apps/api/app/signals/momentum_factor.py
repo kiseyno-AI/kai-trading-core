@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import math
 from dataclasses import dataclass
 from datetime import date
+from statistics import stdev
 from typing import Any, Iterable, Sequence
 
 from app.market_data_store import (
@@ -20,6 +22,7 @@ MOMENTUM_HISTORY_WINDOW = MOMENTUM_LOOKBACK_DAYS + 1
 MA_60_WINDOW = 60
 MA_120_WINDOW = 120
 OVERHEAT_LOOKBACK_DAYS = 5
+OVERHEAT_VOLATILITY_WINDOW_DAYS = 20
 
 
 def _normalize_market_date(value: str | date) -> str:
@@ -58,6 +61,12 @@ def _round(value: float | None, digits: int = 6) -> float | None:
     return round(float(value), digits)
 
 
+def _percentile_from_rank(rank: int, total: int) -> float:
+    if total <= 1:
+        return 1.0
+    return _round(1.0 - ((rank - 1) / (total - 1))) or 0.0
+
+
 def _moving_average(values: Sequence[float], window: int) -> float | None:
     if len(values) < window:
         return None
@@ -83,6 +92,35 @@ def _momentum_12_1(values: Sequence[float]) -> float | None:
     return (end_value / start_value) - 1.0
 
 
+def _realized_return_volatility(values: Sequence[float], *, window: int) -> float | None:
+    if len(values) < window + 1:
+        return None
+
+    observed_returns: list[float] = []
+    close_window = list(values[-(window + 1) :])
+    for previous_close, current_close in zip(close_window, close_window[1:]):
+        if previous_close <= 0:
+            return None
+        observed_returns.append((current_close / previous_close) - 1.0)
+    if len(observed_returns) < 2:
+        return None
+    return _round(stdev(observed_returns))
+
+
+def _volatility_adjusted_return(
+    return_value: float | None,
+    realized_volatility: float | None,
+    *,
+    lookback_days: int,
+) -> float | None:
+    if return_value is None or realized_volatility is None or realized_volatility <= 0:
+        return None
+    expected_scale = realized_volatility * math.sqrt(float(lookback_days))
+    if expected_scale <= 0:
+        return None
+    return _round(return_value / expected_scale)
+
+
 def _ordered_bars(bars: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(bars, key=lambda item: str(item['trade_date']))
 
@@ -102,23 +140,130 @@ def _sort_rows(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
 @dataclass(frozen=True, slots=True)
 class MomentumOverheatRule:
     lookback_days: int = OVERHEAT_LOOKBACK_DAYS
-    return_threshold: float = 0.15
-    rule_type: str = 'absolute_return_threshold'
+    volatility_window_days: int = OVERHEAT_VOLATILITY_WINDOW_DAYS
+    return_percentile_threshold: float = 0.98
+    volatility_adjusted_threshold: float = 2.25
+    minimum_absolute_return: float = 0.07
+    minimum_ranked_universe_size: int = 2
+    rule_version: str = 'momentum_overheat_v2'
+    rule_type: str = 'return_percentile_and_volatility_adjusted_acceleration'
     comparison: str = '>='
 
-    def classify(self, return_value: float | None) -> bool:
+    def has_sufficient_cross_sectional_context(self, ranked_universe_size: int) -> bool:
+        return ranked_universe_size >= self.minimum_ranked_universe_size
+
+    def is_return_5d_extreme(
+        self,
+        return_percentile: float | None,
+        *,
+        ranked_universe_size: int,
+    ) -> bool:
+        if return_percentile is None or not self.has_sufficient_cross_sectional_context(ranked_universe_size):
+            return False
+        return return_percentile >= self.return_percentile_threshold
+
+    def is_volatility_adjusted_overheated(self, volatility_adjusted_return: float | None) -> bool:
+        if volatility_adjusted_return is None:
+            return False
+        return volatility_adjusted_return >= self.volatility_adjusted_threshold
+
+    def passes_minimum_absolute_return(self, return_value: float | None) -> bool:
         if return_value is None:
             return False
-        return return_value >= self.return_threshold
+        return return_value >= self.minimum_absolute_return
+
+    def classify(
+        self,
+        *,
+        return_value: float | None,
+        return_percentile: float | None,
+        volatility_adjusted_return: float | None,
+        ranked_universe_size: int,
+    ) -> dict[str, bool]:
+        has_sufficient_cross_sectional_context = self.has_sufficient_cross_sectional_context(ranked_universe_size)
+        return_5d_extreme = self.is_return_5d_extreme(
+            return_percentile,
+            ranked_universe_size=ranked_universe_size,
+        )
+        volatility_adjusted_overheated = self.is_volatility_adjusted_overheated(volatility_adjusted_return)
+        minimum_absolute_return_met = self.passes_minimum_absolute_return(return_value)
+        return {
+            'has_sufficient_cross_sectional_context': has_sufficient_cross_sectional_context,
+            'is_return_5d_extreme': return_5d_extreme,
+            'is_volatility_adjusted_overheated': volatility_adjusted_overheated,
+            'passes_minimum_absolute_return': minimum_absolute_return_met,
+            'is_recent_overheated': bool(
+                return_5d_extreme
+                and volatility_adjusted_overheated
+                and minimum_absolute_return_met
+            ),
+        }
 
     def to_payload(self) -> dict[str, Any]:
         return {
+            'rule_version': self.rule_version,
             'rule_type': self.rule_type,
-            'comparison': self.comparison,
             'lookback_days': self.lookback_days,
-            'threshold': self.return_threshold,
-            'threshold_units': 'decimal_return',
+            'combine_operator': 'all_of',
+            'cross_sectional_percentile': {
+                'field': 'return_5d_percentile',
+                'comparison': self.comparison,
+                'threshold': self.return_percentile_threshold,
+                'threshold_units': '0_to_1_percentile',
+                'extreme_direction': 'higher_is_more_overheated',
+                'minimum_ranked_universe_size': self.minimum_ranked_universe_size,
+            },
+            'volatility_adjusted_return': {
+                'field': 'return_5d_vol_adjusted',
+                'comparison': self.comparison,
+                'threshold': self.volatility_adjusted_threshold,
+                'threshold_units': '5d_shock_multiple',
+                'formula': (
+                    'return_5d / (stdev(simple_daily_returns_over_20d) * sqrt(lookback_days))'
+                ),
+                'volatility_window_days': self.volatility_window_days,
+            },
+            'minimum_absolute_return': {
+                'field': 'return_5d',
+                'comparison': self.comparison,
+                'threshold': self.minimum_absolute_return,
+                'threshold_units': 'decimal_return',
+            },
         }
+
+
+def _with_overheat_audit_fields(item: dict[str, Any]) -> dict[str, Any]:
+    payload = item.get('factor_payload') or {}
+    returns = payload.get('returns') or {}
+    volatility = payload.get('volatility') or {}
+    overheat = payload.get('overheat') or {}
+    overheat_rule = payload.get('overheat_rule') or {}
+
+    enriched = dict(item)
+    enriched.setdefault('return_5d_rank', returns.get('return_5d_rank'))
+    enriched.setdefault('return_5d_percentile', returns.get('return_5d_percentile'))
+    enriched.setdefault('return_5d_ranked_universe_size', returns.get('return_5d_ranked_universe_size'))
+    enriched.setdefault(
+        'return_5d_realized_volatility_20d',
+        volatility.get('return_5d_realized_volatility_20d'),
+    )
+    enriched.setdefault('return_5d_vol_adjusted', volatility.get('return_5d_vol_adjusted'))
+    enriched.setdefault(
+        'has_sufficient_cross_sectional_context',
+        overheat.get('has_sufficient_cross_sectional_context'),
+    )
+    enriched.setdefault('is_return_5d_extreme', overheat.get('is_return_5d_extreme'))
+    enriched.setdefault(
+        'is_volatility_adjusted_overheated',
+        overheat.get('is_volatility_adjusted_overheated'),
+    )
+    enriched.setdefault(
+        'passes_minimum_absolute_return',
+        overheat.get('passes_minimum_absolute_return'),
+    )
+    enriched.setdefault('is_recent_overheated', overheat.get('is_recent_overheated'))
+    enriched.setdefault('overheat_rule_version', overheat_rule.get('rule_version'))
+    return enriched
 
 
 def build_daily_momentum_factor_rows(
@@ -146,11 +291,19 @@ def build_daily_momentum_factor_rows(
         ma_60 = _round(_moving_average(closes, MA_60_WINDOW))
         ma_120 = _round(_moving_average(closes, MA_120_WINDOW))
         return_5d = _round(_return_ratio(closes, selected_overheat_rule.lookback_days))
+        realized_volatility_20d = _realized_return_volatility(
+            closes,
+            window=selected_overheat_rule.volatility_window_days,
+        )
+        return_5d_vol_adjusted = _volatility_adjusted_return(
+            return_5d,
+            realized_volatility_20d,
+            lookback_days=selected_overheat_rule.lookback_days,
+        )
         momentum_12_1 = _round(_momentum_12_1(closes))
         has_sufficient_history = momentum_12_1 is not None
         is_price_above_ma120 = bool(ma_120 is not None and close_price > ma_120)
         is_ma60_above_ma120 = bool(ma_60 is not None and ma_120 is not None and ma_60 > ma_120)
-        is_recent_overheated = selected_overheat_rule.classify(return_5d)
 
         skip_index = len(bars) - (MOMENTUM_SKIP_WINDOW_DAYS + 1)
         lookback_index = len(bars) - (MOMENTUM_LOOKBACK_DAYS + 1)
@@ -165,10 +318,20 @@ def build_daily_momentum_factor_rows(
             'ma_120': ma_120,
             'momentum_12_1': momentum_12_1,
             'return_5d': return_5d,
+            'return_5d_rank': None,
+            'return_5d_percentile': None,
+            'return_5d_ranked_universe_size': 0,
+            'return_5d_realized_volatility_20d': realized_volatility_20d,
+            'return_5d_vol_adjusted': return_5d_vol_adjusted,
             'has_sufficient_history': has_sufficient_history,
             'is_price_above_ma120': is_price_above_ma120,
             'is_ma60_above_ma120': is_ma60_above_ma120,
-            'is_recent_overheated': is_recent_overheated,
+            'has_sufficient_cross_sectional_context': False,
+            'is_return_5d_extreme': False,
+            'is_volatility_adjusted_overheated': False,
+            'passes_minimum_absolute_return': False,
+            'overheat_rule_version': selected_overheat_rule.rule_version,
+            'is_recent_overheated': False,
             'momentum_rank': None,
             'momentum_percentile': None,
             'is_momentum_eligible': False,
@@ -211,11 +374,25 @@ def build_daily_momentum_factor_rows(
                 'returns': {
                     'momentum_12_1': momentum_12_1,
                     'return_5d': return_5d,
+                    'return_5d_rank': None,
+                    'return_5d_percentile': None,
+                    'return_5d_ranked_universe_size': 0,
                     'units': 'decimal_return',
+                },
+                'volatility': {
+                    'return_5d_realized_volatility_20d': realized_volatility_20d,
+                    'return_5d_vol_adjusted': return_5d_vol_adjusted,
+                    'daily_return_type': 'simple_close_to_close',
+                    'volatility_window_days': selected_overheat_rule.volatility_window_days,
+                    'return_5d_vol_adjusted_units': '5d_shock_multiple',
                 },
                 'overheat_rule': selected_overheat_rule.to_payload(),
                 'overheat': {
-                    'is_recent_overheated': is_recent_overheated,
+                    'has_sufficient_cross_sectional_context': False,
+                    'is_return_5d_extreme': False,
+                    'is_volatility_adjusted_overheated': False,
+                    'passes_minimum_absolute_return': False,
+                    'is_recent_overheated': False,
                 },
                 'eligibility_rule': {
                     'rule_name': 'trend_confirmed_and_not_recently_overheated',
@@ -242,6 +419,42 @@ def build_daily_momentum_factor_rows(
         }
         rows.append(row)
 
+    return_ranked_rows = sorted(
+        [row for row in rows if row['return_5d'] is not None],
+        key=lambda item: (-float(item['return_5d']), item['symbol']),
+    )
+    return_ranked_universe_size = len(return_ranked_rows)
+    for index, row in enumerate(return_ranked_rows, start=1):
+        row['return_5d_rank'] = index
+        row['return_5d_percentile'] = _percentile_from_rank(index, return_ranked_universe_size)
+        row['return_5d_ranked_universe_size'] = return_ranked_universe_size
+        row['factor_payload']['returns'].update(
+            {
+                'return_5d_rank': row['return_5d_rank'],
+                'return_5d_percentile': row['return_5d_percentile'],
+                'return_5d_ranked_universe_size': return_ranked_universe_size,
+            }
+        )
+
+    for row in rows:
+        row['return_5d_ranked_universe_size'] = return_ranked_universe_size
+        if row['return_5d_rank'] is None:
+            row['factor_payload']['returns']['return_5d_ranked_universe_size'] = return_ranked_universe_size
+        overheat_classification = selected_overheat_rule.classify(
+            return_value=row['return_5d'],
+            return_percentile=row['return_5d_percentile'],
+            volatility_adjusted_return=row['return_5d_vol_adjusted'],
+            ranked_universe_size=return_ranked_universe_size,
+        )
+        row['has_sufficient_cross_sectional_context'] = overheat_classification[
+            'has_sufficient_cross_sectional_context'
+        ]
+        row['is_return_5d_extreme'] = overheat_classification['is_return_5d_extreme']
+        row['is_volatility_adjusted_overheated'] = overheat_classification['is_volatility_adjusted_overheated']
+        row['passes_minimum_absolute_return'] = overheat_classification['passes_minimum_absolute_return']
+        row['is_recent_overheated'] = overheat_classification['is_recent_overheated']
+        row['factor_payload']['overheat'].update(overheat_classification)
+
     ranked_rows = sorted(
         [row for row in rows if row['momentum_12_1'] is not None],
         key=lambda item: (-float(item['momentum_12_1']), item['symbol']),
@@ -250,9 +463,8 @@ def build_daily_momentum_factor_rows(
     total_universe_size = len(rows)
 
     for index, row in enumerate(ranked_rows, start=1):
-        percentile = 1.0 if ranked_universe_size <= 1 else 1.0 - ((index - 1) / (ranked_universe_size - 1))
         row['momentum_rank'] = index
-        row['momentum_percentile'] = _round(percentile)
+        row['momentum_percentile'] = _percentile_from_rank(index, ranked_universe_size)
         row['is_momentum_eligible'] = bool(
             row['has_sufficient_history']
             and row['is_price_above_ma120']
@@ -281,6 +493,10 @@ def build_daily_momentum_factor_rows(
             'has_sufficient_history': row['has_sufficient_history'],
             'is_price_above_ma120': row['is_price_above_ma120'],
             'is_ma60_above_ma120': row['is_ma60_above_ma120'],
+            'has_sufficient_cross_sectional_context': row['has_sufficient_cross_sectional_context'],
+            'is_return_5d_extreme': row['is_return_5d_extreme'],
+            'is_volatility_adjusted_overheated': row['is_volatility_adjusted_overheated'],
+            'passes_minimum_absolute_return': row['passes_minimum_absolute_return'],
             'is_recent_overheated': row['is_recent_overheated'],
         }
 
@@ -333,7 +549,7 @@ class DailyMomentumFactorService:
         row = next(item for item in rows if item['symbol'] == normalized_symbol)
         if persist:
             upsert_daily_momentum_factor_result(row)
-        return row
+        return _with_overheat_audit_fields(row)
 
     def rebuild_for_market_date(
         self,
@@ -397,7 +613,7 @@ class DailyMomentumFactorService:
             'results_persisted': len(persisted_items),
             'results_failed': len(combined_failed_symbols),
             'failed_symbols': combined_failed_symbols[:50],
-            'items': persisted_items,
+            'items': [_with_overheat_audit_fields(item) for item in persisted_items],
         }
 
     def inspect(
@@ -409,11 +625,14 @@ class DailyMomentumFactorService:
     ) -> dict[str, Any]:
         normalized_market_date = date.fromisoformat(_normalize_market_date(market_date))
         requested_symbols = _normalize_symbols(symbols)
-        items = load_daily_momentum_factor_results(
-            market_date=normalized_market_date,
-            symbols=requested_symbols,
-            limit=limit,
-        )
+        items = [
+            _with_overheat_audit_fields(item)
+            for item in load_daily_momentum_factor_results(
+                market_date=normalized_market_date,
+                symbols=requested_symbols,
+                limit=limit,
+            )
+        ]
         matched_symbols = [item['symbol'] for item in items]
         matched_symbol_set = set(matched_symbols)
         return {
