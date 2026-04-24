@@ -28,6 +28,7 @@
 25. Daily value factor compute/read routes
 26. Daily beta factor compute/read routes
 27. Daily advanced value factor compute/read routes
+28. Daily composite factor compute/read routes
 
 ## Current routes
 - `POST /broker/kis/token`
@@ -84,6 +85,8 @@
 - `GET /eod/beta-factors?market_date=YYYY-MM-DD&symbol=005930`
 - `POST /eod/advanced-value-factors/compute?market_date=YYYY-MM-DD&symbols=005930,000660&source=advanced_value_v1`
 - `GET /eod/advanced-value-factors?market_date=YYYY-MM-DD&symbol=005930`
+- `POST /eod/composite-factors/compute?market_date=YYYY-MM-DD&symbols=005930,000660&source=composite_v1`
+- `GET /eod/composite-factors?market_date=YYYY-MM-DD&symbol=005930`
 - `GET /agent-context/symbol-day?market_date=YYYY-MM-DD&symbols=005930&symbols=000660&fs_div=CFS&disclosures_limit=5`
 - `POST /agent-context/feedback`
 - `POST /agent-context/feedback/dispatch`
@@ -267,6 +270,18 @@
 - Negative free cash flow remains a valid but unattractive `fcf_yield` input. Non-positive EBITDA and non-positive enterprise value are treated as explicit invalid EV/EBITDA cases rather than ranked values.
 - Auditability is explicit in `factor_payload`: the stored row keeps the selected annual snapshot metadata, matched DART input rows/highlights, component status flags, methodology assumptions, and the raw numerator/denominator pieces used to derive the final metrics.
 - For shell-driven operations, use `python3.11 -m app.internal.ops eod-advanced-value-factors-compute --market-date YYYY-MM-DD` from `apps/api`.
+
+## Composite factor notes
+- `daily_composite_factor_results` is the persisted integrated ranking layer keyed by `symbol_id + market_date`, built on top of the stored momentum, value v1, advanced value, low-risk, and beta slices.
+- `POST /eod/composite-factors/compute` reads only stored factor-result tables for the requested `market_date`; it does not backfill price bars, fundamentals, or factor slices during the request.
+- `GET /eod/composite-factors` is the persisted read API for that table. When `symbol` is provided, the route returns a single `item`; without `symbol`, it returns ordered `items` for the requested date.
+- The normalized score inputs are explicit and all point in the same direction: `momentum_percentile`, `value_score`, `advanced_value_score`, `low_risk_score`, and `low_beta_score` all mean higher is better.
+- The first-pass base weights are explicit and versioned: momentum `0.25`, value v1 `0.15`, advanced value `0.20`, low-risk `0.20`, and beta `0.20`.
+- Missing-input behavior is explicit: the composite layer renormalizes weights across available inputs only when the row has at least three valid factors, at least one valuation-family input (`value_v1` or `advanced_value`), and at least `0.60` of total base-weight coverage. Otherwise it persists `composite_score=null` with `composite_classification=insufficient_inputs`.
+- Hard exclusions are explicit and auditable: `momentum_recent_overheat` excludes symbols whose stored momentum row is flagged `is_recent_overheated=true`, and `low_risk_liquidity_floor` excludes symbols whose stored low-risk row fails `passes_liquidity_floor`.
+- Hard exclusions do not erase the integrated score. Rows can still store `composite_score`, `composite_rank`, and `composite_percentile` while `is_composite_eligible=false` and `composite_classification=hard_excluded` so operators can inspect both score quality and exclusion cause.
+- `factor_payload` keeps the input basis, base and applied weights, per-factor contributions, gate metadata, and the summary rank fields so downstream consumers can explain why a symbol landed where it did.
+- For shell-driven operations, use `python3.11 -m app.internal.ops eod-composite-factors-compute --market-date YYYY-MM-DD` from `apps/api`.
 
 ## Trending stocks read-layer notes
 - `GET /scanner/trending-stocks` is the compact web-facing read API for stored trending-stock candidates.

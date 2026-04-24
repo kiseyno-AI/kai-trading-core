@@ -5,7 +5,7 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Callable
 
-from sqlalchemy import Numeric, and_, cast, delete, func, select, text, update
+from sqlalchemy import Numeric, and_, case, cast, delete, func, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import aliased
 
@@ -15,6 +15,7 @@ from app.db_models import (
     DailyActionSummary,
     DailyAdvancedValueFactorResult,
     DailyBetaFactorResult,
+    DailyCompositeFactorResult,
     DailyLowRiskFactorResult,
     DailyMomentumFactorResult,
     DailyPiotroskiFilterResult,
@@ -2880,6 +2881,170 @@ def load_daily_advanced_value_factor_results(
             }
             for item, symbol, name_ko, market in rows
         ]
+
+
+def upsert_daily_composite_factor_result(result: dict) -> None:
+    refreshed_at = datetime.utcnow()
+    with session_scope() as session:
+        symbol = _get_symbol(session, result['symbol'])
+        if symbol is None:
+            symbol = Symbol(
+                symbol=result['symbol'],
+                market=result.get('market', 'KRX'),
+                name_ko=result.get('name_ko') or result['symbol'],
+                instrument_type='equity',
+                source=result.get('source', 'composite_v1'),
+                is_active=True,
+                last_refreshed_at=refreshed_at,
+            )
+            session.add(symbol)
+            session.flush()
+
+        values = {
+            'symbol_id': symbol.id,
+            'market_date': _normalize_trade_date(result['market_date']),
+            'source': result.get('source', 'composite_v1'),
+            'momentum_input': result.get('momentum_input'),
+            'value_input': result.get('value_input'),
+            'advanced_value_input': result.get('advanced_value_input'),
+            'low_risk_input': result.get('low_risk_input'),
+            'low_beta_input': result.get('low_beta_input'),
+            'momentum_contribution': result.get('momentum_contribution'),
+            'value_contribution': result.get('value_contribution'),
+            'advanced_value_contribution': result.get('advanced_value_contribution'),
+            'low_risk_contribution': result.get('low_risk_contribution'),
+            'low_beta_contribution': result.get('low_beta_contribution'),
+            'valid_factor_count': int(result.get('valid_factor_count') or 0),
+            'available_base_weight': result.get('available_base_weight') or 0.0,
+            'has_required_inputs': bool(result.get('has_required_inputs')),
+            'is_hard_excluded': bool(result.get('is_hard_excluded')),
+            'composite_score': result.get('composite_score'),
+            'composite_rank': result.get('composite_rank'),
+            'composite_percentile': result.get('composite_percentile'),
+            'composite_classification': result.get('composite_classification', 'insufficient_inputs'),
+            'is_composite_eligible': bool(result.get('is_composite_eligible')),
+            'factor_payload': result['factor_payload'],
+            'captured_at': refreshed_at,
+            'updated_at': refreshed_at,
+        }
+        statement = pg_insert(DailyCompositeFactorResult).values(values)
+        session.execute(
+            statement.on_conflict_do_update(
+                constraint='uq_daily_composite_factor_results_symbol_market_date',
+                set_={
+                    'source': statement.excluded.source,
+                    'momentum_input': statement.excluded.momentum_input,
+                    'value_input': statement.excluded.value_input,
+                    'advanced_value_input': statement.excluded.advanced_value_input,
+                    'low_risk_input': statement.excluded.low_risk_input,
+                    'low_beta_input': statement.excluded.low_beta_input,
+                    'momentum_contribution': statement.excluded.momentum_contribution,
+                    'value_contribution': statement.excluded.value_contribution,
+                    'advanced_value_contribution': statement.excluded.advanced_value_contribution,
+                    'low_risk_contribution': statement.excluded.low_risk_contribution,
+                    'low_beta_contribution': statement.excluded.low_beta_contribution,
+                    'valid_factor_count': statement.excluded.valid_factor_count,
+                    'available_base_weight': statement.excluded.available_base_weight,
+                    'has_required_inputs': statement.excluded.has_required_inputs,
+                    'is_hard_excluded': statement.excluded.is_hard_excluded,
+                    'composite_score': statement.excluded.composite_score,
+                    'composite_rank': statement.excluded.composite_rank,
+                    'composite_percentile': statement.excluded.composite_percentile,
+                    'composite_classification': statement.excluded.composite_classification,
+                    'is_composite_eligible': statement.excluded.is_composite_eligible,
+                    'factor_payload': statement.excluded.factor_payload,
+                    'captured_at': statement.excluded.captured_at,
+                    'updated_at': refreshed_at,
+                },
+            )
+        )
+
+
+def load_daily_composite_factor_results(
+    *,
+    market_date: str | date,
+    symbols: list[str] | None = None,
+    limit: int | None = None,
+) -> list[dict]:
+    classification_order = case(
+        (DailyCompositeFactorResult.composite_classification == 'eligible', 0),
+        (DailyCompositeFactorResult.composite_classification == 'watchlist', 1),
+        (DailyCompositeFactorResult.composite_classification == 'ineligible', 2),
+        (DailyCompositeFactorResult.composite_classification == 'hard_excluded', 3),
+        else_=4,
+    )
+    with session_scope() as session:
+        stmt = (
+            select(DailyCompositeFactorResult, Symbol.symbol, Symbol.name_ko, Symbol.market)
+            .join(Symbol, Symbol.id == DailyCompositeFactorResult.symbol_id)
+            .where(DailyCompositeFactorResult.market_date == _normalize_trade_date(market_date))
+            .order_by(
+                classification_order.asc(),
+                DailyCompositeFactorResult.composite_rank.asc().nullslast(),
+                Symbol.symbol.asc(),
+            )
+        )
+        if limit is not None:
+            stmt = stmt.limit(limit)
+        if symbols:
+            stmt = stmt.where(Symbol.symbol.in_(symbols))
+
+        rows = session.execute(stmt).all()
+        items: list[dict] = []
+        for item, symbol, name_ko, market in rows:
+            payload = item.factor_payload or {}
+            weights = payload.get('weights') if isinstance(payload, dict) else None
+            gates = payload.get('gates') if isinstance(payload, dict) else None
+            inputs = {
+                'momentum_percentile': _round_float(item.momentum_input, 6),
+                'value_score_v1': _round_float(item.value_input, 6),
+                'advanced_value_score': _round_float(item.advanced_value_input, 6),
+                'low_risk_score': _round_float(item.low_risk_input, 6),
+                'low_beta_score': _round_float(item.low_beta_input, 6),
+            }
+            contributions = {
+                'momentum': _round_float(item.momentum_contribution, 6),
+                'value_v1': _round_float(item.value_contribution, 6),
+                'advanced_value': _round_float(item.advanced_value_contribution, 6),
+                'low_risk': _round_float(item.low_risk_contribution, 6),
+                'beta': _round_float(item.low_beta_contribution, 6),
+            }
+            items.append(
+                {
+                    'symbol': symbol,
+                    'name_ko': name_ko,
+                    'market': market,
+                    'market_date': item.market_date.isoformat(),
+                    'source': item.source,
+                    'feature_version': item.source,
+                    'momentum_input': inputs['momentum_percentile'],
+                    'value_input': inputs['value_score_v1'],
+                    'advanced_value_input': inputs['advanced_value_score'],
+                    'low_risk_input': inputs['low_risk_score'],
+                    'low_beta_input': inputs['low_beta_score'],
+                    'momentum_contribution': contributions['momentum'],
+                    'value_contribution': contributions['value_v1'],
+                    'advanced_value_contribution': contributions['advanced_value'],
+                    'low_risk_contribution': contributions['low_risk'],
+                    'low_beta_contribution': contributions['beta'],
+                    'inputs': inputs,
+                    'weights': weights,
+                    'contributions': contributions,
+                    'gates': gates,
+                    'valid_factor_count': item.valid_factor_count,
+                    'available_base_weight': _round_float(item.available_base_weight, 6),
+                    'has_required_inputs': item.has_required_inputs,
+                    'is_hard_excluded': item.is_hard_excluded,
+                    'composite_score': _round_float(item.composite_score, 6),
+                    'composite_rank': item.composite_rank,
+                    'composite_percentile': _round_float(item.composite_percentile, 6),
+                    'composite_classification': item.composite_classification,
+                    'is_composite_eligible': item.is_composite_eligible,
+                    'factor_payload': item.factor_payload,
+                    'captured_at': item.captured_at.isoformat() if item.captured_at else None,
+                }
+            )
+        return items
 
 
 def load_daily_signal_feature_context_rows(
