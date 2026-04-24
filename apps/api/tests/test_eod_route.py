@@ -32,9 +32,30 @@ class FakeFreshnessService:
                 },
                 'fundamentals': {
                     'status': 'ready',
+                    'basis': 'same_day_snapshot_updates',
                     'symbols_total': 1,
                     'symbols_succeeded': 1,
                     'symbols_failed': 0,
+                    'current_run': {
+                        'basis': 'market_date_refresh_run',
+                        'market_date': '2026-04-10',
+                        'status': 'completed',
+                        'fs_div': 'CFS',
+                        'trigger': 'eod_pykrx_followup',
+                        'updated_at': '2026-04-10T07:31:55+00:00',
+                        'completed_at': '2026-04-10T07:31:55+00:00',
+                        'symbols_total': 1,
+                        'symbols_checked': 1,
+                        'symbols_succeeded': 1,
+                        'symbols_fresh': 0,
+                        'symbols_refreshed': 1,
+                        'symbols_failed': 0,
+                        'symbols_remaining': 0,
+                        'events_detected': 1,
+                        'events_captured': 1,
+                        'events_failed': 0,
+                        'error_message': None,
+                    },
                 },
             },
             'latest': {
@@ -57,6 +78,26 @@ class FakeFreshnessService:
                 'symbols_failed': 0,
                 'technical_market_date': '2026-04-10',
                 'action_market_date': '2026-04-10',
+                'fundamentals': {
+                    'basis': 'latest_available_refresh_run',
+                    'market_date': '2026-04-10',
+                    'status': 'completed',
+                    'fs_div': 'CFS',
+                    'trigger': 'eod_pykrx_followup',
+                    'updated_at': '2026-04-10T07:31:55+00:00',
+                    'completed_at': '2026-04-10T07:31:55+00:00',
+                    'symbols_total': 1,
+                    'symbols_checked': 1,
+                    'symbols_succeeded': 1,
+                    'symbols_fresh': 0,
+                    'symbols_refreshed': 1,
+                    'symbols_failed': 0,
+                    'symbols_remaining': 0,
+                    'events_detected': 1,
+                    'events_captured': 1,
+                    'events_failed': 0,
+                    'error_message': None,
+                },
             },
         }
 
@@ -582,12 +623,14 @@ class EODRouteTests(unittest.TestCase):
         self.assertEqual(payload['today']['price']['status'], 'ready')
         self.assertEqual(payload['today']['technical_analysis']['symbols_succeeded'], 3)
         self.assertEqual(payload['today']['fundamentals']['symbols_total'], 1)
+        self.assertEqual(payload['today']['fundamentals']['basis'], 'same_day_snapshot_updates')
         self.assertEqual(payload['latest']['trade_date'], '2026-04-10')
         self.assertEqual(payload['latest']['updated_at'], '2026-04-10T07:31:55+00:00')
         self.assertEqual(payload['latest']['total'], 3)
         self.assertEqual(payload['latest']['summary']['basis'], 'latest_eod_run_symbol_universe')
         self.assertEqual(payload['latest']['symbols_succeeded'], 3)
         self.assertEqual(payload['latest']['action_market_date'], '2026-04-10')
+        self.assertEqual(payload['latest']['fundamentals']['market_date'], '2026-04-10')
 
     def test_get_eod_pipeline_status_route_returns_service_payload(self):
         fake_service = FakePipelineStatusService()
