@@ -725,19 +725,20 @@ class OpenClawAgentClient:
                 }
             except AgentDispatchTerminalError as exc:
                 log_agent_feedback_event(
-                    'dispatch_batch_response_error',
+                    'subagent_spawn_error',
                     status='terminal',
                     request_run_id=request_run_id,
-                    dispatch_id=dispatch_id,
-                    attempt_id=attempt_id,
                     agent_name=spec.agent_name,
                     role=spec.role,
                     market_date=market_date.isoformat(),
-                    session_key=request_session_key,
-                    batch_symbols=batch_symbols,
-                    slot=slot,
+                    symbol=symbol,
+                    session_key=child_session_key,
                     error_type=type(exc).__name__,
                     error_message=str(exc),
+                    spawn_target={
+                        'url': url,
+                        'child_label': child_label,
+                    },
                 )
                 raise
             except Exception as exc:  # noqa: BLE001

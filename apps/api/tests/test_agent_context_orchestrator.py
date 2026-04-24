@@ -1098,6 +1098,54 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertEqual(mismatch_log['unexpected_symbols'], ['999999'])
         self.assertEqual(mismatch_log['missing_symbols'], [])
 
+    def test_spawn_symbol_subagent_terminal_error_logs_only_in_scope_fields(self):
+        http_calls = []
+        captured_logs = []
+        fake_settings = SimpleNamespace(
+            openclaw_base_url='https://openclaw.example',
+            openclaw_gateway_token='gateway-token',
+            openclaw_agent_timeout_seconds=30,
+            openclaw_agent_max_retries=0,
+            openclaw_agent_retry_backoff_seconds=0,
+            openclaw_agent_max_prompt_chars=0,
+        )
+
+        def fake_client_factory(*args, **kwargs):
+            return FakeHTTPClient(
+                response=FakeHTTPResponse(404, {'error': 'missing'}),
+                calls=http_calls,
+                **kwargs,
+            )
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            with patch('app.agent_context.orchestrator.httpx.Client', side_effect=fake_client_factory):
+                with patch.object(
+                    orchestrator_module,
+                    'log_agent_feedback_event',
+                    side_effect=lambda stage, **payload: captured_logs.append({'stage': stage, **payload}),
+                ):
+                    client = OpenClawAgentClient()
+                    with self.assertRaisesRegex(orchestrator_module.AgentDispatchTerminalError, 'sessions_spawn is not available'):
+                        client.spawn_symbol_subagent(
+                            spec=orchestrator_module.DISPATCH_SPECS[0],
+                            market_date=orchestrator_module.date.fromisoformat('2026-04-14'),
+                            symbol_item={'symbol': '005930'},
+                            request_run_id='symbol-run-2026-04-14-abc123',
+                        )
+
+        self.assertEqual(http_calls[0]['url'], 'https://openclaw.example/tools/invoke')
+        error_log = next(entry for entry in captured_logs if entry['stage'] == 'subagent_spawn_error')
+        self.assertEqual(error_log['status'], 'terminal')
+        self.assertEqual(error_log['request_run_id'], 'symbol-run-2026-04-14-abc123')
+        self.assertEqual(error_log['agent_name'], 'eod-summarizer')
+        self.assertEqual(error_log['role'], 'eod-summarizer')
+        self.assertEqual(error_log['symbol'], '005930')
+        self.assertTrue(str(error_log['session_key']).startswith('subagent-test/eod-summarizer/symbol-run-2026-04-14-abc123/005930-'))
+        self.assertEqual(error_log['error_type'], 'AgentDispatchTerminalError')
+        self.assertNotIn('dispatch_id', error_log)
+        self.assertNotIn('attempt_id', error_log)
+        self.assertEqual(error_log['spawn_target']['url'], 'https://openclaw.example/tools/invoke')
+
     def test_dispatch_for_symbols_logs_lifecycle_with_dispatch_correlation(self):
         service = AgentFeedbackOrchestrator()
         client = RecordingBatchClient()
