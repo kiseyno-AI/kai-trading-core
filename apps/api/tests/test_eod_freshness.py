@@ -1,7 +1,17 @@
 import unittest
-from datetime import datetime
+from datetime import date, datetime, timezone
 
-from app.eod.freshness import EODFreshnessService
+from sqlalchemy import delete, select
+
+from app.core.settings import settings
+from app.dart.fundamentals_store import DartFundamentalsRepository
+from app.db import session_scope
+from app.db_models import DartFundamentalsRefreshRun
+from app.eod import freshness as freshness_module
+from app.eod.freshness import (
+    EODFreshnessService,
+    LATEST_AVAILABLE_FUNDAMENTALS_RUN_STATUSES,
+)
 
 
 class _FakeMarketState:
@@ -10,6 +20,10 @@ class _FakeMarketState:
 
 class _FakeNextTradeDayMarketState:
     server_time = '2026-04-13T10:05:00+09:00'
+
+
+class _FakeDetachedRunRegressionMarketState:
+    server_time = '2099-12-31T18:05:00+09:00'
 
 
 def _latest_run(
@@ -606,3 +620,120 @@ class EODFreshnessServiceTests(unittest.TestCase):
         self.assertEqual(result['latest']['fundamentals']['status'], 'completed')
         self.assertEqual(result['latest']['fundamentals']['symbols_succeeded'], 180)
         self.assertEqual(result['latest']['fundamentals']['symbols_refreshed'], 0)
+
+
+class EODFreshnessServiceDatabaseTests(unittest.TestCase):
+    def setUp(self):
+        self.repository = DartFundamentalsRepository()
+        self.created_refresh_run_ids: list[int] = []
+
+    def tearDown(self):
+        if not self.created_refresh_run_ids:
+            return
+        with session_scope() as session:
+            session.execute(
+                delete(DartFundamentalsRefreshRun).where(
+                    DartFundamentalsRefreshRun.id.in_(self.created_refresh_run_ids)
+                )
+            )
+
+    def _create_completed_refresh_run(self, *, market_date: date) -> None:
+        fs_div = settings.dart_fundamentals_default_fs_div.strip().upper()
+        run_id = self.repository.create_refresh_run(
+            market_date=market_date,
+            trigger='test_eod_freshness_detached_refresh_run',
+            fs_div=fs_div,
+            force=False,
+            symbol_limit=25,
+            symbol_offset=0,
+            symbols_total=25,
+            run_metadata={'symbols_selected': 25},
+        )
+        self.created_refresh_run_ids.append(run_id)
+        self.repository.complete_refresh_run(
+            run_id,
+            status='completed_with_errors',
+            symbols_checked=20,
+            symbols_missing=2,
+            symbols_stale=4,
+            symbols_fresh=16,
+            symbols_refreshed=3,
+            symbols_failed=1,
+            events_detected=5,
+            events_captured=3,
+            events_failed=1,
+            error_message='one symbol failed',
+            run_metadata={
+                'symbols_selected': 25,
+                'last_progress_at': '2099-12-31T08:45:00+00:00',
+            },
+        )
+        with session_scope() as session:
+            row = session.execute(
+                select(DartFundamentalsRefreshRun).where(DartFundamentalsRefreshRun.id == run_id)
+            ).scalar_one()
+            row.started_at = datetime(2099, 12, 31, 8, 0, tzinfo=timezone.utc)
+            row.completed_at = datetime(2099, 12, 31, 8, 46, tzinfo=timezone.utc)
+
+    def test_read_serializes_latest_fundamentals_refresh_run_inside_session(self):
+        self._create_completed_refresh_run(market_date=date(2099, 12, 31))
+        service = EODFreshnessService(
+            market_state_loader=lambda: _FakeDetachedRunRegressionMarketState(),
+            latest_run_loader=lambda **_: None,
+            live_symbol_count_loader=lambda: 25,
+            daily_price_bar_count_loader=lambda _: 0,
+            daily_technical_snapshot_count_loader=lambda _: 0,
+            daily_action_summary_count_loader=lambda _: 0,
+            daily_fundamentals_count_loader=lambda _: {
+                'symbols_succeeded': 0,
+                'symbols_failed': 0,
+                'symbols_total': 0,
+            },
+            fundamentals_today_refresh_loader=freshness_module._load_today_fundamentals_refresh_run,
+            latest_fundamentals_refresh_loader=lambda: freshness_module._load_latest_fundamentals_refresh_run(
+                market_date='2099-12-31',
+                statuses=LATEST_AVAILABLE_FUNDAMENTALS_RUN_STATUSES,
+            ),
+            latest_price_trade_date_loader=lambda: None,
+            latest_price_bar_count_loader=lambda _: 0,
+            latest_technical_market_date_loader=lambda: None,
+            latest_action_market_date_loader=lambda: None,
+        )
+
+        result = service.read()
+
+        self.assertEqual(result['today']['trade_date'], '2099-12-31')
+        self.assertEqual(result['today']['fundamentals']['status'], 'missing')
+        self.assertEqual(
+            result['today']['fundamentals']['current_run']['basis'],
+            'market_date_refresh_run',
+        )
+        self.assertEqual(result['today']['fundamentals']['current_run']['market_date'], '2099-12-31')
+        self.assertEqual(result['today']['fundamentals']['current_run']['status'], 'partial')
+        self.assertEqual(
+            result['today']['fundamentals']['current_run']['updated_at'],
+            '2099-12-31T08:45:00+00:00',
+        )
+        self.assertEqual(result['today']['fundamentals']['current_run']['symbols_total'], 25)
+        self.assertEqual(result['today']['fundamentals']['current_run']['symbols_checked'], 20)
+        self.assertEqual(result['today']['fundamentals']['current_run']['symbols_succeeded'], 19)
+        self.assertEqual(result['today']['fundamentals']['current_run']['symbols_remaining'], 5)
+        self.assertEqual(result['today']['fundamentals']['current_run']['events_detected'], 5)
+        self.assertEqual(result['today']['fundamentals']['current_run']['events_failed'], 1)
+        self.assertEqual(
+            result['today']['fundamentals']['current_run']['error_message'],
+            'one symbol failed',
+        )
+        self.assertEqual(result['latest']['fundamentals']['basis'], 'latest_available_refresh_run')
+        self.assertEqual(result['latest']['fundamentals']['market_date'], '2099-12-31')
+        self.assertEqual(result['latest']['fundamentals']['status'], 'partial')
+        self.assertEqual(
+            result['latest']['fundamentals']['updated_at'],
+            '2099-12-31T08:45:00+00:00',
+        )
+        self.assertEqual(result['latest']['fundamentals']['symbols_total'], 25)
+        self.assertEqual(result['latest']['fundamentals']['symbols_checked'], 20)
+        self.assertEqual(result['latest']['fundamentals']['symbols_succeeded'], 19)
+        self.assertEqual(result['latest']['fundamentals']['symbols_fresh'], 16)
+        self.assertEqual(result['latest']['fundamentals']['symbols_refreshed'], 3)
+        self.assertEqual(result['latest']['fundamentals']['symbols_failed'], 1)

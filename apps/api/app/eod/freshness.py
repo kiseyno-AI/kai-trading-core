@@ -110,9 +110,9 @@ def _load_latest_fundamentals_refresh_run(
         row = session.execute(
             stmt.order_by(DartFundamentalsRefreshRun.started_at.desc(), DartFundamentalsRefreshRun.id.desc()).limit(1)
         ).scalar_one_or_none()
-    if row is None:
-        return None
-    return _serialize_fundamentals_refresh_run(row)
+        if row is None:
+            return None
+        return _serialize_fundamentals_refresh_run(row)
 
 
 def _load_today_fundamentals_refresh_run(market_date: str) -> dict[str, Any] | None:
