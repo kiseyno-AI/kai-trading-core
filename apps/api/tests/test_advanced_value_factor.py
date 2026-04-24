@@ -236,6 +236,33 @@ class AdvancedValueFactorMathTests(unittest.TestCase):
             '유형자산의 취득',
         )
 
+    def test_derive_annual_financial_context_excludes_disposal_rows_from_capex_matching(self) -> None:
+        snapshot = _snapshot(
+            '005930',
+            total_equity=1000,
+            total_liabilities=400,
+            operating_income=120,
+            operating_cash_flow=260,
+            cash=150,
+            capex_ppe=None,
+            depreciation_and_amortization=35,
+        )
+        snapshot.statement_rows.append(
+            _statement_row(
+                'capex_ppe_disposal',
+                statement_type='CF',
+                account_id='ifrs-full_PurchaseOfPropertyPlantAndEquipment',
+                account_name='유형자산의 처분',
+                amount=80,
+                row_order=2,
+            )
+        )
+
+        context = derive_annual_financial_context(snapshot)
+
+        self.assertIsNone(context['capital_expenditure'])
+        self.assertIsNone(context['audit']['matched_inputs']['capex_ppe'])
+
     def test_derive_annual_financial_context_sums_separate_depreciation_and_amortization_rows(self) -> None:
         snapshot = _snapshot(
             '000660',
@@ -550,6 +577,51 @@ class DailyAdvancedValueFactorServiceTests(unittest.TestCase):
         self.assertEqual(persisted['fcf_yield_rank'], 2)
         self.assertEqual(persisted['ev_to_ebitda_rank'], 2)
         self.assertEqual(persisted['advanced_value_rank'], 2)
+
+    def test_subset_rerun_short_circuits_when_requested_symbols_do_not_resolve(self) -> None:
+        service = DailyAdvancedValueFactorService()
+        market_date = date(2026, 4, 24)
+
+        with (
+            patch.object(service, '_load_inputs', return_value=([], [], ['999999'])) as load_inputs,
+            patch('app.signals.advanced_value_factor.upsert_daily_advanced_value_factor_result') as upsert,
+        ):
+            result = service.rebuild_for_market_date(market_date=market_date, symbols=['999999'])
+
+        load_inputs.assert_called_once_with(
+            market_date=market_date,
+            symbols=['999999'],
+        )
+        upsert.assert_not_called()
+        self.assertEqual(result['requested_symbols'], ['999999'])
+        self.assertEqual(result['matched_symbols'], [])
+        self.assertEqual(result['missing_symbols'], ['999999'])
+        self.assertEqual(result['results_persisted'], 0)
+        self.assertEqual(result['results_failed'], 0)
+        self.assertEqual(result['items'], [])
+        self.assertEqual(
+            result['summary'],
+            {
+                'requested_symbol_count': 1,
+                'matched_symbol_count': 0,
+                'missing_symbol_count': 1,
+                'symbols_with_market_date_bar': 0,
+                'symbols_with_annual_fundamentals': 0,
+                'fcf_yield_valid_count': 0,
+                'ev_to_ebitda_valid_count': 0,
+                'eligible_count': 0,
+                'watchlist_count': 0,
+                'ineligible_count': 0,
+                'insufficient_components_count': 0,
+                'insufficient_fundamentals_count': 0,
+                'missing_market_date_bar_count': 0,
+                'ranking_universe_counts': {
+                    'fcf_yield': 0,
+                    'ev_to_ebitda': 0,
+                    'advanced_value_score': 0,
+                },
+            },
+        )
 
     def test_inspect_returns_single_item_for_symbol(self) -> None:
         service = DailyAdvancedValueFactorService()

@@ -131,6 +131,7 @@ CAPEX_PPE_MATCHER = {
         '유형자산의처분',
         'disposalofpropertyplantandequipment',
     },
+    'reject_excluded_name_matches': True,
 }
 CAPEX_INTANGIBLE_MATCHER = {
     'statement_types': {'CF'},
@@ -153,6 +154,7 @@ CAPEX_INTANGIBLE_MATCHER = {
         '무형자산의처분',
         'disposalofintangibleassets',
     },
+    'reject_excluded_name_matches': True,
 }
 DEPRECIATION_AND_AMORTIZATION_MATCHER = {
     'statement_types': {'CF', 'IS', 'CIS'},
@@ -379,6 +381,8 @@ def _match_score(
     exact_name_match = account_name in normalized_account_names if account_name else False
     contains_name_match = bool(account_name) and any(token in account_name for token in normalized_account_name_contains)
     excluded_name_match = bool(account_name) and any(token in account_name for token in normalized_account_name_excludes)
+    if excluded_name_match and matcher.get('reject_excluded_name_matches'):
+        return None
 
     if not id_match and not exact_name_match and not contains_name_match:
         return None
@@ -668,6 +672,27 @@ class DailyAdvancedValueFactorService:
             market_date=normalized_market_date,
             symbols=normalized_symbols,
         )
+        if normalized_symbols is not None and not matched_symbols:
+            return {
+                'market_date': normalized_market_date.isoformat(),
+                'source': source,
+                'feature_version': source,
+                'requested_symbols': requested_symbols,
+                'matched_symbols': [],
+                'missing_symbols': missing_symbols,
+                'summary': self._build_summary(
+                    [],
+                    requested_symbols=requested_symbols,
+                    matched_symbols=[],
+                    missing_symbols=missing_symbols,
+                    universe_counts=EMPTY_RANKING_UNIVERSE_COUNTS,
+                ),
+                'results_persisted': 0,
+                'results_failed': 0,
+                'failed_symbols': [],
+                'failed_symbol_errors': [],
+                'items': [],
+            }
         ranking_inputs = inputs
         if normalized_symbols is not None:
             ranking_inputs, _, _ = self._load_inputs(
