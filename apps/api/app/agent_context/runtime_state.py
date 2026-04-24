@@ -22,8 +22,11 @@ class RuntimeFeedbackRunState:
     completed_at: datetime | None = None
     buffered_feedback_rows: list[dict[str, Any]] = field(default_factory=list)
     buffered_failures: list[dict[str, Any]] = field(default_factory=list)
+    pending_feedback_rows: list[dict[str, Any]] = field(default_factory=list)
+    pending_failures: list[dict[str, Any]] = field(default_factory=list)
     completed_symbols_by_role: dict[str, set[str]] = field(default_factory=dict)
     failed_symbols_by_role: dict[str, set[str]] = field(default_factory=dict)
+    reused_symbols_by_role: dict[str, set[str]] = field(default_factory=dict)
     in_flight_slots_by_role: dict[str, dict[int, dict[str, Any]]] = field(default_factory=dict)
     last_activity_at: datetime | None = None
     logical_total_symbols: int | None = None
@@ -34,10 +37,16 @@ class RuntimeFeedbackRunState:
     logical_completed_feedback_count: int | None = None
     logical_failed_items: int | None = None
     normalized_response_count: int | None = None
+    flushed_feedback_count: int = 0
+    flushed_failure_count: int = 0
 
     def to_progress_summary(self) -> dict[str, Any]:
         expected_feedback_count = self.logical_expected_feedback_count if self.logical_expected_feedback_count is not None else len(self.requested_symbols) * len(self.requested_roles)
-        completed_feedback_count = self.logical_completed_feedback_count if self.logical_completed_feedback_count is not None else len(self.buffered_feedback_rows)
+        completed_feedback_count = (
+            self.logical_completed_feedback_count
+            if self.logical_completed_feedback_count is not None
+            else sum(len(self.completed_symbols_by_role.get(role, set())) for role in self.requested_roles)
+        )
         total_symbols = self.logical_total_symbols if self.logical_total_symbols is not None else len(self.requested_symbols)
 
         if self.logical_completed_symbols is not None or self.logical_in_progress_symbols is not None or self.logical_pending_symbols is not None:
@@ -66,6 +75,7 @@ class RuntimeFeedbackRunState:
         for role in self.requested_roles:
             completed_for_role = len(self.completed_symbols_by_role.get(role, set()))
             failed_for_role = len(self.failed_symbols_by_role.get(role, set()))
+            reused_for_role = len(self.reused_symbols_by_role.get(role, set()))
             in_flight_symbols = set()
             for slot in self.in_flight_slots_by_role.get(role, {}).values():
                 for symbol in slot.get('symbols') or []:
@@ -90,6 +100,7 @@ class RuntimeFeedbackRunState:
                 'total_symbols': total_symbols,
                 'processed_symbols': processed_for_role,
                 'completed_symbols': completed_for_role,
+                'reused_symbols': reused_for_role,
                 'in_progress_symbols': len(in_flight_symbols),
                 'pending_symbols': pending_for_role,
                 'failed_items': failed_for_role,
@@ -138,6 +149,12 @@ class RuntimeFeedbackRunState:
             'failed_items': self.logical_failed_items if self.logical_failed_items is not None else len(self.buffered_failures),
             'completed_feedback_count': completed_feedback_count,
             'expected_feedback_count': expected_feedback_count,
+            'buffered_feedback_count': len(self.buffered_feedback_rows),
+            'buffered_failure_count': len(self.buffered_failures),
+            'pending_feedback_count': len(self.pending_feedback_rows),
+            'pending_failure_count': len(self.pending_failures),
+            'flushed_feedback_count': self.flushed_feedback_count,
+            'flushed_failure_count': self.flushed_failure_count,
             'completed_feedback_per_minute': completed_feedback_per_minute,
             'completed_symbols_per_minute': None,
             'estimated_remaining_seconds': estimated_remaining_seconds,

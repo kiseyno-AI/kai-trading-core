@@ -1,11 +1,12 @@
 # GET /agent-context/feedback/progress
 
 ## Summary
-Reports aggregate progress for the three-role symbol feedback workflow.
+Reports aggregate progress for the default four-role symbol feedback workflow.
 
 The response is now a stable coverage and liveness snapshot:
 - `total_symbols` uses the active symbol set with `daily_price_bars` for the requested market date, optionally narrowed to requested symbols
 - `result.market_date` echoes the requested market date, and `result.roles[role]` reports durable persisted `requested_count`, `completed_count`, and `error_count`
+- when a matching `agent_context_feedback_runs` row exists, summary fields prefer that durable run snapshot over ambiguous market-date-only runtime state
 - `run_status` indicates whether feedback appears to be actively moving, stalled, pending, or completed
 - `latest_feedback_at` and `seconds_since_last_feedback` help operators tell whether a run is still alive
 - `first_feedback_at`, `elapsed_seconds`, rates, and ETA fields are calculated only from feedback rows for the same target symbol universe used by the progress counts

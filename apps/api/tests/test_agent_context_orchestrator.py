@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 from app.agent_context import orchestrator as orchestrator_module
 from app.agent_context.orchestrator import AgentFeedbackOrchestrator
+from app.agent_context.runtime_state import RuntimeFeedbackStateStore
 
 
 def _batch_result(symbol: str) -> dict:
@@ -237,10 +238,12 @@ class SignalDeciderBatchClient:
 class FakeFeedbackService:
     def __init__(self):
         self.bulk_items = []
+        self.bulk_calls = []
         self.submitted = []
 
     def bulk_submit_feedback(self, *, items):
         self.bulk_items = list(items)
+        self.bulk_calls.append(list(items))
         return {'accepted': True, 'count': len(self.bulk_items), 'items': self.bulk_items}
 
     def submit_feedback(self, **kwargs):
@@ -262,6 +265,75 @@ class FakeSessionCleanupService:
     def delete_now(self, *, target):
         self.targets.append(target)
         return {'status': 'deleted', 'session_key': target.session_key}
+
+
+class RecordingFailureService:
+    def __init__(self):
+        self.recorded = []
+
+    def record_failure(self, **kwargs):
+        self.recorded.append(kwargs)
+        return {'id': len(self.recorded), **kwargs}
+
+
+class RecordingRunStateService:
+    def __init__(self):
+        self.started = []
+        self.checkpoints = []
+        self.finished = []
+
+    def start_run(self, **kwargs):
+        self.started.append(kwargs)
+        return {'ok': True, 'run_id': kwargs['run_id'], 'status': 'running'}
+
+    def checkpoint_run(self, **kwargs):
+        self.checkpoints.append(kwargs)
+        return {'ok': True, 'run_id': kwargs['run_id'], 'status': kwargs['status']}
+
+    def finish_run(self, **kwargs):
+        self.finished.append(kwargs)
+        return {'ok': True, 'run_id': kwargs['run_id'], 'status': kwargs['status']}
+
+
+class StrictRuntimeStateStore:
+    def __init__(self):
+        self._delegate = RuntimeFeedbackStateStore()
+        self.update_run_ids = []
+        self.get_run_ids = []
+
+    def start_run(self, state, *, replace=True, set_active=True, logical=False):
+        return self._delegate.start_run(state, replace=replace, set_active=set_active, logical=logical)
+
+    def get_run(self, market_date, run_id=None, logical=False):
+        if not logical and run_id is None:
+            raise AssertionError('expected explicit run_id for runtime get_run in normal dispatch')
+        if run_id is not None:
+            self.get_run_ids.append(run_id)
+        return self._delegate.get_run(market_date, run_id=run_id, logical=logical)
+
+    def update_run(self, market_date, updater, run_id=None, logical=False):
+        if not logical and run_id is None:
+            raise AssertionError('expected explicit run_id for runtime update_run in normal dispatch')
+        if run_id is not None:
+            self.update_run_ids.append(run_id)
+        return self._delegate.update_run(market_date, updater, run_id=run_id, logical=logical)
+
+
+class PartiallyFailingBatchClient(RecordingBatchClient):
+    def dispatch_batch(self, **kwargs):
+        with self._lock:
+            self.calls.append(kwargs)
+        spec = kwargs['spec']
+        batch_items = kwargs['batch_items']
+        if spec.role == 'technical-summarizer':
+            return {
+                'decoded': {'items': []},
+                'attempt': 1,
+                'started_at': '2026-04-14T01:00:00+00:00',
+                'completed_at': '2026-04-14T01:01:00+00:00',
+                'session_ref': {'session_key': batch_items[0]['session_key']},
+            }
+        return super().dispatch_batch(**kwargs)
 
 
 def _reuse_decision(should_dispatch: bool):
@@ -593,6 +665,119 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertNotIn('technical-summarizer', upstream_summaries)
         self.assertEqual(missing_roles, ['technical-summarizer'])
         self.assertEqual(upstream_traceability['eod-summarizer']['source'], 'current_run_buffer')
+
+    def test_dispatch_for_symbols_scopes_runtime_mutation_to_explicit_request_run_id(self):
+        service = AgentFeedbackOrchestrator()
+        service.client = RecordingBatchClient()
+        feedback_service = FakeFeedbackService()
+        cleanup_service = FakeSessionCleanupService()
+        failure_service = RecordingFailureService()
+        run_state_service = RecordingRunStateService()
+        runtime_store = StrictRuntimeStateStore()
+        fake_settings = SimpleNamespace(openclaw_agent_symbol_chunk_size=1, openclaw_agent_parallel_subtasks=2)
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            with patch.object(orchestrator_module, 'runtime_feedback_state_store', runtime_store):
+                with patch.object(orchestrator_module, 'agent_context_feedback_run_state_service', run_state_service):
+                    with patch.object(orchestrator_module, 'agent_context_read_service', DynamicFakeAgentContextReadService()):
+                        with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
+                            with patch.object(orchestrator_module, 'agent_context_feedback_failure_service', failure_service):
+                                with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
+                                    with patch.object(
+                                        orchestrator_module,
+                                        'load_daily_piotroski_filter_results',
+                                        return_value=_passed_filter_rows('005930'),
+                                    ):
+                                        result = service.dispatch_for_symbols(
+                                            market_date='2026-04-14',
+                                            symbols=['005930'],
+                                            roles=['eod-summarizer'],
+                                            reuse_existing=False,
+                                        )
+
+        request_run_id = result['request']['request_run_id']
+        self.assertEqual(set(runtime_store.update_run_ids), {request_run_id})
+        self.assertEqual(set(runtime_store.get_run_ids), {request_run_id})
+        self.assertEqual(run_state_service.started[0]['run_id'], request_run_id)
+        self.assertTrue(run_state_service.checkpoints)
+        self.assertEqual(run_state_service.finished[0]['run_id'], request_run_id)
+        self.assertEqual(run_state_service.finished[0]['status'], 'completed')
+
+    def test_dispatch_for_symbols_persists_partial_run_when_later_role_raises(self):
+        service = AgentFeedbackOrchestrator()
+        service.client = RecordingBatchClient()
+        feedback_service = FakeFeedbackService()
+        cleanup_service = FakeSessionCleanupService()
+        failure_service = RecordingFailureService()
+        run_state_service = RecordingRunStateService()
+        fake_settings = SimpleNamespace(openclaw_agent_symbol_chunk_size=1, openclaw_agent_parallel_subtasks=1)
+        original_prepare = service._prepare_role_dispatch_items
+
+        def breaking_prepare(*, role, **kwargs):
+            if role == 'technical-summarizer':
+                raise RuntimeError('boom')
+            return original_prepare(role=role, **kwargs)
+
+        with patch.object(service, '_prepare_role_dispatch_items', side_effect=breaking_prepare):
+            with patch.object(orchestrator_module, 'settings', fake_settings):
+                with patch.object(orchestrator_module, 'agent_context_feedback_run_state_service', run_state_service):
+                    with patch.object(orchestrator_module, 'agent_context_read_service', DynamicFakeAgentContextReadService()):
+                        with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
+                            with patch.object(orchestrator_module, 'agent_context_feedback_failure_service', failure_service):
+                                with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
+                                    with patch.object(
+                                        orchestrator_module,
+                                        'load_daily_piotroski_filter_results',
+                                        return_value=_passed_filter_rows('005930'),
+                                    ):
+                                        with self.assertRaisesRegex(RuntimeError, 'boom'):
+                                            service.dispatch_for_symbols(
+                                                market_date='2026-04-14',
+                                                symbols=['005930'],
+                                                roles=['eod-summarizer', 'technical-summarizer'],
+                                                reuse_existing=False,
+                                            )
+
+        self.assertEqual(len(feedback_service.bulk_calls), 1)
+        self.assertEqual(feedback_service.bulk_calls[0][0]['agent_name'], 'eod-summarizer')
+        self.assertEqual(run_state_service.finished[0]['status'], 'partial')
+        self.assertEqual(run_state_service.finished[0]['completed_count'], 1)
+        self.assertEqual(run_state_service.finished[0]['summary_payload']['lifecycle_stage'], 'finished')
+        self.assertIn('boom', run_state_service.finished[0]['summary_payload']['fatal_error'])
+
+    def test_dispatch_for_symbols_continues_to_later_roles_after_role_failures(self):
+        service = AgentFeedbackOrchestrator()
+        client = PartiallyFailingBatchClient()
+        service.client = client
+        feedback_service = FakeFeedbackService()
+        cleanup_service = FakeSessionCleanupService()
+        failure_service = RecordingFailureService()
+        run_state_service = RecordingRunStateService()
+        fake_settings = SimpleNamespace(openclaw_agent_symbol_chunk_size=1, openclaw_agent_parallel_subtasks=1)
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            with patch.object(orchestrator_module, 'agent_context_feedback_run_state_service', run_state_service):
+                with patch.object(orchestrator_module, 'agent_context_read_service', DynamicFakeAgentContextReadService()):
+                    with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
+                        with patch.object(orchestrator_module, 'agent_context_feedback_failure_service', failure_service):
+                            with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
+                                with patch.object(
+                                    orchestrator_module,
+                                    'load_daily_piotroski_filter_results',
+                                    return_value=_passed_filter_rows('005930', '000660'),
+                                ):
+                                    result = service.dispatch_for_symbols(
+                                        market_date='2026-04-14',
+                                        symbols=['005930', '000660'],
+                                        roles=['technical-summarizer', 'fundamental-summarizer'],
+                                        reuse_existing=False,
+                                    )
+
+        self.assertTrue(any(call['spec'].role == 'fundamental-summarizer' for call in client.calls))
+        self.assertEqual(result['summary']['status'], 'partial')
+        self.assertEqual(len(failure_service.recorded), 2)
+        self.assertEqual(run_state_service.finished[0]['status'], 'partial')
+        self.assertEqual(run_state_service.finished[0]['summary_payload']['role_statuses']['fundamental-summarizer'], 'completed')
 
 
 if __name__ == '__main__':

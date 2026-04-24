@@ -11,6 +11,28 @@ from app.db_models import AgentContextFeedbackRun
 
 
 class AgentContextFeedbackRunStateService:
+    @staticmethod
+    def _normalize_scope(values: list[str] | None) -> list[str]:
+        return sorted(list(values or []))
+
+    @staticmethod
+    def _serialize_run(row: AgentContextFeedbackRun) -> dict[str, Any]:
+        return {
+            'id': row.id,
+            'run_id': row.run_id,
+            'market_date': row.market_date,
+            'status': row.status,
+            'symbols_total': row.symbols_total,
+            'completed_count': row.completed_count,
+            'failed_count': row.failed_count,
+            'request_payload': row.request_payload,
+            'summary_payload': row.summary_payload,
+            'started_at': row.started_at,
+            'completed_at': row.completed_at,
+            'created_at': row.created_at,
+            'updated_at': row.updated_at,
+        }
+
     def start_run(
         self,
         *,
@@ -18,6 +40,7 @@ class AgentContextFeedbackRunStateService:
         market_date: date,
         symbols_total: int,
         request_payload: dict[str, Any],
+        summary_payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         now = datetime.now(timezone.utc)
         with session_scope() as session:
@@ -29,7 +52,7 @@ class AgentContextFeedbackRunStateService:
                 completed_count=0,
                 failed_count=0,
                 request_payload=request_payload,
-                summary_payload=None,
+                summary_payload=summary_payload,
                 started_at=now,
                 completed_at=None,
             )
@@ -42,7 +65,7 @@ class AgentContextFeedbackRunStateService:
                     'completed_count': 0,
                     'failed_count': 0,
                     'request_payload': request_payload,
-                    'summary_payload': None,
+                    'summary_payload': summary_payload,
                     'started_at': now,
                     'completed_at': None,
                     'updated_at': now,
@@ -51,7 +74,7 @@ class AgentContextFeedbackRunStateService:
             session.execute(stmt)
         return {'ok': True, 'run_id': run_id, 'status': 'running'}
 
-    def finish_run(
+    def checkpoint_run(
         self,
         *,
         run_id: str,
@@ -59,6 +82,7 @@ class AgentContextFeedbackRunStateService:
         completed_count: int,
         failed_count: int,
         summary_payload: dict[str, Any],
+        completed_at: datetime | None = None,
     ) -> dict[str, Any]:
         now = datetime.now(timezone.utc)
         with session_scope() as session:
@@ -69,9 +93,70 @@ class AgentContextFeedbackRunStateService:
             row.completed_count = completed_count
             row.failed_count = failed_count
             row.summary_payload = summary_payload
-            row.completed_at = now
+            row.completed_at = completed_at
             row.updated_at = now
         return {'ok': True, 'run_id': run_id, 'status': status}
+
+    def finish_run(
+        self,
+        *,
+        run_id: str,
+        status: str,
+        completed_count: int,
+        failed_count: int,
+        summary_payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        return self.checkpoint_run(
+            run_id=run_id,
+            status=status,
+            completed_count=completed_count,
+            failed_count=failed_count,
+            summary_payload=summary_payload,
+            completed_at=datetime.now(timezone.utc),
+        )
+
+    def get_run(self, *, run_id: str) -> dict[str, Any] | None:
+        with session_scope() as session:
+            row = session.execute(
+                select(AgentContextFeedbackRun).where(AgentContextFeedbackRun.run_id == run_id)
+            ).scalar_one_or_none()
+            if row is None:
+                return None
+            return self._serialize_run(row)
+
+    def find_latest_run(
+        self,
+        *,
+        market_date: date,
+        requested_symbols: list[str] | None = None,
+        requested_roles: list[str] | None = None,
+    ) -> dict[str, Any] | None:
+        with session_scope() as session:
+            serialized_rows = [
+                self._serialize_run(row)
+                for row in session.execute(
+                select(AgentContextFeedbackRun)
+                .where(AgentContextFeedbackRun.market_date == market_date)
+                .order_by(AgentContextFeedbackRun.started_at.desc(), AgentContextFeedbackRun.id.desc())
+                ).scalars().all()
+            ]
+
+        normalized_symbols = self._normalize_scope(requested_symbols)
+        normalized_roles = self._normalize_scope(requested_roles)
+        for row in serialized_rows:
+            request_payload = row.get('request_payload') if isinstance(row.get('request_payload'), dict) else {}
+            run_symbols = request_payload.get('symbols')
+            if not isinstance(run_symbols, list):
+                run_symbols = request_payload.get('requested_symbols')
+            run_roles = request_payload.get('roles')
+            if normalized_symbols:
+                if self._normalize_scope(run_symbols if isinstance(run_symbols, list) else None) != normalized_symbols:
+                    continue
+            if normalized_roles:
+                if self._normalize_scope(run_roles if isinstance(run_roles, list) else None) != normalized_roles:
+                    continue
+            return row
+        return None
 
 
 agent_context_feedback_run_state_service = AgentContextFeedbackRunStateService()
