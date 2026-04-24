@@ -258,6 +258,18 @@ class FakeFeedbackService:
         }
 
 
+class ObservingFeedbackService(FakeFeedbackService):
+    def __init__(self, runtime_store):
+        super().__init__()
+        self.runtime_store = runtime_store
+        self.observed_summaries = []
+
+    def bulk_submit_feedback(self, *, items):
+        snapshot = self.runtime_store.get_run(items[0]['market_date'], run_id=items[0]['run_id'])
+        self.observed_summaries.append(snapshot.to_progress_summary() if snapshot is not None else None)
+        return super().bulk_submit_feedback(items=items)
+
+
 class FakeSessionCleanupService:
     def __init__(self):
         self.targets = []
@@ -423,6 +435,91 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertEqual(cleanup_service.targets[0].session_key, client.calls[0]['batch_items'][0]['session_key'])
         self.assertEqual(result['summary']['flushed_to_db'], 2)
 
+    def test_symbol_dispatch_checkpoints_each_persisted_batch_and_leaves_final_flush_as_safety(self):
+        service = AgentFeedbackOrchestrator()
+        client = RecordingBatchClient()
+        service.client = client
+        feedback_service = FakeFeedbackService()
+        cleanup_service = FakeSessionCleanupService()
+        run_state_service = RecordingRunStateService()
+        fake_settings = SimpleNamespace(openclaw_agent_symbol_chunk_size=1, openclaw_agent_parallel_subtasks=1)
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            with patch.object(orchestrator_module, 'agent_context_feedback_run_state_service', run_state_service):
+                with patch.object(orchestrator_module, 'agent_context_read_service', DynamicFakeAgentContextReadService()):
+                    with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
+                        with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
+                            with patch.object(
+                                orchestrator_module,
+                                'load_daily_piotroski_filter_results',
+                                return_value=_passed_filter_rows('005930', '000660'),
+                            ):
+                                result = service.dispatch_for_symbols(
+                                    market_date='2026-04-14',
+                                    symbols=['005930', '000660'],
+                                    roles=['eod-summarizer'],
+                                    reuse_existing=False,
+                                )
+
+        batch_checkpoints = [
+            checkpoint
+            for checkpoint in run_state_service.checkpoints
+            if checkpoint['summary_payload']['lifecycle_stage'] == 'batch_persisted'
+        ]
+
+        self.assertEqual([len(call) for call in feedback_service.bulk_calls], [1, 1])
+        self.assertEqual(len(batch_checkpoints), 2)
+        self.assertEqual(
+            [checkpoint['summary_payload']['flush_result']['feedback_rows_seen'] for checkpoint in batch_checkpoints],
+            [1, 1],
+        )
+        self.assertTrue(
+            all(checkpoint['summary_payload']['flush_result']['status'] == 'feedback_flushed' for checkpoint in batch_checkpoints)
+        )
+        self.assertEqual(run_state_service.finished[0]['summary_payload']['flush_result']['status'], 'noop')
+        self.assertEqual(result['summary']['flushed_to_db'], 2)
+
+    def test_symbol_dispatch_progress_counts_only_persisted_feedback_between_batches(self):
+        service = AgentFeedbackOrchestrator()
+        client = RecordingBatchClient()
+        service.client = client
+        runtime_store = RuntimeFeedbackStateStore()
+        feedback_service = ObservingFeedbackService(runtime_store)
+        cleanup_service = FakeSessionCleanupService()
+        fake_settings = SimpleNamespace(openclaw_agent_symbol_chunk_size=1, openclaw_agent_parallel_subtasks=1)
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            with patch.object(orchestrator_module, 'runtime_feedback_state_store', runtime_store):
+                with patch.object(orchestrator_module, 'agent_context_read_service', DynamicFakeAgentContextReadService()):
+                    with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
+                        with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
+                            with patch.object(
+                                orchestrator_module,
+                                'load_daily_piotroski_filter_results',
+                                return_value=_passed_filter_rows('005930', '000660'),
+                            ):
+                                result = service.dispatch_for_symbols(
+                                    market_date='2026-04-14',
+                                    symbols=['005930', '000660'],
+                                    roles=['eod-summarizer'],
+                                    reuse_existing=False,
+                                )
+
+        self.assertEqual(len(feedback_service.observed_summaries), 2)
+        self.assertEqual(feedback_service.observed_summaries[0]['completed_feedback_count'], 0)
+        self.assertEqual(feedback_service.observed_summaries[0]['pending_feedback_count'], 1)
+        self.assertEqual(feedback_service.observed_summaries[0]['flushed_feedback_count'], 0)
+        self.assertEqual(feedback_service.observed_summaries[1]['completed_feedback_count'], 1)
+        self.assertEqual(feedback_service.observed_summaries[1]['buffered_feedback_count'], 1)
+        self.assertEqual(feedback_service.observed_summaries[1]['pending_feedback_count'], 1)
+        self.assertEqual(feedback_service.observed_summaries[1]['flushed_feedback_count'], 1)
+        self.assertEqual(
+            feedback_service.observed_summaries[1]['role_progress']['eod-summarizer']['completed_symbols'],
+            1,
+        )
+        self.assertEqual(result['summary']['completed'], 2)
+        self.assertEqual(result['summary']['flushed_to_db'], 2)
+
     def test_symbol_dispatch_uses_configured_parallel_subtasks(self):
         service = AgentFeedbackOrchestrator()
         client = RecordingBatchClient()
@@ -543,7 +640,10 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
             [submission['batch_items'][0]['symbol'] for submission in fake_executor.submissions],
             ['005930', '000660'],
         )
-        self.assertEqual([item['symbol'] for item in feedback_service.bulk_items], ['005930', '000660'])
+        self.assertEqual(
+            [item['symbol'] for call in feedback_service.bulk_calls for item in call],
+            ['005930', '000660'],
+        )
         self.assertEqual(len(cleanup_service.targets), 1)
         self.assertEqual(result['summary']['failed'], 0)
 
@@ -740,9 +840,17 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
 
         self.assertEqual(len(feedback_service.bulk_calls), 1)
         self.assertEqual(feedback_service.bulk_calls[0][0]['agent_name'], 'eod-summarizer')
+        batch_checkpoints = [
+            checkpoint
+            for checkpoint in run_state_service.checkpoints
+            if checkpoint['summary_payload']['lifecycle_stage'] == 'batch_persisted'
+        ]
+        self.assertEqual(len(batch_checkpoints), 1)
+        self.assertEqual(batch_checkpoints[0]['summary_payload']['flush_result']['feedback_rows_seen'], 1)
         self.assertEqual(run_state_service.finished[0]['status'], 'partial')
         self.assertEqual(run_state_service.finished[0]['completed_count'], 1)
         self.assertEqual(run_state_service.finished[0]['summary_payload']['lifecycle_stage'], 'finished')
+        self.assertEqual(run_state_service.finished[0]['summary_payload']['flush_result']['status'], 'noop')
         self.assertIn('boom', run_state_service.finished[0]['summary_payload']['fatal_error'])
 
     def test_dispatch_for_symbols_continues_to_later_roles_after_role_failures(self):
@@ -776,7 +884,19 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertTrue(any(call['spec'].role == 'fundamental-summarizer' for call in client.calls))
         self.assertEqual(result['summary']['status'], 'partial')
         self.assertEqual(len(failure_service.recorded), 2)
+        failure_checkpoints = [
+            checkpoint
+            for checkpoint in run_state_service.checkpoints
+            if checkpoint['summary_payload']['lifecycle_stage'] == 'batch_persisted'
+            and checkpoint['summary_payload']['flush_result']['failure_rows_seen'] > 0
+        ]
+        self.assertEqual(len(failure_checkpoints), 2)
+        self.assertEqual(
+            [checkpoint['summary_payload']['flush_result']['failure_rows_seen'] for checkpoint in failure_checkpoints],
+            [1, 1],
+        )
         self.assertEqual(run_state_service.finished[0]['status'], 'partial')
+        self.assertEqual(run_state_service.finished[0]['summary_payload']['flush_result']['status'], 'noop')
         self.assertEqual(run_state_service.finished[0]['summary_payload']['role_statuses']['fundamental-summarizer'], 'completed')
 
 

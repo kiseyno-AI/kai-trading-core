@@ -284,17 +284,22 @@ class AgentContextProgressService:
         failed_items = sum(len(failed_by_role.get(agent_name, set())) for agent_name in expected_agents)
 
         completed_roles_by_symbol: dict[str, set[str]] = defaultdict(set)
+        failed_roles_by_symbol: dict[str, set[str]] = defaultdict(set)
         for agent_name, symbols in completed_by_role.items():
             for symbol in symbols:
                 completed_roles_by_symbol[symbol].add(agent_name)
+        for agent_name, symbols in failed_by_role.items():
+            for symbol in symbols:
+                failed_roles_by_symbol[symbol].add(agent_name)
 
         completed_symbols = 0
         in_progress_symbols = 0
         for symbol in requested_symbols:
             completed_roles = completed_roles_by_symbol.get(symbol, set())
+            failed_roles = failed_roles_by_symbol.get(symbol, set())
             if len(completed_roles) == len(expected_agents) and expected_agents:
                 completed_symbols += 1
-            elif completed_roles:
+            elif completed_roles or failed_roles:
                 in_progress_symbols += 1
         pending_symbols = max(0, requested_count - completed_symbols - in_progress_symbols)
         processed_symbols = completed_symbols + in_progress_symbols
