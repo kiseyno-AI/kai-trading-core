@@ -31,10 +31,12 @@ def _is_abortlike_error(error: Any) -> bool:
 
 
 from app.agent_context.feedback_service import agent_context_feedback_service
+from app.agent_context.feedback_failure_service import agent_context_feedback_failure_service
 from app.agent_context.runtime_state import RuntimeFeedbackRunState, runtime_feedback_state_store
 from app.agent_context.payload_builder import agent_payload_builder
 from app.agent_context.read_service import agent_context_read_service
 from app.agent_context.roles import SIGNAL_DECIDER_AGENT_NAME, SUMMARIZER_AGENT_NAMES
+from app.agent_context.run_state_service import agent_context_feedback_run_state_service
 from app.agent_context.response_contract import build_contract_prompt_suffix, normalize_agent_response
 from app.agent_context.reuse_service import agent_context_reuse_service
 from app.agent_context.session_cleanup_service import SessionCleanupTarget, agent_feedback_session_cleanup_service
@@ -1207,6 +1209,175 @@ class AgentFeedbackOrchestrator:
             result['item']['session_cleanup'] = cleanup_result
         return result['item']
 
+    def _build_run_summary_payload(
+        self,
+        *,
+        market_date: date,
+        request_payload: dict[str, Any],
+        state: RuntimeFeedbackRunState,
+        lifecycle_stage: str,
+        current_role: str | None = None,
+        flush_result: dict[str, Any] | None = None,
+        fatal_error: str | None = None,
+    ) -> dict[str, Any]:
+        progress_summary = state.to_progress_summary()
+        role_progress = progress_summary.get('role_progress') if isinstance(progress_summary.get('role_progress'), dict) else {}
+        return {
+            'market_date': market_date.isoformat(),
+            'request': request_payload,
+            'lifecycle_stage': lifecycle_stage,
+            'current_role': current_role or state.current_role,
+            'role_sequence': list(state.role_sequence),
+            'role_statuses': {
+                role: role_payload.get('status')
+                for role, role_payload in role_progress.items()
+                if isinstance(role_payload, dict)
+            },
+            'progress_summary': progress_summary,
+            'buffered_feedback_count': len(state.buffered_feedback_rows),
+            'buffered_failure_count': len(state.buffered_failures),
+            'pending_feedback_count': len(state.pending_feedback_rows),
+            'pending_failure_count': len(state.pending_failures),
+            'flushed_feedback_count': state.flushed_feedback_count,
+            'flushed_failure_count': state.flushed_failure_count,
+            'reused_symbols_by_role': {
+                role: sorted(symbols)
+                for role, symbols in state.reused_symbols_by_role.items()
+            },
+            'flush_result': flush_result,
+            'fatal_error': fatal_error,
+            'last_activity_at': state.last_activity_at.isoformat() if state.last_activity_at else None,
+        }
+
+    def _checkpoint_run_state(
+        self,
+        *,
+        market_date: date,
+        request_run_id: str,
+        request_payload: dict[str, Any],
+        lifecycle_stage: str,
+        current_role: str | None = None,
+        status: str = 'running',
+        flush_result: dict[str, Any] | None = None,
+        fatal_error: str | None = None,
+    ) -> dict[str, Any]:
+        state = runtime_feedback_state_store.get_run(market_date, run_id=request_run_id)
+        if state is None:
+            raise RuntimeError(f'feedback runtime state missing for {request_run_id}')
+        summary_payload = self._build_run_summary_payload(
+            market_date=market_date,
+            request_payload=request_payload,
+            state=state,
+            lifecycle_stage=lifecycle_stage,
+            current_role=current_role,
+            flush_result=flush_result,
+            fatal_error=fatal_error,
+        )
+        completed_count = int(summary_payload['progress_summary'].get('completed_feedback_count') or 0)
+        failed_count = int(summary_payload['progress_summary'].get('failed_items') or 0)
+        return agent_context_feedback_run_state_service.checkpoint_run(
+            run_id=request_run_id,
+            status=status,
+            completed_count=completed_count,
+            failed_count=failed_count,
+            summary_payload=summary_payload,
+        )
+
+    def _flush_pending_run_buffers(
+        self,
+        *,
+        market_date: date,
+        request_run_id: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        state = runtime_feedback_state_store.get_run(market_date, run_id=request_run_id)
+        if state is None:
+            raise RuntimeError(f'feedback runtime state missing for {request_run_id}')
+
+        pending_feedback_rows = list(state.pending_feedback_rows)
+        pending_failures = list(state.pending_failures)
+        flush_result: dict[str, Any] = {
+            'reason': reason,
+            'feedback_rows_seen': len(pending_feedback_rows),
+            'failure_rows_seen': len(pending_failures),
+            'feedback_rows_persisted': 0,
+            'failure_rows_persisted': 0,
+            'feedback_error': None,
+            'failure_error': None,
+            'status': 'noop',
+        }
+        if not pending_feedback_rows and not pending_failures:
+            return flush_result
+
+        if pending_feedback_rows:
+            flush_payload = [
+                {
+                    'market_date': row['market_date'],
+                    'symbol': row['symbol'],
+                    'agent_name': row['agent_name'],
+                    'run_id': row['run_id'],
+                    'summary': row['summary'],
+                    'feedback': row['feedback'],
+                    'context': row['context'],
+                }
+                for row in pending_feedback_rows
+            ]
+            feedback_result = agent_context_feedback_service.bulk_submit_feedback(items=flush_payload)
+            self._cleanup_buffered_feedback_sessions(rows=pending_feedback_rows)
+
+            def _clear_feedback(current: RuntimeFeedbackRunState) -> None:
+                current.pending_feedback_rows = current.pending_feedback_rows[len(pending_feedback_rows):]
+                current.flushed_feedback_count += len(pending_feedback_rows)
+                current.last_activity_at = datetime.now(timezone.utc)
+
+            runtime_feedback_state_store.update_run(market_date, _clear_feedback, run_id=request_run_id)
+            flush_result['feedback_rows_persisted'] = int(feedback_result.get('count', 0))
+            flush_result['feedback_run_ids'] = [
+                item.get('agent', {}).get('run_id')
+                for item in feedback_result.get('items', [])
+                if isinstance(item, dict)
+            ]
+            flush_result['status'] = 'feedback_flushed'
+
+        if pending_failures:
+            persisted_failures = []
+            try:
+                for failure in pending_failures:
+                    persisted_failures.append(
+                        agent_context_feedback_failure_service.record_failure(
+                            market_date=market_date,
+                            symbol=str(failure.get('symbol') or ''),
+                            agent_name=str(failure.get('agent_name') or failure.get('role') or ''),
+                            run_id=request_run_id,
+                            failure_kind=str(failure.get('failure_kind') or failure.get('error') or 'dispatch_failed'),
+                            retryable=bool(failure.get('retryable', True)),
+                            summary={
+                                'role': failure.get('role'),
+                                'status': failure.get('status'),
+                                'error': failure.get('error'),
+                                'retryable': failure.get('retryable', True),
+                                'failure_kind': failure.get('failure_kind') or failure.get('error') or 'dispatch_failed',
+                            },
+                            context=failure.get('context') if isinstance(failure.get('context'), dict) else None,
+                        )
+                    )
+            except Exception as exc:  # noqa: BLE001
+                flush_result['failure_error'] = f'{type(exc).__name__}: {exc}'
+                flush_result['status'] = 'partial_flush_failed' if flush_result['feedback_rows_persisted'] else 'failed'
+                raise
+            else:
+                def _clear_failures(current: RuntimeFeedbackRunState) -> None:
+                    current.pending_failures = current.pending_failures[len(pending_failures):]
+                    current.flushed_failure_count += len(pending_failures)
+                    current.last_activity_at = datetime.now(timezone.utc)
+
+                runtime_feedback_state_store.update_run(market_date, _clear_failures, run_id=request_run_id)
+                flush_result['failure_rows_persisted'] = len(persisted_failures)
+                flush_result['failure_ids'] = [item.get('id') for item in persisted_failures if isinstance(item, dict)]
+                flush_result['status'] = 'flushed'
+
+        return flush_result
+
     def _dispatch_and_store(
         self,
         *,
@@ -1325,70 +1496,23 @@ class AgentFeedbackOrchestrator:
         request_run_id = f'symbol-run-{normalized_market_date.isoformat()}-{uuid.uuid4().hex[:10]}'
         batch_size = max(1, settings.openclaw_agent_symbol_chunk_size)
         role_parallelism = max(1, settings.openclaw_agent_parallel_subtasks)
-        if not dispatch_symbols:
-            return {
-                'request': {
-                    'market_date': normalized_market_date.isoformat(),
-                    'symbols': [],
-                    'requested_symbols': requested_symbols,
-                    'request_run_id': request_run_id,
-                    'roles': [spec.role for spec in specs],
-                    'fs_div': fs_div,
-                    'disclosures_limit': disclosures_limit,
-                    'symbol_chunk_size': batch_size,
-                    'parallel_subtasks': role_parallelism,
-                    'role_parallel_subtasks': role_parallelism,
-                    'total_parallel_subtasks': role_parallelism,
-                    'reuse_existing': reuse_existing,
-                    'scope': 'piotroski_passed_symbols_only',
-                    'skipped_symbols': skipped_symbols,
-                    'mode': 'role_sequential_runtime_buffered',
-                },
-                'summary': {
-                    'status': 'skipped',
-                    'completed': 0,
-                    'failed': 0,
-                    'skipped': len(skipped_symbols),
-                    'flushed_to_db': 0,
-                },
-                'items': [],
-                'failures': [],
-            }
-        reuse_decisions = {}
-        if reuse_existing and dispatch_symbols:
-            reuse_decisions = agent_context_reuse_service.build_latest_decisions(
-                market_date=normalized_market_date,
-                symbols=dispatch_symbols,
-                roles=[spec.role for spec in specs],
-            )
-        upstream_reuse_decisions = {}
-        if dispatch_symbols and any(spec.role == SIGNAL_DECIDER_AGENT_NAME for spec in specs):
-            upstream_reuse_decisions = agent_context_reuse_service.build_latest_decisions(
-                market_date=normalized_market_date,
-                symbols=dispatch_symbols,
-                roles=UPSTREAM_SUMMARY_ROLES,
-            )
-        symbols_requiring_context = dispatch_symbols
-        if reuse_decisions:
-            symbols_requiring_context = [
-                symbol
-                for symbol in dispatch_symbols
-                if any(
-                    decision is None or decision.should_dispatch
-                    for decision in (
-                        reuse_decisions.get(symbol, {}).get(spec.role)
-                        for spec in specs
-                    )
-                )
-            ]
-        symbol_context = {'items': []}
-        if symbols_requiring_context:
-            symbol_context = agent_context_read_service.get_symbol_day_context(
-                market_date=normalized_market_date,
-                symbols=symbols_requiring_context,
-                fs_div=fs_div,
-                disclosures_limit=disclosures_limit,
-            )
+        request_payload = {
+            'market_date': normalized_market_date.isoformat(),
+            'symbols': list(dispatch_symbols),
+            'requested_symbols': requested_symbols,
+            'request_run_id': request_run_id,
+            'roles': [spec.role for spec in specs],
+            'fs_div': fs_div,
+            'disclosures_limit': disclosures_limit,
+            'symbol_chunk_size': batch_size,
+            'parallel_subtasks': role_parallelism,
+            'role_parallel_subtasks': role_parallelism,
+            'total_parallel_subtasks': role_parallelism,
+            'reuse_existing': reuse_existing,
+            'scope': 'piotroski_passed_symbols_only',
+            'skipped_symbols': skipped_symbols,
+            'mode': 'role_sequential_runtime_buffered',
+        }
         state = RuntimeFeedbackRunState(
             run_id=request_run_id,
             market_date=normalized_market_date,
@@ -1401,6 +1525,19 @@ class AgentFeedbackOrchestrator:
             current_role=specs[0].role if specs else None,
         )
         runtime_feedback_state_store.start_run(state)
+        agent_context_feedback_run_state_service.start_run(
+            run_id=request_run_id,
+            market_date=normalized_market_date,
+            symbols_total=len(dispatch_symbols),
+            request_payload=request_payload,
+            summary_payload=self._build_run_summary_payload(
+                market_date=normalized_market_date,
+                request_payload=request_payload,
+                state=state,
+                lifecycle_stage='run_started',
+                current_role=state.current_role,
+            ),
+        )
         _feedback_runtime_log(
             'run_started',
             market_date=normalized_market_date.isoformat(),
@@ -1415,6 +1552,7 @@ class AgentFeedbackOrchestrator:
         def mark_activity(role: str, slot: int, batch_symbols: list[str] | None = None, done: bool = False) -> None:
             def _update(current: RuntimeFeedbackRunState) -> None:
                 current.current_role = role
+                current.status = 'running'
                 current.last_activity_at = datetime.now(timezone.utc)
                 role_slots = current.in_flight_slots_by_role.setdefault(role, {})
                 if done:
@@ -1424,7 +1562,7 @@ class AgentFeedbackOrchestrator:
                         'symbols': batch_symbols or [],
                         'updated_at': current.last_activity_at.isoformat(),
                     }
-            runtime_feedback_state_store.update_run(normalized_market_date, _update)
+            runtime_feedback_state_store.update_run(normalized_market_date, _update, run_id=request_run_id)
             _feedback_runtime_log(
                 'slot_activity',
                 market_date=normalized_market_date.isoformat(),
@@ -1435,24 +1573,46 @@ class AgentFeedbackOrchestrator:
                 done=done,
             )
 
+        def mark_reused(role: str, symbols_to_reuse: Sequence[str]) -> None:
+            reused_symbols = list(symbols_to_reuse)
+            if not reused_symbols:
+                return
+
+            def _update(current: RuntimeFeedbackRunState) -> None:
+                current.current_role = role
+                current.status = 'running'
+                current.last_activity_at = datetime.now(timezone.utc)
+                current.completed_symbols_by_role.setdefault(role, set()).update(reused_symbols)
+                current.reused_symbols_by_role.setdefault(role, set()).update(reused_symbols)
+
+            runtime_feedback_state_store.update_run(normalized_market_date, _update, run_id=request_run_id)
+            _feedback_runtime_log(
+                'reuse_applied',
+                market_date=normalized_market_date.isoformat(),
+                request_run_id=request_run_id,
+                role=role,
+                reused_symbols=reused_symbols,
+            )
+
         def buffer_success(role: str, symbol: str, context: dict[str, Any], response: dict[str, Any]) -> None:
             normalized_feedback = response.get('normalized_feedback')
+
             def _update(current: RuntimeFeedbackRunState) -> None:
                 current.last_activity_at = datetime.now(timezone.utc)
-                current.buffered_feedback_rows.append(
-                    {
-                        'market_date': normalized_market_date,
-                        'symbol': symbol,
-                        'agent_name': role,
-                        'run_id': request_run_id,
-                        'summary': jsonable_encoder(response),
-                        'feedback': normalized_feedback if isinstance(normalized_feedback, dict) else {},
-                        'context': jsonable_encoder(context),
-                    }
-                )
+                stored_row = {
+                    'market_date': normalized_market_date,
+                    'symbol': symbol,
+                    'agent_name': role,
+                    'run_id': request_run_id,
+                    'summary': jsonable_encoder(response),
+                    'feedback': normalized_feedback if isinstance(normalized_feedback, dict) else {},
+                    'context': jsonable_encoder(context),
+                }
+                current.buffered_feedback_rows.append(stored_row)
+                current.pending_feedback_rows.append(stored_row)
                 current.completed_symbols_by_role.setdefault(role, set()).add(symbol)
-            runtime_feedback_state_store.update_run(normalized_market_date, _update)
-            snapshot = runtime_feedback_state_store.get_run(normalized_market_date)
+            runtime_feedback_state_store.update_run(normalized_market_date, _update, run_id=request_run_id)
+            snapshot = runtime_feedback_state_store.get_run(normalized_market_date, run_id=request_run_id)
             _feedback_runtime_log(
                 'buffer_state_after_success',
                 market_date=normalized_market_date.isoformat(),
@@ -1464,22 +1624,33 @@ class AgentFeedbackOrchestrator:
                 completed_symbols_by_role={k: len(v) for k, v in snapshot.completed_symbols_by_role.items()} if snapshot else None,
             )
 
-        def buffer_failure(role: str, symbol: str, error: str, retryable: bool) -> None:
+        def buffer_failure(
+            role: str,
+            symbol: str,
+            error: str,
+            retryable: bool,
+            *,
+            context: dict[str, Any] | None = None,
+            agent_name: str | None = None,
+        ) -> None:
             def _update(current: RuntimeFeedbackRunState) -> None:
                 current.last_activity_at = datetime.now(timezone.utc)
-                current.buffered_failures.append(
-                    {
-                        'role': role,
-                        'agent_name': role,
-                        'symbol': symbol,
-                        'status': 'failed',
-                        'retryable': retryable,
-                        'error': error,
-                    }
-                )
+                failure_row = {
+                    'role': role,
+                    'agent_name': agent_name or role,
+                    'symbol': symbol,
+                    'status': 'failed',
+                    'retryable': retryable,
+                    'error': error,
+                    'failure_kind': error,
+                    'context': jsonable_encoder(context) if isinstance(context, dict) else None,
+                }
+                current.buffered_failures.append(failure_row)
+                current.pending_failures.append(failure_row)
                 current.failed_symbols_by_role.setdefault(role, set()).add(symbol)
-            runtime_feedback_state_store.update_run(normalized_market_date, _update)
-            snapshot = runtime_feedback_state_store.get_run(normalized_market_date)
+
+            runtime_feedback_state_store.update_run(normalized_market_date, _update, run_id=request_run_id)
+            snapshot = runtime_feedback_state_store.get_run(normalized_market_date, run_id=request_run_id)
             _feedback_runtime_log(
                 'buffer_state_after_failure',
                 market_date=normalized_market_date.isoformat(),
@@ -1495,247 +1666,403 @@ class AgentFeedbackOrchestrator:
 
         all_items: list[dict[str, Any]] = []
         all_failures: list[dict[str, Any]] = []
-        for spec in specs:
-            role = spec.role
-            state.current_role = role
-            dispatch_items = self._prepare_role_dispatch_items(
-                role=role,
-                market_date=normalized_market_date,
-                request_run_id=request_run_id,
-                symbol_context_items=symbol_context['items'],
-                reuse_decisions=reuse_decisions,
-                upstream_reuse_decisions=upstream_reuse_decisions,
-                all_failures=all_failures,
-                buffer_failure=buffer_failure,
-            )
-            indexed_batches = [dispatch_items[i:i + batch_size] for i in range(0, len(dispatch_items), batch_size)]
-            queue: list[tuple[int, list[dict[str, Any]]]] = []
-            for batch_index, batch in enumerate(indexed_batches):
-                slot = (batch_index % role_parallelism) + 1
-                stable_session_key = f"agent:{spec.agent_name}:{_feedback_session_key(agent_name=spec.agent_name, slot=slot)}"
-                batch_with_session = [
-                    {
-                        **batch_item,
-                        'session_slot': slot,
-                        'session_key': stable_session_key,
-                    }
-                    for batch_item in batch
-                ]
-                queue.append((slot, batch_with_session))
-                _feedback_runtime_log(
-                    'queue_batch',
-                    market_date=normalized_market_date.isoformat(),
+        symbol_context = {'items': []}
+        response_payload: dict[str, Any] | None = None
+        raised_exception: Exception | None = None
+        finalization_error: Exception | None = None
+        final_status = 'failed'
+        final_flush_result: dict[str, Any] | None = None
+
+        try:
+            if not dispatch_symbols:
+                final_status = 'completed'
+                response_payload = {
+                    'request': request_payload,
+                    'summary': {
+                        'status': 'skipped',
+                        'completed': 0,
+                        'failed': 0,
+                        'skipped': len(skipped_symbols),
+                        'flushed_to_db': 0,
+                    },
+                    'items': [],
+                    'failures': [],
+                }
+            else:
+                reuse_decisions = {}
+                if reuse_existing:
+                    reuse_decisions = agent_context_reuse_service.build_latest_decisions(
+                        market_date=normalized_market_date,
+                        symbols=dispatch_symbols,
+                        roles=[spec.role for spec in specs],
+                    )
+                upstream_reuse_decisions = {}
+                if any(spec.role == SIGNAL_DECIDER_AGENT_NAME for spec in specs):
+                    upstream_reuse_decisions = agent_context_reuse_service.build_latest_decisions(
+                        market_date=normalized_market_date,
+                        symbols=dispatch_symbols,
+                        roles=UPSTREAM_SUMMARY_ROLES,
+                    )
+                symbols_requiring_context = dispatch_symbols
+                if reuse_decisions:
+                    symbols_requiring_context = [
+                        symbol
+                        for symbol in dispatch_symbols
+                        if any(
+                            decision is None or decision.should_dispatch
+                            for decision in (
+                                reuse_decisions.get(symbol, {}).get(spec.role)
+                                for spec in specs
+                            )
+                        )
+                    ]
+                if symbols_requiring_context:
+                    symbol_context = agent_context_read_service.get_symbol_day_context(
+                        market_date=normalized_market_date,
+                        symbols=symbols_requiring_context,
+                        fs_div=fs_div,
+                        disclosures_limit=disclosures_limit,
+                    )
+                self._checkpoint_run_state(
+                    market_date=normalized_market_date,
                     request_run_id=request_run_id,
-                    role=role,
-                    slot=slot,
-                    session_key=stable_session_key,
-                    batch_symbols=[str(item.get('symbol')) for item in batch_with_session],
+                    request_payload=request_payload,
+                    lifecycle_stage='dispatch_initialized',
+                    current_role=state.current_role,
+                    status='running',
                 )
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=role_parallelism) as executor:
-                future_map: dict[concurrent.futures.Future[dict[str, Any]], tuple[int, list[dict[str, Any]]]] = {}
+                for spec in specs:
+                    role = spec.role
 
-                def submit_next() -> None:
-                    if not queue:
-                        return
-                    slot, batch = queue.pop(0)
-                    mark_activity(role, slot, [item['symbol'] for item in batch], done=False)
-                    future = executor.submit(
-                        self._get_client().dispatch_batch,
-                        spec=spec,
-                        market_date=normalized_market_date,
-                        batch_items=batch,
+                    def _set_current_role(current: RuntimeFeedbackRunState) -> None:
+                        current.current_role = role
+                        current.status = 'running'
+                        current.last_activity_at = datetime.now(timezone.utc)
+
+                    runtime_feedback_state_store.update_run(
+                        normalized_market_date,
+                        _set_current_role,
+                        run_id=request_run_id,
                     )
-                    future_map[future] = (slot, batch)
+                    self._checkpoint_run_state(
+                        market_date=normalized_market_date,
+                        request_run_id=request_run_id,
+                        request_payload=request_payload,
+                        lifecycle_stage='role_started',
+                        current_role=role,
+                        status='running',
+                    )
 
-                for _ in range(min(role_parallelism, len(queue))):
-                    submit_next()
+                    reused_symbols = [
+                        symbol
+                        for symbol in dispatch_symbols
+                        if (reuse_decisions.get(symbol, {}).get(role) is not None)
+                        and not reuse_decisions[symbol][role].should_dispatch
+                    ]
+                    mark_reused(role, reused_symbols)
 
-                while future_map:
-                    done, _ = concurrent.futures.wait(list(future_map.keys()), return_when=concurrent.futures.FIRST_COMPLETED)
-                    for future in done:
-                        slot, batch = future_map.pop(future)
-                        try:
-                            batch_result = future.result()
-                            decoded_items = batch_result.get('decoded', {}).get('items', [])
-                            by_symbol = {
-                                item['symbol']: item for item in decoded_items if isinstance(item, dict) and item.get('symbol')
+                    dispatch_items = self._prepare_role_dispatch_items(
+                        role=role,
+                        market_date=normalized_market_date,
+                        request_run_id=request_run_id,
+                        symbol_context_items=symbol_context['items'],
+                        reuse_decisions=reuse_decisions,
+                        upstream_reuse_decisions=upstream_reuse_decisions,
+                        all_failures=all_failures,
+                        buffer_failure=buffer_failure,
+                    )
+                    indexed_batches = [dispatch_items[i:i + batch_size] for i in range(0, len(dispatch_items), batch_size)]
+                    queue: list[tuple[int, list[dict[str, Any]]]] = []
+                    for batch_index, batch in enumerate(indexed_batches):
+                        slot = (batch_index % role_parallelism) + 1
+                        stable_session_key = f"agent:{spec.agent_name}:{_feedback_session_key(agent_name=spec.agent_name, slot=slot)}"
+                        batch_with_session = [
+                            {
+                                **batch_item,
+                                'session_slot': slot,
+                                'session_key': stable_session_key,
                             }
-                            for source_item in batch:
-                                symbol = source_item['symbol']
-                                feedback_candidate = by_symbol.get(symbol, {}).get('feedback')
-                                if not feedback_candidate:
-                                    failure = {
-                                        'role': role,
-                                        'agent_name': spec.agent_name,
-                                        'symbol': symbol,
-                                        'status': 'failed',
-                                        'retryable': True,
-                                        'error': 'missing_batch_feedback',
-                                    }
-                                    all_failures.append(failure)
-                                    buffer_failure(role, symbol, 'missing_batch_feedback', True)
-                                    _feedback_runtime_log(
-                                        'buffer_failure',
-                                        market_date=normalized_market_date.isoformat(),
-                                        request_run_id=request_run_id,
-                                        role=role,
-                                        agent_name=spec.agent_name,
-                                        symbol=symbol,
-                                        error='missing_batch_feedback',
-                                        batch_result=batch_result,
-                                    )
-                                    continue
-                                normalized_feedback = normalize_agent_response(
-                                    role=spec.role,
-                                    output_text=json.dumps(feedback_candidate, ensure_ascii=False),
-                                    raw_response=feedback_candidate if isinstance(feedback_candidate, dict) else {'feedback': feedback_candidate},
-                                    market_date=source_item.get('market_date') or normalized_market_date.isoformat(),
-                                    symbol=symbol,
-                                    agent_name=spec.agent_name,
-                                )
-                                response_payload = _build_response_storage_payload(
-                                    spec=spec,
-                                    batch_result=batch_result,
-                                    normalized_feedback=normalized_feedback,
-                                    collector_mode='role_sequential_runtime_buffered',
-                                )
-                                buffer_success(spec.agent_name, symbol, source_item, response_payload)
-                                _feedback_runtime_log(
-                                    'buffer_success',
-                                    market_date=normalized_market_date.isoformat(),
-                                    request_run_id=request_run_id,
-                                    role=role,
-                                    agent_name=spec.agent_name,
-                                    symbol=symbol,
-                                    response_payload=response_payload,
-                                    source_item=source_item,
-                                )
-                                all_items.append(
-                                    {
-                                        'role': role,
-                                        'agent_name': spec.agent_name,
-                                        'symbol': symbol,
-                                        'status': 'completed',
-                                        'response': {'normalized_feedback': normalized_feedback},
-                                    }
-                                )
-                        except Exception as exc:
-                            for source_item in batch:
-                                failure = {
-                                    'role': role,
-                                    'agent_name': spec.agent_name,
-                                    'symbol': source_item['symbol'],
-                                    'status': 'failed',
-                                    'retryable': True,
-                                    'error': f'{type(exc).__name__}: {exc}',
-                                }
-                                all_failures.append(failure)
-                                buffer_failure(role, source_item['symbol'], f'{type(exc).__name__}: {exc}', True)
-                                _feedback_runtime_log(
-                                    'buffer_exception',
-                                    market_date=normalized_market_date.isoformat(),
-                                    request_run_id=request_run_id,
-                                    role=role,
-                                    agent_name=spec.agent_name,
-                                    symbol=source_item['symbol'],
-                                    error_type=type(exc).__name__,
-                                    error=str(exc),
-                                )
-                        finally:
-                            mark_activity(role, slot, done=True)
+                            for batch_item in batch
+                        ]
+                        queue.append((slot, batch_with_session))
+                        _feedback_runtime_log(
+                            'queue_batch',
+                            market_date=normalized_market_date.isoformat(),
+                            request_run_id=request_run_id,
+                            role=role,
+                            slot=slot,
+                            session_key=stable_session_key,
+                            batch_symbols=[str(item.get('symbol')) for item in batch_with_session],
+                        )
+
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=role_parallelism) as executor:
+                        future_map: dict[concurrent.futures.Future[dict[str, Any]], tuple[int, list[dict[str, Any]]]] = {}
+
+                        def submit_next() -> None:
+                            if not queue:
+                                return
+                            slot, batch = queue.pop(0)
+                            mark_activity(role, slot, [item['symbol'] for item in batch], done=False)
+                            future = executor.submit(
+                                self._get_client().dispatch_batch,
+                                spec=spec,
+                                market_date=normalized_market_date,
+                                batch_items=batch,
+                            )
+                            future_map[future] = (slot, batch)
+
+                        for _ in range(min(role_parallelism, len(queue))):
                             submit_next()
 
-        final_state = runtime_feedback_state_store.get_run(normalized_market_date) or state
-        buffered_rows = list(final_state.buffered_feedback_rows)
-        flush_payload = [
-            {
-                'market_date': row['market_date'],
-                'symbol': row['symbol'],
-                'agent_name': row['agent_name'],
-                'run_id': row['run_id'],
-                'summary': row['summary'],
-                'feedback': row['feedback'],
-                'context': row['context'],
-            }
-            for row in buffered_rows
-        ]
-        _feedback_runtime_log(
-            'flush_begin',
-            market_date=normalized_market_date.isoformat(),
-            request_run_id=request_run_id,
-            buffered_feedback_count=len(buffered_rows),
-            buffered_failure_count=len(final_state.buffered_failures),
-            flush_payload=flush_payload,
-            buffered_failures=final_state.buffered_failures,
-        )
-        flush_result = agent_context_feedback_service.bulk_submit_feedback(items=flush_payload)
-        _feedback_runtime_log(
-            'flush_complete',
-            market_date=normalized_market_date.isoformat(),
-            request_run_id=request_run_id,
-            buffered_feedback_count=len(buffered_rows),
-            persisted_count=len(flush_result),
-            persisted_rows=flush_result,
-        )
-        self._cleanup_buffered_feedback_sessions(rows=buffered_rows)
-        completed_count = len(buffered_rows)
-        failed_count = len(final_state.buffered_failures)
-        final_status = 'completed' if failed_count == 0 else ('partial' if completed_count > 0 else 'failed')
+                        while future_map:
+                            done, _ = concurrent.futures.wait(list(future_map.keys()), return_when=concurrent.futures.FIRST_COMPLETED)
+                            for future in done:
+                                slot, batch = future_map.pop(future)
+                                try:
+                                    batch_result = future.result()
+                                    decoded_items = batch_result.get('decoded', {}).get('items', [])
+                                    by_symbol = {
+                                        item['symbol']: item for item in decoded_items if isinstance(item, dict) and item.get('symbol')
+                                    }
+                                    for source_item in batch:
+                                        symbol = source_item['symbol']
+                                        feedback_candidate = by_symbol.get(symbol, {}).get('feedback')
+                                        if not feedback_candidate:
+                                            failure = {
+                                                'role': role,
+                                                'agent_name': spec.agent_name,
+                                                'symbol': symbol,
+                                                'status': 'failed',
+                                                'retryable': True,
+                                                'error': 'missing_batch_feedback',
+                                            }
+                                            all_failures.append(failure)
+                                            buffer_failure(
+                                                role,
+                                                symbol,
+                                                'missing_batch_feedback',
+                                                True,
+                                                context=source_item,
+                                                agent_name=spec.agent_name,
+                                            )
+                                            _feedback_runtime_log(
+                                                'buffer_failure',
+                                                market_date=normalized_market_date.isoformat(),
+                                                request_run_id=request_run_id,
+                                                role=role,
+                                                agent_name=spec.agent_name,
+                                                symbol=symbol,
+                                                error='missing_batch_feedback',
+                                                batch_result=batch_result,
+                                            )
+                                            continue
+                                        normalized_feedback = normalize_agent_response(
+                                            role=spec.role,
+                                            output_text=json.dumps(feedback_candidate, ensure_ascii=False),
+                                            raw_response=feedback_candidate if isinstance(feedback_candidate, dict) else {'feedback': feedback_candidate},
+                                            market_date=source_item.get('market_date') or normalized_market_date.isoformat(),
+                                            symbol=symbol,
+                                            agent_name=spec.agent_name,
+                                        )
+                                        response_payload_item = _build_response_storage_payload(
+                                            spec=spec,
+                                            batch_result=batch_result,
+                                            normalized_feedback=normalized_feedback,
+                                            collector_mode='role_sequential_runtime_buffered',
+                                        )
+                                        buffer_success(spec.agent_name, symbol, source_item, response_payload_item)
+                                        _feedback_runtime_log(
+                                            'buffer_success',
+                                            market_date=normalized_market_date.isoformat(),
+                                            request_run_id=request_run_id,
+                                            role=role,
+                                            agent_name=spec.agent_name,
+                                            symbol=symbol,
+                                            response_payload=response_payload_item,
+                                            source_item=source_item,
+                                        )
+                                        all_items.append(
+                                            {
+                                                'role': role,
+                                                'agent_name': spec.agent_name,
+                                                'symbol': symbol,
+                                                'status': 'completed',
+                                                'response': {'normalized_feedback': normalized_feedback},
+                                            }
+                                        )
+                                except Exception as exc:
+                                    for source_item in batch:
+                                        failure = {
+                                            'role': role,
+                                            'agent_name': spec.agent_name,
+                                            'symbol': source_item['symbol'],
+                                            'status': 'failed',
+                                            'retryable': True,
+                                            'error': f'{type(exc).__name__}: {exc}',
+                                        }
+                                        all_failures.append(failure)
+                                        buffer_failure(
+                                            role,
+                                            source_item['symbol'],
+                                            f'{type(exc).__name__}: {exc}',
+                                            True,
+                                            context=source_item,
+                                            agent_name=spec.agent_name,
+                                        )
+                                        _feedback_runtime_log(
+                                            'buffer_exception',
+                                            market_date=normalized_market_date.isoformat(),
+                                            request_run_id=request_run_id,
+                                            role=role,
+                                            agent_name=spec.agent_name,
+                                            symbol=source_item['symbol'],
+                                            error_type=type(exc).__name__,
+                                            error=str(exc),
+                                        )
+                                finally:
+                                    mark_activity(role, slot, done=True)
+                                    submit_next()
 
-        def _finish(current: RuntimeFeedbackRunState) -> None:
-            current.status = final_status
-            current.completed_at = datetime.now(timezone.utc)
-            current.last_activity_at = current.completed_at
-            for role_slots in current.in_flight_slots_by_role.values():
-                role_slots.clear()
-        _feedback_runtime_log(
-            'run_finish_pending',
-            market_date=normalized_market_date.isoformat(),
-            request_run_id=request_run_id,
-            final_status=final_status,
-            completed_count=completed_count,
-            failed_count=failed_count,
-        )
-        runtime_feedback_state_store.update_run(normalized_market_date, _finish)
-        final_snapshot = runtime_feedback_state_store.get_run(normalized_market_date)
-        _feedback_runtime_log(
-            'run_finished',
-            market_date=normalized_market_date.isoformat(),
-            request_run_id=request_run_id,
-            final_status=final_status,
-            completed_at=final_snapshot.completed_at.isoformat() if final_snapshot and final_snapshot.completed_at else None,
-            run_summary=final_snapshot.to_progress_summary() if final_snapshot else None,
-        )
+                    role_flush_result = self._flush_pending_run_buffers(
+                        market_date=normalized_market_date,
+                        request_run_id=request_run_id,
+                        reason=f'role_completed:{role}',
+                    )
+                    self._checkpoint_run_state(
+                        market_date=normalized_market_date,
+                        request_run_id=request_run_id,
+                        request_payload=request_payload,
+                        lifecycle_stage='role_completed',
+                        current_role=role,
+                        status='running',
+                        flush_result=role_flush_result,
+                    )
 
-        return {
-            'request': {
-                'market_date': normalized_market_date.isoformat(),
-                'symbols': list(dispatch_symbols),
-                'requested_symbols': requested_symbols,
-                'request_run_id': request_run_id,
-                'roles': [spec.role for spec in specs],
-                'fs_div': fs_div,
-                'disclosures_limit': disclosures_limit,
-                'symbol_chunk_size': batch_size,
-                'parallel_subtasks': role_parallelism,
-                'role_parallel_subtasks': role_parallelism,
-                'total_parallel_subtasks': role_parallelism,
-                'reuse_existing': reuse_existing,
-                'scope': 'piotroski_passed_symbols_only',
-                'skipped_symbols': skipped_symbols,
-                'mode': 'role_sequential_runtime_buffered',
-            },
-            'summary': {
-                'status': final_status,
-                'completed': completed_count,
-                'failed': failed_count,
-                'skipped': len(skipped_symbols),
-                'flushed_to_db': flush_result.get('count', 0),
-            },
-            'items': all_items,
-            'failures': all_failures,
-        }
+                final_snapshot = runtime_feedback_state_store.get_run(normalized_market_date, run_id=request_run_id) or state
+                completed_count = len(final_snapshot.buffered_feedback_rows)
+                failed_count = len(final_snapshot.buffered_failures)
+                final_status = 'completed' if failed_count == 0 else ('partial' if completed_count > 0 else 'failed')
+                response_payload = {
+                    'request': request_payload,
+                    'summary': {
+                        'status': final_status,
+                        'completed': completed_count,
+                        'failed': failed_count,
+                        'skipped': len(skipped_symbols),
+                        'flushed_to_db': final_snapshot.flushed_feedback_count,
+                    },
+                    'items': all_items,
+                    'failures': all_failures,
+                }
+        except Exception as exc:  # noqa: BLE001
+            raised_exception = exc
+        finally:
+            final_snapshot = runtime_feedback_state_store.get_run(normalized_market_date, run_id=request_run_id) or state
+            try:
+                final_flush_result = self._flush_pending_run_buffers(
+                    market_date=normalized_market_date,
+                    request_run_id=request_run_id,
+                    reason='finalize',
+                )
+            except Exception as exc:  # noqa: BLE001
+                finalization_error = exc
+                _feedback_runtime_log(
+                    'flush_failed',
+                    market_date=normalized_market_date.isoformat(),
+                    request_run_id=request_run_id,
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                )
+            final_snapshot = runtime_feedback_state_store.get_run(normalized_market_date, run_id=request_run_id) or final_snapshot
+            completed_count = len(final_snapshot.buffered_feedback_rows) if final_snapshot is not None else 0
+            failed_count = len(final_snapshot.buffered_failures) if final_snapshot is not None else 0
+            if raised_exception is not None or finalization_error is not None:
+                final_status = 'partial' if (completed_count > 0 or failed_count > 0) else 'failed'
+            elif dispatch_symbols:
+                final_status = 'completed' if failed_count == 0 else ('partial' if completed_count > 0 else 'failed')
+            else:
+                final_status = 'completed'
+
+            def _finish(current: RuntimeFeedbackRunState) -> None:
+                current.status = final_status
+                current.completed_at = datetime.now(timezone.utc)
+                current.last_activity_at = current.completed_at
+                for role_slots in current.in_flight_slots_by_role.values():
+                    role_slots.clear()
+
+            runtime_feedback_state_store.update_run(
+                normalized_market_date,
+                _finish,
+                run_id=request_run_id,
+            )
+            final_snapshot = runtime_feedback_state_store.get_run(normalized_market_date, run_id=request_run_id) or final_snapshot or state
+            _feedback_runtime_log(
+                'run_finish_pending',
+                market_date=normalized_market_date.isoformat(),
+                request_run_id=request_run_id,
+                final_status=final_status,
+                completed_count=completed_count,
+                failed_count=failed_count,
+                final_flush_result=final_flush_result,
+                raised_exception=(
+                    {
+                        'type': type(raised_exception).__name__,
+                        'error': str(raised_exception),
+                    }
+                    if raised_exception is not None
+                    else None
+                ),
+            )
+            try:
+                agent_context_feedback_run_state_service.finish_run(
+                    run_id=request_run_id,
+                    status=final_status,
+                    completed_count=int(final_snapshot.to_progress_summary().get('completed_feedback_count') or 0),
+                    failed_count=int(final_snapshot.to_progress_summary().get('failed_items') or 0),
+                    summary_payload=self._build_run_summary_payload(
+                        market_date=normalized_market_date,
+                        request_payload=request_payload,
+                        state=final_snapshot,
+                        lifecycle_stage='finished',
+                        current_role=final_snapshot.current_role,
+                        flush_result=final_flush_result,
+                        fatal_error=(
+                            None
+                            if raised_exception is None and finalization_error is None
+                            else str(finalization_error or raised_exception)
+                        ),
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001
+                if finalization_error is None:
+                    finalization_error = exc
+            _feedback_runtime_log(
+                'run_finished',
+                market_date=normalized_market_date.isoformat(),
+                request_run_id=request_run_id,
+                final_status=final_status,
+                completed_at=final_snapshot.completed_at.isoformat() if final_snapshot and final_snapshot.completed_at else None,
+                run_summary=final_snapshot.to_progress_summary() if final_snapshot else None,
+            )
+
+            if response_payload is not None and dispatch_symbols:
+                response_payload['summary']['status'] = final_status
+                response_payload['summary']['completed'] = completed_count
+                response_payload['summary']['failed'] = failed_count
+                response_payload['summary']['flushed_to_db'] = final_snapshot.flushed_feedback_count if final_snapshot else 0
+
+        if finalization_error is not None:
+            if raised_exception is not None:
+                raise finalization_error from raised_exception
+            raise finalization_error
+        if raised_exception is not None:
+            raise raised_exception
+
+        if response_payload is None:
+            raise RuntimeError(f'No response payload generated for {request_run_id}')
+
+        return response_payload
 
     def dispatch_for_symbols_via_subagents(
         self,

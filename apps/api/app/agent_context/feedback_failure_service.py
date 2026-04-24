@@ -12,6 +12,13 @@ from app.db_models import AgentContextFeedbackFailure
 
 
 class AgentContextFeedbackFailureService:
+    @staticmethod
+    def _normalize_failure_kind(value: str) -> str:
+        normalized = (value or '').strip() or 'dispatch_failed'
+        if len(normalized) > 64:
+            return normalized[:64]
+        return normalized
+
     def record_failure(
         self,
         *,
@@ -27,6 +34,7 @@ class AgentContextFeedbackFailureService:
         market_date_value = _normalize_market_date(market_date)
         symbol_value = _normalize_symbol(symbol)
         agent_name_value = _normalize_agent_name(agent_name)
+        failure_kind_value = self._normalize_failure_kind(failure_kind)
         summary_payload = _normalize_json_object(summary, field_name='summary')
         context_payload = _normalize_json_object(context, field_name='context') if context is not None else None
         received_at = datetime.now(timezone.utc)
@@ -36,7 +44,7 @@ class AgentContextFeedbackFailureService:
                 symbol=symbol_value,
                 agent_name=agent_name_value,
                 run_id=_normalize_optional_text(run_id, field_name='run_id', max_length=128),
-                failure_kind=failure_kind.strip(),
+                failure_kind=failure_kind_value,
                 retryable=retryable,
                 summary_payload=summary_payload,
                 context_payload=context_payload,
@@ -46,7 +54,7 @@ class AgentContextFeedbackFailureService:
                 constraint='uq_agent_context_feedback_failures_market_symbol_agent',
                 set_={
                     'run_id': _normalize_optional_text(run_id, field_name='run_id', max_length=128),
-                    'failure_kind': failure_kind.strip(),
+                    'failure_kind': failure_kind_value,
                     'retryable': retryable,
                     'summary_payload': summary_payload,
                     'context_payload': context_payload,

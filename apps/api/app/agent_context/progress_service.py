@@ -8,6 +8,7 @@ from typing import Any, Sequence
 from sqlalchemy import select
 
 from app.agent_context.feedback_service import _normalize_market_date, _normalize_symbols
+from app.agent_context.run_state_service import agent_context_feedback_run_state_service
 from app.agent_context.status_service import EXPECTED_AGENT_NAMES
 from app.agent_context.runtime_state import runtime_feedback_state_store
 from app.db import session_scope
@@ -31,7 +32,42 @@ class AgentContextProgressService:
             symbols=normalized_symbols,
             expected_agents=expected_agent_names,
         )
-        state = runtime_feedback_state_store.get_run(normalized_market_date, run_id=run_id, logical=(run_id is None))
+        resolved_run = self._resolve_run_snapshot(
+            market_date=normalized_market_date,
+            symbols=normalized_symbols,
+            expected_agents=expected_agent_names,
+            run_id=run_id,
+        )
+        state = None
+        if run_id is not None:
+            state = runtime_feedback_state_store.get_run(normalized_market_date, run_id=run_id)
+        elif resolved_run is not None:
+            state = runtime_feedback_state_store.get_run(normalized_market_date, run_id=resolved_run['run_id'])
+        if state is None and run_id is None and resolved_run is None:
+            state = runtime_feedback_state_store.get_run(normalized_market_date, logical=True)
+
+        result_payload = persisted_progress['result']
+        summary_payload = persisted_progress['summary']
+        if state is not None:
+            summary_payload = state.to_progress_summary()
+            if resolved_run is not None:
+                summary_payload = self._merge_run_table_metadata(summary=summary_payload, run_snapshot=resolved_run)
+                result_payload = self._build_result_from_summary(
+                    market_date=normalized_market_date,
+                    summary=summary_payload,
+                    expected_agents=expected_agent_names,
+                )
+        elif resolved_run is not None:
+            summary_payload = self._build_summary_from_run_snapshot(
+                run_snapshot=resolved_run,
+                fallback_summary=persisted_progress['summary'],
+            )
+            result_payload = self._build_result_from_summary(
+                market_date=normalized_market_date,
+                summary=summary_payload,
+                expected_agents=expected_agent_names,
+            )
+
         return {
             'request': {
                 'market_date': normalized_market_date.isoformat(),
@@ -39,8 +75,8 @@ class AgentContextProgressService:
                 'expected_agents': list(expected_agent_names),
                 'run_id': run_id,
             },
-            'result': persisted_progress['result'],
-            'summary': state.to_progress_summary() if state is not None else persisted_progress['summary'],
+            'result': result_payload,
+            'summary': summary_payload,
         }
 
     def _build_persisted_progress(
@@ -117,6 +153,24 @@ class AgentContextProgressService:
             ),
         }
 
+    def _resolve_run_snapshot(
+        self,
+        *,
+        market_date: date,
+        symbols: Sequence[str] | None,
+        expected_agents: Sequence[str],
+        run_id: str | None,
+    ) -> dict[str, Any] | None:
+        if run_id is not None:
+            return agent_context_feedback_run_state_service.get_run(run_id=run_id)
+        if symbols is None:
+            return None
+        return agent_context_feedback_run_state_service.find_latest_run(
+            market_date=market_date,
+            requested_symbols=list(symbols) if symbols is not None else None,
+            requested_roles=list(expected_agents),
+        )
+
     @staticmethod
     def _load_market_date_symbols(market_date: date) -> list[str]:
         with session_scope() as session:
@@ -148,6 +202,71 @@ class AgentContextProgressService:
                 for agent_name in expected_agents
             },
         }
+
+    @staticmethod
+    def _build_result_from_summary(
+        *,
+        market_date: date,
+        summary: dict[str, Any],
+        expected_agents: Sequence[str],
+    ) -> dict[str, Any]:
+        role_progress = summary.get('role_progress') if isinstance(summary.get('role_progress'), dict) else {}
+        total_symbols = int(summary.get('total_symbols') or 0)
+        roles_payload: dict[str, dict[str, int]] = {}
+        for agent_name in expected_agents:
+            role_summary = role_progress.get(agent_name) if isinstance(role_progress.get(agent_name), dict) else {}
+            roles_payload[agent_name] = {
+                'requested_count': int(role_summary.get('total_symbols') or total_symbols),
+                'completed_count': int(role_summary.get('completed_symbols') or 0),
+                'error_count': int(role_summary.get('failed_items') or 0),
+            }
+        return {
+            'market_date': market_date.isoformat(),
+            'roles': roles_payload,
+        }
+
+    def _build_summary_from_run_snapshot(
+        self,
+        *,
+        run_snapshot: dict[str, Any],
+        fallback_summary: dict[str, Any],
+    ) -> dict[str, Any]:
+        payload = run_snapshot.get('summary_payload') if isinstance(run_snapshot.get('summary_payload'), dict) else {}
+        progress_summary = payload.get('progress_summary') if isinstance(payload.get('progress_summary'), dict) else None
+        if progress_summary is not None:
+            summary = dict(progress_summary)
+        else:
+            summary = dict(fallback_summary)
+            summary['failed_items'] = int(run_snapshot.get('failed_count') or summary.get('failed_items') or 0)
+            summary['completed_feedback_count'] = int(
+                run_snapshot.get('completed_count') or summary.get('completed_feedback_count') or 0
+            )
+            summary['current_role'] = payload.get('current_role')
+            summary['parallel_per_role'] = payload.get('parallel_per_role')
+        for key in (
+            'buffered_feedback_count',
+            'buffered_failure_count',
+            'pending_feedback_count',
+            'pending_failure_count',
+            'flushed_feedback_count',
+            'flushed_failure_count',
+        ):
+            if key in payload and key not in summary:
+                summary[key] = payload[key]
+        return self._merge_run_table_metadata(summary=summary, run_snapshot=run_snapshot)
+
+    @staticmethod
+    def _merge_run_table_metadata(*, summary: dict[str, Any], run_snapshot: dict[str, Any]) -> dict[str, Any]:
+        merged = dict(summary)
+        started_at = run_snapshot.get('started_at')
+        completed_at = run_snapshot.get('completed_at')
+        merged['run_id'] = run_snapshot.get('run_id')
+        merged['run_status'] = merged.get('run_status') or run_snapshot.get('status')
+        merged['run_table_status'] = run_snapshot.get('status')
+        merged['is_live'] = merged.get('is_live') if merged.get('is_live') is not None else run_snapshot.get('status') == 'running'
+        merged['run_started_at'] = merged.get('run_started_at') or (started_at.isoformat() if started_at else None)
+        merged['run_completed_at'] = merged.get('run_completed_at') or (completed_at.isoformat() if completed_at else None)
+        return merged
 
     @staticmethod
     def _build_persisted_summary(

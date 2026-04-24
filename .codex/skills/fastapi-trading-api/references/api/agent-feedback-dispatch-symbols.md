@@ -4,6 +4,7 @@
 Dispatches symbol-level summarizer feedback collection with optional freshness-aware reuse.
 
 Core dispatches only the subset of requested symbols whose persisted `daily_piotroski_filter_results` row has `passed_filter=true` for the requested `market_date`. Requested symbols outside that universe are returned in `request.skipped_symbols` and are not dispatched.
+Each normal dispatch also creates a durable `agent_context_feedback_runs` row, checkpoints role progress as the run advances, and finalizes that run row even when the cycle exits partially.
 
 ## Example request
 ```http
