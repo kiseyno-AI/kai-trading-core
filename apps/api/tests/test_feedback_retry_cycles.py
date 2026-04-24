@@ -6,6 +6,7 @@ from unittest.mock import ANY, patch
 from app.agent_context.retry_service import (
     AgentFeedbackRetryService,
     EXPECTED_ROLES,
+    RetryCyclePlan,
     RoleSequenceRoleState,
     RoleSequenceSnapshot,
 )
@@ -595,6 +596,7 @@ class FeedbackRetryCycleTests(unittest.TestCase):
             [('fundamental-summarizer', ['000660']), ('signal-decider', ['005930', '000660'])],
         )
         self.assertEqual(run_state_service.started[0]['request_payload']['resumed_from_run_id'], 'prior-retry-run')
+        self.assertEqual(run_state_service.finished[-1]['status'], 'completed')
         role_started_checkpoints = [
             checkpoint['summary_payload']
             for checkpoint in run_state_service.checkpoints
@@ -608,8 +610,87 @@ class FeedbackRetryCycleTests(unittest.TestCase):
             role_started_checkpoints[0]['remaining_roles'],
             ['fundamental-summarizer', 'signal-decider'],
         )
-        self.assertTrue(result['completed'])
-        self.assertEqual(result['final_pending'], 0)
+
+    def test_run_retry_cycles_marks_failed_cycle_status_for_failed_run(self):
+        roles = ('technical-summarizer',)
+        symbols = ('005930',)
+        service = AgentFeedbackRetryService()
+        run_state_service = RecordingRunStateService()
+        snapshots = SnapshotSequence(
+            [
+                _snapshot(
+                    symbols=symbols,
+                    role_states={
+                        'technical-summarizer': _role_state(
+                            role='technical-summarizer',
+                            symbols=symbols,
+                            boundary_pending=symbols,
+                            retry_pending=symbols,
+                        ),
+                    },
+                ),
+                _snapshot(
+                    symbols=symbols,
+                    role_states={
+                        'technical-summarizer': _role_state(
+                            role='technical-summarizer',
+                            symbols=symbols,
+                            boundary_pending=symbols,
+                            retry_pending=symbols,
+                            boundary_status='failed',
+                        ),
+                    },
+                ),
+            ]
+        )
+
+        def dispatch_for_symbols(**kwargs):
+            return {
+                'request': {'roles': kwargs['roles'], 'symbols': kwargs['symbols']},
+                'summary': {'status': 'failed', 'completed': 0, 'failed': len(kwargs['symbols'])},
+            }
+
+        progress = {'request': {'expected_agents': list(roles)}, 'summary': {'cycle_status': 'failed'}}
+        plans = [
+            RetryCyclePlan(
+                cycle_number=1,
+                completed_cycles=0,
+                mode='boundary_resume',
+                current_role='technical-summarizer',
+                plan_roles=('technical-summarizer',),
+                completed_roles=(),
+                remaining_roles=('technical-summarizer',),
+            ),
+            None,
+        ]
+
+        def resolve_cycle_plan(**kwargs):
+            return plans.pop(0) if plans else None
+
+        with patch.object(service, '_load_eligible_symbols', return_value=list(symbols)):
+            with patch.object(service, '_build_role_sequence_snapshot', side_effect=snapshots):
+                with patch.object(service, '_resolve_cycle_plan', side_effect=resolve_cycle_plan):
+                    with patch('app.agent_context.retry_service.agent_context_feedback_run_state_service', run_state_service):
+                        with patch(
+                            'app.agent_context.retry_service.agent_feedback_orchestrator.dispatch_for_symbols',
+                            side_effect=dispatch_for_symbols,
+                        ):
+                            with patch(
+                                'app.agent_context.retry_service.agent_context_progress_service.get_feedback_progress',
+                                return_value=progress,
+                            ):
+                                service.run_retry_cycles(
+                                    config=SimpleNamespace(
+                                        market_date=date.fromisoformat('2026-04-16'),
+                                        roles=roles,
+                                        max_cycles=1,
+                                        outer_batch_size=20,
+                                        reuse_existing=True,
+                                    )
+                                )
+
+        self.assertEqual(run_state_service.finished[-1]['status'], 'failed')
+        self.assertEqual(run_state_service.finished[-1]['summary_payload']['cycle_status'], 'failed')
 
 
 if __name__ == '__main__':

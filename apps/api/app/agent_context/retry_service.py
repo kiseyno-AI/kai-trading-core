@@ -765,6 +765,11 @@ class AgentFeedbackRetryService:
                 previous_completed_cycles=completed_cycles,
                 enforce_max_cycles=False,
             )
+            resolved_cycle_status = (
+                'failed'
+                if final_status == 'failed'
+                else ('partial' if final_status == 'partial' else 'completed')
+            )
             self._sync_runtime_state(
                 market_date=config.market_date,
                 run_id=request_run_id,
@@ -776,7 +781,7 @@ class AgentFeedbackRetryService:
                 completed_cycles=completed_cycles,
                 max_cycles=config.max_cycles,
                 cycle_mode=resume_plan.mode if resume_plan is not None else None,
-                cycle_status='partial' if final_status == 'partial' else 'completed',
+                cycle_status=resolved_cycle_status,
                 status=final_status,
             )
             final_state = runtime_feedback_state_store.get_run(config.market_date, run_id=request_run_id, logical=True)
