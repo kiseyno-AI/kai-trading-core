@@ -383,7 +383,7 @@ async def inspect_daily_value_factors(
 
 @router.get('/piotroski-filter-results')
 async def inspect_daily_piotroski_filter_results(
-    market_date: str,
+    market_date: str | None = None,
     symbol: str | None = None,
     limit: int | None = Query(default=None, ge=1, le=20000),
 ) -> dict:

@@ -219,9 +219,19 @@ class FakePiotroskiFilterService:
         self.inspect_args = kwargs
         market_date = kwargs['market_date']
         symbol = kwargs.get('symbol')
+        resolved_market_date = market_date or '2026-04-23'
+        latest_mode = market_date is None
+        is_latest_fallback = market_date == '2026-04-24'
+        if is_latest_fallback:
+            resolved_market_date = '2026-04-23'
         if symbol:
             return {
-                'market_date': market_date,
+                'requested_market_date': market_date,
+                'resolved_market_date': resolved_market_date,
+                'market_date': resolved_market_date,
+                'latest_mode': latest_mode,
+                'is_latest_fallback': is_latest_fallback,
+                'fallback_policy': 'latest_on_or_before_requested_market_date',
                 'summary': {
                     'entries': 1,
                     'requested_symbol': symbol,
@@ -232,13 +242,18 @@ class FakePiotroskiFilterService:
                 },
                 'item': {
                     'symbol': symbol,
-                    'market_date': market_date,
+                    'market_date': resolved_market_date,
                     'passed_filter': True,
                     'piotroski_score': 8,
                 },
             }
         return {
-            'market_date': market_date,
+            'requested_market_date': market_date,
+            'resolved_market_date': resolved_market_date,
+            'market_date': resolved_market_date,
+            'latest_mode': latest_mode,
+            'is_latest_fallback': is_latest_fallback,
+            'fallback_policy': 'latest_on_or_before_requested_market_date',
             'summary': {
                 'entries': 2,
                 'requested_symbol': None,
@@ -248,8 +263,8 @@ class FakePiotroskiFilterService:
                 'not_passed_count': 1,
             },
             'items': [
-                {'symbol': '005930', 'market_date': market_date, 'passed_filter': True, 'piotroski_score': 8},
-                {'symbol': '000660', 'market_date': market_date, 'passed_filter': False, 'piotroski_score': 5},
+                {'symbol': '005930', 'market_date': resolved_market_date, 'passed_filter': True, 'piotroski_score': 8},
+                {'symbol': '000660', 'market_date': resolved_market_date, 'passed_filter': False, 'piotroski_score': 5},
             ],
         }
 
@@ -658,6 +673,10 @@ class EODRouteTests(unittest.TestCase):
             fake_service.inspect_args,
             {'market_date': '2026-04-14', 'symbol': None, 'limit': None},
         )
+        self.assertEqual(response.json()['requested_market_date'], '2026-04-14')
+        self.assertEqual(response.json()['resolved_market_date'], '2026-04-14')
+        self.assertFalse(response.json()['latest_mode'])
+        self.assertFalse(response.json()['is_latest_fallback'])
         self.assertEqual(response.json()['summary']['entries'], 2)
         self.assertEqual(response.json()['summary']['passed_count'], 1)
         self.assertEqual(response.json()['items'][0]['symbol'], '005930')
@@ -681,4 +700,26 @@ class EODRouteTests(unittest.TestCase):
             {'market_date': '2026-04-14', 'symbol': '005930', 'limit': 10},
         )
         self.assertEqual(response.json()['summary']['requested_symbol'], '005930')
+        self.assertEqual(response.json()['resolved_market_date'], '2026-04-14')
         self.assertEqual(response.json()['item']['piotroski_score'], 8)
+
+    def test_inspect_piotroski_filter_results_route_allows_latest_mode_without_market_date(self):
+        fake_service = FakePiotroskiFilterService()
+        original_service = routes_eod.daily_piotroski_filter_service
+        routes_eod.daily_piotroski_filter_service = fake_service
+        try:
+            client = TestClient(self.app)
+            response = client.get('/eod/piotroski-filter-results')
+        finally:
+            routes_eod.daily_piotroski_filter_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            fake_service.inspect_args,
+            {'market_date': None, 'symbol': None, 'limit': None},
+        )
+        self.assertIsNone(response.json()['requested_market_date'])
+        self.assertEqual(response.json()['resolved_market_date'], '2026-04-23')
+        self.assertTrue(response.json()['latest_mode'])
+        self.assertFalse(response.json()['is_latest_fallback'])
+        self.assertEqual(response.json()['market_date'], '2026-04-23')

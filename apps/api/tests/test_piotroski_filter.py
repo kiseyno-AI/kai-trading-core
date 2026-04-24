@@ -2,7 +2,11 @@ import unittest
 from datetime import date
 from unittest.mock import patch
 
-from app.signals.piotroski_filter import DailyPiotroskiFilterService, PiotroskiInputs
+from app.signals.piotroski_filter import (
+    LATEST_FALLBACK_POLICY,
+    DailyPiotroskiFilterService,
+    PiotroskiInputs,
+)
 
 
 def _build_input(
@@ -89,7 +93,7 @@ class DailyPiotroskiFilterServiceTests(unittest.TestCase):
         self.assertEqual(result['results_failed'], 1)
         self.assertEqual(result['failed_symbols'], ['000660'])
 
-    def test_inspect_returns_all_items_for_market_date_without_symbol(self):
+    def test_inspect_returns_exact_market_date_when_requested_date_is_available(self):
         service = DailyPiotroskiFilterService()
         stored_items = [
             {
@@ -104,21 +108,124 @@ class DailyPiotroskiFilterServiceTests(unittest.TestCase):
             },
         ]
 
-        with patch(
-            'app.signals.piotroski_filter.load_daily_piotroski_filter_results',
-            return_value=stored_items,
-        ) as loader:
+        with (
+            patch(
+                'app.signals.piotroski_filter.load_latest_available_daily_piotroski_filter_result_date',
+                return_value='2026-04-14',
+            ) as latest_loader,
+            patch(
+                'app.signals.piotroski_filter.load_daily_piotroski_filter_results',
+                return_value=stored_items,
+            ) as loader,
+        ):
             result = service.inspect(market_date='2026-04-14')
 
-        loader.assert_called_once_with(
+        latest_loader.assert_called_once_with(
             market_date=date(2026, 4, 14),
+            symbols=None,
+        )
+        loader.assert_called_once_with(
+            market_date='2026-04-14',
             symbols=None,
             limit=None,
         )
+        self.assertEqual(result['requested_market_date'], '2026-04-14')
+        self.assertEqual(result['resolved_market_date'], '2026-04-14')
         self.assertEqual(result['market_date'], '2026-04-14')
+        self.assertFalse(result['latest_mode'])
+        self.assertFalse(result['is_latest_fallback'])
+        self.assertEqual(result['fallback_policy'], LATEST_FALLBACK_POLICY)
         self.assertEqual(result['summary']['entries'], 2)
         self.assertEqual(result['summary']['passed_count'], 1)
         self.assertEqual(result['summary']['not_passed_count'], 1)
+        self.assertEqual(result['items'], stored_items)
+
+    def test_inspect_uses_latest_mode_when_market_date_is_omitted(self):
+        service = DailyPiotroskiFilterService()
+        stored_items = [
+            {
+                'symbol': '005930',
+                'market_date': '2026-04-23',
+                'passed_filter': True,
+            },
+            {
+                'symbol': '000660',
+                'market_date': '2026-04-23',
+                'passed_filter': False,
+            },
+        ]
+
+        with (
+            patch(
+                'app.signals.piotroski_filter.load_latest_available_daily_piotroski_filter_result_date',
+                return_value='2026-04-23',
+            ) as latest_loader,
+            patch(
+                'app.signals.piotroski_filter.load_daily_piotroski_filter_results',
+                return_value=stored_items,
+            ) as loader,
+        ):
+            result = service.inspect()
+
+        latest_loader.assert_called_once_with(
+            market_date=None,
+            symbols=None,
+        )
+        loader.assert_called_once_with(
+            market_date='2026-04-23',
+            symbols=None,
+            limit=None,
+        )
+        self.assertIsNone(result['requested_market_date'])
+        self.assertEqual(result['resolved_market_date'], '2026-04-23')
+        self.assertEqual(result['market_date'], '2026-04-23')
+        self.assertTrue(result['latest_mode'])
+        self.assertFalse(result['is_latest_fallback'])
+        self.assertEqual(result['summary']['entries'], 2)
+        self.assertEqual(result['items'], stored_items)
+
+    def test_inspect_uses_latest_fallback_when_requested_market_date_is_missing(self):
+        service = DailyPiotroskiFilterService()
+        stored_items = [
+            {
+                'symbol': '005930',
+                'market_date': '2026-04-23',
+                'passed_filter': True,
+            },
+            {
+                'symbol': '000660',
+                'market_date': '2026-04-23',
+                'passed_filter': False,
+            },
+        ]
+
+        with (
+            patch(
+                'app.signals.piotroski_filter.load_latest_available_daily_piotroski_filter_result_date',
+                return_value='2026-04-23',
+            ) as latest_loader,
+            patch(
+                'app.signals.piotroski_filter.load_daily_piotroski_filter_results',
+                return_value=stored_items,
+            ) as loader,
+        ):
+            result = service.inspect(market_date='2026-04-24')
+
+        latest_loader.assert_called_once_with(
+            market_date=date(2026, 4, 24),
+            symbols=None,
+        )
+        loader.assert_called_once_with(
+            market_date='2026-04-23',
+            symbols=None,
+            limit=None,
+        )
+        self.assertEqual(result['requested_market_date'], '2026-04-24')
+        self.assertEqual(result['resolved_market_date'], '2026-04-23')
+        self.assertEqual(result['market_date'], '2026-04-23')
+        self.assertFalse(result['latest_mode'])
+        self.assertTrue(result['is_latest_fallback'])
+        self.assertEqual(result['fallback_policy'], LATEST_FALLBACK_POLICY)
         self.assertEqual(result['items'], stored_items)
 
     def test_inspect_returns_single_item_when_symbol_is_requested(self):
@@ -126,22 +233,34 @@ class DailyPiotroskiFilterServiceTests(unittest.TestCase):
         stored_items = [
             {
                 'symbol': '005930',
-                'market_date': '2026-04-14',
+                'market_date': '2026-04-23',
                 'passed_filter': True,
             }
         ]
 
-        with patch(
-            'app.signals.piotroski_filter.load_daily_piotroski_filter_results',
-            return_value=stored_items,
-        ) as loader:
-            result = service.inspect(market_date='2026-04-14', symbol='5930', limit=25)
+        with (
+            patch(
+                'app.signals.piotroski_filter.load_latest_available_daily_piotroski_filter_result_date',
+                return_value='2026-04-23',
+            ) as latest_loader,
+            patch(
+                'app.signals.piotroski_filter.load_daily_piotroski_filter_results',
+                return_value=stored_items,
+            ) as loader,
+        ):
+            result = service.inspect(symbol='5930', limit=25)
 
+        latest_loader.assert_called_once_with(
+            market_date=None,
+            symbols=['005930'],
+        )
         loader.assert_called_once_with(
-            market_date=date(2026, 4, 14),
+            market_date='2026-04-23',
             symbols=['005930'],
             limit=1,
         )
+        self.assertTrue(result['latest_mode'])
+        self.assertEqual(result['resolved_market_date'], '2026-04-23')
         self.assertEqual(result['summary']['requested_symbol'], '005930')
         self.assertEqual(result['summary']['missing_symbols'], [])
         self.assertEqual(result['item'], stored_items[0])

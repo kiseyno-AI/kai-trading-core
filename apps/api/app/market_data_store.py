@@ -2344,6 +2344,25 @@ def load_daily_piotroski_filter_results(
         ]
 
 
+def load_latest_available_daily_piotroski_filter_result_date(
+    *,
+    market_date: str | date | None = None,
+    symbols: list[str] | None = None,
+) -> str | None:
+    with session_scope() as session:
+        stmt = select(func.max(DailyPiotroskiFilterResult.market_date)).select_from(DailyPiotroskiFilterResult)
+        if symbols:
+            stmt = (
+                stmt.join(Symbol, Symbol.id == DailyPiotroskiFilterResult.symbol_id)
+                .where(Symbol.symbol.in_(symbols))
+            )
+        if market_date is not None:
+            stmt = stmt.where(DailyPiotroskiFilterResult.market_date <= _normalize_trade_date(market_date))
+
+        value = session.execute(stmt).scalar_one()
+        return value.isoformat() if value else None
+
+
 def upsert_daily_low_risk_factor_result(result: dict) -> None:
     refreshed_at = datetime.utcnow()
     with session_scope() as session:
