@@ -357,6 +357,41 @@ class DailyLowRiskFactorResult(Base, TimestampMixin):
     captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
+class DailyValueFactorResult(Base, TimestampMixin):
+    __tablename__ = 'daily_value_factor_results'
+    __table_args__ = (
+        UniqueConstraint(
+            'symbol_id',
+            'market_date',
+            name='uq_daily_value_factor_results_symbol_market_date',
+        ),
+        Index('ix_daily_value_factor_results_market_rank', 'market_date', 'value_rank'),
+        Index('ix_daily_value_factor_results_market_score', 'market_date', 'value_score'),
+        Index('ix_daily_value_factor_results_market_status', 'market_date', 'value_status'),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol_id: Mapped[int] = mapped_column(ForeignKey('symbols.id', ondelete='CASCADE'), nullable=False, index=True)
+    market_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default='value_factor_v1')
+    per: Mapped[float | None] = mapped_column(Numeric(18, 6))
+    pbr: Mapped[float | None] = mapped_column(Numeric(18, 6))
+    dividend_yield: Mapped[float | None] = mapped_column(Numeric(18, 6))
+    per_status: Mapped[str] = mapped_column(String(32), nullable=False, default='missing', index=True)
+    per_rank: Mapped[int | None] = mapped_column(Integer, index=True)
+    pbr_rank: Mapped[int | None] = mapped_column(Integer, index=True)
+    dividend_yield_rank: Mapped[int | None] = mapped_column(Integer, index=True)
+    per_percentile: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    pbr_percentile: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    dividend_yield_percentile: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    value_score: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    value_rank: Mapped[int | None] = mapped_column(Integer, index=True)
+    value_percentile: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    value_status: Mapped[str] = mapped_column(String(32), nullable=False, default='missing_metric', index=True)
+    factor_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
 class DailyMomentumFactorResult(Base, TimestampMixin):
     __tablename__ = 'daily_momentum_factor_results'
     __table_args__ = (
