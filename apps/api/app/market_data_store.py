@@ -14,6 +14,7 @@ from app.db_models import (
     CurrentQuoteCache,
     DailyActionSummary,
     DailyLowRiskFactorResult,
+    DailyMomentumFactorResult,
     DailyPiotroskiFilterResult,
     DailyMarketParticipationContext,
     DailyPriceBar,
@@ -2177,6 +2178,120 @@ def upsert_daily_piotroski_filter_result(result: dict) -> None:
                 },
             )
         )
+
+
+def upsert_daily_momentum_factor_result(result: dict) -> None:
+    refreshed_at = datetime.utcnow()
+    with session_scope() as session:
+        symbol = _get_symbol(session, result['symbol'])
+        if symbol is None:
+            payload = result.get('factor_payload') or {}
+            symbol = Symbol(
+                symbol=result['symbol'],
+                market='KRX',
+                name_ko=payload.get('name_ko') or result['symbol'],
+                instrument_type='equity',
+                source=result.get('source', 'daily_price_bars'),
+                is_active=True,
+                last_refreshed_at=refreshed_at,
+            )
+            session.add(symbol)
+            session.flush()
+
+        values = {
+            'symbol_id': symbol.id,
+            'market_date': _normalize_trade_date(result['market_date']),
+            'source': result.get('source', 'daily_price_bars'),
+            'close_price': int(result['close_price']),
+            'ma_60': result.get('ma_60'),
+            'ma_120': result.get('ma_120'),
+            'momentum_12_1': result.get('momentum_12_1'),
+            'return_5d': result.get('return_5d'),
+            'has_sufficient_history': bool(result.get('has_sufficient_history')),
+            'is_price_above_ma120': bool(result.get('is_price_above_ma120')),
+            'is_ma60_above_ma120': bool(result.get('is_ma60_above_ma120')),
+            'is_recent_overheated': bool(result.get('is_recent_overheated')),
+            'momentum_rank': result.get('momentum_rank'),
+            'momentum_percentile': result.get('momentum_percentile'),
+            'is_momentum_eligible': bool(result.get('is_momentum_eligible')),
+            'factor_payload': result['factor_payload'],
+            'captured_at': refreshed_at,
+            'updated_at': refreshed_at,
+        }
+        statement = pg_insert(DailyMomentumFactorResult).values(values)
+        session.execute(
+            statement.on_conflict_do_update(
+                constraint='uq_daily_momentum_factor_results_symbol_market_date',
+                set_={
+                    'source': statement.excluded.source,
+                    'close_price': statement.excluded.close_price,
+                    'ma_60': statement.excluded.ma_60,
+                    'ma_120': statement.excluded.ma_120,
+                    'momentum_12_1': statement.excluded.momentum_12_1,
+                    'return_5d': statement.excluded.return_5d,
+                    'has_sufficient_history': statement.excluded.has_sufficient_history,
+                    'is_price_above_ma120': statement.excluded.is_price_above_ma120,
+                    'is_ma60_above_ma120': statement.excluded.is_ma60_above_ma120,
+                    'is_recent_overheated': statement.excluded.is_recent_overheated,
+                    'momentum_rank': statement.excluded.momentum_rank,
+                    'momentum_percentile': statement.excluded.momentum_percentile,
+                    'is_momentum_eligible': statement.excluded.is_momentum_eligible,
+                    'factor_payload': statement.excluded.factor_payload,
+                    'captured_at': statement.excluded.captured_at,
+                    'updated_at': refreshed_at,
+                },
+            )
+        )
+
+
+def load_daily_momentum_factor_results(
+    *,
+    market_date: str | date,
+    symbols: list[str] | None = None,
+    eligible_only: bool | None = None,
+    limit: int | None = 100,
+) -> list[dict]:
+    with session_scope() as session:
+        stmt = (
+            select(DailyMomentumFactorResult, Symbol.symbol)
+            .join(Symbol, Symbol.id == DailyMomentumFactorResult.symbol_id)
+            .where(DailyMomentumFactorResult.market_date == _normalize_trade_date(market_date))
+            .order_by(
+                DailyMomentumFactorResult.is_momentum_eligible.desc(),
+                DailyMomentumFactorResult.momentum_rank.asc().nullslast(),
+                Symbol.symbol.asc(),
+            )
+        )
+        if limit is not None:
+            stmt = stmt.limit(limit)
+        if symbols:
+            stmt = stmt.where(Symbol.symbol.in_(symbols))
+        if eligible_only is not None:
+            stmt = stmt.where(DailyMomentumFactorResult.is_momentum_eligible == eligible_only)
+
+        rows = session.execute(stmt).all()
+        return [
+            {
+                'symbol': symbol,
+                'market_date': item.market_date.isoformat(),
+                'source': item.source,
+                'close_price': int(item.close_price),
+                'ma_60': _round_float(item.ma_60, 6),
+                'ma_120': _round_float(item.ma_120, 6),
+                'momentum_12_1': _round_float(item.momentum_12_1, 6),
+                'return_5d': _round_float(item.return_5d, 6),
+                'has_sufficient_history': item.has_sufficient_history,
+                'is_price_above_ma120': item.is_price_above_ma120,
+                'is_ma60_above_ma120': item.is_ma60_above_ma120,
+                'is_recent_overheated': item.is_recent_overheated,
+                'momentum_rank': item.momentum_rank,
+                'momentum_percentile': _round_float(item.momentum_percentile, 6),
+                'is_momentum_eligible': item.is_momentum_eligible,
+                'factor_payload': item.factor_payload,
+                'captured_at': item.captured_at.isoformat() if item.captured_at else None,
+            }
+            for item, symbol in rows
+        ]
 
 
 def load_daily_piotroski_filter_results(

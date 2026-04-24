@@ -215,6 +215,73 @@ class DailyLowRiskFactorServiceTests(unittest.TestCase):
         self.assertFalse(persisted['is_low_risk_eligible'])
         self.assertEqual(result['summary']['insufficient_history_count'], 1)
 
+    def test_subset_rerun_uses_full_market_date_universe_for_persisted_rankings(self) -> None:
+        service = DailyLowRiskFactorService()
+        market_date = date(2026, 4, 23)
+        low_risk_returns = ([0.002, -0.001, 0.0015, -0.0005] * 30)[:120]
+        mid_risk_returns = ([0.01, -0.008, 0.012, -0.009] * 30)[:120]
+        high_risk_returns = ([0.02, -0.018, 0.025, -0.02] * 30)[:120]
+        mid_risk_returns[70] = -0.08
+        high_risk_returns[70] = -0.25
+
+        all_inputs = [
+            LowRiskFactorInput(
+                symbol='000001',
+                name_ko='Low Risk',
+                market='KOSPI',
+                bars=_build_bars(
+                    market_date,
+                    closes=_build_close_series(100.0, low_risk_returns),
+                    turnover=9_000_000,
+                ),
+            ),
+            LowRiskFactorInput(
+                symbol='000002',
+                name_ko='Mid Risk',
+                market='KOSPI',
+                bars=_build_bars(
+                    market_date,
+                    closes=_build_close_series(100.0, mid_risk_returns),
+                    turnover=4_000_000,
+                ),
+            ),
+            LowRiskFactorInput(
+                symbol='000003',
+                name_ko='High Risk',
+                market='KOSPI',
+                bars=_build_bars(
+                    market_date,
+                    closes=_build_close_series(100.0, high_risk_returns),
+                    turnover=1_000_000,
+                ),
+            ),
+        ]
+
+        def load_inputs_side_effect(*, market_date, symbols):
+            if symbols is None:
+                return (all_inputs, ['000001', '000002', '000003'], [])
+            self.assertEqual(symbols, ['000002'])
+            return ([all_inputs[1]], ['000002'], [])
+
+        with (
+            patch.object(service, '_load_inputs', side_effect=load_inputs_side_effect),
+            patch('app.signals.low_risk_factor.upsert_daily_low_risk_factor_result') as upsert,
+        ):
+            result = service.rebuild_for_market_date(
+                market_date=market_date,
+                symbols=['000002'],
+            )
+
+        persisted = upsert.call_args.args[0]
+        self.assertEqual(result['results_persisted'], 1)
+        self.assertEqual(result['summary']['ranking_universe_counts']['volatility_60d'], 3)
+        self.assertEqual(result['summary']['ranking_universe_counts']['combined_score'], 3)
+        self.assertEqual(persisted['symbol'], '000002')
+        self.assertEqual(persisted['volatility_60d_rank'], 2)
+        self.assertEqual(persisted['volatility_60d_percentile'], 0.5)
+        self.assertEqual(persisted['low_risk_classification'], 'watchlist')
+        self.assertFalse(persisted['is_low_risk_eligible'])
+
     def test_inspect_returns_single_item_for_symbol(self) -> None:
         service = DailyLowRiskFactorService()
         stored_items = [

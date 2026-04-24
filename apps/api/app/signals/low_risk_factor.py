@@ -144,19 +144,40 @@ class DailyLowRiskFactorService:
             market_date=normalized_market_date,
             symbols=normalized_symbols,
         )
+        ranking_inputs = inputs
+        if normalized_symbols is not None:
+            ranking_inputs, _, _ = self._load_inputs(
+                market_date=normalized_market_date,
+                symbols=None,
+            )
 
-        items = [
+        ranking_items = [
             self._build_symbol_result(
                 input_row=item,
                 market_date=normalized_market_date,
                 source=source,
             )
-            for item in inputs
+            for item in ranking_inputs
         ]
 
-        universe_counts = self._assign_rankings(items)
-        self._assign_liquidity_floor(items)
-        self._assign_scores_and_classifications(items)
+        universe_counts = self._assign_rankings(ranking_items)
+        self._assign_liquidity_floor(ranking_items)
+        self._assign_scores_and_classifications(ranking_items)
+        if normalized_symbols is None:
+            items = ranking_items
+        else:
+            ranked_items_by_symbol = {item['symbol']: item for item in ranking_items}
+            items = []
+            for input_row in inputs:
+                item = ranked_items_by_symbol.get(input_row.symbol)
+                if item is None:
+                    item = self._build_symbol_result(
+                        input_row=input_row,
+                        market_date=normalized_market_date,
+                        source=source,
+                    )
+                items.append(item)
+
         for item in items:
             item['factor_payload'] = self._build_factor_payload(
                 item=item,

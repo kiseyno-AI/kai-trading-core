@@ -24,6 +24,7 @@
 21. Daily low-risk factor compute/read routes
 22. Agent feedback intake/read routes for OpenClaw summaries
 23. Role-specific post-EOD agent feedback dispatch route
+24. Daily price momentum factor compute/inspect routes
 
 ## Current routes
 - `POST /broker/kis/token`
@@ -69,6 +70,8 @@
 - `GET /eod/action-summaries?market_date=YYYY-MM-DD&symbols=005930,000660`
 - `POST /eod/signal-features/collect?market_date=YYYY-MM-DD&sources=volume-power,overtime-volume,overtime-fluctuation`
 - `GET /eod/signal-features?market_date=YYYY-MM-DD&symbols=005930,000660`
+- `POST /eod/momentum-factors/compute?market_date=YYYY-MM-DD&symbols=005930,000660`
+- `GET /eod/momentum-factors?market_date=YYYY-MM-DD&symbols=005930,000660`
 - `GET /eod/piotroski-filter-results?market_date=YYYY-MM-DD&symbol=005930`
 - `POST /eod/low-risk-factors/compute?market_date=YYYY-MM-DD&symbols=005930,000660`
 - `GET /eod/low-risk-factors?market_date=YYYY-MM-DD&symbol=005930`
@@ -188,6 +191,15 @@
 - The same collect path now also rebuilds `daily_market_participation_contexts` for that market date from the stored `daily_signal_features` rows, so market-summary payloads no longer derive participation context on demand.
 - Repo-owned bootstrap/backfill for the new derived-context tables is the internal ops command `python3.11 -m app.internal.ops agent-derived-contexts-backfill-recent`, which fills the recent seven trading days ending yesterday from existing `daily_price_bars` and stored `daily_signal_features` without changing the steady-state daily EOD scope.
 - For shell-driven operations, prefer `python3.11 -m app.internal.ops kis-daily-signal-features-collect --market-date YYYY-MM-DD` from `apps/api`.
+
+## Daily momentum factor notes
+- `daily_momentum_factor_results` is the DB-backed price-factor layer keyed by `symbol_id + market_date`.
+- `POST /eod/momentum-factors/compute` reads only stored `daily_price_bars`; it does not fetch a new upstream price series during the request.
+- V1 uses exact stored trading-bar offsets for 12-1 momentum: `close[t-21] / close[t-252] - 1`. Symbols with fewer than 253 stored bars still get persisted rows with moving-average and overheat fields where available, but they do not receive a momentum rank or percentile.
+- The route also stores `ma_60`, `ma_120`, `is_price_above_ma120`, `is_ma60_above_ma120`, `return_5d`, and `is_recent_overheated`, plus rule metadata and input references in `factor_payload` for later audit.
+- Cross-sectional `momentum_rank` and `momentum_percentile` are computed only across symbols in the selected compute universe that have non-null 12-1 momentum. Higher momentum receives a lower rank number and a higher percentile.
+- The default 5-day overheat exclusion is an absolute decimal-return rule: `return_5d >= 0.15`. The persisted payload records the rule type, lookback window, comparison, and threshold so later threshold changes are auditable.
+- The current scope is intentionally manual or operator-triggered rather than part of the steady-state pykrx pipeline stages. For shell-driven operations, use `python3.11 -m app.internal.ops eod-momentum-factors-compute --market-date YYYY-MM-DD` from `apps/api`.
 
 ## Piotroski filter read-layer notes
 - `GET /eod/piotroski-filter-results` is the persisted read API for `daily_piotroski_filter_results`.

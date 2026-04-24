@@ -118,6 +118,29 @@ class FakeSignalFeatureService:
         }
 
 
+class FakeMomentumFactorService:
+    def __init__(self):
+        self.compute_args = None
+        self.inspect_args = None
+
+    def rebuild_for_market_date(self, **kwargs):
+        self.compute_args = kwargs
+        return {
+            'market_date': kwargs['market_date'],
+            'results_persisted': 2,
+            'results_failed': 0,
+            'items': [{'symbol': '005930', 'momentum_rank': 1}],
+        }
+
+    def inspect(self, **kwargs):
+        self.inspect_args = kwargs
+        return {
+            'market_date': kwargs['market_date'],
+            'summary': {'entries': 1, 'eligible_symbols': 1},
+            'items': [{'symbol': '005930', 'momentum_rank': 1, 'is_momentum_eligible': True}],
+        }
+
+
 class FakePiotroskiFilterService:
     def __init__(self):
         self.inspect_args = None
@@ -445,6 +468,42 @@ class EODRouteTests(unittest.TestCase):
         self.assertEqual(fake_service.inspect_args['symbol'], '005930')
         self.assertEqual(response.json()['item']['low_risk_score'], 0.91)
         self.assertTrue(response.json()['item']['is_low_risk_eligible'])
+
+    def test_compute_momentum_factors_route_calls_service(self):
+        fake_service = FakeMomentumFactorService()
+        original_service = routes_eod.daily_momentum_factor_service
+        routes_eod.daily_momentum_factor_service = fake_service
+        try:
+            client = TestClient(self.app)
+            response = client.post(
+                '/eod/momentum-factors/compute',
+                params={'market_date': '2026-04-14', 'symbols': '005930,000660'},
+            )
+        finally:
+            routes_eod.daily_momentum_factor_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(fake_service.compute_args['symbols'], ['005930', '000660'])
+        self.assertEqual(response.json()['results_persisted'], 2)
+
+    def test_inspect_momentum_factors_route_calls_service(self):
+        fake_service = FakeMomentumFactorService()
+        original_service = routes_eod.daily_momentum_factor_service
+        routes_eod.daily_momentum_factor_service = fake_service
+        try:
+            client = TestClient(self.app)
+            response = client.get(
+                '/eod/momentum-factors',
+                params={'market_date': '2026-04-14', 'symbols': '005930', 'limit': 5},
+            )
+        finally:
+            routes_eod.daily_momentum_factor_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(fake_service.inspect_args['symbols'], ['005930'])
+        self.assertEqual(fake_service.inspect_args['limit'], 5)
+        self.assertEqual(response.json()['summary']['eligible_symbols'], 1)
+        self.assertEqual(response.json()['items'][0]['momentum_rank'], 1)
 
     def test_inspect_piotroski_filter_results_route_returns_all_items(self):
         fake_service = FakePiotroskiFilterService()
