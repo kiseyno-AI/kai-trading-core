@@ -2079,10 +2079,6 @@ class AgentFeedbackOrchestrator:
                     request_run_id=request_run_id,
                     reason='finalize',
                 )
-                self._cleanup_persisted_run_sessions(
-                    market_date=normalized_market_date,
-                    request_run_id=request_run_id,
-                )
             except Exception as exc:  # noqa: BLE001
                 finalization_error = exc
                 _feedback_runtime_log(
@@ -2092,6 +2088,20 @@ class AgentFeedbackOrchestrator:
                     error_type=type(exc).__name__,
                     error=str(exc),
                 )
+            finally:
+                try:
+                    self._cleanup_persisted_run_sessions(
+                        market_date=normalized_market_date,
+                        request_run_id=request_run_id,
+                    )
+                except Exception as cleanup_exc:  # noqa: BLE001
+                    _feedback_runtime_log(
+                        'cleanup_persisted_run_sessions_failed',
+                        market_date=normalized_market_date.isoformat(),
+                        request_run_id=request_run_id,
+                        error_type=type(cleanup_exc).__name__,
+                        error=str(cleanup_exc),
+                    )
             final_snapshot = runtime_feedback_state_store.get_run(normalized_market_date, run_id=request_run_id) or final_snapshot
             completed_count = len(final_snapshot.buffered_feedback_rows) if final_snapshot is not None else 0
             failed_count = len(final_snapshot.buffered_failures) if final_snapshot is not None else 0
