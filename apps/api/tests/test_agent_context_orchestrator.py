@@ -1,10 +1,11 @@
+import json
 import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from app.agent_context import orchestrator as orchestrator_module
-from app.agent_context.orchestrator import AgentFeedbackOrchestrator
+from app.agent_context.orchestrator import AgentFeedbackOrchestrator, OpenClawAgentClient
 from app.agent_context.runtime_state import RuntimeFeedbackStateStore
 
 
@@ -26,6 +27,12 @@ def _batch_result(symbol: str) -> dict:
             ]
         },
         'attempt': 1,
+        'attempt_id': f'dispatch:{symbol}:attempt-1',
+        'dispatch_id': f'dispatch:{symbol}',
+        'request_run_id': 'request-run-test',
+        'market_date': '2026-04-14',
+        'batch_symbols': [symbol],
+        'slot': 1,
         'started_at': '2026-04-14T01:00:00+00:00',
         'completed_at': '2026-04-14T01:01:00+00:00',
         'session_ref': {'session_key': 'feedback/eod-summarizer/slot-01'},
@@ -118,6 +125,8 @@ class RecordingBatchClient:
         with self._lock:
             self.calls.append(kwargs)
         spec = kwargs['spec']
+        batch_items = kwargs['batch_items']
+        dispatch_id = kwargs['batch_items'][0].get('dispatch_id')
         return {
             'decoded': {
                 'items': [
@@ -136,6 +145,12 @@ class RecordingBatchClient:
                 ]
             },
             'attempt': 1,
+            'attempt_id': f'{dispatch_id}:attempt-1' if dispatch_id is not None else None,
+            'dispatch_id': dispatch_id,
+            'request_run_id': kwargs['batch_items'][0].get('request_run_id'),
+            'market_date': kwargs['market_date'].isoformat(),
+            'batch_symbols': [item['symbol'] for item in batch_items],
+            'slot': batch_items[0].get('session_slot'),
             'started_at': '2026-04-14T01:00:00+00:00',
             'completed_at': '2026-04-14T01:01:00+00:00',
             'session_ref': {'session_key': kwargs['batch_items'][0]['session_key']},
@@ -153,6 +168,7 @@ class SignalDeciderBatchClient:
             self.calls.append(kwargs)
         spec = kwargs['spec']
         batch_items = kwargs['batch_items']
+        dispatch_id = batch_items[0].get('dispatch_id')
         if spec.role == 'eod-summarizer':
             feedback_by_symbol = {
                 item['symbol']: {
@@ -227,12 +243,45 @@ class SignalDeciderBatchClient:
                 ]
             },
             'attempt': 1,
+            'attempt_id': f'{dispatch_id}:attempt-1' if dispatch_id is not None else None,
+            'dispatch_id': dispatch_id,
+            'request_run_id': batch_items[0].get('request_run_id'),
+            'market_date': kwargs['market_date'].isoformat(),
+            'batch_symbols': [item['symbol'] for item in batch_items],
+            'slot': batch_items[0].get('session_slot'),
             'started_at': '2026-04-14T01:00:00+00:00',
             'completed_at': '2026-04-14T01:01:00+00:00',
             'session_ref': {'session_key': batch_items[0]['session_key']},
             'response': {'model': f"openclaw/{spec.agent_name}", 'id': f"resp-{spec.role}"},
             'output_text': '{}',
         }
+
+
+class FakeHTTPResponse:
+    def __init__(self, status_code: int, payload: dict):
+        self.status_code = status_code
+        self._payload = payload
+        self.text = json.dumps(payload)
+
+    def json(self):
+        return self._payload
+
+
+class FakeHTTPClient:
+    def __init__(self, *, response: FakeHTTPResponse, calls: list[dict], **kwargs):
+        self.response = response
+        self.calls = calls
+        self.kwargs = kwargs
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def post(self, url, json):
+        self.calls.append({'url': url, 'json': json, 'kwargs': self.kwargs})
+        return self.response
 
 
 class FakeFeedbackService:
@@ -952,6 +1001,262 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertEqual(run_state_service.finished[0]['status'], 'partial')
         self.assertEqual(run_state_service.finished[0]['summary_payload']['flush_result']['status'], 'noop')
         self.assertEqual(run_state_service.finished[0]['summary_payload']['role_statuses']['fundamental-summarizer'], 'completed')
+
+    def test_openclaw_batch_dispatch_logs_request_response_and_symbol_mismatch(self):
+        dispatch_id = 'symbol-run-2026-04-14-abc123:eod-summarizer:slot-1:batch-1'
+        http_calls = []
+        captured_logs = []
+        response_payload = {
+            'id': 'resp-1',
+            'status': 'completed',
+            'model': 'openclaw/eod-summarizer',
+            'output': [
+                {
+                    'type': 'message',
+                    'content': [
+                        {
+                            'type': 'output_text',
+                            'text': json.dumps(
+                                {
+                                    'items': [
+                                        {
+                                            'symbol': '005930',
+                                            'feedback': {
+                                                'role': 'eod-summarizer',
+                                                'summary': 'Constructive close.',
+                                                'confidence': 0.6,
+                                                'risk_flags': [],
+                                                'details': {},
+                                                'improvement_notes': [],
+                                            },
+                                        },
+                                        {
+                                            'symbol': '999999',
+                                            'feedback': {
+                                                'role': 'eod-summarizer',
+                                                'summary': 'Unexpected stale symbol.',
+                                                'confidence': 0.2,
+                                                'risk_flags': ['stale_session_reuse'],
+                                                'details': {},
+                                                'improvement_notes': [],
+                                            },
+                                        },
+                                    ]
+                                }
+                            ),
+                        }
+                    ],
+                }
+            ],
+        }
+        fake_settings = SimpleNamespace(
+            openclaw_base_url='https://openclaw.example',
+            openclaw_gateway_token='gateway-token',
+            openclaw_agent_timeout_seconds=30,
+            openclaw_agent_max_retries=0,
+            openclaw_agent_retry_backoff_seconds=0,
+            openclaw_agent_max_prompt_chars=0,
+        )
+
+        def fake_client_factory(*args, **kwargs):
+            return FakeHTTPClient(
+                response=FakeHTTPResponse(200, response_payload),
+                calls=http_calls,
+                **kwargs,
+            )
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            with patch('app.agent_context.orchestrator.httpx.Client', side_effect=fake_client_factory):
+                with patch.object(
+                    orchestrator_module,
+                    'log_agent_feedback_event',
+                    side_effect=lambda stage, **payload: captured_logs.append({'stage': stage, **payload}),
+                ):
+                    client = OpenClawAgentClient()
+                    result = client.dispatch_batch(
+                        spec=orchestrator_module.DISPATCH_SPECS[0],
+                        market_date=orchestrator_module.date.fromisoformat('2026-04-14'),
+                        batch_items=[
+                            {
+                                'symbol': '005930',
+                                'request_run_id': 'symbol-run-2026-04-14-abc123',
+                                'dispatch_id': dispatch_id,
+                                'session_slot': 1,
+                                'session_key': 'agent:eod-summarizer:feedback/eod-summarizer/slot-01',
+                            }
+                        ],
+                    )
+
+        self.assertEqual(result['dispatch_id'], dispatch_id)
+        self.assertEqual(result['attempt_id'], f'{dispatch_id}:attempt-1')
+        self.assertEqual(http_calls[0]['url'], 'https://openclaw.example/v1/responses')
+        self.assertEqual(http_calls[0]['json']['model'], 'openclaw/eod-summarizer')
+        self.assertIn('dispatch_batch_request', [entry['stage'] for entry in captured_logs])
+        self.assertIn('dispatch_batch_response', [entry['stage'] for entry in captured_logs])
+        mismatch_log = next(entry for entry in captured_logs if entry['stage'] == 'batch_response_symbol_mismatch')
+        self.assertEqual(mismatch_log['dispatch_id'], dispatch_id)
+        self.assertEqual(mismatch_log['unexpected_symbols'], ['999999'])
+        self.assertEqual(mismatch_log['missing_symbols'], [])
+
+    def test_spawn_symbol_subagent_terminal_error_logs_only_in_scope_fields(self):
+        http_calls = []
+        captured_logs = []
+        fake_settings = SimpleNamespace(
+            openclaw_base_url='https://openclaw.example',
+            openclaw_gateway_token='gateway-token',
+            openclaw_agent_timeout_seconds=30,
+            openclaw_agent_max_retries=0,
+            openclaw_agent_retry_backoff_seconds=0,
+            openclaw_agent_max_prompt_chars=0,
+        )
+
+        def fake_client_factory(*args, **kwargs):
+            return FakeHTTPClient(
+                response=FakeHTTPResponse(404, {'error': 'missing'}),
+                calls=http_calls,
+                **kwargs,
+            )
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            with patch('app.agent_context.orchestrator.httpx.Client', side_effect=fake_client_factory):
+                with patch.object(
+                    orchestrator_module,
+                    'log_agent_feedback_event',
+                    side_effect=lambda stage, **payload: captured_logs.append({'stage': stage, **payload}),
+                ):
+                    client = OpenClawAgentClient()
+                    with self.assertRaisesRegex(orchestrator_module.AgentDispatchTerminalError, 'sessions_spawn is not available'):
+                        client.spawn_symbol_subagent(
+                            spec=orchestrator_module.DISPATCH_SPECS[0],
+                            market_date=orchestrator_module.date.fromisoformat('2026-04-14'),
+                            symbol_item={'symbol': '005930'},
+                            request_run_id='symbol-run-2026-04-14-abc123',
+                        )
+
+        self.assertEqual(http_calls[0]['url'], 'https://openclaw.example/tools/invoke')
+        error_log = next(entry for entry in captured_logs if entry['stage'] == 'subagent_spawn_error')
+        self.assertEqual(error_log['status'], 'terminal')
+        self.assertEqual(error_log['request_run_id'], 'symbol-run-2026-04-14-abc123')
+        self.assertEqual(error_log['agent_name'], 'eod-summarizer')
+        self.assertEqual(error_log['role'], 'eod-summarizer')
+        self.assertEqual(error_log['symbol'], '005930')
+        self.assertTrue(str(error_log['session_key']).startswith('subagent-test/eod-summarizer/symbol-run-2026-04-14-abc123/005930-'))
+        self.assertEqual(error_log['error_type'], 'AgentDispatchTerminalError')
+        self.assertNotIn('dispatch_id', error_log)
+        self.assertNotIn('attempt_id', error_log)
+        self.assertEqual(error_log['spawn_target']['url'], 'https://openclaw.example/tools/invoke')
+
+    def test_dispatch_for_symbols_logs_lifecycle_with_dispatch_correlation(self):
+        service = AgentFeedbackOrchestrator()
+        client = RecordingBatchClient()
+        service.client = client
+        feedback_service = FakeFeedbackService()
+        cleanup_service = FakeSessionCleanupService()
+        run_state_service = RecordingRunStateService()
+        captured_logs = []
+        fake_settings = SimpleNamespace(openclaw_agent_symbol_chunk_size=1, openclaw_agent_parallel_subtasks=1)
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            with patch.object(orchestrator_module, 'agent_context_feedback_run_state_service', run_state_service):
+                with patch.object(orchestrator_module, 'agent_context_read_service', DynamicFakeAgentContextReadService()):
+                    with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
+                        with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
+                            with patch.object(
+                                orchestrator_module,
+                                'load_daily_piotroski_filter_results',
+                                return_value=_passed_filter_rows('005930'),
+                            ):
+                                with patch.object(
+                                    orchestrator_module,
+                                    'log_agent_feedback_event',
+                                    side_effect=lambda stage, **payload: captured_logs.append({'stage': stage, **payload}),
+                                ):
+                                    result = service.dispatch_for_symbols(
+                                        market_date='2026-04-14',
+                                        symbols=['005930'],
+                                        roles=['eod-summarizer'],
+                                        reuse_existing=False,
+                                    )
+
+        request_run_id = result['request']['request_run_id']
+        stages = {entry['stage'] for entry in captured_logs}
+        self.assertTrue(
+            {
+                'run_started',
+                'role_started',
+                'normalized_response_accepted',
+                'feedback_persistence_attempt',
+                'feedback_persistence_success',
+                'role_checkpoint_summary',
+                'final_reconciliation',
+                'run_finished',
+            }.issubset(stages)
+        )
+        normalized_log = next(entry for entry in captured_logs if entry['stage'] == 'normalized_response_accepted')
+        self.assertTrue(normalized_log['dispatch_id'].startswith(request_run_id))
+        self.assertEqual(normalized_log['symbol'], '005930')
+        self.assertEqual(normalized_log['attempt_id'], f"{normalized_log['dispatch_id']}:attempt-1")
+        persistence_attempt = next(entry for entry in captured_logs if entry['stage'] == 'feedback_persistence_attempt')
+        persistence_success = next(entry for entry in captured_logs if entry['stage'] == 'feedback_persistence_success')
+        self.assertEqual(persistence_attempt['dispatch_id'], normalized_log['dispatch_id'])
+        self.assertEqual(persistence_success['dispatch_id'], normalized_log['dispatch_id'])
+        final_log = next(entry for entry in captured_logs if entry['stage'] == 'run_finished')
+        self.assertEqual(final_log['request_run_id'], request_run_id)
+        self.assertEqual(final_log['terminal_status'], 'completed')
+
+    def test_dispatch_for_symbols_logs_stale_reuse_signal(self):
+        service = AgentFeedbackOrchestrator()
+        client = RecordingBatchClient()
+        service.client = client
+        feedback_service = FakeFeedbackService()
+        cleanup_service = FakeSessionCleanupService()
+        run_state_service = RecordingRunStateService()
+        captured_logs = []
+        fake_settings = SimpleNamespace(openclaw_agent_symbol_chunk_size=1, openclaw_agent_parallel_subtasks=1)
+        reuse_service = SimpleNamespace(
+            build_latest_decisions=lambda **kwargs: {
+                '005930': {
+                    'eod-summarizer': SimpleNamespace(
+                        symbol='005930',
+                        agent_name='eod-summarizer',
+                        should_dispatch=True,
+                        reason='stale_market_feedback',
+                        latest_feedback_id=41,
+                        latest_feedback_received_at='2026-04-13T06:00:00+00:00',
+                        latest_source_updated_at='2026-04-14T06:05:00+00:00',
+                    )
+                }
+            }
+        )
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            with patch.object(orchestrator_module, 'agent_context_reuse_service', reuse_service):
+                with patch.object(orchestrator_module, 'agent_context_feedback_run_state_service', run_state_service):
+                    with patch.object(orchestrator_module, 'agent_context_read_service', DynamicFakeAgentContextReadService()):
+                        with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
+                            with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
+                                with patch.object(
+                                    orchestrator_module,
+                                    'load_daily_piotroski_filter_results',
+                                    return_value=_passed_filter_rows('005930'),
+                                ):
+                                    with patch.object(
+                                        orchestrator_module,
+                                        'log_agent_feedback_event',
+                                        side_effect=lambda stage, **payload: captured_logs.append({'stage': stage, **payload}),
+                                    ):
+                                        service.dispatch_for_symbols(
+                                            market_date='2026-04-14',
+                                            symbols=['005930'],
+                                            roles=['eod-summarizer'],
+                                            reuse_existing=True,
+                                        )
+
+        reuse_log = next(entry for entry in captured_logs if entry['stage'] == 'reuse_signal')
+        self.assertEqual(reuse_log['symbol'], '005930')
+        self.assertEqual(reuse_log['reuse_signal'], 'stale_feedback')
+        self.assertEqual(reuse_log['status'], 'redispatch_required')
+        self.assertEqual(reuse_log['reuse_reason'], 'stale_market_feedback')
 
 
 if __name__ == '__main__':
