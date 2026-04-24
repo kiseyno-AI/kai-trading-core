@@ -75,7 +75,7 @@
 - `GET /eod/momentum-factors?market_date=YYYY-MM-DD&symbols=005930,000660`
 - `POST /eod/value-factors/compute?market_date=YYYY-MM-DD&symbols=005930,000660&source=value_factor_v1`
 - `GET /eod/value-factors?market_date=YYYY-MM-DD&symbol=005930&limit=100`
-- `GET /eod/piotroski-filter-results?market_date=YYYY-MM-DD&symbol=005930`
+- `GET /eod/piotroski-filter-results`
 - `POST /eod/low-risk-factors/compute?market_date=YYYY-MM-DD&symbols=005930,000660`
 - `GET /eod/low-risk-factors?market_date=YYYY-MM-DD&symbol=005930`
 - `GET /agent-context/symbol-day?market_date=YYYY-MM-DD&symbols=005930&symbols=000660&fs_div=CFS&disclosures_limit=5`
@@ -218,11 +218,13 @@
 
 ## Piotroski filter read-layer notes
 - `GET /eod/piotroski-filter-results` is the persisted read API for `daily_piotroski_filter_results`.
-- `market_date` is required. When `symbol` is provided, the route returns a single `item` for that symbol and date. Without `symbol`, it returns `items` for every stored result on that date by default.
+- `market_date` is optional. When omitted, the route resolves the latest stored Piotroski result date for the current request scope. When `symbol` is provided, latest-date resolution is scoped to that symbol; without `symbol`, it is scoped to the full stored result set.
+- When a specific `market_date` is requested, the read path preserves the exact date when rows exist for that scope. If no rows exist for the requested scope and date, it falls back to the latest stored date on or before the requested date and reports that resolution explicitly.
 - The read path intentionally returns both passed and not-passed rows because the DART daily fundamentals refresh stores one persisted result per evaluated symbol, not just the winners.
 - The same persisted table is the source of truth for agent-feedback dispatch and retry eligibility: only rows with `passed_filter=true` are eligible for symbol-level agent feedback on that `market_date`.
 - Results are ordered with passed names first, then lower PBR percentile ranks first, so callers can consume the returned list directly without applying a second client-side sort.
-- The `summary` block reports the number of returned entries, passed vs not-passed counts, and any requested symbol that did not have a stored row for the requested date.
+- The response keeps `market_date` as the resolved result-set date for compatibility and now also includes `requested_market_date`, `resolved_market_date`, `latest_mode`, `is_latest_fallback`, and `fallback_policy='latest_on_or_before_requested_market_date'` so callers can distinguish exact reads, latest-mode reads, and requested-date fallback behavior.
+- The `summary` block reports the number of returned entries, passed vs not-passed counts, and any requested symbol that did not have a stored row for the resolved date.
 
 ## Low-risk factor notes
 - `daily_low_risk_factor_results` is the persisted low-volatility and downside-risk layer keyed by `symbol_id + market_date`.

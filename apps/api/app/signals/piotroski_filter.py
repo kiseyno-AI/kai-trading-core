@@ -16,12 +16,17 @@ from app.db_models import (
     DartFundamentalsSnapshot,
     Symbol,
 )
-from app.market_data_store import load_daily_piotroski_filter_results, upsert_daily_piotroski_filter_result
+from app.market_data_store import (
+    load_daily_piotroski_filter_results,
+    load_latest_available_daily_piotroski_filter_result_date,
+    upsert_daily_piotroski_filter_result,
+)
 
 FILTER_SOURCE = 'strategy_piotroski_v1'
 LOW_PBR_PERCENTILE = 0.30
 BOTTOM_MOMENTUM_PERCENTILE = 0.30
 PIOTROSKI_PASS_SCORE = 7
+LATEST_FALLBACK_POLICY = 'latest_on_or_before_requested_market_date'
 
 INDEX_GROSS_MARGIN = 'M211300'
 INDEX_CURRENT_RATIO = 'M221200'
@@ -220,20 +225,36 @@ class DailyPiotroskiFilterService:
     def inspect(
         self,
         *,
-        market_date: str | date,
+        market_date: str | date | None = None,
         symbol: str | None = None,
         limit: int | None = None,
     ) -> dict[str, Any]:
-        normalized_market_date = date.fromisoformat(market_date) if isinstance(market_date, str) else market_date
+        normalized_requested_market_date = self._normalize_market_date(market_date)
         normalized_symbol = self._normalize_symbol(symbol)
         requested_symbols = [normalized_symbol] if normalized_symbol else []
-        items = load_daily_piotroski_filter_results(
-            market_date=normalized_market_date,
+        resolved_market_date = load_latest_available_daily_piotroski_filter_result_date(
+            market_date=normalized_requested_market_date,
             symbols=requested_symbols or None,
-            limit=(1 if normalized_symbol else limit),
+        )
+        items = (
+            load_daily_piotroski_filter_results(
+                market_date=resolved_market_date,
+                symbols=requested_symbols or None,
+                limit=(1 if normalized_symbol else limit),
+            )
+            if resolved_market_date is not None
+            else []
         )
         matched_symbols = [item['symbol'] for item in items]
         matched_symbol_set = set(matched_symbols)
+        requested_market_date = (
+            normalized_requested_market_date.isoformat() if normalized_requested_market_date is not None else None
+        )
+        is_latest_fallback = (
+            requested_market_date is not None
+            and resolved_market_date is not None
+            and resolved_market_date != requested_market_date
+        )
         summary = {
             'entries': len(items),
             'requested_symbol': normalized_symbol,
@@ -243,7 +264,12 @@ class DailyPiotroskiFilterService:
             'not_passed_count': sum(1 for item in items if not item.get('passed_filter')),
         }
         payload: dict[str, Any] = {
-            'market_date': normalized_market_date.isoformat(),
+            'requested_market_date': requested_market_date,
+            'resolved_market_date': resolved_market_date,
+            'market_date': resolved_market_date,
+            'latest_mode': normalized_requested_market_date is None,
+            'is_latest_fallback': is_latest_fallback,
+            'fallback_policy': LATEST_FALLBACK_POLICY,
             'summary': summary,
         }
         if normalized_symbol:
@@ -251,6 +277,17 @@ class DailyPiotroskiFilterService:
         else:
             payload['items'] = items
         return payload
+
+    @staticmethod
+    def _normalize_market_date(market_date: str | date | None) -> date | None:
+        if market_date is None:
+            return None
+        if isinstance(market_date, date):
+            return market_date
+        normalized = market_date.strip()
+        if not normalized:
+            raise ValueError('market_date must not be blank')
+        return date.fromisoformat(normalized)
 
     @staticmethod
     def _normalize_symbol(symbol: str | None) -> str | None:
