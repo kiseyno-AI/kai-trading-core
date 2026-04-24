@@ -38,8 +38,20 @@ class FakeFreshnessService:
                 },
             },
             'latest': {
+                'trade_date': '2026-04-10',
                 'price_trade_date': '2026-04-10',
                 'eod_status': 'completed',
+                'updated_at': '2026-04-10T07:31:55+00:00',
+                'succeeded': 3,
+                'failed': 0,
+                'total': 3,
+                'summary': {
+                    'basis': 'latest_eod_run_symbol_universe',
+                    'updated_at': '2026-04-10T07:31:55+00:00',
+                    'succeeded': 3,
+                    'failed': 0,
+                    'total': 3,
+                },
                 'symbols_total': 3,
                 'symbols_succeeded': 3,
                 'symbols_failed': 0,
@@ -291,6 +303,10 @@ class EODRouteTests(unittest.TestCase):
         self.assertEqual(payload['today']['price']['status'], 'ready')
         self.assertEqual(payload['today']['technical_analysis']['symbols_succeeded'], 3)
         self.assertEqual(payload['today']['fundamentals']['symbols_total'], 1)
+        self.assertEqual(payload['latest']['trade_date'], '2026-04-10')
+        self.assertEqual(payload['latest']['updated_at'], '2026-04-10T07:31:55+00:00')
+        self.assertEqual(payload['latest']['total'], 3)
+        self.assertEqual(payload['latest']['summary']['basis'], 'latest_eod_run_symbol_universe')
         self.assertEqual(payload['latest']['symbols_succeeded'], 3)
         self.assertEqual(payload['latest']['action_market_date'], '2026-04-10')
 
