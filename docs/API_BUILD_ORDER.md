@@ -96,7 +96,9 @@
 - It reports the current Seoul trade date, today's stage-specific status for price, technical analysis, action summary, and fundamentals, plus the latest stored dates for price bars, technical snapshots, and action summaries.
 - Today's price, technical-analysis, and action-summary stage totals are based on the current active symbol universe. Their succeeded counts come from same-day persisted rows for active symbols; once a stage has same-day rows, failed counts represent active symbols still missing that persisted data.
 - Today's fundamentals counts come from persisted DART data updated during the current Seoul day: succeeded is distinct symbols with updated fundamentals snapshots, and failed is distinct financial-report symbols whose capture attempt failed that day.
-- The `latest` block also reports EOD run status and symbol counts for `latest.price_trade_date`, so clients can show the latest stored run result before today's run exists.
+- The `latest` block preserves `price_trade_date` plus the legacy `symbols_*` fields and now also mirrors its web-facing summary at top level through `latest.trade_date`, `latest.updated_at`, `latest.succeeded`, `latest.failed`, and `latest.total`.
+- `latest.summary.basis` explicitly names the summary basis. `latest_eod_run_symbol_universe` means counts come from the selected `eod_collection_runs` row for `latest.trade_date`; `stored_price_bars_for_latest_trade_date` is the fallback when stored price bars exist but no matching EOD run row is available, in which case `total == succeeded` and `failed == 0`.
+- `latest.updated_at` comes from the latest run's `run_metadata.last_progress_at` when available, otherwise from its run timestamps; the stored-price-bar fallback uses the max `daily_price_bars.captured_at` for `latest.trade_date`.
 - `latest.eod_status` falls back to all stored price bars for `latest.price_trade_date`, including symbols that are no longer in the current active universe.
 - The `today` block is scoped only to the current Seoul trade date; previous-day historical availability is surfaced through `latest.*`, not copied into `today.*`.
 

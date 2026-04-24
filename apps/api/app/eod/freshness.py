@@ -9,7 +9,7 @@ from sqlalchemy import func, select
 
 from app.core.settings import settings
 from app.db import session_scope
-from app.db_models import DartDisclosureEvent, DartFundamentalsRefreshRun, DartFundamentalsSnapshot, EODCollectionRun
+from app.db_models import DartDisclosureEvent, DartFundamentalsRefreshRun, DartFundamentalsSnapshot, DailyPriceBar, EODCollectionRun
 from app.market.clock import get_market_state
 from app.market_data_store import (
     count_daily_action_summaries_for_live_symbols,
@@ -67,6 +67,26 @@ def _load_daily_fundamentals_stage_counts(market_date: str) -> dict[str, int]:
     }
 
 
+def _load_latest_price_bar_updated_at(trade_date: str) -> str | None:
+    with session_scope() as session:
+        updated_at = session.execute(
+            select(func.max(DailyPriceBar.captured_at)).where(DailyPriceBar.trade_date == date.fromisoformat(trade_date))
+        ).scalar_one_or_none()
+    return updated_at.isoformat() if updated_at else None
+
+
+def _has_running_fundamentals_refresh(market_date: str) -> bool:
+    with session_scope() as session:
+        running_refresh = session.execute(
+            select(DartFundamentalsRefreshRun.id)
+            .where(DartFundamentalsRefreshRun.market_date == date.fromisoformat(market_date))
+            .where(DartFundamentalsRefreshRun.status == 'running')
+            .order_by(DartFundamentalsRefreshRun.started_at.desc(), DartFundamentalsRefreshRun.id.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+    return running_refresh is not None
+
+
 @dataclass
 class EODFreshnessService:
     market_state_loader: Callable = get_market_state
@@ -76,8 +96,10 @@ class EODFreshnessService:
     daily_technical_snapshot_count_loader: Callable = count_daily_technical_snapshots_for_live_symbols
     daily_action_summary_count_loader: Callable = count_daily_action_summaries_for_live_symbols
     daily_fundamentals_count_loader: Callable = _load_daily_fundamentals_stage_counts
+    fundamentals_running_refresh_loader: Callable = _has_running_fundamentals_refresh
     latest_price_trade_date_loader: Callable = load_latest_available_daily_price_trade_date
     latest_price_bar_count_loader: Callable = count_daily_price_bars_for_date
+    latest_price_bar_updated_at_loader: Callable = _load_latest_price_bar_updated_at
     latest_technical_market_date_loader: Callable = load_latest_available_daily_technical_snapshot_date
     latest_action_market_date_loader: Callable = load_latest_available_daily_action_summary_date
 
@@ -88,6 +110,7 @@ class EODFreshnessService:
         technical_snapshot_count = self.daily_technical_snapshot_count_loader(trade_date)
         action_summary_count = self.daily_action_summary_count_loader(trade_date)
         fundamentals_counts = self.daily_fundamentals_count_loader(trade_date)
+        fundamentals_refresh_running = bool(self.fundamentals_running_refresh_loader(trade_date))
 
         if latest_price_trade_date:
             latest_price_run = self._select_freshness_run(
@@ -98,6 +121,16 @@ class EODFreshnessService:
         else:
             latest_price_run = None
             latest_price_bar_count = 0
+
+        latest_summary = self._build_latest_summary(
+            trade_date=latest_price_trade_date,
+            latest_run=latest_price_run,
+            price_bar_count=latest_price_bar_count,
+        )
+        latest_eod_status = self._resolve_eod_status(
+            latest_run=latest_price_run,
+            price_bar_count=latest_price_bar_count,
+        )
 
         today_run = self._select_freshness_run(
             trade_date=trade_date,
@@ -124,14 +157,20 @@ class EODFreshnessService:
                     symbols_total=live_symbols_total,
                     symbols_succeeded=action_summary_count,
                 ),
-                'fundamentals': self._build_fundamentals_stage(fundamentals_counts),
+                'fundamentals': self._build_fundamentals_stage(
+                    counts=fundamentals_counts,
+                    is_running=fundamentals_refresh_running,
+                ),
             },
             'latest': {
+                'trade_date': latest_price_trade_date,
                 'price_trade_date': latest_price_trade_date,
-                'eod_status': self._resolve_eod_status(
-                    latest_run=latest_price_run,
-                    price_bar_count=latest_price_bar_count,
-                ),
+                'eod_status': latest_eod_status,
+                'updated_at': latest_summary['updated_at'],
+                'succeeded': latest_summary['succeeded'],
+                'failed': latest_summary['failed'],
+                'total': latest_summary['total'],
+                'summary': latest_summary,
                 'symbols_total': latest_price_run.get('symbols_total') if latest_price_run else None,
                 'symbols_succeeded': latest_price_run.get('symbols_succeeded') if latest_price_run else None,
                 'symbols_failed': latest_price_run.get('symbols_failed') if latest_price_run else None,
@@ -202,21 +241,12 @@ class EODFreshnessService:
         }
 
     @staticmethod
-    def _build_fundamentals_stage(counts: dict[str, int]) -> dict:
+    def _build_fundamentals_stage(*, counts: dict[str, int], is_running: bool) -> dict:
         symbols_succeeded = int(counts.get('symbols_succeeded') or 0)
         symbols_failed = int(counts.get('symbols_failed') or 0)
         symbols_total = int(counts.get('symbols_total') or 0)
 
-        with session_scope() as session:
-            running_refresh = session.execute(
-                select(DartFundamentalsRefreshRun.id)
-                .where(DartFundamentalsRefreshRun.market_date == date.fromisoformat(get_market_state().server_time[:10]))
-                .where(DartFundamentalsRefreshRun.status == 'running')
-                .order_by(DartFundamentalsRefreshRun.started_at.desc(), DartFundamentalsRefreshRun.id.desc())
-                .limit(1)
-            ).scalar_one_or_none()
-
-        if running_refresh is not None:
+        if is_running:
             status = 'running'
         elif symbols_succeeded > 0:
             status = 'ready'
@@ -229,6 +259,47 @@ class EODFreshnessService:
             'symbols_succeeded': symbols_succeeded,
             'symbols_failed': symbols_failed,
         }
+
+    def _build_latest_summary(
+        self,
+        *,
+        trade_date: str | None,
+        latest_run: dict | None,
+        price_bar_count: int,
+    ) -> dict:
+        # latest.summary is intentionally scoped to the selected latest trade date.
+        # When an EOD run row exists, its symbol universe is the summary basis because
+        # that best answers whether the latest EOD patch completed for that run.
+        if latest_run:
+            return {
+                'basis': 'latest_eod_run_symbol_universe',
+                'updated_at': self._resolve_latest_run_updated_at(latest_run),
+                'succeeded': int(latest_run.get('symbols_succeeded') or 0),
+                'failed': int(latest_run.get('symbols_failed') or 0),
+                'total': int(latest_run.get('symbols_total') or 0),
+            }
+
+        if trade_date and price_bar_count > 0:
+            return {
+                'basis': 'stored_price_bars_for_latest_trade_date',
+                'updated_at': self.latest_price_bar_updated_at_loader(trade_date),
+                'succeeded': int(price_bar_count),
+                'failed': 0,
+                'total': int(price_bar_count),
+            }
+
+        return {
+            'basis': None,
+            'updated_at': None,
+            'succeeded': None,
+            'failed': None,
+            'total': None,
+        }
+
+    @staticmethod
+    def _resolve_latest_run_updated_at(latest_run: dict) -> str | None:
+        metadata = latest_run.get('run_metadata') if isinstance(latest_run.get('run_metadata'), dict) else {}
+        return metadata.get('last_progress_at') or latest_run.get('completed_at') or latest_run.get('started_at')
 
     @staticmethod
     def _resolve_eod_status(*, latest_run: dict | None, price_bar_count: int) -> str:
