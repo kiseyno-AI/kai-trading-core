@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
-from typing import Callable
+from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, select
@@ -25,6 +25,7 @@ from app.market_data_store import (
 
 SEOUL_TZ = ZoneInfo('Asia/Seoul')
 FUNDAMENTALS_CAPTURE_FAILED = 'failed'
+LATEST_AVAILABLE_FUNDAMENTALS_RUN_STATUSES = ('completed', 'partial', 'completed_with_errors')
 
 
 def _seoul_day_bounds(value: str | date) -> tuple[datetime, datetime]:
@@ -67,6 +68,61 @@ def _load_daily_fundamentals_stage_counts(market_date: str) -> dict[str, int]:
     }
 
 
+def _serialize_fundamentals_refresh_run(row: DartFundamentalsRefreshRun) -> dict[str, Any]:
+    return {
+        'id': row.id,
+        'market_date': row.market_date.isoformat(),
+        'trigger': row.trigger,
+        'status': row.status,
+        'fs_div': row.fs_div,
+        'force': row.force,
+        'symbol_limit': row.symbol_limit,
+        'symbol_offset': row.symbol_offset,
+        'symbols_total': row.symbols_total,
+        'symbols_checked': row.symbols_checked,
+        'symbols_missing': row.symbols_missing,
+        'symbols_stale': row.symbols_stale,
+        'symbols_fresh': row.symbols_fresh,
+        'symbols_refreshed': row.symbols_refreshed,
+        'symbols_failed': row.symbols_failed,
+        'events_detected': row.events_detected,
+        'events_captured': row.events_captured,
+        'events_failed': row.events_failed,
+        'error_message': row.error_message,
+        'run_metadata': row.run_metadata,
+        'started_at': row.started_at.isoformat() if row.started_at else None,
+        'completed_at': row.completed_at.isoformat() if row.completed_at else None,
+    }
+
+
+def _load_latest_fundamentals_refresh_run(
+    *,
+    market_date: str | None = None,
+    statuses: tuple[str, ...] | None = None,
+) -> dict[str, Any] | None:
+    fs_div = settings.dart_fundamentals_default_fs_div.strip().upper()
+    with session_scope() as session:
+        stmt = select(DartFundamentalsRefreshRun).where(DartFundamentalsRefreshRun.fs_div == fs_div)
+        if market_date is not None:
+            stmt = stmt.where(DartFundamentalsRefreshRun.market_date == date.fromisoformat(market_date))
+        if statuses:
+            stmt = stmt.where(DartFundamentalsRefreshRun.status.in_(statuses))
+        row = session.execute(
+            stmt.order_by(DartFundamentalsRefreshRun.started_at.desc(), DartFundamentalsRefreshRun.id.desc()).limit(1)
+        ).scalar_one_or_none()
+    if row is None:
+        return None
+    return _serialize_fundamentals_refresh_run(row)
+
+
+def _load_today_fundamentals_refresh_run(market_date: str) -> dict[str, Any] | None:
+    return _load_latest_fundamentals_refresh_run(market_date=market_date)
+
+
+def _load_latest_available_fundamentals_refresh_run() -> dict[str, Any] | None:
+    return _load_latest_fundamentals_refresh_run(statuses=LATEST_AVAILABLE_FUNDAMENTALS_RUN_STATUSES)
+
+
 def _load_latest_price_bar_updated_at(trade_date: str) -> str | None:
     with session_scope() as session:
         updated_at = session.execute(
@@ -75,16 +131,14 @@ def _load_latest_price_bar_updated_at(trade_date: str) -> str | None:
     return updated_at.isoformat() if updated_at else None
 
 
-def _has_running_fundamentals_refresh(market_date: str) -> bool:
-    with session_scope() as session:
-        running_refresh = session.execute(
-            select(DartFundamentalsRefreshRun.id)
-            .where(DartFundamentalsRefreshRun.market_date == date.fromisoformat(market_date))
-            .where(DartFundamentalsRefreshRun.status == 'running')
-            .order_by(DartFundamentalsRefreshRun.started_at.desc(), DartFundamentalsRefreshRun.id.desc())
-            .limit(1)
-        ).scalar_one_or_none()
-    return running_refresh is not None
+def _normalize_fundamentals_refresh_status(value: str | None) -> str | None:
+    if not value:
+        return None
+    if value == 'completed_with_errors':
+        return 'partial'
+    if value == 'skipped':
+        return 'pending'
+    return value
 
 
 @dataclass
@@ -96,7 +150,8 @@ class EODFreshnessService:
     daily_technical_snapshot_count_loader: Callable = count_daily_technical_snapshots_for_live_symbols
     daily_action_summary_count_loader: Callable = count_daily_action_summaries_for_live_symbols
     daily_fundamentals_count_loader: Callable = _load_daily_fundamentals_stage_counts
-    fundamentals_running_refresh_loader: Callable = _has_running_fundamentals_refresh
+    fundamentals_today_refresh_loader: Callable = _load_today_fundamentals_refresh_run
+    latest_fundamentals_refresh_loader: Callable = _load_latest_available_fundamentals_refresh_run
     latest_price_trade_date_loader: Callable = load_latest_available_daily_price_trade_date
     latest_price_bar_count_loader: Callable = count_daily_price_bars_for_date
     latest_price_bar_updated_at_loader: Callable = _load_latest_price_bar_updated_at
@@ -110,7 +165,8 @@ class EODFreshnessService:
         technical_snapshot_count = self.daily_technical_snapshot_count_loader(trade_date)
         action_summary_count = self.daily_action_summary_count_loader(trade_date)
         fundamentals_counts = self.daily_fundamentals_count_loader(trade_date)
-        fundamentals_refresh_running = bool(self.fundamentals_running_refresh_loader(trade_date))
+        fundamentals_today_run = self.fundamentals_today_refresh_loader(trade_date)
+        latest_available_fundamentals_run = self.latest_fundamentals_refresh_loader()
 
         if latest_price_trade_date:
             latest_price_run = self._select_freshness_run(
@@ -159,7 +215,7 @@ class EODFreshnessService:
                 ),
                 'fundamentals': self._build_fundamentals_stage(
                     counts=fundamentals_counts,
-                    is_running=fundamentals_refresh_running,
+                    current_run=fundamentals_today_run,
                 ),
             },
             'latest': {
@@ -176,6 +232,10 @@ class EODFreshnessService:
                 'symbols_failed': latest_price_run.get('symbols_failed') if latest_price_run else None,
                 'technical_market_date': self.latest_technical_market_date_loader(),
                 'action_market_date': self.latest_action_market_date_loader(),
+                'fundamentals': self._build_fundamentals_refresh_summary(
+                    latest_available_fundamentals_run,
+                    basis='latest_available_refresh_run',
+                ),
             },
         }
 
@@ -240,13 +300,12 @@ class EODFreshnessService:
             'symbols_failed': symbols_failed,
         }
 
-    @staticmethod
-    def _build_fundamentals_stage(*, counts: dict[str, int], is_running: bool) -> dict:
+    def _build_fundamentals_stage(self, *, counts: dict[str, int], current_run: dict | None) -> dict:
         symbols_succeeded = int(counts.get('symbols_succeeded') or 0)
         symbols_failed = int(counts.get('symbols_failed') or 0)
         symbols_total = int(counts.get('symbols_total') or 0)
 
-        if is_running:
+        if current_run and _normalize_fundamentals_refresh_status(str(current_run.get('status') or '')) == 'running':
             status = 'running'
         elif symbols_succeeded > 0:
             status = 'ready'
@@ -255,9 +314,70 @@ class EODFreshnessService:
 
         return {
             'status': status,
+            'basis': 'same_day_snapshot_updates',
             'symbols_total': symbols_total,
             'symbols_succeeded': symbols_succeeded,
             'symbols_failed': symbols_failed,
+            'current_run': self._build_fundamentals_refresh_summary(
+                current_run,
+                basis='market_date_refresh_run',
+            ),
+        }
+
+    def _build_fundamentals_refresh_summary(
+        self,
+        run: dict | None,
+        *,
+        basis: str,
+    ) -> dict:
+        if run is None:
+            return {
+                'basis': None,
+                'market_date': None,
+                'status': None,
+                'fs_div': None,
+                'trigger': None,
+                'updated_at': None,
+                'completed_at': None,
+                'symbols_total': None,
+                'symbols_checked': None,
+                'symbols_succeeded': None,
+                'symbols_fresh': None,
+                'symbols_refreshed': None,
+                'symbols_failed': None,
+                'symbols_remaining': None,
+                'events_detected': None,
+                'events_captured': None,
+                'events_failed': None,
+                'error_message': None,
+            }
+
+        metadata = run.get('run_metadata') if isinstance(run.get('run_metadata'), dict) else {}
+        symbols_total = int(metadata.get('symbols_selected') or run.get('symbols_total') or 0)
+        symbols_checked = int(run.get('symbols_checked') or 0)
+        symbols_fresh = int(run.get('symbols_fresh') or 0)
+        symbols_refreshed = int(run.get('symbols_refreshed') or 0)
+        symbols_failed = int(run.get('symbols_failed') or 0)
+
+        return {
+            'basis': basis,
+            'market_date': run.get('market_date'),
+            'status': _normalize_fundamentals_refresh_status(str(run.get('status') or '')),
+            'fs_div': run.get('fs_div'),
+            'trigger': run.get('trigger'),
+            'updated_at': self._resolve_latest_run_updated_at(run),
+            'completed_at': run.get('completed_at'),
+            'symbols_total': symbols_total,
+            'symbols_checked': symbols_checked,
+            'symbols_succeeded': symbols_fresh + symbols_refreshed,
+            'symbols_fresh': symbols_fresh,
+            'symbols_refreshed': symbols_refreshed,
+            'symbols_failed': symbols_failed,
+            'symbols_remaining': max(symbols_total - symbols_checked, 0),
+            'events_detected': int(run.get('events_detected') or 0),
+            'events_captured': int(run.get('events_captured') or 0),
+            'events_failed': int(run.get('events_failed') or 0),
+            'error_message': run.get('error_message'),
         }
 
     def _build_latest_summary(
