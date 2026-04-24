@@ -1066,6 +1066,11 @@ class AgentFeedbackOrchestrator:
             )
             if missing_roles:
                 error = f"missing_decider_upstream_summaries:{','.join(missing_roles)}"
+                dependency_context = {
+                    'dependency_status': 'blocked_missing_upstream_summaries',
+                    'dependency_policy': 'record_failure_and_continue',
+                    'missing_roles': missing_roles,
+                }
                 failure = {
                     'role': role,
                     'agent_name': role,
@@ -1073,9 +1078,10 @@ class AgentFeedbackOrchestrator:
                     'status': 'failed',
                     'retryable': True,
                     'error': error,
+                    'context': dependency_context,
                 }
                 all_failures.append(failure)
-                buffer_failure(role, symbol, error, True)
+                buffer_failure(role, symbol, error, True, context=dependency_context)
                 _feedback_runtime_log(
                     'decider_prerequisite_missing',
                     market_date=market_date.isoformat(),
@@ -1083,6 +1089,7 @@ class AgentFeedbackOrchestrator:
                     role=role,
                     symbol=symbol,
                     missing_roles=missing_roles,
+                    dependency_policy=dependency_context['dependency_policy'],
                 )
                 continue
             dispatch_items.append(

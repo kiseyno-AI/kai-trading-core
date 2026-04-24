@@ -8,6 +8,7 @@ from typing import Any, Sequence
 from sqlalchemy import select
 
 from app.agent_context.feedback_service import _normalize_market_date, _normalize_symbols
+from app.agent_context.run_modes import DAILY_RETRY_CYCLE_MODE
 from app.agent_context.run_state_service import agent_context_feedback_run_state_service
 from app.agent_context.status_service import EXPECTED_AGENT_NAMES
 from app.agent_context.runtime_state import runtime_feedback_state_store
@@ -163,12 +164,11 @@ class AgentContextProgressService:
     ) -> dict[str, Any] | None:
         if run_id is not None:
             return agent_context_feedback_run_state_service.get_run(run_id=run_id)
-        if symbols is None:
-            return None
         return agent_context_feedback_run_state_service.find_latest_run(
             market_date=market_date,
             requested_symbols=list(symbols) if symbols is not None else None,
             requested_roles=list(expected_agents),
+            request_modes=[DAILY_RETRY_CYCLE_MODE] if symbols is None else None,
         )
 
     @staticmethod
