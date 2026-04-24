@@ -13,6 +13,7 @@ from app.db import engine, session_scope
 from app.db_models import (
     CurrentQuoteCache,
     DailyActionSummary,
+    DailyAdvancedValueFactorResult,
     DailyBetaFactorResult,
     DailyLowRiskFactorResult,
     DailyMomentumFactorResult,
@@ -2728,6 +2729,152 @@ def load_daily_value_factor_results(
                 'value_rank': item.value_rank,
                 'value_percentile': _round_float(item.value_percentile, 6),
                 'value_status': item.value_status,
+                'factor_payload': item.factor_payload,
+                'captured_at': item.captured_at.isoformat() if item.captured_at else None,
+            }
+            for item, symbol, name_ko, market in rows
+        ]
+
+
+def upsert_daily_advanced_value_factor_result(result: dict) -> None:
+    refreshed_at = datetime.utcnow()
+    with session_scope() as session:
+        symbol = _get_symbol(session, result['symbol'])
+        if symbol is None:
+            symbol = Symbol(
+                symbol=result['symbol'],
+                market=result.get('market', 'KRX'),
+                name_ko=result.get('name_ko') or result['symbol'],
+                instrument_type='equity',
+                source=result.get('source', 'advanced_value_v1'),
+                is_active=True,
+                last_refreshed_at=refreshed_at,
+            )
+            session.add(symbol)
+            session.flush()
+
+        values = {
+            'symbol_id': symbol.id,
+            'market_date': _normalize_trade_date(result['market_date']),
+            'source': result.get('source', 'advanced_value_v1'),
+            'market_cap_proxy': result.get('market_cap_proxy'),
+            'enterprise_value': result.get('enterprise_value'),
+            'ebitda': result.get('ebitda'),
+            'free_cash_flow': result.get('free_cash_flow'),
+            'fcf_yield': result.get('fcf_yield'),
+            'ev_to_ebitda': result.get('ev_to_ebitda'),
+            'fcf_yield_status': result.get('fcf_yield_status', 'missing_metric'),
+            'ev_to_ebitda_status': result.get('ev_to_ebitda_status', 'missing_metric'),
+            'fcf_yield_valid_for_scoring': bool(result.get('fcf_yield_valid_for_scoring')),
+            'ev_to_ebitda_valid_for_scoring': bool(result.get('ev_to_ebitda_valid_for_scoring')),
+            'fcf_yield_rank': result.get('fcf_yield_rank'),
+            'ev_to_ebitda_rank': result.get('ev_to_ebitda_rank'),
+            'fcf_yield_percentile': result.get('fcf_yield_percentile'),
+            'ev_to_ebitda_percentile': result.get('ev_to_ebitda_percentile'),
+            'advanced_value_score': result.get('advanced_value_score'),
+            'advanced_value_rank': result.get('advanced_value_rank'),
+            'advanced_value_percentile': result.get('advanced_value_percentile'),
+            'advanced_value_components_used': int(result.get('advanced_value_components_used') or 0),
+            'advanced_value_classification': result.get(
+                'advanced_value_classification',
+                'insufficient_components',
+            ),
+            'is_advanced_value_eligible': bool(result.get('is_advanced_value_eligible')),
+            'factor_payload': result['factor_payload'],
+            'captured_at': refreshed_at,
+            'updated_at': refreshed_at,
+        }
+        statement = pg_insert(DailyAdvancedValueFactorResult).values(values)
+        session.execute(
+            statement.on_conflict_do_update(
+                constraint='uq_daily_advanced_value_factor_results_symbol_market_date',
+                set_={
+                    'source': statement.excluded.source,
+                    'market_cap_proxy': statement.excluded.market_cap_proxy,
+                    'enterprise_value': statement.excluded.enterprise_value,
+                    'ebitda': statement.excluded.ebitda,
+                    'free_cash_flow': statement.excluded.free_cash_flow,
+                    'fcf_yield': statement.excluded.fcf_yield,
+                    'ev_to_ebitda': statement.excluded.ev_to_ebitda,
+                    'fcf_yield_status': statement.excluded.fcf_yield_status,
+                    'ev_to_ebitda_status': statement.excluded.ev_to_ebitda_status,
+                    'fcf_yield_valid_for_scoring': statement.excluded.fcf_yield_valid_for_scoring,
+                    'ev_to_ebitda_valid_for_scoring': statement.excluded.ev_to_ebitda_valid_for_scoring,
+                    'fcf_yield_rank': statement.excluded.fcf_yield_rank,
+                    'ev_to_ebitda_rank': statement.excluded.ev_to_ebitda_rank,
+                    'fcf_yield_percentile': statement.excluded.fcf_yield_percentile,
+                    'ev_to_ebitda_percentile': statement.excluded.ev_to_ebitda_percentile,
+                    'advanced_value_score': statement.excluded.advanced_value_score,
+                    'advanced_value_rank': statement.excluded.advanced_value_rank,
+                    'advanced_value_percentile': statement.excluded.advanced_value_percentile,
+                    'advanced_value_components_used': statement.excluded.advanced_value_components_used,
+                    'advanced_value_classification': statement.excluded.advanced_value_classification,
+                    'is_advanced_value_eligible': statement.excluded.is_advanced_value_eligible,
+                    'factor_payload': statement.excluded.factor_payload,
+                    'captured_at': statement.excluded.captured_at,
+                    'updated_at': refreshed_at,
+                },
+            )
+        )
+
+
+def load_daily_advanced_value_factor_results(
+    *,
+    market_date: str | date,
+    symbols: list[str] | None = None,
+    classification: str | None = None,
+    is_eligible: bool | None = None,
+    limit: int | None = None,
+) -> list[dict]:
+    with session_scope() as session:
+        stmt = (
+            select(DailyAdvancedValueFactorResult, Symbol.symbol, Symbol.name_ko, Symbol.market)
+            .join(Symbol, Symbol.id == DailyAdvancedValueFactorResult.symbol_id)
+            .where(DailyAdvancedValueFactorResult.market_date == _normalize_trade_date(market_date))
+            .order_by(
+                DailyAdvancedValueFactorResult.advanced_value_rank.asc().nullslast(),
+                DailyAdvancedValueFactorResult.advanced_value_score.desc().nullslast(),
+                Symbol.symbol.asc(),
+            )
+        )
+        if limit is not None:
+            stmt = stmt.limit(limit)
+        if symbols:
+            stmt = stmt.where(Symbol.symbol.in_(symbols))
+        if classification is not None:
+            stmt = stmt.where(DailyAdvancedValueFactorResult.advanced_value_classification == classification)
+        if is_eligible is not None:
+            stmt = stmt.where(DailyAdvancedValueFactorResult.is_advanced_value_eligible == is_eligible)
+
+        rows = session.execute(stmt).all()
+        return [
+            {
+                'symbol': symbol,
+                'name_ko': name_ko,
+                'market': market,
+                'market_date': item.market_date.isoformat(),
+                'source': item.source,
+                'feature_version': item.source,
+                'market_cap_proxy': _round_float(item.market_cap_proxy, 4),
+                'enterprise_value': _round_float(item.enterprise_value, 4),
+                'ebitda': _round_float(item.ebitda, 4),
+                'free_cash_flow': _round_float(item.free_cash_flow, 4),
+                'fcf_yield': _round_float(item.fcf_yield, 6),
+                'ev_to_ebitda': _round_float(item.ev_to_ebitda, 6),
+                'fcf_yield_status': item.fcf_yield_status,
+                'ev_to_ebitda_status': item.ev_to_ebitda_status,
+                'fcf_yield_valid_for_scoring': item.fcf_yield_valid_for_scoring,
+                'ev_to_ebitda_valid_for_scoring': item.ev_to_ebitda_valid_for_scoring,
+                'fcf_yield_rank': item.fcf_yield_rank,
+                'ev_to_ebitda_rank': item.ev_to_ebitda_rank,
+                'fcf_yield_percentile': _round_float(item.fcf_yield_percentile, 6),
+                'ev_to_ebitda_percentile': _round_float(item.ev_to_ebitda_percentile, 6),
+                'advanced_value_score': _round_float(item.advanced_value_score, 6),
+                'advanced_value_rank': item.advanced_value_rank,
+                'advanced_value_percentile': _round_float(item.advanced_value_percentile, 6),
+                'advanced_value_components_used': item.advanced_value_components_used,
+                'advanced_value_classification': item.advanced_value_classification,
+                'is_advanced_value_eligible': item.is_advanced_value_eligible,
                 'factor_payload': item.factor_payload,
                 'captured_at': item.captured_at.isoformat() if item.captured_at else None,
             }

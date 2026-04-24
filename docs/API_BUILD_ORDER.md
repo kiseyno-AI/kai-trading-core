@@ -27,6 +27,7 @@
 24. Daily price momentum factor compute/inspect routes
 25. Daily value factor compute/read routes
 26. Daily beta factor compute/read routes
+27. Daily advanced value factor compute/read routes
 
 ## Current routes
 - `POST /broker/kis/token`
@@ -81,6 +82,8 @@
 - `GET /eod/low-risk-factors?market_date=YYYY-MM-DD&symbol=005930`
 - `POST /eod/beta-factors/compute?market_date=YYYY-MM-DD&symbols=005930,000660&source=beta_v1`
 - `GET /eod/beta-factors?market_date=YYYY-MM-DD&symbol=005930`
+- `POST /eod/advanced-value-factors/compute?market_date=YYYY-MM-DD&symbols=005930,000660&source=advanced_value_v1`
+- `GET /eod/advanced-value-factors?market_date=YYYY-MM-DD&symbol=005930`
 - `GET /agent-context/symbol-day?market_date=YYYY-MM-DD&symbols=005930&symbols=000660&fs_div=CFS&disclosures_limit=5`
 - `POST /agent-context/feedback`
 - `POST /agent-context/feedback/dispatch`
@@ -250,6 +253,20 @@
 - Lower beta ranks better. Cross-sectional percentiles are stored with `best_symbol=1.0` and `worst_symbol=0.0`, and the combined `low_beta_score` is `0.50 * beta_60d_percentile + 0.50 * beta_120d_percentile`.
 - Rows with incomplete overlap history remain persisted with any available raw beta field, `low_beta_score=null`, and `low_beta_classification=insufficient_history`.
 - For shell-driven operations, use `python3.11 -m app.internal.ops eod-beta-factors-compute --market-date YYYY-MM-DD` from `apps/api`.
+
+## Advanced value factor notes
+- `daily_advanced_value_factor_results` is the DB-backed advanced-value layer keyed by `symbol_id + market_date`, and it intentionally sits alongside `daily_value_factor_results` rather than replacing value v1.
+- `POST /eod/advanced-value-factors/compute` rebuilds persisted rows from stored `daily_price_bars` plus stored DART fundamentals snapshots only; it does not call live quote, broker, or execution paths during the request.
+- `GET /eod/advanced-value-factors` is the persisted read API for that table. When `symbol` is provided, the route returns a single `item`; without `symbol`, it returns ordered `items` for the requested date.
+- `advanced_value_v1` uses the latest stored annual DART `CFS` snapshot whose receipt date is on or before the requested `market_date` (`report_code=11011`, `period_type=annual`).
+- `fcf_yield` is defined as `free_cash_flow / market_cap_proxy`, where `free_cash_flow = operating_cash_flow - capex` and the first-pass capex proxy is the sum of matched PPE and intangible-asset acquisition cash outflows.
+- `ev_to_ebitda` is defined as `enterprise_value / ebitda`, where `enterprise_value = market_cap_proxy + total_liabilities - cash_and_cash_equivalents` and `ebitda = operating_income + depreciation_and_amortization`.
+- `market_cap_proxy` is explicit because stored KRX daily bars do not persist shares outstanding: `market_cap_proxy = pbr * total_equity` using same-day stored `daily_price_bars.pbr` and the selected annual DART `total_equity`.
+- Higher `fcf_yield` ranks better and lower `ev_to_ebitda` ranks better. Cross-sectional percentiles are stored with `best_symbol=1.0` and `worst_symbol=0.0`.
+- The combined `advanced_value_score` is the equal-weight mean of the two component percentiles and requires both component metrics to be valid for scoring. Rows with only one valid metric remain persisted with `advanced_value_score=null` and `advanced_value_classification=insufficient_components`.
+- Negative free cash flow remains a valid but unattractive `fcf_yield` input. Non-positive EBITDA and non-positive enterprise value are treated as explicit invalid EV/EBITDA cases rather than ranked values.
+- Auditability is explicit in `factor_payload`: the stored row keeps the selected annual snapshot metadata, matched DART input rows/highlights, component status flags, methodology assumptions, and the raw numerator/denominator pieces used to derive the final metrics.
+- For shell-driven operations, use `python3.11 -m app.internal.ops eod-advanced-value-factors-compute --market-date YYYY-MM-DD` from `apps/api`.
 
 ## Trending stocks read-layer notes
 - `GET /scanner/trending-stocks` is the compact web-facing read API for stored trending-stock candidates.

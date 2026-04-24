@@ -429,6 +429,66 @@ class DailyValueFactorResult(Base, TimestampMixin):
     captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
+class DailyAdvancedValueFactorResult(Base, TimestampMixin):
+    __tablename__ = 'daily_advanced_value_factor_results'
+    __table_args__ = (
+        UniqueConstraint(
+            'symbol_id',
+            'market_date',
+            name='uq_daily_advanced_value_factor_results_symbol_market_date',
+        ),
+        Index('ix_daily_advanced_value_factor_results_market_rank', 'market_date', 'advanced_value_rank'),
+        Index('ix_daily_advanced_value_factor_results_market_score', 'market_date', 'advanced_value_score'),
+        Index(
+            'ix_daily_advanced_value_factor_results_market_eligible',
+            'market_date',
+            'is_advanced_value_eligible',
+        ),
+        Index(
+            'ix_daily_advanced_value_factor_results_market_classification',
+            'market_date',
+            'advanced_value_classification',
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol_id: Mapped[int] = mapped_column(ForeignKey('symbols.id', ondelete='CASCADE'), nullable=False, index=True)
+    market_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default='advanced_value_v1')
+    market_cap_proxy: Mapped[float | None] = mapped_column(Numeric(24, 4))
+    enterprise_value: Mapped[float | None] = mapped_column(Numeric(24, 4))
+    ebitda: Mapped[float | None] = mapped_column(Numeric(24, 4))
+    free_cash_flow: Mapped[float | None] = mapped_column(Numeric(24, 4))
+    fcf_yield: Mapped[float | None] = mapped_column(Numeric(18, 6))
+    ev_to_ebitda: Mapped[float | None] = mapped_column(Numeric(18, 6))
+    fcf_yield_status: Mapped[str] = mapped_column(String(48), nullable=False, default='missing_metric', index=True)
+    ev_to_ebitda_status: Mapped[str] = mapped_column(
+        String(48),
+        nullable=False,
+        default='missing_metric',
+        index=True,
+    )
+    fcf_yield_valid_for_scoring: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, index=True)
+    ev_to_ebitda_valid_for_scoring: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, index=True)
+    fcf_yield_rank: Mapped[int | None] = mapped_column(Integer, index=True)
+    ev_to_ebitda_rank: Mapped[int | None] = mapped_column(Integer, index=True)
+    fcf_yield_percentile: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    ev_to_ebitda_percentile: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    advanced_value_score: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    advanced_value_rank: Mapped[int | None] = mapped_column(Integer, index=True)
+    advanced_value_percentile: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    advanced_value_components_used: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    advanced_value_classification: Mapped[str] = mapped_column(
+        String(48),
+        nullable=False,
+        default='insufficient_components',
+        index=True,
+    )
+    is_advanced_value_eligible: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, index=True)
+    factor_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
 class DailyMomentumFactorResult(Base, TimestampMixin):
     __tablename__ = 'daily_momentum_factor_results'
     __table_args__ = (
