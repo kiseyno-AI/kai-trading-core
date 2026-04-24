@@ -12,6 +12,10 @@ from app.db_models import AgentContextFeedbackRun
 
 class AgentContextFeedbackRunStateService:
     @staticmethod
+    def _normalize_scope(values: list[str] | None) -> list[str]:
+        return sorted(list(values or []))
+
+    @staticmethod
     def _serialize_run(row: AgentContextFeedbackRun) -> dict[str, Any]:
         return {
             'id': row.id,
@@ -137,18 +141,20 @@ class AgentContextFeedbackRunStateService:
                 ).scalars().all()
             ]
 
-        normalized_symbols = list(requested_symbols or [])
-        normalized_roles = list(requested_roles or [])
+        normalized_symbols = self._normalize_scope(requested_symbols)
+        normalized_roles = self._normalize_scope(requested_roles)
         for row in serialized_rows:
             request_payload = row.get('request_payload') if isinstance(row.get('request_payload'), dict) else {}
             run_symbols = request_payload.get('symbols')
             if not isinstance(run_symbols, list):
                 run_symbols = request_payload.get('requested_symbols')
             run_roles = request_payload.get('roles')
-            if normalized_symbols and list(run_symbols or []) != normalized_symbols:
-                continue
-            if normalized_roles and list(run_roles or []) != normalized_roles:
-                continue
+            if normalized_symbols:
+                if self._normalize_scope(run_symbols if isinstance(run_symbols, list) else None) != normalized_symbols:
+                    continue
+            if normalized_roles:
+                if self._normalize_scope(run_roles if isinstance(run_roles, list) else None) != normalized_roles:
+                    continue
             return row
         return None
 
