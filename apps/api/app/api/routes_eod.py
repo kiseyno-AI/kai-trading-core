@@ -14,6 +14,7 @@ from app.eod.service import EOD_SERVICE
 from app.eod.state import job_state
 from app.eod.technical_snapshots import daily_technical_snapshot_service
 from app.market.clock import get_market_state
+from app.signals.beta_factor import BETA_FACTOR_SOURCE, daily_beta_factor_service
 from app.signals.daily_signal_features import daily_signal_feature_service
 from app.signals.low_risk_factor import LOW_RISK_SOURCE, daily_low_risk_factor_service
 from app.signals.momentum_factor import daily_momentum_factor_service
@@ -265,6 +266,7 @@ async def inspect_daily_signal_features(
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f'Daily signal feature inspect failed: {exc}') from exc
 
+
 @router.post('/low-risk-factors/compute')
 async def compute_daily_low_risk_factors(
     market_date: str,
@@ -283,6 +285,45 @@ async def compute_daily_low_risk_factors(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f'Daily low-risk factor compute failed: {exc}') from exc
+
+
+@router.post('/beta-factors/compute')
+async def compute_daily_beta_factors(
+    market_date: str,
+    symbols: str | None = None,
+    source: str = BETA_FACTOR_SOURCE,
+) -> dict:
+    try:
+        parsed_symbols = [item.strip() for item in symbols.split(',') if item.strip()] if symbols else None
+        return await asyncio.to_thread(
+            daily_beta_factor_service.rebuild_for_market_date,
+            market_date=market_date,
+            symbols=parsed_symbols,
+            source=source,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f'Daily beta factor compute failed: {exc}') from exc
+
+
+@router.get('/beta-factors')
+async def inspect_daily_beta_factors(
+    market_date: str,
+    symbol: str | None = None,
+    limit: int | None = Query(default=None, ge=1, le=20000),
+) -> dict:
+    try:
+        return await asyncio.to_thread(
+            daily_beta_factor_service.inspect,
+            market_date=market_date,
+            symbol=symbol,
+            limit=limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'Daily beta factor read failed: {exc}') from exc
 
 
 @router.get('/low-risk-factors')
