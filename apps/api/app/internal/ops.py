@@ -28,6 +28,7 @@ from app.market_data_store import (
     persist_market_status_snapshot,
 )
 from app.quotes.service import QuoteService
+from app.signals.beta_factor import BETA_FACTOR_SOURCE, daily_beta_factor_service
 from app.signals.low_risk_factor import LOW_RISK_SOURCE, daily_low_risk_factor_service
 from app.signals.momentum_factor import daily_momentum_factor_service
 from app.signals.piotroski_filter import daily_piotroski_filter_service
@@ -163,6 +164,7 @@ def collect_daily_piotroski_filter_results(
         market_date=market_date or get_market_state().server_time[:10],
     )
 
+
 def compute_low_risk_factors(*, market_date: str, symbols: str | None = None) -> dict[str, Any]:
     bootstrap_runtime()
     parsed_symbols = [item.strip() for item in symbols.split(',') if item.strip()] if symbols else None
@@ -170,6 +172,16 @@ def compute_low_risk_factors(*, market_date: str, symbols: str | None = None) ->
         market_date=market_date,
         symbols=parsed_symbols,
         source=LOW_RISK_SOURCE,
+    )
+
+
+def compute_beta_factors(*, market_date: str, symbols: str | None = None) -> dict[str, Any]:
+    bootstrap_runtime()
+    parsed_symbols = [item.strip() for item in symbols.split(',') if item.strip()] if symbols else None
+    return daily_beta_factor_service.rebuild_for_market_date(
+        market_date=market_date,
+        symbols=parsed_symbols,
+        source=BETA_FACTOR_SOURCE,
     )
 
 
@@ -369,6 +381,13 @@ def _build_parser() -> argparse.ArgumentParser:
     low_risk_factor_parser.add_argument('--market-date', required=True)
     low_risk_factor_parser.add_argument('--symbols')
 
+    beta_factor_parser = subparsers.add_parser(
+        'eod-beta-factors-compute',
+        help='Compute and persist daily beta factor results directly',
+    )
+    beta_factor_parser.add_argument('--market-date', required=True)
+    beta_factor_parser.add_argument('--symbols')
+
     technical_parser = subparsers.add_parser('eod-technical-snapshots-compute', help='Compute technical snapshots directly')
     technical_parser.add_argument('--market-date', required=True)
     technical_parser.add_argument('--symbols')
@@ -477,6 +496,8 @@ def main(argv: Iterable[str] | None = None) -> int:
         payload = collect_daily_piotroski_filter_results(market_date=args.market_date)
     elif args.command == 'eod-low-risk-factors-compute':
         payload = compute_low_risk_factors(market_date=args.market_date, symbols=args.symbols)
+    elif args.command == 'eod-beta-factors-compute':
+        payload = compute_beta_factors(market_date=args.market_date, symbols=args.symbols)
     elif args.command == 'eod-technical-snapshots-compute':
         payload = compute_technical_snapshots(market_date=args.market_date, symbols=args.symbols)
     elif args.command == 'eod-action-summaries-compute':

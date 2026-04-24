@@ -357,6 +357,43 @@ class DailyLowRiskFactorResult(Base, TimestampMixin):
     captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
+class DailyBetaFactorResult(Base, TimestampMixin):
+    __tablename__ = 'daily_beta_factor_results'
+    __table_args__ = (
+        UniqueConstraint(
+            'symbol_id',
+            'market_date',
+            name='uq_daily_beta_factor_results_symbol_market_date',
+        ),
+        Index('ix_daily_beta_factor_results_market_eligible', 'market_date', 'is_low_beta_eligible'),
+        Index('ix_daily_beta_factor_results_market_score', 'market_date', 'low_beta_score'),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol_id: Mapped[int] = mapped_column(ForeignKey('symbols.id', ondelete='CASCADE'), nullable=False, index=True)
+    market_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default='beta_v1')
+    benchmark_id: Mapped[str] = mapped_column(String(32), nullable=False, default='KRX_EQW')
+    benchmark_market: Mapped[str] = mapped_column(String(32), nullable=False, default='KRX')
+    beta_60d: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    beta_120d: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    beta_60d_rank: Mapped[int | None] = mapped_column(Integer, index=True)
+    beta_120d_rank: Mapped[int | None] = mapped_column(Integer, index=True)
+    beta_60d_percentile: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    beta_120d_percentile: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    low_beta_score: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    low_beta_classification: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default='insufficient_history',
+        index=True,
+    )
+    is_low_beta_eligible: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, index=True)
+    history_days_available: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    factor_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
 class DailyValueFactorResult(Base, TimestampMixin):
     __tablename__ = 'daily_value_factor_results'
     __table_args__ = (

@@ -26,6 +26,7 @@
 23. Role-specific post-EOD agent feedback dispatch route
 24. Daily price momentum factor compute/inspect routes
 25. Daily value factor compute/read routes
+26. Daily beta factor compute/read routes
 
 ## Current routes
 - `POST /broker/kis/token`
@@ -78,6 +79,8 @@
 - `GET /eod/piotroski-filter-results`
 - `POST /eod/low-risk-factors/compute?market_date=YYYY-MM-DD&symbols=005930,000660`
 - `GET /eod/low-risk-factors?market_date=YYYY-MM-DD&symbol=005930`
+- `POST /eod/beta-factors/compute?market_date=YYYY-MM-DD&symbols=005930,000660&source=beta_v1`
+- `GET /eod/beta-factors?market_date=YYYY-MM-DD&symbol=005930`
 - `GET /agent-context/symbol-day?market_date=YYYY-MM-DD&symbols=005930&symbols=000660&fs_div=CFS&disclosures_limit=5`
 - `POST /agent-context/feedback`
 - `POST /agent-context/feedback/dispatch`
@@ -236,6 +239,17 @@
 - Cross-sectional percentiles are stored with `best_symbol=1.0` and `worst_symbol=0.0`; v1 uses deterministic symbol ordering to break ties.
 - The combined v1 low-risk score is explicit and persisted: `0.30 * volatility_60d_percentile + 0.30 * volatility_120d_percentile + 0.25 * max_drawdown_120d_percentile + 0.15 * liquidity_percentile`.
 - `is_low_risk_eligible` requires the liquidity floor to pass and the combined score to meet the stored eligible threshold. Rows with incomplete history remain persisted with partial raw metrics, `low_risk_score=null`, and `low_risk_classification=insufficient_history`.
+
+## Beta factor notes
+- `daily_beta_factor_results` is the persisted benchmark-relative beta layer keyed by `symbol_id + market_date`.
+- `POST /eod/beta-factors/compute` rebuilds persisted beta rows from stored `daily_price_bars` only; it does not fetch a live benchmark or quote series during the request.
+- `GET /eod/beta-factors` is the persisted read API for that table. When `symbol` is provided, the route returns a single `item`; without `symbol`, it returns ordered `items` for the requested date.
+- v1 benchmark policy is explicit and deterministic: KOSPI equities use `KOSPI_EQW`, KOSDAQ equities use `KOSDAQ_EQW`, and all other markets fall back to `KRX_EQW`.
+- Those benchmark IDs are stored equal-weight market benchmarks built from the same-market stored `daily_price_bars` universe on each trade date, using simple close-to-close returns.
+- v1 beta estimation uses the slope form `cov(symbol_returns, benchmark_returns) / var(benchmark_returns)` over trailing 60-return and 120-return windows, exposed as `beta_60d` and `beta_120d`.
+- Lower beta ranks better. Cross-sectional percentiles are stored with `best_symbol=1.0` and `worst_symbol=0.0`, and the combined `low_beta_score` is `0.50 * beta_60d_percentile + 0.50 * beta_120d_percentile`.
+- Rows with incomplete overlap history remain persisted with any available raw beta field, `low_beta_score=null`, and `low_beta_classification=insufficient_history`.
+- For shell-driven operations, use `python3.11 -m app.internal.ops eod-beta-factors-compute --market-date YYYY-MM-DD` from `apps/api`.
 
 ## Trending stocks read-layer notes
 - `GET /scanner/trending-stocks` is the compact web-facing read API for stored trending-stock candidates.

@@ -1,7 +1,7 @@
 """add daily value factor results
 
-Revision ID: 20260424_0023
-Revises: 20260424_0022
+Revision ID: 20260424_0024
+Revises: 20260424_0023
 Create Date: 2026-04-24 13:10:00.000000
 """
 
@@ -9,8 +9,8 @@ from alembic import op
 import sqlalchemy as sa
 
 
-revision = '20260424_0023'
-down_revision = '20260424_0022'
+revision = '20260424_0024'
+down_revision = '20260424_0023'
 branch_labels = None
 depends_on = None
 
