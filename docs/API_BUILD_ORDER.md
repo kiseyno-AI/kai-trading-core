@@ -21,9 +21,10 @@
 18. KIS realtime trending route
 19. KIS daily ranking signal-feature collect/inspect routes
 20. Daily Piotroski filter result read route
-21. Agent feedback intake/read routes for OpenClaw summaries
-22. Role-specific post-EOD agent feedback dispatch route
-23. Daily price momentum factor compute/inspect routes
+21. Daily low-risk factor compute/read routes
+22. Agent feedback intake/read routes for OpenClaw summaries
+23. Role-specific post-EOD agent feedback dispatch route
+24. Daily price momentum factor compute/inspect routes
 
 ## Current routes
 - `POST /broker/kis/token`
@@ -72,6 +73,8 @@
 - `POST /eod/momentum-factors/compute?market_date=YYYY-MM-DD&symbols=005930,000660`
 - `GET /eod/momentum-factors?market_date=YYYY-MM-DD&symbols=005930,000660`
 - `GET /eod/piotroski-filter-results?market_date=YYYY-MM-DD&symbol=005930`
+- `POST /eod/low-risk-factors/compute?market_date=YYYY-MM-DD&symbols=005930,000660`
+- `GET /eod/low-risk-factors?market_date=YYYY-MM-DD&symbol=005930`
 - `GET /agent-context/symbol-day?market_date=YYYY-MM-DD&symbols=005930&symbols=000660&fs_div=CFS&disclosures_limit=5`
 - `POST /agent-context/feedback`
 - `POST /agent-context/feedback/dispatch`
@@ -205,6 +208,17 @@
 - The same persisted table is the source of truth for agent-feedback dispatch and retry eligibility: only rows with `passed_filter=true` are eligible for symbol-level agent feedback on that `market_date`.
 - Results are ordered with passed names first, then lower PBR percentile ranks first, so callers can consume the returned list directly without applying a second client-side sort.
 - The `summary` block reports the number of returned entries, passed vs not-passed counts, and any requested symbol that did not have a stored row for the requested date.
+
+## Low-risk factor notes
+- `daily_low_risk_factor_results` is the persisted low-volatility and downside-risk layer keyed by `symbol_id + market_date`.
+- `POST /eod/low-risk-factors/compute` rebuilds the persisted rows from stored `daily_price_bars` only; it does not pull live quotes or execution data.
+- `GET /eod/low-risk-factors` is the persisted read API for that table. When `symbol` is provided, the route returns a single `item`; without `symbol`, it returns ordered `items` for the requested date.
+- v1 realized volatility uses simple close-to-close daily returns from stored `close_price`, with 60-return and 120-return trailing windows annualized by `sqrt(252)`.
+- v1 downside risk uses trailing 120 stored closes for `max_drawdown_120d`, expressed as the worst `close / running_peak - 1.0` value inside that window.
+- v1 liquidity support uses `avg_trading_value_20d` from the trailing 20 stored trade-date bars, then applies a cross-sectional liquidity-percentile floor so thinly traded names are not classified as safe by low volatility alone.
+- Cross-sectional percentiles are stored with `best_symbol=1.0` and `worst_symbol=0.0`; v1 uses deterministic symbol ordering to break ties.
+- The combined v1 low-risk score is explicit and persisted: `0.30 * volatility_60d_percentile + 0.30 * volatility_120d_percentile + 0.25 * max_drawdown_120d_percentile + 0.15 * liquidity_percentile`.
+- `is_low_risk_eligible` requires the liquidity floor to pass and the combined score to meet the stored eligible threshold. Rows with incomplete history remain persisted with partial raw metrics, `low_risk_score=null`, and `low_risk_classification=insufficient_history`.
 
 ## Trending stocks read-layer notes
 - `GET /scanner/trending-stocks` is the compact web-facing read API for stored trending-stock candidates.

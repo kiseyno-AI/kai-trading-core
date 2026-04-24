@@ -320,6 +320,42 @@ class DailyPiotroskiFilterResult(Base, TimestampMixin):
     filter_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
     captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
+class DailyLowRiskFactorResult(Base, TimestampMixin):
+    __tablename__ = 'daily_low_risk_factor_results'
+    __table_args__ = (
+        UniqueConstraint(
+            'symbol_id',
+            'market_date',
+            name='uq_daily_low_risk_factor_results_symbol_market_date',
+        ),
+        Index('ix_daily_low_risk_factor_results_market_eligible', 'market_date', 'is_low_risk_eligible'),
+        Index('ix_daily_low_risk_factor_results_market_score', 'market_date', 'low_risk_score'),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol_id: Mapped[int] = mapped_column(ForeignKey('symbols.id', ondelete='CASCADE'), nullable=False, index=True)
+    market_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default='low_risk_v1')
+    volatility_60d: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    volatility_120d: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    max_drawdown_120d: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    avg_trading_value_20d: Mapped[float | None] = mapped_column(Numeric(24, 4))
+    volatility_60d_rank: Mapped[int | None] = mapped_column(Integer, index=True)
+    volatility_120d_rank: Mapped[int | None] = mapped_column(Integer, index=True)
+    max_drawdown_120d_rank: Mapped[int | None] = mapped_column(Integer, index=True)
+    liquidity_rank: Mapped[int | None] = mapped_column(Integer, index=True)
+    volatility_60d_percentile: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    volatility_120d_percentile: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    max_drawdown_120d_percentile: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    liquidity_percentile: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    passes_liquidity_floor: Mapped[bool | None] = mapped_column(Boolean)
+    low_risk_score: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    low_risk_classification: Mapped[str] = mapped_column(String(32), nullable=False, default='insufficient_history', index=True)
+    is_low_risk_eligible: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, index=True)
+    history_days_available: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    factor_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
 
 class DailyMomentumFactorResult(Base, TimestampMixin):
     __tablename__ = 'daily_momentum_factor_results'
