@@ -766,6 +766,60 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertEqual(missing_roles, ['technical-summarizer'])
         self.assertEqual(upstream_traceability['eod-summarizer']['source'], 'current_run_buffer')
 
+    def test_signal_decider_missing_upstream_records_dependency_context_without_dispatch(self):
+        service = AgentFeedbackOrchestrator()
+        client = RecordingBatchClient()
+        service.client = client
+        feedback_service = FakeFeedbackService()
+        cleanup_service = FakeSessionCleanupService()
+        failure_service = RecordingFailureService()
+
+        def build_latest_decisions(**kwargs):
+            roles = tuple(kwargs['roles'])
+            if roles == ('signal-decider',):
+                return {}
+            return {
+                '005930': {
+                    'eod-summarizer': _reuse_decision(True),
+                    'technical-summarizer': _reuse_decision(True),
+                    'fundamental-summarizer': _reuse_decision(True),
+                }
+            }
+
+        reuse_service = SimpleNamespace(build_latest_decisions=build_latest_decisions)
+        fake_settings = SimpleNamespace(openclaw_agent_symbol_chunk_size=1, openclaw_agent_parallel_subtasks=1)
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            with patch.object(orchestrator_module, 'agent_context_read_service', DynamicFakeAgentContextReadService()):
+                with patch.object(orchestrator_module, 'agent_context_reuse_service', reuse_service):
+                    with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
+                        with patch.object(orchestrator_module, 'agent_context_feedback_failure_service', failure_service):
+                            with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
+                                with patch.object(
+                                    orchestrator_module,
+                                    'load_daily_piotroski_filter_results',
+                                    return_value=_passed_filter_rows('005930'),
+                                ):
+                                    result = service.dispatch_for_symbols(
+                                        market_date='2026-04-14',
+                                        symbols=['005930'],
+                                        roles=['signal-decider'],
+                                        reuse_existing=False,
+                                    )
+
+        self.assertEqual(client.calls, [])
+        self.assertEqual(result['summary']['status'], 'failed')
+        self.assertEqual(len(failure_service.recorded), 1)
+        self.assertEqual(
+            failure_service.recorded[0]['context'],
+            {
+                'dependency_status': 'blocked_missing_upstream_summaries',
+                'dependency_policy': 'record_failure_and_continue',
+                'missing_roles': ['eod-summarizer', 'technical-summarizer', 'fundamental-summarizer'],
+            },
+        )
+        self.assertIn('missing_decider_upstream_summaries', failure_service.recorded[0]['failure_kind'])
+
     def test_dispatch_for_symbols_scopes_runtime_mutation_to_explicit_request_run_id(self):
         service = AgentFeedbackOrchestrator()
         service.client = RecordingBatchClient()

@@ -19,6 +19,13 @@ class RuntimeFeedbackRunState:
     started_at: datetime
     status: str = 'running'
     current_role: str | None = None
+    completed_roles: list[str] = field(default_factory=list)
+    remaining_roles: list[str] = field(default_factory=list)
+    cycle_number: int | None = None
+    completed_cycles: int | None = None
+    max_cycles: int | None = None
+    cycle_mode: str | None = None
+    cycle_status: str | None = None
     completed_at: datetime | None = None
     buffered_feedback_rows: list[dict[str, Any]] = field(default_factory=list)
     buffered_failures: list[dict[str, Any]] = field(default_factory=list)
@@ -28,6 +35,8 @@ class RuntimeFeedbackRunState:
     completed_symbols_by_role: dict[str, set[str]] = field(default_factory=dict)
     failed_symbols_by_role: dict[str, set[str]] = field(default_factory=dict)
     reused_symbols_by_role: dict[str, set[str]] = field(default_factory=dict)
+    retry_pending_symbols_by_role: dict[str, set[str]] = field(default_factory=dict)
+    role_boundary_statuses: dict[str, str] = field(default_factory=dict)
     in_flight_slots_by_role: dict[str, dict[int, dict[str, Any]]] = field(default_factory=dict)
     last_activity_at: datetime | None = None
     logical_total_symbols: int | None = None
@@ -42,13 +51,21 @@ class RuntimeFeedbackRunState:
     flushed_failure_count: int = 0
 
     def to_progress_summary(self) -> dict[str, Any]:
+        role_boundary_complete_statuses = {'completed', 'completed_with_failures', 'failed'}
         expected_feedback_count = self.logical_expected_feedback_count if self.logical_expected_feedback_count is not None else len(self.requested_symbols) * len(self.requested_roles)
         completed_feedback_count = (
             self.logical_completed_feedback_count
             if self.logical_completed_feedback_count is not None
             else sum(len(self.completed_symbols_by_role.get(role, set())) for role in self.requested_roles)
         )
-        failed_items = self.logical_failed_items if self.logical_failed_items is not None else len(self.buffered_failures)
+        failed_items = (
+            self.logical_failed_items
+            if self.logical_failed_items is not None
+            else (
+                sum(len(self.failed_symbols_by_role.get(role, set())) for role in self.requested_roles)
+                or len(self.buffered_failures)
+            )
+        )
         total_symbols = self.logical_total_symbols if self.logical_total_symbols is not None else len(self.requested_symbols)
 
         if self.logical_completed_symbols is not None or self.logical_in_progress_symbols is not None or self.logical_pending_symbols is not None:
@@ -116,19 +133,56 @@ class RuntimeFeedbackRunState:
                     role_status = 'failed'
             elif processed_for_role > 0 or in_flight_symbols:
                 role_status = 'running'
+            role_status = self.role_boundary_statuses.get(role) or role_status
+            retry_pending_symbols = len(self.retry_pending_symbols_by_role.get(role, set()))
             role_progress[role] = {
                 'role': role,
                 'status': role_status,
+                'boundary_status': role_status,
                 'total_symbols': total_symbols,
                 'processed_symbols': processed_for_role,
                 'completed_symbols': completed_for_role,
                 'reused_symbols': reused_for_role,
                 'in_progress_symbols': len(in_flight_symbols),
                 'pending_symbols': pending_for_role,
+                'terminal_symbols': min(total_symbols, completed_for_role + failed_for_role),
                 'failed_items': failed_for_role,
+                'retry_pending_symbols': retry_pending_symbols,
                 'progress_ratio': round(progress_ratio_for_role, 6),
                 'progress_percent': round(progress_ratio_for_role * 100, 2),
             }
+
+        if self.completed_roles:
+            completed_roles = list(self.completed_roles)
+        elif self.role_sequence and self.current_role in self.role_sequence:
+            current_index = self.role_sequence.index(self.current_role)
+            completed_roles = [
+                role
+                for role in self.role_sequence[:current_index]
+                if (role_progress.get(role) or {}).get('status') in role_boundary_complete_statuses
+            ]
+        else:
+            completed_roles = [
+                role
+                for role in self.role_sequence
+                if (role_progress.get(role) or {}).get('status') in role_boundary_complete_statuses
+            ]
+
+        if self.remaining_roles:
+            remaining_roles = list(self.remaining_roles)
+        elif self.role_sequence and self.current_role in self.role_sequence:
+            remaining_roles = list(self.role_sequence[self.role_sequence.index(self.current_role):])
+        else:
+            remaining_roles = [role for role in self.role_sequence if role not in completed_roles]
+
+        cycle_status = self.cycle_status
+        if cycle_status is None:
+            if remaining_roles and self.status == 'running':
+                cycle_status = 'running'
+            elif remaining_roles:
+                cycle_status = 'partial'
+            else:
+                cycle_status = 'completed'
 
         now = datetime.now(timezone.utc)
         elapsed_seconds = max(0, int((now - self.started_at.astimezone(timezone.utc)).total_seconds()))
@@ -155,6 +209,13 @@ class RuntimeFeedbackRunState:
             'run_started_at': self.started_at.isoformat(),
             'run_completed_at': self.completed_at.isoformat() if self.completed_at else None,
             'current_role': self.current_role,
+            'completed_roles': completed_roles,
+            'remaining_roles': remaining_roles,
+            'cycle_number': self.cycle_number,
+            'completed_cycles': self.completed_cycles,
+            'max_cycles': self.max_cycles,
+            'cycle_mode': self.cycle_mode,
+            'cycle_status': cycle_status,
             'parallel_per_role': self.parallel_per_role,
             'first_feedback_at': self.started_at.isoformat(),
             'latest_feedback_at': self.last_activity_at.isoformat() if self.last_activity_at else None,

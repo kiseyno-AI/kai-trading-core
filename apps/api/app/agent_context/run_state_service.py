@@ -130,6 +130,7 @@ class AgentContextFeedbackRunStateService:
         market_date: date,
         requested_symbols: list[str] | None = None,
         requested_roles: list[str] | None = None,
+        request_modes: list[str] | tuple[str, ...] | None = None,
     ) -> dict[str, Any] | None:
         with session_scope() as session:
             serialized_rows = [
@@ -143,18 +144,22 @@ class AgentContextFeedbackRunStateService:
 
         normalized_symbols = self._normalize_scope(requested_symbols)
         normalized_roles = self._normalize_scope(requested_roles)
+        normalized_modes = set(self._normalize_scope(list(request_modes) if request_modes is not None else None))
         for row in serialized_rows:
             request_payload = row.get('request_payload') if isinstance(row.get('request_payload'), dict) else {}
             run_symbols = request_payload.get('symbols')
             if not isinstance(run_symbols, list):
                 run_symbols = request_payload.get('requested_symbols')
             run_roles = request_payload.get('roles')
+            run_mode = str(request_payload.get('mode') or '').strip()
             if normalized_symbols:
                 if self._normalize_scope(run_symbols if isinstance(run_symbols, list) else None) != normalized_symbols:
                     continue
             if normalized_roles:
                 if self._normalize_scope(run_roles if isinstance(run_roles, list) else None) != normalized_roles:
                     continue
+            if normalized_modes and run_mode not in normalized_modes:
+                continue
             return row
         return None
 

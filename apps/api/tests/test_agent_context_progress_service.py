@@ -138,6 +138,13 @@ class AgentContextProgressServiceTests(unittest.TestCase):
                     'run_table_status': 'partial',
                     'is_live': False,
                     'current_role': 'fundamental-summarizer',
+                    'completed_roles': ['eod-summarizer'],
+                    'remaining_roles': ['fundamental-summarizer'],
+                    'cycle_number': 1,
+                    'completed_cycles': 0,
+                    'max_cycles': 3,
+                    'cycle_mode': 'boundary_resume',
+                    'cycle_status': 'partial',
                     'total_symbols': 2,
                     'processed_symbols': 2,
                     'completed_symbols': 1,
@@ -195,6 +202,9 @@ class AgentContextProgressServiceTests(unittest.TestCase):
         self.assertEqual(result['summary']['run_id'], 'run-durable')
         self.assertEqual(result['summary']['run_table_status'], 'partial')
         self.assertEqual(result['summary']['current_role'], 'fundamental-summarizer')
+        self.assertEqual(result['summary']['completed_roles'], ['eod-summarizer'])
+        self.assertEqual(result['summary']['remaining_roles'], ['fundamental-summarizer'])
+        self.assertEqual(result['summary']['cycle_number'], 1)
         self.assertEqual(result['summary']['buffered_feedback_count'], 3)
         self.assertEqual(
             result['result']['roles']['technical-summarizer'],
@@ -328,6 +338,81 @@ class AgentContextProgressServiceTests(unittest.TestCase):
         self.assertEqual(result['summary']['total_symbols'], 2)
         self.assertEqual(result['result']['roles']['technical-summarizer']['requested_count'], 2)
         self.assertEqual(result['result']['roles']['technical-summarizer']['completed_count'], 1)
+
+    def test_feedback_progress_without_symbols_uses_latest_durable_retry_cycle_run(self):
+        fake_session = FakeProgressSession()
+        run_snapshot = {
+            'run_id': 'retry-run',
+            'status': 'partial',
+            'started_at': datetime(2026, 4, 14, 1, 0, tzinfo=timezone.utc),
+            'completed_at': datetime(2026, 4, 14, 1, 10, tzinfo=timezone.utc),
+            'summary_payload': {
+                'progress_summary': {
+                    'run_id': 'retry-run',
+                    'run_status': 'partial',
+                    'run_table_status': 'partial',
+                    'is_live': False,
+                    'current_role': 'signal-decider',
+                    'completed_roles': ['eod-summarizer', 'technical-summarizer', 'fundamental-summarizer'],
+                    'remaining_roles': ['signal-decider'],
+                    'cycle_number': 2,
+                    'completed_cycles': 1,
+                    'max_cycles': 3,
+                    'cycle_mode': 'retry_followup',
+                    'cycle_status': 'partial',
+                    'total_symbols': 2,
+                    'processed_symbols': 2,
+                    'completed_symbols': 1,
+                    'in_progress_symbols': 1,
+                    'pending_symbols': 0,
+                    'failed_items': 1,
+                    'completed_feedback_count': 7,
+                    'expected_feedback_count': 8,
+                    'role_progress': {
+                        'signal-decider': {
+                            'role': 'signal-decider',
+                            'status': 'completed_with_failures',
+                            'boundary_status': 'completed_with_failures',
+                            'total_symbols': 2,
+                            'processed_symbols': 2,
+                            'completed_symbols': 1,
+                            'in_progress_symbols': 0,
+                            'pending_symbols': 0,
+                            'terminal_symbols': 2,
+                            'failed_items': 1,
+                            'retry_pending_symbols': 1,
+                            'progress_ratio': 1.0,
+                            'progress_percent': 100.0,
+                        }
+                    },
+                }
+            },
+        }
+
+        @contextmanager
+        def fake_session_scope():
+            yield fake_session
+
+        with patch('app.agent_context.progress_service.session_scope', fake_session_scope):
+            with patch('app.agent_context.progress_service.runtime_feedback_state_store.get_run', return_value=None):
+                with patch(
+                    'app.agent_context.progress_service.agent_context_feedback_run_state_service.find_latest_run',
+                    return_value=run_snapshot,
+                ) as find_latest_run:
+                    result = AgentContextProgressService().get_feedback_progress(
+                        market_date='2026-04-14',
+                        symbols=None,
+                    )
+
+        self.assertEqual(result['summary']['run_id'], 'retry-run')
+        self.assertEqual(result['summary']['current_role'], 'signal-decider')
+        self.assertEqual(result['summary']['completed_roles'], ['eod-summarizer', 'technical-summarizer', 'fundamental-summarizer'])
+        self.assertEqual(result['summary']['remaining_roles'], ['signal-decider'])
+        self.assertEqual(result['summary']['cycle_mode'], 'retry_followup')
+        self.assertEqual(result['summary']['cycle_number'], 2)
+        self.assertEqual(result['summary']['role_progress']['signal-decider']['retry_pending_symbols'], 1)
+        self.assertEqual(result['result']['roles']['signal-decider']['error_count'], 1)
+        self.assertEqual(find_latest_run.call_args.kwargs['request_modes'], ['daily_retry_cycle_role_sequenced'])
 
     def test_feedback_progress_returns_timing_rate_and_eta_fields(self):
         fake_session = FakeProgressSession()

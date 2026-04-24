@@ -94,6 +94,48 @@ class AgentContextFeedbackRunStateServiceTests(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(result['run_id'], 'matching-run')
 
+    def test_find_latest_run_can_filter_by_request_mode(self):
+        service = AgentContextFeedbackRunStateService()
+        market_date = date.fromisoformat('2026-04-14')
+        fake_session = FakeRunStateSession(
+            [
+                _build_run_row(
+                    row_id=2,
+                    run_id='symbol-dispatch-run',
+                    market_date=market_date,
+                    started_at=datetime(2026, 4, 14, 1, 5, tzinfo=timezone.utc),
+                    request_payload={
+                        'roles': ['technical-summarizer'],
+                        'mode': 'role_sequential_runtime_buffered',
+                    },
+                ),
+                _build_run_row(
+                    row_id=1,
+                    run_id='retry-cycle-run',
+                    market_date=market_date,
+                    started_at=datetime(2026, 4, 14, 1, 0, tzinfo=timezone.utc),
+                    request_payload={
+                        'roles': ['technical-summarizer'],
+                        'mode': 'daily_retry_cycle_role_sequenced',
+                    },
+                ),
+            ]
+        )
+
+        @contextmanager
+        def fake_session_scope():
+            yield fake_session
+
+        with patch('app.agent_context.run_state_service.session_scope', fake_session_scope):
+            result = service.find_latest_run(
+                market_date=market_date,
+                requested_roles=['technical-summarizer'],
+                request_modes=['daily_retry_cycle_role_sequenced'],
+            )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result['run_id'], 'retry-cycle-run')
+
 
 if __name__ == '__main__':
     unittest.main()
