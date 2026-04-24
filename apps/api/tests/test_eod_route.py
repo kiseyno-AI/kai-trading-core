@@ -211,6 +211,76 @@ class FakeValueFactorService:
         }
 
 
+class FakeAdvancedValueFactorService:
+    def __init__(self):
+        self.compute_args = None
+        self.inspect_args = None
+
+    def rebuild_for_market_date(self, **kwargs):
+        self.compute_args = kwargs
+        return {
+            'market_date': kwargs['market_date'],
+            'feature_version': kwargs['source'],
+            'results_persisted': 2,
+            'results_failed': 0,
+            'items': [{'symbol': '005930', 'advanced_value_score': 0.84}],
+        }
+
+    def inspect(self, **kwargs):
+        self.inspect_args = kwargs
+        market_date = kwargs['market_date']
+        symbol = kwargs.get('symbol')
+        if symbol:
+            return {
+                'market_date': market_date,
+                'feature_version': 'advanced_value_v1',
+                'summary': {
+                    'entries': 1,
+                    'requested_symbol': symbol,
+                    'matched_symbols': [symbol],
+                    'missing_symbols': [],
+                    'eligible_count': 1,
+                    'watchlist_count': 0,
+                    'ineligible_count': 0,
+                    'insufficient_components_count': 0,
+                },
+                'item': {
+                    'symbol': symbol,
+                    'market_date': market_date,
+                    'advanced_value_score': 0.91,
+                    'advanced_value_classification': 'eligible',
+                },
+            }
+        return {
+            'market_date': market_date,
+            'feature_version': 'advanced_value_v1',
+            'summary': {
+                'entries': 2,
+                'requested_symbol': None,
+                'matched_symbols': ['005930', '000660'],
+                'missing_symbols': [],
+                'eligible_count': 1,
+                'watchlist_count': 1,
+                'ineligible_count': 0,
+                'insufficient_components_count': 0,
+            },
+            'items': [
+                {
+                    'symbol': '005930',
+                    'market_date': market_date,
+                    'advanced_value_score': 0.91,
+                    'advanced_value_classification': 'eligible',
+                },
+                {
+                    'symbol': '000660',
+                    'market_date': market_date,
+                    'advanced_value_score': 0.50,
+                    'advanced_value_classification': 'watchlist',
+                },
+            ],
+        }
+
+
 class FakePiotroskiFilterService:
     def __init__(self):
         self.inspect_args = None
@@ -758,6 +828,48 @@ class EODRouteTests(unittest.TestCase):
         self.assertEqual(fake_service.inspect_args['symbol'], '005930')
         self.assertEqual(response.json()['item']['value_score'], 0.91)
         self.assertEqual(response.json()['item']['value_status'], 'scored')
+
+    def test_compute_advanced_value_factors_route_calls_service(self):
+        fake_service = FakeAdvancedValueFactorService()
+        original_service = routes_eod.daily_advanced_value_factor_service
+        routes_eod.daily_advanced_value_factor_service = fake_service
+        try:
+            client = TestClient(self.app)
+            response = client.post(
+                '/eod/advanced-value-factors/compute',
+                params={
+                    'market_date': '2026-04-24',
+                    'symbols': '005930,000660',
+                    'source': 'advanced_value_v1',
+                },
+            )
+        finally:
+            routes_eod.daily_advanced_value_factor_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(fake_service.compute_args['market_date'], '2026-04-24')
+        self.assertEqual(fake_service.compute_args['symbols'], ['005930', '000660'])
+        self.assertEqual(fake_service.compute_args['source'], 'advanced_value_v1')
+        self.assertEqual(response.json()['items'][0]['advanced_value_score'], 0.84)
+
+    def test_inspect_advanced_value_factors_route_returns_single_item_for_symbol(self):
+        fake_service = FakeAdvancedValueFactorService()
+        original_service = routes_eod.daily_advanced_value_factor_service
+        routes_eod.daily_advanced_value_factor_service = fake_service
+        try:
+            client = TestClient(self.app)
+            response = client.get(
+                '/eod/advanced-value-factors',
+                params={'market_date': '2026-04-24', 'symbol': '005930'},
+            )
+        finally:
+            routes_eod.daily_advanced_value_factor_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(fake_service.inspect_args['market_date'], '2026-04-24')
+        self.assertEqual(fake_service.inspect_args['symbol'], '005930')
+        self.assertEqual(response.json()['item']['advanced_value_score'], 0.91)
+        self.assertEqual(response.json()['item']['advanced_value_classification'], 'eligible')
 
     def test_inspect_piotroski_filter_results_route_returns_all_items(self):
         fake_service = FakePiotroskiFilterService()

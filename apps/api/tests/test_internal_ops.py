@@ -11,6 +11,7 @@ from app.core.settings import settings
 from app.internal import ops
 from app.internal.http_client import InternalAPIClient
 from app.main import audit_and_require_upstream_bearer_token
+from app.signals.advanced_value_factor import ADVANCED_VALUE_FACTOR_SOURCE
 from app.signals.beta_factor import BETA_FACTOR_SOURCE
 from app.signals.low_risk_factor import LOW_RISK_SOURCE
 from app.signals.value_factor import VALUE_FACTOR_SOURCE
@@ -254,6 +255,44 @@ class InternalOpsTests(unittest.TestCase):
         self.assertEqual(compute_value.call_args.kwargs['market_date'], '2026-04-24')
         self.assertEqual(compute_value.call_args.kwargs['symbols'], [])
         self.assertEqual(compute_value.call_args.kwargs['source'], VALUE_FACTOR_SOURCE)
+
+    def test_compute_advanced_value_factors_uses_canonical_feature_version(self) -> None:
+        with (
+            patch('app.internal.ops.bootstrap_runtime') as bootstrap_runtime,
+            patch(
+                'app.internal.ops.daily_advanced_value_factor_service.rebuild_for_market_date',
+                return_value={'results_persisted': 2},
+            ) as compute_advanced_value,
+        ):
+            result = ops.compute_advanced_value_factors(
+                market_date='2026-04-24',
+                symbols='005930,000660',
+            )
+
+        bootstrap_runtime.assert_called_once_with()
+        self.assertEqual(result, {'results_persisted': 2})
+        self.assertEqual(compute_advanced_value.call_args.kwargs['market_date'], '2026-04-24')
+        self.assertEqual(compute_advanced_value.call_args.kwargs['symbols'], ['005930', '000660'])
+        self.assertEqual(compute_advanced_value.call_args.kwargs['source'], ADVANCED_VALUE_FACTOR_SOURCE)
+
+    def test_compute_advanced_value_factors_preserves_empty_symbol_subset(self) -> None:
+        with (
+            patch('app.internal.ops.bootstrap_runtime') as bootstrap_runtime,
+            patch(
+                'app.internal.ops.daily_advanced_value_factor_service.rebuild_for_market_date',
+                return_value={'results_persisted': 0},
+            ) as compute_advanced_value,
+        ):
+            result = ops.compute_advanced_value_factors(
+                market_date='2026-04-24',
+                symbols=',',
+            )
+
+        bootstrap_runtime.assert_called_once_with()
+        self.assertEqual(result, {'results_persisted': 0})
+        self.assertEqual(compute_advanced_value.call_args.kwargs['market_date'], '2026-04-24')
+        self.assertEqual(compute_advanced_value.call_args.kwargs['symbols'], [])
+        self.assertEqual(compute_advanced_value.call_args.kwargs['source'], ADVANCED_VALUE_FACTOR_SOURCE)
 
     def test_cli_quotes_tracked_outputs_json(self) -> None:
         stdout = io.StringIO()

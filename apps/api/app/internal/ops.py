@@ -28,6 +28,10 @@ from app.market_data_store import (
     persist_market_status_snapshot,
 )
 from app.quotes.service import QuoteService
+from app.signals.advanced_value_factor import (
+    ADVANCED_VALUE_FACTOR_SOURCE,
+    daily_advanced_value_factor_service,
+)
 from app.signals.beta_factor import BETA_FACTOR_SOURCE, daily_beta_factor_service
 from app.signals.low_risk_factor import LOW_RISK_SOURCE, daily_low_risk_factor_service
 from app.signals.momentum_factor import daily_momentum_factor_service
@@ -201,6 +205,16 @@ def compute_value_factors(*, market_date: str, symbols: str | None = None) -> di
         market_date=market_date,
         symbols=parsed_symbols,
         source=VALUE_FACTOR_SOURCE,
+    )
+
+
+def compute_advanced_value_factors(*, market_date: str, symbols: str | None = None) -> dict[str, Any]:
+    bootstrap_runtime()
+    parsed_symbols = [item.strip() for item in symbols.split(',') if item.strip()] if symbols else None
+    return daily_advanced_value_factor_service.rebuild_for_market_date(
+        market_date=market_date,
+        symbols=parsed_symbols,
+        source=ADVANCED_VALUE_FACTOR_SOURCE,
     )
 
 
@@ -404,6 +418,13 @@ def _build_parser() -> argparse.ArgumentParser:
     value_parser.add_argument('--market-date', required=True)
     value_parser.add_argument('--symbols')
 
+    advanced_value_parser = subparsers.add_parser(
+        'eod-advanced-value-factors-compute',
+        help='Compute advanced value factor rows directly',
+    )
+    advanced_value_parser.add_argument('--market-date', required=True)
+    advanced_value_parser.add_argument('--symbols')
+
     trending_parser = subparsers.add_parser(
         'eod-trending-ranks-compute',
         help='Compute stored day-based trending ranks directly',
@@ -506,6 +527,8 @@ def main(argv: Iterable[str] | None = None) -> int:
         payload = compute_momentum_factors(market_date=args.market_date, symbols=args.symbols)
     elif args.command == 'eod-value-factors-compute':
         payload = compute_value_factors(market_date=args.market_date, symbols=args.symbols)
+    elif args.command == 'eod-advanced-value-factors-compute':
+        payload = compute_advanced_value_factors(market_date=args.market_date, symbols=args.symbols)
     elif args.command == 'eod-trending-ranks-compute':
         payload = compute_trending_ranks(market_date=args.market_date, periods=args.periods)
     elif args.command == 'agent-feedback-retry-cycles':
