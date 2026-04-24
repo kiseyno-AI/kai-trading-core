@@ -22,6 +22,7 @@ from app.db_models import (
     DailySignalFeature,
     DailyTechnicalSnapshot,
     DailyTrendingRank,
+    DailyValueFactorResult,
     EODCollectionRun,
     FavoriteSymbol,
     MarketStatusSnapshot,
@@ -2468,6 +2469,128 @@ def load_daily_low_risk_factor_results(
                 'low_risk_classification': item.low_risk_classification,
                 'is_low_risk_eligible': item.is_low_risk_eligible,
                 'history_days_available': item.history_days_available,
+                'factor_payload': item.factor_payload,
+                'captured_at': item.captured_at.isoformat() if item.captured_at else None,
+            }
+            for item, symbol, name_ko, market in rows
+        ]
+
+
+def upsert_daily_value_factor_result(result: dict) -> None:
+    refreshed_at = datetime.utcnow()
+    with session_scope() as session:
+        symbol = _get_symbol(session, result['symbol'])
+        if symbol is None:
+            symbol = Symbol(
+                symbol=result['symbol'],
+                market=result.get('market', 'KRX'),
+                name_ko=result.get('name_ko') or result['symbol'],
+                instrument_type='equity',
+                source=result.get('source', 'value_factor_v1'),
+                is_active=True,
+                last_refreshed_at=refreshed_at,
+            )
+            session.add(symbol)
+            session.flush()
+
+        values = {
+            'symbol_id': symbol.id,
+            'market_date': _normalize_trade_date(result['market_date']),
+            'source': result.get('source', 'value_factor_v1'),
+            'per': result.get('per'),
+            'pbr': result.get('pbr'),
+            'dividend_yield': result.get('dividend_yield'),
+            'per_status': result.get('per_status', 'missing'),
+            'per_rank': result.get('per_rank'),
+            'pbr_rank': result.get('pbr_rank'),
+            'dividend_yield_rank': result.get('dividend_yield_rank'),
+            'per_percentile': result.get('per_percentile'),
+            'pbr_percentile': result.get('pbr_percentile'),
+            'dividend_yield_percentile': result.get('dividend_yield_percentile'),
+            'value_score': result.get('value_score'),
+            'value_rank': result.get('value_rank'),
+            'value_percentile': result.get('value_percentile'),
+            'value_status': result.get('value_status', 'missing_metric'),
+            'factor_payload': result['factor_payload'],
+            'captured_at': refreshed_at,
+            'updated_at': refreshed_at,
+        }
+        statement = pg_insert(DailyValueFactorResult).values(values)
+        session.execute(
+            statement.on_conflict_do_update(
+                constraint='uq_daily_value_factor_results_symbol_market_date',
+                set_={
+                    'source': statement.excluded.source,
+                    'per': statement.excluded.per,
+                    'pbr': statement.excluded.pbr,
+                    'dividend_yield': statement.excluded.dividend_yield,
+                    'per_status': statement.excluded.per_status,
+                    'per_rank': statement.excluded.per_rank,
+                    'pbr_rank': statement.excluded.pbr_rank,
+                    'dividend_yield_rank': statement.excluded.dividend_yield_rank,
+                    'per_percentile': statement.excluded.per_percentile,
+                    'pbr_percentile': statement.excluded.pbr_percentile,
+                    'dividend_yield_percentile': statement.excluded.dividend_yield_percentile,
+                    'value_score': statement.excluded.value_score,
+                    'value_rank': statement.excluded.value_rank,
+                    'value_percentile': statement.excluded.value_percentile,
+                    'value_status': statement.excluded.value_status,
+                    'factor_payload': statement.excluded.factor_payload,
+                    'captured_at': statement.excluded.captured_at,
+                    'updated_at': refreshed_at,
+                },
+            )
+        )
+
+
+def load_daily_value_factor_results(
+    *,
+    market_date: str | date,
+    symbols: list[str] | None = None,
+    value_status: str | None = None,
+    limit: int | None = None,
+) -> list[dict]:
+    with session_scope() as session:
+        stmt = (
+            select(DailyValueFactorResult, Symbol.symbol, Symbol.name_ko, Symbol.market)
+            .join(Symbol, Symbol.id == DailyValueFactorResult.symbol_id)
+            .where(DailyValueFactorResult.market_date == _normalize_trade_date(market_date))
+            .order_by(
+                DailyValueFactorResult.value_rank.asc().nullslast(),
+                DailyValueFactorResult.value_score.desc().nullslast(),
+                Symbol.symbol.asc(),
+            )
+        )
+        if limit is not None:
+            stmt = stmt.limit(limit)
+        if symbols:
+            stmt = stmt.where(Symbol.symbol.in_(symbols))
+        if value_status is not None:
+            stmt = stmt.where(DailyValueFactorResult.value_status == value_status)
+
+        rows = session.execute(stmt).all()
+        return [
+            {
+                'symbol': symbol,
+                'name_ko': name_ko,
+                'market': market,
+                'market_date': item.market_date.isoformat(),
+                'source': item.source,
+                'feature_version': item.source,
+                'per': _round_float(item.per, 6),
+                'pbr': _round_float(item.pbr, 6),
+                'dividend_yield': _round_float(item.dividend_yield, 6),
+                'per_status': item.per_status,
+                'per_rank': item.per_rank,
+                'pbr_rank': item.pbr_rank,
+                'dividend_yield_rank': item.dividend_yield_rank,
+                'per_percentile': _round_float(item.per_percentile, 6),
+                'pbr_percentile': _round_float(item.pbr_percentile, 6),
+                'dividend_yield_percentile': _round_float(item.dividend_yield_percentile, 6),
+                'value_score': _round_float(item.value_score, 6),
+                'value_rank': item.value_rank,
+                'value_percentile': _round_float(item.value_percentile, 6),
+                'value_status': item.value_status,
                 'factor_payload': item.factor_payload,
                 'captured_at': item.captured_at.isoformat() if item.captured_at else None,
             }

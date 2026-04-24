@@ -25,6 +25,7 @@
 22. Agent feedback intake/read routes for OpenClaw summaries
 23. Role-specific post-EOD agent feedback dispatch route
 24. Daily price momentum factor compute/inspect routes
+25. Daily value factor compute/read routes
 
 ## Current routes
 - `POST /broker/kis/token`
@@ -72,6 +73,8 @@
 - `GET /eod/signal-features?market_date=YYYY-MM-DD&symbols=005930,000660`
 - `POST /eod/momentum-factors/compute?market_date=YYYY-MM-DD&symbols=005930,000660`
 - `GET /eod/momentum-factors?market_date=YYYY-MM-DD&symbols=005930,000660`
+- `POST /eod/value-factors/compute?market_date=YYYY-MM-DD&symbols=005930,000660&source=value_factor_v1`
+- `GET /eod/value-factors?market_date=YYYY-MM-DD&symbol=005930&limit=100`
 - `GET /eod/piotroski-filter-results?market_date=YYYY-MM-DD&symbol=005930`
 - `POST /eod/low-risk-factors/compute?market_date=YYYY-MM-DD&symbols=005930,000660`
 - `GET /eod/low-risk-factors?market_date=YYYY-MM-DD&symbol=005930`
@@ -202,6 +205,16 @@
 - Cross-sectional `momentum_rank` and `momentum_percentile` are computed only across symbols in the selected compute universe that have non-null 12-1 momentum. Higher momentum receives a lower rank number and a higher percentile.
 - The default 5-day overheat exclusion is an absolute decimal-return rule: `return_5d >= 0.15`. The persisted payload records the rule type, lookback window, comparison, and threshold so later threshold changes are auditable.
 - The current scope is intentionally manual or operator-triggered rather than part of the steady-state pykrx pipeline stages. For shell-driven operations, use `python3.11 -m app.internal.ops eod-momentum-factors-compute --market-date YYYY-MM-DD` from `apps/api`.
+
+## Daily value factor notes
+- `daily_value_factor_results` is the DB-backed value-factor layer keyed by `symbol_id + market_date`.
+- `POST /eod/value-factors/compute` rebuilds persisted rows from stored `daily_price_bars`; it does not call live quote, broker, or execution paths during the request.
+- `GET /eod/value-factors` is the persisted read API for that table. When `symbol` is provided, the route returns a single `item`; without `symbol`, it returns ordered `items` for the requested date, bounded by optional `limit`.
+- V1 computes cross-sectional percentiles for `per`, `pbr`, and `dividend_yield`, then stores `value_score` as the equal-weight mean of those three percentiles. Lower `per` and `pbr` rank better; higher `dividend_yield` ranks better.
+- Eligibility is explicit per metric: `per` and `pbr` must be strictly positive, `dividend_yield` must be non-negative, and symbols missing the requested market-date bar or any required metric remain persisted with a non-scored `value_status` rather than being dropped.
+- Symbol-subset reruns still rank against the full stored market-date universe before persisting the requested subset, so `value_rank` and percentile fields remain comparable across targeted reruns.
+- If the `symbols` query resolves to an explicit empty subset after trimming, the compute route returns a no-op payload with zero persisted rows instead of recomputing the full universe.
+- For shell-driven operations, use `python3.11 -m app.internal.ops eod-value-factors-compute --market-date YYYY-MM-DD` from `apps/api`.
 
 ## Piotroski filter read-layer notes
 - `GET /eod/piotroski-filter-results` is the persisted read API for `daily_piotroski_filter_results`.
