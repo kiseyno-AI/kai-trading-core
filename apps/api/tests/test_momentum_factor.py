@@ -4,12 +4,30 @@ from unittest.mock import patch
 
 from app.signals.momentum_factor import (
     DailyMomentumFactorService,
-    MomentumOverheatRule,
     build_daily_momentum_factor_rows,
 )
 
 
-def _build_bars(closes: list[int], *, start_date: date = date(2025, 1, 1)) -> list[dict]:
+def _build_close_series(initial_close: float, daily_returns: list[float]) -> list[float]:
+    closes = [initial_close]
+    for value in daily_returns:
+        closes.append(round(closes[-1] * (1.0 + value), 6))
+    return closes
+
+
+def _build_series_with_trailing_returns(
+    trailing_returns: list[float],
+    *,
+    initial_close: float = 100.0,
+    baseline_return: float = 0.001,
+) -> list[float]:
+    if len(trailing_returns) > 252:
+        raise ValueError('trailing_returns must fit inside the 252-day return history window')
+    daily_returns = ([baseline_return] * (252 - len(trailing_returns))) + list(trailing_returns)
+    return _build_close_series(initial_close, daily_returns)
+
+
+def _build_bars(closes: list[float], *, start_date: date = date(2025, 1, 1)) -> list[dict]:
     bars: list[dict] = []
     for index, close in enumerate(closes):
         trade_date = (start_date + timedelta(days=index)).isoformat()
@@ -76,11 +94,9 @@ class DailyMomentumFactorBuilderTests(unittest.TestCase):
         self.assertTrue(rows[0]['is_ma60_above_ma120'])
         self.assertTrue(rows[0]['is_momentum_eligible'])
 
-    def test_build_rows_classifies_recent_overheat_from_configured_threshold(self) -> None:
-        base = [100] * 247
-        normal_closes = base + [100, 101, 102, 103, 104, 105]
-        hot_closes = base + [100, 104, 108, 112, 120, 130]
-        rule = MomentumOverheatRule(return_threshold=0.15)
+    def test_build_rows_marks_extreme_spike_overheated_with_percentile_and_volatility_context(self) -> None:
+        normal_closes = _build_series_with_trailing_returns([0.004, 0.004, 0.004, 0.004, 0.004])
+        hot_closes = _build_series_with_trailing_returns([0.015, 0.02, 0.025, 0.03, 0.035])
 
         rows = build_daily_momentum_factor_rows(
             market_date='2025-09-10',
@@ -88,14 +104,99 @@ class DailyMomentumFactorBuilderTests(unittest.TestCase):
                 '000660': _build_bars(normal_closes),
                 '005930': _build_bars(hot_closes),
             },
-            overheat_rule=rule,
         )
 
         by_symbol = {row['symbol']: row for row in rows}
         self.assertFalse(by_symbol['000660']['is_recent_overheated'])
+        self.assertEqual(by_symbol['005930']['return_5d_rank'], 1)
+        self.assertEqual(by_symbol['005930']['return_5d_percentile'], 1.0)
+        self.assertTrue(by_symbol['005930']['has_sufficient_cross_sectional_context'])
+        self.assertTrue(by_symbol['005930']['is_return_5d_extreme'])
+        self.assertTrue(by_symbol['005930']['is_volatility_adjusted_overheated'])
+        self.assertTrue(by_symbol['005930']['passes_minimum_absolute_return'])
         self.assertTrue(by_symbol['005930']['is_recent_overheated'])
-        self.assertEqual(by_symbol['005930']['factor_payload']['overheat_rule']['threshold'], 0.15)
+        self.assertEqual(by_symbol['005930']['overheat_rule_version'], 'momentum_overheat_v2')
+        self.assertEqual(
+            by_symbol['005930']['factor_payload']['overheat_rule']['cross_sectional_percentile']['threshold'],
+            0.98,
+        )
         self.assertFalse(by_symbol['005930']['is_momentum_eligible'])
+
+    def test_build_rows_keeps_high_absolute_return_when_volatility_context_absorbs_move(self) -> None:
+        high_volatility_closes = _build_series_with_trailing_returns(
+            [
+                0.08,
+                -0.07,
+                0.08,
+                -0.06,
+                0.09,
+                -0.08,
+                0.08,
+                -0.07,
+                0.09,
+                -0.08,
+                0.08,
+                -0.06,
+                0.08,
+                -0.07,
+                0.09,
+                0.08,
+                -0.05,
+                0.08,
+                -0.03,
+                0.08,
+            ]
+        )
+        steady_closes = _build_series_with_trailing_returns([0.006, 0.006, 0.006, 0.006, 0.006])
+
+        rows = build_daily_momentum_factor_rows(
+            market_date='2025-09-10',
+            price_histories={
+                '000660': _build_bars(steady_closes),
+                '005930': _build_bars(high_volatility_closes),
+            },
+        )
+
+        overheated_candidate = {row['symbol']: row for row in rows}['005930']
+        self.assertTrue(overheated_candidate['is_return_5d_extreme'])
+        self.assertTrue(overheated_candidate['passes_minimum_absolute_return'])
+        self.assertGreater(overheated_candidate['return_5d'], 0.07)
+        self.assertLess(overheated_candidate['return_5d_vol_adjusted'], 2.25)
+        self.assertFalse(overheated_candidate['is_volatility_adjusted_overheated'])
+        self.assertFalse(overheated_candidate['is_recent_overheated'])
+
+    def test_build_rows_requires_minimum_absolute_return_even_for_top_percentile_name(self) -> None:
+        mild_leader_closes = _build_series_with_trailing_returns([0.01, 0.01, 0.01, 0.01, 0.01])
+        laggard_closes = _build_series_with_trailing_returns([0.0, 0.0, 0.0, 0.0, 0.0])
+
+        rows = build_daily_momentum_factor_rows(
+            market_date='2025-09-10',
+            price_histories={
+                '000660': _build_bars(laggard_closes),
+                '005930': _build_bars(mild_leader_closes),
+            },
+        )
+
+        mild_leader = {row['symbol']: row for row in rows}['005930']
+        self.assertTrue(mild_leader['is_return_5d_extreme'])
+        self.assertTrue(mild_leader['is_volatility_adjusted_overheated'])
+        self.assertFalse(mild_leader['passes_minimum_absolute_return'])
+        self.assertFalse(mild_leader['is_recent_overheated'])
+
+    def test_build_rows_does_not_flag_single_symbol_without_cross_sectional_context(self) -> None:
+        hot_closes = _build_series_with_trailing_returns([0.015, 0.02, 0.025, 0.03, 0.035])
+
+        rows = build_daily_momentum_factor_rows(
+            market_date='2025-09-10',
+            price_histories={'005930': _build_bars(hot_closes)},
+        )
+
+        self.assertEqual(rows[0]['return_5d_rank'], 1)
+        self.assertEqual(rows[0]['return_5d_percentile'], 1.0)
+        self.assertEqual(rows[0]['return_5d_ranked_universe_size'], 1)
+        self.assertFalse(rows[0]['has_sufficient_cross_sectional_context'])
+        self.assertFalse(rows[0]['is_return_5d_extreme'])
+        self.assertFalse(rows[0]['is_recent_overheated'])
 
     def test_build_rows_assigns_cross_sectional_rank_and_percentile(self) -> None:
         histories = {
@@ -176,8 +277,29 @@ class DailyMomentumFactorServiceTests(unittest.TestCase):
             {
                 'symbol': '005930',
                 'market_date': '2025-09-10',
+                'return_5d': 0.134337,
                 'momentum_rank': 1,
-                'is_momentum_eligible': True,
+                'is_momentum_eligible': False,
+                'is_recent_overheated': True,
+                'factor_payload': {
+                    'returns': {
+                        'return_5d_rank': 1,
+                        'return_5d_percentile': 1.0,
+                        'return_5d_ranked_universe_size': 75,
+                    },
+                    'volatility': {
+                        'return_5d_realized_volatility_20d': 0.019851,
+                        'return_5d_vol_adjusted': 3.026114,
+                    },
+                    'overheat_rule': {'rule_version': 'momentum_overheat_v2'},
+                    'overheat': {
+                        'has_sufficient_cross_sectional_context': True,
+                        'is_return_5d_extreme': True,
+                        'is_volatility_adjusted_overheated': True,
+                        'passes_minimum_absolute_return': True,
+                        'is_recent_overheated': True,
+                    },
+                },
             }
         ]
 
@@ -195,4 +317,16 @@ class DailyMomentumFactorServiceTests(unittest.TestCase):
         self.assertEqual(result['summary']['entries'], 1)
         self.assertEqual(result['summary']['matched_symbols'], ['005930'])
         self.assertEqual(result['summary']['missing_symbols'], ['000660'])
-        self.assertEqual(result['summary']['eligible_symbols'], 1)
+        self.assertEqual(result['summary']['eligible_symbols'], 0)
+        item = result['items'][0]
+        self.assertEqual(item['return_5d_rank'], 1)
+        self.assertEqual(item['return_5d_percentile'], 1.0)
+        self.assertEqual(item['return_5d_ranked_universe_size'], 75)
+        self.assertEqual(item['return_5d_realized_volatility_20d'], 0.019851)
+        self.assertEqual(item['return_5d_vol_adjusted'], 3.026114)
+        self.assertTrue(item['has_sufficient_cross_sectional_context'])
+        self.assertTrue(item['is_return_5d_extreme'])
+        self.assertTrue(item['is_volatility_adjusted_overheated'])
+        self.assertTrue(item['passes_minimum_absolute_return'])
+        self.assertTrue(item['is_recent_overheated'])
+        self.assertEqual(item['overheat_rule_version'], 'momentum_overheat_v2')

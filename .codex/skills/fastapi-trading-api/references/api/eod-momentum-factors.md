@@ -3,7 +3,7 @@
 ## Summary
 Computes or reads persisted price-based momentum factor rows built from stored `daily_price_bars`.
 
-The v1 slice stores 12-1 momentum using exact stored trading-bar offsets (`close[t-21] / close[t-252] - 1`), 60-day and 120-day moving averages, trend-confirmation flags, a configurable 5-day overheat exclusion rule, and cross-sectional rank or percentile across the requested symbol universe.
+The v1 slice stores 12-1 momentum using exact stored trading-bar offsets (`close[t-21] / close[t-252] - 1`), 60-day and 120-day moving averages, trend-confirmation flags, and a `momentum_overheat_v2` exclusion rule that combines cross-sectional 5-day return percentile, a volatility-adjusted 5-day shock metric, and a minimum absolute 5-day return gate. Compute and read responses expose the overheat audit fields directly and also preserve the full rule metadata inside `factor_payload`.
 
 ## Example compute request
 ```http
@@ -37,13 +37,29 @@ GET /eod/momentum-factors?market_date=2026-04-23&symbols=005930,000660
       "ma_60": 77650.3,
       "ma_120": 74220.8,
       "momentum_12_1": 0.284,
-      "return_5d": 0.031,
+      "return_5d": 0.134337,
+      "return_5d_rank": 1,
+      "return_5d_percentile": 1.0,
+      "return_5d_realized_volatility_20d": 0.019851,
+      "return_5d_vol_adjusted": 3.026114,
+      "is_return_5d_extreme": true,
+      "is_volatility_adjusted_overheated": true,
       "is_price_above_ma120": true,
       "is_ma60_above_ma120": true,
-      "is_recent_overheated": false,
+      "is_recent_overheated": true,
+      "overheat_rule_version": "momentum_overheat_v2",
       "momentum_rank": 142,
       "momentum_percentile": 0.96,
-      "is_momentum_eligible": true
+      "is_momentum_eligible": false,
+      "factor_payload": {
+        "overheat_rule": {
+          "rule_version": "momentum_overheat_v2"
+        },
+        "overheat": {
+          "has_sufficient_cross_sectional_context": true,
+          "passes_minimum_absolute_return": true
+        }
+      }
     }
   ]
 }
