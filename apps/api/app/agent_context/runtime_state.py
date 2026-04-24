@@ -24,6 +24,7 @@ class RuntimeFeedbackRunState:
     buffered_failures: list[dict[str, Any]] = field(default_factory=list)
     pending_feedback_rows: list[dict[str, Any]] = field(default_factory=list)
     pending_failures: list[dict[str, Any]] = field(default_factory=list)
+    cleaned_session_keys: set[str] = field(default_factory=set)
     completed_symbols_by_role: dict[str, set[str]] = field(default_factory=dict)
     failed_symbols_by_role: dict[str, set[str]] = field(default_factory=dict)
     reused_symbols_by_role: dict[str, set[str]] = field(default_factory=dict)
@@ -47,6 +48,7 @@ class RuntimeFeedbackRunState:
             if self.logical_completed_feedback_count is not None
             else sum(len(self.completed_symbols_by_role.get(role, set())) for role in self.requested_roles)
         )
+        failed_items = self.logical_failed_items if self.logical_failed_items is not None else len(self.buffered_failures)
         total_symbols = self.logical_total_symbols if self.logical_total_symbols is not None else len(self.requested_symbols)
 
         if self.logical_completed_symbols is not None or self.logical_in_progress_symbols is not None or self.logical_pending_symbols is not None:
@@ -59,14 +61,34 @@ class RuntimeFeedbackRunState:
             completed_symbols = 0
             in_progress_symbols = 0
             pending_symbols = 0
-            for symbol in self.requested_symbols:
-                role_hits = sum(1 for role in self.requested_roles if symbol in self.completed_symbols_by_role.get(role, set()))
-                if role_hits == len(self.requested_roles):
-                    completed_symbols += 1
-                elif role_hits > 0:
-                    in_progress_symbols += 1
-                else:
-                    pending_symbols += 1
+            if not self.requested_roles:
+                completed_symbols = len(self.requested_symbols)
+            else:
+                for symbol in self.requested_symbols:
+                    completed_roles = {
+                        role
+                        for role in self.requested_roles
+                        if symbol in self.completed_symbols_by_role.get(role, set())
+                    }
+                    failed_roles = {
+                        role
+                        for role in self.requested_roles
+                        if symbol in self.failed_symbols_by_role.get(role, set())
+                    }
+                    has_in_flight_role = any(
+                        symbol in (slot.get('symbols') or [])
+                        and symbol not in completed_roles
+                        and symbol not in failed_roles
+                        for role_slots in self.in_flight_slots_by_role.values()
+                        for slot in role_slots.values()
+                    )
+                    touched_roles = completed_roles | failed_roles
+                    if len(completed_roles) == len(self.requested_roles):
+                        completed_symbols += 1
+                    elif touched_roles or has_in_flight_role:
+                        in_progress_symbols += 1
+                    else:
+                        pending_symbols += 1
 
         processed_symbols = completed_symbols + in_progress_symbols
         progress_ratio = (processed_symbols / total_symbols) if total_symbols else 0.0
@@ -120,7 +142,7 @@ class RuntimeFeedbackRunState:
         if elapsed_seconds > 0 and completed_feedback_count > 0:
             rate = completed_feedback_count / elapsed_seconds
             completed_feedback_per_minute = round(rate * 60, 2)
-            remaining = max(0, expected_feedback_count - completed_feedback_count)
+            remaining = max(0, expected_feedback_count - completed_feedback_count - failed_items)
             if remaining > 0 and rate > 0:
                 estimated_remaining_seconds = ceil(remaining / rate)
                 estimated_completion_at = (now + __import__('datetime').timedelta(seconds=estimated_remaining_seconds)).isoformat()
@@ -146,7 +168,7 @@ class RuntimeFeedbackRunState:
             'pending_symbols': pending_symbols,
             'progress_ratio': round(progress_ratio, 6),
             'progress_percent': round(progress_ratio * 100, 2),
-            'failed_items': self.logical_failed_items if self.logical_failed_items is not None else len(self.buffered_failures),
+            'failed_items': failed_items,
             'completed_feedback_count': completed_feedback_count,
             'expected_feedback_count': expected_feedback_count,
             'buffered_feedback_count': len(self.buffered_feedback_rows),

@@ -374,6 +374,37 @@ class AgentContextProgressServiceTests(unittest.TestCase):
         self.assertEqual(summary['completed_feedback_count'], 1)
         self.assertEqual(summary['expected_feedback_count'], 1)
 
+    def test_feedback_progress_counts_failure_only_symbols_as_processed(self):
+        fake_session = FakeProgressSession()
+        fake_session.feedback_rows = []
+        fake_session.failure_rows = [
+            SimpleNamespace(
+                symbol='005930',
+                agent_name='technical-summarizer',
+                run_id='run-1',
+                received_at=datetime(2026, 4, 14, 1, 8, tzinfo=timezone.utc),
+                id=10,
+            ),
+        ]
+
+        result = self._call_service(
+            fake_session,
+            symbols=['005930'],
+            expected_agents=['technical-summarizer'],
+        )
+
+        summary = result['summary']
+        self.assertEqual(summary['completed_symbols'], 0)
+        self.assertEqual(summary['in_progress_symbols'], 1)
+        self.assertEqual(summary['pending_symbols'], 0)
+        self.assertEqual(summary['progress_ratio'], 1.0)
+        self.assertEqual(summary['progress_percent'], 100.0)
+        self.assertEqual(summary['failed_items'], 1)
+        self.assertEqual(
+            result['result']['roles']['technical-summarizer'],
+            {'requested_count': 1, 'completed_count': 0, 'error_count': 1},
+        )
+
 
 if __name__ == '__main__':
     unittest.main()

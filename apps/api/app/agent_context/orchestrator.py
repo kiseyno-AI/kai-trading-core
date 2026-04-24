@@ -1177,6 +1177,49 @@ class AgentFeedbackOrchestrator:
             seen_session_keys.add(session_key)
         return cleanup_results
 
+    def _cleanup_persisted_run_sessions(
+        self,
+        *,
+        market_date: date,
+        request_run_id: str,
+        role: str | None = None,
+    ) -> list[dict[str, Any]]:
+        state = runtime_feedback_state_store.get_run(market_date, run_id=request_run_id)
+        if state is None:
+            return []
+
+        rows_to_cleanup: list[dict[str, Any]] = []
+        cleaned_session_keys = set(state.cleaned_session_keys)
+        for row in state.buffered_feedback_rows:
+            agent_name = str(row.get('agent_name') or '')
+            if role is not None and agent_name != role:
+                continue
+            response = row.get('summary') if isinstance(row.get('summary'), dict) else None
+            session_key = self._session_key_from_response(response)
+            if session_key is None or session_key in cleaned_session_keys:
+                continue
+            rows_to_cleanup.append(row)
+            cleaned_session_keys.add(session_key)
+
+        if not rows_to_cleanup:
+            return []
+
+        cleanup_results = self._cleanup_buffered_feedback_sessions(rows=rows_to_cleanup)
+        session_keys = {
+            session_key
+            for session_key in (
+                self._session_key_from_response(row.get('summary') if isinstance(row.get('summary'), dict) else None)
+                for row in rows_to_cleanup
+            )
+            if session_key is not None
+        }
+
+        def _mark_cleaned(current: RuntimeFeedbackRunState) -> None:
+            current.cleaned_session_keys.update(session_keys)
+
+        runtime_feedback_state_store.update_run(market_date, _mark_cleaned, run_id=request_run_id)
+        return cleanup_results
+
     def _store_feedback(
         self,
         *,
@@ -1283,6 +1326,34 @@ class AgentFeedbackOrchestrator:
             summary_payload=summary_payload,
         )
 
+    def _flush_and_checkpoint_pending_run_buffers(
+        self,
+        *,
+        market_date: date,
+        request_run_id: str,
+        request_payload: dict[str, Any],
+        reason: str,
+        lifecycle_stage: str,
+        current_role: str | None,
+        status: str = 'running',
+    ) -> dict[str, Any]:
+        flush_result = self._flush_pending_run_buffers(
+            market_date=market_date,
+            request_run_id=request_run_id,
+            reason=reason,
+        )
+        if flush_result['feedback_rows_seen'] or flush_result['failure_rows_seen']:
+            self._checkpoint_run_state(
+                market_date=market_date,
+                request_run_id=request_run_id,
+                request_payload=request_payload,
+                lifecycle_stage=lifecycle_stage,
+                current_role=current_role,
+                status=status,
+                flush_result=flush_result,
+            )
+        return flush_result
+
     def _flush_pending_run_buffers(
         self,
         *,
@@ -1323,10 +1394,15 @@ class AgentFeedbackOrchestrator:
                 for row in pending_feedback_rows
             ]
             feedback_result = agent_context_feedback_service.bulk_submit_feedback(items=flush_payload)
-            self._cleanup_buffered_feedback_sessions(rows=pending_feedback_rows)
 
             def _clear_feedback(current: RuntimeFeedbackRunState) -> None:
                 current.pending_feedback_rows = current.pending_feedback_rows[len(pending_feedback_rows):]
+                current.buffered_feedback_rows.extend(pending_feedback_rows)
+                for row in pending_feedback_rows:
+                    symbol = str(row.get('symbol') or '')
+                    agent_name = str(row.get('agent_name') or '')
+                    if symbol and agent_name:
+                        current.completed_symbols_by_role.setdefault(agent_name, set()).add(symbol)
                 current.flushed_feedback_count += len(pending_feedback_rows)
                 current.last_activity_at = datetime.now(timezone.utc)
 
@@ -1368,6 +1444,12 @@ class AgentFeedbackOrchestrator:
             else:
                 def _clear_failures(current: RuntimeFeedbackRunState) -> None:
                     current.pending_failures = current.pending_failures[len(pending_failures):]
+                    current.buffered_failures.extend(pending_failures)
+                    for failure in pending_failures:
+                        role = str(failure.get('role') or failure.get('agent_name') or '')
+                        symbol = str(failure.get('symbol') or '')
+                        if role and symbol:
+                            current.failed_symbols_by_role.setdefault(role, set()).add(symbol)
                     current.flushed_failure_count += len(pending_failures)
                     current.last_activity_at = datetime.now(timezone.utc)
 
@@ -1608,9 +1690,7 @@ class AgentFeedbackOrchestrator:
                     'feedback': normalized_feedback if isinstance(normalized_feedback, dict) else {},
                     'context': jsonable_encoder(context),
                 }
-                current.buffered_feedback_rows.append(stored_row)
                 current.pending_feedback_rows.append(stored_row)
-                current.completed_symbols_by_role.setdefault(role, set()).add(symbol)
             runtime_feedback_state_store.update_run(normalized_market_date, _update, run_id=request_run_id)
             snapshot = runtime_feedback_state_store.get_run(normalized_market_date, run_id=request_run_id)
             _feedback_runtime_log(
@@ -1621,6 +1701,8 @@ class AgentFeedbackOrchestrator:
                 symbol=symbol,
                 buffered_feedback_count=len(snapshot.buffered_feedback_rows) if snapshot else None,
                 buffered_failure_count=len(snapshot.buffered_failures) if snapshot else None,
+                pending_feedback_count=len(snapshot.pending_feedback_rows) if snapshot else None,
+                pending_failure_count=len(snapshot.pending_failures) if snapshot else None,
                 completed_symbols_by_role={k: len(v) for k, v in snapshot.completed_symbols_by_role.items()} if snapshot else None,
             )
 
@@ -1645,9 +1727,7 @@ class AgentFeedbackOrchestrator:
                     'failure_kind': error,
                     'context': jsonable_encoder(context) if isinstance(context, dict) else None,
                 }
-                current.buffered_failures.append(failure_row)
                 current.pending_failures.append(failure_row)
-                current.failed_symbols_by_role.setdefault(role, set()).add(symbol)
 
             runtime_feedback_state_store.update_run(normalized_market_date, _update, run_id=request_run_id)
             snapshot = runtime_feedback_state_store.get_run(normalized_market_date, run_id=request_run_id)
@@ -1661,6 +1741,8 @@ class AgentFeedbackOrchestrator:
                 retryable=retryable,
                 buffered_feedback_count=len(snapshot.buffered_feedback_rows) if snapshot else None,
                 buffered_failure_count=len(snapshot.buffered_failures) if snapshot else None,
+                pending_feedback_count=len(snapshot.pending_feedback_rows) if snapshot else None,
+                pending_failure_count=len(snapshot.pending_failures) if snapshot else None,
                 failed_symbols_by_role={k: len(v) for k, v in snapshot.failed_symbols_by_role.items()} if snapshot else None,
             )
 
@@ -1772,6 +1854,15 @@ class AgentFeedbackOrchestrator:
                         all_failures=all_failures,
                         buffer_failure=buffer_failure,
                     )
+                    self._flush_and_checkpoint_pending_run_buffers(
+                        market_date=normalized_market_date,
+                        request_run_id=request_run_id,
+                        request_payload=request_payload,
+                        reason=f'role_prepared:{role}',
+                        lifecycle_stage='batch_persisted',
+                        current_role=role,
+                        status='running',
+                    )
                     indexed_batches = [dispatch_items[i:i + batch_size] for i in range(0, len(dispatch_items), batch_size)]
                     queue: list[tuple[int, list[dict[str, Any]]]] = []
                     for batch_index, batch in enumerate(indexed_batches):
@@ -1819,6 +1910,8 @@ class AgentFeedbackOrchestrator:
                             done, _ = concurrent.futures.wait(list(future_map.keys()), return_when=concurrent.futures.FIRST_COMPLETED)
                             for future in done:
                                 slot, batch = future_map.pop(future)
+                                should_submit_next = False
+                                staged_batch_outcomes = False
                                 try:
                                     batch_result = future.result()
                                     decoded_items = batch_result.get('decoded', {}).get('items', [])
@@ -1856,6 +1949,7 @@ class AgentFeedbackOrchestrator:
                                                 error='missing_batch_feedback',
                                                 batch_result=batch_result,
                                             )
+                                            staged_batch_outcomes = True
                                             continue
                                         normalized_feedback = normalize_agent_response(
                                             role=spec.role,
@@ -1891,6 +1985,7 @@ class AgentFeedbackOrchestrator:
                                                 'response': {'normalized_feedback': normalized_feedback},
                                             }
                                         )
+                                    staged_batch_outcomes = True
                                 except Exception as exc:
                                     for source_item in batch:
                                         failure = {
@@ -1920,14 +2015,33 @@ class AgentFeedbackOrchestrator:
                                             error_type=type(exc).__name__,
                                             error=str(exc),
                                         )
+                                    staged_batch_outcomes = True
+                                try:
+                                    if staged_batch_outcomes:
+                                        self._flush_and_checkpoint_pending_run_buffers(
+                                            market_date=normalized_market_date,
+                                            request_run_id=request_run_id,
+                                            request_payload=request_payload,
+                                            reason=f'batch_completed:{role}:slot-{slot}',
+                                            lifecycle_stage='batch_persisted',
+                                            current_role=role,
+                                            status='running',
+                                        )
+                                    should_submit_next = True
                                 finally:
                                     mark_activity(role, slot, done=True)
+                                if should_submit_next:
                                     submit_next()
 
                     role_flush_result = self._flush_pending_run_buffers(
                         market_date=normalized_market_date,
                         request_run_id=request_run_id,
                         reason=f'role_completed:{role}',
+                    )
+                    self._cleanup_persisted_run_sessions(
+                        market_date=normalized_market_date,
+                        request_run_id=request_run_id,
+                        role=role,
                     )
                     self._checkpoint_run_state(
                         market_date=normalized_market_date,
@@ -1968,12 +2082,26 @@ class AgentFeedbackOrchestrator:
             except Exception as exc:  # noqa: BLE001
                 finalization_error = exc
                 _feedback_runtime_log(
-                    'flush_failed',
+                    'finalize_failed',
                     market_date=normalized_market_date.isoformat(),
                     request_run_id=request_run_id,
                     error_type=type(exc).__name__,
                     error=str(exc),
                 )
+            finally:
+                try:
+                    self._cleanup_persisted_run_sessions(
+                        market_date=normalized_market_date,
+                        request_run_id=request_run_id,
+                    )
+                except Exception as cleanup_exc:  # noqa: BLE001
+                    _feedback_runtime_log(
+                        'cleanup_persisted_run_sessions_failed',
+                        market_date=normalized_market_date.isoformat(),
+                        request_run_id=request_run_id,
+                        error_type=type(cleanup_exc).__name__,
+                        error=str(cleanup_exc),
+                    )
             final_snapshot = runtime_feedback_state_store.get_run(normalized_market_date, run_id=request_run_id) or final_snapshot
             completed_count = len(final_snapshot.buffered_feedback_rows) if final_snapshot is not None else 0
             failed_count = len(final_snapshot.buffered_failures) if final_snapshot is not None else 0
