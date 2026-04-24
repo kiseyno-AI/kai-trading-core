@@ -586,6 +586,28 @@ class EODRouteTests(unittest.TestCase):
         self.assertEqual(fake_service.compute_args['source'], 'value_factor_v1')
         self.assertEqual(response.json()['items'][0]['value_score'], 0.86)
 
+    def test_compute_value_factors_route_preserves_empty_symbol_subset(self):
+        fake_service = FakeValueFactorService()
+        original_service = routes_eod.daily_value_factor_service
+        routes_eod.daily_value_factor_service = fake_service
+        try:
+            client = TestClient(self.app)
+            response = client.post(
+                '/eod/value-factors/compute',
+                params={
+                    'market_date': '2026-04-24',
+                    'symbols': ',',
+                    'source': 'value_factor_v1',
+                },
+            )
+        finally:
+            routes_eod.daily_value_factor_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(fake_service.compute_args['market_date'], '2026-04-24')
+        self.assertEqual(fake_service.compute_args['symbols'], [])
+        self.assertEqual(fake_service.compute_args['source'], 'value_factor_v1')
+
     def test_inspect_value_factors_route_returns_single_item_for_symbol(self):
         fake_service = FakeValueFactorService()
         original_service = routes_eod.daily_value_factor_service

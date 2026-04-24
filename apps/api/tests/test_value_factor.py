@@ -149,6 +149,46 @@ class DailyValueFactorServiceTests(unittest.TestCase):
         self.assertEqual(persisted['dividend_yield_rank'], 2)
         self.assertEqual(persisted['value_rank'], 2)
 
+    def test_rebuild_with_empty_symbols_is_no_op(self) -> None:
+        service = DailyValueFactorService()
+
+        with (
+            patch.object(service, '_load_inputs') as load_inputs,
+            patch('app.signals.value_factor.upsert_daily_value_factor_result') as upsert,
+        ):
+            result = service.rebuild_for_market_date(
+                market_date='2026-04-24',
+                symbols=[],
+            )
+
+        load_inputs.assert_not_called()
+        upsert.assert_not_called()
+        self.assertEqual(result['requested_symbols'], [])
+        self.assertEqual(result['matched_symbols'], [])
+        self.assertEqual(result['missing_symbols'], [])
+        self.assertEqual(result['results_persisted'], 0)
+        self.assertEqual(result['results_failed'], 0)
+        self.assertEqual(result['items'], [])
+        self.assertEqual(
+            result['summary'],
+            {
+                'requested_symbol_count': 0,
+                'matched_symbol_count': 0,
+                'missing_symbol_count': 0,
+                'symbols_with_market_date_bar': 0,
+                'missing_market_date_bar_count': 0,
+                'invalid_per_count': 0,
+                'missing_metric_count': 0,
+                'scored_count': 0,
+                'ranking_universe_counts': {
+                    'per': 0,
+                    'pbr': 0,
+                    'dividend_yield': 0,
+                    'composite_score': 0,
+                },
+            },
+        )
+
     def test_inspect_returns_single_item_for_symbol(self) -> None:
         service = DailyValueFactorService()
         stored_items = [

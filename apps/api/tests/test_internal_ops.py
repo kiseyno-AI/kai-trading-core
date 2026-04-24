@@ -216,6 +216,25 @@ class InternalOpsTests(unittest.TestCase):
         self.assertEqual(compute_value.call_args.kwargs['symbols'], ['005930', '000660'])
         self.assertEqual(compute_value.call_args.kwargs['source'], VALUE_FACTOR_SOURCE)
 
+    def test_compute_value_factors_preserves_empty_symbol_subset(self) -> None:
+        with (
+            patch('app.internal.ops.bootstrap_runtime') as bootstrap_runtime,
+            patch(
+                'app.internal.ops.daily_value_factor_service.rebuild_for_market_date',
+                return_value={'results_persisted': 0},
+            ) as compute_value,
+        ):
+            result = ops.compute_value_factors(
+                market_date='2026-04-24',
+                symbols=',',
+            )
+
+        bootstrap_runtime.assert_called_once_with()
+        self.assertEqual(result, {'results_persisted': 0})
+        self.assertEqual(compute_value.call_args.kwargs['market_date'], '2026-04-24')
+        self.assertEqual(compute_value.call_args.kwargs['symbols'], [])
+        self.assertEqual(compute_value.call_args.kwargs['source'], VALUE_FACTOR_SOURCE)
+
     def test_cli_quotes_tracked_outputs_json(self) -> None:
         stdout = io.StringIO()
         with (

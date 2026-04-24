@@ -27,6 +27,12 @@ VALUE_SCORE_COMPONENT_KEYS = (
     'pbr_percentile',
     'dividend_yield_percentile',
 )
+EMPTY_RANKING_UNIVERSE_COUNTS = {
+    'per': 0,
+    'pbr': 0,
+    'dividend_yield': 0,
+    'composite_score': 0,
+}
 
 
 def _round(value: float | None, digits: int = 6) -> float | None:
@@ -109,6 +115,27 @@ class DailyValueFactorService:
         normalized_market_date = _normalize_market_date(market_date)
         normalized_symbols = _normalize_symbols(symbols)
         requested_symbols = list(normalized_symbols or [])
+        if normalized_symbols == []:
+            return {
+                'market_date': normalized_market_date.isoformat(),
+                'source': source,
+                'feature_version': source,
+                'requested_symbols': requested_symbols,
+                'matched_symbols': [],
+                'missing_symbols': [],
+                'summary': self._build_summary(
+                    [],
+                    requested_symbols=requested_symbols,
+                    matched_symbols=[],
+                    missing_symbols=[],
+                    universe_counts=EMPTY_RANKING_UNIVERSE_COUNTS,
+                ),
+                'results_persisted': 0,
+                'results_failed': 0,
+                'failed_symbols': [],
+                'failed_symbol_errors': [],
+                'items': [],
+            }
         inputs, matched_symbols, missing_symbols = self._load_inputs(
             market_date=normalized_market_date,
             symbols=normalized_symbols,
@@ -247,6 +274,8 @@ class DailyValueFactorService:
         market_date: date,
         symbols: list[str] | None,
     ) -> tuple[list[ValueFactorInput], list[str], list[str]]:
+        if symbols == []:
+            return [], [], []
         if symbols is None:
             matched_symbols = list_symbols_with_daily_bar_on_date(market_date.isoformat())
             if not matched_symbols:
