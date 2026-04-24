@@ -489,6 +489,56 @@ class DailyAdvancedValueFactorResult(Base, TimestampMixin):
     captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
+class DailyCompositeFactorResult(Base, TimestampMixin):
+    __tablename__ = 'daily_composite_factor_results'
+    __table_args__ = (
+        UniqueConstraint(
+            'symbol_id',
+            'market_date',
+            name='uq_daily_composite_factor_results_symbol_market_date',
+        ),
+        Index('ix_daily_composite_factor_results_market_rank', 'market_date', 'composite_rank'),
+        Index('ix_daily_composite_factor_results_market_score', 'market_date', 'composite_score'),
+        Index('ix_daily_composite_factor_results_market_eligible', 'market_date', 'is_composite_eligible'),
+        Index(
+            'ix_daily_composite_factor_results_market_classification',
+            'market_date',
+            'composite_classification',
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol_id: Mapped[int] = mapped_column(ForeignKey('symbols.id', ondelete='CASCADE'), nullable=False, index=True)
+    market_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default='composite_v1')
+    momentum_input: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    value_input: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    advanced_value_input: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    low_risk_input: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    low_beta_input: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    momentum_contribution: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    value_contribution: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    advanced_value_contribution: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    low_risk_contribution: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    low_beta_contribution: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    valid_factor_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    available_base_weight: Mapped[float] = mapped_column(Numeric(12, 6), nullable=False, default=0.0)
+    has_required_inputs: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    is_hard_excluded: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    composite_score: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    composite_rank: Mapped[int | None] = mapped_column(Integer, index=True)
+    composite_percentile: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    composite_classification: Mapped[str] = mapped_column(
+        String(48),
+        nullable=False,
+        default='insufficient_inputs',
+        index=True,
+    )
+    is_composite_eligible: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, index=True)
+    factor_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
 class DailyMomentumFactorResult(Base, TimestampMixin):
     __tablename__ = 'daily_momentum_factor_results'
     __table_args__ = (

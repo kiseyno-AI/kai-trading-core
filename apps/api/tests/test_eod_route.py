@@ -281,6 +281,83 @@ class FakeAdvancedValueFactorService:
         }
 
 
+class FakeCompositeFactorService:
+    def __init__(self):
+        self.compute_args = None
+        self.inspect_args = None
+
+    def rebuild_for_market_date(self, **kwargs):
+        self.compute_args = kwargs
+        return {
+            'market_date': kwargs['market_date'],
+            'feature_version': kwargs['source'],
+            'results_persisted': 2,
+            'results_failed': 0,
+            'items': [{'symbol': '005930', 'composite_score': 0.88}],
+        }
+
+    def inspect(self, **kwargs):
+        self.inspect_args = kwargs
+        market_date = kwargs['market_date']
+        symbol = kwargs.get('symbol')
+        if symbol:
+            return {
+                'market_date': market_date,
+                'feature_version': 'composite_v1',
+                'summary': {
+                    'entries': 1,
+                    'requested_symbol': symbol,
+                    'matched_symbols': [symbol],
+                    'missing_symbols': [],
+                    'scored_count': 1,
+                    'eligible_count': 1,
+                    'watchlist_count': 0,
+                    'ineligible_count': 0,
+                    'hard_excluded_count': 0,
+                    'insufficient_inputs_count': 0,
+                },
+                'item': {
+                    'symbol': symbol,
+                    'market_date': market_date,
+                    'composite_score': 0.91,
+                    'composite_classification': 'eligible',
+                    'is_composite_eligible': True,
+                },
+            }
+        return {
+            'market_date': market_date,
+            'feature_version': 'composite_v1',
+            'summary': {
+                'entries': 2,
+                'requested_symbol': None,
+                'matched_symbols': ['005930', '000660'],
+                'missing_symbols': [],
+                'scored_count': 2,
+                'eligible_count': 1,
+                'watchlist_count': 1,
+                'ineligible_count': 0,
+                'hard_excluded_count': 0,
+                'insufficient_inputs_count': 0,
+            },
+            'items': [
+                {
+                    'symbol': '005930',
+                    'market_date': market_date,
+                    'composite_score': 0.91,
+                    'composite_classification': 'eligible',
+                    'is_composite_eligible': True,
+                },
+                {
+                    'symbol': '000660',
+                    'market_date': market_date,
+                    'composite_score': 0.58,
+                    'composite_classification': 'watchlist',
+                    'is_composite_eligible': False,
+                },
+            ],
+        }
+
+
 class FakePiotroskiFilterService:
     def __init__(self):
         self.inspect_args = None
@@ -870,6 +947,48 @@ class EODRouteTests(unittest.TestCase):
         self.assertEqual(fake_service.inspect_args['symbol'], '005930')
         self.assertEqual(response.json()['item']['advanced_value_score'], 0.91)
         self.assertEqual(response.json()['item']['advanced_value_classification'], 'eligible')
+
+    def test_compute_composite_factors_route_calls_service(self):
+        fake_service = FakeCompositeFactorService()
+        original_service = routes_eod.daily_composite_factor_service
+        routes_eod.daily_composite_factor_service = fake_service
+        try:
+            client = TestClient(self.app)
+            response = client.post(
+                '/eod/composite-factors/compute',
+                params={
+                    'market_date': '2026-04-24',
+                    'symbols': '005930,000660',
+                    'source': 'composite_v1',
+                },
+            )
+        finally:
+            routes_eod.daily_composite_factor_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(fake_service.compute_args['market_date'], '2026-04-24')
+        self.assertEqual(fake_service.compute_args['symbols'], ['005930', '000660'])
+        self.assertEqual(fake_service.compute_args['source'], 'composite_v1')
+        self.assertEqual(response.json()['items'][0]['composite_score'], 0.88)
+
+    def test_inspect_composite_factors_route_returns_single_item_for_symbol(self):
+        fake_service = FakeCompositeFactorService()
+        original_service = routes_eod.daily_composite_factor_service
+        routes_eod.daily_composite_factor_service = fake_service
+        try:
+            client = TestClient(self.app)
+            response = client.get(
+                '/eod/composite-factors',
+                params={'market_date': '2026-04-24', 'symbol': '005930'},
+            )
+        finally:
+            routes_eod.daily_composite_factor_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(fake_service.inspect_args['market_date'], '2026-04-24')
+        self.assertEqual(fake_service.inspect_args['symbol'], '005930')
+        self.assertEqual(response.json()['item']['composite_score'], 0.91)
+        self.assertTrue(response.json()['item']['is_composite_eligible'])
 
     def test_inspect_piotroski_filter_results_route_returns_all_items(self):
         fake_service = FakePiotroskiFilterService()
