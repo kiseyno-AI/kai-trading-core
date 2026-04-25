@@ -13,6 +13,15 @@ class _FakeMarketState:
     server_time = '2026-04-21T18:15:00+09:00'
 
 
+class _FakeBreakDayMarketState:
+    market = 'KRX'
+    state = 'CLOSED'
+    is_trading_day = False
+    is_open = False
+    reason = 'holiday'
+    server_time = '2026-04-14T12:15:00+09:00'
+
+
 class EODPipelineStatusServiceTests(unittest.TestCase):
     def test_load_latest_pipeline_pykrx_run_reconciles_selected_daily_run_instead_of_newer_historical_backfill(self):
         historical_run = {
@@ -96,6 +105,35 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
             result['stages']['fundamentals_daily_refresh']['details'],
             {'fs_div': 'CFS'},
         )
+
+    def test_read_keeps_break_day_default_market_date_on_current_calendar_day(self):
+        service = EODPipelineStatusService(
+            market_state_loader=lambda: _FakeBreakDayMarketState(),
+            pykrx_run_loader=lambda **_: None,
+            pykrx_stage_counts_loader=lambda *_: {},
+            live_symbol_count_loader=lambda: 3579,
+            fundamentals_refresh_loader=lambda **_: None,
+        )
+
+        result = service.read()
+
+        self.assertEqual(result['market_date'], '2026-04-14')
+        self.assertEqual(
+            result['market'],
+            {
+                'market': 'KRX',
+                'state': 'CLOSED',
+                'is_trading_day': False,
+                'is_open': False,
+                'reason': 'holiday',
+                'server_time': '2026-04-14T12:15:00+09:00',
+            },
+        )
+        self.assertEqual(result['status'], 'pending')
+        self.assertEqual(result['stages']['price_collection']['market_date'], '2026-04-14')
+        self.assertEqual(result['stages']['price_collection']['status'], 'pending')
+        self.assertEqual(result['stages']['fundamentals_daily_refresh']['market_date'], '2026-04-14')
+        self.assertEqual(result['stages']['fundamentals_daily_refresh']['status'], 'pending')
 
     def test_read_reports_live_stage_progress_for_pykrx_and_fundamentals(self):
         pykrx_run = {

@@ -42,6 +42,7 @@ It is based on the live GitHub issue and PR state as of 2026-04-25, not only the
 
 ## Current sources of truth for the remaining work
 
+- `docs/EOD_STATUS_SEMANTICS_CONTRACT.md`
 - `docs/API_BUILD_ORDER.md`
   - `EOD freshness read-layer notes`
   - `EOD pipeline status notes`

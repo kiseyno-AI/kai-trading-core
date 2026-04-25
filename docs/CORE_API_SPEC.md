@@ -325,6 +325,8 @@ Authorization: Bearer <token>
 ## 2.2 `GET /eod/freshness`
 Returns UX-friendly EOD and derived-data freshness information.
 
+Canonical semantics for `/eod/freshness` and `/eod/pipeline/status` live in `docs/EOD_STATUS_SEMANTICS_CONTRACT.md`.
+
 ### Example request
 ```http
 GET /eod/freshness
@@ -401,6 +403,8 @@ This route is the preferred API for expressing:
 The `today` block is always scoped to the current Seoul trade date. Price, technical-analysis, and action-summary totals use the active symbol universe; their succeeded counts come from same-day persisted rows for active symbols, and their failed counts represent active symbols still missing that persisted data once the stage has same-day rows. Fundamentals succeeded counts use distinct DART fundamentals snapshot symbols updated during the current Seoul day, and fundamentals failed counts use distinct financial-report symbols with failed capture attempts during that day. When no rows exist for a stage, that stage remains `missing` even if `latest.*` points to a prior available date. Use `latest.symbols_total`, `latest.symbols_succeeded`, `latest.symbols_failed`, and `latest.eod_status` for the run metadata tied to `latest.price_trade_date`. Bar-availability checks for `latest.eod_status` use all stored bars for `latest.price_trade_date`, not only symbols still active in the current universe.
 
 `latest.trade_date`, `latest.updated_at`, `latest.succeeded`, `latest.failed`, and `latest.total` mirror `latest.summary` for easier web consumption. `latest.summary.basis=latest_eod_run_symbol_universe` means those counts come from the selected `eod_collection_runs` row for `latest.trade_date`; if bars exist without a matching run row, `basis=stored_price_bars_for_latest_trade_date` and the fallback uses stored bar counts with `failed=0`.
+
+The current implementation keeps `today.trade_date` on the current Seoul calendar date even on weekends or other break-days; callers should use `latest.*` for previous stored availability instead of expecting `today` to backshift automatically.
 
 ---
 

@@ -3,7 +3,11 @@
 ## Summary
 Operator-facing live status API for the post-close EOD pipeline.
 
+Canonical semantics for this route and `GET /eod/freshness` live in `docs/EOD_STATUS_SEMANTICS_CONTRACT.md`.
+
 Unlike `GET /eod/freshness`, this route focuses on in-flight work. It reports the current stage status for pykrx daily price collection, technical snapshot compute, action summary compute, stored trending-rank rebuild, and the latest DART fundamentals daily refresh run for the requested `market_date`.
+
+The default `market_date` is the current Seoul calendar date from `server_time[:10]`. On weekends, holidays, or other break-days, callers must pass `market_date` explicitly if they want the previous trading day's pipeline view instead of the current calendar date.
 
 ## Example request
 ```http

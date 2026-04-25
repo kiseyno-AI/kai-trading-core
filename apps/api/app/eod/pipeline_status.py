@@ -83,6 +83,8 @@ class EODPipelineStatusService:
         fs_div: str | None = None,
     ) -> dict[str, Any]:
         market_state = self.market_state_loader()
+        # The default operator view stays on the current Seoul calendar date.
+        # Callers must pass market_date explicitly when they want a previous trade date on weekends or break-days.
         resolved_market_date = date.fromisoformat(market_date or str(market_state.server_time)[:10]).isoformat()
         resolved_fs_div = (fs_div or settings.dart_fundamentals_default_fs_div).strip().upper()
         pykrx_run = self.pykrx_run_loader(trade_date=resolved_market_date)
@@ -270,6 +272,8 @@ class EODPipelineStatusService:
             status = progress_status
         elif run_status == 'running' and current_stage == stage_name:
             status = 'running'
+        # Later pykrx stages remain pending until they actually start. Earlier completed counts alone
+        # must not imply that downstream stages are already running or done for the current live run.
         elif current_stage_index is not None and stage_index > current_stage_index and not started:
             status = 'pending'
         elif run_status == 'failed' and current_stage == stage_name and not started:

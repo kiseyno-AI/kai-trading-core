@@ -77,6 +77,8 @@ class EODFreshnessService:
     best_run_loader: Callable = load_most_complete_eod_collection_run
 
     def read(self) -> dict:
+        # Keep "today" bound to the current Seoul calendar date.
+        # Weekend and break-day fallback lives under latest.*, not by backshifting today.trade_date.
         trade_date = self.market_state_loader().server_time[:10]
         latest_price_trade_date = self.latest_price_trade_date_loader()
         price_bar_count = self.daily_price_bar_count_loader(trade_date)
@@ -219,6 +221,8 @@ class EODFreshnessService:
             failed=counts.get('symbols_failed'),
         )
 
+        # today.fundamentals is an activity view, but a live refresh run should still surface as running
+        # even before same-day snapshot updates are fully reflected in the stored counts.
         if current_run and normalize_run_status(str(current_run.get('status') or '')) == 'running':
             status = 'running'
         elif stage_counts.succeeded > 0:

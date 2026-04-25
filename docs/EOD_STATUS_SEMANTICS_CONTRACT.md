@@ -1,0 +1,127 @@
+# EOD freshness and pipeline status semantics contract
+
+This document is the source-of-truth contract for the EOD read-layer semantics behind:
+
+- `GET /eod/freshness`
+- `GET /eod/pipeline/status`
+
+It freezes the behavior currently shipped on `main` so future web work, core refactors, and regression tests can judge changes against one explicit contract instead of re-inferring intent from multiple routes and tests.
+
+## Terms
+
+- `today`
+  Current Seoul calendar date from `market_state.server_time[:10]`.
+- `latest`
+  Latest stored availability for that data layer. It is not forced to match `today`.
+- `running`
+  The selected current run for that scope is still in progress, so live progress should be surfaced even if some persisted rows already exist.
+- `break-day`
+  Any non-trading Seoul calendar day other than a normal weekend, such as a holiday or exchange closure. Current behavior treats it the same way as a weekend for default date selection.
+
+## Shared rules
+
+- Default date selection is calendar-date based, not prior-trading-date based.
+  Both routes derive their default day from the current Seoul server date. They do not backshift to the previous trading day on weekends, holidays, or other break-days.
+- Stored availability and in-flight progress are separate concerns.
+  `/eod/freshness` answers what persisted data is available. `/eod/pipeline/status` answers which pipeline stage is currently active and how much work is in progress.
+- Historical backfill rows must not outrank the daily pipeline row when both exist for the same trade date.
+  The preferred EOD run is the first non-`historical_backfill` row for that trade date. Historical rows are only used when no daily row exists.
+
+## `GET /eod/freshness`
+
+### `today`
+
+- `today.trade_date` is always the current Seoul calendar date.
+- `today.price`, `today.technical_analysis`, and `today.action_summary` are same-day availability views over the current active symbol universe.
+- Those three stages use `ready` when same-day persisted rows exist and `missing` when same-day persisted rows do not exist.
+- For those three stages, `symbols_failed` stays `0` until the stage has at least one same-day success row. Once same-day rows exist, `symbols_failed` means active symbols still missing that same-day persisted layer.
+- `today` never falls back to previous-day availability. If today is a weekend, holiday, or other break-day, `today.*` can stay `missing` while `latest.*` still points to the previous stored trade date.
+
+### `today.fundamentals`
+
+- `today.fundamentals` is an activity view, not a latest-coverage view.
+- Its `basis` is always `same_day_snapshot_updates`.
+- `symbols_succeeded` counts distinct stock codes whose DART fundamentals snapshots were updated during the current Seoul day.
+- `symbols_failed` counts distinct financial-report stock codes whose capture attempt failed during the current Seoul day.
+- `current_run` shows the latest persisted refresh run for the current `market_date` when one exists, even if same-day snapshot updates are still zero.
+- A running current-day fundamentals refresh run overrides the stage status to `running`.
+  This is true even if same-day successes already exist.
+- A completed same-day no-op refresh run does not make `today.fundamentals.status` become `ready` by itself. Without same-day snapshot updates, the stage stays `missing` and the no-op run remains visible only through `today.fundamentals.current_run`.
+
+### `latest`
+
+- `latest.trade_date` and `latest.price_trade_date` are anchored to the latest stored daily price-bar trade date.
+- `latest.summary` is scoped to that latest stored price trade date only.
+- `latest.summary.basis=latest_eod_run_symbol_universe` means counts come from the selected `eod_collection_runs` row for that trade date.
+- `latest.summary.basis=stored_price_bars_for_latest_trade_date` is the fallback when bars exist for the latest trade date but no matching EOD run row exists. In that fallback, `failed=0` and `total=succeeded`.
+- `latest.updated_at` comes from `run_metadata.last_progress_at` when available, then run timestamps. The stored-bar fallback uses the max `daily_price_bars.captured_at` for that trade date.
+- `latest.eod_status` is derived from the selected latest run plus stored bar availability for the latest trade date.
+- `latest.eod_status` uses all stored bars for `latest.price_trade_date`, not only symbols still active in the current live universe.
+- `latest.trade_date`, `latest.updated_at`, `latest.succeeded`, `latest.failed`, and `latest.total` mirror `latest.summary` for compact web consumption.
+
+### `latest.fundamentals`
+
+- `latest.fundamentals` is the latest-available fundamentals coverage view.
+- It is sourced from the latest completed or partial DART fundamentals refresh run across market dates.
+- A running same-day refresh does not replace this baseline. While today is still running, `latest.fundamentals` continues to point at the latest completed or partial refresh result.
+- Weekends, pre-close periods, break-days, and same-day no-op refreshes must not collapse fundamentals availability back to zero.
+- `symbols_total` uses the refresh-run universe, preferring `run_metadata.symbols_selected` when present.
+- `symbols_checked` is how many symbols that run processed.
+- `symbols_succeeded` is `symbols_fresh + symbols_refreshed`.
+- `symbols_refreshed` is preserved separately as the count of symbols whose fundamentals were newly updated in that run.
+
+## `GET /eod/pipeline/status`
+
+### Scope
+
+- This route is operator-facing and live-progress-oriented.
+- The default `market_date` is the current Seoul calendar date from `market_state.server_time[:10]`.
+- On weekends, holidays, and other break-days, callers must pass an explicit `market_date` if they want to inspect the previous trading day's pipeline run instead of the current calendar date.
+- `fs_div` defaults to the configured DART fundamentals default and is normalized to uppercase.
+
+### pykrx stages
+
+- The pykrx stage order is fixed:
+  `price_collection`, `technical_snapshots`, `action_summaries`, `trending_ranks`.
+- Stage counts come from the selected pykrx `eod_collection_runs` row plus downstream rows linked by `eod_run_id`, with live stage progress from `run_metadata.stage_progress`.
+- The inferred current pykrx stage is resolved in this order:
+  `run_metadata.stage`, then the latest populated `stage_progress` entry, then persisted downstream counts, then `price_collection` when a run exists but no better stage signal exists.
+- When the selected pykrx run is still `running`, the inferred current stage is authoritative for live status display.
+- A later pykrx stage stays `pending` until that later stage has actually started.
+  Persisted completion of earlier stages does not advance later stages by implication alone.
+- If a stage-progress entry still says `running` after the owning run has already ended, that stale running progress must be downgraded to the final run outcome instead of continuing to display as live work.
+
+### fundamentals stage
+
+- `fundamentals_daily_refresh` is reported alongside the pykrx stages, but it is sourced independently from the latest DART fundamentals refresh run for the requested `market_date` and `fs_div`.
+- That stage can be `running`, `completed`, `partial`, `failed`, or `pending` independently of the pykrx stages.
+- Its counts are refresh-run metrics, not same-day snapshot-activity counts:
+  `symbols_succeeded = symbols_fresh + symbols_refreshed`, and totals prefer `run_metadata.symbols_selected`.
+- Its activity text should prefer the current metadata-driven refresh stage while running, but once the refresh run is failed, the run `error_message` overrides the running-style activity text.
+
+### overall status
+
+- Overall pipeline `status` is `running` if any stage is `running`.
+- Overall pipeline `status` is `pending` only when every stage is `pending`.
+- Overall pipeline `status` is `completed` only when every stage is `completed`.
+- Overall pipeline `status` is `failed` only when at least one stage is `failed` and no stage is `completed` or `partial`.
+- All other mixed states resolve to `partial`.
+
+## Non-trading-day behavior
+
+- Weekend behavior:
+  `today.trade_date` and default pipeline `market_date` stay on the weekend calendar date; prior availability remains visible only through `latest.*` or an explicit query date.
+- Market-closed same-day behavior:
+  After the market closes, `today` still refers to that same Seoul calendar date. If same-day EOD persistence is not finished yet, `today` can remain `missing` while `latest` still points to the previous stored trade date.
+- Break-day behavior:
+  Current implementation treats exchange holidays and other non-trading break-days the same as weekends for default date selection. The routes do not auto-resolve a previous trading date into `today` or the default pipeline `market_date`.
+
+## Test anchors
+
+The contract is intentionally mirrored in focused tests and helper coverage:
+
+- `apps/api/tests/test_eod_freshness.py`
+- `apps/api/tests/test_eod_pipeline_status.py`
+- `apps/api/tests/test_eod_run_stage_support.py`
+
+Future behavior changes should update this contract and the matching tests in the same PR.
