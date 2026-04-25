@@ -327,3 +327,75 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
             result['stages']['fundamentals_daily_refresh']['current_activity'],
             'Marked failed after exceeding the stale running threshold before a daily refresh status read',
         )
+
+    def test_read_maps_completed_pipeline_stages_from_completed_run_and_aggregate_counts(self):
+        pykrx_run = {
+            'id': 303,
+            'market': 'KRX',
+            'trade_date': '2026-04-21',
+            'source': 'pykrx',
+            'trigger': 'manual_daily_api',
+            'status': 'completed',
+            'symbols_total': 3,
+            'symbols_succeeded': 3,
+            'symbols_failed': 0,
+            'error_message': None,
+            'started_at': '2026-04-21T09:10:00+00:00',
+            'completed_at': '2026-04-21T10:00:00+00:00',
+            'run_metadata': {
+                'mode': 'daily_auto',
+                'latest_available_trade_date': '2026-04-21',
+                'markets': ['KOSPI', 'KOSDAQ'],
+            },
+        }
+        stage_counts = {
+            'price_collection': {'persisted': 3, 'updated_at': '2026-04-21T09:20:00+00:00'},
+            'technical_snapshots': {'persisted': 3, 'updated_at': '2026-04-21T09:35:00+00:00'},
+            'action_summaries': {'persisted': 3, 'updated_at': '2026-04-21T09:45:00+00:00'},
+            'trending_ranks': {'persisted': 9, 'periods_persisted': 3, 'updated_at': '2026-04-21T09:55:00+00:00'},
+        }
+        fundamentals_run = {
+            'id': 88,
+            'market_date': '2026-04-21',
+            'trigger': 'eod_pykrx_followup',
+            'status': 'completed',
+            'fs_div': 'CFS',
+            'force': False,
+            'symbol_limit': None,
+            'symbol_offset': 0,
+            'symbols_total': 3,
+            'symbols_checked': 3,
+            'symbols_missing': 0,
+            'symbols_stale': 0,
+            'symbols_fresh': 2,
+            'symbols_refreshed': 1,
+            'symbols_failed': 0,
+            'events_detected': 5,
+            'events_captured': 5,
+            'events_failed': 0,
+            'error_message': None,
+            'started_at': '2026-04-21T10:01:00+00:00',
+            'completed_at': '2026-04-21T10:05:00+00:00',
+            'run_metadata': {
+                'symbols_selected': 3,
+                'last_progress_at': '2026-04-21T10:05:00+00:00',
+            },
+        }
+        service = EODPipelineStatusService(
+            market_state_loader=lambda: _FakeMarketState(),
+            pykrx_run_loader=lambda **_: pykrx_run,
+            pykrx_stage_counts_loader=lambda *_: stage_counts,
+            live_symbol_count_loader=lambda: 3579,
+            fundamentals_refresh_loader=lambda **_: fundamentals_run,
+        )
+
+        result = service.read()
+
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['stages']['price_collection']['status'], 'completed')
+        self.assertEqual(result['stages']['technical_snapshots']['status'], 'completed')
+        self.assertEqual(result['stages']['action_summaries']['status'], 'completed')
+        self.assertEqual(result['stages']['trending_ranks']['status'], 'completed')
+        self.assertEqual(result['stages']['fundamentals_daily_refresh']['status'], 'completed')
+        self.assertEqual(result['stages']['trending_ranks']['processed'], 3)
+        self.assertEqual(result['stages']['fundamentals_daily_refresh']['succeeded'], 3)

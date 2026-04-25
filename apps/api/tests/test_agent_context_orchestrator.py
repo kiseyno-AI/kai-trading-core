@@ -730,6 +730,37 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertEqual(result['request']['skipped_symbols'], ['000660'])
         self.assertEqual(result['summary']['skipped'], 1)
 
+    def test_dispatch_for_symbols_preserves_canonical_role_sequence_when_requested_out_of_order(self):
+        service = AgentFeedbackOrchestrator()
+        client = RecordingBatchClient()
+        service.client = client
+        feedback_service = FakeFeedbackService()
+        cleanup_service = FakeSessionCleanupService()
+        fake_settings = SimpleNamespace(openclaw_agent_symbol_chunk_size=1, openclaw_agent_parallel_subtasks=1)
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            with patch.object(orchestrator_module, 'agent_context_read_service', DynamicFakeAgentContextReadService()):
+                with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
+                    with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
+                        with patch.object(
+                            orchestrator_module,
+                            'load_daily_piotroski_filter_results',
+                            return_value=_passed_filter_rows('005930'),
+                        ):
+                            result = service.dispatch_for_symbols(
+                                market_date='2026-04-14',
+                                symbols=['005930'],
+                                roles=['fundamental-summarizer', 'eod-summarizer'],
+                                reuse_existing=False,
+                            )
+
+        self.assertEqual(
+            result['request']['roles'],
+            ['eod-summarizer', 'fundamental-summarizer'],
+        )
+        self.assertEqual([call['spec'].role for call in client.calls], ['eod-summarizer', 'fundamental-summarizer'])
+        self.assertEqual(result['summary']['completed'], 2)
+
     def test_default_symbol_dispatch_builds_signal_decider_payload_from_full_upstream_summaries(self):
         service = AgentFeedbackOrchestrator()
         client = SignalDeciderBatchClient()

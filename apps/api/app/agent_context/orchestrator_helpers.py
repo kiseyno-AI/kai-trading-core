@@ -1,0 +1,339 @@
+from __future__ import annotations
+
+import json
+import re
+import uuid
+from datetime import date, datetime, timezone
+from typing import Any, Sequence
+
+from fastapi.encoders import jsonable_encoder
+
+ABORTLIKE_ERROR_MARKERS = (
+    'this operation was aborted',
+    'aborted',
+    'abortedlastrun',
+    'killed',
+    'failed',
+)
+
+
+def is_abortlike_error(error: Any) -> bool:
+    text = str(error or '').lower()
+    return any(marker in text for marker in ABORTLIKE_ERROR_MARKERS)
+
+
+def feedback_session_key(*, agent_name: str, slot: int) -> str:
+    return f"feedback/{agent_name}/slot-{slot:02d}"
+
+
+def fresh_feedback_session_key(*, agent_name: str, request_run_id: str, slot: int) -> str:
+    return f"feedback/{agent_name}/{request_run_id}/slot-{slot:02d}/{uuid.uuid4().hex[:10]}"
+
+
+def subagent_test_session_key(*, agent_name: str, request_run_id: str, symbol: str) -> str:
+    safe_symbol = ''.join(ch for ch in symbol if ch.isalnum())[:24] or 'symbol'
+    return f"subagent-test/{agent_name}/{request_run_id}/{safe_symbol}-{uuid.uuid4().hex[:8]}"
+
+
+def normalize_requested_symbols(symbols: Sequence[str]) -> list[str]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw_symbol in symbols:
+        for piece in (raw_symbol or '').split(','):
+            symbol = piece.strip().upper()
+            if not symbol or symbol in seen:
+                continue
+            seen.add(symbol)
+            normalized.append(symbol)
+    if not normalized:
+        raise ValueError('At least one symbol is required')
+    return normalized
+
+
+def strip_runtime_session_fields(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in item.items()
+        if key not in {'session_slot', 'session_key'}
+    }
+
+
+def feedback_row_lookup(rows: Sequence[dict[str, Any]]) -> dict[tuple[str, str], dict[str, Any]]:
+    lookup: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in rows:
+        symbol = str(row.get('symbol') or '').strip()
+        agent_name = str(row.get('agent_name') or '').strip()
+        if not symbol or not agent_name:
+            continue
+        lookup[(symbol, agent_name)] = row
+    return lookup
+
+
+def request_scope_from_items(batch_items: Sequence[dict[str, Any]], key: str) -> str | None:
+    values = {
+        str(item.get(key)).strip()
+        for item in batch_items
+        if item.get(key) is not None and str(item.get(key)).strip()
+    }
+    if not values:
+        return None
+    if len(values) > 1:
+        raise ValueError(f'batch items mixed {key}: {sorted(values)}')
+    return next(iter(values))
+
+
+def slot_from_items(batch_items: Sequence[dict[str, Any]]) -> int | None:
+    raw_slot = request_scope_from_items(batch_items, 'session_slot')
+    if raw_slot is None:
+        return None
+    return int(raw_slot)
+
+
+def extract_response_mismatch_flags(normalized_feedback: dict[str, Any] | None) -> list[str]:
+    if not isinstance(normalized_feedback, dict):
+        return []
+    risk_flags = normalized_feedback.get('risk_flags')
+    if not isinstance(risk_flags, list):
+        return []
+    return [
+        str(flag)
+        for flag in risk_flags
+        if isinstance(flag, str) and flag in {'role_mismatch', 'symbol_mismatch', 'market_date_mismatch'}
+    ]
+
+
+def failure_log_fields(failure: dict[str, Any]) -> dict[str, Any]:
+    context = failure.get('context') if isinstance(failure.get('context'), dict) else {}
+    batch_symbols = context.get('batch_symbols')
+    return {
+        'dispatch_id': failure.get('dispatch_id') or context.get('dispatch_id'),
+        'attempt_id': failure.get('attempt_id') or context.get('attempt_id'),
+        'slot': failure.get('slot') or context.get('session_slot'),
+        'session_key': failure.get('session_key') or context.get('session_key'),
+        'batch_symbols': batch_symbols if isinstance(batch_symbols, list) else None,
+    }
+
+
+def build_response_storage_payload(
+    *,
+    spec,
+    batch_result: dict[str, Any],
+    normalized_feedback: dict[str, Any],
+    collector_mode: str,
+) -> dict[str, Any]:
+    raw_response = batch_result.get('response') if isinstance(batch_result.get('response'), dict) else None
+    model_name = None
+    if raw_response is not None:
+        model_name = raw_response.get('model') or raw_response.get('model_name')
+    return {
+        'attempt': batch_result.get('attempt', 1),
+        'attempt_id': batch_result.get('attempt_id'),
+        'dispatch_id': batch_result.get('dispatch_id'),
+        'request_run_id': batch_result.get('request_run_id'),
+        'market_date': batch_result.get('market_date'),
+        'role': spec.role,
+        'agent_name': spec.agent_name,
+        'batch_symbols': batch_result.get('batch_symbols'),
+        'slot': batch_result.get('slot'),
+        'session_key': batch_result.get('session_ref', {}).get('session_key') if isinstance(batch_result.get('session_ref'), dict) else None,
+        'started_at': batch_result.get('started_at'),
+        'completed_at': batch_result.get('completed_at'),
+        'model': model_name or f'openclaw/{spec.agent_name}',
+        'output_text': batch_result.get('output_text'),
+        'raw_response': raw_response,
+        'normalized_feedback': normalized_feedback,
+        'normalization_mismatch_flags': extract_response_mismatch_flags(normalized_feedback),
+        'session_ref': batch_result.get('session_ref'),
+        'collector_mode': collector_mode,
+    }
+
+
+def trim_batch_item_for_prompt(item: dict[str, Any]) -> dict[str, Any]:
+    trimmed = json.loads(json.dumps(item, ensure_ascii=False))
+    symbol_day_context = trimmed.get('symbol_day_context')
+    if isinstance(symbol_day_context, dict):
+        trimmed['symbol_day_context'] = trim_batch_item_for_prompt(symbol_day_context)
+    technical_snapshot = trimmed.get('technical_snapshot')
+    if isinstance(technical_snapshot, dict):
+        technical_snapshot.pop('signal_payload', None)
+    action_summary = trimmed.get('action_summary')
+    if isinstance(action_summary, dict):
+        action_summary.pop('summary_payload', None)
+    fundamentals = trimmed.get('fundamentals')
+    if isinstance(fundamentals, dict):
+        latest_snapshot = fundamentals.get('latest_snapshot')
+        if isinstance(latest_snapshot, dict):
+            latest_snapshot.pop('raw_rows', None)
+            statement = latest_snapshot.get('statement')
+            if isinstance(statement, dict):
+                keep_statement_keys = {'fs_div', 'fs_label', 'statement_type', 'currency', 'source_status', 'source_message', 'row_count'}
+                latest_snapshot['statement'] = {k: v for k, v in statement.items() if k in keep_statement_keys}
+        history_summary = fundamentals.get('history_summary')
+        if isinstance(history_summary, dict):
+            recent_periods = history_summary.get('recent_periods')
+            if isinstance(recent_periods, list):
+                history_summary['recent_periods'] = recent_periods[:3]
+    recent_disclosures = trimmed.get('recent_disclosures')
+    if isinstance(recent_disclosures, dict):
+        items = recent_disclosures.get('items')
+        if isinstance(items, list):
+            recent_disclosures['items'] = items[:3]
+            recent_disclosures['count'] = min(recent_disclosures.get('count', len(items)), len(recent_disclosures['items']))
+    return trimmed
+
+
+def extract_json_object(text: str | None) -> str | None:
+    if not text:
+        return None
+    normalized = text.strip()
+    if not normalized:
+        return None
+    if normalized.startswith('```'):
+        parts = normalized.split('```')
+        for part in parts:
+            part = part.strip()
+            if not part:
+                continue
+            if part.startswith('json'):
+                part = part[4:].strip()
+            candidate = extract_json_object(part)
+            if candidate:
+                return candidate
+    if normalized.startswith('[intent:'):
+        newline_index = normalized.find("\n")
+        if newline_index != -1:
+            candidate = extract_json_object(normalized[newline_index + 1:])
+            if candidate:
+                return candidate
+    if '[tool_code]' in normalized and '[/tool_code]' in normalized:
+        start_marker = normalized.find('[tool_code]') + len('[tool_code]')
+        end_marker = normalized.find('[/tool_code]', start_marker)
+        if end_marker != -1:
+            tool_block = normalized[start_marker:end_marker].strip()
+            json_call_match = re.search(r'json\.dumps\((\{.*\})\)\s*$', tool_block, re.DOTALL)
+            if json_call_match:
+                candidate = extract_json_object(json_call_match.group(1))
+                if candidate:
+                    return candidate
+            candidate = extract_json_object(tool_block)
+            if candidate:
+                return candidate
+    start = normalized.find('{')
+    if start == -1:
+        return None
+    depth = 0
+    in_string = False
+    escaped = False
+    for idx in range(start, len(normalized)):
+        char = normalized[idx]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == '\\':
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+            continue
+        if char == '{':
+            depth += 1
+        elif char == '}':
+            depth -= 1
+            if depth == 0:
+                candidate = normalized[start:idx + 1]
+                try:
+                    json.loads(candidate)
+                    return candidate
+                except json.JSONDecodeError:
+                    continue
+    return None
+
+
+def build_upstream_feedback_bundle(
+    *,
+    symbol: str,
+    market_date: date,
+    buffered_lookup: dict[tuple[str, str], dict[str, Any]],
+    upstream_reuse_decisions: dict[str, dict[str, Any]],
+    upstream_summary_roles: Sequence[str],
+) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]], list[str]]:
+    upstream_summaries: dict[str, dict[str, Any]] = {}
+    upstream_traceability: dict[str, dict[str, Any]] = {}
+    missing_roles: list[str] = []
+    symbol_decisions = upstream_reuse_decisions.get(symbol, {})
+
+    for role in upstream_summary_roles:
+        buffered_row = buffered_lookup.get((symbol, role))
+        if buffered_row is not None:
+            feedback_payload = buffered_row.get('feedback') if isinstance(buffered_row.get('feedback'), dict) else None
+            if feedback_payload:
+                upstream_summaries[role] = feedback_payload
+                upstream_traceability[role] = {
+                    'agent_name': role,
+                    'run_id': buffered_row.get('run_id'),
+                    'market_date': market_date.isoformat(),
+                    'source': 'current_run_buffer',
+                }
+                continue
+
+        decision = symbol_decisions.get(role)
+        if decision is not None and bool(decision.should_dispatch):
+            missing_roles.append(role)
+            continue
+        latest_feedback = decision.latest_feedback if decision is not None else None
+        feedback_payload = latest_feedback.get('feedback_payload') if isinstance(latest_feedback, dict) else None
+        feedback_market_date = latest_feedback.get('market_date') if isinstance(latest_feedback, dict) else None
+        if isinstance(feedback_payload, dict) and feedback_market_date == market_date.isoformat():
+            upstream_summaries[role] = feedback_payload
+            upstream_traceability[role] = {
+                'agent_name': role,
+                'run_id': latest_feedback.get('run_id'),
+                'market_date': feedback_market_date,
+                'received_at': latest_feedback.get('received_at'),
+                'feedback_id': latest_feedback.get('id'),
+                'source': 'persisted_feedback',
+            }
+            continue
+
+        missing_roles.append(role)
+
+    return upstream_summaries, upstream_traceability, missing_roles
+
+
+def build_signal_decider_payload(
+    *,
+    item: dict[str, Any],
+    market_date: date,
+    request_run_id: str,
+    upstream_summaries: dict[str, dict[str, Any]],
+    upstream_traceability: dict[str, dict[str, Any]],
+    signal_decider_agent_name: str,
+) -> dict[str, Any]:
+    symbol_day_context = jsonable_encoder(strip_runtime_session_fields(item))
+    requested_at = datetime.now(timezone.utc).isoformat()
+    return {
+        'role': signal_decider_agent_name,
+        'agent_name': signal_decider_agent_name,
+        'symbol': str(item.get('symbol') or ''),
+        'market_date': market_date.isoformat(),
+        'symbol_day_context': symbol_day_context,
+        'upstream_summaries': jsonable_encoder(upstream_summaries),
+        'upstream_traceability': jsonable_encoder(upstream_traceability),
+        'decision_support_constraints': {
+            'decision_support_only': True,
+            'allow_execution_logic': False,
+            'allow_position_sizing': False,
+            'allow_leverage_guidance': False,
+            'avoid_fake_precision': True,
+        },
+        'orchestration': {
+            'request_run_id': request_run_id,
+            'requested_at': requested_at,
+            'request_model': f'openclaw/{signal_decider_agent_name}',
+            'source': 'agent_feedback_orchestrator.dispatch_for_symbols',
+            'mode': 'role_sequential_runtime_buffered',
+            'required_upstream_roles': list(upstream_summaries.keys() if False else ()),
+        },
+    }
