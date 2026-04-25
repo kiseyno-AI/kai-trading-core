@@ -1,0 +1,622 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from dataclasses import dataclass
+from typing import Any, Callable, Sequence
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class PykrxPipelineDependencies:
+    log_fetch: Callable[..., None]
+    create_eod_collection_run: Callable[..., int]
+    update_eod_collection_run_progress: Callable[..., None]
+    complete_eod_collection_run: Callable[..., None]
+    persist_daily_price_bars: Callable[..., int]
+    get_market_ohlcv_by_date: Callable[..., Any]
+    price_context_service: Any
+    technical_snapshot_service: Any
+    action_summary_service: Any
+    compute_trending_ranks: Callable[..., dict]
+    signal_feature_service: Any
+    dart_fundamentals_capture_service: Any
+    settings: Any
+    normalize_yyyymmdd: Callable[..., str]
+    update_run_stage_metadata: Callable[..., dict]
+
+
+def run_market_data_pipeline(
+    service,
+    *,
+    dependencies: PykrxPipelineDependencies,
+    start_date: str,
+    end_date: str,
+    markets: Sequence[str],
+    trigger: str,
+    refresh_universe: bool,
+    mode: str,
+    limit: int | None = None,
+    symbol: str | None = None,
+    symbols_override: Sequence[Any] | None = None,
+    retry_context: dict | None = None,
+) -> dict:
+    normalized_start = dependencies.normalize_yyyymmdd(start_date)
+    normalized_end = dependencies.normalize_yyyymmdd(end_date)
+    dependencies.log_fetch(
+        'run_collection',
+        'started',
+        mode=mode,
+        trigger=trigger,
+        start_date=normalized_start,
+        end_date=normalized_end,
+        markets=list(markets),
+        limit=limit,
+        symbol=symbol,
+        symbols_override_count=len(symbols_override) if symbols_override is not None else None,
+        refresh_universe=refresh_universe,
+        retry=retry_context,
+    )
+
+    effective_refresh_universe = refresh_universe and symbols_override is None
+    if symbols_override is not None:
+        universe_snapshot = None
+        symbols = list(symbols_override)
+    elif effective_refresh_universe:
+        snapshot = service.fetch_recent_universe_snapshot(markets=markets, limit=limit)
+        symbols = snapshot['symbols']
+        deactivate_missing = limit is None and symbol is None
+        persisted = service._persist_universe(symbols, deactivate_missing=deactivate_missing)
+        universe_snapshot = {
+            'source': 'pykrx',
+            'markets': list(markets),
+            'symbol_count': len(symbols),
+            'persisted_count': persisted,
+            'latest_trade_date': snapshot['latest_trade_date'],
+            'universe_source': snapshot['universe_source'],
+            'deactivate_missing': deactivate_missing,
+        }
+    else:
+        universe_snapshot = None
+        symbols = service.load_active_universe(markets=markets, symbol=symbol, limit=limit)
+
+    if symbol:
+        symbols = [item for item in symbols if item.symbol == symbol]
+        if not symbols:
+            matched = service.find_symbol(symbol, markets=markets)
+            if matched is not None:
+                symbols = [matched]
+    if not symbols:
+        raise RuntimeError('No active pykrx symbols are available for backfill.')
+
+    latest_trade_date = service.resolve_latest_trade_date(end_date=normalized_end)
+    run_metadata = {
+        'mode': mode,
+        'requested_start_date': normalized_start,
+        'requested_end_date': normalized_end,
+        'latest_available_trade_date': latest_trade_date,
+        'markets': list(markets),
+        'symbol': symbol,
+        'limited_run': limit is not None,
+        'universe_refreshed': effective_refresh_universe,
+        'universe_snapshot': universe_snapshot,
+    }
+    if retry_context is not None:
+        run_metadata['retry'] = retry_context
+        run_metadata['requested_symbols'] = [item.symbol for item in symbols]
+    first_symbol = symbols[0].symbol if symbols else None
+    run_metadata = dependencies.update_run_stage_metadata(
+        run_metadata,
+        stage='price_collection',
+        status='running',
+        current_step='fetch_symbol_ohlcv',
+        current_activity=(
+            f'Collecting pykrx daily prices for {first_symbol}'
+            if first_symbol
+            else 'Collecting pykrx daily prices'
+        ),
+        processed=0,
+        total=len(symbols),
+        succeeded=0,
+        failed=0,
+        current_symbol=first_symbol,
+        extra={'bars_upserted': 0},
+    )
+    run_id = dependencies.create_eod_collection_run(
+        market='KRX',
+        trade_date=latest_trade_date,
+        symbols_total=len(symbols),
+        trigger=trigger,
+        source='pykrx',
+        run_metadata=run_metadata,
+    )
+
+    symbols_succeeded = 0
+    symbols_failed = 0
+    failed_symbols: list[str] = []
+    bars_upserted = 0
+
+    def persist_stage_progress(
+        *,
+        stage: str,
+        status: str,
+        current_step: str,
+        current_activity: str,
+        processed: int | None = None,
+        total: int | None = None,
+        succeeded: int | None = None,
+        failed: int | None = None,
+        current_symbol: str | None = None,
+        current_period: str | None = None,
+        extra: dict | None = None,
+    ) -> None:
+        nonlocal run_metadata
+        run_metadata = dependencies.update_run_stage_metadata(
+            run_metadata,
+            stage=stage,
+            status=status,
+            current_step=current_step,
+            current_activity=current_activity,
+            processed=processed,
+            total=total,
+            succeeded=succeeded,
+            failed=failed,
+            current_symbol=current_symbol,
+            current_period=current_period,
+            extra=extra,
+        )
+        try:
+            dependencies.update_eod_collection_run_progress(
+                run_id,
+                symbols_succeeded=symbols_succeeded,
+                symbols_failed=symbols_failed,
+                run_metadata=run_metadata,
+            )
+        except Exception as exc:
+            logger.warning('pykrx progress update failed for run %s during %s: %s', run_id, stage, exc)
+            dependencies.log_fetch(
+                'update_collection_progress',
+                'failed',
+                run_id=run_id,
+                stage=stage,
+                current_step=current_step,
+                current_symbol=current_symbol,
+                current_period=current_period,
+                symbols_succeeded=symbols_succeeded,
+                symbols_failed=symbols_failed,
+                error_type=type(exc).__name__,
+                error_message=str(exc),
+            )
+
+    try:
+        for index, item in enumerate(symbols):
+            symbol_started_at = time.perf_counter()
+            try:
+                frame = dependencies.get_market_ohlcv_by_date(normalized_start, normalized_end, item.symbol)
+                if frame.empty:
+                    raise RuntimeError('No OHLCV rows returned.')
+                fundamentals_frame = service._load_symbol_fundamentals(
+                    symbol=item.symbol,
+                    start_date=normalized_start,
+                    end_date=normalized_end,
+                )
+                bars = service._map_symbol_bars(frame, fundamentals_frame=fundamentals_frame)
+                persisted_count = dependencies.persist_daily_price_bars(
+                    item.symbol,
+                    bars,
+                    market=item.market,
+                    source='pykrx',
+                    run_id=run_id,
+                    name_ko=item.name_ko,
+                    standard_code=item.standard_code,
+                )
+                bars_upserted += persisted_count
+                symbols_succeeded += 1
+                dependencies.log_fetch(
+                    'fetch_symbol_ohlcv',
+                    'completed',
+                    run_id=run_id,
+                    symbol=item.symbol,
+                    market=item.market,
+                    start_date=normalized_start,
+                    end_date=normalized_end,
+                    bar_count=len(bars),
+                    persisted_count=persisted_count,
+                    duration_ms=round((time.perf_counter() - symbol_started_at) * 1000, 3),
+                )
+            except Exception as exc:
+                symbols_failed += 1
+                failed_symbols.append(item.symbol)
+                logger.warning('pykrx backfill failed for %s: %s', item.symbol, exc)
+                dependencies.log_fetch(
+                    'fetch_symbol_ohlcv',
+                    'failed',
+                    run_id=run_id,
+                    symbol=item.symbol,
+                    market=item.market,
+                    start_date=normalized_start,
+                    end_date=normalized_end,
+                    duration_ms=round((time.perf_counter() - symbol_started_at) * 1000, 3),
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
+                )
+            try:
+                next_symbol = symbols[index + 1].symbol if index + 1 < len(symbols) else None
+                persist_stage_progress(
+                    stage='price_collection',
+                    status='running' if next_symbol is not None else ('completed' if not failed_symbols else 'partial'),
+                    current_step='fetch_symbol_ohlcv' if next_symbol is not None else 'price_collection_completed',
+                    current_activity=(
+                        f'Collecting pykrx daily prices for {next_symbol}'
+                        if next_symbol is not None
+                        else 'Completed pykrx daily price collection'
+                    ),
+                    processed=symbols_succeeded + symbols_failed,
+                    total=len(symbols),
+                    succeeded=symbols_succeeded,
+                    failed=symbols_failed,
+                    current_symbol=next_symbol,
+                    extra={'bars_upserted': bars_upserted},
+                )
+            except Exception as exc:
+                logger.warning('pykrx progress update failed for run %s after %s: %s', run_id, item.symbol, exc)
+                dependencies.log_fetch(
+                    'update_collection_progress',
+                    'failed',
+                    run_id=run_id,
+                    symbol=item.symbol,
+                    symbols_succeeded=symbols_succeeded,
+                    symbols_failed=symbols_failed,
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
+                )
+            if service.symbol_pause_seconds:
+                time.sleep(service.symbol_pause_seconds)
+    except Exception as exc:
+        dependencies.log_fetch(
+            'run_collection',
+            'failed',
+            run_id=run_id,
+            mode=mode,
+            trigger=trigger,
+            start_date=normalized_start,
+            end_date=normalized_end,
+            latest_available_trade_date=latest_trade_date,
+            symbols_total=len(symbols),
+            symbols_succeeded=symbols_succeeded,
+            symbols_failed=symbols_failed,
+            bars_upserted=bars_upserted,
+            error_type=type(exc).__name__,
+            error_message=str(exc),
+        )
+        run_metadata = dependencies.update_run_stage_metadata(
+            run_metadata,
+            stage='price_collection',
+            status='failed',
+            current_step='price_collection_failed',
+            current_activity='pykrx daily price collection failed',
+            processed=symbols_succeeded + symbols_failed,
+            total=len(symbols),
+            succeeded=symbols_succeeded,
+            failed=symbols_failed,
+            current_symbol=None,
+            extra={'bars_upserted': bars_upserted},
+        )
+        if failed_symbols:
+            run_metadata = service._run_metadata_with_failed_symbols(run_metadata, failed_symbols)
+        dependencies.complete_eod_collection_run(
+            run_id,
+            status='failed',
+            symbols_succeeded=symbols_succeeded,
+            symbols_failed=symbols_failed,
+            error_message=str(exc),
+            run_metadata=run_metadata,
+        )
+        raise
+
+    failed_symbol_set = set(failed_symbols)
+    price_context_symbols = [item.symbol for item in symbols if item.symbol not in failed_symbol_set]
+    price_context_result: dict
+    price_context_error_message: str | None = None
+    try:
+        price_context_result = dependencies.price_context_service.rebuild_for_market_date(
+            market_date=latest_trade_date,
+            symbols=price_context_symbols,
+            source='pykrx',
+            run_id=run_id,
+        )
+    except Exception as exc:
+        price_context_result = {
+            'market_date': latest_trade_date,
+            'source': 'pykrx',
+            'requested_symbols': len(price_context_symbols),
+            'contexts_persisted': 0,
+            'contexts_failed': len(price_context_symbols),
+            'failed_symbols': price_context_symbols[:50],
+            'items': [],
+            'error': str(exc),
+        }
+        price_context_error_message = f'Price context persistence failed: {exc}'
+
+    technical_snapshot_result: dict
+    snapshot_error_message: str | None = None
+    try:
+        technical_snapshot_result = dependencies.technical_snapshot_service.rebuild_for_market_date(
+            market_date=latest_trade_date,
+            symbols=[item.symbol for item in symbols],
+            source='pykrx',
+            run_id=run_id,
+            progress_callback=lambda progress: persist_stage_progress(
+                stage='technical_snapshots',
+                status=str(progress.get('status') or 'running'),
+                current_step=str(progress.get('current_step') or 'computing_symbol_snapshot'),
+                current_activity=str(progress.get('current_activity') or 'Computing daily technical snapshots'),
+                processed=progress.get('processed'),
+                total=progress.get('total'),
+                succeeded=progress.get('succeeded'),
+                failed=progress.get('failed'),
+                current_symbol=progress.get('current_symbol'),
+                extra=progress.get('details') if isinstance(progress.get('details'), dict) else None,
+            ),
+        )
+    except Exception as exc:
+        technical_snapshot_result = {
+            'market_date': latest_trade_date,
+            'source': 'pykrx',
+            'requested_symbols': len(symbols),
+            'snapshots_persisted': 0,
+            'snapshots_failed': len(symbols),
+            'failed_symbols': [item.symbol for item in symbols][:50],
+            'items': [],
+            'error': str(exc),
+        }
+        snapshot_error_message = f'Technical snapshot persistence failed: {exc}'
+        persist_stage_progress(
+            stage='technical_snapshots',
+            status='failed',
+            current_step='technical_snapshots_failed',
+            current_activity='Daily technical snapshot persistence failed',
+            processed=0,
+            total=len(symbols),
+            succeeded=0,
+            failed=len(symbols),
+        )
+
+    action_summary_result: dict
+    action_summary_error_message: str | None = None
+    try:
+        action_summary_result = dependencies.action_summary_service.rebuild_for_market_date(
+            market_date=latest_trade_date,
+            symbols=[item.symbol for item in symbols],
+            source='pykrx',
+            run_id=run_id,
+            progress_callback=lambda progress: persist_stage_progress(
+                stage='action_summaries',
+                status=str(progress.get('status') or 'running'),
+                current_step=str(progress.get('current_step') or 'computing_action_summary'),
+                current_activity=str(progress.get('current_activity') or 'Computing daily action summaries'),
+                processed=progress.get('processed'),
+                total=progress.get('total'),
+                succeeded=progress.get('succeeded'),
+                failed=progress.get('failed'),
+                current_symbol=progress.get('current_symbol'),
+                extra=progress.get('details') if isinstance(progress.get('details'), dict) else None,
+            ),
+        )
+    except Exception as exc:
+        action_summary_result = {
+            'market_date': latest_trade_date,
+            'source': 'pykrx',
+            'requested_symbols': len(symbols),
+            'action_summaries_persisted': 0,
+            'action_summaries_failed': len(symbols),
+            'failed_symbols': [item.symbol for item in symbols][:50],
+            'items': [],
+            'error': str(exc),
+        }
+        action_summary_error_message = f'Action summary persistence failed: {exc}'
+        persist_stage_progress(
+            stage='action_summaries',
+            status='failed',
+            current_step='action_summaries_failed',
+            current_activity='Daily action summary persistence failed',
+            processed=0,
+            total=len(symbols),
+            succeeded=0,
+            failed=len(symbols),
+        )
+
+    trending_rank_result: dict
+    trending_rank_error_message: str | None = None
+    try:
+        trending_rank_result = dependencies.compute_trending_ranks(
+            market_date=latest_trade_date,
+            source='pykrx',
+            run_id=run_id,
+            progress_callback=lambda progress: persist_stage_progress(
+                stage='trending_ranks',
+                status=str(progress.get('status') or 'running'),
+                current_step=str(progress.get('current_step') or 'computing_trending_period'),
+                current_activity=str(progress.get('current_activity') or 'Computing daily trending ranks'),
+                processed=progress.get('processed'),
+                total=progress.get('total'),
+                succeeded=progress.get('succeeded'),
+                failed=progress.get('failed'),
+                current_period=progress.get('current_period'),
+                extra=progress.get('details') if isinstance(progress.get('details'), dict) else None,
+            ),
+        )
+    except Exception as exc:
+        trending_rank_result = {
+            'market_date': latest_trade_date,
+            'source': 'pykrx',
+            'periods': [],
+            'trending_ranks_persisted': 0,
+            'error': str(exc),
+        }
+        trending_rank_error_message = f'Trending rank persistence failed: {exc}'
+        persist_stage_progress(
+            stage='trending_ranks',
+            status='failed',
+            current_step='trending_ranks_failed',
+            current_activity='Daily trending rank persistence failed',
+            processed=0,
+            total=0,
+            succeeded=0,
+            failed=1,
+        )
+
+    signal_feature_result: dict
+    signal_feature_error_message: str | None = None
+    try:
+        persist_stage_progress(
+            stage='signal_features',
+            status='running',
+            current_step='collecting_daily_signal_features',
+            current_activity='Collecting daily KIS signal features',
+            processed=0,
+            total=3,
+            succeeded=0,
+            failed=0,
+        )
+        signal_feature_result = asyncio.run(
+            dependencies.signal_feature_service.refresh_for_market_date(
+                market_date=latest_trade_date,
+            )
+        )
+        signal_total = int(signal_feature_result.get('features_persisted', 0)) + int(signal_feature_result.get('features_failed', 0))
+        persist_stage_progress(
+            stage='signal_features',
+            status='completed' if not signal_feature_result.get('features_failed') else 'partial',
+            current_step='signal_features_completed',
+            current_activity='Daily KIS signal features collected',
+            processed=signal_total,
+            total=signal_total,
+            succeeded=signal_feature_result.get('features_persisted'),
+            failed=signal_feature_result.get('features_failed'),
+            extra={
+                'sources': signal_feature_result.get('sources'),
+                'source_counts': signal_feature_result.get('source_counts'),
+            },
+        )
+    except Exception as exc:
+        signal_feature_result = {
+            'market_date': latest_trade_date,
+            'source': 'kis_ranking',
+            'sources': [],
+            'source_counts': {},
+            'features_persisted': 0,
+            'features_failed': 0,
+            'failed_symbols': [],
+            'participation_context': {'error': str(exc)},
+            'items': [],
+            'error': str(exc),
+        }
+        signal_feature_error_message = f'Daily signal feature collection failed: {exc}'
+        persist_stage_progress(
+            stage='signal_features',
+            status='failed',
+            current_step='signal_features_failed',
+            current_activity='Daily KIS signal feature collection failed',
+            processed=0,
+            total=3,
+            succeeded=0,
+            failed=1,
+        )
+
+    run_errors: list[str] = []
+    if failed_symbols:
+        run_errors.append(f'Failed symbols: {",".join(failed_symbols[:20])}')
+    if price_context_error_message:
+        run_errors.append(price_context_error_message)
+    else:
+        price_context_failed_symbols = [
+            symbol for symbol in price_context_result.get('failed_symbols', []) if symbol not in failed_symbol_set
+        ]
+        if price_context_failed_symbols:
+            run_errors.append(
+                'Price context persistence incomplete for symbols: '
+                + ','.join(price_context_failed_symbols[:20])
+            )
+    if snapshot_error_message:
+        run_errors.append(snapshot_error_message)
+    elif technical_snapshot_result.get('snapshots_failed'):
+        run_errors.append(
+            'Technical snapshot persistence incomplete for symbols: '
+            + ','.join(technical_snapshot_result.get('failed_symbols', [])[:20])
+        )
+    if action_summary_error_message:
+        run_errors.append(action_summary_error_message)
+    elif action_summary_result.get('action_summaries_failed'):
+        run_errors.append(
+            'Action summary persistence incomplete for symbols: '
+            + ','.join(action_summary_result.get('failed_symbols', [])[:20])
+        )
+    if trending_rank_error_message:
+        run_errors.append(trending_rank_error_message)
+    if signal_feature_error_message:
+        run_errors.append(signal_feature_error_message)
+    elif signal_feature_result.get('features_failed'):
+        run_errors.append(
+            'Daily signal feature persistence incomplete for symbols: '
+            + ','.join((signal_feature_result.get('failed_symbols') or [])[:20])
+        )
+
+    status = 'completed' if not run_errors else 'completed_with_errors'
+    if failed_symbols:
+        run_metadata = service._run_metadata_with_failed_symbols(run_metadata, failed_symbols)
+    dependencies.complete_eod_collection_run(
+        run_id,
+        status=status,
+        symbols_succeeded=symbols_succeeded,
+        symbols_failed=symbols_failed,
+        error_message=' | '.join(run_errors) if run_errors else None,
+        run_metadata=run_metadata,
+    )
+    result = {
+        'run_id': run_id,
+        'source': 'pykrx',
+        'status': status,
+        'markets': list(markets),
+        'start_date': normalized_start,
+        'requested_end_date': normalized_end,
+        'latest_available_trade_date': latest_trade_date,
+        'symbols_total': len(symbols),
+        'symbols_succeeded': symbols_succeeded,
+        'symbols_failed': symbols_failed,
+        'failed_symbols': failed_symbols[:50],
+        'bars_upserted': bars_upserted,
+        'price_contexts': price_context_result,
+        'technical_snapshots': technical_snapshot_result,
+        'action_summaries': action_summary_result,
+        'trending_ranks': trending_rank_result,
+        'signal_features': signal_feature_result,
+        'refresh_universe': effective_refresh_universe,
+        'universe_snapshot': universe_snapshot,
+    }
+    dart_auto_followup_enabled = bool((dependencies.settings.dart_api_key or '').strip())
+    should_chain_fundamentals = (
+        dart_auto_followup_enabled
+        and mode == 'daily_auto'
+        and status in {'completed', 'completed_with_errors'}
+    )
+    if should_chain_fundamentals:
+        result['fundamentals_followup'] = asyncio.run(
+            dependencies.dart_fundamentals_capture_service.run_daily_incremental_refresh(
+                market_date=latest_trade_date,
+                capture_limit=500,
+                trigger='eod_pykrx_followup',
+            )
+        )
+    elif mode == 'daily_auto' and status in {'completed', 'completed_with_errors'}:
+        result['fundamentals_followup'] = {
+            'triggered': False,
+            'reason': 'dart_api_key_not_configured',
+            'market_date': latest_trade_date,
+        }
+    if retry_context is not None:
+        result['retry'] = retry_context
+    dependencies.log_fetch('run_collection', status, **{key: value for key, value in result.items() if key != 'status'})
+    return result

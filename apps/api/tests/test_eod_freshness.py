@@ -1,5 +1,7 @@
 import unittest
+from contextlib import contextmanager
 from datetime import date, datetime, timezone
+from types import SimpleNamespace
 
 from sqlalchemy import delete, select
 
@@ -20,6 +22,10 @@ class _FakeMarketState:
 
 class _FakeNextTradeDayMarketState:
     server_time = '2026-04-13T10:05:00+09:00'
+
+
+class _FakeWeekendMarketState:
+    server_time = '2026-04-11T12:05:00+09:00'
 
 
 class _FakeDetachedRunRegressionMarketState:
@@ -312,6 +318,91 @@ class EODFreshnessServiceTests(unittest.TestCase):
         self.assertEqual(requested_live_count_dates, ['2026-04-10'])
         self.assertEqual(requested_latest_count_dates, ['2026-04-10'])
 
+    def test_latest_summary_uses_same_fallback_run_selection_logic_as_today(self):
+        fallback_row = SimpleNamespace(
+            id=99,
+            market='KRX',
+            trade_date=date(2026, 4, 10),
+            source='pykrx',
+            trigger='manual_daily_api',
+            status='completed',
+            symbols_total=5,
+            symbols_succeeded=4,
+            symbols_failed=1,
+            error_message=None,
+            started_at=datetime(2026, 4, 10, 6, 0, tzinfo=timezone.utc),
+            completed_at=datetime(2026, 4, 10, 6, 45, tzinfo=timezone.utc),
+            run_metadata={'last_progress_at': '2026-04-10T06:44:00+00:00'},
+        )
+
+        class _FakeScalarResult:
+            def __init__(self, row):
+                self._row = row
+
+            def first(self):
+                return self._row
+
+        class _FakeExecuteResult:
+            def __init__(self, row):
+                self._row = row
+
+            def scalars(self):
+                return _FakeScalarResult(self._row)
+
+        class _FakeFallbackSession:
+            def execute(self, _statement):
+                return _FakeExecuteResult(fallback_row)
+
+        @contextmanager
+        def fake_session_scope():
+            yield _FakeFallbackSession()
+
+        def latest_run_loader(**_kwargs):
+            return _latest_run(
+                status='completed',
+                symbols_total=2,
+                symbols_succeeded=0,
+                symbols_failed=0,
+                completed_at='2026-04-10T06:10:00+00:00',
+            )
+
+        service = EODFreshnessService(
+            market_state_loader=lambda: _FakeMarketState(),
+            latest_run_loader=latest_run_loader,
+            live_symbol_count_loader=lambda: 3,
+            daily_price_bar_count_loader=lambda _: 4,
+            daily_technical_snapshot_count_loader=lambda _: 0,
+            daily_action_summary_count_loader=lambda _: 0,
+            daily_fundamentals_count_loader=lambda _: {'symbols_succeeded': 0, 'symbols_failed': 0, 'symbols_total': 0},
+            fundamentals_today_refresh_loader=lambda _: None,
+            latest_fundamentals_refresh_loader=lambda: None,
+            latest_price_trade_date_loader=lambda: '2026-04-10',
+            latest_price_bar_count_loader=lambda _: 5,
+            latest_technical_market_date_loader=lambda: None,
+            latest_action_market_date_loader=lambda: None,
+        )
+
+        with unittest.mock.patch.object(freshness_module, 'session_scope', fake_session_scope):
+            result = service.read()
+
+        self.assertEqual(result['today']['price']['symbols_total'], 5)
+        self.assertEqual(result['today']['price']['symbols_succeeded'], 4)
+        self.assertEqual(result['today']['price']['symbols_failed'], 1)
+        self.assertEqual(result['latest']['trade_date'], '2026-04-10')
+        self.assertEqual(result['latest']['symbols_total'], 5)
+        self.assertEqual(result['latest']['symbols_succeeded'], 4)
+        self.assertEqual(result['latest']['symbols_failed'], 1)
+        self.assertEqual(
+            result['latest']['summary'],
+            {
+                'basis': 'latest_eod_run_symbol_universe',
+                'updated_at': '2026-04-10T06:44:00+00:00',
+                'succeeded': 4,
+                'failed': 1,
+                'total': 5,
+            },
+        )
+
     def test_latest_summary_exposes_healthy_run_counts_and_timestamp(self):
         service = EODFreshnessService(
             market_state_loader=lambda: _FakeMarketState(),
@@ -583,6 +674,45 @@ class EODFreshnessServiceTests(unittest.TestCase):
         self.assertEqual(result['latest']['fundamentals']['symbols_checked'], 250)
         self.assertEqual(result['latest']['fundamentals']['symbols_succeeded'], 250)
         self.assertEqual(result['latest']['fundamentals']['symbols_refreshed'], 1)
+
+    def test_read_keeps_weekend_today_missing_while_latest_stays_on_previous_trade_date(self):
+        friday_refresh = _fundamentals_refresh_run(
+            market_date='2026-04-10',
+            status='completed',
+            symbols_total=250,
+            symbols_checked=250,
+            symbols_fresh=250,
+            completed_at='2026-04-10T07:45:00+00:00',
+            run_metadata={'last_progress_at': '2026-04-10T07:45:00+00:00'},
+        )
+        service = EODFreshnessService(
+            market_state_loader=lambda: _FakeWeekendMarketState(),
+            latest_run_loader=lambda **_: None,
+            live_symbol_count_loader=lambda: 250,
+            daily_price_bar_count_loader=lambda _: 0,
+            daily_technical_snapshot_count_loader=lambda _: 0,
+            daily_action_summary_count_loader=lambda _: 0,
+            daily_fundamentals_count_loader=lambda _: {'symbols_succeeded': 0, 'symbols_failed': 0, 'symbols_total': 0},
+            fundamentals_today_refresh_loader=lambda _: None,
+            latest_fundamentals_refresh_loader=lambda: friday_refresh,
+            latest_price_trade_date_loader=lambda: '2026-04-10',
+            latest_price_bar_count_loader=lambda _: 250,
+            latest_price_bar_updated_at_loader=lambda _: '2026-04-10T06:05:12+00:00',
+            latest_technical_market_date_loader=lambda: '2026-04-10',
+            latest_action_market_date_loader=lambda: '2026-04-10',
+        )
+
+        result = service.read()
+
+        self.assertEqual(result['today']['trade_date'], '2026-04-11')
+        self.assertEqual(result['today']['price']['status'], 'missing')
+        self.assertEqual(result['today']['technical_analysis']['status'], 'missing')
+        self.assertEqual(result['today']['action_summary']['status'], 'missing')
+        self.assertEqual(result['today']['fundamentals']['status'], 'missing')
+        self.assertEqual(result['latest']['trade_date'], '2026-04-10')
+        self.assertEqual(result['latest']['price_trade_date'], '2026-04-10')
+        self.assertEqual(result['latest']['eod_status'], 'completed')
+        self.assertEqual(result['latest']['fundamentals']['market_date'], '2026-04-10')
 
     def test_latest_fundamentals_keeps_same_day_noop_completed_refresh_available(self):
         completed_today_refresh = _fundamentals_refresh_run(

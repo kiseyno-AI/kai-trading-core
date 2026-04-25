@@ -1,0 +1,233 @@
+from __future__ import annotations
+
+from datetime import datetime
+
+from sqlalchemy import delete, select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+from app.db import session_scope
+from app.db_models import Symbol, TrackedSymbol
+from app.scanner.state import scanner_state
+
+
+def _get_symbol(session, symbol: str) -> Symbol | None:
+    return session.execute(select(Symbol).where(Symbol.symbol == symbol)).scalar_one_or_none()
+
+
+def _normalize_symbol_code(symbol: str) -> str:
+    normalized = symbol.strip().upper()
+    if not normalized:
+        raise ValueError('symbol is required')
+    return normalized
+
+
+def ensure_symbol(
+    symbol: str,
+    *,
+    market: str = 'KRX',
+    name_ko: str | None = None,
+    standard_code: str | None = None,
+    instrument_type: str = 'equity',
+    source: str = 'app',
+) -> int:
+    with session_scope() as session:
+        record = _get_symbol(session, symbol)
+        if record is None:
+            record = Symbol(
+                symbol=symbol,
+                market=market,
+                name_ko=name_ko or symbol,
+                standard_code=standard_code,
+                instrument_type=instrument_type,
+                source=source,
+                last_refreshed_at=datetime.utcnow(),
+            )
+            session.add(record)
+            session.flush()
+            return record.id
+
+        if name_ko:
+            record.name_ko = name_ko
+        if standard_code:
+            record.standard_code = standard_code
+        if market:
+            record.market = market
+        record.instrument_type = instrument_type
+        record.source = source
+        record.is_active = True
+        record.last_refreshed_at = datetime.utcnow()
+        session.flush()
+        return record.id
+
+
+def upsert_symbol_universe(
+    items: list,
+    *,
+    source: str,
+    stale_sources: list[str] | None = None,
+    stale_markets: list[str] | None = None,
+    instrument_type: str = 'equity',
+) -> int:
+    if not items:
+        return 0
+
+    refreshed_at = datetime.utcnow()
+    symbol_rows = [
+        {
+            'symbol': entry.symbol,
+            'standard_code': getattr(entry, 'standard_code', None),
+            'name_ko': entry.name_ko,
+            'market': entry.market,
+            'instrument_type': instrument_type,
+            'source': source,
+            'is_active': True,
+            'last_refreshed_at': refreshed_at,
+        }
+        for entry in items
+    ]
+
+    with session_scope() as session:
+        statement = pg_insert(Symbol).values(symbol_rows)
+        session.execute(
+            statement.on_conflict_do_update(
+                index_elements=[Symbol.symbol],
+                set_={
+                    'standard_code': statement.excluded.standard_code,
+                    'name_ko': statement.excluded.name_ko,
+                    'market': statement.excluded.market,
+                    'instrument_type': statement.excluded.instrument_type,
+                    'source': statement.excluded.source,
+                    'is_active': statement.excluded.is_active,
+                    'last_refreshed_at': statement.excluded.last_refreshed_at,
+                    'updated_at': refreshed_at,
+                },
+            )
+        )
+        stale_source_names = [source] if stale_sources is None else stale_sources
+        if stale_source_names:
+            target_markets = stale_markets or list({entry.market for entry in items if getattr(entry, 'market', None)})
+            stale_stmt = (
+                update(Symbol)
+                .where(Symbol.source.in_(stale_source_names), ~Symbol.symbol.in_([entry.symbol for entry in items]))
+                .values(is_active=False, last_refreshed_at=refreshed_at, updated_at=refreshed_at)
+            )
+            if target_markets:
+                stale_stmt = stale_stmt.where(Symbol.market.in_(target_markets))
+            session.execute(stale_stmt)
+    return len(items)
+
+
+def upsert_master_symbols(items: list) -> int:
+    return upsert_symbol_universe(items, source='kis_master')
+
+
+def load_symbols(
+    *,
+    is_active: bool | None = None,
+    source: str | None = None,
+    markets: list[str] | None = None,
+    symbols: list[str] | None = None,
+    limit: int | None = None,
+) -> list[dict]:
+    with session_scope() as session:
+        stmt = select(
+            Symbol.id,
+            Symbol.symbol,
+            Symbol.standard_code,
+            Symbol.name_ko,
+            Symbol.market,
+            Symbol.instrument_type,
+            Symbol.source,
+            Symbol.is_active,
+            Symbol.last_refreshed_at,
+        ).order_by(Symbol.market.asc(), Symbol.symbol.asc())
+        if is_active is not None:
+            stmt = stmt.where(Symbol.is_active == is_active)
+        if source:
+            stmt = stmt.where(Symbol.source == source)
+        if markets:
+            stmt = stmt.where(Symbol.market.in_(markets))
+        if symbols:
+            stmt = stmt.where(Symbol.symbol.in_(symbols))
+        if limit:
+            stmt = stmt.limit(limit)
+        rows = session.execute(stmt).all()
+        return [dict(row._mapping) for row in rows]
+
+
+def load_tracked_symbols() -> list[str]:
+    with session_scope() as session:
+        rows = session.execute(
+            select(Symbol.symbol)
+            .join(TrackedSymbol, TrackedSymbol.symbol_id == Symbol.id)
+            .order_by(TrackedSymbol.sort_order.asc(), TrackedSymbol.id.asc())
+        ).all()
+        return [row[0] for row in rows]
+
+
+def replace_tracked_symbols(symbols: list[str]) -> None:
+    ordered_symbols = list(dict.fromkeys(symbols))
+    with session_scope() as session:
+        session.execute(delete(TrackedSymbol))
+        for index, symbol in enumerate(ordered_symbols):
+            record = _get_symbol(session, symbol)
+            if record is None:
+                record = Symbol(
+                    symbol=symbol,
+                    market='KRX',
+                    name_ko=symbol,
+                    instrument_type='equity',
+                    source='scanner',
+                    is_active=True,
+                    last_refreshed_at=datetime.utcnow(),
+                )
+                session.add(record)
+                session.flush()
+            session.add(TrackedSymbol(symbol_id=record.id, sort_order=index))
+
+
+def load_favorite_symbols() -> list[dict]:
+    with session_scope() as session:
+        rows = session.execute(
+            select(
+                Symbol.name_ko,
+                Symbol.standard_code,
+                Symbol.symbol,
+                Symbol.market,
+                Symbol.instrument_type,
+                Symbol.is_active,
+                TrackedSymbol.sort_order,
+                TrackedSymbol.created_at,
+            )
+            .join(TrackedSymbol, TrackedSymbol.symbol_id == Symbol.id)
+            .order_by(TrackedSymbol.sort_order.asc(), TrackedSymbol.id.asc())
+        ).all()
+        return [
+            {
+                'symbol': row.symbol,
+                'standard_code': row.standard_code,
+                'name_ko': row.name_ko,
+                'market': row.market,
+                'instrument_type': row.instrument_type,
+                'is_active': row.is_active,
+                'sort_order': row.sort_order,
+                'favorited_at': row.created_at.isoformat() if row.created_at else None,
+            }
+            for row in rows
+        ]
+
+
+def remove_favorite_symbol(symbol: str) -> bool:
+    normalized_symbol = _normalize_symbol_code(symbol)
+    with session_scope() as session:
+        favorite = session.execute(
+            select(TrackedSymbol)
+            .join(Symbol, Symbol.id == TrackedSymbol.symbol_id)
+            .where(Symbol.symbol == normalized_symbol)
+        ).scalar_one_or_none()
+        if favorite is None:
+            return False
+        session.delete(favorite)
+
+    scanner_state.update(load_tracked_symbols())
+    return True

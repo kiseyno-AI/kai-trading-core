@@ -70,6 +70,35 @@ class PykrxBackfillServiceTests(TestCase):
         )
         fallback_universe.assert_called_once_with(markets=('KOSPI',), limit=None)
 
+    def test_refresh_recent_universe_preserves_snapshot_and_persist_counts(self) -> None:
+        service = PykrxBackfillService()
+        snapshot = {
+            'symbols': [PykrxSymbol(symbol='005930', market='KOSPI', name_ko='삼성전자')],
+            'latest_trade_date': '2026-04-07',
+            'universe_source': 'pykrx_market_ohlcv',
+        }
+
+        with (
+            patch.object(service, 'fetch_recent_universe_snapshot', return_value=snapshot) as fetch_snapshot,
+            patch.object(service, '_persist_universe', return_value=1) as persist_universe,
+        ):
+            result = service.refresh_recent_universe(markets=('KOSPI',), deactivate_missing=False)
+
+        self.assertEqual(
+            result,
+            {
+                'source': 'pykrx',
+                'markets': ['KOSPI'],
+                'symbol_count': 1,
+                'persisted_count': 1,
+                'latest_trade_date': '2026-04-07',
+                'universe_source': 'pykrx_market_ohlcv',
+                'deactivate_missing': False,
+            },
+        )
+        fetch_snapshot.assert_called_once_with(markets=('KOSPI',), limit=None)
+        persist_universe.assert_called_once_with(snapshot['symbols'], deactivate_missing=False)
+
     def test_run_daily_pipeline_skips_completed_trade_date(self) -> None:
         service = PykrxBackfillService()
 
@@ -648,6 +677,87 @@ class PykrxBackfillServiceTests(TestCase):
             symbols_succeeded=1,
             symbols_failed=0,
             error_message='Technical snapshot persistence incomplete for symbols: 005930 | Action summary persistence incomplete for symbols: 005930',
+            run_metadata=ANY,
+        )
+
+    def test_run_market_data_pipeline_preserves_price_collection_counts_in_result(self) -> None:
+        service = PykrxBackfillService()
+
+        with (
+            patch.object(
+                service,
+                'load_active_universe',
+                return_value=[PykrxSymbol(symbol='005930', market='KOSPI', name_ko='Samsung Electronics')],
+            ),
+            patch.object(service, 'resolve_latest_trade_date', return_value='2026-04-03'),
+            patch.object(service, '_load_symbol_fundamentals', return_value=None),
+            patch.object(
+                service,
+                '_map_symbol_bars',
+                return_value=[
+                    {
+                        'trade_date': '2026-04-02',
+                        'open_price': 1,
+                        'high_price': 2,
+                        'low_price': 1,
+                        'close_price': 2,
+                        'volume': 3,
+                        'turnover': 4,
+                    },
+                    {
+                        'trade_date': '2026-04-03',
+                        'open_price': 2,
+                        'high_price': 3,
+                        'low_price': 2,
+                        'close_price': 3,
+                        'volume': 5,
+                        'turnover': 6,
+                    },
+                ],
+            ),
+            patch('app.eod.pykrx_backfill.create_eod_collection_run', return_value=12),
+            patch('app.eod.pykrx_backfill._get_market_ohlcv_by_date', return_value=SimpleNamespace(empty=False)),
+            patch('app.eod.pykrx_backfill.persist_daily_price_bars', return_value=2),
+            patch('app.eod.pykrx_backfill.update_eod_collection_run_progress'),
+            patch(
+                'app.eod.pykrx_backfill.daily_price_context_service.rebuild_for_market_date',
+                return_value={'contexts_persisted': 1, 'contexts_failed': 0},
+            ),
+            patch(
+                'app.eod.pykrx_backfill.daily_technical_snapshot_service.rebuild_for_market_date',
+                return_value={'snapshots_persisted': 1, 'snapshots_failed': 0},
+            ),
+            patch(
+                'app.eod.pykrx_backfill.daily_action_summary_service.rebuild_for_market_date',
+                return_value={'action_summaries_persisted': 1, 'action_summaries_failed': 0},
+            ),
+            patch(
+                'app.eod.pykrx_backfill.compute_and_persist_daily_trending_ranks',
+                return_value={'trending_ranks_persisted': 3},
+            ),
+            patch(
+                'app.eod.pykrx_backfill.daily_signal_feature_service.refresh_for_market_date',
+                return_value={'features_persisted': 0, 'features_failed': 0, 'sources': [], 'source_counts': {}},
+            ),
+            patch('app.eod.pykrx_backfill.complete_eod_collection_run') as complete_run,
+        ):
+            result = service.run_backfill(
+                start_date='20260403',
+                end_date='20260403',
+                refresh_universe=False,
+            )
+
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['symbols_total'], 1)
+        self.assertEqual(result['symbols_succeeded'], 1)
+        self.assertEqual(result['symbols_failed'], 0)
+        self.assertEqual(result['bars_upserted'], 2)
+        complete_run.assert_called_once_with(
+            12,
+            status='completed',
+            symbols_succeeded=1,
+            symbols_failed=0,
+            error_message=None,
             run_metadata=ANY,
         )
 
