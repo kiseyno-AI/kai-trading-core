@@ -6,6 +6,12 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Sequence
 
+from app.eod.pykrx_pipeline_support import (
+    append_stage_error,
+    build_stage_failure_result,
+    make_stage_progress_callback,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -328,16 +334,18 @@ def run_market_data_pipeline(
             run_id=run_id,
         )
     except Exception as exc:
-        price_context_result = {
-            'market_date': latest_trade_date,
-            'source': 'pykrx',
-            'requested_symbols': len(price_context_symbols),
-            'contexts_persisted': 0,
-            'contexts_failed': len(price_context_symbols),
-            'failed_symbols': price_context_symbols[:50],
-            'items': [],
-            'error': str(exc),
-        }
+        price_context_result = build_stage_failure_result(
+            market_date=latest_trade_date,
+            source='pykrx',
+            error=exc,
+            totals={
+                'requested_symbols': len(price_context_symbols),
+                'contexts_persisted': 0,
+                'contexts_failed': len(price_context_symbols),
+            },
+            failed_symbols=price_context_symbols,
+            items_key='items',
+        )
         price_context_error_message = f'Price context persistence failed: {exc}'
 
     technical_snapshot_result: dict
@@ -348,30 +356,27 @@ def run_market_data_pipeline(
             symbols=[item.symbol for item in symbols],
             source='pykrx',
             run_id=run_id,
-            progress_callback=lambda progress: persist_stage_progress(
+            progress_callback=make_stage_progress_callback(
+                persist_stage_progress,
                 stage='technical_snapshots',
-                status=str(progress.get('status') or 'running'),
-                current_step=str(progress.get('current_step') or 'computing_symbol_snapshot'),
-                current_activity=str(progress.get('current_activity') or 'Computing daily technical snapshots'),
-                processed=progress.get('processed'),
-                total=progress.get('total'),
-                succeeded=progress.get('succeeded'),
-                failed=progress.get('failed'),
-                current_symbol=progress.get('current_symbol'),
-                extra=progress.get('details') if isinstance(progress.get('details'), dict) else None,
+                default_step='computing_symbol_snapshot',
+                default_activity='Computing daily technical snapshots',
+                include_current_symbol=True,
             ),
         )
     except Exception as exc:
-        technical_snapshot_result = {
-            'market_date': latest_trade_date,
-            'source': 'pykrx',
-            'requested_symbols': len(symbols),
-            'snapshots_persisted': 0,
-            'snapshots_failed': len(symbols),
-            'failed_symbols': [item.symbol for item in symbols][:50],
-            'items': [],
-            'error': str(exc),
-        }
+        technical_snapshot_result = build_stage_failure_result(
+            market_date=latest_trade_date,
+            source='pykrx',
+            error=exc,
+            totals={
+                'requested_symbols': len(symbols),
+                'snapshots_persisted': 0,
+                'snapshots_failed': len(symbols),
+            },
+            failed_symbols=[item.symbol for item in symbols],
+            items_key='items',
+        )
         snapshot_error_message = f'Technical snapshot persistence failed: {exc}'
         persist_stage_progress(
             stage='technical_snapshots',
@@ -392,30 +397,27 @@ def run_market_data_pipeline(
             symbols=[item.symbol for item in symbols],
             source='pykrx',
             run_id=run_id,
-            progress_callback=lambda progress: persist_stage_progress(
+            progress_callback=make_stage_progress_callback(
+                persist_stage_progress,
                 stage='action_summaries',
-                status=str(progress.get('status') or 'running'),
-                current_step=str(progress.get('current_step') or 'computing_action_summary'),
-                current_activity=str(progress.get('current_activity') or 'Computing daily action summaries'),
-                processed=progress.get('processed'),
-                total=progress.get('total'),
-                succeeded=progress.get('succeeded'),
-                failed=progress.get('failed'),
-                current_symbol=progress.get('current_symbol'),
-                extra=progress.get('details') if isinstance(progress.get('details'), dict) else None,
+                default_step='computing_action_summary',
+                default_activity='Computing daily action summaries',
+                include_current_symbol=True,
             ),
         )
     except Exception as exc:
-        action_summary_result = {
-            'market_date': latest_trade_date,
-            'source': 'pykrx',
-            'requested_symbols': len(symbols),
-            'action_summaries_persisted': 0,
-            'action_summaries_failed': len(symbols),
-            'failed_symbols': [item.symbol for item in symbols][:50],
-            'items': [],
-            'error': str(exc),
-        }
+        action_summary_result = build_stage_failure_result(
+            market_date=latest_trade_date,
+            source='pykrx',
+            error=exc,
+            totals={
+                'requested_symbols': len(symbols),
+                'action_summaries_persisted': 0,
+                'action_summaries_failed': len(symbols),
+            },
+            failed_symbols=[item.symbol for item in symbols],
+            items_key='items',
+        )
         action_summary_error_message = f'Action summary persistence failed: {exc}'
         persist_stage_progress(
             stage='action_summaries',
@@ -435,27 +437,24 @@ def run_market_data_pipeline(
             market_date=latest_trade_date,
             source='pykrx',
             run_id=run_id,
-            progress_callback=lambda progress: persist_stage_progress(
+            progress_callback=make_stage_progress_callback(
+                persist_stage_progress,
                 stage='trending_ranks',
-                status=str(progress.get('status') or 'running'),
-                current_step=str(progress.get('current_step') or 'computing_trending_period'),
-                current_activity=str(progress.get('current_activity') or 'Computing daily trending ranks'),
-                processed=progress.get('processed'),
-                total=progress.get('total'),
-                succeeded=progress.get('succeeded'),
-                failed=progress.get('failed'),
-                current_period=progress.get('current_period'),
-                extra=progress.get('details') if isinstance(progress.get('details'), dict) else None,
+                default_step='computing_trending_period',
+                default_activity='Computing daily trending ranks',
+                include_current_period=True,
             ),
         )
     except Exception as exc:
-        trending_rank_result = {
-            'market_date': latest_trade_date,
-            'source': 'pykrx',
-            'periods': [],
-            'trending_ranks_persisted': 0,
-            'error': str(exc),
-        }
+        trending_rank_result = build_stage_failure_result(
+            market_date=latest_trade_date,
+            source='pykrx',
+            error=exc,
+            totals={
+                'periods': [],
+                'trending_ranks_persisted': 0,
+            },
+        )
         trending_rank_error_message = f'Trending rank persistence failed: {exc}'
         persist_stage_progress(
             stage='trending_ranks',
@@ -502,18 +501,20 @@ def run_market_data_pipeline(
             },
         )
     except Exception as exc:
-        signal_feature_result = {
-            'market_date': latest_trade_date,
-            'source': 'kis_ranking',
-            'sources': [],
-            'source_counts': {},
-            'features_persisted': 0,
-            'features_failed': 0,
-            'failed_symbols': [],
-            'participation_context': {'error': str(exc)},
-            'items': [],
-            'error': str(exc),
-        }
+        signal_feature_result = build_stage_failure_result(
+            market_date=latest_trade_date,
+            source='kis_ranking',
+            error=exc,
+            totals={
+                'sources': [],
+                'source_counts': {},
+                'features_persisted': 0,
+                'features_failed': 0,
+            },
+            failed_symbols=[],
+            items_key='items',
+            extra={'participation_context': {'error': str(exc)}},
+        )
         signal_feature_error_message = f'Daily signal feature collection failed: {exc}'
         persist_stage_progress(
             stage='signal_features',
@@ -529,40 +530,36 @@ def run_market_data_pipeline(
     run_errors: list[str] = []
     if failed_symbols:
         run_errors.append(f'Failed symbols: {",".join(failed_symbols[:20])}')
-    if price_context_error_message:
-        run_errors.append(price_context_error_message)
-    else:
-        price_context_failed_symbols = [
-            symbol for symbol in price_context_result.get('failed_symbols', []) if symbol not in failed_symbol_set
-        ]
-        if price_context_failed_symbols:
-            run_errors.append(
-                'Price context persistence incomplete for symbols: '
-                + ','.join(price_context_failed_symbols[:20])
-            )
-    if snapshot_error_message:
-        run_errors.append(snapshot_error_message)
-    elif technical_snapshot_result.get('snapshots_failed'):
-        run_errors.append(
-            'Technical snapshot persistence incomplete for symbols: '
-            + ','.join(technical_snapshot_result.get('failed_symbols', [])[:20])
-        )
-    if action_summary_error_message:
-        run_errors.append(action_summary_error_message)
-    elif action_summary_result.get('action_summaries_failed'):
-        run_errors.append(
-            'Action summary persistence incomplete for symbols: '
-            + ','.join(action_summary_result.get('failed_symbols', [])[:20])
-        )
-    if trending_rank_error_message:
-        run_errors.append(trending_rank_error_message)
-    if signal_feature_error_message:
-        run_errors.append(signal_feature_error_message)
-    elif signal_feature_result.get('features_failed'):
-        run_errors.append(
-            'Daily signal feature persistence incomplete for symbols: '
-            + ','.join((signal_feature_result.get('failed_symbols') or [])[:20])
-        )
+    append_stage_error(
+        run_errors,
+        direct_error=price_context_error_message,
+        result=price_context_result,
+        failed_key='contexts_failed',
+        incomplete_prefix='Price context persistence incomplete for symbols: ',
+        exclude_symbols=failed_symbol_set,
+    )
+    append_stage_error(
+        run_errors,
+        direct_error=snapshot_error_message,
+        result=technical_snapshot_result,
+        failed_key='snapshots_failed',
+        incomplete_prefix='Technical snapshot persistence incomplete for symbols: ',
+    )
+    append_stage_error(
+        run_errors,
+        direct_error=action_summary_error_message,
+        result=action_summary_result,
+        failed_key='action_summaries_failed',
+        incomplete_prefix='Action summary persistence incomplete for symbols: ',
+    )
+    append_stage_error(run_errors, direct_error=trending_rank_error_message)
+    append_stage_error(
+        run_errors,
+        direct_error=signal_feature_error_message,
+        result=signal_feature_result,
+        failed_key='features_failed',
+        incomplete_prefix='Daily signal feature persistence incomplete for symbols: ',
+    )
 
     status = 'completed' if not run_errors else 'completed_with_errors'
     if failed_symbols:

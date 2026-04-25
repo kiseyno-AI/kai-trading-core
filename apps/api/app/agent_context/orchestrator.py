@@ -19,6 +19,8 @@ from sqlalchemy import select
 from app.agent_context.feedback_service import agent_context_feedback_service
 from app.agent_context.feedback_failure_service import agent_context_feedback_failure_service
 from app.agent_context.orchestrator_helpers import (
+    build_completed_dispatch_item as _build_completed_dispatch_item,
+    build_failed_dispatch_item as _build_failed_dispatch_item,
     build_response_storage_payload as _build_response_storage_payload,
     build_signal_decider_payload as _build_signal_decider_payload_helper,
     build_upstream_feedback_bundle as _build_upstream_feedback_bundle_helper,
@@ -31,14 +33,20 @@ from app.agent_context.orchestrator_helpers import (
     is_abortlike_error as _is_abortlike_error,
     normalize_requested_symbols as _normalize_requested_symbols,
     request_scope_from_items as _request_scope_from_items,
+    resolve_dispatch_status as _resolve_dispatch_status,
     slot_from_items as _slot_from_items,
     strip_runtime_session_fields as _strip_runtime_session_fields,
     subagent_test_session_key as _subagent_test_session_key,
     trim_batch_item_for_prompt as _trim_batch_item_for_prompt,
 )
 from app.agent_context.orchestrator_runtime_helpers import (
+    build_buffer_counts as _build_buffer_counts,
+    build_pending_failure_row as _build_pending_failure_row,
+    build_pending_feedback_row as _build_pending_feedback_row,
     dispatch_and_store as _dispatch_and_store_helper,
     dispatch_for_symbols_via_subagents as _dispatch_for_symbols_via_subagents_helper,
+    normalize_symbol_feedback as _normalize_symbol_feedback,
+    resolve_batch_dispatch_context as _resolve_batch_dispatch_context,
 )
 from app.agent_context.logging import (
     build_normalized_feedback_snapshot,
@@ -949,15 +957,14 @@ class AgentFeedbackOrchestrator:
                     'dependency_policy': 'record_failure_and_continue',
                     'missing_roles': missing_roles,
                 }
-                failure = {
-                    'role': role,
-                    'agent_name': role,
-                    'symbol': symbol,
-                    'status': 'failed',
-                    'retryable': True,
-                    'error': error,
-                    'context': dependency_context,
-                }
+                failure = _build_failed_dispatch_item(
+                    role=role,
+                    agent_name=role,
+                    symbol=symbol,
+                    error=error,
+                    retryable=True,
+                    context=dependency_context,
+                )
                 all_failures.append(failure)
                 buffer_failure(role, symbol, error, True, context=dependency_context)
                 log_agent_feedback_event(
@@ -1566,11 +1573,7 @@ class AgentFeedbackOrchestrator:
             symbol='__MARKET__',
         )
 
-        status = 'completed'
-        if failures and items:
-            status = 'partial'
-        elif failures and not items:
-            status = 'failed'
+        status = _resolve_dispatch_status(completed=len(items), failed=len(failures))
         return {
             'request': {
                 'eod_run_id': resolved_run_id,
@@ -1725,18 +1728,22 @@ class AgentFeedbackOrchestrator:
 
             def _update(current: RuntimeFeedbackRunState) -> None:
                 current.last_activity_at = datetime.now(timezone.utc)
-                stored_row = {
-                    'market_date': normalized_market_date,
-                    'symbol': symbol,
-                    'agent_name': role,
-                    'run_id': request_run_id,
-                    'summary': jsonable_encoder(response),
-                    'feedback': normalized_feedback if isinstance(normalized_feedback, dict) else {},
-                    'context': jsonable_encoder(context),
-                }
-                current.pending_feedback_rows.append(stored_row)
-            runtime_feedback_state_store.update_run(normalized_market_date, _update, run_id=request_run_id)
-            snapshot = runtime_feedback_state_store.get_run(normalized_market_date, run_id=request_run_id)
+                current.pending_feedback_rows.append(
+                    _build_pending_feedback_row(
+                        market_date=normalized_market_date,
+                        symbol=symbol,
+                        agent_name=role,
+                        run_id=request_run_id,
+                        response=response,
+                        context=context,
+                    )
+                )
+
+            snapshot = runtime_feedback_state_store.update_run(
+                normalized_market_date,
+                _update,
+                run_id=request_run_id,
+            )
             log_agent_feedback_event(
                 'feedback_buffered',
                 status='buffered',
@@ -1753,10 +1760,7 @@ class AgentFeedbackOrchestrator:
                 normalized_feedback_snapshot=build_normalized_feedback_snapshot(
                     normalized_feedback if isinstance(normalized_feedback, dict) else None
                 ),
-                buffered_feedback_count=len(snapshot.buffered_feedback_rows) if snapshot else None,
-                buffered_failure_count=len(snapshot.buffered_failures) if snapshot else None,
-                pending_feedback_count=len(snapshot.pending_feedback_rows) if snapshot else None,
-                pending_failure_count=len(snapshot.pending_failures) if snapshot else None,
+                **_build_buffer_counts(snapshot),
                 response_summary={
                     'collector_mode': response.get('collector_mode'),
                     'completed_at': response.get('completed_at'),
@@ -1779,25 +1783,27 @@ class AgentFeedbackOrchestrator:
         ) -> None:
             def _update(current: RuntimeFeedbackRunState) -> None:
                 current.last_activity_at = datetime.now(timezone.utc)
-                failure_row = {
-                    'role': role,
-                    'agent_name': agent_name or role,
-                    'symbol': symbol,
-                    'status': 'failed',
-                    'retryable': retryable,
-                    'error': error,
-                    'failure_kind': error,
-                    'dispatch_id': dispatch_id,
-                    'attempt_id': attempt_id,
-                    'slot': slot,
-                    'session_key': session_key,
-                    'batch_symbols': list(batch_symbols) if batch_symbols is not None else None,
-                    'context': jsonable_encoder(context) if isinstance(context, dict) else None,
-                }
-                current.pending_failures.append(failure_row)
+                current.pending_failures.append(
+                    _build_pending_failure_row(
+                        role=role,
+                        symbol=symbol,
+                        error=error,
+                        retryable=retryable,
+                        agent_name=agent_name,
+                        context=context,
+                        dispatch_id=dispatch_id,
+                        attempt_id=attempt_id,
+                        slot=slot,
+                        session_key=session_key,
+                        batch_symbols=batch_symbols,
+                    )
+                )
 
-            runtime_feedback_state_store.update_run(normalized_market_date, _update, run_id=request_run_id)
-            snapshot = runtime_feedback_state_store.get_run(normalized_market_date, run_id=request_run_id)
+            snapshot = runtime_feedback_state_store.update_run(
+                normalized_market_date,
+                _update,
+                run_id=request_run_id,
+            )
             log_agent_feedback_event(
                 'failure_buffered',
                 status='buffered',
@@ -1813,10 +1819,7 @@ class AgentFeedbackOrchestrator:
                 session_key=session_key,
                 error_message=error,
                 retryable=retryable,
-                buffered_feedback_count=len(snapshot.buffered_feedback_rows) if snapshot else None,
-                buffered_failure_count=len(snapshot.buffered_failures) if snapshot else None,
-                pending_feedback_count=len(snapshot.pending_feedback_rows) if snapshot else None,
-                pending_failure_count=len(snapshot.pending_failures) if snapshot else None,
+                **_build_buffer_counts(snapshot),
                 failure_context=context,
             )
 
@@ -2040,29 +2043,30 @@ class AgentFeedbackOrchestrator:
                                     response_symbols = sorted(by_symbol.keys())
                                     for source_item in batch:
                                         symbol = source_item['symbol']
-                                        dispatch_id = source_item.get('dispatch_id') or batch_result.get('dispatch_id')
-                                        attempt_id = batch_result.get('attempt_id')
-                                        batch_symbols = batch_result.get('batch_symbols') or [item['symbol'] for item in batch]
-                                        session_key = (
-                                            batch_result.get('session_ref', {}).get('session_key')
-                                            if isinstance(batch_result.get('session_ref'), dict)
-                                            else source_item.get('session_key')
+                                        dispatch_context = _resolve_batch_dispatch_context(
+                                            batch_result=batch_result,
+                                            source_item=source_item,
+                                            batch=batch,
+                                            slot=slot,
                                         )
+                                        dispatch_id = dispatch_context['dispatch_id']
+                                        attempt_id = dispatch_context['attempt_id']
+                                        batch_symbols = dispatch_context['batch_symbols']
+                                        session_key = dispatch_context['session_key']
                                         feedback_candidate = by_symbol.get(symbol, {}).get('feedback')
                                         if not feedback_candidate:
-                                            failure = {
-                                                'role': role,
-                                                'agent_name': spec.agent_name,
-                                                'symbol': symbol,
-                                                'status': 'failed',
-                                                'retryable': True,
-                                                'error': 'missing_batch_feedback',
-                                                'dispatch_id': dispatch_id,
-                                                'attempt_id': attempt_id,
-                                                'slot': slot,
-                                                'session_key': session_key,
-                                                'batch_symbols': batch_symbols,
-                                            }
+                                            failure = _build_failed_dispatch_item(
+                                                role=role,
+                                                agent_name=spec.agent_name,
+                                                symbol=symbol,
+                                                error='missing_batch_feedback',
+                                                retryable=True,
+                                                dispatch_id=dispatch_id,
+                                                attempt_id=attempt_id,
+                                                slot=slot,
+                                                session_key=session_key,
+                                                batch_symbols=batch_symbols,
+                                            )
                                             all_failures.append(failure)
                                             log_agent_feedback_event(
                                                 'normalized_response_rejected',
@@ -2096,13 +2100,13 @@ class AgentFeedbackOrchestrator:
                                             )
                                             staged_batch_outcomes = True
                                             continue
-                                        normalized_feedback = normalize_agent_response(
+                                        normalized_feedback = _normalize_symbol_feedback(
+                                            normalize_agent_response=normalize_agent_response,
                                             role=spec.role,
-                                            output_text=json.dumps(feedback_candidate, ensure_ascii=False),
-                                            raw_response=feedback_candidate if isinstance(feedback_candidate, dict) else {'feedback': feedback_candidate},
+                                            agent_name=spec.agent_name,
+                                            feedback_candidate=feedback_candidate,
                                             market_date=source_item.get('market_date') or normalized_market_date.isoformat(),
                                             symbol=symbol,
-                                            agent_name=spec.agent_name,
                                         )
                                         mismatch_flags = _extract_response_mismatch_flags(normalized_feedback)
                                         normalization_status = 'accepted_with_warnings' if mismatch_flags else 'accepted'
@@ -2152,32 +2156,35 @@ class AgentFeedbackOrchestrator:
                                         )
                                         buffer_success(spec.agent_name, symbol, source_item, response_payload_item)
                                         all_items.append(
-                                            {
-                                                'role': role,
-                                                'agent_name': spec.agent_name,
-                                                'symbol': symbol,
-                                                'status': 'completed',
-                                                'response': {'normalized_feedback': normalized_feedback},
-                                            }
+                                            _build_completed_dispatch_item(
+                                                role=role,
+                                                agent_name=spec.agent_name,
+                                                symbol=symbol,
+                                                normalized_feedback=normalized_feedback,
+                                            )
                                         )
                                     staged_batch_outcomes = True
                                 except Exception as exc:
                                     for source_item in batch:
-                                        dispatch_id = source_item.get('dispatch_id')
-                                        batch_symbols = [item['symbol'] for item in batch]
-                                        failure = {
-                                            'role': role,
-                                            'agent_name': spec.agent_name,
-                                            'symbol': source_item['symbol'],
-                                            'status': 'failed',
-                                            'retryable': True,
-                                            'error': f'{type(exc).__name__}: {exc}',
-                                            'dispatch_id': dispatch_id,
-                                            'attempt_id': None,
-                                            'slot': slot,
-                                            'session_key': source_item.get('session_key'),
-                                            'batch_symbols': batch_symbols,
-                                        }
+                                        dispatch_context = _resolve_batch_dispatch_context(
+                                            batch_result=None,
+                                            source_item=source_item,
+                                            batch=batch,
+                                            slot=slot,
+                                        )
+                                        dispatch_id = dispatch_context['dispatch_id']
+                                        batch_symbols = dispatch_context['batch_symbols']
+                                        failure = _build_failed_dispatch_item(
+                                            role=role,
+                                            agent_name=spec.agent_name,
+                                            symbol=source_item['symbol'],
+                                            error=f'{type(exc).__name__}: {exc}',
+                                            retryable=True,
+                                            dispatch_id=dispatch_id,
+                                            slot=slot,
+                                            session_key=dispatch_context['session_key'],
+                                            batch_symbols=batch_symbols,
+                                        )
                                         all_failures.append(failure)
                                         buffer_failure(
                                             role,
@@ -2188,7 +2195,7 @@ class AgentFeedbackOrchestrator:
                                             agent_name=spec.agent_name,
                                             dispatch_id=dispatch_id,
                                             slot=slot,
-                                            session_key=source_item.get('session_key'),
+                                            session_key=dispatch_context['session_key'],
                                             batch_symbols=batch_symbols,
                                         )
                                         log_agent_feedback_event(
@@ -2202,7 +2209,7 @@ class AgentFeedbackOrchestrator:
                                             symbol=source_item['symbol'],
                                             batch_symbols=batch_symbols,
                                             slot=slot,
-                                            session_key=source_item.get('session_key'),
+                                            session_key=dispatch_context['session_key'],
                                             error_type=type(exc).__name__,
                                             error_message=str(exc),
                                         )
@@ -2261,7 +2268,7 @@ class AgentFeedbackOrchestrator:
                 final_snapshot = runtime_feedback_state_store.get_run(normalized_market_date, run_id=request_run_id) or state
                 completed_count = len(final_snapshot.buffered_feedback_rows)
                 failed_count = len(final_snapshot.buffered_failures)
-                final_status = 'completed' if failed_count == 0 else ('partial' if completed_count > 0 else 'failed')
+                final_status = _resolve_dispatch_status(completed=completed_count, failed=failed_count)
                 response_payload = {
                     'request': request_payload,
                     'summary': {
@@ -2315,7 +2322,7 @@ class AgentFeedbackOrchestrator:
             if raised_exception is not None or finalization_error is not None:
                 final_status = 'partial' if (completed_count > 0 or failed_count > 0) else 'failed'
             elif dispatch_symbols:
-                final_status = 'completed' if failed_count == 0 else ('partial' if completed_count > 0 else 'failed')
+                final_status = _resolve_dispatch_status(completed=completed_count, failed=failed_count)
             else:
                 final_status = 'completed'
 
