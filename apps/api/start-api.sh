@@ -18,6 +18,15 @@ if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
   exit 1
 fi
 
+is_truthy() {
+  local value
+  value="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')"
+  case "$value" in
+    1|true|yes|on) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 NEEDS_BOOTSTRAP=0
 if ! "$PYTHON_BIN" - <<'PYCODE' >/dev/null 2>&1
 import fastapi, uvicorn, httpx, pydantic_settings, sqlalchemy, psycopg, alembic, pykrx
@@ -35,7 +44,7 @@ source .env
 set +a
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
 
-if [ "${DB_AUTO_UPGRADE:-true}" = "true" ]; then
+if is_truthy "${DB_AUTO_UPGRADE:-true}"; then
   "$PYTHON_BIN" -m app.internal.deploy_hygiene preflight --format text
 fi
 
