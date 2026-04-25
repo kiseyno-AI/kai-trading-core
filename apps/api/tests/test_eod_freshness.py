@@ -377,6 +377,74 @@ class EODFreshnessServiceTests(unittest.TestCase):
             },
         )
 
+    def test_latest_summary_prefers_daily_run_over_newer_historical_backfill_row(self):
+        historical_run = {
+            **_latest_run(
+                status='completed',
+                symbols_total=100,
+                symbols_succeeded=100,
+                symbols_failed=0,
+                started_at='2026-04-10T07:00:00+00:00',
+                completed_at='2026-04-10T08:00:00+00:00',
+                run_metadata={
+                    'mode': 'historical_backfill',
+                    'last_progress_at': '2026-04-10T07:59:00+00:00',
+                },
+            ),
+            'id': 500,
+            'trade_date': '2026-04-10',
+            'market': 'KRX',
+            'source': 'pykrx',
+            'trigger': 'manual_backfill_api',
+            'error_message': None,
+        }
+        daily_run = {
+            **_latest_run(
+                status='completed',
+                symbols_total=3,
+                symbols_succeeded=2,
+                symbols_failed=1,
+                started_at='2026-04-10T06:00:00+00:00',
+                completed_at='2026-04-10T06:45:00+00:00',
+                run_metadata={
+                    'mode': 'daily_auto',
+                    'last_progress_at': '2026-04-10T06:44:00+00:00',
+                },
+            ),
+            'id': 501,
+            'trade_date': '2026-04-10',
+            'market': 'KRX',
+            'source': 'pykrx',
+            'trigger': 'auto_close_scheduler',
+            'error_message': None,
+        }
+        service = EODFreshnessService(
+            market_state_loader=lambda: _FakeMarketState(),
+            latest_run_loader=lambda **_: historical_run,
+            latest_run_rows_loader=lambda **_: [historical_run, daily_run],
+            live_symbol_count_loader=lambda: 3,
+            daily_price_bar_count_loader=lambda _: 2,
+            daily_technical_snapshot_count_loader=lambda _: 0,
+            daily_action_summary_count_loader=lambda _: 0,
+            daily_fundamentals_count_loader=lambda _: {'symbols_succeeded': 0, 'symbols_failed': 0, 'symbols_total': 0},
+            fundamentals_today_refresh_loader=lambda _: None,
+            latest_fundamentals_refresh_loader=lambda: None,
+            latest_price_trade_date_loader=lambda: '2026-04-10',
+            latest_price_bar_count_loader=lambda _: 2,
+            latest_technical_market_date_loader=lambda: None,
+            latest_action_market_date_loader=lambda: None,
+        )
+
+        result = service.read()
+
+        self.assertEqual(result['today']['price']['symbols_total'], 3)
+        self.assertEqual(result['latest']['trade_date'], '2026-04-10')
+        self.assertEqual(result['latest']['updated_at'], '2026-04-10T06:44:00+00:00')
+        self.assertEqual(result['latest']['symbols_total'], 3)
+        self.assertEqual(result['latest']['symbols_succeeded'], 2)
+        self.assertEqual(result['latest']['symbols_failed'], 1)
+        self.assertEqual(result['latest']['summary']['basis'], 'latest_eod_run_symbol_universe')
+
     def test_latest_summary_exposes_healthy_run_counts_and_timestamp(self):
         service = EODFreshnessService(
             market_state_loader=lambda: _FakeMarketState(),

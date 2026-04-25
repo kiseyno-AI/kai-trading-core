@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable
+from typing import Any, Callable
 
 from app.eod.freshness_repository import (
     LATEST_AVAILABLE_FUNDAMENTALS_RUN_STATUSES,
@@ -23,7 +23,18 @@ from app.market_data_store import (
     load_latest_available_daily_technical_snapshot_date,
     load_latest_eod_collection_run,
 )
-from app.repositories.eod_run_repository import load_most_complete_eod_collection_run
+from app.eod.run_stage_support import (
+    build_stage_counts,
+    extract_fundamentals_refresh_metrics,
+    extract_run_stage_counts,
+    normalize_run_status,
+    resolve_run_updated_at,
+    select_preferred_eod_run,
+)
+from app.repositories.eod_run_repository import (
+    list_eod_collection_runs,
+    load_most_complete_eod_collection_run,
+)
 
 DEFAULT_FRESHNESS_FALLBACK_STATUSES = (
     'completed',
@@ -33,20 +44,24 @@ DEFAULT_FRESHNESS_FALLBACK_STATUSES = (
 )
 
 
-def _normalize_fundamentals_refresh_status(value: str | None) -> str | None:
-    if not value:
-        return None
-    if value == 'completed_with_errors':
-        return 'partial'
-    if value == 'skipped':
-        return 'pending'
-    return value
+def _load_freshness_run_rows(
+    *,
+    trade_date: str,
+    statuses: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    return list_eod_collection_runs(
+        market='KRX',
+        trade_date=trade_date,
+        statuses=statuses,
+        limit=10,
+    )
 
 
 @dataclass
 class EODFreshnessService:
     market_state_loader: Callable = get_market_state
     latest_run_loader: Callable = load_latest_eod_collection_run
+    latest_run_rows_loader: Callable | None = None
     live_symbol_count_loader: Callable = count_live_symbols
     daily_price_bar_count_loader: Callable = count_daily_price_bars_for_live_symbols
     daily_technical_snapshot_count_loader: Callable = count_daily_technical_snapshots_for_live_symbols
@@ -148,13 +163,23 @@ class EODFreshnessService:
         trade_date: str,
         statuses: list[str] | None = None,
     ) -> dict | None:
-        candidate = self.latest_run_loader(market='KRX', trade_date=trade_date, statuses=statuses)
+        candidate = (
+            select_preferred_eod_run(
+                self.latest_run_rows_loader(trade_date=trade_date, statuses=statuses)
+            )
+            if self.latest_run_rows_loader is not None
+            else self.latest_run_loader(market='KRX', trade_date=trade_date, statuses=statuses)
+        )
         if not candidate:
             return None
-        candidate_total = int(candidate.get('symbols_total') or 0)
-        candidate_succeeded = int(candidate.get('symbols_succeeded') or 0)
+        candidate_counts = extract_run_stage_counts(candidate)
         latest_bar_count = int(self.latest_price_bar_count_loader(trade_date) or 0)
-        if latest_bar_count > 0 and candidate_total > 0 and candidate_total < latest_bar_count and candidate_succeeded == 0:
+        if (
+            latest_bar_count > 0
+            and candidate_counts.total > 0
+            and candidate_counts.total < latest_bar_count
+            and candidate_counts.succeeded == 0
+        ):
             fallback = self.best_run_loader(
                 market='KRX',
                 trade_date=trade_date,
@@ -170,28 +195,33 @@ class EODFreshnessService:
         symbols_total: int,
         symbols_succeeded: int,
     ) -> dict:
+        counts = build_stage_counts(
+            total=symbols_total,
+            succeeded=symbols_succeeded,
+            failed=max(symbols_total - symbols_succeeded, 0) if symbols_succeeded > 0 else 0,
+        )
         if symbols_succeeded > 0:
             status = 'ready'
-            symbols_failed = max(symbols_total - symbols_succeeded, 0)
         else:
             status = 'missing'
-            symbols_failed = 0
 
         return {
             'status': status,
-            'symbols_total': symbols_total,
-            'symbols_succeeded': symbols_succeeded,
-            'symbols_failed': symbols_failed,
+            'symbols_total': counts.total,
+            'symbols_succeeded': counts.succeeded,
+            'symbols_failed': counts.failed,
         }
 
     def _build_fundamentals_stage(self, *, counts: dict[str, int], current_run: dict | None) -> dict:
-        symbols_succeeded = int(counts.get('symbols_succeeded') or 0)
-        symbols_failed = int(counts.get('symbols_failed') or 0)
-        symbols_total = int(counts.get('symbols_total') or 0)
+        stage_counts = build_stage_counts(
+            total=counts.get('symbols_total'),
+            succeeded=counts.get('symbols_succeeded'),
+            failed=counts.get('symbols_failed'),
+        )
 
-        if current_run and _normalize_fundamentals_refresh_status(str(current_run.get('status') or '')) == 'running':
+        if current_run and normalize_run_status(str(current_run.get('status') or '')) == 'running':
             status = 'running'
-        elif symbols_succeeded > 0:
+        elif stage_counts.succeeded > 0:
             status = 'ready'
         else:
             status = 'missing'
@@ -199,9 +229,9 @@ class EODFreshnessService:
         return {
             'status': status,
             'basis': 'same_day_snapshot_updates',
-            'symbols_total': symbols_total,
-            'symbols_succeeded': symbols_succeeded,
-            'symbols_failed': symbols_failed,
+            'symbols_total': stage_counts.total,
+            'symbols_succeeded': stage_counts.succeeded,
+            'symbols_failed': stage_counts.failed,
             'current_run': self._build_fundamentals_refresh_summary(
                 current_run,
                 basis='market_date_refresh_run',
@@ -236,31 +266,26 @@ class EODFreshnessService:
                 'error_message': None,
             }
 
-        metadata = run.get('run_metadata') if isinstance(run.get('run_metadata'), dict) else {}
-        symbols_total = int(metadata.get('symbols_selected') or run.get('symbols_total') or 0)
-        symbols_checked = int(run.get('symbols_checked') or 0)
-        symbols_fresh = int(run.get('symbols_fresh') or 0)
-        symbols_refreshed = int(run.get('symbols_refreshed') or 0)
-        symbols_failed = int(run.get('symbols_failed') or 0)
+        metrics = extract_fundamentals_refresh_metrics(run)
 
         return {
             'basis': basis,
             'market_date': run.get('market_date'),
-            'status': _normalize_fundamentals_refresh_status(str(run.get('status') or '')),
+            'status': normalize_run_status(str(run.get('status') or '')),
             'fs_div': run.get('fs_div'),
             'trigger': run.get('trigger'),
-            'updated_at': self._resolve_latest_run_updated_at(run),
+            'updated_at': resolve_run_updated_at(run),
             'completed_at': run.get('completed_at'),
-            'symbols_total': symbols_total,
-            'symbols_checked': symbols_checked,
-            'symbols_succeeded': symbols_fresh + symbols_refreshed,
-            'symbols_fresh': symbols_fresh,
-            'symbols_refreshed': symbols_refreshed,
-            'symbols_failed': symbols_failed,
-            'symbols_remaining': max(symbols_total - symbols_checked, 0),
-            'events_detected': int(run.get('events_detected') or 0),
-            'events_captured': int(run.get('events_captured') or 0),
-            'events_failed': int(run.get('events_failed') or 0),
+            'symbols_total': metrics.total,
+            'symbols_checked': metrics.processed,
+            'symbols_succeeded': metrics.succeeded,
+            'symbols_fresh': metrics.fresh,
+            'symbols_refreshed': metrics.refreshed,
+            'symbols_failed': metrics.failed,
+            'symbols_remaining': metrics.remaining,
+            'events_detected': metrics.events_detected,
+            'events_captured': metrics.events_captured,
+            'events_failed': metrics.events_failed,
             'error_message': run.get('error_message'),
         }
 
@@ -275,21 +300,27 @@ class EODFreshnessService:
         # When an EOD run row exists, its symbol universe is the summary basis because
         # that best answers whether the latest EOD patch completed for that run.
         if latest_run:
+            latest_counts = extract_run_stage_counts(latest_run)
             return {
                 'basis': 'latest_eod_run_symbol_universe',
-                'updated_at': self._resolve_latest_run_updated_at(latest_run),
-                'succeeded': int(latest_run.get('symbols_succeeded') or 0),
-                'failed': int(latest_run.get('symbols_failed') or 0),
-                'total': int(latest_run.get('symbols_total') or 0),
+                'updated_at': resolve_run_updated_at(latest_run),
+                'succeeded': latest_counts.succeeded,
+                'failed': latest_counts.failed,
+                'total': latest_counts.total,
             }
 
         if trade_date and price_bar_count > 0:
+            latest_counts = build_stage_counts(
+                total=price_bar_count,
+                succeeded=price_bar_count,
+                failed=0,
+            )
             return {
                 'basis': 'stored_price_bars_for_latest_trade_date',
                 'updated_at': self.latest_price_bar_updated_at_loader(trade_date),
-                'succeeded': int(price_bar_count),
-                'failed': 0,
-                'total': int(price_bar_count),
+                'succeeded': latest_counts.succeeded,
+                'failed': latest_counts.failed,
+                'total': latest_counts.total,
             }
 
         return {
@@ -301,25 +332,20 @@ class EODFreshnessService:
         }
 
     @staticmethod
-    def _resolve_latest_run_updated_at(latest_run: dict) -> str | None:
-        metadata = latest_run.get('run_metadata') if isinstance(latest_run.get('run_metadata'), dict) else {}
-        return metadata.get('last_progress_at') or latest_run.get('completed_at') or latest_run.get('started_at')
-
-    @staticmethod
     def _resolve_eod_status(*, latest_run: dict | None, price_bar_count: int) -> str:
         if latest_run:
             status = latest_run.get('status')
+            latest_counts = extract_run_stage_counts(latest_run)
             if status == 'running':
                 return 'running'
             if status == 'completed_with_errors':
                 return 'completed_with_errors'
             if status == 'completed':
-                return 'completed_with_errors' if (latest_run.get('symbols_failed') or 0) > 0 else 'completed'
+                return 'completed_with_errors' if latest_counts.failed > 0 else 'completed'
             if status == 'failed':
                 return 'completed_with_errors' if price_bar_count > 0 else 'missing'
         if price_bar_count > 0:
             return 'completed'
         return 'missing'
 
-
-eod_freshness_service = EODFreshnessService()
+eod_freshness_service = EODFreshnessService(latest_run_rows_loader=_load_freshness_run_rows)
