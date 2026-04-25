@@ -540,6 +540,12 @@ class FundamentalsRefreshRegressionPackTests(unittest.TestCase):
         self.fs_div = settings.dart_fundamentals_default_fs_div.strip().upper()
         self.trigger = 'test_issue_189_regression_pack'
 
+    def _alternate_fs_div(self) -> str:
+        for candidate in ('CFS', 'OFS'):
+            if candidate != self.fs_div:
+                return candidate
+        return f'{self.fs_div}_ALT'
+
     def tearDown(self):
         if not self.created_refresh_run_ids:
             return
@@ -658,7 +664,7 @@ class FundamentalsRefreshRegressionPackTests(unittest.TestCase):
         self._create_refresh_run(
             market_date=date(2199, 12, 31),
             status='completed',
-            fs_div='OFS',
+            fs_div=self._alternate_fs_div(),
             started_at=datetime(2199, 12, 31, 7, 0, tzinfo=timezone.utc),
             completed_at=datetime(2199, 12, 31, 7, 30, tzinfo=timezone.utc),
             last_progress_at='2199-12-31T07:29:00+00:00',
