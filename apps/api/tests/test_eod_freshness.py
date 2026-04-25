@@ -1,7 +1,5 @@
 import unittest
-from contextlib import contextmanager
 from datetime import date, datetime, timezone
-from types import SimpleNamespace
 
 from sqlalchemy import delete, select
 
@@ -319,44 +317,6 @@ class EODFreshnessServiceTests(unittest.TestCase):
         self.assertEqual(requested_latest_count_dates, ['2026-04-10'])
 
     def test_latest_summary_uses_same_fallback_run_selection_logic_as_today(self):
-        fallback_row = SimpleNamespace(
-            id=99,
-            market='KRX',
-            trade_date=date(2026, 4, 10),
-            source='pykrx',
-            trigger='manual_daily_api',
-            status='completed',
-            symbols_total=5,
-            symbols_succeeded=4,
-            symbols_failed=1,
-            error_message=None,
-            started_at=datetime(2026, 4, 10, 6, 0, tzinfo=timezone.utc),
-            completed_at=datetime(2026, 4, 10, 6, 45, tzinfo=timezone.utc),
-            run_metadata={'last_progress_at': '2026-04-10T06:44:00+00:00'},
-        )
-
-        class _FakeScalarResult:
-            def __init__(self, row):
-                self._row = row
-
-            def first(self):
-                return self._row
-
-        class _FakeExecuteResult:
-            def __init__(self, row):
-                self._row = row
-
-            def scalars(self):
-                return _FakeScalarResult(self._row)
-
-        class _FakeFallbackSession:
-            def execute(self, _statement):
-                return _FakeExecuteResult(fallback_row)
-
-        @contextmanager
-        def fake_session_scope():
-            yield _FakeFallbackSession()
-
         def latest_run_loader(**_kwargs):
             return _latest_run(
                 status='completed',
@@ -380,10 +340,24 @@ class EODFreshnessServiceTests(unittest.TestCase):
             latest_price_bar_count_loader=lambda _: 5,
             latest_technical_market_date_loader=lambda: None,
             latest_action_market_date_loader=lambda: None,
+            best_run_loader=lambda **_: {
+                'id': 99,
+                'market': 'KRX',
+                'trade_date': '2026-04-10',
+                'source': 'pykrx',
+                'trigger': 'manual_daily_api',
+                'status': 'completed',
+                'symbols_total': 5,
+                'symbols_succeeded': 4,
+                'symbols_failed': 1,
+                'error_message': None,
+                'started_at': datetime(2026, 4, 10, 6, 0, tzinfo=timezone.utc).isoformat(),
+                'completed_at': datetime(2026, 4, 10, 6, 45, tzinfo=timezone.utc).isoformat(),
+                'run_metadata': {'last_progress_at': '2026-04-10T06:44:00+00:00'},
+            },
         )
 
-        with unittest.mock.patch.object(freshness_module, 'session_scope', fake_session_scope):
-            result = service.read()
+        result = service.read()
 
         self.assertEqual(result['today']['price']['symbols_total'], 5)
         self.assertEqual(result['today']['price']['symbols_succeeded'], 4)
