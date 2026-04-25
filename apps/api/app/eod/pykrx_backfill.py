@@ -17,6 +17,10 @@ from app.agent_context.derived_contexts import daily_price_context_service
 from app.core.audit_logging import log_fetch_event
 from app.core.settings import settings
 from app.eod.master import get_master_symbols
+from app.eod.pykrx_pipeline_support import (
+    build_daily_retry_context,
+    build_daily_skip_result,
+)
 from app.dart.fundamentals_capture_service import dart_fundamentals_capture_service
 from app.eod.action_summaries import daily_action_summary_service
 from app.eod.pykrx_pipeline_runner import PykrxPipelineDependencies, run_market_data_pipeline
@@ -574,25 +578,21 @@ class PykrxBackfillService:
         latest_trade_date = self.resolve_latest_trade_date(end_date=normalized_market_date)
 
         if latest_trade_date != market_date_iso:
-            result = {
-                'triggered': False,
-                'reason': 'trade_date_not_available_yet',
-                'market_date': market_date_iso,
-                'latest_available_trade_date': latest_trade_date,
-                'source': 'pykrx',
-            }
+            result = build_daily_skip_result(
+                reason='trade_date_not_available_yet',
+                market_date=market_date_iso,
+                latest_available_trade_date=latest_trade_date,
+            )
             _log_pykrx_fetch('run_daily_pipeline_if_due', 'skipped', **result)
             return result
 
         with advisory_eod_collection_lock(market='KRX', trade_date=market_date_iso, source='pykrx') as lock_acquired:
             if not lock_acquired:
-                result = {
-                    'triggered': False,
-                    'reason': 'already_running',
-                    'market_date': market_date_iso,
-                    'latest_available_trade_date': latest_trade_date,
-                    'source': 'pykrx',
-                }
+                result = build_daily_skip_result(
+                    reason='already_running',
+                    market_date=market_date_iso,
+                    latest_available_trade_date=latest_trade_date,
+                )
                 _log_pykrx_fetch('run_daily_pipeline_if_due', 'skipped', **result)
                 return result
 
@@ -607,14 +607,12 @@ class PykrxBackfillService:
                     latest_run=latest_run,
                 )
             if latest_run and latest_run['status'] == 'running' and not force:
-                result = {
-                    'triggered': False,
-                    'reason': 'already_running',
-                    'market_date': market_date_iso,
-                    'latest_available_trade_date': latest_trade_date,
-                    'source': 'pykrx',
-                    'existing_run': latest_run,
-                }
+                result = build_daily_skip_result(
+                    reason='already_running',
+                    market_date=market_date_iso,
+                    latest_available_trade_date=latest_trade_date,
+                    existing_run=latest_run,
+                )
                 _log_pykrx_fetch('run_daily_pipeline_if_due', 'skipped', **result)
                 return result
             symbols_override: list[PykrxSymbol] | None = None
@@ -623,25 +621,21 @@ class PykrxBackfillService:
                 latest_status = latest_run.get('status')
                 latest_failed = int(latest_run.get('symbols_failed') or 0)
                 if latest_status == 'completed' and latest_failed == 0:
-                    result = {
-                        'triggered': False,
-                        'reason': 'already_completed',
-                        'market_date': market_date_iso,
-                        'latest_available_trade_date': latest_trade_date,
-                        'source': 'pykrx',
-                        'existing_run': latest_run,
-                    }
+                    result = build_daily_skip_result(
+                        reason='already_completed',
+                        market_date=market_date_iso,
+                        latest_available_trade_date=latest_trade_date,
+                        existing_run=latest_run,
+                    )
                     _log_pykrx_fetch('run_daily_pipeline_if_due', 'skipped', **result)
                     return result
                 if latest_status == 'completed_with_errors' and latest_failed == 0:
-                    result = {
-                        'triggered': False,
-                        'reason': 'already_completed_with_errors',
-                        'market_date': market_date_iso,
-                        'latest_available_trade_date': latest_trade_date,
-                        'source': 'pykrx',
-                        'existing_run': latest_run,
-                    }
+                    result = build_daily_skip_result(
+                        reason='already_completed_with_errors',
+                        market_date=market_date_iso,
+                        latest_available_trade_date=latest_trade_date,
+                        existing_run=latest_run,
+                    )
                     _log_pykrx_fetch('run_daily_pipeline_if_due', 'skipped', **result)
                     return result
                 if _is_auto_daily_trigger(trigger) and self._is_retryable_daily_run(latest_run):
@@ -652,44 +646,38 @@ class PykrxBackfillService:
                         trigger_prefix='auto_',
                     )
                     if automatic_run_count >= MAX_AUTO_PYKRX_DAILY_RUNS_PER_TRADE_DATE:
-                        result = {
-                            'triggered': False,
-                            'reason': 'auto_retry_limit_reached',
-                            'market_date': market_date_iso,
-                            'latest_available_trade_date': latest_trade_date,
-                            'source': 'pykrx',
-                            'existing_run': latest_run,
-                            'auto_retry': {
+                        result = build_daily_skip_result(
+                            reason='auto_retry_limit_reached',
+                            market_date=market_date_iso,
+                            latest_available_trade_date=latest_trade_date,
+                            existing_run=latest_run,
+                            auto_retry={
                                 'attempts': automatic_run_count,
                                 'max_attempts': MAX_AUTO_PYKRX_DAILY_RUNS_PER_TRADE_DATE,
                             },
-                        }
+                        )
                         _log_pykrx_fetch('run_daily_pipeline_if_due', 'skipped', **result)
                         return result
                     symbols_override = self._load_retry_symbols_for_run(latest_run, markets=markets)
                     if not symbols_override:
-                        result = {
-                            'triggered': False,
-                            'reason': 'no_failed_symbols_to_retry',
-                            'market_date': market_date_iso,
-                            'latest_available_trade_date': latest_trade_date,
-                            'source': 'pykrx',
-                            'existing_run': latest_run,
-                            'auto_retry': {
+                        result = build_daily_skip_result(
+                            reason='no_failed_symbols_to_retry',
+                            market_date=market_date_iso,
+                            latest_available_trade_date=latest_trade_date,
+                            existing_run=latest_run,
+                            auto_retry={
                                 'attempts': automatic_run_count,
                                 'max_attempts': MAX_AUTO_PYKRX_DAILY_RUNS_PER_TRADE_DATE,
                             },
-                        }
+                        )
                         _log_pykrx_fetch('run_daily_pipeline_if_due', 'skipped', **result)
                         return result
-                    retry_context = {
-                        'retry_of_run_id': latest_run.get('id'),
-                        'previous_status': latest_status,
-                        'previous_symbols_failed': latest_failed,
-                        'attempt': automatic_run_count + 1,
-                        'max_attempts': MAX_AUTO_PYKRX_DAILY_RUNS_PER_TRADE_DATE,
-                        'symbol_count': len(symbols_override),
-                    }
+                    retry_context = build_daily_retry_context(
+                        latest_run,
+                        attempt=automatic_run_count + 1,
+                        max_attempts=MAX_AUTO_PYKRX_DAILY_RUNS_PER_TRADE_DATE,
+                        symbol_count=len(symbols_override),
+                    )
 
             result = self._run_market_data_pipeline(
                 start_date=normalized_market_date,

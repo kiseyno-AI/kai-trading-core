@@ -114,6 +114,74 @@ def failure_log_fields(failure: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def build_completed_dispatch_item(
+    *,
+    role: str,
+    agent_name: str,
+    symbol: str,
+    normalized_feedback: dict[str, Any],
+    storage: dict[str, Any] | None = None,
+    session_ref: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    item = {
+        'role': role,
+        'agent_name': agent_name,
+        'symbol': symbol,
+        'status': 'completed',
+        'response': {'normalized_feedback': normalized_feedback},
+    }
+    if storage is not None:
+        item['storage'] = storage
+    if session_ref is not None:
+        item['session_ref'] = session_ref
+    return item
+
+
+def build_failed_dispatch_item(
+    *,
+    role: str,
+    agent_name: str,
+    symbol: str,
+    error: str,
+    retryable: bool,
+    context: dict[str, Any] | None = None,
+    dispatch_id: str | None = None,
+    attempt_id: str | None = None,
+    slot: int | None = None,
+    session_key: str | None = None,
+    batch_symbols: Sequence[str] | None = None,
+) -> dict[str, Any]:
+    item = {
+        'role': role,
+        'agent_name': agent_name,
+        'symbol': symbol,
+        'status': 'failed',
+        'retryable': retryable,
+        'error': error,
+    }
+    if context is not None:
+        item['context'] = context
+    if dispatch_id is not None:
+        item['dispatch_id'] = dispatch_id
+    if attempt_id is not None:
+        item['attempt_id'] = attempt_id
+    if slot is not None:
+        item['slot'] = slot
+    if session_key is not None:
+        item['session_key'] = session_key
+    if batch_symbols is not None:
+        item['batch_symbols'] = list(batch_symbols)
+    return item
+
+
+def resolve_dispatch_status(*, completed: int, failed: int) -> str:
+    if failed and completed:
+        return 'partial'
+    if failed:
+        return 'failed'
+    return 'completed'
+
+
 def build_response_storage_payload(
     *,
     spec,
