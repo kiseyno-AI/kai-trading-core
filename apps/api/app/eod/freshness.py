@@ -1,13 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
-from typing import Any, Callable
+from typing import Callable
 
-from sqlalchemy import select
-
-from app.db import session_scope
-from app.db_models import EODCollectionRun
 from app.eod.freshness_repository import (
     LATEST_AVAILABLE_FUNDAMENTALS_RUN_STATUSES,
     _load_daily_fundamentals_stage_counts,
@@ -28,6 +23,15 @@ from app.market_data_store import (
     load_latest_available_daily_technical_snapshot_date,
     load_latest_eod_collection_run,
 )
+from app.repositories.eod_run_repository import load_most_complete_eod_collection_run
+
+DEFAULT_FRESHNESS_FALLBACK_STATUSES = (
+    'completed',
+    'completed_with_errors',
+    'failed',
+    'running',
+)
+
 
 def _normalize_fundamentals_refresh_status(value: str | None) -> str | None:
     if not value:
@@ -55,6 +59,7 @@ class EODFreshnessService:
     latest_price_bar_updated_at_loader: Callable = _load_latest_price_bar_updated_at
     latest_technical_market_date_loader: Callable = load_latest_available_daily_technical_snapshot_date
     latest_action_market_date_loader: Callable = load_latest_available_daily_action_summary_date
+    best_run_loader: Callable = load_most_complete_eod_collection_run
 
     def read(self) -> dict:
         trade_date = self.market_state_loader().server_time[:10]
@@ -150,32 +155,13 @@ class EODFreshnessService:
         candidate_succeeded = int(candidate.get('symbols_succeeded') or 0)
         latest_bar_count = int(self.latest_price_bar_count_loader(trade_date) or 0)
         if latest_bar_count > 0 and candidate_total > 0 and candidate_total < latest_bar_count and candidate_succeeded == 0:
-            with session_scope() as session:
-                fallback_row = session.execute(
-                    select(EODCollectionRun)
-                    .where(EODCollectionRun.market == 'KRX')
-                    .where(EODCollectionRun.trade_date == date.fromisoformat(trade_date))
-                    .where(EODCollectionRun.status.in_(statuses or ['completed', 'completed_with_errors', 'failed', 'running']))
-                    .where(EODCollectionRun.symbols_succeeded > 0)
-                    .order_by(EODCollectionRun.symbols_succeeded.desc(), EODCollectionRun.symbols_total.desc(), EODCollectionRun.started_at.desc(), EODCollectionRun.id.desc())
-                    .limit(1)
-                ).scalars().first()
-                if fallback_row is not None:
-                    return {
-                        'id': fallback_row.id,
-                        'market': fallback_row.market,
-                        'trade_date': fallback_row.trade_date.isoformat(),
-                        'source': fallback_row.source,
-                        'trigger': fallback_row.trigger,
-                        'status': fallback_row.status,
-                        'symbols_total': fallback_row.symbols_total,
-                        'symbols_succeeded': fallback_row.symbols_succeeded,
-                        'symbols_failed': fallback_row.symbols_failed,
-                        'error_message': fallback_row.error_message,
-                        'started_at': fallback_row.started_at.isoformat() if fallback_row.started_at else None,
-                        'completed_at': fallback_row.completed_at.isoformat() if fallback_row.completed_at else None,
-                        'run_metadata': fallback_row.run_metadata,
-                    }
+            fallback = self.best_run_loader(
+                market='KRX',
+                trade_date=trade_date,
+                statuses=statuses or DEFAULT_FRESHNESS_FALLBACK_STATUSES,
+            )
+            if fallback is not None:
+                return fallback
         return candidate
 
     @staticmethod

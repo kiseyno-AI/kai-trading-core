@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from datetime import date, datetime, timezone
-from typing import Any
+from typing import Any, Sequence
 
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -378,6 +378,7 @@ class DartFundamentalsRepository:
         *,
         market_date: date | None = None,
         fs_div: str | None = None,
+        statuses: Sequence[str] | None = None,
     ) -> dict[str, Any] | None:
         with session_scope() as session:
             stmt = select(DartFundamentalsRefreshRun)
@@ -385,6 +386,8 @@ class DartFundamentalsRepository:
                 stmt = stmt.where(DartFundamentalsRefreshRun.market_date == market_date)
             if fs_div is not None:
                 stmt = stmt.where(DartFundamentalsRefreshRun.fs_div == fs_div)
+            if statuses:
+                stmt = stmt.where(DartFundamentalsRefreshRun.status.in_(statuses))
             row = session.execute(
                 stmt.order_by(DartFundamentalsRefreshRun.started_at.desc(), DartFundamentalsRefreshRun.id.desc())
                 .limit(1)

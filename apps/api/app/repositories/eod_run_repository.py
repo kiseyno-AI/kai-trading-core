@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from datetime import date, datetime
+from typing import Any, Sequence
 
 from sqlalchemy import func, select, text
 
@@ -17,6 +18,24 @@ def _normalize_trade_date(value: str | date) -> date:
     if isinstance(value, date):
         return value
     return _parse_trade_date(value)
+
+
+def _serialize_eod_collection_run(row: EODCollectionRun) -> dict[str, Any]:
+    return {
+        'id': row.id,
+        'market': row.market,
+        'trade_date': row.trade_date.isoformat(),
+        'source': row.source,
+        'trigger': row.trigger,
+        'status': row.status,
+        'symbols_total': row.symbols_total,
+        'symbols_succeeded': row.symbols_succeeded,
+        'symbols_failed': row.symbols_failed,
+        'error_message': row.error_message,
+        'started_at': row.started_at.isoformat() if row.started_at else None,
+        'completed_at': row.completed_at.isoformat() if row.completed_at else None,
+        'run_metadata': row.run_metadata,
+    }
 
 
 def create_eod_collection_run(
@@ -48,8 +67,28 @@ def load_latest_eod_collection_run(
     market: str,
     trade_date: str,
     source: str | None = None,
-    statuses: list[str] | None = None,
+    statuses: Sequence[str] | None = None,
 ) -> dict | None:
+    rows = list_eod_collection_runs(
+        market=market,
+        trade_date=trade_date,
+        source=source,
+        statuses=statuses,
+        limit=1,
+    )
+    if not rows:
+        return None
+    return rows[0]
+
+
+def list_eod_collection_runs(
+    *,
+    market: str,
+    trade_date: str,
+    source: str | None = None,
+    statuses: Sequence[str] | None = None,
+    limit: int = 10,
+) -> list[dict[str, Any]]:
     with session_scope() as session:
         stmt = select(EODCollectionRun).where(
             EODCollectionRun.market == market,
@@ -59,25 +98,42 @@ def load_latest_eod_collection_run(
             stmt = stmt.where(EODCollectionRun.source == source)
         if statuses:
             stmt = stmt.where(EODCollectionRun.status.in_(statuses))
-        stmt = stmt.order_by(EODCollectionRun.started_at.desc(), EODCollectionRun.id.desc()).limit(1)
-        row = session.execute(stmt).scalars().first()
+        rows = session.execute(
+            stmt.order_by(EODCollectionRun.started_at.desc(), EODCollectionRun.id.desc()).limit(limit)
+        ).scalars()
+        return [_serialize_eod_collection_run(row) for row in rows]
+
+
+def load_most_complete_eod_collection_run(
+    *,
+    market: str,
+    trade_date: str,
+    source: str | None = None,
+    statuses: Sequence[str] | None = None,
+    min_symbols_succeeded: int = 1,
+) -> dict[str, Any] | None:
+    with session_scope() as session:
+        stmt = (
+            select(EODCollectionRun)
+            .where(EODCollectionRun.market == market)
+            .where(EODCollectionRun.trade_date == _parse_trade_date(trade_date))
+            .where(EODCollectionRun.symbols_succeeded >= min_symbols_succeeded)
+        )
+        if source:
+            stmt = stmt.where(EODCollectionRun.source == source)
+        if statuses:
+            stmt = stmt.where(EODCollectionRun.status.in_(statuses))
+        row = session.execute(
+            stmt.order_by(
+                EODCollectionRun.symbols_succeeded.desc(),
+                EODCollectionRun.symbols_total.desc(),
+                EODCollectionRun.started_at.desc(),
+                EODCollectionRun.id.desc(),
+            ).limit(1)
+        ).scalar_one_or_none()
         if row is None:
             return None
-        return {
-            'id': row.id,
-            'market': row.market,
-            'trade_date': row.trade_date.isoformat(),
-            'source': row.source,
-            'trigger': row.trigger,
-            'status': row.status,
-            'symbols_total': row.symbols_total,
-            'symbols_succeeded': row.symbols_succeeded,
-            'symbols_failed': row.symbols_failed,
-            'error_message': row.error_message,
-            'started_at': row.started_at.isoformat() if row.started_at else None,
-            'completed_at': row.completed_at.isoformat() if row.completed_at else None,
-            'run_metadata': row.run_metadata,
-        }
+        return _serialize_eod_collection_run(row)
 
 
 def count_eod_collection_runs(

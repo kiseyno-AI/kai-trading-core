@@ -4,12 +4,8 @@ from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from typing import Any, Callable
 
-from sqlalchemy import select
-
 from app.core.settings import settings
 from app.dart.fundamentals_capture_service import dart_fundamentals_capture_service
-from app.db import session_scope
-from app.db_models import EODCollectionRun
 from app.eod.pykrx_backfill import DEFAULT_MARKETS, PYKRX_BACKFILL_SERVICE
 from app.eod.pipeline_status_support import (
     PYKRX_STAGE_ORDER,
@@ -23,6 +19,7 @@ from app.eod.pipeline_status_support import (
 )
 from app.market.clock import get_market_state
 from app.market_data_store import DAY_BASED_TRENDING_PERIODS, count_live_symbols, load_eod_run_stage_counts
+from app.repositories.eod_run_repository import list_eod_collection_runs
 
 PIPELINE_STAGE_ORDER = PYKRX_STAGE_ORDER + ('fundamentals_daily_refresh',)
 
@@ -31,37 +28,13 @@ def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _serialize_eod_collection_run(row: EODCollectionRun) -> dict[str, Any]:
-    return {
-        'id': row.id,
-        'market': row.market,
-        'trade_date': row.trade_date.isoformat(),
-        'source': row.source,
-        'trigger': row.trigger,
-        'status': row.status,
-        'symbols_total': row.symbols_total,
-        'symbols_succeeded': row.symbols_succeeded,
-        'symbols_failed': row.symbols_failed,
-        'error_message': row.error_message,
-        'started_at': row.started_at.isoformat() if row.started_at else None,
-        'completed_at': row.completed_at.isoformat() if row.completed_at else None,
-        'run_metadata': row.run_metadata,
-    }
-
-
 def _load_pipeline_pykrx_run_rows(*, trade_date: str) -> list[dict[str, Any]]:
-    with session_scope() as session:
-        return [
-            _serialize_eod_collection_run(row)
-            for row in session.execute(
-                select(EODCollectionRun)
-                .where(EODCollectionRun.market == 'KRX')
-                .where(EODCollectionRun.trade_date == date.fromisoformat(trade_date))
-                .where(EODCollectionRun.source == 'pykrx')
-                .order_by(EODCollectionRun.started_at.desc(), EODCollectionRun.id.desc())
-                .limit(10)
-            ).scalars().all()
-        ]
+    return list_eod_collection_runs(
+        market='KRX',
+        trade_date=trade_date,
+        source='pykrx',
+        limit=10,
+    )
 
 
 def _select_pipeline_pykrx_run(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
