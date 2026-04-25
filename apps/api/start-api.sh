@@ -34,4 +34,9 @@ set -a
 source .env
 set +a
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
+
+if [ "${DB_AUTO_UPGRADE:-true}" = "true" ]; then
+  "$PYTHON_BIN" -m app.internal.deploy_hygiene preflight --format text
+fi
+
 exec "$PYTHON_BIN" -m uvicorn app.main:app --host "$HOST" --port "$PORT"

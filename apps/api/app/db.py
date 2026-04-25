@@ -44,7 +44,7 @@ def session_scope():
         session.close()
 
 
-def _alembic_config() -> Config:
+def get_alembic_config() -> Config:
     config = Config(str(Path(__file__).resolve().parent.parent / 'alembic.ini'))
     config.set_main_option('script_location', str(Path(__file__).resolve().parent.parent / 'db_migrations'))
     config.set_main_option('sqlalchemy.url', DATABASE_URL)
@@ -52,7 +52,7 @@ def _alembic_config() -> Config:
 
 
 def run_migrations() -> None:
-    command.upgrade(_alembic_config(), 'head')
+    command.upgrade(get_alembic_config(), 'head')
 
 
 def init_database() -> None:

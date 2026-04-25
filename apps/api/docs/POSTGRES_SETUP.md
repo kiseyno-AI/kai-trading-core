@@ -21,6 +21,7 @@ Use these keys in local `.env`:
 ## Current app behavior
 
 - FastAPI startup can auto-apply Alembic migrations when `DB_AUTO_UPGRADE=true`
+- `apps/api/start-api.sh` now runs a non-destructive migration preflight before uvicorn when `DB_AUTO_UPGRADE=true`
 - `/health` reports database connectivity
 - Schema is managed in `apps/api/db_migrations/versions/`
 
@@ -37,6 +38,16 @@ From `apps/api`:
    `python -c "from app.main import app"`
 
 If you keep `DB_AUTO_UPGRADE=true`, normal FastAPI startup will also try to bring the schema to `head`.
+
+For deploy-time hygiene from `apps/api`:
+
+1. `python3.11 -m app.internal.deploy_hygiene preflight --format text`
+2. `alembic upgrade head`
+3. `python3.11 -m app.internal.deploy_hygiene preflight --require-head --format text`
+4. Restart the API
+5. `python3.11 -m app.internal.deploy_hygiene smoke-check --base-url http://127.0.0.1:8000 --format text`
+
+If the preflight flags likely duplicate-table drift, verify the live table shape against the pending migration and use `alembic stamp <matching_revision>` only after schema parity is confirmed. If parity is not clean, prefer a corrective migration over destructive table drops.
 
 ## First-pass schema
 
