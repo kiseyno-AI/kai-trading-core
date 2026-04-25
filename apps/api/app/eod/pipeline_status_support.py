@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from app.market_data_store import DAY_BASED_TRENDING_PERIODS
+from app.eod.run_stage_support import normalize_run_status
 
 PYKRX_STAGE_ORDER = (
     'price_collection',
@@ -34,13 +35,7 @@ STAGE_PROGRESS_RESERVED_KEYS = {
 
 
 def _normalize_status(value: str | None) -> str | None:
-    if not value:
-        return None
-    if value == 'completed_with_errors':
-        return 'partial'
-    if value == 'skipped':
-        return 'pending'
-    return value
+    return normalize_run_status(value)
 
 
 def _stage_index(stage: str | None) -> int | None:

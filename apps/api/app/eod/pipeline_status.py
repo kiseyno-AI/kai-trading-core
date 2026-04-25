@@ -17,6 +17,13 @@ from app.eod.pipeline_status_support import (
     _progress_extras,
     _stage_index,
 )
+from app.eod.run_stage_support import (
+    build_stage_counts,
+    extract_fundamentals_refresh_metrics,
+    get_run_metadata,
+    resolve_run_updated_at,
+    select_preferred_eod_run,
+)
 from app.market.clock import get_market_state
 from app.market_data_store import DAY_BASED_TRENDING_PERIODS, count_live_symbols, load_eod_run_stage_counts
 from app.repositories.eod_run_repository import list_eod_collection_runs
@@ -38,17 +45,7 @@ def _load_pipeline_pykrx_run_rows(*, trade_date: str) -> list[dict[str, Any]]:
 
 
 def _select_pipeline_pykrx_run(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
-    if not rows:
-        return None
-
-    return next(
-        (
-            row
-            for row in rows
-            if (row.get('run_metadata') or {}).get('mode') != 'historical_backfill'
-        ),
-        rows[0],
-    )
+    return select_preferred_eod_run(rows)
 
 
 def _load_latest_pipeline_pykrx_run(*, trade_date: str) -> dict[str, Any] | None:
@@ -140,7 +137,7 @@ class EODPipelineStatusService:
                 for stage_name in PYKRX_STAGE_ORDER
             }
 
-        run_metadata = run.get('run_metadata') if isinstance(run.get('run_metadata'), dict) else {}
+        run_metadata = get_run_metadata(run)
         stage_progress = run_metadata.get('stage_progress') if isinstance(run_metadata.get('stage_progress'), dict) else {}
         current_stage = _infer_pykrx_stage(
             run_status=str(run.get('status') or ''),
@@ -171,6 +168,7 @@ class EODPipelineStatusService:
         live_symbols_total: int,
     ) -> dict[str, Any]:
         total = live_symbols_total if stage_name != 'trending_ranks' else len(DAY_BASED_TRENDING_PERIODS)
+        counts = build_stage_counts(total=total, succeeded=0, failed=0, processed=0)
         return {
             'task': stage_name,
             'label': STAGE_LABELS[stage_name],
@@ -180,11 +178,11 @@ class EODPipelineStatusService:
             'started_at': None,
             'updated_at': None,
             'completed_at': None,
-            'processed': 0,
-            'total': total,
-            'succeeded': 0,
-            'failed': 0,
-            'remaining': total,
+            'processed': counts.processed,
+            'total': counts.total,
+            'succeeded': counts.succeeded,
+            'failed': counts.failed,
+            'remaining': counts.remaining,
             'current_step': None,
             'current_activity': _default_activity(STAGE_LABELS[stage_name], 'pending'),
             'current_symbol': None,
@@ -215,14 +213,16 @@ class EODPipelineStatusService:
             progress_status = 'failed' if run_status == 'failed' else None
 
         if stage_name == 'price_collection':
-            total = int(progress.get('total') or run.get('symbols_total') or live_symbols_total or 0)
-            succeeded = max(
-                int(progress.get('succeeded') or 0),
-                int(run.get('symbols_succeeded') or 0),
-                int(aggregate.get('persisted') or 0),
+            counts = build_stage_counts(
+                total=progress.get('total') or run.get('symbols_total') or live_symbols_total,
+                succeeded=max(
+                    int(progress.get('succeeded') or 0),
+                    int(run.get('symbols_succeeded') or 0),
+                    int(aggregate.get('persisted') or 0),
+                ),
+                failed=int(progress['failed']) if 'failed' in progress else int(run.get('symbols_failed') or 0),
+                processed=int(progress['processed']) if 'processed' in progress else None,
             )
-            failed = int(progress['failed']) if 'failed' in progress else int(run.get('symbols_failed') or 0)
-            processed = int(progress['processed']) if 'processed' in progress else succeeded + failed
             started = True
         elif stage_name in {'technical_snapshots', 'action_summaries'}:
             total = int(progress.get('total') or run.get('symbols_total') or 0)
@@ -240,16 +240,30 @@ class EODPipelineStatusService:
                 )
                 else 0
             )
-            processed = int(progress['processed']) if 'processed' in progress else min(succeeded + failed, total) if total else succeeded + failed
+            counts = build_stage_counts(
+                total=total,
+                succeeded=succeeded,
+                failed=failed,
+                processed=(
+                    int(progress['processed'])
+                    if 'processed' in progress
+                    else min(succeeded + failed, total) if total else succeeded + failed
+                ),
+            )
             started = bool(progress or succeeded or failed or (current_stage_index is not None and stage_index < current_stage_index))
         else:
-            total = int(progress.get('total') or len(DAY_BASED_TRENDING_PERIODS))
             succeeded = max(
                 int(progress.get('succeeded') or 0),
                 int(aggregate.get('periods_persisted') or 0),
             )
             failed = int(progress['failed']) if 'failed' in progress else 0
-            processed = int(progress['processed']) if 'processed' in progress else min(succeeded + failed, total)
+            total = int(progress.get('total') or len(DAY_BASED_TRENDING_PERIODS))
+            counts = build_stage_counts(
+                total=total,
+                succeeded=succeeded,
+                failed=failed,
+                processed=int(progress['processed']) if 'processed' in progress else min(succeeded + failed, total),
+            )
             started = bool(progress or succeeded or failed)
 
         if progress_status:
@@ -262,10 +276,10 @@ class EODPipelineStatusService:
             status = 'failed'
         elif not started:
             status = 'pending'
-        elif total and succeeded >= total and failed == 0:
+        elif counts.total and counts.succeeded >= counts.total and counts.failed == 0:
             status = 'completed'
-        elif failed > 0:
-            status = 'partial' if succeeded > 0 or run_status in {'completed', 'completed_with_errors'} else 'failed'
+        elif counts.failed > 0:
+            status = 'partial' if counts.succeeded > 0 or run_status in {'completed', 'completed_with_errors'} else 'failed'
         elif run_status == 'completed_with_errors':
             status = 'partial'
         else:
@@ -306,7 +320,6 @@ class EODPipelineStatusService:
             if status == 'running' and current_stage == stage_name
             else progress.get('current_period')
         )
-        remaining = max(total - processed, 0) if total else 0
 
         details = {
             **_progress_extras(progress),
@@ -339,11 +352,11 @@ class EODPipelineStatusService:
             'started_at': started_at,
             'updated_at': updated_at,
             'completed_at': completed_at,
-            'processed': processed,
-            'total': total,
-            'succeeded': succeeded,
-            'failed': failed,
-            'remaining': remaining,
+            'processed': counts.processed,
+            'total': counts.total,
+            'succeeded': counts.succeeded,
+            'failed': counts.failed,
+            'remaining': counts.remaining,
             'current_step': current_step,
             'current_activity': current_activity,
             'current_symbol': current_symbol,
@@ -362,6 +375,7 @@ class EODPipelineStatusService:
     ) -> dict[str, Any]:
         run = self.fundamentals_refresh_loader(market_date=market_date, fs_div=fs_div)
         if not run:
+            counts = build_stage_counts(total=0, succeeded=0, failed=0, processed=0)
             return {
                 'task': 'fundamentals_daily_refresh',
                 'label': STAGE_LABELS['fundamentals_daily_refresh'],
@@ -371,11 +385,11 @@ class EODPipelineStatusService:
                 'started_at': None,
                 'updated_at': None,
                 'completed_at': None,
-                'processed': 0,
-                'total': 0,
-                'succeeded': 0,
-                'failed': 0,
-                'remaining': 0,
+                'processed': counts.processed,
+                'total': counts.total,
+                'succeeded': counts.succeeded,
+                'failed': counts.failed,
+                'remaining': counts.remaining,
                 'current_step': None,
                 'current_activity': _default_activity(STAGE_LABELS['fundamentals_daily_refresh'], 'pending'),
                 'current_symbol': None,
@@ -386,12 +400,8 @@ class EODPipelineStatusService:
                 },
             }
 
-        metadata = run.get('run_metadata') if isinstance(run.get('run_metadata'), dict) else {}
-        total = int(metadata.get('symbols_selected') or run.get('symbols_total') or 0)
-        processed = int(run.get('symbols_checked') or 0)
-        refreshed = int(run.get('symbols_refreshed') or 0)
-        fresh = int(run.get('symbols_fresh') or 0)
-        failed = int(run.get('symbols_failed') or 0)
+        metadata = get_run_metadata(run)
+        metrics = extract_fundamentals_refresh_metrics(run)
         status = _normalize_status(str(run.get('status') or '')) or 'pending'
         current_step = str(metadata.get('stage') or '') or None
         current_activity = (
@@ -399,7 +409,6 @@ class EODPipelineStatusService:
             if status == 'failed' and run.get('error_message')
             else _build_fundamentals_activity(metadata, status)
         )
-        remaining = max(total - processed, 0) if total else 0
         source_run_ids = {
             'refresh_run_id': run.get('id'),
             'sync_run_ids': [
@@ -421,13 +430,13 @@ class EODPipelineStatusService:
             'source_status': run.get('status'),
             'market_date': market_date,
             'started_at': run.get('started_at'),
-            'updated_at': metadata.get('last_progress_at') or run.get('completed_at') or run.get('started_at'),
+            'updated_at': resolve_run_updated_at(run),
             'completed_at': run.get('completed_at'),
-            'processed': processed,
-            'total': total,
-            'succeeded': fresh + refreshed,
-            'failed': failed,
-            'remaining': remaining,
+            'processed': metrics.processed,
+            'total': metrics.total,
+            'succeeded': metrics.succeeded,
+            'failed': metrics.failed,
+            'remaining': metrics.remaining,
             'current_step': current_step,
             'current_activity': current_activity,
             'current_symbol': None,
@@ -441,11 +450,11 @@ class EODPipelineStatusService:
                 'symbol_offset': run.get('symbol_offset'),
                 'symbols_missing': int(run.get('symbols_missing') or 0),
                 'symbols_stale': int(run.get('symbols_stale') or 0),
-                'symbols_fresh': fresh,
-                'symbols_refreshed': refreshed,
-                'events_detected': int(run.get('events_detected') or 0),
-                'events_captured': int(run.get('events_captured') or 0),
-                'events_failed': int(run.get('events_failed') or 0),
+                'symbols_fresh': metrics.fresh,
+                'symbols_refreshed': metrics.refreshed,
+                'events_detected': metrics.events_detected,
+                'events_captured': metrics.events_captured,
+                'events_failed': metrics.events_failed,
                 'remaining_retryable_events': int(metadata.get('remaining_candidate_events') or 0),
                 'retry_cycles_requested': metadata.get('retry_cycles_requested'),
                 'retry_cycles_completed': metadata.get('retry_cycles_completed'),
