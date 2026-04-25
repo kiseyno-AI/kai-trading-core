@@ -104,11 +104,13 @@
 - `GET /agent-context/feedback/progress?market_date=YYYY-MM-DD`
 
 ## EOD freshness read-layer notes
+- Canonical semantics live in `docs/EOD_STATUS_SEMANTICS_CONTRACT.md`.
 - `GET /eod/freshness` is the compact web-facing read API for EOD ingestion freshness.
 - It reports the current Seoul trade date, today's stage-specific status for price, technical analysis, action summary, and fundamentals, plus the latest stored dates for price bars, technical snapshots, and action summaries.
+- `today.trade_date` is the current Seoul calendar date from `server_time[:10]`; weekends, holidays, and other break-days do not backshift `today` to a previous trading day.
 - Today's price, technical-analysis, and action-summary stage totals are based on the current active symbol universe. Their succeeded counts come from same-day persisted rows for active symbols; once a stage has same-day rows, failed counts represent active symbols still missing that persisted data.
 - `today.fundamentals` is explicitly an activity view. Its `basis` is `same_day_snapshot_updates`, so `symbols_succeeded` counts distinct stock codes with DART fundamentals snapshots updated during the current Seoul day and `symbols_failed` counts distinct financial-report stock codes whose capture attempt failed that same day.
-- `today.fundamentals.current_run` is the latest persisted DART fundamentals refresh run for the current `market_date` when one exists. It is sourced from `dart_fundamentals_refresh_runs` and keeps refresh progress visible even when same-day snapshot updates are still zero.
+- `today.fundamentals.current_run` is the latest persisted DART fundamentals refresh run for the current `market_date` when one exists. It is sourced from `dart_fundamentals_refresh_runs` and keeps refresh progress visible even when same-day snapshot updates are still zero. A running current-day refresh run overrides `today.fundamentals.status` to `running`, but a completed same-day no-op refresh still leaves the stage `missing` if no same-day snapshot updates exist.
 - The `latest` block preserves `price_trade_date` plus the legacy `symbols_*` fields and now also mirrors its web-facing summary at top level through `latest.trade_date`, `latest.updated_at`, `latest.succeeded`, `latest.failed`, and `latest.total`.
 - `latest.summary.basis` explicitly names the summary basis. `latest_eod_run_symbol_universe` means counts come from the selected `eod_collection_runs` row for `latest.trade_date`; `stored_price_bars_for_latest_trade_date` is the fallback when stored price bars exist but no matching EOD run row is available, in which case `total == succeeded` and `failed == 0`.
 - `latest.updated_at` comes from the latest run's `run_metadata.last_progress_at` when available, otherwise from its run timestamps; the stored-price-bar fallback uses the max `daily_price_bars.captured_at` for `latest.trade_date`.
@@ -118,10 +120,13 @@
 - The `today` block is scoped only to the current Seoul trade date; previous-day historical availability is surfaced through `latest.*`, not copied into `today.*`.
 
 ## EOD pipeline status notes
+- Canonical semantics live in `docs/EOD_STATUS_SEMANTICS_CONTRACT.md`.
 - `GET /eod/pipeline/status` is the operator-facing live status API for the post-close EOD pipeline.
 - It stays separate from `GET /eod/freshness`: freshness answers whether the stored data is available, while pipeline status answers which stage is running now and what work is currently in progress.
+- Its default `market_date` is also the current Seoul calendar date from `server_time[:10]`; weekends, holidays, and other break-days do not auto-resolve to the previous trading date unless the caller passes `market_date` explicitly.
 - The pykrx stage breakdown reuses the existing `eod_collection_runs` row plus downstream rows linked by `eod_run_id`, and records lightweight per-stage progress in `eod_collection_runs.run_metadata`.
 - The current pykrx pipeline stages are `price_collection`, `technical_snapshots`, `action_summaries`, and `trending_ranks`. The same payload also reports the latest DART `fundamentals_daily_refresh` run for the requested `market_date` and `fs_div`.
+- While a pykrx run is `running`, the inferred current stage is authoritative for live display: that stage remains `running`, later pykrx stages stay `pending` until they actually start, and stale `stage_progress.status=running` entries must be downgraded once the owning run is no longer running.
 - Stage payloads include normalized status, timestamps, processed or total or failed counts where available, current step or activity text, and linked source run IDs so operators can correlate the live run with existing inspect routes.
 
 ## EOD technical snapshot notes

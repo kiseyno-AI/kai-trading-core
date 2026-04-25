@@ -3,6 +3,8 @@
 ## Summary
 Compact web-facing freshness read API for EOD ingestion and downstream dashboards.
 
+Canonical semantics for this route and `GET /eod/pipeline/status` live in `docs/EOD_STATUS_SEMANTICS_CONTRACT.md`.
+
 The `today` block is scoped to the current Seoul trade date and is derived from persisted same-day data. Price, technical-analysis, and action-summary counts use the active symbol universe. `today.fundamentals` is intentionally an activity view: its `basis` is `same_day_snapshot_updates`, and `current_run` shows the latest refresh-run progress for the current market date when one exists.
 
 The `latest` block keeps the latest stored price date, preserves the legacy `price_trade_date` and `symbols_*` fields, and exposes top-level `trade_date`, `updated_at`, `succeeded`, `failed`, and `total` values for the web. `latest.fundamentals` is the latest-available fundamentals coverage view sourced from the latest completed or partial `dart_fundamentals_refresh_runs` row, so clients can keep showing the last completed refresh result until a newer completed run supersedes it.
