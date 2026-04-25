@@ -13,6 +13,7 @@ Start command:
 What it does:
 - installs Python requirements
 - loads `apps/api/.env`
+- when `DB_AUTO_UPGRADE=true`, runs `python3.11 -m app.internal.deploy_hygiene preflight --format text` before uvicorn
 - starts FastAPI via uvicorn on `127.0.0.1:8000` by default
 - if `UPSTREAM_BEARER_TOKEN` is set, all incoming API requests require `Authorization: Bearer <token>`
 - local orchestration should prefer `python3.11 -m app.internal.ops ...` over raw localhost `curl` so bearer auth does not break internal jobs
@@ -75,6 +76,38 @@ Before first startup on a fresh machine, from `apps/api`:
 2. Create the Postgres database and user referenced by `.env`
 3. `alembic upgrade head`
 4. `python -c "from app.main import app"`
+
+## Deployment migration hygiene
+
+Use these commands from `apps/api` when you want deploy-time schema checks to fail early and explain drift more clearly:
+
+1. Preflight before upgrade or restart:
+   `python3.11 -m app.internal.deploy_hygiene preflight --format text`
+2. Explicit head gate for a deploy:
+   `alembic upgrade head`
+   `python3.11 -m app.internal.deploy_hygiene preflight --require-head --format text`
+3. Restart the API.
+4. Post-restart smoke:
+   `python3.11 -m app.internal.deploy_hygiene smoke-check --base-url http://127.0.0.1:8000 --format text`
+
+Notes:
+
+- The preflight is intentionally non-destructive. It does not mutate schema state.
+- The duplicate-table warning is heuristic by design: it flags live tables that overlap with still-pending unguarded `create_table(...)` revisions, which is the common `alembic_version` lag pattern behind repeated `DuplicateTable` deploy failures.
+- The smoke command automatically sends `Authorization: Bearer <token>` when `UPSTREAM_BEARER_TOKEN` is set in the current shell environment.
+
+## Duplicate-table drift recovery
+
+If the preflight flags likely drift, or `alembic upgrade head` fails with `DuplicateTable`:
+
+1. Stop automatic restart or migration retries for that deploy.
+2. Inspect the flagged live table, indexes, unique constraints, and foreign keys against the pending migration file.
+3. Only if the live schema materially matches the intended migration boundary, run `alembic stamp <matching_revision>`.
+4. Use `alembic stamp head` only when every still-pending revision is already reflected in the live schema.
+5. Rerun `python3.11 -m app.internal.deploy_hygiene preflight --require-head --format text`.
+6. Restart the API and rerun `python3.11 -m app.internal.deploy_hygiene smoke-check --base-url http://127.0.0.1:8000 --format text`.
+
+If schema parity is not clean, write a corrective migration instead of dropping tables in place.
 
 ## pykrx EOD backfill
 

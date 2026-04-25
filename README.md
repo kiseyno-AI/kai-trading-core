@@ -315,6 +315,8 @@ pip install -r requirements.txt
 # or: uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
+When `DB_AUTO_UPGRADE=true`, `./start-api.sh` now runs a non-destructive Alembic preflight before uvicorn. The preflight allows ordinary pending migrations to proceed, but it blocks startup when the database is unreachable or when pending unguarded `create_table(...)` revisions already have matching live tables and are likely to hit `DuplicateTable`.
+
 ## Database bootstrap and schema overview
 
 The project uses Alembic-backed schema bootstrap under `apps/api/db_migrations/`. The migration set is the source of truth, and startup can apply pending revisions automatically when `DB_AUTO_UPGRADE=true`.
@@ -345,6 +347,9 @@ Practical notes:
 - Run `alembic current` before and after bootstrapping if you want explicit revision visibility.
 - `alembic upgrade head` is the predictable explicit bootstrap path.
 - If `DB_AUTO_UPGRADE=true`, startup can also apply pending migrations.
+- `python3.11 -m app.internal.deploy_hygiene preflight --format text` is the lightweight deploy/startup guard for Alembic head visibility and likely duplicate-table drift.
+- `python3.11 -m app.internal.deploy_hygiene preflight --require-head --format text` is the explicit post-migration gate for deploys that want the database at head before restart.
+- `python3.11 -m app.internal.deploy_hygiene smoke-check --base-url http://127.0.0.1:8000 --format text` verifies `/health` and `/eod/freshness` after restart.
 
 ## Implemented jobs, APIs, and operator flows
 
@@ -368,6 +373,9 @@ Operator-friendly Python module entry points from `apps/api` include:
 - `python3.11 -m app.eod.action_summaries --market-date YYYY-MM-DD`
 - `python3.11 -m app.dart.backfill_current_universe ...`
 - `python3.11 -m app.dart.backfill_current_universe_runner ...`
+- `python3.11 -m app.internal.deploy_hygiene preflight --format text`
+- `python3.11 -m app.internal.deploy_hygiene preflight --require-head --format text`
+- `python3.11 -m app.internal.deploy_hygiene smoke-check --base-url http://127.0.0.1:8000 --format text`
 
 ### Background behavior
 
