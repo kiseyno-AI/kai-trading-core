@@ -22,6 +22,10 @@ from app.signals.beta_factor import BETA_FACTOR_SOURCE, daily_beta_factor_servic
 from app.signals.composite_factor import COMPOSITE_FACTOR_SOURCE, daily_composite_factor_service
 from app.signals.daily_signal_features import daily_signal_feature_service
 from app.signals.low_risk_factor import LOW_RISK_SOURCE, daily_low_risk_factor_service
+from app.signals.market_risk_filter import (
+    MARKET_RISK_FILTER_SOURCE,
+    daily_market_risk_filter_service,
+)
 from app.signals.momentum_factor import daily_momentum_factor_service
 from app.signals.piotroski_filter import daily_piotroski_filter_service
 from app.signals.value_factor import VALUE_FACTOR_SOURCE, daily_value_factor_service
@@ -270,6 +274,46 @@ async def inspect_daily_signal_features(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f'Daily signal feature inspect failed: {exc}') from exc
+
+
+@router.post('/market-risk-filters/compute')
+async def compute_daily_market_risk_filters(
+    market_date: str,
+    symbols: str | None = None,
+    source: str = MARKET_RISK_FILTER_SOURCE,
+    market_code: str = 'J',
+) -> dict:
+    try:
+        parsed_symbols = [item.strip() for item in symbols.split(',') if item.strip()] if symbols else None
+        return await daily_market_risk_filter_service.rebuild_for_market_date(
+            market_date=market_date,
+            symbols=parsed_symbols,
+            source=source,
+            market_code=market_code,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f'Daily market risk filter compute failed: {exc}') from exc
+
+
+@router.get('/market-risk-filters')
+async def inspect_daily_market_risk_filters(
+    market_date: str | None = None,
+    symbol: str | None = None,
+    limit: int | None = Query(default=None, ge=1, le=20000),
+) -> dict:
+    try:
+        return await asyncio.to_thread(
+            daily_market_risk_filter_service.inspect,
+            market_date=market_date,
+            symbol=symbol,
+            limit=limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'Daily market risk filter read failed: {exc}') from exc
 
 
 @router.post('/low-risk-factors/compute')

@@ -149,6 +149,16 @@ class KISClient:
             },
         )
 
+    async def fetch_domestic_quote_risk_status(self, symbol: str, market_code: str = 'J') -> dict:
+        return await self._get(
+            '/uapi/domestic-stock/v1/quotations/inquire-price-2',
+            tr_id='FHPST01010000',
+            params={
+                'FID_COND_MRKT_DIV_CODE': market_code,
+                'FID_INPUT_ISCD': symbol,
+            },
+        )
+
     async def fetch_domestic_stock_info(self, symbol: str, product_type_code: str = '300') -> dict:
         return await self._get(
             '/uapi/domestic-stock/v1/quotations/search-stock-info',

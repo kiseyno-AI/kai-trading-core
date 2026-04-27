@@ -11,6 +11,7 @@ from app.eod.pykrx_pipeline_support import (
     build_stage_failure_result,
     make_stage_progress_callback,
 )
+from app.signals.market_risk_filter import MARKET_RISK_FILTER_SOURCE
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +29,7 @@ class PykrxPipelineDependencies:
     action_summary_service: Any
     compute_trending_ranks: Callable[..., dict]
     signal_feature_service: Any
+    market_risk_filter_service: Any
     dart_fundamentals_capture_service: Any
     settings: Any
     normalize_yyyymmdd: Callable[..., str]
@@ -527,6 +529,67 @@ def run_market_data_pipeline(
             failed=1,
         )
 
+    market_risk_filter_result: dict
+    market_risk_filter_error_message: str | None = None
+    try:
+        persist_stage_progress(
+            stage='market_risk_filter',
+            status='running',
+            current_step='computing_market_risk_filter',
+            current_activity='Computing daily KIS market risk filter',
+            processed=0,
+            total=len(price_context_symbols),
+            succeeded=0,
+            failed=0,
+        )
+        market_risk_filter_result = asyncio.run(
+            dependencies.market_risk_filter_service.rebuild_for_market_date(
+                market_date=latest_trade_date,
+                symbols=price_context_symbols,
+                source=MARKET_RISK_FILTER_SOURCE,
+                run_id=run_id,
+            )
+        )
+        market_risk_total = len(market_risk_filter_result.get('matched_symbols') or [])
+        market_risk_failed = int(market_risk_filter_result.get('results_failed') or 0)
+        persist_stage_progress(
+            stage='market_risk_filter',
+            status='completed' if market_risk_failed == 0 else 'partial',
+            current_step='market_risk_filter_completed',
+            current_activity='Daily KIS market risk filter computed',
+            processed=(int(market_risk_filter_result.get('results_persisted') or 0) + market_risk_failed),
+            total=market_risk_total,
+            succeeded=market_risk_filter_result.get('results_persisted'),
+            failed=market_risk_failed,
+            extra={
+                'passed_count': market_risk_filter_result.get('summary', {}).get('passed_count'),
+                'watchlist_count': market_risk_filter_result.get('summary', {}).get('watchlist_count'),
+            },
+        )
+    except Exception as exc:
+        market_risk_filter_result = build_stage_failure_result(
+            market_date=latest_trade_date,
+            source=MARKET_RISK_FILTER_SOURCE,
+            error=exc,
+            totals={
+                'results_persisted': 0,
+                'results_failed': len(price_context_symbols),
+            },
+            failed_symbols=price_context_symbols,
+            items_key='items',
+        )
+        market_risk_filter_error_message = f'Market risk filter persistence failed: {exc}'
+        persist_stage_progress(
+            stage='market_risk_filter',
+            status='failed',
+            current_step='market_risk_filter_failed',
+            current_activity='Daily KIS market risk filter persistence failed',
+            processed=0,
+            total=len(price_context_symbols),
+            succeeded=0,
+            failed=len(price_context_symbols),
+        )
+
     run_errors: list[str] = []
     if failed_symbols:
         run_errors.append(f'Failed symbols: {",".join(failed_symbols[:20])}')
@@ -560,6 +623,13 @@ def run_market_data_pipeline(
         failed_key='features_failed',
         incomplete_prefix='Daily signal feature persistence incomplete for symbols: ',
     )
+    append_stage_error(
+        run_errors,
+        direct_error=market_risk_filter_error_message,
+        result=market_risk_filter_result,
+        failed_key='results_failed',
+        incomplete_prefix='Market risk filter persistence incomplete for symbols: ',
+    )
 
     status = 'completed' if not run_errors else 'completed_with_errors'
     if failed_symbols:
@@ -590,6 +660,7 @@ def run_market_data_pipeline(
         'action_summaries': action_summary_result,
         'trending_ranks': trending_rank_result,
         'signal_features': signal_feature_result,
+        'market_risk_filter': market_risk_filter_result,
         'refresh_universe': effective_refresh_universe,
         'universe_snapshot': universe_snapshot,
     }

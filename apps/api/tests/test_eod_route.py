@@ -171,6 +171,70 @@ class FakeSignalFeatureService:
         }
 
 
+class FakeMarketRiskFilterService:
+    def __init__(self):
+        self.compute_args = None
+        self.inspect_args = None
+
+    async def rebuild_for_market_date(self, **kwargs):
+        self.compute_args = kwargs
+        return {
+            'market_date': kwargs['market_date'],
+            'feature_version': kwargs['source'],
+            'results_persisted': 2,
+            'results_failed': 0,
+            'items': [{'symbol': '005930', 'risk_state': 'watchlist', 'watchlist_flagged': True}],
+        }
+
+    def inspect(self, **kwargs):
+        self.inspect_args = kwargs
+        market_date = kwargs.get('market_date') or '2026-04-14'
+        symbol = kwargs.get('symbol')
+        if symbol:
+            return {
+                'market_date': market_date,
+                'requested_market_date': market_date,
+                'resolved_market_date': market_date,
+                'feature_version': 'kis_market_risk_v1',
+                'summary': {
+                    'entries': 1,
+                    'requested_symbol': symbol,
+                    'matched_symbols': [symbol],
+                    'missing_symbols': [],
+                    'passed_count': 1,
+                    'watchlist_count': 1,
+                    'failed_count': 0,
+                },
+                'item': {
+                    'symbol': symbol,
+                    'market_date': market_date,
+                    'risk_state': 'watchlist',
+                    'passed_filter': True,
+                    'watchlist_flagged': True,
+                },
+            }
+        return {
+            'market_date': '2026-04-14',
+            'requested_market_date': None,
+            'resolved_market_date': '2026-04-14',
+            'latest_mode': True,
+            'feature_version': 'kis_market_risk_v1',
+            'summary': {
+                'entries': 2,
+                'requested_symbol': None,
+                'matched_symbols': ['005930', '000660'],
+                'missing_symbols': [],
+                'passed_count': 1,
+                'watchlist_count': 1,
+                'failed_count': 1,
+            },
+            'items': [
+                {'symbol': '000660', 'market_date': '2026-04-14', 'risk_state': 'fail', 'passed_filter': False},
+                {'symbol': '005930', 'market_date': '2026-04-14', 'risk_state': 'watchlist', 'passed_filter': True},
+            ],
+        }
+
+
 class FakeMomentumFactorService:
     def __init__(self):
         self.compute_args = None
@@ -764,6 +828,65 @@ class EODRouteTests(unittest.TestCase):
         self.assertEqual(fake_service.inspect_args['symbols'], ['005930'])
         self.assertEqual(fake_service.inspect_args['limit'], 5)
         self.assertEqual(response.json()['items'][0]['signal_count'], 2)
+
+    def test_compute_market_risk_filters_route_calls_service(self):
+        fake_service = FakeMarketRiskFilterService()
+        original_service = routes_eod.daily_market_risk_filter_service
+        routes_eod.daily_market_risk_filter_service = fake_service
+        try:
+            client = TestClient(self.app)
+            response = client.post(
+                '/eod/market-risk-filters/compute',
+                params={
+                    'market_date': '2026-04-14',
+                    'symbols': '005930,000660',
+                    'source': 'kis_market_risk_v1',
+                    'market_code': 'UN',
+                },
+            )
+        finally:
+            routes_eod.daily_market_risk_filter_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(fake_service.compute_args['market_date'], '2026-04-14')
+        self.assertEqual(fake_service.compute_args['symbols'], ['005930', '000660'])
+        self.assertEqual(fake_service.compute_args['source'], 'kis_market_risk_v1')
+        self.assertEqual(fake_service.compute_args['market_code'], 'UN')
+        self.assertEqual(response.json()['items'][0]['risk_state'], 'watchlist')
+
+    def test_inspect_market_risk_filters_route_returns_single_item_for_symbol(self):
+        fake_service = FakeMarketRiskFilterService()
+        original_service = routes_eod.daily_market_risk_filter_service
+        routes_eod.daily_market_risk_filter_service = fake_service
+        try:
+            client = TestClient(self.app)
+            response = client.get(
+                '/eod/market-risk-filters',
+                params={'market_date': '2026-04-14', 'symbol': '005930'},
+            )
+        finally:
+            routes_eod.daily_market_risk_filter_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(fake_service.inspect_args['market_date'], '2026-04-14')
+        self.assertEqual(fake_service.inspect_args['symbol'], '005930')
+        self.assertEqual(response.json()['item']['risk_state'], 'watchlist')
+        self.assertTrue(response.json()['item']['watchlist_flagged'])
+
+    def test_inspect_market_risk_filters_route_allows_latest_mode_without_market_date(self):
+        fake_service = FakeMarketRiskFilterService()
+        original_service = routes_eod.daily_market_risk_filter_service
+        routes_eod.daily_market_risk_filter_service = fake_service
+        try:
+            client = TestClient(self.app)
+            response = client.get('/eod/market-risk-filters')
+        finally:
+            routes_eod.daily_market_risk_filter_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(fake_service.inspect_args['market_date'])
+        self.assertTrue(response.json()['latest_mode'])
+        self.assertEqual(response.json()['summary']['failed_count'], 1)
 
     def test_compute_low_risk_factors_route_calls_service(self):
         fake_service = FakeLowRiskFactorService()

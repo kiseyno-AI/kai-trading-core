@@ -74,6 +74,8 @@
 - `GET /eod/action-summaries?market_date=YYYY-MM-DD&symbols=005930,000660`
 - `POST /eod/signal-features/collect?market_date=YYYY-MM-DD&sources=volume-power,overtime-volume,overtime-fluctuation`
 - `GET /eod/signal-features?market_date=YYYY-MM-DD&symbols=005930,000660`
+- `POST /eod/market-risk-filters/compute?market_date=YYYY-MM-DD&symbols=005930,000660&market_code=J`
+- `GET /eod/market-risk-filters?market_date=YYYY-MM-DD&symbol=005930`
 - `POST /eod/momentum-factors/compute?market_date=YYYY-MM-DD&symbols=005930,000660`
 - `GET /eod/momentum-factors?market_date=YYYY-MM-DD&symbols=005930,000660`
 - `POST /eod/value-factors/compute?market_date=YYYY-MM-DD&symbols=005930,000660&source=value_factor_v1`
@@ -215,6 +217,14 @@
 - The same collect path now also rebuilds `daily_market_participation_contexts` for that market date from the stored `daily_signal_features` rows, so market-summary payloads no longer derive participation context on demand.
 - Repo-owned bootstrap/backfill for the new derived-context tables is the internal ops command `python3.11 -m app.internal.ops agent-derived-contexts-backfill-recent`, which fills the recent seven trading days ending yesterday from existing `daily_price_bars` and stored `daily_signal_features` without changing the steady-state daily EOD scope.
 - For shell-driven operations, prefer `python3.11 -m app.internal.ops kis-daily-signal-features-collect --market-date YYYY-MM-DD` from `apps/api`.
+
+## Market risk filter notes
+- `daily_market_risk_filter_results` is the persisted KIS market-risk status layer keyed by `symbol_id + market_date`.
+- `POST /eod/market-risk-filters/compute` uses the stored `daily_price_bars` universe for the requested date unless `symbols` is provided explicitly, then fetches KIS `inquire-price-2` once per symbol and normalizes deterministic `passed_filter`, `watchlist_flagged`, and `risk_state` fields before upsert.
+- The persisted payload keeps explicit blocking and watchlist reason arrays plus the raw KIS quote2 payload so operators can audit why a symbol was marked `pass`, `watchlist`, or `fail`.
+- `GET /eod/market-risk-filters` is the persisted read API for that table. `market_date` is optional: when omitted, or when the requested date has no stored rows for the current scope, the read path resolves the latest stored result date on or before the requested date and reports that resolution explicitly.
+- The automatic pykrx daily EOD pipeline now also computes and stores `daily_market_risk_filter_results` for the symbols whose daily bars were persisted successfully. Per-symbol KIS failures are recorded as partial errors and do not abort the overall daily pipeline.
+- For shell-driven operations, use `python3.11 -m app.internal.ops eod-market-risk-filters-compute --market-date YYYY-MM-DD` from `apps/api`.
 
 ## Daily momentum factor notes
 - `daily_momentum_factor_results` is the DB-backed price-factor layer keyed by `symbol_id + market_date`.
