@@ -12,7 +12,7 @@ from app.agent_context.orchestrator_helpers import normalize_requested_symbols a
 from app.agent_context.orchestrator import agent_feedback_orchestrator
 from app.agent_context.progress_service import agent_context_progress_service
 from app.agent_context.reuse_service import agent_context_reuse_service
-from app.agent_context.roles import DEFAULT_AGENT_NAMES
+from app.agent_context.roles import DEFAULT_AGENT_NAMES, SIGNAL_DECIDER_AGENT_NAME
 from app.agent_context.run_modes import DAILY_RETRY_CYCLE_MODE
 from app.agent_context.run_state_service import agent_context_feedback_run_state_service
 from app.agent_context.runtime_state import RuntimeFeedbackRunState, runtime_feedback_state_store
@@ -275,7 +275,7 @@ class AgentFeedbackRetryService:
                 remaining_roles=tuple(snapshot.roles[current_index:]),
             )
 
-        retry_pending_roles = snapshot.retry_pending_roles()
+        retry_pending_roles = self._retry_pending_roles(snapshot)
         if not retry_pending_roles:
             return None
 
@@ -331,10 +331,24 @@ class AgentFeedbackRetryService:
                 if role_state.failed_symbols
             }
             current.retry_pending_symbols_by_role = {
-                role: set(role_state.retry_pending_symbols)
+                role: set(self._retry_symbols_for_role(role_state))
                 for role, role_state in snapshot.role_states.items()
-                if role_state.retry_pending_symbols
+                if self._retry_symbols_for_role(role_state)
             }
+            for role, role_state in snapshot.role_states.items():
+                if role_state.boundary_pending_symbols:
+                    continue
+                current.first_pass_completed_symbols_by_role.setdefault(
+                    role,
+                    set(role_state.terminal_symbols),
+                )
+                current.first_pass_failed_symbols_by_role.setdefault(
+                    role,
+                    set(role_state.failed_symbols),
+                )
+                retry_subset = self._retry_symbols_for_role(role_state)
+                if retry_subset:
+                    current.retry_queued_symbols_by_role.setdefault(role, set(retry_subset))
             current.role_boundary_statuses = {
                 role: role_state.boundary_status
                 for role, role_state in snapshot.role_states.items()
@@ -434,16 +448,47 @@ class AgentFeedbackRetryService:
         )
 
     @staticmethod
-    def _collect_retry_pending_symbols(snapshot: RoleSequenceSnapshot) -> list[str]:
+    def _retry_symbols_for_role(role_state: RoleSequenceRoleState) -> tuple[str, ...]:
+        if role_state.role == SIGNAL_DECIDER_AGENT_NAME and not role_state.boundary_pending_symbols:
+            return role_state.failed_symbols
+        return role_state.retry_pending_symbols
+
+    def _retry_pending_roles(self, snapshot: RoleSequenceSnapshot) -> list[str]:
+        return [
+            role
+            for role in snapshot.roles
+            if self._retry_symbols_for_role(snapshot.role_states[role])
+        ]
+
+    def _collect_retry_pending_symbols(self, snapshot: RoleSequenceSnapshot) -> list[str]:
         ordered: list[str] = []
         seen: set[str] = set()
         for role in snapshot.roles:
-            for symbol in snapshot.role_states[role].retry_pending_symbols:
+            for symbol in self._retry_symbols_for_role(snapshot.role_states[role]):
                 if symbol in seen:
                     continue
                 seen.add(symbol)
                 ordered.append(symbol)
         return ordered
+
+    @staticmethod
+    def _mark_retry_attempted_symbols(
+        *,
+        market_date: date,
+        run_id: str,
+        role: str,
+        symbols: Sequence[str],
+    ) -> None:
+        def _mark_retry_attempted(current: RuntimeFeedbackRunState) -> None:
+            current.retry_attempted_symbols_by_role.setdefault(role, set()).update(symbols)
+            current.last_activity_at = datetime.now(timezone.utc)
+
+        runtime_feedback_state_store.update_run(
+            market_date,
+            _mark_retry_attempted,
+            run_id=run_id,
+            logical=True,
+        )
 
     @staticmethod
     def _collect_terminal_items(snapshot: RoleSequenceSnapshot) -> int:
@@ -618,8 +663,15 @@ class AgentFeedbackRetryService:
                     dispatch_symbols = list(
                         role_state_before.boundary_pending_symbols
                         if active_plan.mode == 'boundary_resume'
-                        else role_state_before.retry_pending_symbols
+                        else self._retry_symbols_for_role(role_state_before)
                     )
+                    if active_plan.mode == 'retry_followup' and dispatch_symbols:
+                        self._mark_retry_attempted_symbols(
+                            market_date=config.market_date,
+                            run_id=request_run_id,
+                            role=role,
+                            symbols=dispatch_symbols,
+                        )
                     self._checkpoint_run_state(
                         market_date=config.market_date,
                         request_run_id=request_run_id,

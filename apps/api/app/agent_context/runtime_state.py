@@ -36,6 +36,10 @@ class RuntimeFeedbackRunState:
     failed_symbols_by_role: dict[str, set[str]] = field(default_factory=dict)
     reused_symbols_by_role: dict[str, set[str]] = field(default_factory=dict)
     retry_pending_symbols_by_role: dict[str, set[str]] = field(default_factory=dict)
+    first_pass_completed_symbols_by_role: dict[str, set[str]] = field(default_factory=dict)
+    first_pass_failed_symbols_by_role: dict[str, set[str]] = field(default_factory=dict)
+    retry_queued_symbols_by_role: dict[str, set[str]] = field(default_factory=dict)
+    retry_attempted_symbols_by_role: dict[str, set[str]] = field(default_factory=dict)
     role_boundary_statuses: dict[str, str] = field(default_factory=dict)
     in_flight_slots_by_role: dict[str, dict[int, dict[str, Any]]] = field(default_factory=dict)
     last_activity_at: datetime | None = None
@@ -115,6 +119,10 @@ class RuntimeFeedbackRunState:
             completed_for_role = len(self.completed_symbols_by_role.get(role, set()))
             failed_for_role = len(self.failed_symbols_by_role.get(role, set()))
             reused_for_role = len(self.reused_symbols_by_role.get(role, set()))
+            first_pass_completed_for_role = len(self.first_pass_completed_symbols_by_role.get(role, set()))
+            first_pass_failed_for_role = len(self.first_pass_failed_symbols_by_role.get(role, set()))
+            retry_queued_for_role = len(self.retry_queued_symbols_by_role.get(role, set()))
+            retry_attempted_for_role = len(self.retry_attempted_symbols_by_role.get(role, set()))
             in_flight_symbols = set()
             for slot in self.in_flight_slots_by_role.get(role, {}).values():
                 for symbol in slot.get('symbols') or []:
@@ -148,6 +156,10 @@ class RuntimeFeedbackRunState:
                 'terminal_symbols': min(total_symbols, completed_for_role + failed_for_role),
                 'failed_items': failed_for_role,
                 'retry_pending_symbols': retry_pending_symbols,
+                'first_pass_completed_symbols': first_pass_completed_for_role,
+                'first_pass_failed_symbols': first_pass_failed_for_role,
+                'retry_queued_symbols': retry_queued_for_role,
+                'retry_attempted_symbols': retry_attempted_for_role,
                 'progress_ratio': round(progress_ratio_for_role, 6),
                 'progress_percent': round(progress_ratio_for_role * 100, 2),
             }
@@ -243,6 +255,22 @@ class RuntimeFeedbackRunState:
             'estimated_remaining_seconds': estimated_remaining_seconds,
             'estimated_completion_at': estimated_completion_at,
             'eta_confidence': eta_confidence,
+            'first_pass_completed_symbols_by_role': {
+                role: sorted(symbols)
+                for role, symbols in self.first_pass_completed_symbols_by_role.items()
+            },
+            'first_pass_failed_symbols_by_role': {
+                role: sorted(symbols)
+                for role, symbols in self.first_pass_failed_symbols_by_role.items()
+            },
+            'retry_queued_symbols_by_role': {
+                role: sorted(symbols)
+                for role, symbols in self.retry_queued_symbols_by_role.items()
+            },
+            'retry_attempted_symbols_by_role': {
+                role: sorted(symbols)
+                for role, symbols in self.retry_attempted_symbols_by_role.items()
+            },
             'role_progress': role_progress,
         }
 
