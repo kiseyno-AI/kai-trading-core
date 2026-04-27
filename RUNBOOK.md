@@ -49,6 +49,10 @@ What it does:
 - `GET /eod/action-summaries`
 - `POST /eod/signal-features/collect`
 - `GET /eod/signal-features`
+- `POST /eod/market-risk-snapshots/collect`
+- `GET /eod/market-risk-snapshots`
+- `POST /eod/market-risk-filters/compute`
+- `GET /eod/market-risk-filters`
 - `POST /eod/low-risk-factors/compute`
 - `GET /eod/low-risk-factors`
 - `POST /eod/beta-factors/compute`
@@ -66,7 +70,7 @@ What it does:
 - A background runner checks market state every 60 seconds while the API process is alive.
 - During `PREOPEN`, it refreshes the daily master if needed.
 - During `CLOSED`, after `EOD_AUTO_PYKRX_AFTER_CLOSE_MINUTES`, it schedules a thread-based pykrx daily EOD run if that trade date is available and not already completed.
-- Database persistence stores symbol master data, tracked symbols, quote cache/history, market status snapshots, EOD bars, EOD run records, persisted daily price contexts, daily technical/action snapshots, KIS daily signal features, persisted daily momentum factor results, persisted daily low-risk factor results, persisted daily beta factor results, persisted daily advanced value factor results, persisted daily composite factor results, persisted daily market participation context, and stored day-based trending ranks.
+- Database persistence stores symbol master data, tracked symbols, quote cache/history, market status snapshots, EOD bars, EOD run records, persisted daily price contexts, daily technical/action snapshots, KIS daily signal features, KIS daily market-risk snapshots, persisted daily market-risk filter results, persisted daily momentum factor results, persisted daily low-risk factor results, persisted daily beta factor results, persisted daily advanced value factor results, persisted daily composite factor results, persisted daily market participation context, and stored day-based trending ranks.
 
 ## Database bootstrap
 
@@ -158,6 +162,9 @@ Useful limited-scope runs:
 - API-triggered composite factor rerun: `curl -X POST "http://127.0.0.1:8000/eod/composite-factors/compute?market_date=2026-04-24"`
 - Persisted composite factor inspect: `curl "http://127.0.0.1:8000/eod/composite-factors?market_date=2026-04-24&symbol=005930"`
 - KIS ranking signal-feature collection: `python3.11 -m app.internal.ops kis-daily-signal-features-collect --market-date 2026-04-14`
+- KIS market-risk snapshot collection: `python3.11 -m app.internal.ops eod-market-risk-snapshots-collect --market-date 2026-04-14`
+- API-triggered KIS market-risk snapshot collection: `curl -X POST "http://127.0.0.1:8000/eod/market-risk-snapshots/collect?market_date=2026-04-14"`
+- API-triggered KIS market-risk filter compute: `curl -X POST "http://127.0.0.1:8000/eod/market-risk-filters/compute?market_date=2026-04-14"`
 - Recent derived-context backfill: `python3.11 -m app.internal.ops agent-derived-contexts-backfill-recent`
 - API-triggered KIS ranking signal-feature collection: `curl -X POST "http://127.0.0.1:8000/eod/signal-features/collect?market_date=2026-04-14"`
 
@@ -172,13 +179,14 @@ Internal ops commands from `apps/api`:
 - `python3.11 -m app.internal.ops eod-trending-ranks-compute --market-date 2026-04-08`
 - `python3.11 -m app.internal.ops eod-momentum-factors-compute --market-date 2026-04-08`
 - `python3.11 -m app.internal.ops eod-piotroski-filter-collect --market-date 2026-04-08`
+- `python3.11 -m app.internal.ops eod-market-risk-snapshots-collect --market-date 2026-04-14`
+- `python3.11 -m app.internal.ops eod-market-risk-filters-compute --market-date 2026-04-14`
 - `python3.11 -m app.internal.ops eod-low-risk-factors-compute --market-date 2026-04-23`
 - `python3.11 -m app.internal.ops eod-beta-factors-compute --market-date 2026-04-23`
 - `python3.11 -m app.internal.ops eod-advanced-value-factors-compute --market-date 2026-04-24`
 - `python3.11 -m app.internal.ops eod-composite-factors-compute --market-date 2026-04-24`
 - `python3.11 -m app.internal.ops dart-fundamentals-daily-run-if-due --market-date 2026-04-14 --symbol-limit 250 --capture-limit 500`
 - `python3.11 -m app.internal.ops kis-daily-signal-features-collect --market-date 2026-04-14`
-- `python3.11 -m app.internal.ops eod-market-risk-filters-compute --market-date 2026-04-14`
 - `python3.11 -m app.internal.ops agent-derived-contexts-backfill-recent`
 - `python3.11 -m app.internal.index_audit`
 
@@ -198,7 +206,7 @@ Notes:
 - The pykrx path refreshes the active listed universe first, then backfills only those active symbols.
 - Automatic daily ingestion uses the same pykrx universe/backfill persistence path, but only for the resolved market date and only once per day unless forced or retrying a partial/failed run. Automatic retries are capped at 5 runs per trade date and retry only the symbols that failed in the prior run.
 - The automatic pykrx daily ingestion path now also persists `daily_price_contexts`, `daily_technical_snapshots`, `daily_action_summaries`, and day-based `daily_trending_ranks` after the day bar write completes.
-- The same automatic daily path now also computes `daily_market_risk_filter_results` from KIS `inquire-price-2` for the successfully stored symbol universe. Per-symbol KIS failures are reported as partial errors and do not abort the rest of the daily run.
+- The same automatic daily path now also collects `daily_market_risk_snapshots` from KIS `inquire-price-2`, then computes `daily_market_risk_filter_results` from those stored snapshots for the successfully stored symbol universe. Per-symbol KIS failures are reported as partial errors and do not abort the rest of the daily run.
 - KIS ranking signal-feature collection is a separate ops path because it calls KIS ranking endpoints (`volume-power`, `overtime-volume`, and `overtime-fluctuation`) rather than pykrx bars.
 - The KIS ranking signal-feature collection path also rebuilds `daily_market_participation_contexts` from the stored `daily_signal_features` rows for that market date.
 - `python3.11 -m app.internal.ops agent-derived-contexts-backfill-recent` is the repo-owned bootstrap path for the new derived-context tables. It backfills the recent seven trading days ending yesterday from existing stored `daily_price_bars` and `daily_signal_features`, and it skips participation dates that do not yet have stored signal-feature rows.

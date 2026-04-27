@@ -3,7 +3,11 @@
 ## Summary
 Computes or reads the persisted KIS-backed market-risk status filter for Korean equities.
 
-The compute path uses KIS `inquire-price-2` per symbol, normalizes deterministic `passed_filter`, `watchlist_flagged`, and `risk_state` fields, and stores one row per symbol/date in `daily_market_risk_filter_results`.
+The compute path now runs in two layers:
+- collect or reuse stored KIS `inquire-price-2` snapshots first
+- evaluate focused policy rules second and store the downstream result rows in `daily_market_risk_filter_results`
+
+The read path is intentionally filter-focused: it returns policy state plus explicit blocking or watchlist reasons, not the full normalized snapshot field set.
 
 ## Example compute request
 ```http
@@ -15,6 +19,11 @@ POST /eod/market-risk-filters/compute?market_date=2026-04-15&symbols=005930,0006
 {
   "market_date": "2026-04-15",
   "source": "kis_market_risk_v1",
+  "snapshot_collection": {
+    "feature_version": "kis_quote2_snapshot_v1",
+    "snapshots_persisted": 2,
+    "snapshots_failed": 0
+  },
   "results_persisted": 2,
   "results_failed": 0,
   "summary": {
@@ -30,7 +39,10 @@ POST /eod/market-risk-filters/compute?market_date=2026-04-15&symbols=005930,0006
       "risk_state": "watchlist",
       "passed_filter": true,
       "watchlist_flagged": true,
-      "market_warning_code": "01"
+      "filter_payload": {
+        "blocking_reasons": [],
+        "watchlist_reasons": ["market_warning_01", "investment_caution"]
+      }
     }
   ]
 }
