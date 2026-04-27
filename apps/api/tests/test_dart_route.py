@@ -134,8 +134,83 @@ class FakeCaptureService:
 
     def inspect_daily_refresh_status(self, **kwargs):
         return {
-            'latest_run': {'id': 15, 'status': 'completed'},
-            'runs': [{'id': 15, 'status': 'completed', 'market_date': kwargs['market_date'].isoformat()}],
+            'latest_run': {
+                'id': 15,
+                'status': 'completed',
+                'updated_entries_summary': {
+                    'updated_count': 2,
+                    'visible_preview_limit': 3,
+                    'visible_preview_count': 2,
+                    'has_more': False,
+                    'remaining_count': 0,
+                    'full_list_available': True,
+                },
+                'updated_entries_preview': [
+                    {
+                        'symbol': '005930',
+                        'stock_code': '005930',
+                        'company_name': '삼성전자',
+                        'update_category': 'financial_statement_refresh',
+                        'category_label': 'Financial statement refresh',
+                    }
+                ],
+                'updated_entries': [
+                    {
+                        'symbol': '005930',
+                        'stock_code': '005930',
+                        'company_name': '삼성전자',
+                        'update_category': 'financial_statement_refresh',
+                        'category_label': 'Financial statement refresh',
+                    },
+                    {
+                        'symbol': '123456',
+                        'stock_code': '123456',
+                        'company_name': 'Missing Corp',
+                        'update_category': 'initial_fundamentals_capture',
+                        'category_label': 'Initial fundamentals capture',
+                    },
+                ],
+            },
+            'runs': [
+                {
+                    'id': 15,
+                    'status': 'completed',
+                    'market_date': kwargs['market_date'].isoformat(),
+                    'updated_entries_summary': {
+                        'updated_count': 2,
+                        'visible_preview_limit': 3,
+                        'visible_preview_count': 2,
+                        'has_more': False,
+                        'remaining_count': 0,
+                        'full_list_available': True,
+                    },
+                    'updated_entries_preview': [
+                        {
+                            'symbol': '005930',
+                            'stock_code': '005930',
+                            'company_name': '삼성전자',
+                            'update_category': 'financial_statement_refresh',
+                            'category_label': 'Financial statement refresh',
+                        }
+                    ],
+                    'updated_entries': [
+                        {
+                            'symbol': '005930',
+                            'stock_code': '005930',
+                            'company_name': '삼성전자',
+                            'update_category': 'financial_statement_refresh',
+                            'category_label': 'Financial statement refresh',
+                        },
+                        {
+                            'symbol': '123456',
+                            'stock_code': '123456',
+                            'company_name': 'Missing Corp',
+                            'update_category': 'initial_fundamentals_capture',
+                            'category_label': 'Initial fundamentals capture',
+                        },
+                    ],
+                }
+            ],
         }
 
 
@@ -476,6 +551,8 @@ class DartRouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()['latest_run']['id'], 15)
+        self.assertEqual(response.json()['latest_run']['updated_entries_summary']['updated_count'], 2)
+        self.assertEqual(response.json()['latest_run']['updated_entries'][1]['update_category'], 'initial_fundamentals_capture')
 
     def test_current_universe_backfill_route_validates_fs_div(self):
         client = TestClient(self.app)
