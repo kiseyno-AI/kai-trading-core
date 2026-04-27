@@ -5,6 +5,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.api import routes_agent_context
+from app.agent_context.runtime_state import RuntimeFeedbackStateStore
 
 
 class FakeAgentContextReadService:
@@ -143,6 +144,96 @@ class FakeAgentFeedbackRetryService:
         }
 
 
+class FakeBackgroundDispatchOrchestrator:
+    def __init__(self):
+        self.calls = []
+
+    def dispatch_for_symbols(self, **kwargs):
+        self.calls.append(kwargs)
+        return {
+            'request': {
+                'market_date': kwargs['market_date'].isoformat(),
+                'symbols': kwargs['symbols'],
+                'roles': kwargs['roles'],
+                'request_run_id': kwargs['request_run_id'],
+            },
+            'summary': {
+                'status': 'completed',
+                'completed': len(kwargs['symbols']),
+                'failed': 0,
+            },
+            'items': [],
+            'failures': [],
+        }
+
+
+class FailingBackgroundDispatchOrchestrator:
+    def __init__(self, error: Exception):
+        self.calls = []
+        self.error = error
+
+    def dispatch_for_symbols(self, **kwargs):
+        self.calls.append(kwargs)
+        raise self.error
+
+
+class FakeRunStateService:
+    def __init__(self):
+        self.started = []
+        self.finished = []
+        self._runs_by_id = {}
+
+    def start_run(self, **kwargs):
+        self.started.append(kwargs)
+        self._runs_by_id[kwargs['run_id']] = {
+            'run_id': kwargs['run_id'],
+            'status': kwargs['status'],
+            'completed_count': 0,
+            'failed_count': 0,
+            'request_payload': kwargs['request_payload'],
+            'summary_payload': kwargs.get('summary_payload'),
+            'started_at': kwargs.get('started_at'),
+            'completed_at': None,
+        }
+        return {'ok': True, 'run_id': kwargs['run_id'], 'status': kwargs['status']}
+
+    def get_run(self, *, run_id):
+        return self._runs_by_id.get(run_id)
+
+    def finish_run(self, **kwargs):
+        self.finished.append(kwargs)
+        current = dict(self._runs_by_id.get(kwargs['run_id']) or {})
+        current.update(
+            {
+                'run_id': kwargs['run_id'],
+                'status': kwargs['status'],
+                'completed_count': kwargs['completed_count'],
+                'failed_count': kwargs['failed_count'],
+                'summary_payload': kwargs['summary_payload'],
+                'completed_at': 'finished',
+            }
+        )
+        self._runs_by_id[kwargs['run_id']] = current
+        return {'ok': True, 'run_id': kwargs['run_id'], 'status': kwargs['status']}
+
+
+class FakeAgentContextProgressService:
+    def __init__(self):
+        self.last_args = None
+
+    def get_feedback_progress(self, **kwargs):
+        self.last_args = kwargs
+        return {
+            'request': {
+                'market_date': kwargs['market_date'].isoformat(),
+                'symbols': kwargs['symbols'],
+                'run_id': kwargs['run_id'],
+            },
+            'result': {'market_date': kwargs['market_date'].isoformat(), 'roles': {}},
+            'summary': {'run_id': kwargs['run_id'], 'run_status': 'running'},
+        }
+
+
 class AgentContextRouteTests(unittest.TestCase):
     def setUp(self):
         self.app = FastAPI()
@@ -202,6 +293,113 @@ class AgentContextRouteTests(unittest.TestCase):
         self.assertEqual(summary['first_feedback_at'], '2026-04-14T01:00:00+00:00')
         self.assertEqual(summary['completed_feedback_per_minute'], 0.6)
         self.assertEqual(summary['estimated_completion_at'], '2026-04-14T01:05:00+00:00')
+
+    def test_symbol_dispatch_background_route_starts_durable_queued_run_and_reuses_same_run_id(self):
+        fake_orchestrator = FakeBackgroundDispatchOrchestrator()
+        fake_run_state_service = FakeRunStateService()
+        runtime_store = RuntimeFeedbackStateStore()
+        original_orchestrator = routes_agent_context.agent_feedback_orchestrator
+        original_run_state_service = routes_agent_context.agent_context_feedback_run_state_service
+        original_runtime_store = routes_agent_context.runtime_feedback_state_store
+        routes_agent_context.agent_feedback_orchestrator = fake_orchestrator
+        routes_agent_context.agent_context_feedback_run_state_service = fake_run_state_service
+        routes_agent_context.runtime_feedback_state_store = runtime_store
+        try:
+            client = TestClient(self.app)
+            response = client.post(
+                '/agent-context/feedback/dispatch/symbols',
+                json={
+                    'market_date': '2026-04-14',
+                    'symbols': ['005930', '000660'],
+                    'roles': ['eod-summarizer', 'technical-summarizer'],
+                    'reuse_existing': False,
+                    'wait_for_completion': False,
+                },
+            )
+        finally:
+            routes_agent_context.agent_feedback_orchestrator = original_orchestrator
+            routes_agent_context.agent_context_feedback_run_state_service = original_run_state_service
+            routes_agent_context.runtime_feedback_state_store = original_runtime_store
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        request_run_id = payload['request']['request_run_id']
+        self.assertEqual(payload['summary']['status'], 'queued')
+        self.assertEqual(fake_run_state_service.started[0]['run_id'], request_run_id)
+        self.assertEqual(fake_run_state_service.started[0]['status'], 'queued')
+        self.assertEqual(
+            fake_run_state_service.started[0]['request_payload']['requested_symbols'],
+            ['005930', '000660'],
+        )
+        self.assertEqual(fake_orchestrator.calls[0]['request_run_id'], request_run_id)
+        self.assertEqual(fake_orchestrator.calls[0]['symbols'], ['005930', '000660'])
+        self.assertEqual(fake_orchestrator.calls[0]['roles'], ['eod-summarizer', 'technical-summarizer'])
+
+    def test_symbol_dispatch_background_route_marks_queued_run_failed_when_startup_raises(self):
+        fake_orchestrator = FailingBackgroundDispatchOrchestrator(RuntimeError('unknown roles during startup'))
+        fake_run_state_service = FakeRunStateService()
+        runtime_store = RuntimeFeedbackStateStore()
+        original_orchestrator = routes_agent_context.agent_feedback_orchestrator
+        original_run_state_service = routes_agent_context.agent_context_feedback_run_state_service
+        original_runtime_store = routes_agent_context.runtime_feedback_state_store
+        routes_agent_context.agent_feedback_orchestrator = fake_orchestrator
+        routes_agent_context.agent_context_feedback_run_state_service = fake_run_state_service
+        routes_agent_context.runtime_feedback_state_store = runtime_store
+        try:
+            client = TestClient(self.app)
+            response = client.post(
+                '/agent-context/feedback/dispatch/symbols',
+                json={
+                    'market_date': '2026-04-14',
+                    'symbols': ['005930', '000660'],
+                    'roles': ['bogus-role'],
+                    'reuse_existing': False,
+                    'wait_for_completion': False,
+                },
+            )
+        finally:
+            routes_agent_context.agent_feedback_orchestrator = original_orchestrator
+            routes_agent_context.agent_context_feedback_run_state_service = original_run_state_service
+            routes_agent_context.runtime_feedback_state_store = original_runtime_store
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        request_run_id = payload['request']['request_run_id']
+        self.assertEqual(payload['summary']['status'], 'queued')
+        self.assertEqual(fake_run_state_service.started[0]['status'], 'queued')
+        self.assertEqual(fake_run_state_service.finished[0]['run_id'], request_run_id)
+        self.assertEqual(fake_run_state_service.finished[0]['status'], 'failed')
+        self.assertEqual(
+            fake_run_state_service.finished[0]['summary_payload']['lifecycle_stage'],
+            'background_startup_failed',
+        )
+        self.assertIn('unknown roles during startup', fake_run_state_service.finished[0]['summary_payload']['fatal_error'])
+        self.assertEqual(fake_run_state_service.get_run(run_id=request_run_id)['status'], 'failed')
+        runtime_state = runtime_store.get_run(date.fromisoformat('2026-04-14'), run_id=request_run_id)
+        self.assertIsNotNone(runtime_state)
+        self.assertEqual(runtime_state.status, 'failed')
+
+    def test_feedback_progress_route_passes_optional_run_id(self):
+        fake_service = FakeAgentContextProgressService()
+        original_service = routes_agent_context.agent_context_progress_service
+        routes_agent_context.agent_context_progress_service = fake_service
+        try:
+            client = TestClient(self.app)
+            response = client.get(
+                '/agent-context/feedback/progress',
+                params=[
+                    ('market_date', '2026-04-14'),
+                    ('symbols', '005930'),
+                    ('run_id', 'symbol-run-2026-04-14-abc123'),
+                ],
+            )
+        finally:
+            routes_agent_context.agent_context_progress_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(fake_service.last_args['run_id'], 'symbol-run-2026-04-14-abc123')
+        self.assertEqual(fake_service.last_args['symbols'], ['005930'])
+        self.assertEqual(response.json()['summary']['run_id'], 'symbol-run-2026-04-14-abc123')
 
     def test_symbol_day_context_route_maps_validation_error_to_400(self):
         original_service = routes_agent_context.agent_context_read_service

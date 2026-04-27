@@ -4,7 +4,7 @@
 Dispatches symbol-level summarizer feedback collection with optional freshness-aware reuse.
 
 Core dispatches only the subset of requested symbols whose persisted `daily_piotroski_filter_results` row has `passed_filter=true` for the requested `market_date`. Requested symbols outside that universe are returned in `request.skipped_symbols` and are not dispatched.
-Each normal dispatch also creates a durable `agent_context_feedback_runs` row, checkpoints role progress as the run advances, and finalizes that run row even when the cycle exits partially.
+Each normal dispatch also creates a durable `agent_context_feedback_runs` row, checkpoints role progress as the run advances, and finalizes that run row even when the cycle exits partially. When `wait_for_completion=false`, Core now creates the durable queued run row before returning and reuses the same `request_run_id` when the background work starts.
 
 ## Example request
 ```http
@@ -15,7 +15,8 @@ Content-Type: application/json
   "market_date": "2026-04-15",
   "symbols": ["005930", "000660"],
   "roles": ["eod-summarizer", "technical-summarizer", "fundamental-summarizer"],
-  "reuse_existing": true
+  "reuse_existing": true,
+  "wait_for_completion": false
 }
 ```
 
@@ -24,22 +25,16 @@ Content-Type: application/json
 {
   "request": {
     "market_date": "2026-04-15",
-    "symbols": ["005930"],
+    "symbols": ["005930", "000660"],
     "requested_symbols": ["005930", "000660"],
     "request_run_id": "symbol-run-2026-04-15-ab12cd34ef",
     "roles": ["eod-summarizer", "technical-summarizer", "fundamental-summarizer"],
-    "scope": "piotroski_passed_symbols_only",
-    "skipped_symbols": ["000660"],
-    "symbol_chunk_size": 5,
-    "parallel_subtasks": 6,
-    "reuse_existing": true
+    "reuse_existing": true,
+    "wait_for_completion": false
   },
   "summary": {
-    "status": "completed",
-    "completed": 3,
-    "failed": 0,
-    "skipped": 1
-  },
-  "items": []
+    "status": "queued",
+    "queued": 2
+  }
 }
 ```

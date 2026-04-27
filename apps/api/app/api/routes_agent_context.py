@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 import os
 import signal
@@ -17,6 +17,7 @@ from app.agent_context.orchestrator import agent_feedback_orchestrator
 from app.agent_context.progress_service import agent_context_progress_service
 from app.agent_context.reuse_service import agent_context_reuse_service
 from app.agent_context.read_service import agent_context_read_service
+from app.agent_context.run_state_service import agent_context_feedback_run_state_service
 from app.agent_context.session_cleanup_service import agent_feedback_session_cleanup_service
 from app.agent_context.retry_service import (
     EXPECTED_ROLES,
@@ -24,7 +25,7 @@ from app.agent_context.retry_service import (
     agent_feedback_retry_service,
 )
 from app.agent_context.status_service import agent_context_status_service
-from app.agent_context.runtime_state import runtime_feedback_state_store
+from app.agent_context.runtime_state import RuntimeFeedbackRunState, runtime_feedback_state_store
 
 import threading
 import uuid
@@ -182,11 +183,21 @@ async def dispatch_symbol_agent_feedback(
         request_run_id = f"symbol-run-{payload.market_date.isoformat()}-{uuid.uuid4().hex[:10]}"
         requested_roles = list(payload.roles or EXPECTED_ROLES)
         requested_symbols = list(dict.fromkeys(payload.symbols))
+        started_at = datetime.now(timezone.utc)
+        request_payload = {
+            'market_date': payload.market_date.isoformat(),
+            'symbols': requested_symbols,
+            'requested_symbols': requested_symbols,
+            'request_run_id': request_run_id,
+            'roles': requested_roles,
+            'fs_div': payload.fs_div,
+            'disclosures_limit': payload.disclosures_limit,
+            'reuse_existing': payload.reuse_existing,
+            'scope': 'piotroski_passed_symbols_only',
+            'mode': 'role_sequential_runtime_buffered',
+        }
 
         def _bootstrap_placeholder() -> None:
-            from app.agent_context.runtime_state import RuntimeFeedbackRunState
-            from datetime import datetime, timezone
-
             state = RuntimeFeedbackRunState(
                 run_id=request_run_id,
                 market_date=payload.market_date,
@@ -195,21 +206,115 @@ async def dispatch_symbol_agent_feedback(
                 role_sequence=requested_roles,
                 parallel_per_role=0,
                 batch_size=max(1, len(requested_symbols)),
-                started_at=datetime.now(timezone.utc),
+                started_at=started_at,
                 current_role=requested_roles[0] if requested_roles else None,
             )
             state.status = 'queued'
             runtime_feedback_state_store.start_run(state)
+            agent_context_feedback_run_state_service.start_run(
+                run_id=request_run_id,
+                market_date=payload.market_date,
+                symbols_total=len(requested_symbols),
+                request_payload=request_payload,
+                summary_payload={
+                    'market_date': payload.market_date.isoformat(),
+                    'request': request_payload,
+                    'lifecycle_stage': 'queued',
+                    'current_role': state.current_role,
+                    'role_sequence': requested_roles,
+                    'progress_summary': state.to_progress_summary(),
+                },
+                status='queued',
+                started_at=started_at,
+            )
+
+        def _mark_background_startup_failure(exc: Exception) -> None:
+            run_snapshot = agent_context_feedback_run_state_service.get_run(run_id=request_run_id)
+            if run_snapshot is not None:
+                run_status = str(run_snapshot.get('status') or '').strip().lower()
+                if run_snapshot.get('completed_at') is not None or run_status in {'completed', 'partial', 'failed'}:
+                    return
+
+            completed_count = int(run_snapshot.get('completed_count') or 0) if isinstance(run_snapshot, dict) else 0
+            failed_count = int(run_snapshot.get('failed_count') or 0) if isinstance(run_snapshot, dict) else 0
+            final_status = 'partial' if completed_count > 0 or failed_count > 0 else 'failed'
+            completed_at = datetime.now(timezone.utc)
+
+            def _update_runtime_state(current: RuntimeFeedbackRunState) -> None:
+                current.status = final_status
+                current.completed_at = completed_at
+                current.last_activity_at = completed_at
+                current.cycle_status = final_status
+
+            state = runtime_feedback_state_store.update_run(
+                payload.market_date,
+                _update_runtime_state,
+                run_id=request_run_id,
+            )
+            progress_summary = state.to_progress_summary() if state is not None else None
+            if progress_summary is not None:
+                completed_count = int(progress_summary.get('completed_feedback_count') or completed_count)
+                failed_count = int(progress_summary.get('failed_items') or failed_count)
+                final_status = 'partial' if completed_count > 0 or failed_count > 0 else 'failed'
+                if state.status != final_status:
+                    state.status = final_status
+                progress_summary['run_status'] = final_status
+                progress_summary['run_table_status'] = final_status
+                progress_summary['is_live'] = False
+                progress_summary['run_completed_at'] = completed_at.isoformat()
+
+            agent_context_feedback_run_state_service.finish_run(
+                run_id=request_run_id,
+                status=final_status,
+                completed_count=completed_count,
+                failed_count=failed_count,
+                summary_payload={
+                    'market_date': payload.market_date.isoformat(),
+                    'request': request_payload,
+                    'lifecycle_stage': 'background_startup_failed',
+                    'current_role': requested_roles[0] if requested_roles else None,
+                    'role_sequence': requested_roles,
+                    'progress_summary': progress_summary,
+                    'fatal_error': f'{type(exc).__name__}: {exc}',
+                },
+            )
 
         def _run_dispatch() -> None:
-            agent_feedback_orchestrator.dispatch_for_symbols(
-                market_date=payload.market_date,
-                symbols=requested_symbols,
-                roles=requested_roles,
-                fs_div=payload.fs_div,
-                disclosures_limit=payload.disclosures_limit,
-                reuse_existing=payload.reuse_existing,
-            )
+            try:
+                agent_feedback_orchestrator.dispatch_for_symbols(
+                    market_date=payload.market_date,
+                    symbols=requested_symbols,
+                    roles=requested_roles,
+                    fs_div=payload.fs_div,
+                    disclosures_limit=payload.disclosures_limit,
+                    reuse_existing=payload.reuse_existing,
+                    request_run_id=request_run_id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                try:
+                    _mark_background_startup_failure(exc)
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        'Agent symbol feedback background startup failure finalization failed',
+                        extra={
+                            'request_run_id': request_run_id,
+                            'market_date': payload.market_date.isoformat(),
+                            'requested_roles': requested_roles,
+                            'requested_symbols': requested_symbols,
+                            'error': str(exc),
+                        },
+                    )
+                else:
+                    logger.exception(
+                        'Agent symbol feedback background dispatch failed after queue handoff',
+                        extra={
+                            'request_run_id': request_run_id,
+                            'market_date': payload.market_date.isoformat(),
+                            'requested_roles': requested_roles,
+                            'requested_symbols': requested_symbols,
+                            'error': str(exc),
+                        },
+                    )
 
         _bootstrap_placeholder()
         background_tasks.add_task(_run_dispatch)
@@ -438,11 +543,13 @@ async def get_agent_feedback_status(
 async def get_agent_feedback_progress(
     market_date: date = Query(...),
     symbols: list[str] | None = Query(default=None),
+    run_id: str | None = Query(default=None),
 ) -> dict:
     try:
         return agent_context_progress_service.get_feedback_progress(
             market_date=market_date,
             symbols=symbols,
+            run_id=run_id,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

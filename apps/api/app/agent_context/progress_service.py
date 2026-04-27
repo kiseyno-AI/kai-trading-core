@@ -49,15 +49,24 @@ class AgentContextProgressService:
 
         result_payload = persisted_progress['result']
         summary_payload = persisted_progress['summary']
+        resolved_run_mode = self._resolve_run_mode(resolved_run)
         if state is not None:
-            summary_payload = state.to_progress_summary()
-            if resolved_run is not None:
-                summary_payload = self._merge_run_table_metadata(summary=summary_payload, run_snapshot=resolved_run)
-                result_payload = self._build_result_from_summary(
-                    market_date=normalized_market_date,
-                    summary=summary_payload,
-                    expected_agents=expected_agent_names,
+            runtime_summary = state.to_progress_summary()
+            if resolved_run is not None and resolved_run_mode == DAILY_RETRY_CYCLE_MODE and normalized_symbols is None:
+                summary_payload = self._merge_live_retry_summary_with_persisted_progress(
+                    persisted_summary=persisted_progress['summary'],
+                    runtime_summary=runtime_summary,
+                    run_snapshot=resolved_run,
                 )
+            else:
+                summary_payload = runtime_summary
+                if resolved_run is not None:
+                    summary_payload = self._merge_run_table_metadata(summary=summary_payload, run_snapshot=resolved_run)
+                    result_payload = self._build_result_from_summary(
+                        market_date=normalized_market_date,
+                        summary=summary_payload,
+                        expected_agents=expected_agent_names,
+                    )
         elif resolved_run is not None:
             summary_payload = self._build_summary_from_run_snapshot(
                 run_snapshot=resolved_run,
@@ -79,6 +88,71 @@ class AgentContextProgressService:
             'result': result_payload,
             'summary': summary_payload,
         }
+
+    @staticmethod
+    def _resolve_run_mode(run_snapshot: dict[str, Any] | None) -> str | None:
+        if not isinstance(run_snapshot, dict):
+            return None
+        request_payload = run_snapshot.get('request_payload') if isinstance(run_snapshot.get('request_payload'), dict) else {}
+        summary_payload = run_snapshot.get('summary_payload') if isinstance(run_snapshot.get('summary_payload'), dict) else {}
+        mode = request_payload.get('mode')
+        if mode is None:
+            mode = summary_payload.get('mode')
+        return str(mode).strip() if mode is not None else None
+
+    def _merge_live_retry_summary_with_persisted_progress(
+        self,
+        *,
+        persisted_summary: dict[str, Any],
+        runtime_summary: dict[str, Any],
+        run_snapshot: dict[str, Any],
+    ) -> dict[str, Any]:
+        merged = self._merge_run_table_metadata(summary=dict(persisted_summary), run_snapshot=run_snapshot)
+        for key in (
+            'run_status',
+            'is_live',
+            'run_started_at',
+            'run_completed_at',
+            'current_role',
+            'completed_roles',
+            'remaining_roles',
+            'cycle_number',
+            'completed_cycles',
+            'max_cycles',
+            'cycle_mode',
+            'cycle_status',
+            'parallel_per_role',
+            'seconds_since_last_feedback',
+            'buffered_feedback_count',
+            'buffered_failure_count',
+            'pending_feedback_count',
+            'pending_failure_count',
+            'flushed_feedback_count',
+            'flushed_failure_count',
+        ):
+            if runtime_summary.get(key) is not None:
+                merged[key] = runtime_summary[key]
+
+        current_role = str(merged.get('current_role') or '').strip()
+        role_progress = merged.get('role_progress') if isinstance(merged.get('role_progress'), dict) else {}
+        runtime_role_progress = (
+            runtime_summary.get('role_progress')
+            if isinstance(runtime_summary.get('role_progress'), dict)
+            else {}
+        )
+        current_role_progress = runtime_role_progress.get(current_role)
+        if current_role and isinstance(role_progress.get(current_role), dict):
+            updated_role_progress = dict(role_progress[current_role])
+            updated_role_progress['status'] = (
+                current_role_progress.get('status')
+                if isinstance(current_role_progress, dict) and current_role_progress.get('status') is not None
+                else 'running'
+            )
+            if isinstance(current_role_progress, dict) and current_role_progress.get('boundary_status') is not None:
+                updated_role_progress['boundary_status'] = current_role_progress['boundary_status']
+            role_progress = {**role_progress, current_role: updated_role_progress}
+            merged['role_progress'] = role_progress
+        return merged
 
     def _build_persisted_progress(
         self,

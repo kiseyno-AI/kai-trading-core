@@ -1599,6 +1599,7 @@ class AgentFeedbackOrchestrator:
         fs_div: str | None = None,
         disclosures_limit: int = 5,
         reuse_existing: bool = True,
+        request_run_id: str | None = None,
     ) -> dict[str, Any]:
         normalized_market_date = market_date if isinstance(market_date, date) else date.fromisoformat(market_date)
         specs = self._select_specs(roles=roles)
@@ -1607,7 +1608,7 @@ class AgentFeedbackOrchestrator:
             market_date=normalized_market_date,
             requested_symbols=requested_symbols,
         )
-        request_run_id = f'symbol-run-{normalized_market_date.isoformat()}-{uuid.uuid4().hex[:10]}'
+        request_run_id = request_run_id or f'symbol-run-{normalized_market_date.isoformat()}-{uuid.uuid4().hex[:10]}'
         batch_size = max(1, settings.openclaw_agent_symbol_chunk_size)
         role_parallelism = max(1, settings.openclaw_agent_parallel_subtasks)
         request_payload = {
