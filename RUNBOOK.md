@@ -13,11 +13,11 @@ Start command:
 What it does:
 - installs Python requirements
 - loads `apps/api/.env`
-- when `DB_AUTO_UPGRADE=true`, runs `python3.11 -m app.internal.deploy_hygiene preflight --format text` before uvicorn
+- when `DB_AUTO_UPGRADE=true`, runs deploy preflight before uvicorn, applies `alembic upgrade head` itself when the database is safely behind head, then verifies `--require-head` before starting the server
 - starts FastAPI via uvicorn on `127.0.0.1:8000` by default
 - if `UPSTREAM_BEARER_TOKEN` is set, all incoming API requests require `Authorization: Bearer <token>`
 - local orchestration should prefer `python3.11 -m app.internal.ops ...` over raw localhost `curl` so bearer auth does not break internal jobs
-- if `DB_AUTO_UPGRADE=true`, startup also runs Alembic migrations to `head`
+- when `./start-api.sh` handles the migration path, it exports `DB_AUTO_UPGRADE=false` for the uvicorn process so FastAPI lifespan startup does not immediately run a duplicate migration pass
 - if `API_REQUEST_LOGGING_ENABLED=true` and/or `UPSTREAM_HTTP_LOGGING_ENABLED=true`, the service writes rotating JSONL audit logs under `apps/api/var/log` by default
 
 ## Health checks

@@ -21,7 +21,7 @@ Use these keys in local `.env`:
 ## Current app behavior
 
 - FastAPI startup can auto-apply Alembic migrations when `DB_AUTO_UPGRADE=true`
-- `apps/api/start-api.sh` now runs a non-destructive migration preflight before uvicorn when `DB_AUTO_UPGRADE=true`
+- `apps/api/start-api.sh` now runs migration preflight before uvicorn when `DB_AUTO_UPGRADE=true`, applies `alembic upgrade head` itself when the database is safely behind head, then verifies `--require-head`
 - `/health` reports database connectivity
 - Schema is managed in `apps/api/db_migrations/versions/`
 
@@ -37,7 +37,7 @@ From `apps/api`:
 4. Verify the app imports cleanly:
    `python -c "from app.main import app"`
 
-If you keep `DB_AUTO_UPGRADE=true`, normal FastAPI startup will also try to bring the schema to `head`.
+If you keep `DB_AUTO_UPGRADE=true` and launch uvicorn directly, normal FastAPI startup will still try to bring the schema to `head`. The `./start-api.sh` wrapper now owns that migration step itself and clears `DB_AUTO_UPGRADE` for the uvicorn child process after the schema is verified at head, so startup does not immediately run a duplicate migration pass.
 
 For deploy-time hygiene from `apps/api`:
 
