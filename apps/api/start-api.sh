@@ -46,6 +46,7 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PA
 
 if is_truthy "${DB_AUTO_UPGRADE:-true}"; then
   "$PYTHON_BIN" -m app.internal.deploy_hygiene preflight --format text
+  export DB_AUTO_UPGRADE=false
 fi
 
 exec "$PYTHON_BIN" -m uvicorn app.main:app --host "$HOST" --port "$PORT"
