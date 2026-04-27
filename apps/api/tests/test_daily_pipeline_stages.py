@@ -41,6 +41,21 @@ class _FakeFeedbackRetryService:
         }
 
 
+class _FakeSkippedPykrxStageRunner:
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def run_daily_pipeline_stages(self, **kwargs):
+        self.calls.append(kwargs)
+        return {
+            'triggered': False,
+            'reason': 'already_running',
+            'market_date': kwargs['market_date'],
+            'latest_available_trade_date': kwargs['market_date'],
+            'source': 'pykrx',
+        }
+
+
 class DailyPipelineStageServiceTests(unittest.TestCase):
     def test_describe_returns_canonical_stage_order_and_default_sequence(self) -> None:
         service = DailyPipelineStageService()
@@ -99,6 +114,36 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, 'Unknown daily stage'):
             service.run(market_date='2026-04-14', stages=['not-a-stage'])
+
+    def test_run_marks_grouped_pykrx_skip_payloads_as_skipped(self) -> None:
+        pykrx_runner = _FakeSkippedPykrxStageRunner()
+        service = DailyPipelineStageService(pykrx_service=pykrx_runner)
+
+        result = service.run(
+            market_date='2026-04-14',
+            stages=['price_collection', 'technical_snapshots'],
+        )
+
+        self.assertEqual(result['status'], 'skipped')
+        self.assertEqual(result['stages']['price_collection']['status'], 'skipped')
+        self.assertEqual(result['stages']['technical_snapshots']['status'], 'skipped')
+        self.assertFalse(result['stages']['price_collection']['result']['triggered'])
+        self.assertEqual(result['stages']['technical_snapshots']['result']['reason'], 'already_running')
+
+    def test_resolve_result_status_marks_error_only_payload_failed(self) -> None:
+        status = DailyPipelineStageService._resolve_result_status({'error': 'boom'})
+
+        self.assertEqual(status, 'failed')
+
+    def test_resolve_result_status_marks_error_payload_with_progress_partial(self) -> None:
+        status = DailyPipelineStageService._resolve_result_status(
+            {
+                'error': 'boom',
+                'trending_ranks_persisted': 2,
+            }
+        )
+
+        self.assertEqual(status, 'partial')
 
 
 if __name__ == '__main__':

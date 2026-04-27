@@ -343,7 +343,7 @@ def run_market_data_pipeline(
     price_context_symbols = [item.symbol for item in symbols if item.symbol not in failed_symbol_set]
     price_context_result: dict
     price_context_error_message: str | None = None
-    if selected_stages is None:
+    if mode != 'daily_stage_run':
         try:
             price_context_result = dependencies.price_context_service.rebuild_for_market_date(
                 market_date=latest_trade_date,

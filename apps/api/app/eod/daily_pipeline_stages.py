@@ -554,6 +554,10 @@ class DailyPipelineStageService:
         raise ValueError(f'Unsupported daily stage: {stage_id}')
 
     def _extract_pykrx_stage_result(self, stage_id: str, result: dict[str, Any]) -> dict[str, Any]:
+        if result.get('skipped') or result.get('triggered') is False:
+            payload = dict(result)
+            payload.setdefault('market_date', result.get('latest_available_trade_date'))
+            return payload
         if stage_id == 'price_collection':
             return {
                 'run_id': result.get('run_id'),
@@ -629,6 +633,14 @@ class DailyPipelineStageService:
 
     @staticmethod
     def _resolve_result_status(result: dict[str, Any]) -> str:
+        failed_keys = (
+            'results_failed',
+            'snapshots_failed',
+            'action_summaries_failed',
+            'features_failed',
+            'symbols_failed',
+            'contexts_failed',
+        )
         if result.get('skipped') or result.get('triggered') is False:
             return 'skipped'
         raw_status = str(result.get('status') or '').strip()
@@ -636,18 +648,32 @@ class DailyPipelineStageService:
             return 'partial' if raw_status == 'completed_with_errors' else raw_status
         if 'completed' in result and 'final_pending' in result:
             return 'completed' if bool(result.get('completed')) else 'partial'
+        if result.get('error') or result.get('error_message'):
+            if any(int(result.get(failed_key) or 0) > 0 for failed_key in failed_keys):
+                return 'partial'
+            if DailyPipelineStageService._has_successful_work(result):
+                return 'partial'
+            return 'failed'
 
-        for failed_key in (
-            'results_failed',
-            'snapshots_failed',
-            'action_summaries_failed',
-            'features_failed',
-            'symbols_failed',
-            'contexts_failed',
-        ):
+        for failed_key in failed_keys:
             if failed_key in result:
                 return 'completed' if int(result.get(failed_key) or 0) == 0 else 'partial'
         return 'completed'
+
+    @staticmethod
+    def _has_successful_work(result: dict[str, Any]) -> bool:
+        success_suffixes = ('_persisted', '_succeeded', '_refreshed', '_fresh')
+        success_keys = {'bars_upserted', 'persisted_count'}
+        for key, value in result.items():
+            if isinstance(value, bool):
+                continue
+            if not isinstance(value, int):
+                continue
+            if value <= 0:
+                continue
+            if key in success_keys or key.endswith(success_suffixes):
+                return True
+        return False
 
     @staticmethod
     def _resolve_overall_status(stage_outcomes: Sequence[dict[str, Any]]) -> str:
