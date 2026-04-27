@@ -52,6 +52,14 @@ DEFAULT_START_DATE = '19560101'
 DEFAULT_MARKETS = ('KOSPI', 'KOSDAQ', 'KONEX')
 MAX_AUTO_PYKRX_DAILY_RUNS_PER_TRADE_DATE = 5
 RETRYABLE_DAILY_STATUSES = {'completed_with_errors', 'failed'}
+PYKRX_STAGE_SEQUENCE = (
+    'price_collection',
+    'technical_snapshots',
+    'action_summaries',
+    'trending_ranks',
+    'signal_features',
+    'market_risk_filter',
+)
 
 
 def _log_pykrx_fetch(operation: str, status: str, **fields) -> None:
@@ -689,6 +697,8 @@ class PykrxBackfillService:
                 mode='daily_auto',
                 symbols_override=symbols_override,
                 retry_context=retry_context,
+                selected_stages=PYKRX_STAGE_SEQUENCE,
+                chain_fundamentals_followup=True,
             )
             result['triggered'] = True
             _log_pykrx_fetch(
@@ -725,6 +735,74 @@ class PykrxBackfillService:
                 source='pykrx',
             )
         return resolved_run
+
+    def run_daily_pipeline_stages(
+        self,
+        *,
+        market_date: str,
+        stages: Sequence[str],
+        markets: Sequence[str] = DEFAULT_MARKETS,
+        trigger: str = 'stage_orchestrator',
+        refresh_universe: bool = True,
+        force: bool = False,
+        symbols: Sequence[str] | None = None,
+    ) -> dict:
+        requested_stages = [stage for stage in PYKRX_STAGE_SEQUENCE if stage in set(stages)]
+        if not requested_stages:
+            raise ValueError('At least one pykrx stage must be requested.')
+        if 'price_collection' not in requested_stages:
+            raise ValueError('price_collection must be included when running grouped pykrx stages.')
+
+        normalized_market_date = _normalize_yyyymmdd(market_date)
+        market_date_iso = _normalize_iso_date(normalized_market_date)
+        latest_trade_date = self.resolve_latest_trade_date(end_date=normalized_market_date)
+        if latest_trade_date != market_date_iso:
+            return build_daily_skip_result(
+                reason='trade_date_not_available_yet',
+                market_date=market_date_iso,
+                latest_available_trade_date=latest_trade_date,
+            )
+
+        symbols_override = None
+        if symbols:
+            requested_symbols = {str(item).strip().zfill(6) for item in symbols if str(item).strip()}
+            symbols_override = [
+                item
+                for item in self.load_active_universe(markets=markets)
+                if item.symbol in requested_symbols
+            ]
+            if not symbols_override:
+                raise RuntimeError('No active pykrx symbols matched the requested stage scope.')
+
+        with advisory_eod_collection_lock(market='KRX', trade_date=market_date_iso, source='pykrx') as lock_acquired:
+            if not lock_acquired:
+                result = build_daily_skip_result(
+                    reason='already_running',
+                    market_date=market_date_iso,
+                    latest_available_trade_date=latest_trade_date,
+                )
+                _log_pykrx_fetch('run_daily_pipeline_stages', 'skipped', **result)
+                return result
+
+            result = self._run_market_data_pipeline(
+                start_date=normalized_market_date,
+                end_date=normalized_market_date,
+                markets=markets,
+                trigger=trigger,
+                refresh_universe=refresh_universe,
+                mode='daily_stage_run',
+                symbols_override=symbols_override,
+                selected_stages=requested_stages,
+                chain_fundamentals_followup=False,
+            )
+            result['triggered'] = True
+            result['forced'] = force
+            _log_pykrx_fetch(
+                'run_daily_pipeline_stages',
+                result['status'],
+                **{key: value for key, value in result.items() if key != 'status'},
+            )
+            return result
 
     def _is_retryable_daily_run(self, run: dict) -> bool:
         status = run.get('status')
@@ -904,6 +982,8 @@ class PykrxBackfillService:
         symbol: str | None = None,
         symbols_override: Sequence[PykrxSymbol] | None = None,
         retry_context: dict | None = None,
+        selected_stages: Sequence[str] | None = None,
+        chain_fundamentals_followup: bool = True,
     ) -> dict:
         return run_market_data_pipeline(
             self,
@@ -935,6 +1015,8 @@ class PykrxBackfillService:
             symbol=symbol,
             symbols_override=symbols_override,
             retry_context=retry_context,
+            selected_stages=selected_stages,
+            chain_fundamentals_followup=chain_fundamentals_followup,
         )
 
     def _load_symbol_fundamentals(self, *, symbol: str, start_date: str, end_date: str):

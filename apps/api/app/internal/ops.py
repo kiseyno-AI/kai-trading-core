@@ -16,6 +16,7 @@ from app.dart.signals_service import dart_signals_service
 from app.db import init_database
 from app.eod.action_summaries import daily_action_summary_service
 from app.eod.auto_pykrx import auto_pykrx_eod_scheduler
+from app.eod.daily_pipeline_stages import daily_pipeline_stage_service
 from app.eod.master import refresh_master_if_due
 from app.eod.master_state import master_refresh_state
 from app.eod.pykrx_backfill import DEFAULT_MARKETS, PYKRX_BACKFILL_SERVICE
@@ -175,6 +176,50 @@ def collect_daily_piotroski_filter_results(
     bootstrap_runtime()
     return daily_piotroski_filter_service.rebuild_for_market_date(
         market_date=market_date or get_market_state().server_time[:10],
+    )
+
+
+def list_daily_pipeline_stages() -> dict[str, Any]:
+    bootstrap_runtime()
+    return daily_pipeline_stage_service.describe()
+
+
+def run_daily_pipeline_stages(
+    *,
+    market_date: str | None = None,
+    stages: str | None = None,
+    symbols: str | None = None,
+    markets: str | None = None,
+    force: bool = False,
+    refresh_universe: bool | None = None,
+    fs_div: str | None = None,
+    symbol_limit: int | None = None,
+    symbol_offset: int = 0,
+    capture_limit: int = 500,
+    retry_cycles: int | None = None,
+    feedback_max_cycles: int = 3,
+    feedback_outer_batch_size: int = 20,
+    reuse_existing_feedback: bool = True,
+) -> dict[str, Any]:
+    bootstrap_runtime()
+    parsed_stages = [item.strip() for item in stages.split(',') if item.strip()] if stages else None
+    parsed_symbols = [item.strip() for item in symbols.split(',') if item.strip()] if symbols else None
+    parsed_markets = [item.strip() for item in markets.split(',') if item.strip()] if markets else None
+    return daily_pipeline_stage_service.run(
+        market_date=market_date,
+        stages=parsed_stages,
+        symbols=parsed_symbols,
+        markets=parsed_markets,
+        force=force,
+        refresh_universe=refresh_universe,
+        fs_div=fs_div,
+        symbol_limit=symbol_limit,
+        symbol_offset=symbol_offset,
+        capture_limit=capture_limit,
+        retry_cycles=retry_cycles,
+        feedback_max_cycles=feedback_max_cycles,
+        feedback_outer_batch_size=feedback_outer_batch_size,
+        reuse_existing_feedback=reuse_existing_feedback,
     )
 
 
@@ -394,6 +439,26 @@ def _build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser('quotes-tracked', help='Return /quotes/tracked directly from services')
     subparsers.add_parser('scanner-tracked-symbols', help='Return /scanner/tracked-symbols directly from services')
     subparsers.add_parser('eod-status', help='Return /eod/status directly from services')
+    subparsers.add_parser('eod-pipeline-stages', help='List the canonical daily pipeline stage catalog')
+
+    pipeline_run_parser = subparsers.add_parser(
+        'eod-pipeline-run',
+        help='Run an explicit subset of the daily pipeline stages in canonical order',
+    )
+    pipeline_run_parser.add_argument('--market-date')
+    pipeline_run_parser.add_argument('--stages')
+    pipeline_run_parser.add_argument('--symbols')
+    pipeline_run_parser.add_argument('--markets')
+    pipeline_run_parser.add_argument('--force', action='store_true')
+    pipeline_run_parser.add_argument('--refresh-universe', choices=('true', 'false'))
+    pipeline_run_parser.add_argument('--fs-div')
+    pipeline_run_parser.add_argument('--symbol-limit', type=int)
+    pipeline_run_parser.add_argument('--symbol-offset', type=int, default=0)
+    pipeline_run_parser.add_argument('--capture-limit', type=int, default=500)
+    pipeline_run_parser.add_argument('--retry-cycles', type=int)
+    pipeline_run_parser.add_argument('--feedback-max-cycles', type=int, default=3)
+    pipeline_run_parser.add_argument('--feedback-outer-batch-size', type=int, default=20)
+    pipeline_run_parser.add_argument('--reuse-existing-feedback', choices=('true', 'false'), default='true')
 
     refresh_master_parser = subparsers.add_parser('eod-master-refresh-if-due', help='Run master refresh directly')
     refresh_master_parser.add_argument('--force', action='store_true')
@@ -562,6 +627,25 @@ def main(argv: Iterable[str] | None = None) -> int:
         payload = get_tracked_symbols()
     elif args.command == 'eod-status':
         payload = get_eod_status()
+    elif args.command == 'eod-pipeline-stages':
+        payload = list_daily_pipeline_stages()
+    elif args.command == 'eod-pipeline-run':
+        payload = run_daily_pipeline_stages(
+            market_date=args.market_date,
+            stages=args.stages,
+            symbols=args.symbols,
+            markets=args.markets,
+            force=args.force,
+            refresh_universe=None if args.refresh_universe is None else args.refresh_universe == 'true',
+            fs_div=args.fs_div,
+            symbol_limit=args.symbol_limit,
+            symbol_offset=args.symbol_offset,
+            capture_limit=args.capture_limit,
+            retry_cycles=args.retry_cycles,
+            feedback_max_cycles=args.feedback_max_cycles,
+            feedback_outer_batch_size=args.feedback_outer_batch_size,
+            reuse_existing_feedback=args.reuse_existing_feedback == 'true',
+        )
     elif args.command == 'eod-master-refresh-if-due':
         payload = refresh_master_if_due_internal(force=args.force)
     elif args.command == 'eod-pykrx-daily-run-if-due':

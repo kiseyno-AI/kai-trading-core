@@ -1,10 +1,12 @@
 import asyncio
 
 from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel, Field
 
 from app.core.settings import settings
 from app.eod.action_summaries import daily_action_summary_service
 from app.eod.auto_pykrx import auto_pykrx_eod_scheduler
+from app.eod.daily_pipeline_stages import daily_pipeline_stage_service
 from app.eod.freshness import eod_freshness_service
 from app.eod.master import refresh_master_if_due
 from app.eod.pipeline_status import eod_pipeline_status_service
@@ -37,6 +39,23 @@ from app.signals.value_factor import VALUE_FACTOR_SOURCE, daily_value_factor_ser
 router = APIRouter(prefix='/eod', tags=['eod'])
 
 
+class EODPipelineRunRequest(BaseModel):
+    market_date: str | None = None
+    stages: list[str] | None = None
+    symbols: list[str] | None = None
+    markets: list[str] | None = None
+    force: bool = False
+    refresh_universe: bool | None = None
+    fs_div: str | None = None
+    symbol_limit: int | None = Field(default=None, ge=1)
+    symbol_offset: int = Field(default=0, ge=0)
+    capture_limit: int = Field(default=500, ge=1)
+    retry_cycles: int | None = Field(default=None, ge=1)
+    feedback_max_cycles: int = Field(default=3, ge=1)
+    feedback_outer_batch_size: int = Field(default=20, ge=1)
+    reuse_existing_feedback: bool = True
+
+
 @router.get('/status')
 async def get_eod_status() -> dict:
     return {
@@ -66,6 +85,32 @@ async def get_eod_pipeline_status(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f'EOD pipeline status read failed: {exc}') from exc
+
+
+@router.get('/pipeline/stages')
+async def get_eod_pipeline_stages() -> dict:
+    try:
+        return await asyncio.to_thread(daily_pipeline_stage_service.describe)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'EOD pipeline stage catalog read failed: {exc}') from exc
+
+
+@router.post('/pipeline/run')
+async def run_eod_pipeline(payload: EODPipelineRunRequest) -> dict:
+    try:
+        request_kwargs = (
+            payload.model_dump(exclude_none=True)
+            if hasattr(payload, 'model_dump')
+            else payload.dict(exclude_none=True)
+        )
+        return await asyncio.to_thread(
+            daily_pipeline_stage_service.run,
+            **request_kwargs,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f'EOD pipeline run failed: {exc}') from exc
 
 
 @router.post('/master/refresh-if-due')

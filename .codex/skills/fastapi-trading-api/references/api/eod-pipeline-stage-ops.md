@@ -1,0 +1,74 @@
+# GET /eod/pipeline/stages and POST /eod/pipeline/run
+
+## Summary
+Lists the canonical daily stage catalog and runs an explicit subset of those stages through the thin daily pipeline orchestrator.
+
+`GET /eod/pipeline/stages` returns the stable stage order, default operator sequence, dependency metadata, inspect routes, and output-table hints so operators can decide which stages to run.
+
+`POST /eod/pipeline/run` accepts a stage subset, preserves canonical ordering, and delegates execution to the reusable stage operations. Callers should include any prerequisites they need; the catalog response exposes `depends_on` for inspectability.
+
+## Example catalog request
+```http
+GET /eod/pipeline/stages
+```
+
+## Example run request
+```http
+POST /eod/pipeline/run
+Content-Type: application/json
+
+{
+  "market_date": "2026-04-21",
+  "stages": ["signal_decider", "technical_snapshots", "price_collection", "agent_feedback_summaries"],
+  "symbols": ["005930", "000660"],
+  "markets": ["KOSPI", "KOSDAQ"],
+  "force": true,
+  "fs_div": "CFS",
+  "capture_limit": 100
+}
+```
+
+## Example response
+```json
+{
+  "market_date": "2026-04-21",
+  "requested_stages": [
+    "signal_decider",
+    "technical_snapshots",
+    "price_collection",
+    "agent_feedback_summaries"
+  ],
+  "resolved_stages": [
+    "price_collection",
+    "technical_snapshots",
+    "agent_feedback_summaries",
+    "signal_decider"
+  ],
+  "status": "completed",
+  "stages": {
+    "price_collection": {
+      "stage": "price_collection",
+      "label": "pykrx daily price collection",
+      "group": "market_data",
+      "status": "completed",
+      "result": {
+        "run_id": 184,
+        "market_date": "2026-04-21",
+        "bars_upserted": 2,
+        "symbols_succeeded": 2,
+        "symbols_failed": 0
+      }
+    },
+    "signal_decider": {
+      "stage": "signal_decider",
+      "label": "signal decider dispatch",
+      "group": "agent_feedback",
+      "status": "completed",
+      "result": {
+        "completed": true,
+        "final_pending": 0
+      }
+    }
+  }
+}
+```
