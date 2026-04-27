@@ -229,13 +229,16 @@ def build_contract_prompt_suffix(*, role: str | None = None) -> str:
     if role == SIGNAL_DECIDER_AGENT_NAME:
         return (
             'Return JSON only. Do not wrap in markdown. '
-            'Required top-level keys: role, agent_name, symbol, market_date, preferred_action, next_day_open_action, '
+            'For every signal-decider feedback object, required keys are: role, agent_name, symbol, market_date, preferred_action, next_day_open_action, '
             'entry_price_basis, target_price, expected_return_pct, stop_loss_price, suggested_holding_period, '
             'confidence_score_10, conviction_score_10, thesis_summary, supporting_evidence, decision_risks, '
             'invalidation_conditions, data_quality_warnings, specialist_disagreement, traceability, summary, confidence, '
             'risk_flags, details, improvement_notes. '
             'role must equal the requested role. '
             'agent_name should equal signal-decider. '
+            'symbol is mandatory and must exactly equal the assigned/requested symbol string. '
+            'Do not omit, alias, translate, normalize away leading zeroes, reorder, infer, or substitute symbols. '
+            'traceability.symbol must exactly match symbol, and both must match the assigned item symbol. '
             'next_day_open_action and preferred_action must be one of buy, wait, reject. '
             'entry_price_basis should be next_open unless the supplied inputs justify a different explicit basis. '
             'Use null rather than fake precision when a numeric field is not well-supported by the inputs. '
@@ -243,7 +246,9 @@ def build_contract_prompt_suffix(*, role: str | None = None) -> str:
             'thesis_summary must be a concise decision-support explanation. '
             'supporting_evidence, decision_risks, invalidation_conditions, data_quality_warnings, specialist_disagreement, '
             'risk_flags, and improvement_notes must be arrays of short strings. '
-            'details must be an object with structured decision-support fields and traceability.'
+            'details must be an object with structured decision-support fields and traceability. '
+            'If evidence is missing, weak, conflicting, or truncated, still return a complete structured conservative feedback object with wait or reject, null unsupported numeric fields, and explicit risk/data-quality warnings. '
+            'Before finalizing, self-check that the JSON is parseable, all required keys are present, role and agent_name are correct, symbol and traceability.symbol exactly match the assigned symbol, and arrays are arrays of strings.'
         )
     return (
         'Return JSON only. Do not wrap in markdown. '
