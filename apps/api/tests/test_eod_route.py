@@ -171,6 +171,69 @@ class FakeSignalFeatureService:
         }
 
 
+class FakeMarketRiskSnapshotService:
+    def __init__(self):
+        self.collect_args = None
+        self.inspect_args = None
+
+    async def collect_for_market_date(self, **kwargs):
+        self.collect_args = kwargs
+        return {
+            'market_date': kwargs['market_date'],
+            'feature_version': kwargs['source'],
+            'snapshots_persisted': 2,
+            'snapshots_failed': 0,
+            'items': [{'symbol': '005930', 'is_trade_halted': True, 'market_warning_code': '01'}],
+        }
+
+    def inspect(self, **kwargs):
+        self.inspect_args = kwargs
+        market_date = kwargs.get('market_date') or '2026-04-14'
+        symbol = kwargs.get('symbol')
+        if symbol:
+            return {
+                'market_date': market_date,
+                'requested_market_date': market_date,
+                'resolved_market_date': market_date,
+                'feature_version': 'kis_quote2_snapshot_v1',
+                'summary': {
+                    'entries': 1,
+                    'requested_symbol': symbol,
+                    'matched_symbols': [symbol],
+                    'missing_symbols': [],
+                    'management_item_count': 0,
+                    'warning_count': 1,
+                    'trade_halted_count': 1,
+                },
+                'item': {
+                    'symbol': symbol,
+                    'market_date': market_date,
+                    'is_trade_halted': True,
+                    'market_warning_code': '01',
+                },
+            }
+        return {
+            'market_date': '2026-04-14',
+            'requested_market_date': None,
+            'resolved_market_date': '2026-04-14',
+            'latest_mode': True,
+            'feature_version': 'kis_quote2_snapshot_v1',
+            'summary': {
+                'entries': 2,
+                'requested_symbol': None,
+                'matched_symbols': ['005930', '000660'],
+                'missing_symbols': [],
+                'management_item_count': 1,
+                'warning_count': 1,
+                'trade_halted_count': 1,
+            },
+            'items': [
+                {'symbol': '000660', 'market_date': '2026-04-14', 'is_management_item': True},
+                {'symbol': '005930', 'market_date': '2026-04-14', 'is_trade_halted': True},
+            ],
+        }
+
+
 class FakeMarketRiskFilterService:
     def __init__(self):
         self.compute_args = None
@@ -183,6 +246,7 @@ class FakeMarketRiskFilterService:
             'feature_version': kwargs['source'],
             'results_persisted': 2,
             'results_failed': 0,
+            'snapshot_collection': {'feature_version': 'kis_quote2_snapshot_v1', 'snapshots_persisted': 2},
             'items': [{'symbol': '005930', 'risk_state': 'watchlist', 'watchlist_flagged': True}],
         }
 
@@ -853,6 +917,66 @@ class EODRouteTests(unittest.TestCase):
         self.assertEqual(fake_service.compute_args['source'], 'kis_market_risk_v1')
         self.assertEqual(fake_service.compute_args['market_code'], 'UN')
         self.assertEqual(response.json()['items'][0]['risk_state'], 'watchlist')
+
+    def test_collect_market_risk_snapshots_route_calls_service(self):
+        fake_service = FakeMarketRiskSnapshotService()
+        original_service = routes_eod.daily_market_risk_snapshot_service
+        routes_eod.daily_market_risk_snapshot_service = fake_service
+        try:
+            client = TestClient(self.app)
+            response = client.post(
+                '/eod/market-risk-snapshots/collect',
+                params={
+                    'market_date': '2026-04-14',
+                    'symbols': '005930,000660',
+                    'source': 'kis_quote2_snapshot_v1',
+                    'market_code': 'UN',
+                },
+            )
+        finally:
+            routes_eod.daily_market_risk_snapshot_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(fake_service.collect_args['market_date'], '2026-04-14')
+        self.assertEqual(fake_service.collect_args['symbols'], ['005930', '000660'])
+        self.assertEqual(fake_service.collect_args['source'], 'kis_quote2_snapshot_v1')
+        self.assertEqual(fake_service.collect_args['market_code'], 'UN')
+        self.assertEqual(response.json()['snapshots_persisted'], 2)
+        self.assertTrue(response.json()['items'][0]['is_trade_halted'])
+
+    def test_inspect_market_risk_snapshots_route_returns_single_item_for_symbol(self):
+        fake_service = FakeMarketRiskSnapshotService()
+        original_service = routes_eod.daily_market_risk_snapshot_service
+        routes_eod.daily_market_risk_snapshot_service = fake_service
+        try:
+            client = TestClient(self.app)
+            response = client.get(
+                '/eod/market-risk-snapshots',
+                params={'market_date': '2026-04-14', 'symbol': '005930'},
+            )
+        finally:
+            routes_eod.daily_market_risk_snapshot_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(fake_service.inspect_args['market_date'], '2026-04-14')
+        self.assertEqual(fake_service.inspect_args['symbol'], '005930')
+        self.assertTrue(response.json()['item']['is_trade_halted'])
+        self.assertEqual(response.json()['item']['market_warning_code'], '01')
+
+    def test_inspect_market_risk_snapshots_route_allows_latest_mode_without_market_date(self):
+        fake_service = FakeMarketRiskSnapshotService()
+        original_service = routes_eod.daily_market_risk_snapshot_service
+        routes_eod.daily_market_risk_snapshot_service = fake_service
+        try:
+            client = TestClient(self.app)
+            response = client.get('/eod/market-risk-snapshots')
+        finally:
+            routes_eod.daily_market_risk_snapshot_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(fake_service.inspect_args['market_date'])
+        self.assertTrue(response.json()['latest_mode'])
+        self.assertEqual(response.json()['summary']['trade_halted_count'], 1)
 
     def test_inspect_market_risk_filters_route_returns_single_item_for_symbol(self):
         fake_service = FakeMarketRiskFilterService()

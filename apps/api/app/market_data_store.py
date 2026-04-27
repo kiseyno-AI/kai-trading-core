@@ -18,6 +18,7 @@ from app.db_models import (
     DailyCompositeFactorResult,
     DailyLowRiskFactorResult,
     DailyMarketRiskFilterResult,
+    DailyMarketRiskSnapshot,
     DailyMomentumFactorResult,
     DailyMarketParticipationContext,
     DailyPiotroskiFilterResult,
@@ -1706,6 +1707,76 @@ def upsert_daily_signal_feature(feature: dict) -> None:
         )
 
 
+def upsert_daily_market_risk_snapshot(snapshot: dict) -> None:
+    refreshed_at = datetime.utcnow()
+    with session_scope() as session:
+        symbol = _get_symbol(session, snapshot['symbol'])
+        if symbol is None:
+            symbol = Symbol(
+                symbol=snapshot['symbol'],
+                market=snapshot.get('market', 'KRX'),
+                name_ko=snapshot.get('name_ko') or snapshot['symbol'],
+                instrument_type='equity',
+                source=snapshot.get('source', 'kis_quote2_snapshot_v1'),
+                is_active=True,
+                last_refreshed_at=refreshed_at,
+            )
+            session.add(symbol)
+            session.flush()
+        elif snapshot.get('name_ko') and symbol.name_ko == symbol.symbol:
+            symbol.name_ko = snapshot['name_ko']
+            symbol.last_refreshed_at = refreshed_at
+
+        values = {
+            'symbol_id': symbol.id,
+            'eod_run_id': snapshot.get('eod_run_id'),
+            'market_date': _normalize_trade_date(snapshot['market_date']),
+            'source': snapshot.get('source', 'kis_quote2_snapshot_v1'),
+            'market_code': snapshot.get('market_code', 'J'),
+            'source_endpoint': snapshot.get('source_endpoint', 'inquire-price-2'),
+            'market_warning_code': snapshot.get('market_warning_code'),
+            'market_warning_name': snapshot.get('market_warning_name'),
+            'is_management_item': bool(snapshot.get('is_management_item')),
+            'is_investment_caution': bool(snapshot.get('is_investment_caution')),
+            'is_short_overheated': bool(snapshot.get('is_short_overheated')),
+            'short_overheat_class_code': snapshot.get('short_overheat_class_code'),
+            'is_short_sale_overheated': bool(snapshot.get('is_short_sale_overheated')),
+            'vi_class_code': snapshot.get('vi_class_code'),
+            'is_vi_triggered': bool(snapshot.get('is_vi_triggered')),
+            'is_dishonest_disclosure': bool(snapshot.get('is_dishonest_disclosure')),
+            'is_trade_halted': bool(snapshot.get('is_trade_halted')),
+            'snapshot_payload': snapshot['snapshot_payload'],
+            'captured_at': refreshed_at,
+            'updated_at': refreshed_at,
+        }
+        statement = pg_insert(DailyMarketRiskSnapshot).values(values)
+        session.execute(
+            statement.on_conflict_do_update(
+                constraint='uq_daily_market_risk_snapshots_symbol_market_date',
+                set_={
+                    'eod_run_id': statement.excluded.eod_run_id,
+                    'source': statement.excluded.source,
+                    'market_code': statement.excluded.market_code,
+                    'source_endpoint': statement.excluded.source_endpoint,
+                    'market_warning_code': statement.excluded.market_warning_code,
+                    'market_warning_name': statement.excluded.market_warning_name,
+                    'is_management_item': statement.excluded.is_management_item,
+                    'is_investment_caution': statement.excluded.is_investment_caution,
+                    'is_short_overheated': statement.excluded.is_short_overheated,
+                    'short_overheat_class_code': statement.excluded.short_overheat_class_code,
+                    'is_short_sale_overheated': statement.excluded.is_short_sale_overheated,
+                    'vi_class_code': statement.excluded.vi_class_code,
+                    'is_vi_triggered': statement.excluded.is_vi_triggered,
+                    'is_dishonest_disclosure': statement.excluded.is_dishonest_disclosure,
+                    'is_trade_halted': statement.excluded.is_trade_halted,
+                    'snapshot_payload': statement.excluded.snapshot_payload,
+                    'captured_at': statement.excluded.captured_at,
+                    'updated_at': refreshed_at,
+                },
+            )
+        )
+
+
 def upsert_daily_market_risk_filter_result(result: dict) -> None:
     refreshed_at = datetime.utcnow()
     with session_scope() as session:
@@ -1726,6 +1797,7 @@ def upsert_daily_market_risk_filter_result(result: dict) -> None:
             symbol.name_ko = result['name_ko']
             symbol.last_refreshed_at = refreshed_at
 
+        snapshot_fields = result.get('_snapshot_fields') or {}
         values = {
             'symbol_id': symbol.id,
             'eod_run_id': result.get('eod_run_id'),
@@ -1734,17 +1806,17 @@ def upsert_daily_market_risk_filter_result(result: dict) -> None:
             'risk_state': result.get('risk_state', 'pass'),
             'passed_filter': bool(result.get('passed_filter')),
             'watchlist_flagged': bool(result.get('watchlist_flagged')),
-            'market_warning_code': result.get('market_warning_code'),
-            'market_warning_name': result.get('market_warning_name'),
-            'is_management_item': bool(result.get('is_management_item')),
-            'is_investment_caution': bool(result.get('is_investment_caution')),
-            'is_short_overheated': bool(result.get('is_short_overheated')),
-            'short_overheat_class_code': result.get('short_overheat_class_code'),
-            'is_short_sale_overheated': bool(result.get('is_short_sale_overheated')),
-            'vi_class_code': result.get('vi_class_code'),
-            'is_vi_triggered': bool(result.get('is_vi_triggered')),
-            'is_dishonest_disclosure': bool(result.get('is_dishonest_disclosure')),
-            'is_trade_halted': bool(result.get('is_trade_halted')),
+            'market_warning_code': snapshot_fields.get('market_warning_code'),
+            'market_warning_name': snapshot_fields.get('market_warning_name'),
+            'is_management_item': bool(snapshot_fields.get('is_management_item')),
+            'is_investment_caution': bool(snapshot_fields.get('is_investment_caution')),
+            'is_short_overheated': bool(snapshot_fields.get('is_short_overheated')),
+            'short_overheat_class_code': snapshot_fields.get('short_overheat_class_code'),
+            'is_short_sale_overheated': bool(snapshot_fields.get('is_short_sale_overheated')),
+            'vi_class_code': snapshot_fields.get('vi_class_code'),
+            'is_vi_triggered': bool(snapshot_fields.get('is_vi_triggered')),
+            'is_dishonest_disclosure': bool(snapshot_fields.get('is_dishonest_disclosure')),
+            'is_trade_halted': bool(snapshot_fields.get('is_trade_halted')),
             'filter_payload': result['filter_payload'],
             'captured_at': refreshed_at,
             'updated_at': refreshed_at,
@@ -1957,6 +2029,78 @@ def load_daily_momentum_factor_results(
         ]
 
 
+def load_daily_market_risk_snapshots(
+    *,
+    market_date: str | date,
+    symbols: list[str] | None = None,
+    limit: int | None = 100,
+) -> list[dict]:
+    with session_scope() as session:
+        stmt = (
+            select(DailyMarketRiskSnapshot, Symbol.symbol, Symbol.name_ko, Symbol.market)
+            .join(Symbol, Symbol.id == DailyMarketRiskSnapshot.symbol_id)
+            .where(DailyMarketRiskSnapshot.market_date == _normalize_trade_date(market_date))
+            .order_by(
+                DailyMarketRiskSnapshot.is_trade_halted.desc(),
+                DailyMarketRiskSnapshot.is_management_item.desc(),
+                DailyMarketRiskSnapshot.market_warning_code.asc().nullslast(),
+                Symbol.symbol.asc(),
+            )
+        )
+        if limit is not None:
+            stmt = stmt.limit(limit)
+        if symbols:
+            stmt = stmt.where(Symbol.symbol.in_(symbols))
+
+        rows = session.execute(stmt).all()
+        return [
+            {
+                'symbol': symbol,
+                'name_ko': name_ko,
+                'market': market,
+                'eod_run_id': item.eod_run_id,
+                'market_date': item.market_date.isoformat(),
+                'source': item.source,
+                'feature_version': item.source,
+                'market_code': item.market_code,
+                'source_endpoint': item.source_endpoint,
+                'market_warning_code': item.market_warning_code,
+                'market_warning_name': item.market_warning_name,
+                'is_management_item': item.is_management_item,
+                'is_investment_caution': item.is_investment_caution,
+                'is_short_overheated': item.is_short_overheated,
+                'short_overheat_class_code': item.short_overheat_class_code,
+                'is_short_sale_overheated': item.is_short_sale_overheated,
+                'vi_class_code': item.vi_class_code,
+                'is_vi_triggered': item.is_vi_triggered,
+                'is_dishonest_disclosure': item.is_dishonest_disclosure,
+                'is_trade_halted': item.is_trade_halted,
+                'snapshot_payload': item.snapshot_payload,
+                'captured_at': item.captured_at.isoformat() if item.captured_at else None,
+            }
+            for item, symbol, name_ko, market in rows
+        ]
+
+
+def load_latest_available_daily_market_risk_snapshot_date(
+    *,
+    market_date: str | date | None = None,
+    symbols: list[str] | None = None,
+) -> str | None:
+    with session_scope() as session:
+        stmt = select(func.max(DailyMarketRiskSnapshot.market_date)).select_from(DailyMarketRiskSnapshot)
+        if symbols:
+            stmt = (
+                stmt.join(Symbol, Symbol.id == DailyMarketRiskSnapshot.symbol_id)
+                .where(Symbol.symbol.in_(symbols))
+            )
+        if market_date is not None:
+            stmt = stmt.where(DailyMarketRiskSnapshot.market_date <= _normalize_trade_date(market_date))
+
+        value = session.execute(stmt).scalar_one()
+        return value.isoformat() if value else None
+
+
 def load_daily_market_risk_filter_results(
     *,
     market_date: str | date,
@@ -1995,17 +2139,6 @@ def load_daily_market_risk_filter_results(
                 'risk_state': item.risk_state,
                 'passed_filter': item.passed_filter,
                 'watchlist_flagged': item.watchlist_flagged,
-                'market_warning_code': item.market_warning_code,
-                'market_warning_name': item.market_warning_name,
-                'is_management_item': item.is_management_item,
-                'is_investment_caution': item.is_investment_caution,
-                'is_short_overheated': item.is_short_overheated,
-                'short_overheat_class_code': item.short_overheat_class_code,
-                'is_short_sale_overheated': item.is_short_sale_overheated,
-                'vi_class_code': item.vi_class_code,
-                'is_vi_triggered': item.is_vi_triggered,
-                'is_dishonest_disclosure': item.is_dishonest_disclosure,
-                'is_trade_halted': item.is_trade_halted,
                 'filter_payload': item.filter_payload,
                 'captured_at': item.captured_at.isoformat() if item.captured_at else None,
             }

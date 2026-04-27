@@ -287,6 +287,41 @@ class DailySignalFeature(Base, TimestampMixin):
     captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
+class DailyMarketRiskSnapshot(Base, TimestampMixin):
+    __tablename__ = 'daily_market_risk_snapshots'
+    __table_args__ = (
+        UniqueConstraint(
+            'symbol_id',
+            'market_date',
+            name='uq_daily_market_risk_snapshots_symbol_market_date',
+        ),
+        Index('ix_daily_market_risk_snapshots_market_warning', 'market_date', 'market_warning_code'),
+        Index('ix_daily_market_risk_snapshots_market_halted', 'market_date', 'is_trade_halted'),
+        Index('ix_daily_market_risk_snapshots_market_management', 'market_date', 'is_management_item'),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol_id: Mapped[int] = mapped_column(ForeignKey('symbols.id', ondelete='CASCADE'), nullable=False, index=True)
+    eod_run_id: Mapped[int | None] = mapped_column(ForeignKey('eod_collection_runs.id', ondelete='SET NULL'), index=True)
+    market_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default='kis_quote2_snapshot_v1')
+    market_code: Mapped[str] = mapped_column(String(8), nullable=False, default='J')
+    source_endpoint: Mapped[str] = mapped_column(String(64), nullable=False, default='inquire-price-2')
+    market_warning_code: Mapped[str | None] = mapped_column(String(8))
+    market_warning_name: Mapped[str | None] = mapped_column(String(64))
+    is_management_item: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, index=True)
+    is_investment_caution: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    is_short_overheated: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    short_overheat_class_code: Mapped[str | None] = mapped_column(String(8))
+    is_short_sale_overheated: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    vi_class_code: Mapped[str | None] = mapped_column(String(8))
+    is_vi_triggered: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    is_dishonest_disclosure: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    is_trade_halted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, index=True)
+    snapshot_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
 class DailyMarketRiskFilterResult(Base, TimestampMixin):
     __tablename__ = 'daily_market_risk_filter_results'
     __table_args__ = (

@@ -535,8 +535,8 @@ def run_market_data_pipeline(
         persist_stage_progress(
             stage='market_risk_filter',
             status='running',
-            current_step='computing_market_risk_filter',
-            current_activity='Computing daily KIS market risk filter',
+            current_step='collecting_market_risk_snapshots_and_filters',
+            current_activity='Collecting daily KIS risk snapshots and evaluating market risk filter',
             processed=0,
             total=len(price_context_symbols),
             succeeded=0,
@@ -562,6 +562,7 @@ def run_market_data_pipeline(
             succeeded=market_risk_filter_result.get('results_persisted'),
             failed=market_risk_failed,
             extra={
+                'snapshot_results_failed': market_risk_filter_result.get('snapshot_collection', {}).get('snapshots_failed'),
                 'passed_count': market_risk_filter_result.get('summary', {}).get('passed_count'),
                 'watchlist_count': market_risk_filter_result.get('summary', {}).get('watchlist_count'),
             },

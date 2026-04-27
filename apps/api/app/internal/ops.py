@@ -39,6 +39,10 @@ from app.signals.market_risk_filter import (
     MARKET_RISK_FILTER_SOURCE,
     daily_market_risk_filter_service,
 )
+from app.signals.market_risk_snapshot import (
+    MARKET_RISK_SNAPSHOT_SOURCE,
+    daily_market_risk_snapshot_service,
+)
 from app.signals.momentum_factor import daily_momentum_factor_service
 from app.signals.piotroski_filter import daily_piotroski_filter_service
 from app.signals.value_factor import VALUE_FACTOR_SOURCE, daily_value_factor_service
@@ -171,6 +175,25 @@ def collect_daily_piotroski_filter_results(
     bootstrap_runtime()
     return daily_piotroski_filter_service.rebuild_for_market_date(
         market_date=market_date or get_market_state().server_time[:10],
+    )
+
+
+def collect_market_risk_snapshots(
+    *,
+    market_date: str,
+    symbols: str | None = None,
+    source: str = MARKET_RISK_SNAPSHOT_SOURCE,
+    market_code: str = 'J',
+) -> dict[str, Any]:
+    bootstrap_runtime()
+    parsed_symbols = [item.strip() for item in symbols.split(',') if item.strip()] if symbols else None
+    return asyncio.run(
+        daily_market_risk_snapshot_service.collect_for_market_date(
+            market_date=market_date,
+            symbols=parsed_symbols,
+            source=source,
+            market_code=market_code,
+        )
     )
 
 
@@ -431,6 +454,15 @@ def _build_parser() -> argparse.ArgumentParser:
     market_risk_filter_parser.add_argument('--source', default=MARKET_RISK_FILTER_SOURCE)
     market_risk_filter_parser.add_argument('--market-code', default='J')
 
+    market_risk_snapshot_parser = subparsers.add_parser(
+        'eod-market-risk-snapshots-collect',
+        help='Collect daily KIS market risk snapshots from inquire-price-2',
+    )
+    market_risk_snapshot_parser.add_argument('--market-date', required=True)
+    market_risk_snapshot_parser.add_argument('--symbols')
+    market_risk_snapshot_parser.add_argument('--source', default=MARKET_RISK_SNAPSHOT_SOURCE)
+    market_risk_snapshot_parser.add_argument('--market-code', default='J')
+
     low_risk_factor_parser = subparsers.add_parser(
         'eod-low-risk-factors-compute',
         help='Compute and persist daily low-risk factor results directly',
@@ -567,6 +599,13 @@ def main(argv: Iterable[str] | None = None) -> int:
         payload = collect_daily_piotroski_filter_results(market_date=args.market_date)
     elif args.command == 'eod-market-risk-filters-compute':
         payload = compute_market_risk_filters(
+            market_date=args.market_date,
+            symbols=args.symbols,
+            source=args.source,
+            market_code=args.market_code,
+        )
+    elif args.command == 'eod-market-risk-snapshots-collect':
+        payload = collect_market_risk_snapshots(
             market_date=args.market_date,
             symbols=args.symbols,
             source=args.source,
