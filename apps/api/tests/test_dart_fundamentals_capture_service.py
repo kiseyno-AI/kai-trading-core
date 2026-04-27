@@ -497,6 +497,127 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['latest_run']['id'], 144)
         self.assertEqual(result['latest_run']['status'], 'failed')
 
+    async def test_inspect_daily_refresh_status_returns_zero_updated_entries_summary(self):
+        repository = FakeCaptureRepository()
+        repository.latest_refresh_run = {
+            'id': 145,
+            'market_date': '2026-04-14',
+            'status': 'completed',
+            'symbols_refreshed': 0,
+            'run_metadata': {'updated_entries': []},
+        }
+        service = DartFundamentalsCaptureService(
+            client=FakeCaptureClient(),
+            repository=repository,
+        )
+
+        result = service.inspect_daily_refresh_status(
+            market_date=date(2026, 4, 14),
+            fs_div='CFS',
+        )
+
+        self.assertEqual(result['latest_run']['updated_entries'], [])
+        self.assertEqual(result['latest_run']['updated_entries_preview'], [])
+        self.assertEqual(
+            result['latest_run']['updated_entries_summary'],
+            {
+                'updated_count': 0,
+                'visible_preview_limit': 3,
+                'visible_preview_count': 0,
+                'has_more': False,
+                'remaining_count': 0,
+                'full_list_available': True,
+            },
+        )
+
+    async def test_inspect_daily_refresh_status_normalizes_single_updated_entry(self):
+        repository = FakeCaptureRepository()
+        repository.latest_refresh_run = {
+            'id': 146,
+            'market_date': '2026-04-14',
+            'status': 'completed',
+            'symbols_refreshed': 1,
+            'run_metadata': {
+                'updated_entries': [
+                    {
+                        'symbol': '005930',
+                        'company_name': '삼성전자',
+                        'update_category': 'financial_statement_refresh',
+                    }
+                ]
+            },
+        }
+        service = DartFundamentalsCaptureService(
+            client=FakeCaptureClient(),
+            repository=repository,
+        )
+
+        result = service.inspect_daily_refresh_status(
+            market_date=date(2026, 4, 14),
+            fs_div='CFS',
+        )
+
+        self.assertEqual(
+            result['latest_run']['updated_entries'][0],
+            {
+                'symbol': '005930',
+                'stock_code': '005930',
+                'company_name': '삼성전자',
+                'update_category': 'financial_statement_refresh',
+                'category_label': 'Financial statement refresh',
+            },
+        )
+        self.assertEqual(result['latest_run']['updated_entries_preview'], result['latest_run']['updated_entries'])
+        self.assertEqual(result['latest_run']['updated_entries_summary']['updated_count'], 1)
+
+    async def test_inspect_daily_refresh_status_exposes_preview_and_more_counts_for_many_entries(self):
+        repository = FakeCaptureRepository()
+        repository.latest_refresh_run = {
+            'id': 147,
+            'market_date': '2026-04-14',
+            'status': 'completed',
+            'symbols_refreshed': 4,
+            'run_metadata': {
+                'updated_entries': [
+                    {
+                        'symbol': '005930',
+                        'company_name': '삼성전자',
+                        'update_category': 'financial_statement_refresh',
+                    },
+                    {
+                        'symbol': '000660',
+                        'company_name': 'SK하이닉스',
+                        'update_category': 'financial_statement_refresh',
+                    },
+                    {
+                        'symbol': '035420',
+                        'company_name': 'NAVER',
+                        'update_category': 'initial_fundamentals_capture',
+                    },
+                    {
+                        'symbol': '051910',
+                        'company_name': 'LG화학',
+                        'update_category': 'financial_statement_refresh',
+                    },
+                ]
+            },
+        }
+        service = DartFundamentalsCaptureService(
+            client=FakeCaptureClient(),
+            repository=repository,
+        )
+
+        result = service.inspect_daily_refresh_status(
+            market_date=date(2026, 4, 14),
+            fs_div='CFS',
+        )
+
+        self.assertEqual(len(result['latest_run']['updated_entries']), 4)
+        self.assertEqual(len(result['latest_run']['updated_entries_preview']), 3)
+        self.assertTrue(result['latest_run']['updated_entries_summary']['has_more'])
+        self.assertEqual(result['latest_run']['updated_entries_summary']['remaining_count'], 1)
+        self.assertTrue(result['latest_run']['updated_entries_summary']['full_list_available'])
+
     async def test_backfill_current_universe_uses_2015_floor_and_selected_active_symbols(self):
         client = FakeCaptureClient()
         repository = FakeCaptureRepository()
@@ -610,6 +731,25 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([call['start_date'] for call in sync_calls], [date(2015, 1, 1), date(2026, 4, 2)])
         self.assertEqual(repository.candidate_call_kwargs[-1]['event_ids'], [4, 5])
         self.assertEqual(repository.completed_refresh_runs[-1][1]['status'], 'completed')
+        self.assertEqual(
+            repository.completed_refresh_runs[-1][1]['run_metadata']['updated_entries'],
+            [
+                {
+                    'symbol': '005930',
+                    'stock_code': '005930',
+                    'company_name': '삼성전자',
+                    'update_category': 'financial_statement_refresh',
+                    'category_label': 'Financial statement refresh',
+                },
+                {
+                    'symbol': '123456',
+                    'stock_code': '123456',
+                    'company_name': 'Missing Corp',
+                    'update_category': 'initial_fundamentals_capture',
+                    'category_label': 'Initial fundamentals capture',
+                },
+            ],
+        )
         self.mock_piotroski_filter.assert_called_once_with(market_date=date(2026, 4, 14))
 
     async def test_daily_incremental_refresh_retries_failed_event_when_baseline_is_missing(self):

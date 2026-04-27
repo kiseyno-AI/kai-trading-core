@@ -47,6 +47,13 @@ DART_FUNDAMENTALS_MIN_START_DATE = date(settings.dart_fundamentals_min_business_
 DART_FUNDAMENTALS_REFRESH_HEARTBEAT_SECONDS = 30.0
 DART_NO_DATA_STATUS = '013'
 UNSUPPORTED_CODE_REASON = 'code_unsupported:dart_lookup'
+UPDATED_ENTRIES_PREVIEW_LIMIT = 3
+UPDATED_ENTRY_CATEGORY_INITIAL_CAPTURE = 'initial_fundamentals_capture'
+UPDATED_ENTRY_CATEGORY_FINANCIAL_STATEMENT_REFRESH = 'financial_statement_refresh'
+UPDATED_ENTRY_CATEGORY_LABELS = {
+    UPDATED_ENTRY_CATEGORY_INITIAL_CAPTURE: 'Initial fundamentals capture',
+    UPDATED_ENTRY_CATEGORY_FINANCIAL_STATEMENT_REFRESH: 'Financial statement refresh',
+}
 
 
 class TerminalFundamentalsCaptureError(RuntimeError):
@@ -484,6 +491,169 @@ def _build_operator_buckets(
         'remaining_retryable_events': {
             'count': remaining_retryable_events,
         },
+    }
+
+
+def _updated_entry_category_for_symbol(*, had_fundamentals_before_run: bool) -> str:
+    if had_fundamentals_before_run:
+        return UPDATED_ENTRY_CATEGORY_FINANCIAL_STATEMENT_REFRESH
+    return UPDATED_ENTRY_CATEGORY_INITIAL_CAPTURE
+
+
+def _updated_entry_category_label(category: str) -> str:
+    return UPDATED_ENTRY_CATEGORY_LABELS.get(category, category.replace('_', ' ').strip().title())
+
+
+def _normalize_updated_entry(raw_entry: dict[str, Any]) -> dict[str, Any] | None:
+    stock_code = str(raw_entry.get('stock_code') or raw_entry.get('symbol') or '').strip()
+    if not stock_code:
+        return None
+    category = str(raw_entry.get('update_category') or '').strip() or UPDATED_ENTRY_CATEGORY_FINANCIAL_STATEMENT_REFRESH
+    company_name = raw_entry.get('company_name') or raw_entry.get('corp_name') or stock_code
+    return {
+        'symbol': str(raw_entry.get('symbol') or stock_code).strip() or stock_code,
+        'stock_code': stock_code,
+        'company_name': company_name,
+        'update_category': category,
+        'category_label': str(raw_entry.get('category_label') or _updated_entry_category_label(category)),
+    }
+
+
+def _build_daily_refresh_updated_entries(
+    *,
+    capture_results: list[dict[str, Any]],
+    candidate_events_by_id: dict[int, dict[str, Any]],
+    symbol_rows_by_code: dict[str, dict[str, Any]],
+    had_fundamentals_before_run: dict[str, bool],
+) -> list[dict[str, Any]]:
+    entries_by_symbol: dict[str, dict[str, Any]] = {}
+    for item in capture_results:
+        if item.get('status') != 'captured':
+            continue
+        stock_code = str(item.get('stock_code') or '').strip()
+        if not stock_code:
+            continue
+        event_id = item.get('event_id')
+        normalized_event_id = int(event_id) if event_id is not None else None
+        event = candidate_events_by_id.get(normalized_event_id or -1) or {}
+        category = _updated_entry_category_for_symbol(
+            had_fundamentals_before_run=had_fundamentals_before_run.get(stock_code, False)
+        )
+        symbol_row = symbol_rows_by_code.get(stock_code) or {}
+        candidate_sort_key = (
+            str(event.get('receipt_date') or ''),
+            str(event.get('rcept_no') or ''),
+            stock_code,
+        )
+        entry = {
+            'symbol': stock_code,
+            'stock_code': stock_code,
+            'company_name': symbol_row.get('name_ko') or event.get('corp_name') or stock_code,
+            'update_category': category,
+            'category_label': _updated_entry_category_label(category),
+            '_sort_key': candidate_sort_key,
+        }
+        current = entries_by_symbol.get(stock_code)
+        if current is None or candidate_sort_key > current['_sort_key']:
+            entries_by_symbol[stock_code] = entry
+
+    ordered_entries = sorted(
+        entries_by_symbol.values(),
+        key=lambda item: item['_sort_key'],
+        reverse=True,
+    )
+    return [
+        {
+            'symbol': item['symbol'],
+            'stock_code': item['stock_code'],
+            'company_name': item['company_name'],
+            'update_category': item['update_category'],
+            'category_label': item['category_label'],
+        }
+        for item in ordered_entries
+    ]
+
+
+def _build_legacy_daily_refresh_updated_entries(run: dict[str, Any]) -> list[dict[str, Any]]:
+    run_metadata = run.get('run_metadata')
+    if not isinstance(run_metadata, dict):
+        return []
+    refreshed_symbols_sample = run_metadata.get('refreshed_symbols_sample')
+    if not isinstance(refreshed_symbols_sample, list):
+        return []
+    sample_symbols = [
+        str(symbol).strip()
+        for symbol in refreshed_symbols_sample
+        if str(symbol).strip()
+    ]
+    if not sample_symbols:
+        return []
+
+    symbol_results_by_code: dict[str, dict[str, Any]] = {}
+    symbol_results_sample = run_metadata.get('symbol_results_sample')
+    if isinstance(symbol_results_sample, list):
+        for item in symbol_results_sample:
+            if not isinstance(item, dict):
+                continue
+            stock_code = str(item.get('stock_code') or '').strip()
+            if stock_code:
+                symbol_results_by_code[stock_code] = item
+
+    symbol_rows_by_code = {
+        row['symbol']: row
+        for row in load_symbols(symbols=sample_symbols, limit=len(sample_symbols))
+    }
+    legacy_entries: list[dict[str, Any]] = []
+    for stock_code in sample_symbols:
+        symbol_result = symbol_results_by_code.get(stock_code) or {}
+        category = _updated_entry_category_for_symbol(
+            had_fundamentals_before_run=bool(symbol_result.get('has_fundamentals'))
+        )
+        legacy_entries.append(
+            {
+                'symbol': stock_code,
+                'stock_code': stock_code,
+                'company_name': (symbol_rows_by_code.get(stock_code) or {}).get('name_ko') or stock_code,
+                'update_category': category,
+                'category_label': _updated_entry_category_label(category),
+            }
+        )
+    return legacy_entries
+
+
+def _extract_daily_refresh_updated_entries(run: dict[str, Any]) -> list[dict[str, Any]]:
+    run_metadata = run.get('run_metadata')
+    if isinstance(run_metadata, dict):
+        raw_entries = run_metadata.get('updated_entries')
+        if isinstance(raw_entries, list):
+            normalized_entries: list[dict[str, Any]] = []
+            seen_symbols: set[str] = set()
+            for raw_entry in raw_entries:
+                if not isinstance(raw_entry, dict):
+                    continue
+                entry = _normalize_updated_entry(raw_entry)
+                if entry is None or entry['stock_code'] in seen_symbols:
+                    continue
+                normalized_entries.append(entry)
+                seen_symbols.add(entry['stock_code'])
+            if normalized_entries:
+                return normalized_entries
+    return _build_legacy_daily_refresh_updated_entries(run)
+
+
+def _build_daily_refresh_updated_entries_summary(
+    *,
+    updated_count: int,
+    updated_entries: list[dict[str, Any]],
+) -> dict[str, Any]:
+    preview_limit = UPDATED_ENTRIES_PREVIEW_LIMIT
+    return {
+        'updated_count': updated_count,
+        'visible_preview_limit': preview_limit,
+        'visible_preview_count': min(len(updated_entries), preview_limit),
+        'has_more': updated_count > preview_limit,
+        'remaining_count': max(updated_count - preview_limit, 0),
+        'full_list_available': updated_count == len(updated_entries),
     }
 
 
@@ -1150,6 +1320,11 @@ class DartFundamentalsCaptureService:
         active_symbols = self.active_symbol_loader()
         upper_bound = None if symbol_limit is None else symbol_offset + symbol_limit
         selected_symbols = active_symbols[symbol_offset:upper_bound]
+        symbol_rows_by_code = {
+            str(symbol.get('symbol') or '').strip().zfill(6): symbol
+            for symbol in active_symbols
+            if (symbol.get('symbol') or '').strip()
+        }
         selected_stock_codes = [
             (symbol.get('symbol') or '').strip().zfill(6)
             for symbol in selected_symbols
@@ -1521,6 +1696,11 @@ class DartFundamentalsCaptureService:
 
             events_detected = len(candidate_events)
             candidate_event_ids = [int(event['id']) for event in candidate_events]
+            candidate_events_by_id = {
+                int(event['id']): event
+                for event in candidate_events
+                if event.get('id') is not None
+            }
             event_ids_to_capture = (
                 candidate_event_ids
                 if capture_limit is None
@@ -1710,6 +1890,15 @@ class DartFundamentalsCaptureService:
                         symbol_results[stock_code]['state'] = _terminal_symbol_state(status_value)
                         symbol_results[stock_code]['terminal'] = True
                         symbol_results[stock_code]['error'] = item.get('error')
+            updated_entries = _build_daily_refresh_updated_entries(
+                capture_results=capture_result.get('results', []),
+                candidate_events_by_id=candidate_events_by_id,
+                symbol_rows_by_code=symbol_rows_by_code,
+                had_fundamentals_before_run={
+                    stock_code: latest_fundamentals_date_by_symbol.get(stock_code) is not None
+                    for stock_code in selected_stock_codes
+                },
+            )
             symbols_refreshed = len(refreshed_symbols)
             symbols_failed = len(lookup_failed_symbols | failed_symbols)
             symbols_fresh = len(
@@ -1780,6 +1969,7 @@ class DartFundamentalsCaptureService:
                 'stale_symbols_sample': _limited_sample(sorted(stale_symbols)),
                 'missing_candidate_symbols_sample': _limited_sample(sorted(missing_candidate_symbols)),
                 'refreshed_symbols_sample': _limited_sample(sorted(refreshed_symbols)),
+                'updated_entries': updated_entries,
                 'failed_symbols_sample': _limited_sample(sorted(lookup_failed_symbols | failed_symbols)),
                 'terminal_no_data_symbols_sample': _limited_sample(
                     sorted(terminal_symbols_by_status.get(CAPTURE_STATUS_NO_DATA, set()))
@@ -1981,15 +2171,20 @@ class DartFundamentalsCaptureService:
         )
         resolved_fs_div = fs_div.strip().upper() if fs_div else None
         return {
-            'latest_run': self.repository.get_latest_refresh_run(
-                market_date=market_date,
-                fs_div=resolved_fs_div,
+            'latest_run': self._decorate_refresh_run_for_inspect(
+                self.repository.get_latest_refresh_run(
+                    market_date=market_date,
+                    fs_div=resolved_fs_div,
+                )
             ),
-            'runs': self.repository.list_refresh_runs(
-                limit=runs_limit,
-                market_date=market_date,
-                fs_div=resolved_fs_div,
-            ),
+            'runs': [
+                self._decorate_refresh_run_for_inspect(item)
+                for item in self.repository.list_refresh_runs(
+                    limit=runs_limit,
+                    market_date=market_date,
+                    fs_div=resolved_fs_div,
+                )
+            ],
         }
 
     def _fail_stale_refresh_runs(self, *, error_message: str) -> list[int]:
@@ -1997,6 +2192,21 @@ class DartFundamentalsCaptureService:
             stale_before=_utcnow() - timedelta(minutes=self.stale_run_minutes),
             error_message=error_message,
         )
+
+    def _decorate_refresh_run_for_inspect(self, run: dict[str, Any] | None) -> dict[str, Any] | None:
+        if run is None:
+            return None
+        updated_entries = _extract_daily_refresh_updated_entries(run)
+        updated_count = int(run.get('symbols_refreshed') or len(updated_entries))
+        return {
+            **run,
+            'updated_entries_summary': _build_daily_refresh_updated_entries_summary(
+                updated_count=updated_count,
+                updated_entries=updated_entries,
+            ),
+            'updated_entries_preview': updated_entries[:UPDATED_ENTRIES_PREVIEW_LIMIT],
+            'updated_entries': updated_entries,
+        }
 
 
 dart_fundamentals_capture_service = DartFundamentalsCaptureService()

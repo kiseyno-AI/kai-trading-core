@@ -45,7 +45,23 @@ set +a
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
 
 if is_truthy "${DB_AUTO_UPGRADE:-true}"; then
-  "$PYTHON_BIN" -m app.internal.deploy_hygiene preflight --format text
+  PREFLIGHT_JSON=""
+  if ! PREFLIGHT_JSON="$("$PYTHON_BIN" -m app.internal.deploy_hygiene preflight --format json)"; then
+    "$PYTHON_BIN" -m app.internal.deploy_hygiene preflight --format text
+    exit 1
+  fi
+
+  PREFLIGHT_AT_HEAD=0
+  if printf '%s' "$PREFLIGHT_JSON" | tr -d '[:space:]' | grep -q '"at_head":true'; then
+    PREFLIGHT_AT_HEAD=1
+  fi
+
+  if [ "$PREFLIGHT_AT_HEAD" != "1" ]; then
+    "$PYTHON_BIN" -m alembic upgrade head
+  fi
+
+  "$PYTHON_BIN" -m app.internal.deploy_hygiene preflight --require-head --format text
+  export DB_AUTO_UPGRADE=false
 fi
 
 exec "$PYTHON_BIN" -m uvicorn app.main:app --host "$HOST" --port "$PORT"
