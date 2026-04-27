@@ -26,6 +26,7 @@ from app.eod.action_summaries import daily_action_summary_service
 from app.eod.pykrx_pipeline_runner import PykrxPipelineDependencies, run_market_data_pipeline
 from app.eod.technical_snapshots import daily_technical_snapshot_service
 from app.signals.daily_signal_features import daily_signal_feature_service
+from app.signals.market_risk_filter import daily_market_risk_filter_service
 from app.market_data_store import (
     advisory_eod_collection_lock,
     compute_and_persist_daily_trending_ranks,
@@ -918,6 +919,7 @@ class PykrxBackfillService:
                 action_summary_service=daily_action_summary_service,
                 compute_trending_ranks=compute_and_persist_daily_trending_ranks,
                 signal_feature_service=daily_signal_feature_service,
+                market_risk_filter_service=daily_market_risk_filter_service,
                 dart_fundamentals_capture_service=dart_fundamentals_capture_service,
                 settings=settings,
                 normalize_yyyymmdd=_normalize_yyyymmdd,

@@ -188,8 +188,9 @@ These support universe identity, scanner state, quote history, current quote cac
 - `daily_technical_snapshots`
 - `daily_action_summaries`
 - `daily_signal_features`
+- `daily_market_risk_filter_results`
 
-These tables store raw durable EOD bars, deterministic read models derived from those bars, and daily KIS ranking signal features keyed by symbol/date.
+These tables store raw durable EOD bars, deterministic read models derived from those bars, daily KIS ranking signal features, and persisted KIS market-risk filter results keyed by symbol/date.
 
 ### DART disclosure and fundamentals persistence
 

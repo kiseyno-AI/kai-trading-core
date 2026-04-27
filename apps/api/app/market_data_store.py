@@ -17,9 +17,10 @@ from app.db_models import (
     DailyBetaFactorResult,
     DailyCompositeFactorResult,
     DailyLowRiskFactorResult,
+    DailyMarketRiskFilterResult,
     DailyMomentumFactorResult,
-    DailyPiotroskiFilterResult,
     DailyMarketParticipationContext,
+    DailyPiotroskiFilterResult,
     DailyPriceBar,
     DailyPriceContext,
     DailySignalFeature,
@@ -1705,6 +1706,78 @@ def upsert_daily_signal_feature(feature: dict) -> None:
         )
 
 
+def upsert_daily_market_risk_filter_result(result: dict) -> None:
+    refreshed_at = datetime.utcnow()
+    with session_scope() as session:
+        symbol = _get_symbol(session, result['symbol'])
+        if symbol is None:
+            symbol = Symbol(
+                symbol=result['symbol'],
+                market=result.get('market', 'KRX'),
+                name_ko=result.get('name_ko') or result['symbol'],
+                instrument_type='equity',
+                source=result.get('source', 'kis_market_risk_v1'),
+                is_active=True,
+                last_refreshed_at=refreshed_at,
+            )
+            session.add(symbol)
+            session.flush()
+        elif result.get('name_ko') and symbol.name_ko == symbol.symbol:
+            symbol.name_ko = result['name_ko']
+            symbol.last_refreshed_at = refreshed_at
+
+        values = {
+            'symbol_id': symbol.id,
+            'eod_run_id': result.get('eod_run_id'),
+            'market_date': _normalize_trade_date(result['market_date']),
+            'source': result.get('source', 'kis_market_risk_v1'),
+            'risk_state': result.get('risk_state', 'pass'),
+            'passed_filter': bool(result.get('passed_filter')),
+            'watchlist_flagged': bool(result.get('watchlist_flagged')),
+            'market_warning_code': result.get('market_warning_code'),
+            'market_warning_name': result.get('market_warning_name'),
+            'is_management_item': bool(result.get('is_management_item')),
+            'is_investment_caution': bool(result.get('is_investment_caution')),
+            'is_short_overheated': bool(result.get('is_short_overheated')),
+            'short_overheat_class_code': result.get('short_overheat_class_code'),
+            'is_short_sale_overheated': bool(result.get('is_short_sale_overheated')),
+            'vi_class_code': result.get('vi_class_code'),
+            'is_vi_triggered': bool(result.get('is_vi_triggered')),
+            'is_dishonest_disclosure': bool(result.get('is_dishonest_disclosure')),
+            'is_trade_halted': bool(result.get('is_trade_halted')),
+            'filter_payload': result['filter_payload'],
+            'captured_at': refreshed_at,
+            'updated_at': refreshed_at,
+        }
+        statement = pg_insert(DailyMarketRiskFilterResult).values(values)
+        session.execute(
+            statement.on_conflict_do_update(
+                constraint='uq_daily_market_risk_filter_results_symbol_market_date',
+                set_={
+                    'eod_run_id': statement.excluded.eod_run_id,
+                    'source': statement.excluded.source,
+                    'risk_state': statement.excluded.risk_state,
+                    'passed_filter': statement.excluded.passed_filter,
+                    'watchlist_flagged': statement.excluded.watchlist_flagged,
+                    'market_warning_code': statement.excluded.market_warning_code,
+                    'market_warning_name': statement.excluded.market_warning_name,
+                    'is_management_item': statement.excluded.is_management_item,
+                    'is_investment_caution': statement.excluded.is_investment_caution,
+                    'is_short_overheated': statement.excluded.is_short_overheated,
+                    'short_overheat_class_code': statement.excluded.short_overheat_class_code,
+                    'is_short_sale_overheated': statement.excluded.is_short_sale_overheated,
+                    'vi_class_code': statement.excluded.vi_class_code,
+                    'is_vi_triggered': statement.excluded.is_vi_triggered,
+                    'is_dishonest_disclosure': statement.excluded.is_dishonest_disclosure,
+                    'is_trade_halted': statement.excluded.is_trade_halted,
+                    'filter_payload': statement.excluded.filter_payload,
+                    'captured_at': statement.excluded.captured_at,
+                    'updated_at': refreshed_at,
+                },
+            )
+        )
+
+
 def upsert_daily_piotroski_filter_result(result: dict) -> None:
     refreshed_at = datetime.utcnow()
     with session_scope() as session:
@@ -1882,6 +1955,81 @@ def load_daily_momentum_factor_results(
             }
             for item, symbol in rows
         ]
+
+
+def load_daily_market_risk_filter_results(
+    *,
+    market_date: str | date,
+    symbols: list[str] | None = None,
+    passed_filter: bool | None = None,
+    limit: int | None = 100,
+) -> list[dict]:
+    with session_scope() as session:
+        stmt = (
+            select(DailyMarketRiskFilterResult, Symbol.symbol, Symbol.name_ko, Symbol.market)
+            .join(Symbol, Symbol.id == DailyMarketRiskFilterResult.symbol_id)
+            .where(DailyMarketRiskFilterResult.market_date == _normalize_trade_date(market_date))
+            .order_by(
+                DailyMarketRiskFilterResult.passed_filter.asc(),
+                DailyMarketRiskFilterResult.watchlist_flagged.desc(),
+                Symbol.symbol.asc(),
+            )
+        )
+        if limit is not None:
+            stmt = stmt.limit(limit)
+        if symbols:
+            stmt = stmt.where(Symbol.symbol.in_(symbols))
+        if passed_filter is not None:
+            stmt = stmt.where(DailyMarketRiskFilterResult.passed_filter == passed_filter)
+
+        rows = session.execute(stmt).all()
+        return [
+            {
+                'symbol': symbol,
+                'name_ko': name_ko,
+                'market': market,
+                'eod_run_id': item.eod_run_id,
+                'market_date': item.market_date.isoformat(),
+                'source': item.source,
+                'feature_version': item.source,
+                'risk_state': item.risk_state,
+                'passed_filter': item.passed_filter,
+                'watchlist_flagged': item.watchlist_flagged,
+                'market_warning_code': item.market_warning_code,
+                'market_warning_name': item.market_warning_name,
+                'is_management_item': item.is_management_item,
+                'is_investment_caution': item.is_investment_caution,
+                'is_short_overheated': item.is_short_overheated,
+                'short_overheat_class_code': item.short_overheat_class_code,
+                'is_short_sale_overheated': item.is_short_sale_overheated,
+                'vi_class_code': item.vi_class_code,
+                'is_vi_triggered': item.is_vi_triggered,
+                'is_dishonest_disclosure': item.is_dishonest_disclosure,
+                'is_trade_halted': item.is_trade_halted,
+                'filter_payload': item.filter_payload,
+                'captured_at': item.captured_at.isoformat() if item.captured_at else None,
+            }
+            for item, symbol, name_ko, market in rows
+        ]
+
+
+def load_latest_available_daily_market_risk_filter_result_date(
+    *,
+    market_date: str | date | None = None,
+    symbols: list[str] | None = None,
+) -> str | None:
+    with session_scope() as session:
+        stmt = select(func.max(DailyMarketRiskFilterResult.market_date)).select_from(DailyMarketRiskFilterResult)
+        if symbols:
+            stmt = (
+                stmt.join(Symbol, Symbol.id == DailyMarketRiskFilterResult.symbol_id)
+                .where(Symbol.symbol.in_(symbols))
+            )
+        if market_date is not None:
+            stmt = stmt.where(DailyMarketRiskFilterResult.market_date <= _normalize_trade_date(market_date))
+
+        value = session.execute(stmt).scalar_one()
+        return value.isoformat() if value else None
 
 
 def load_daily_piotroski_filter_results(
@@ -2790,4 +2938,3 @@ def load_daily_market_participation_context_history(
         }
         for row in reversed(rows)
     ]
-

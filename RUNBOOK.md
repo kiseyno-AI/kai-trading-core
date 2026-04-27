@@ -178,6 +178,7 @@ Internal ops commands from `apps/api`:
 - `python3.11 -m app.internal.ops eod-composite-factors-compute --market-date 2026-04-24`
 - `python3.11 -m app.internal.ops dart-fundamentals-daily-run-if-due --market-date 2026-04-14 --symbol-limit 250 --capture-limit 500`
 - `python3.11 -m app.internal.ops kis-daily-signal-features-collect --market-date 2026-04-14`
+- `python3.11 -m app.internal.ops eod-market-risk-filters-compute --market-date 2026-04-14`
 - `python3.11 -m app.internal.ops agent-derived-contexts-backfill-recent`
 - `python3.11 -m app.internal.index_audit`
 
@@ -197,6 +198,7 @@ Notes:
 - The pykrx path refreshes the active listed universe first, then backfills only those active symbols.
 - Automatic daily ingestion uses the same pykrx universe/backfill persistence path, but only for the resolved market date and only once per day unless forced or retrying a partial/failed run. Automatic retries are capped at 5 runs per trade date and retry only the symbols that failed in the prior run.
 - The automatic pykrx daily ingestion path now also persists `daily_price_contexts`, `daily_technical_snapshots`, `daily_action_summaries`, and day-based `daily_trending_ranks` after the day bar write completes.
+- The same automatic daily path now also computes `daily_market_risk_filter_results` from KIS `inquire-price-2` for the successfully stored symbol universe. Per-symbol KIS failures are reported as partial errors and do not abort the rest of the daily run.
 - KIS ranking signal-feature collection is a separate ops path because it calls KIS ranking endpoints (`volume-power`, `overtime-volume`, and `overtime-fluctuation`) rather than pykrx bars.
 - The KIS ranking signal-feature collection path also rebuilds `daily_market_participation_contexts` from the stored `daily_signal_features` rows for that market date.
 - `python3.11 -m app.internal.ops agent-derived-contexts-backfill-recent` is the repo-owned bootstrap path for the new derived-context tables. It backfills the recent seven trading days ending yesterday from existing stored `daily_price_bars` and `daily_signal_features`, and it skips participation dates that do not yet have stored signal-feature rows.

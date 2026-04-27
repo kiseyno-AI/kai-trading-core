@@ -15,6 +15,7 @@ from app.signals.advanced_value_factor import ADVANCED_VALUE_FACTOR_SOURCE
 from app.signals.beta_factor import BETA_FACTOR_SOURCE
 from app.signals.composite_factor import COMPOSITE_FACTOR_SOURCE
 from app.signals.low_risk_factor import LOW_RISK_SOURCE
+from app.signals.market_risk_filter import MARKET_RISK_FILTER_SOURCE
 from app.signals.value_factor import VALUE_FACTOR_SOURCE
 
 
@@ -162,6 +163,28 @@ class InternalOpsTests(unittest.TestCase):
         bootstrap_runtime.assert_called_once_with()
         self.assertEqual(result, {'symbols_evaluated': 2})
         self.assertEqual(collect_filter.call_args.kwargs['market_date'], '2026-04-14')
+
+    def test_compute_market_risk_filters_uses_canonical_feature_version(self) -> None:
+        with (
+            patch('app.internal.ops.bootstrap_runtime') as bootstrap_runtime,
+            patch(
+                'app.internal.ops.daily_market_risk_filter_service.rebuild_for_market_date',
+                new=AsyncMock(return_value={'results_persisted': 2}),
+            ) as compute_market_risk,
+        ):
+            result = ops.compute_market_risk_filters(
+                market_date='2026-04-14',
+                symbols='005930,000660',
+                source=MARKET_RISK_FILTER_SOURCE,
+                market_code='UN',
+            )
+
+        bootstrap_runtime.assert_called_once_with()
+        self.assertEqual(result, {'results_persisted': 2})
+        self.assertEqual(compute_market_risk.call_args.kwargs['market_date'], '2026-04-14')
+        self.assertEqual(compute_market_risk.call_args.kwargs['symbols'], ['005930', '000660'])
+        self.assertEqual(compute_market_risk.call_args.kwargs['source'], MARKET_RISK_FILTER_SOURCE)
+        self.assertEqual(compute_market_risk.call_args.kwargs['market_code'], 'UN')
 
     def test_compute_low_risk_factors_uses_canonical_feature_version(self) -> None:
         with (

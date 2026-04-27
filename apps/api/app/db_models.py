@@ -287,6 +287,42 @@ class DailySignalFeature(Base, TimestampMixin):
     captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
+class DailyMarketRiskFilterResult(Base, TimestampMixin):
+    __tablename__ = 'daily_market_risk_filter_results'
+    __table_args__ = (
+        UniqueConstraint(
+            'symbol_id',
+            'market_date',
+            name='uq_daily_market_risk_filter_results_symbol_market_date',
+        ),
+        Index('ix_daily_market_risk_filter_results_market_passed', 'market_date', 'passed_filter'),
+        Index('ix_daily_market_risk_filter_results_market_watchlist', 'market_date', 'watchlist_flagged'),
+        Index('ix_daily_market_risk_filter_results_market_state', 'market_date', 'risk_state'),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol_id: Mapped[int] = mapped_column(ForeignKey('symbols.id', ondelete='CASCADE'), nullable=False, index=True)
+    eod_run_id: Mapped[int | None] = mapped_column(ForeignKey('eod_collection_runs.id', ondelete='SET NULL'), index=True)
+    market_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default='kis_market_risk_v1')
+    risk_state: Mapped[str] = mapped_column(String(16), nullable=False, default='pass', index=True)
+    passed_filter: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, index=True)
+    watchlist_flagged: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, index=True)
+    market_warning_code: Mapped[str | None] = mapped_column(String(8))
+    market_warning_name: Mapped[str | None] = mapped_column(String(64))
+    is_management_item: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    is_investment_caution: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    is_short_overheated: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    short_overheat_class_code: Mapped[str | None] = mapped_column(String(8))
+    is_short_sale_overheated: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    vi_class_code: Mapped[str | None] = mapped_column(String(8))
+    is_vi_triggered: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    is_dishonest_disclosure: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    is_trade_halted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    filter_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
 class DailyPiotroskiFilterResult(Base, TimestampMixin):
     __tablename__ = 'daily_piotroski_filter_results'
     __table_args__ = (
@@ -319,6 +355,7 @@ class DailyPiotroskiFilterResult(Base, TimestampMixin):
     passed_filter: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, index=True)
     filter_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
     captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
 
 class DailyLowRiskFactorResult(Base, TimestampMixin):
     __tablename__ = 'daily_low_risk_factor_results'
