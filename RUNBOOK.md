@@ -186,6 +186,7 @@ Internal ops commands from `apps/api`:
 - `python3.11 -m app.internal.ops eod-advanced-value-factors-compute --market-date 2026-04-24`
 - `python3.11 -m app.internal.ops eod-composite-factors-compute --market-date 2026-04-24`
 - `python3.11 -m app.internal.ops dart-fundamentals-daily-run-if-due --market-date 2026-04-14 --symbol-limit 250 --capture-limit 500`
+- `python3.11 -m app.internal.ops agent-feedback-retry-cycles --market-date 2026-04-14 --symbols 005930`
 - `python3.11 -m app.internal.ops kis-daily-signal-features-collect --market-date 2026-04-14`
 - `python3.11 -m app.internal.ops agent-derived-contexts-backfill-recent`
 - `python3.11 -m app.internal.index_audit`

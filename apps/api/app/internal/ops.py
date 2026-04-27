@@ -318,17 +318,20 @@ def compute_trending_ranks(*, market_date: str, periods: str | None = None) -> d
 def run_agent_feedback_retry_cycles(
     *,
     market_date: str,
+    symbols: str | None = None,
     roles: str | None = None,
     max_cycles: int = 3,
     outer_batch_size: int = 20,
     reuse_existing: bool = True,
 ) -> dict[str, Any]:
     bootstrap_runtime()
+    parsed_symbols = tuple(item.strip() for item in symbols.split(',') if item.strip()) if symbols else None
     parsed_roles = tuple(item.strip() for item in roles.split(',') if item.strip()) if roles else EXPECTED_ROLES
     return agent_feedback_retry_service.run_retry_cycles(
         config=FeedbackRetryCycleConfig(
             market_date=__import__('datetime').date.fromisoformat(market_date),
             roles=parsed_roles,
+            symbols=parsed_symbols,
             max_cycles=max_cycles,
             outer_batch_size=outer_batch_size,
             reuse_existing=reuse_existing,
@@ -519,6 +522,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help='Run the same agent feedback retry-cycle engine used by fundamentals follow-up',
     )
     feedback_retry_parser.add_argument('--market-date', required=True)
+    feedback_retry_parser.add_argument('--symbols')
     feedback_retry_parser.add_argument('--roles')
     feedback_retry_parser.add_argument('--max-cycles', type=int, default=3)
     feedback_retry_parser.add_argument('--outer-batch-size', type=int, default=20)
@@ -632,6 +636,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     elif args.command == 'agent-feedback-retry-cycles':
         payload = run_agent_feedback_retry_cycles(
             market_date=args.market_date,
+            symbols=args.symbols,
             roles=args.roles,
             max_cycles=args.max_cycles,
             outer_batch_size=args.outer_batch_size,
