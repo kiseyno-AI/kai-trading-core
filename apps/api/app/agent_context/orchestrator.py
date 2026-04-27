@@ -1561,6 +1561,16 @@ class AgentFeedbackOrchestrator:
             try:
                 for failure in pending_failures:
                     failure_log_fields = _failure_log_fields(failure)
+                    failure_kind = str(failure.get('failure_kind') or failure.get('error') or 'dispatch_failed')
+                    original_failure = {
+                        'origin': 'agent_dispatch_failure',
+                        'failure_kind': failure_kind,
+                        'error_message': failure.get('error'),
+                        'retryable': failure.get('retryable', True),
+                        'role': failure.get('role'),
+                        'agent_name': failure.get('agent_name') or failure.get('role'),
+                        'symbol': failure.get('symbol'),
+                    }
                     log_agent_feedback_event(
                         'failure_persistence_attempt',
                         status='attempting',
@@ -1579,6 +1589,8 @@ class AgentFeedbackOrchestrator:
                             'operation': 'upsert',
                             'reason': reason,
                         },
+                        failure_origin='agent_dispatch_failure',
+                        original_failure=original_failure,
                     )
                     try:
                         persisted_failure = agent_context_feedback_failure_service.record_failure(
@@ -1586,14 +1598,20 @@ class AgentFeedbackOrchestrator:
                             symbol=str(failure.get('symbol') or ''),
                             agent_name=str(failure.get('agent_name') or failure.get('role') or ''),
                             run_id=request_run_id,
-                            failure_kind=str(failure.get('failure_kind') or failure.get('error') or 'dispatch_failed'),
+                            failure_kind=failure_kind,
                             retryable=bool(failure.get('retryable', True)),
                             summary={
+                                'origin': 'agent_dispatch_failure',
                                 'role': failure.get('role'),
                                 'status': failure.get('status'),
                                 'error': failure.get('error'),
                                 'retryable': failure.get('retryable', True),
-                                'failure_kind': failure.get('failure_kind') or failure.get('error') or 'dispatch_failed',
+                                'failure_kind': failure_kind,
+                                'dispatch_id': failure_log_fields['dispatch_id'],
+                                'attempt_id': failure_log_fields['attempt_id'],
+                                'slot': failure_log_fields['slot'],
+                                'session_key': failure_log_fields['session_key'],
+                                'batch_symbols': failure_log_fields['batch_symbols'],
                             },
                             context=failure.get('context') if isinstance(failure.get('context'), dict) else None,
                         )
@@ -1616,6 +1634,9 @@ class AgentFeedbackOrchestrator:
                                 'operation': 'upsert',
                                 'reason': reason,
                             },
+                            failure_origin='agent_dispatch_failure',
+                            original_failure=original_failure,
+                            persistence_error_origin='failure_row_persistence',
                             error_type=type(exc).__name__,
                             error_message=str(exc),
                         )
@@ -1644,6 +1665,8 @@ class AgentFeedbackOrchestrator:
                             'received_at': persisted_failure.get('received_at') if isinstance(persisted_failure, dict) else None,
                             'failure_kind': persisted_failure.get('failure_kind') if isinstance(persisted_failure, dict) else None,
                         },
+                        failure_origin='agent_dispatch_failure',
+                        original_failure=original_failure,
                     )
             except Exception as exc:  # noqa: BLE001
                 flush_result['failure_error'] = f'{type(exc).__name__}: {exc}'

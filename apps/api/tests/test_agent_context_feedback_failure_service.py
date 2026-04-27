@@ -1,6 +1,41 @@
 import unittest
+from contextlib import contextmanager
+from datetime import date, datetime, timezone
+from unittest.mock import patch
+
+from sqlalchemy.orm.exc import DetachedInstanceError
 
 from app.agent_context.feedback_failure_service import AgentContextFeedbackFailureService
+
+
+class DetachingRow(dict):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.closed = False
+
+    def __getitem__(self, key):
+        if self.closed:
+            raise DetachedInstanceError('row was accessed after session close')
+        return super().__getitem__(key)
+
+
+class FakeMappingResult:
+    def __init__(self, row):
+        self.row = row
+
+    def mappings(self):
+        return self
+
+    def one(self):
+        return self.row
+
+
+class FakeSession:
+    def __init__(self, row):
+        self.row = row
+
+    def execute(self, statement):
+        return FakeMappingResult(self.row)
 
 
 class AgentContextFeedbackFailureServiceTests(unittest.TestCase):
@@ -11,6 +46,49 @@ class AgentContextFeedbackFailureServiceTests(unittest.TestCase):
 
         self.assertEqual(len(result), 64)
         self.assertEqual(result, 'x' * 64)
+
+    def test_record_failure_serializes_before_session_closes(self):
+        service = AgentContextFeedbackFailureService()
+        row = DetachingRow(
+            {
+                'id': 17,
+                'market_date': date(2026, 4, 14),
+                'symbol': '005930',
+                'agent_name': 'signal-decider',
+                'run_id': 'run-1',
+                'failure_kind': 'gateway_failed',
+                'retryable': True,
+                'summary_payload': {'error': 'gateway failed'},
+                'context_payload': {'dispatch_id': 'dispatch-1'},
+                'received_at': datetime(2026, 4, 14, 1, 0, tzinfo=timezone.utc),
+            }
+        )
+        fake_session = FakeSession(row)
+
+        @contextmanager
+        def fake_session_scope():
+            try:
+                yield fake_session
+            finally:
+                row.closed = True
+
+        with patch('app.agent_context.feedback_failure_service.session_scope', fake_session_scope):
+            result = service.record_failure(
+                market_date='2026-04-14',
+                symbol='005930',
+                agent_name='signal-decider',
+                run_id='run-1',
+                failure_kind='gateway_failed',
+                retryable=True,
+                summary={'error': 'gateway failed'},
+                context={'dispatch_id': 'dispatch-1'},
+            )
+
+        self.assertEqual(result['id'], 17)
+        self.assertEqual(result['market_date'], '2026-04-14')
+        self.assertEqual(result['agent_name'], 'signal-decider')
+        self.assertEqual(result['summary'], {'error': 'gateway failed'})
+        self.assertTrue(row.closed)
 
 
 if __name__ == '__main__':

@@ -84,10 +84,12 @@ async def _run_batches(args: argparse.Namespace, *, log_path: Path) -> dict[str,
         last_result = result
         active_symbols_total = result['active_symbols_total']
         symbols_selected = result['symbols_selected']
+        sync_result = result.get('sync') if isinstance(result.get('sync'), dict) else {}
+        capture_result = result.get('capture') if isinstance(result.get('capture'), dict) else {}
         next_offset = current_offset + symbols_selected
-        total_events_inserted += result['sync']['events_inserted']
-        total_events_captured += result['capture']['events_captured']
-        total_events_failed += result['capture']['events_failed']
+        total_events_inserted += int(sync_result.get('events_inserted') or 0)
+        total_events_captured += int(capture_result.get('events_captured') or 0)
+        total_events_failed += int(capture_result.get('events_failed') or 0)
         total_symbols_resolved += result['symbols_resolved']
         batches_completed += 1
 
@@ -99,14 +101,14 @@ async def _run_batches(args: argparse.Namespace, *, log_path: Path) -> dict[str,
             active_symbols_total=active_symbols_total,
             symbols_selected=symbols_selected,
             symbols_resolved=result['symbols_resolved'],
-            sync_run_id=result['sync']['run_id'],
-            capture_run_id=result['capture']['run_id'],
-            events_inserted=result['sync']['events_inserted'],
-            events_captured=result['capture']['events_captured'],
-            events_failed=result['capture']['events_failed'],
-            events_skipped=result['capture']['events_skipped'],
-            sync_status=result['sync']['status'],
-            capture_status=result['capture']['status'],
+            sync_run_id=sync_result.get('run_id'),
+            capture_run_id=capture_result.get('run_id'),
+            events_inserted=int(sync_result.get('events_inserted') or 0),
+            events_captured=int(capture_result.get('events_captured') or 0),
+            events_failed=int(capture_result.get('events_failed') or 0),
+            events_skipped=int(capture_result.get('events_skipped') or 0),
+            sync_status=sync_result.get('status'),
+            capture_status=capture_result.get('status'),
         )
 
         if args.max_batches is not None and batches_completed >= args.max_batches:
