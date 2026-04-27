@@ -118,6 +118,7 @@ class FakeAgentFeedbackRetryService:
         self.last_config = config
         return {
             'market_date': config.market_date.isoformat(),
+            'requested_symbols': list(config.symbols) if config.symbols is not None else None,
             'roles': list(config.roles),
             'max_cycles': config.max_cycles,
             'outer_batch_size': config.outer_batch_size,
@@ -128,7 +129,7 @@ class FakeAgentFeedbackRetryService:
             'progress': {
                 'request': {
                     'market_date': config.market_date.isoformat(),
-                    'symbols': None,
+                    'symbols': list(config.symbols) if config.symbols is not None else None,
                     'expected_agents': list(config.roles),
                 },
                 'summary': {
@@ -274,6 +275,7 @@ class AgentContextRouteTests(unittest.TestCase):
                 '/agent-context/feedback/retry-cycles',
                 json={
                     'market_date': '2026-04-14',
+                    'symbols': ['005930'],
                     'roles': ['technical-summarizer'],
                     'max_cycles': 2,
                     'outer_batch_size': 10,
@@ -285,10 +287,12 @@ class AgentContextRouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(fake_service.last_config.market_date.isoformat(), '2026-04-14')
+        self.assertEqual(fake_service.last_config.symbols, ('005930',))
         self.assertEqual(fake_service.last_config.roles, ('technical-summarizer',))
         self.assertEqual(fake_service.last_config.max_cycles, 2)
         self.assertEqual(fake_service.last_config.outer_batch_size, 10)
         self.assertFalse(fake_service.last_config.reuse_existing)
+        self.assertEqual(response.json()['requested_symbols'], ['005930'])
         summary = response.json()['progress']['summary']
         self.assertEqual(summary['first_feedback_at'], '2026-04-14T01:00:00+00:00')
         self.assertEqual(summary['completed_feedback_per_minute'], 0.6)

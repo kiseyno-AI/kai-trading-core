@@ -165,6 +165,33 @@ class InternalOpsTests(unittest.TestCase):
         self.assertEqual(result, {'symbols_evaluated': 2})
         self.assertEqual(collect_filter.call_args.kwargs['market_date'], '2026-04-14')
 
+    def test_run_agent_feedback_retry_cycles_passes_explicit_symbols_to_retry_service(self) -> None:
+        with (
+            patch('app.internal.ops.bootstrap_runtime') as bootstrap_runtime,
+            patch(
+                'app.internal.ops.agent_feedback_retry_service.run_retry_cycles',
+                return_value={'completed': True, 'final_pending': 0},
+            ) as run_retry_cycles,
+        ):
+            result = ops.run_agent_feedback_retry_cycles(
+                market_date='2026-04-14',
+                symbols='005930,000660',
+                roles='technical-summarizer',
+                max_cycles=2,
+                outer_batch_size=10,
+                reuse_existing=False,
+            )
+
+        bootstrap_runtime.assert_called_once_with()
+        self.assertEqual(result, {'completed': True, 'final_pending': 0})
+        config = run_retry_cycles.call_args.kwargs['config']
+        self.assertEqual(config.market_date.isoformat(), '2026-04-14')
+        self.assertEqual(config.symbols, ('005930', '000660'))
+        self.assertEqual(config.roles, ('technical-summarizer',))
+        self.assertEqual(config.max_cycles, 2)
+        self.assertEqual(config.outer_batch_size, 10)
+        self.assertFalse(config.reuse_existing)
+
     def test_compute_market_risk_filters_uses_canonical_feature_version(self) -> None:
         with (
             patch('app.internal.ops.bootstrap_runtime') as bootstrap_runtime,

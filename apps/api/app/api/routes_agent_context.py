@@ -76,6 +76,7 @@ class AgentFeedbackRetryCyclesRequest(BaseModel):
     model_config = ConfigDict(extra='forbid')
 
     market_date: date
+    symbols: list[str] | None = Field(default=None, min_length=1, max_length=500)
     roles: list[str] | None = None
     max_cycles: int = Field(default=3, ge=1, le=20)
     outer_batch_size: int = Field(default=20, ge=1, le=200)
@@ -86,6 +87,7 @@ class AgentFeedbackFollowupRequest(BaseModel):
     model_config = ConfigDict(extra='forbid')
 
     market_date: date
+    symbols: list[str] | None = Field(default=None, min_length=1, max_length=500)
     roles: list[str] | None = None
     max_cycles: int = Field(default=3, ge=1, le=20)
     outer_batch_size: int = Field(default=20, ge=1, le=500)
@@ -346,6 +348,7 @@ async def run_agent_feedback_retry_cycles(payload: AgentFeedbackRetryCyclesReque
         config = FeedbackRetryCycleConfig(
             market_date=payload.market_date,
             roles=tuple(payload.roles or EXPECTED_ROLES),
+            symbols=tuple(payload.symbols) if payload.symbols is not None else None,
             max_cycles=payload.max_cycles,
             outer_batch_size=payload.outer_batch_size,
             reuse_existing=payload.reuse_existing,
@@ -366,6 +369,7 @@ async def run_agent_feedback_followup(payload: AgentFeedbackFollowupRequest) -> 
         config = FeedbackRetryCycleConfig(
             market_date=payload.market_date,
             roles=tuple(payload.roles or EXPECTED_ROLES),
+            symbols=tuple(payload.symbols) if payload.symbols is not None else None,
             max_cycles=payload.max_cycles,
             outer_batch_size=payload.outer_batch_size,
             reuse_existing=payload.reuse_existing,

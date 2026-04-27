@@ -8,6 +8,7 @@ from uuid import uuid4
 
 from sqlalchemy import select
 
+from app.agent_context.orchestrator_helpers import normalize_requested_symbols as _normalize_requested_symbols
 from app.agent_context.orchestrator import agent_feedback_orchestrator
 from app.agent_context.progress_service import agent_context_progress_service
 from app.agent_context.reuse_service import agent_context_reuse_service
@@ -27,6 +28,7 @@ EXPECTED_ROLES: tuple[str, ...] = DEFAULT_AGENT_NAMES
 class FeedbackRetryCycleConfig:
     market_date: date
     roles: tuple[str, ...]
+    symbols: tuple[str, ...] | None = None
     max_cycles: int = 3
     outer_batch_size: int = 20
     reuse_existing: bool = True
@@ -78,8 +80,13 @@ class RetryCyclePlan:
 
 
 class AgentFeedbackRetryService:
-    def _load_eligible_symbols(self, *, market_date: date) -> list[str]:
-        normalized: list[str] = []
+    def _load_eligible_symbols(
+        self,
+        *,
+        market_date: date,
+        requested_symbols: Sequence[str] | None = None,
+    ) -> list[str]:
+        passed_symbols: list[str] = []
         seen: set[str] = set()
         for item in load_daily_piotroski_filter_results(
             market_date=market_date,
@@ -90,8 +97,11 @@ class AgentFeedbackRetryService:
             if not symbol or symbol in seen:
                 continue
             seen.add(symbol)
-            normalized.append(symbol)
-        return normalized
+            passed_symbols.append(symbol)
+        if requested_symbols is None:
+            return passed_symbols
+        passed_symbol_set = set(passed_symbols)
+        return [symbol for symbol in requested_symbols if symbol in passed_symbol_set]
 
     def load_incomplete_symbols(
         self,
@@ -444,9 +454,24 @@ class AgentFeedbackRetryService:
 
     def run_retry_cycles(self, *, config: FeedbackRetryCycleConfig) -> dict[str, Any]:
         roles = tuple(config.roles)
-        eligible_symbols = self._load_eligible_symbols(market_date=config.market_date)
+        raw_requested_symbols = getattr(config, 'symbols', None)
+        requested_symbols = (
+            tuple(_normalize_requested_symbols(raw_requested_symbols))
+            if raw_requested_symbols is not None
+            else None
+        )
+        eligible_symbols = self._load_eligible_symbols(
+            market_date=config.market_date,
+            requested_symbols=requested_symbols,
+        )
+        skipped_symbols = (
+            [symbol for symbol in requested_symbols or () if symbol not in set(eligible_symbols)]
+            if requested_symbols is not None
+            else []
+        )
         previous_run = agent_context_feedback_run_state_service.find_latest_run(
             market_date=config.market_date,
+            requested_symbols=list(requested_symbols) if requested_symbols is not None else None,
             requested_roles=list(roles),
             request_modes=[DAILY_RETRY_CYCLE_MODE],
         )
@@ -467,14 +492,19 @@ class AgentFeedbackRetryService:
         request_payload = {
             'market_date': config.market_date.isoformat(),
             'symbols': list(eligible_symbols),
-            'requested_symbols': list(eligible_symbols),
+            'requested_symbols': list(requested_symbols) if requested_symbols is not None else list(eligible_symbols),
             'request_run_id': request_run_id,
             'roles': list(roles),
             'max_cycles': config.max_cycles,
             'outer_batch_size': config.outer_batch_size,
             'parallel_subtasks': max(1, int(settings.openclaw_agent_parallel_subtasks)),
             'reuse_existing': config.reuse_existing,
-            'scope': 'piotroski_passed_symbols_only',
+            'scope': (
+                'requested_symbols_intersected_with_piotroski_passed_filter'
+                if requested_symbols is not None
+                else 'piotroski_passed_symbols_only'
+            ),
+            'skipped_symbols': skipped_symbols,
             'mode': DAILY_RETRY_CYCLE_MODE,
             'resumed_from_run_id': previous_run.get('run_id') if isinstance(previous_run, dict) else None,
         }
@@ -812,6 +842,7 @@ class AgentFeedbackRetryService:
         progress = self._get_retry_progress(
             market_date=config.market_date,
             roles=roles,
+            symbols=list(requested_symbols) if requested_symbols is not None else None,
             run_id=request_run_id,
         )
         final_pending_symbols = self._collect_retry_pending_symbols(
@@ -828,6 +859,9 @@ class AgentFeedbackRetryService:
             'max_cycles': config.max_cycles,
             'outer_batch_size': config.outer_batch_size,
             'reuse_existing': config.reuse_existing,
+            'requested_symbols': list(requested_symbols) if requested_symbols is not None else None,
+            'eligible_symbols': list(eligible_symbols) if requested_symbols is not None else None,
+            'skipped_symbols': skipped_symbols,
             'run_id': request_run_id,
             'cycles': cycles,
             'final_pending': len(final_pending_symbols),
@@ -835,10 +869,17 @@ class AgentFeedbackRetryService:
             'progress': progress,
         }
 
-    def _get_retry_progress(self, *, market_date: date, roles: Sequence[str], run_id: str | None = None) -> dict[str, Any]:
+    def _get_retry_progress(
+        self,
+        *,
+        market_date: date,
+        roles: Sequence[str],
+        symbols: Sequence[str] | None = None,
+        run_id: str | None = None,
+    ) -> dict[str, Any]:
         return agent_context_progress_service.get_feedback_progress(
             market_date=market_date,
-            symbols=None,
+            symbols=list(symbols) if symbols is not None else None,
             expected_agents=roles,
             run_id=run_id,
         )

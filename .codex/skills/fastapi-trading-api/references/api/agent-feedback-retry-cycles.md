@@ -5,6 +5,8 @@ Runs bounded retry passes over incomplete symbol-level agent feedback.
 
 The retry universe is the persisted passed-filter symbol set for the requested `market_date`, derived from `daily_piotroski_filter_results` rows where `passed_filter=true`. The retry path does not fan out to the full stored date universe.
 
+Callers can optionally provide `symbols` to restrict the real daily retry cycle to one explicit symbol or a small explicit symbol list. Core still runs the same summarizer and decider sequence, persists through the same durable tables, and keeps the run inspectable through the normal progress/latest/read surfaces. Requested symbols outside the passed-filter universe are reported as `skipped_symbols`.
+
 The response includes cycle and batch details plus a fresh `progress` snapshot using the same response shape as `GET /agent-context/feedback/progress`. Consumers can read `progress.summary.first_feedback_at`, `elapsed_seconds`, rate fields, and ETA fields immediately after the retry request completes.
 
 ## Example request
@@ -14,6 +16,7 @@ Content-Type: application/json
 
 {
   "market_date": "2026-04-16",
+  "symbols": ["005930"],
   "roles": ["eod-summarizer", "technical-summarizer", "fundamental-summarizer"],
   "max_cycles": 3,
   "outer_batch_size": 20,
@@ -25,6 +28,9 @@ Content-Type: application/json
 ```json
 {
   "market_date": "2026-04-16",
+  "requested_symbols": ["005930"],
+  "eligible_symbols": ["005930"],
+  "skipped_symbols": [],
   "roles": ["eod-summarizer", "technical-summarizer", "fundamental-summarizer"],
   "max_cycles": 3,
   "outer_batch_size": 20,
@@ -43,7 +49,7 @@ Content-Type: application/json
   "progress": {
     "request": {
       "market_date": "2026-04-16",
-      "symbols": null,
+      "symbols": ["005930"],
       "expected_agents": ["eod-summarizer", "technical-summarizer", "fundamental-summarizer"]
     },
     "summary": {

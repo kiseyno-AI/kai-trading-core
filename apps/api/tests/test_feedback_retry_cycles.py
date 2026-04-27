@@ -186,12 +186,31 @@ class FeedbackRetryCycleTests(unittest.TestCase):
         )
         self.assertEqual(result, ['005930'])
 
+    def test_load_eligible_symbols_respects_requested_symbol_subset_and_order(self):
+        service = AgentFeedbackRetryService()
+
+        with patch(
+            'app.agent_context.retry_service.load_daily_piotroski_filter_results',
+            return_value=[
+                {'symbol': '000660', 'passed_filter': True},
+                {'symbol': '005930', 'passed_filter': True},
+                {'symbol': '035420', 'passed_filter': True},
+            ],
+        ):
+            result = service._load_eligible_symbols(
+                market_date=date.fromisoformat('2026-04-16'),
+                requested_symbols=('035420', '005930', '114630'),
+            )
+
+        self.assertEqual(result, ['035420', '005930'])
+
     def test_parse_args_uses_env_market_date_default(self):
         with patch.dict('os.environ', {'FEEDBACK_RETRY_MARKET_DATE': '2026-04-16'}, clear=True):
             with patch('sys.argv', ['run_feedback_retry_cycles.py']):
                 args = run_feedback_retry_cycles._parse_args()
 
         self.assertEqual(args.market_date, date.fromisoformat('2026-04-16'))
+        self.assertIsNone(args.symbols)
 
     def test_parse_args_cli_market_date_overrides_env_default(self):
         with patch.dict('os.environ', {'FEEDBACK_RETRY_MARKET_DATE': '2026-04-15'}, clear=True):
@@ -199,6 +218,15 @@ class FeedbackRetryCycleTests(unittest.TestCase):
                 args = run_feedback_retry_cycles._parse_args()
 
         self.assertEqual(args.market_date, date.fromisoformat('2026-04-16'))
+
+    def test_parse_args_accepts_explicit_symbols(self):
+        with patch(
+            'sys.argv',
+            ['run_feedback_retry_cycles.py', '--symbols', '005930,000660', '035420'],
+        ):
+            args = run_feedback_retry_cycles._parse_args()
+
+        self.assertEqual(args.symbols, ['005930,000660', '035420'])
 
     def test_run_retry_cycles_includes_progress_response_fields(self):
         service = AgentFeedbackRetryService()
@@ -287,6 +315,69 @@ class FeedbackRetryCycleTests(unittest.TestCase):
         )
         self.assertEqual(result['progress']['request']['expected_agents'], ['technical-summarizer'])
         self.assertEqual(result['progress']['summary']['expected_feedback_count'], 10)
+
+    def test_run_retry_cycles_preserves_requested_symbol_scope_in_progress_and_run_payload(self):
+        service = AgentFeedbackRetryService()
+        run_state_service = RecordingRunStateService()
+        snapshot = _snapshot(
+            symbols=('005930',),
+            role_states={
+                role: _role_state(
+                    role=role,
+                    symbols=('005930',),
+                    completed=('005930',),
+                )
+                for role in EXPECTED_ROLES
+            },
+        )
+        progress = {
+            'request': {
+                'market_date': '2026-04-16',
+                'symbols': ['005930'],
+                'expected_agents': list(EXPECTED_ROLES),
+            },
+            'summary': {
+                'completed_symbols': 1,
+                'expected_feedback_count': 4,
+            },
+        }
+
+        with patch.object(service, '_load_eligible_symbols', return_value=['005930']):
+            with patch.object(service, '_build_role_sequence_snapshot', return_value=snapshot):
+                with patch(
+                    'app.agent_context.retry_service.agent_context_feedback_run_state_service',
+                    run_state_service,
+                ):
+                    with patch(
+                        'app.agent_context.retry_service.agent_context_progress_service.get_feedback_progress',
+                        return_value=progress,
+                    ) as get_progress:
+                        result = service.run_retry_cycles(
+                            config=SimpleNamespace(
+                                market_date=date.fromisoformat('2026-04-16'),
+                                roles=EXPECTED_ROLES,
+                                symbols=('005930',),
+                                max_cycles=3,
+                                outer_batch_size=20,
+                                reuse_existing=True,
+                            )
+                        )
+
+        get_progress.assert_called_once_with(
+            market_date=date.fromisoformat('2026-04-16'),
+            symbols=['005930'],
+            expected_agents=EXPECTED_ROLES,
+            run_id=ANY,
+        )
+        self.assertEqual(run_state_service.started[0]['request_payload']['requested_symbols'], ['005930'])
+        self.assertEqual(run_state_service.started[0]['request_payload']['symbols'], ['005930'])
+        self.assertEqual(
+            run_state_service.started[0]['request_payload']['scope'],
+            'requested_symbols_intersected_with_piotroski_passed_filter',
+        )
+        self.assertEqual(result['requested_symbols'], ['005930'])
+        self.assertEqual(result['eligible_symbols'], ['005930'])
+        self.assertEqual(result['skipped_symbols'], [])
 
     def test_run_retry_cycles_persists_role_boundaries_and_advances_past_terminal_failures(self):
         service = AgentFeedbackRetryService()
