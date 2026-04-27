@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 from app.agent_context import orchestrator as orchestrator_module
 from app.agent_context.orchestrator import AgentFeedbackOrchestrator, OpenClawAgentClient
+from app.agent_context.orchestrator_helpers import correlate_decoded_batch_response
 from app.agent_context.runtime_state import RuntimeFeedbackStateStore
 
 
@@ -255,6 +256,16 @@ class SignalDeciderBatchClient:
             'response': {'model': f"openclaw/{spec.agent_name}", 'id': f"resp-{spec.role}"},
             'output_text': '{}',
         }
+
+
+class FailingSignalDeciderBatchClient(SignalDeciderBatchClient):
+    def dispatch_batch(self, **kwargs):
+        spec = kwargs['spec']
+        if spec.role == 'signal-decider':
+            with self._lock:
+                self.calls.append(kwargs)
+            raise orchestrator_module.AgentDispatchRetryableError('gateway failed before feedback rows')
+        return super().dispatch_batch(**kwargs)
 
 
 class FakeHTTPResponse:
@@ -808,7 +819,78 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertEqual(decider_row['feedback']['preferred_action'], 'buy')
         self.assertEqual(decider_row['summary']['model'], 'openclaw/signal-decider')
         self.assertIn('raw_response', decider_row['summary'])
+        decider_call = next(call for call in client.calls if call['spec'].role == 'signal-decider')
+        self.assertEqual(decider_call['batch_items'][0]['session_reuse_mode'], 'fresh_per_batch')
+        self.assertIn(result['request']['request_run_id'], decider_call['batch_items'][0]['session_key'])
         self.assertEqual(result['summary']['completed'], 4)
+
+    def test_failed_fresh_signal_decider_batch_still_cleans_session(self):
+        service = AgentFeedbackOrchestrator()
+        client = FailingSignalDeciderBatchClient()
+        service.client = client
+        feedback_service = FakeFeedbackService()
+        cleanup_service = FakeSessionCleanupService()
+        failure_service = RecordingFailureService()
+        fake_settings = SimpleNamespace(openclaw_agent_symbol_chunk_size=1, openclaw_agent_parallel_subtasks=1)
+
+        def build_latest_decisions(**kwargs):
+            roles = tuple(kwargs['roles'])
+            if set(roles) != set(orchestrator_module.UPSTREAM_SUMMARY_ROLES):
+                return {}
+            return {
+                '005930': {
+                    role: SimpleNamespace(
+                        should_dispatch=False,
+                        latest_feedback={
+                            'id': len(role),
+                            'market_date': '2026-04-14',
+                            'run_id': f'upstream-{role}',
+                            'received_at': '2026-04-14T00:30:00+00:00',
+                            'feedback_payload': {
+                                'role': role,
+                                'summary': f'{role} summary',
+                                'confidence': 0.7,
+                                'risk_flags': [],
+                                'details': {},
+                                'improvement_notes': [],
+                            },
+                        },
+                    )
+                    for role in roles
+                }
+            }
+
+        reuse_service = SimpleNamespace(build_latest_decisions=build_latest_decisions)
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            with patch.object(orchestrator_module, 'agent_context_read_service', DeciderReadyAgentContextReadService()):
+                with patch.object(orchestrator_module, 'agent_context_reuse_service', reuse_service):
+                    with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
+                        with patch.object(orchestrator_module, 'agent_context_feedback_failure_service', failure_service):
+                            with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
+                                with patch.object(
+                                    orchestrator_module,
+                                    'load_daily_piotroski_filter_results',
+                                    return_value=_passed_filter_rows('005930'),
+                                ):
+                                    result = service.dispatch_for_symbols(
+                                        market_date='2026-04-14',
+                                        symbols=['005930'],
+                                        roles=['signal-decider'],
+                                        reuse_existing=False,
+                                    )
+
+        self.assertEqual(feedback_service.bulk_calls, [])
+        self.assertEqual(len(failure_service.recorded), 1)
+        self.assertEqual(result['summary']['status'], 'failed')
+        self.assertEqual(result['summary']['failed'], 1)
+        self.assertEqual(len(cleanup_service.targets), 1)
+        cleanup_target = cleanup_service.targets[0]
+        self.assertEqual(cleanup_target.agent_name, 'signal-decider')
+        self.assertEqual(cleanup_target.symbol, '005930')
+        self.assertEqual(cleanup_target.run_id, result['request']['request_run_id'])
+        self.assertIn(result['request']['request_run_id'], cleanup_target.session_key)
+        self.assertIn('feedback/signal-decider/', cleanup_target.session_key)
 
     def test_build_upstream_feedback_bundle_does_not_reuse_same_day_persisted_summary_when_role_requires_redispatch(self):
         upstream_summaries, upstream_traceability, missing_roles = AgentFeedbackOrchestrator._build_upstream_feedback_bundle(
@@ -1128,6 +1210,202 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertEqual(mismatch_log['dispatch_id'], dispatch_id)
         self.assertEqual(mismatch_log['unexpected_symbols'], ['999999'])
         self.assertEqual(mismatch_log['missing_symbols'], [])
+        self.assertEqual(mismatch_log['failure_class'], 'batch_response_attribution_mismatch')
+        self.assertEqual(mismatch_log['session_reuse_mode'], 'slot_reused')
+
+    def test_signal_decider_one_symbol_batch_attributes_missing_symbol_under_reused_session(self):
+        dispatch_id = 'symbol-run-2026-04-14-abc123:signal-decider:slot-1:batch-1'
+        http_calls = []
+        captured_logs = []
+        response_payload = {
+            'id': 'resp-decider-1',
+            'status': 'completed',
+            'model': 'openclaw/signal-decider',
+            'output': [
+                {
+                    'type': 'message',
+                    'content': [
+                        {
+                            'type': 'output_text',
+                            'text': json.dumps(
+                                {
+                                    'items': [
+                                        {
+                                            'feedback': {
+                                                'role': 'signal-decider',
+                                                'agent_name': 'signal-decider',
+                                                'market_date': '2026-04-14',
+                                                'preferred_action': 'wait',
+                                                'next_day_open_action': 'wait',
+                                                'entry_price_basis': 'next_open',
+                                                'target_price': None,
+                                                'expected_return_pct': None,
+                                                'stop_loss_price': None,
+                                                'suggested_holding_period': '3-10 trading days',
+                                                'confidence_score_10': 6,
+                                                'conviction_score_10': 5,
+                                                'thesis_summary': 'Valid one-symbol decision support.',
+                                                'supporting_evidence': ['Specialists are aligned enough to wait.'],
+                                                'decision_risks': [],
+                                                'invalidation_conditions': [],
+                                                'data_quality_warnings': [],
+                                                'specialist_disagreement': [],
+                                                'summary': 'Valid one-symbol decision support.',
+                                                'confidence': 0.6,
+                                                'risk_flags': [],
+                                                'details': {'decision_support': {'decision_support_only': True}},
+                                                'improvement_notes': [],
+                                            },
+                                        }
+                                    ]
+                                }
+                            ),
+                        }
+                    ],
+                }
+            ],
+        }
+        fake_settings = SimpleNamespace(
+            openclaw_base_url='https://openclaw.example',
+            openclaw_gateway_token='gateway-token',
+            openclaw_agent_timeout_seconds=30,
+            openclaw_agent_max_retries=0,
+            openclaw_agent_retry_backoff_seconds=0,
+            openclaw_agent_max_prompt_chars=0,
+        )
+
+        def fake_client_factory(*args, **kwargs):
+            return FakeHTTPClient(
+                response=FakeHTTPResponse(200, response_payload),
+                calls=http_calls,
+                **kwargs,
+            )
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            with patch('app.agent_context.orchestrator.httpx.Client', side_effect=fake_client_factory):
+                with patch.object(
+                    orchestrator_module,
+                    'log_agent_feedback_event',
+                    side_effect=lambda stage, **payload: captured_logs.append({'stage': stage, **payload}),
+                ):
+                    client = OpenClawAgentClient()
+                    result = client.dispatch_batch(
+                        spec=orchestrator_module.DISPATCH_SPECS[-1],
+                        market_date=orchestrator_module.date.fromisoformat('2026-04-14'),
+                        batch_items=[
+                            {
+                                'symbol': '005930',
+                                'market_date': '2026-04-14',
+                                'request_run_id': 'symbol-run-2026-04-14-abc123',
+                                'dispatch_id': dispatch_id,
+                                'session_slot': 1,
+                                'session_key': 'agent:signal-decider:feedback/signal-decider/slot-01',
+                                'session_reuse_mode': 'slot_reused',
+                            }
+                        ],
+                    )
+
+        decoded_item = result['decoded']['items'][0]
+        self.assertEqual(decoded_item['symbol'], '005930')
+        self.assertEqual(result['response_correlation']['attribution_status'], 'fallback_attributed')
+        self.assertEqual(result['response_correlation']['fallback_attributions'][0]['reason'], 'single_symbol_batch')
+        self.assertIn('fallback_symbol_attribution', decoded_item['feedback']['risk_flags'])
+        self.assertIn('response_symbol_missing', decoded_item['feedback']['risk_flags'])
+        self.assertNotIn('batch_response_symbol_mismatch', [entry['stage'] for entry in captured_logs])
+        fallback_log = next(entry for entry in captured_logs if entry['stage'] == 'batch_response_symbol_attribution_fallback')
+        self.assertEqual(fallback_log['session_reuse_mode'], 'slot_reused')
+        self.assertEqual(fallback_log['fallback_attributions'][0]['symbol'], '005930')
+
+    def test_single_symbol_batch_keeps_contradictory_envelope_symbol_as_mismatch(self):
+        decoded, metadata = correlate_decoded_batch_response(
+            decoded={
+                'items': [
+                    {
+                        'symbol': '999999',
+                        'feedback': {
+                            'symbol': '005930',
+                            'role': 'signal-decider',
+                            'summary': 'Nested feedback named the requested symbol.',
+                            'confidence': 0.6,
+                            'risk_flags': [],
+                            'details': {},
+                            'improvement_notes': [],
+                        },
+                    }
+                ]
+            },
+            expected_symbols=['005930'],
+            session_reuse_mode='slot_reused',
+        )
+
+        self.assertEqual(decoded['items'][0]['symbol'], '999999')
+        self.assertEqual(decoded['items'][0]['feedback']['risk_flags'], [])
+        self.assertEqual(metadata['attribution_status'], 'mismatch')
+        self.assertEqual(metadata['failure_class'], 'batch_response_attribution_mismatch')
+        self.assertEqual(metadata['missing_symbols'], ['005930'])
+        self.assertEqual(metadata['unexpected_symbols'], ['999999'])
+        self.assertEqual(metadata['fallback_attributions'], [])
+
+    def test_openclaw_batch_dispatch_classifies_invalid_json_parse_failures(self):
+        dispatch_id = 'symbol-run-2026-04-14-abc123:signal-decider:slot-1:batch-1'
+        http_calls = []
+        captured_logs = []
+        response_payload = {
+            'id': 'resp-decider-2',
+            'status': 'completed',
+            'model': 'openclaw/signal-decider',
+            'output': [
+                {
+                    'type': 'message',
+                    'content': [{'type': 'output_text', 'text': 'not json'}],
+                }
+            ],
+        }
+        fake_settings = SimpleNamespace(
+            openclaw_base_url='https://openclaw.example',
+            openclaw_gateway_token='gateway-token',
+            openclaw_agent_timeout_seconds=30,
+            openclaw_agent_max_retries=0,
+            openclaw_agent_retry_backoff_seconds=0,
+            openclaw_agent_max_prompt_chars=0,
+        )
+
+        def fake_client_factory(*args, **kwargs):
+            return FakeHTTPClient(
+                response=FakeHTTPResponse(200, response_payload),
+                calls=http_calls,
+                **kwargs,
+            )
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            with patch('app.agent_context.orchestrator.httpx.Client', side_effect=fake_client_factory):
+                with patch.object(
+                    orchestrator_module,
+                    'log_agent_feedback_event',
+                    side_effect=lambda stage, **payload: captured_logs.append({'stage': stage, **payload}),
+                ):
+                    client = OpenClawAgentClient()
+                    with self.assertRaisesRegex(orchestrator_module.AgentDispatchRetryableError, 'invalid_json'):
+                        client.dispatch_batch(
+                            spec=orchestrator_module.DISPATCH_SPECS[-1],
+                            market_date=orchestrator_module.date.fromisoformat('2026-04-14'),
+                            batch_items=[
+                                {
+                                    'symbol': '005930',
+                                    'market_date': '2026-04-14',
+                                    'request_run_id': 'symbol-run-2026-04-14-abc123',
+                                    'dispatch_id': dispatch_id,
+                                    'session_slot': 1,
+                                    'session_key': 'agent:signal-decider:feedback/signal-decider/slot-01',
+                                    'session_reuse_mode': 'slot_reused',
+                                }
+                            ],
+                        )
+
+        parse_log = next(entry for entry in captured_logs if entry['stage'] == 'batch_response_parse_failed')
+        self.assertEqual(parse_log['failure_class'], 'invalid_json')
+        self.assertIn(parse_log['json_failure_class'], {'session_history_marker_not_found', 'json_object_not_found'})
+        self.assertNotIn('batch_response_symbol_mismatch', [entry['stage'] for entry in captured_logs])
 
     def test_spawn_symbol_subagent_terminal_error_logs_only_in_scope_fields(self):
         http_calls = []

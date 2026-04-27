@@ -82,6 +82,162 @@ def request_scope_from_items(batch_items: Sequence[dict[str, Any]], key: str) ->
     return next(iter(values))
 
 
+def _canonical_symbol(value: Any) -> str | None:
+    symbol = str(value or '').strip().upper()
+    return symbol or None
+
+
+def _feedback_reported_symbol(feedback: Any) -> str | None:
+    if not isinstance(feedback, dict):
+        return None
+    symbol = _canonical_symbol(feedback.get('symbol'))
+    if symbol:
+        return symbol
+    traceability = feedback.get('traceability')
+    if isinstance(traceability, dict):
+        return _canonical_symbol(traceability.get('symbol'))
+    return None
+
+
+def _append_feedback_risk_flags(feedback: dict[str, Any], flags: Sequence[str]) -> None:
+    existing = feedback.get('risk_flags')
+    risk_flags = [str(flag) for flag in existing if isinstance(flag, str)] if isinstance(existing, list) else []
+    feedback['risk_flags'] = list(dict.fromkeys([*risk_flags, *flags]))
+
+
+def _annotate_feedback_attribution(
+    *,
+    feedback: Any,
+    expected_symbol: str,
+    item_symbol: str | None,
+    feedback_symbol: str | None,
+    fallback_reason: str,
+    session_reuse_mode: str | None,
+) -> None:
+    if not isinstance(feedback, dict):
+        return
+    flags = ['fallback_symbol_attribution']
+    if item_symbol is None and feedback_symbol is None:
+        flags.append('response_symbol_missing')
+    if item_symbol is not None and item_symbol != expected_symbol:
+        flags.append('response_symbol_mismatch')
+    if feedback_symbol is not None and feedback_symbol != expected_symbol:
+        flags.append('reported_symbol_mismatch')
+    _append_feedback_risk_flags(feedback, flags)
+    traceability = feedback.get('traceability') if isinstance(feedback.get('traceability'), dict) else {}
+    feedback['traceability'] = {
+        **traceability,
+        'response_attribution': {
+            'expected_symbol': expected_symbol,
+            'item_symbol': item_symbol,
+            'feedback_symbol': feedback_symbol,
+            'fallback_reason': fallback_reason,
+            'session_reuse_mode': session_reuse_mode,
+        },
+    }
+
+
+def correlate_decoded_batch_response(
+    *,
+    decoded: dict[str, Any] | None,
+    expected_symbols: Sequence[str],
+    session_reuse_mode: str | None = None,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    expected = [_canonical_symbol(symbol) for symbol in expected_symbols]
+    expected = [symbol for symbol in expected if symbol is not None]
+    metadata: dict[str, Any] = {
+        'expected_symbols': expected,
+        'parsed_symbols': [],
+        'response_symbols': [],
+        'missing_symbols': expected,
+        'unexpected_symbols': [],
+        'fallback_attributions': [],
+        'attribution_status': 'not_decoded',
+        'failure_class': 'invalid_json',
+        'session_reuse_mode': session_reuse_mode,
+    }
+    if decoded is None:
+        return None, metadata
+
+    decoded_items = decoded.get('items') if isinstance(decoded, dict) else None
+    if not isinstance(decoded_items, list):
+        metadata['attribution_status'] = 'missing_items'
+        metadata['failure_class'] = 'batch_response_missing_items'
+        return decoded, metadata
+
+    canonical_by_symbol = {symbol: symbol for symbol in expected}
+    response_symbols: list[str] = []
+    normalized_items: list[Any] = []
+    for item in decoded_items:
+        if not isinstance(item, dict):
+            normalized_items.append(item)
+            continue
+        copied = dict(item)
+        item_symbol = _canonical_symbol(copied.get('symbol'))
+        if item_symbol:
+            response_symbols.append(item_symbol)
+            if item_symbol in canonical_by_symbol:
+                copied['symbol'] = canonical_by_symbol[item_symbol]
+        normalized_items.append(copied)
+
+    normalized_decoded = {**decoded, 'items': normalized_items}
+    response_symbol_set = set(response_symbols)
+    expected_set = set(expected)
+    missing_symbols = [symbol for symbol in expected if symbol not in response_symbol_set]
+    unexpected_symbols = [symbol for symbol in response_symbols if symbol not in expected_set]
+
+    if len(expected) == 1 and len(normalized_items) == 1 and isinstance(normalized_items[0], dict):
+        expected_symbol = expected[0]
+        item = dict(normalized_items[0])
+        feedback = item.get('feedback')
+        item_symbol = _canonical_symbol(item.get('symbol'))
+        feedback_symbol = _feedback_reported_symbol(feedback)
+        feedback_symbol_matches = feedback_symbol in (None, expected_symbol)
+        if item_symbol is None and feedback_symbol_matches:
+            fallback_reason = 'single_symbol_batch'
+            item['symbol'] = expected_symbol
+            _annotate_feedback_attribution(
+                feedback=feedback,
+                expected_symbol=expected_symbol,
+                item_symbol=item_symbol,
+                feedback_symbol=feedback_symbol,
+                fallback_reason=fallback_reason,
+                session_reuse_mode=session_reuse_mode,
+            )
+            normalized_decoded = {**decoded, 'items': [item]}
+            metadata.update(
+                {
+                    'parsed_symbols': response_symbols,
+                    'response_symbols': [expected_symbol],
+                    'missing_symbols': [],
+                    'unexpected_symbols': [],
+                    'fallback_attributions': [
+                        {
+                            'symbol': expected_symbol,
+                            'item_symbol': item_symbol,
+                            'feedback_symbol': feedback_symbol,
+                            'reason': fallback_reason,
+                        }
+                    ],
+                    'attribution_status': 'fallback_attributed',
+                    'failure_class': None,
+                }
+            )
+            return normalized_decoded, metadata
+
+    metadata.update(
+        {
+            'parsed_symbols': response_symbols,
+            'response_symbols': response_symbols,
+            'missing_symbols': missing_symbols,
+            'unexpected_symbols': unexpected_symbols,
+            'attribution_status': 'matched' if not missing_symbols and not unexpected_symbols else 'mismatch',
+            'failure_class': None if not missing_symbols and not unexpected_symbols else 'batch_response_attribution_mismatch',
+        }
+    )
+    return normalized_decoded, metadata
+
+
 def slot_from_items(batch_items: Sequence[dict[str, Any]]) -> int | None:
     raw_slot = request_scope_from_items(batch_items, 'session_slot')
     if raw_slot is None:
@@ -212,6 +368,8 @@ def build_response_storage_payload(
         'normalized_feedback': normalized_feedback,
         'normalization_mismatch_flags': extract_response_mismatch_flags(normalized_feedback),
         'session_ref': batch_result.get('session_ref'),
+        'response_correlation': batch_result.get('response_correlation'),
+        'session_reuse_mode': batch_result.get('session_reuse_mode'),
         'collector_mode': collector_mode,
     }
 

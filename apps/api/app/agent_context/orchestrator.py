@@ -24,6 +24,7 @@ from app.agent_context.orchestrator_helpers import (
     build_response_storage_payload as _build_response_storage_payload,
     build_signal_decider_payload as _build_signal_decider_payload_helper,
     build_upstream_feedback_bundle as _build_upstream_feedback_bundle_helper,
+    correlate_decoded_batch_response as _correlate_decoded_batch_response,
     extract_json_object as _extract_json_object,
     extract_response_mismatch_flags as _extract_response_mismatch_flags,
     failure_log_fields as _failure_log_fields,
@@ -620,6 +621,9 @@ class OpenClawAgentClient:
         request_session_key = _request_scope_from_items(batch_items, 'session_key')
         request_session_key = str(request_session_key or f"feedback/{spec.agent_name}/{market_date.isoformat()}/{uuid.uuid4().hex}")
         fixed_session_key = request_session_key
+        session_reuse_mode = _request_scope_from_items(batch_items, 'session_reuse_mode')
+        if session_reuse_mode is None:
+            session_reuse_mode = 'fresh_per_batch' if request_run_id and request_run_id in request_session_key else 'slot_reused'
         dispatch_id = _request_scope_from_items(batch_items, 'dispatch_id')
         if dispatch_id is None:
             slot_token = slot if slot is not None else 0
@@ -659,6 +663,7 @@ class OpenClawAgentClient:
                     session_key=request_session_key,
                     batch_symbols=batch_symbols,
                     slot=slot,
+                    session_reuse_mode=session_reuse_mode,
                     request_marker=request_marker,
                     request_snapshot=build_request_snapshot(body),
                     http_target={'url': url, 'headers': headers},
@@ -694,6 +699,7 @@ class OpenClawAgentClient:
                     session_key=request_session_key,
                     batch_symbols=batch_symbols,
                     slot=slot,
+                    session_reuse_mode=session_reuse_mode,
                     response_snapshot=build_response_snapshot(
                         parsed,
                         output_text=output_text,
@@ -705,14 +711,26 @@ class OpenClawAgentClient:
                         f"OpenClaw batch ended with status={parsed.get('status')}"
                     )
                 normalized_text = _extract_json_object(output_text)
-                decoded = None
+                decoded: dict[str, Any] | None = None
+                decoded_source = 'output_text'
+                json_failure_class = 'json_object_not_found'
                 if normalized_text:
                     try:
-                        decoded = json.loads(normalized_text)
+                        candidate_decoded = json.loads(normalized_text)
                     except json.JSONDecodeError:
-                        decoded = None
+                        json_failure_class = 'json_decode_error'
+                    else:
+                        if isinstance(candidate_decoded, dict):
+                            decoded = candidate_decoded
+                            json_failure_class = None
+                        elif isinstance(candidate_decoded, list):
+                            decoded = {'items': candidate_decoded}
+                            json_failure_class = None
+                        else:
+                            json_failure_class = 'json_shape_not_object'
                 session_ref = self._extract_session_ref(parsed, explicit_session_key=request_session_key)
                 session_history = None
+                history_marker_found = None
                 if decoded is None and request_session_key:
                     session_history = self.fetch_session_history(session_key=request_session_key, limit=80, include_tools=True)
                     marker_index = None
@@ -726,6 +744,7 @@ class OpenClawAgentClient:
                         candidate_text = '\n'.join(text_chunks)
                         if request_marker in candidate_text:
                             marker_index = idx
+                    history_marker_found = marker_index is not None
                     if marker_index is not None:
                         for message in session_history[marker_index + 1:]:
                             if message.get('role') != 'assistant':
@@ -742,11 +761,58 @@ class OpenClawAgentClient:
                                 candidate_decoded = json.loads(candidate_json)
                             except json.JSONDecodeError:
                                 continue
-                            if isinstance(candidate_decoded, dict) and isinstance(candidate_decoded.get('items'), list):
+                            if isinstance(candidate_decoded, list):
+                                decoded = {'items': candidate_decoded}
+                            elif isinstance(candidate_decoded, dict):
                                 decoded = candidate_decoded
+                            if decoded is not None:
+                                decoded_source = 'session_history_after_marker'
+                                json_failure_class = None
                                 output_text = candidate_text
                                 break
+                    if decoded is None:
+                        json_failure_class = (
+                            'session_history_marker_not_found'
+                            if marker_index is None
+                            else 'session_history_response_json_not_found'
+                        )
+                if decoded is None:
+                    response_correlation = {
+                        'expected_symbols': batch_symbols,
+                        'parsed_symbols': [],
+                        'response_symbols': [],
+                        'missing_symbols': batch_symbols,
+                        'unexpected_symbols': [],
+                        'fallback_attributions': [],
+                        'attribution_status': 'not_decoded',
+                        'failure_class': 'invalid_json',
+                        'json_failure_class': json_failure_class,
+                        'decoded_source': decoded_source,
+                        'history_checked': bool(session_history) if session_history is not None else False,
+                        'history_marker_found': history_marker_found,
+                        'session_reuse_mode': session_reuse_mode,
+                    }
+                    log_agent_feedback_event(
+                        'batch_response_parse_failed',
+                        status='retryable',
+                        request_run_id=request_run_id,
+                        dispatch_id=dispatch_id,
+                        attempt_id=attempt_id,
+                        agent_name=spec.agent_name,
+                        role=spec.role,
+                        market_date=market_date.isoformat(),
+                        session_key=request_session_key,
+                        batch_symbols=batch_symbols,
+                        slot=slot,
+                        session_reuse_mode=session_reuse_mode,
+                        failure_class='invalid_json',
+                        json_failure_class=json_failure_class,
+                        response_correlation=response_correlation,
+                    )
+                    raise AgentDispatchRetryableError(f'OpenClaw batch response invalid_json:{json_failure_class}')
+                top_level_object_fallback = False
                 if isinstance(decoded, dict) and not isinstance(decoded.get('items'), list):
+                    top_level_object_fallback = True
                     symbol_items = []
                     for batch_item in batch_items:
                         symbol = str(batch_item.get('symbol') or '').strip()
@@ -769,14 +835,41 @@ class OpenClawAgentClient:
                     decoded = {
                         'items': symbol_items,
                     }
-                decoded_items = decoded.get('items') if isinstance(decoded, dict) else None
-                response_symbols = [
-                    str(item.get('symbol') or '').strip()
-                    for item in decoded_items
-                    if isinstance(item, dict) and str(item.get('symbol') or '').strip()
-                ] if isinstance(decoded_items, list) else []
-                unexpected_symbols = [symbol for symbol in response_symbols if symbol not in batch_symbols]
-                missing_symbols = [symbol for symbol in batch_symbols if symbol not in response_symbols]
+                decoded, response_correlation = _correlate_decoded_batch_response(
+                    decoded=decoded,
+                    expected_symbols=batch_symbols,
+                    session_reuse_mode=session_reuse_mode,
+                )
+                response_correlation = {
+                    **response_correlation,
+                    'decoded_source': decoded_source,
+                    'history_checked': bool(session_history) if session_history is not None else False,
+                    'history_marker_found': history_marker_found,
+                    'top_level_object_fallback': top_level_object_fallback,
+                    'json_failure_class': json_failure_class,
+                }
+                response_symbols = response_correlation.get('response_symbols') or []
+                unexpected_symbols = response_correlation.get('unexpected_symbols') or []
+                missing_symbols = response_correlation.get('missing_symbols') or []
+                fallback_attributions = response_correlation.get('fallback_attributions') or []
+                if fallback_attributions:
+                    log_agent_feedback_event(
+                        'batch_response_symbol_attribution_fallback',
+                        status='accepted_with_fallback',
+                        request_run_id=request_run_id,
+                        dispatch_id=dispatch_id,
+                        attempt_id=attempt_id,
+                        agent_name=spec.agent_name,
+                        role=spec.role,
+                        market_date=market_date.isoformat(),
+                        session_key=request_session_key,
+                        batch_symbols=batch_symbols,
+                        slot=slot,
+                        session_reuse_mode=session_reuse_mode,
+                        response_symbols=response_symbols,
+                        fallback_attributions=fallback_attributions,
+                        response_correlation=response_correlation,
+                    )
                 if unexpected_symbols or missing_symbols:
                     log_agent_feedback_event(
                         'batch_response_symbol_mismatch',
@@ -794,10 +887,11 @@ class OpenClawAgentClient:
                         unexpected_symbols=unexpected_symbols,
                         missing_symbols=missing_symbols,
                         history_checked=bool(session_history) if session_history is not None else False,
+                        failure_class=response_correlation.get('failure_class') or 'batch_response_attribution_mismatch',
+                        session_reuse_mode=session_reuse_mode,
+                        response_correlation=response_correlation,
                         reuse_signal='stale_or_ambiguous_session_reuse',
                     )
-                if decoded is None:
-                    raise AgentDispatchRetryableError('OpenClaw batch returned invalid JSON')
                 return {
                     'ok': True,
                     'attempt': attempt,
@@ -816,6 +910,8 @@ class OpenClawAgentClient:
                     'session_ref': session_ref,
                     'decoded': decoded,
                     'history_checked': bool(session_history) if session_history is not None else False,
+                    'response_correlation': response_correlation,
+                    'session_reuse_mode': session_reuse_mode,
                 }
             except AgentDispatchTerminalError:
                 raise
@@ -835,6 +931,7 @@ class OpenClawAgentClient:
                     session_key=request_session_key,
                     batch_symbols=batch_symbols,
                     slot=slot,
+                    session_reuse_mode=session_reuse_mode,
                     error_type=error_type,
                     error_message=error_message,
                     response_snapshot=(
@@ -1031,6 +1128,33 @@ class AgentFeedbackOrchestrator:
             return None
         return session_key.strip()
 
+    @staticmethod
+    def _session_key_from_failure(failure: dict[str, Any]) -> str | None:
+        context = failure.get('context') if isinstance(failure.get('context'), dict) else {}
+        session_key = failure.get('session_key') or context.get('session_key')
+        if not isinstance(session_key, str) or not session_key.strip():
+            return None
+        return session_key.strip()
+
+    def _cleanup_session_key(
+        self,
+        *,
+        market_date: date,
+        symbol: str,
+        agent_name: str,
+        run_id: str | None,
+        session_key: str,
+    ) -> dict[str, Any]:
+        return agent_feedback_session_cleanup_service.delete_now(
+            target=SessionCleanupTarget(
+                market_date=market_date,
+                symbol=symbol,
+                agent_name=agent_name,
+                run_id=run_id,
+                session_key=session_key,
+            )
+        )
+
     def _cleanup_feedback_session(
         self,
         *,
@@ -1043,14 +1167,12 @@ class AgentFeedbackOrchestrator:
         session_key = self._session_key_from_response(response)
         if session_key is None:
             return None
-        return agent_feedback_session_cleanup_service.delete_now(
-            target=SessionCleanupTarget(
-                market_date=market_date,
-                symbol=symbol,
-                agent_name=agent_name,
-                run_id=run_id,
-                session_key=session_key,
-            )
+        return self._cleanup_session_key(
+            market_date=market_date,
+            symbol=symbol,
+            agent_name=agent_name,
+            run_id=run_id,
+            session_key=session_key,
         )
 
     def _cleanup_buffered_feedback_sessions(self, *, rows: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1085,6 +1207,7 @@ class AgentFeedbackOrchestrator:
             return []
 
         rows_to_cleanup: list[dict[str, Any]] = []
+        failure_cleanup_targets: list[dict[str, Any]] = []
         cleaned_session_keys = set(state.cleaned_session_keys)
         for row in state.buffered_feedback_rows:
             agent_name = str(row.get('agent_name') or '')
@@ -1097,10 +1220,30 @@ class AgentFeedbackOrchestrator:
             rows_to_cleanup.append(row)
             cleaned_session_keys.add(session_key)
 
-        if not rows_to_cleanup:
+        for failure in state.buffered_failures:
+            agent_name = str(failure.get('agent_name') or failure.get('role') or '')
+            if role is not None and agent_name != role:
+                continue
+            session_key = self._session_key_from_failure(failure)
+            if session_key is None or session_key in cleaned_session_keys:
+                continue
+            failure_cleanup_targets.append(
+                {
+                    'market_date': market_date,
+                    'symbol': str(failure.get('symbol') or ''),
+                    'agent_name': agent_name,
+                    'run_id': request_run_id,
+                    'session_key': session_key,
+                }
+            )
+            cleaned_session_keys.add(session_key)
+
+        if not rows_to_cleanup and not failure_cleanup_targets:
             return []
 
         cleanup_results = self._cleanup_buffered_feedback_sessions(rows=rows_to_cleanup)
+        for target in failure_cleanup_targets:
+            cleanup_results.append(self._cleanup_session_key(**target))
         session_keys = {
             session_key
             for session_key in (
@@ -1109,6 +1252,11 @@ class AgentFeedbackOrchestrator:
             )
             if session_key is not None
         }
+        session_keys.update(
+            target['session_key']
+            for target in failure_cleanup_targets
+            if isinstance(target.get('session_key'), str)
+        )
 
         def _mark_cleaned(current: RuntimeFeedbackRunState) -> None:
             current.cleaned_session_keys.update(session_keys)
@@ -1984,13 +2132,18 @@ class AgentFeedbackOrchestrator:
                     queue: list[tuple[int, list[dict[str, Any]]]] = []
                     for batch_index, batch in enumerate(indexed_batches):
                         slot = (batch_index % role_parallelism) + 1
+                        session_reuse_mode = 'slot_reused'
                         stable_session_key = f"agent:{spec.agent_name}:{_feedback_session_key(agent_name=spec.agent_name, slot=slot)}"
+                        if role == SIGNAL_DECIDER_AGENT_NAME:
+                            session_reuse_mode = 'fresh_per_batch'
+                            stable_session_key = f"agent:{spec.agent_name}:{_fresh_feedback_session_key(agent_name=spec.agent_name, request_run_id=request_run_id, slot=slot)}"
                         dispatch_id = f'{request_run_id}:{role}:slot-{slot}:batch-{batch_index + 1}'
                         batch_with_session = [
                             {
                                 **batch_item,
                                 'session_slot': slot,
                                 'session_key': stable_session_key,
+                                'session_reuse_mode': session_reuse_mode,
                                 'request_run_id': request_run_id,
                                 'dispatch_id': dispatch_id,
                             }
@@ -2007,6 +2160,7 @@ class AgentFeedbackOrchestrator:
                             agent_name=spec.agent_name,
                             slot=slot,
                             session_key=stable_session_key,
+                            session_reuse_mode=session_reuse_mode,
                             batch_symbols=[str(item.get('symbol')) for item in batch_with_session],
                         )
 
@@ -2039,11 +2193,19 @@ class AgentFeedbackOrchestrator:
                                     batch_result = future.result()
                                     decoded_items = batch_result.get('decoded', {}).get('items', [])
                                     by_symbol = {
-                                        item['symbol']: item for item in decoded_items if isinstance(item, dict) and item.get('symbol')
+                                        str(item['symbol']).strip().upper(): item
+                                        for item in decoded_items
+                                        if isinstance(item, dict) and item.get('symbol')
                                     }
                                     response_symbols = sorted(by_symbol.keys())
+                                    response_correlation = (
+                                        batch_result.get('response_correlation')
+                                        if isinstance(batch_result.get('response_correlation'), dict)
+                                        else {}
+                                    )
                                     for source_item in batch:
                                         symbol = source_item['symbol']
+                                        symbol_key = str(symbol).strip().upper()
                                         dispatch_context = _resolve_batch_dispatch_context(
                                             batch_result=batch_result,
                                             source_item=source_item,
@@ -2054,14 +2216,24 @@ class AgentFeedbackOrchestrator:
                                         attempt_id = dispatch_context['attempt_id']
                                         batch_symbols = dispatch_context['batch_symbols']
                                         session_key = dispatch_context['session_key']
-                                        feedback_candidate = by_symbol.get(symbol, {}).get('feedback')
+                                        feedback_candidate = by_symbol.get(symbol_key, {}).get('feedback')
                                         if not feedback_candidate:
+                                            failure_class = (
+                                                response_correlation.get('failure_class')
+                                                if response_correlation.get('failure_class')
+                                                else 'missing_batch_feedback'
+                                            )
+                                            failure_context = {
+                                                **source_item,
+                                                'response_correlation': response_correlation or None,
+                                            }
                                             failure = _build_failed_dispatch_item(
                                                 role=role,
                                                 agent_name=spec.agent_name,
                                                 symbol=symbol,
-                                                error='missing_batch_feedback',
+                                                error=str(failure_class),
                                                 retryable=True,
+                                                context=failure_context,
                                                 dispatch_id=dispatch_id,
                                                 attempt_id=attempt_id,
                                                 slot=slot,
@@ -2083,15 +2255,17 @@ class AgentFeedbackOrchestrator:
                                                 slot=slot,
                                                 session_key=session_key,
                                                 error_type='MissingBatchFeedback',
-                                                error_message='missing_batch_feedback',
+                                                error_message=str(failure_class),
+                                                failure_class=failure_class,
                                                 response_symbols=response_symbols,
+                                                response_correlation=response_correlation,
                                             )
                                             buffer_failure(
                                                 role,
                                                 symbol,
-                                                'missing_batch_feedback',
+                                                str(failure_class),
                                                 True,
-                                                context=source_item,
+                                                context=failure_context,
                                                 agent_name=spec.agent_name,
                                                 dispatch_id=dispatch_id,
                                                 attempt_id=attempt_id,
@@ -2124,8 +2298,11 @@ class AgentFeedbackOrchestrator:
                                             batch_symbols=batch_symbols,
                                             slot=slot,
                                             session_key=session_key,
+                                            session_reuse_mode=batch_result.get('session_reuse_mode'),
                                             normalized_feedback_snapshot=build_normalized_feedback_snapshot(normalized_feedback),
                                             mismatch_flags=mismatch_flags,
+                                            attribution_status=response_correlation.get('attribution_status'),
+                                            response_correlation=response_correlation or None,
                                             response_symbol=(
                                                 feedback_candidate.get('symbol')
                                                 if isinstance(feedback_candidate, dict)
@@ -2146,7 +2323,10 @@ class AgentFeedbackOrchestrator:
                                                 batch_symbols=batch_symbols,
                                                 slot=slot,
                                                 session_key=session_key,
+                                                session_reuse_mode=batch_result.get('session_reuse_mode'),
                                                 mismatch_flags=mismatch_flags,
+                                                attribution_status=response_correlation.get('attribution_status'),
+                                                response_correlation=response_correlation or None,
                                                 normalized_feedback_snapshot=build_normalized_feedback_snapshot(normalized_feedback),
                                             )
                                         response_payload_item = _build_response_storage_payload(
