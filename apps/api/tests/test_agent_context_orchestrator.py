@@ -432,6 +432,73 @@ def _passed_filter_rows(*symbols: str) -> list[dict]:
 
 
 class AgentFeedbackOrchestratorTests(unittest.TestCase):
+    def test_signal_decider_batch_message_requires_exact_symbol_batch_envelope(self):
+        fake_settings = SimpleNamespace(
+            openclaw_base_url='https://openclaw.example',
+            openclaw_gateway_token='gateway-token',
+            openclaw_agent_timeout_seconds=30,
+            openclaw_agent_max_retries=0,
+            openclaw_agent_retry_backoff_seconds=0,
+            openclaw_agent_max_prompt_chars=0,
+        )
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            client = OpenClawAgentClient()
+            message = client._build_batch_message(
+                spec=orchestrator_module.DISPATCH_SPECS[-1],
+                market_date=orchestrator_module.date.fromisoformat('2026-04-14'),
+                batch_items=[
+                    {'symbol': '005930', 'market_date': '2026-04-14'},
+                    {'symbol': '000660', 'market_date': '2026-04-14'},
+                ],
+                request_marker='batch-request::test',
+            )
+            one_symbol_message = client._build_batch_message(
+                spec=orchestrator_module.DISPATCH_SPECS[-1],
+                market_date=orchestrator_module.date.fromisoformat('2026-04-14'),
+                batch_items=[{'symbol': '005930', 'market_date': '2026-04-14'}],
+                request_marker='batch-request::test-one',
+            )
+
+        self.assertIn('Assigned symbols (exact authoritative strings): ["005930", "000660"]', message)
+        self.assertIn('output exactly 2 item(s)', message)
+        self.assertIn('The only top-level JSON shape allowed is {"items":[...]}', message)
+        self.assertIn('Every item.symbol is mandatory and must exactly match one assigned symbol string', message)
+        self.assertIn('Every feedback.symbol and feedback.traceability.symbol is mandatory', message)
+        self.assertIn('Self-check before final answer', message)
+        self.assertIn('no assigned symbol is missing', message)
+        self.assertIn('Assigned symbols (exact authoritative strings): ["005930"]', one_symbol_message)
+        self.assertIn('output exactly 1 item(s)', one_symbol_message)
+        self.assertIn('One-symbol requests still require the same batch envelope with exactly one item', one_symbol_message)
+
+    def test_signal_decider_prompt_trim_final_fallback_uses_one_item_rules(self):
+        fake_settings = SimpleNamespace(
+            openclaw_base_url='https://openclaw.example',
+            openclaw_gateway_token='gateway-token',
+            openclaw_agent_timeout_seconds=30,
+            openclaw_agent_max_retries=0,
+            openclaw_agent_retry_backoff_seconds=0,
+            openclaw_agent_max_prompt_chars=1,
+        )
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            client = OpenClawAgentClient()
+            message = client._build_batch_message(
+                spec=orchestrator_module.DISPATCH_SPECS[-1],
+                market_date=orchestrator_module.date.fromisoformat('2026-04-14'),
+                batch_items=[
+                    {'symbol': '005930', 'market_date': '2026-04-14', 'large_context': 'x' * 1000},
+                    {'symbol': '000660', 'market_date': '2026-04-14', 'large_context': 'y' * 1000},
+                ],
+                request_marker='batch-request::trim-fallback',
+            )
+
+        self.assertIn('Assigned symbols (exact authoritative strings): ["005930"]', message)
+        self.assertIn('output exactly 1 item(s)', message)
+        self.assertNotIn('Assigned symbols (exact authoritative strings): ["005930", "000660"]', message)
+        self.assertNotIn('output exactly 2 item(s)', message)
+        self.assertNotIn('"symbol": "000660"', message)
+
     def test_reuse_existing_skips_reusable_symbol_role_pairs(self):
         service = AgentFeedbackOrchestrator()
         client = RecordingBatchClient()
@@ -822,6 +889,17 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
             'improving',
         )
         self.assertEqual(decider_payload['orchestration']['request_model'], 'openclaw/signal-decider')
+        self.assertEqual(
+            decider_payload['orchestration']['required_upstream_roles'],
+            ['eod-summarizer', 'technical-summarizer', 'fundamental-summarizer'],
+        )
+        self.assertEqual(decider_payload['output_contract']['assigned_symbol'], '005930')
+        self.assertTrue(decider_payload['output_contract']['batch_envelope_required'])
+        self.assertTrue(decider_payload['output_contract']['symbol_identity']['exact_match_required'])
+        self.assertIn(
+            'item_symbol_feedback_symbol_and_traceability_symbol_match_assigned_symbol',
+            decider_payload['output_contract']['self_check_before_final_output'],
+        )
 
         decider_row = next(item for item in feedback_service.bulk_items if item['agent_name'] == 'signal-decider')
         self.assertEqual(decider_row['feedback']['next_day_open_action'], 'buy')

@@ -226,6 +226,29 @@ class OpenClawAgentClient:
         request_marker: str,
     ) -> str:
         example_symbol = str(batch_items[0].get('symbol') or '000000') if batch_items else '000000'
+        assigned_symbols = [
+            str(item.get('symbol') or '').strip()
+            for item in batch_items
+            if str(item.get('symbol') or '').strip()
+        ]
+        assigned_symbols_json = json.dumps(assigned_symbols, ensure_ascii=False)
+
+        def _signal_decider_batch_rules(symbols: Sequence[str]) -> str:
+            if spec.role != SIGNAL_DECIDER_AGENT_NAME:
+                return ''
+            symbols_json = json.dumps(list(symbols), ensure_ascii=False)
+            symbol_count = len(symbols)
+            return (
+                "Signal-decider hard batch contract:\n"
+                f"- Assigned symbols are exactly {symbols_json}; output exactly {symbol_count} item(s), no more and no fewer.\n"
+                "- The only top-level JSON shape allowed is {\"items\":[...]}; never return a bare feedback object or a top-level array.\n"
+                "- Every item.symbol is mandatory and must exactly match one assigned symbol string.\n"
+                "- Every feedback.symbol and feedback.traceability.symbol is mandatory and must exactly match its item.symbol.\n"
+                "- One-symbol requests still require the same batch envelope with exactly one item; never collapse the response to a single feedback object.\n"
+                "- If context is weak, missing, conflicting, or truncated, emit a complete conservative wait or reject item instead of prose, placeholders, omissions, or malformed JSON.\n"
+                "- Self-check before final answer: JSON parses; top-level object has items; item count matches assigned symbols; assigned symbols are exact and unique; no assigned symbol is missing; no unexpected symbol appears; required feedback fields exist.\n"
+            )
+
         if spec.role == SIGNAL_DECIDER_AGENT_NAME:
             example_feedback = {
                 'role': spec.role,
@@ -255,7 +278,14 @@ class OpenClawAgentClient:
                 'summary': 'brief conservative decision-support thesis',
                 'confidence': 0.6,
                 'risk_flags': ['example_warning'],
-                'details': {'decision_support': {'decision_support_only': True}},
+                'details': {
+                    'decision_support': {'decision_support_only': True},
+                    'traceability': {
+                        'agent_name': spec.agent_name,
+                        'symbol': example_symbol,
+                        'market_date': market_date.isoformat(),
+                    },
+                },
                 'improvement_notes': ['example note about missing or helpful extra data'],
             }
         else:
@@ -276,19 +306,23 @@ class OpenClawAgentClient:
                 }
             ]
         }
+        signal_decider_batch_rules = _signal_decider_batch_rules(assigned_symbols)
         base_message = (
             f"Request marker: {request_marker}\n"
             f"Role: {spec.role}\n"
             f"Instruction: {spec.instruction}\n"
+            f"Assigned symbols (exact authoritative strings): {assigned_symbols_json}\n"
             "Analyze each assigned symbol directly using only the supplied payload.\n"
             "Return one aggregated JSON object for the whole batch.\n"
-            "Return JSON only with top-level shape {\"items\": [{\"symbol\": \"...\", \"feedback\": {...}}]}.\n"
-            "Each symbol must appear exactly once. Do not omit symbols.\n"
+            "Return JSON only with exactly one top-level object in this batch envelope: {\"items\": [{\"symbol\": \"...\", \"feedback\": {...}}]}.\n"
+            "items length must equal the number of assigned symbols. Each assigned symbol must appear exactly once. Do not omit or invent symbols.\n"
+            "Each item.symbol must exactly match one assigned symbol string.\n"
             "For each symbol, feedback must include role, summary, confidence, risk_flags, details, improvement_notes, and every additional role-specific field required by the contract.\n"
             "Inside details, do not repeat raw payload facts or echo numeric/source fields already present in the request.\n"
             "Use details only for compact interpretation, relationships, anomalies, conservative takeaways, and missing-context notes that add new value beyond the payload.\n"
             "Prefer derived judgments over restating inputs; if a field is already in the payload, reference its implication instead of copying it.\n"
             "If some inputs are weak or missing, still return conservative structured feedback for that symbol instead of prose or placeholders.\n"
+            f"{signal_decider_batch_rules}"
             "Do not mention subagents, children, spawning, waiting, or internal orchestration.\n"
             "Do not output tool_code, python, print(...), json.dumps(...), markdown fences, code blocks, intent tags, analysis, reasoning, or explanatory prose.\n"
             "Do not prepend labels like [intent:...], do not wrap JSON in tags, and do not add any text before or after the JSON.\n"
@@ -308,8 +342,11 @@ class OpenClawAgentClient:
                 f"Request marker: {request_marker}\n"
                 f"Role: {spec.role}\n"
                 f"Instruction: {spec.instruction}\n"
+                f"Assigned symbols (exact authoritative strings): {assigned_symbols_json}\n"
                 "Analyze each assigned symbol directly and return aggregated JSON only.\n"
-                "Each symbol must appear exactly once in {\"items\": [...]} with structured feedback.\n"
+                "Each assigned symbol must appear exactly once in {\"items\": [...]} with structured feedback; do not omit or invent symbols.\n"
+                "item.symbol must exactly match an assigned symbol string.\n"
+                f"{signal_decider_batch_rules}"
                 "No tool_code, no print(json.dumps(...)), no markdown fences, no intent tags, no prose, no request restatement, raw JSON object only.\n"
                 f"{build_contract_prompt_suffix(role=spec.role)}\n"
                 f"Market date: {market_date.isoformat()}\n"
@@ -317,15 +354,22 @@ class OpenClawAgentClient:
             )
             if max_chars <= 0 or len(candidate) <= max_chars:
                 return candidate
+        fallback_item = _trim_batch_item_for_prompt(batch_items[0])
+        fallback_symbol = str(fallback_item.get('symbol') or example_symbol).strip() or '000000'
+        fallback_assigned_symbols = [fallback_symbol]
+        fallback_assigned_symbols_json = json.dumps(fallback_assigned_symbols, ensure_ascii=False)
         return (
             f"Role: {spec.role}\n"
             f"Instruction: {spec.instruction}\n"
+            f"Assigned symbols (exact authoritative strings): {fallback_assigned_symbols_json}\n"
             "Analyze the assigned symbol directly and return aggregated JSON only.\n"
             "Return {\"items\": [{\"symbol\": \"...\", \"feedback\": {...}}]} with exactly one item.\n"
+            "The one item.symbol must exactly match the assigned symbol string; do not omit feedback.symbol when the role contract requires it.\n"
+            f"{_signal_decider_batch_rules(fallback_assigned_symbols)}"
             "No tool_code, no print(json.dumps(...)), no markdown fences, no intent tags, no prose, no request restatement, raw JSON object only.\n"
             f"{build_contract_prompt_suffix(role=spec.role)}\n"
             f"Market date: {market_date.isoformat()}\n"
-            f"Assigned batch payload:\n{json.dumps([_trim_batch_item_for_prompt(batch_items[0])], ensure_ascii=False)}"
+            f"Assigned batch payload:\n{json.dumps([fallback_item], ensure_ascii=False)}"
         )
 
     def dispatch(self, *, spec: AgentDispatchSpec, payload: dict[str, Any]) -> dict[str, Any]:

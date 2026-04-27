@@ -1,10 +1,20 @@
 import json
 import unittest
 
-from app.agent_context.response_contract import normalize_agent_response
+from app.agent_context.response_contract import build_contract_prompt_suffix, normalize_agent_response
 
 
 class AgentContextResponseContractTests(unittest.TestCase):
+    def test_signal_decider_contract_makes_exact_symbol_and_self_check_mandatory(self):
+        suffix = build_contract_prompt_suffix(role='signal-decider')
+
+        self.assertIn('symbol is mandatory', suffix)
+        self.assertIn('exactly equal the assigned/requested symbol string', suffix)
+        self.assertIn('traceability.symbol must exactly match symbol', suffix)
+        self.assertIn('wait or reject', suffix)
+        self.assertIn('self-check', suffix)
+        self.assertIn('JSON is parseable', suffix)
+
     def test_normalize_signal_decider_response_preserves_decision_support_fields_and_traceability(self):
         output_text = json.dumps(
             {
