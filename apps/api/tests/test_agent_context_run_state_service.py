@@ -136,6 +136,39 @@ class AgentContextFeedbackRunStateServiceTests(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(result['run_id'], 'retry-cycle-run')
 
+    def test_find_latest_run_matches_requested_symbol_scope_when_run_tracks_eligible_subset(self):
+        service = AgentContextFeedbackRunStateService()
+        market_date = date.fromisoformat('2026-04-14')
+        fake_session = FakeRunStateSession(
+            [
+                _build_run_row(
+                    row_id=1,
+                    run_id='matching-run',
+                    market_date=market_date,
+                    started_at=datetime(2026, 4, 14, 1, 0, tzinfo=timezone.utc),
+                    request_payload={
+                        'symbols': ['005930'],
+                        'requested_symbols': ['005930', '000660'],
+                        'roles': ['eod-summarizer'],
+                    },
+                ),
+            ]
+        )
+
+        @contextmanager
+        def fake_session_scope():
+            yield fake_session
+
+        with patch('app.agent_context.run_state_service.session_scope', fake_session_scope):
+            result = service.find_latest_run(
+                market_date=market_date,
+                requested_symbols=['005930', '000660'],
+                requested_roles=['eod-summarizer'],
+            )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result['run_id'], 'matching-run')
+
 
 if __name__ == '__main__':
     unittest.main()

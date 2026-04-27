@@ -41,38 +41,41 @@ class AgentContextFeedbackRunStateService:
         symbols_total: int,
         request_payload: dict[str, Any],
         summary_payload: dict[str, Any] | None = None,
+        status: str = 'running',
+        started_at: datetime | None = None,
     ) -> dict[str, Any]:
         now = datetime.now(timezone.utc)
+        resolved_started_at = started_at or now
         with session_scope() as session:
             stmt = insert(AgentContextFeedbackRun).values(
                 run_id=run_id,
                 market_date=market_date,
-                status='running',
+                status=status,
                 symbols_total=symbols_total,
                 completed_count=0,
                 failed_count=0,
                 request_payload=request_payload,
                 summary_payload=summary_payload,
-                started_at=now,
+                started_at=resolved_started_at,
                 completed_at=None,
             )
             stmt = stmt.on_conflict_do_update(
                 index_elements=['run_id'],
                 set_={
                     'market_date': market_date,
-                    'status': 'running',
+                    'status': status,
                     'symbols_total': symbols_total,
                     'completed_count': 0,
                     'failed_count': 0,
                     'request_payload': request_payload,
                     'summary_payload': summary_payload,
-                    'started_at': now,
+                    'started_at': resolved_started_at,
                     'completed_at': None,
                     'updated_at': now,
                 },
             )
             session.execute(stmt)
-        return {'ok': True, 'run_id': run_id, 'status': 'running'}
+        return {'ok': True, 'run_id': run_id, 'status': status}
 
     def checkpoint_run(
         self,
@@ -147,13 +150,18 @@ class AgentContextFeedbackRunStateService:
         normalized_modes = set(self._normalize_scope(list(request_modes) if request_modes is not None else None))
         for row in serialized_rows:
             request_payload = row.get('request_payload') if isinstance(row.get('request_payload'), dict) else {}
-            run_symbols = request_payload.get('symbols')
-            if not isinstance(run_symbols, list):
-                run_symbols = request_payload.get('requested_symbols')
+            run_symbol_scopes: list[list[str]] = []
+            for key in ('requested_symbols', 'symbols'):
+                candidate = request_payload.get(key)
+                if not isinstance(candidate, list):
+                    continue
+                normalized_candidate = self._normalize_scope(candidate)
+                if normalized_candidate not in run_symbol_scopes:
+                    run_symbol_scopes.append(normalized_candidate)
             run_roles = request_payload.get('roles')
             run_mode = str(request_payload.get('mode') or '').strip()
             if normalized_symbols:
-                if self._normalize_scope(run_symbols if isinstance(run_symbols, list) else None) != normalized_symbols:
+                if normalized_symbols not in run_symbol_scopes:
                     continue
             if normalized_roles:
                 if self._normalize_scope(run_roles if isinstance(run_roles, list) else None) != normalized_roles:
