@@ -39,7 +39,7 @@ class AgentContextProgressService:
             state = runtime_feedback_state_store.get_run(normalized_market_date, run_id=run_id)
         elif resolved_run is not None:
             state = runtime_feedback_state_store.get_run(normalized_market_date, run_id=resolved_run['run_id'])
-        if state is None and run_id is None and resolved_run is None:
+        if state is None and run_id is None and resolved_run is None and normalized_symbols is None:
             state = runtime_feedback_state_store.get_run(normalized_market_date, logical=True)
 
         scoped_symbols, scope_resolved_from_run = self._resolve_progress_scope_symbols(
@@ -102,9 +102,6 @@ class AgentContextProgressService:
         resolved_run: dict[str, Any] | None,
         runtime_state: Any,
     ) -> tuple[list[str] | None, bool]:
-        runtime_symbols = self._normalize_scope_symbols(getattr(runtime_state, 'requested_symbols', None))
-        if runtime_symbols is not None:
-            return runtime_symbols, True
         if isinstance(resolved_run, dict):
             run_scope_symbols = agent_context_feedback_run_state_service.resolve_run_requested_symbols(
                 run_snapshot=resolved_run,
@@ -113,6 +110,9 @@ class AgentContextProgressService:
                 return run_scope_symbols, True
         if requested_symbols is not None:
             return list(requested_symbols), False
+        runtime_symbols = self._normalize_scope_symbols(getattr(runtime_state, 'requested_symbols', None))
+        if runtime_symbols is not None:
+            return runtime_symbols, resolved_run is not None
         return None, False
 
     @staticmethod
