@@ -28,11 +28,6 @@ class AgentContextProgressService:
         normalized_market_date = _normalize_market_date(market_date)
         normalized_symbols = _normalize_symbols(symbols) if symbols is not None else None
         expected_agent_names = self._normalize_expected_agents(expected_agents)
-        persisted_progress = self._build_persisted_progress(
-            market_date=normalized_market_date,
-            symbols=normalized_symbols,
-            expected_agents=expected_agent_names,
-        )
         resolved_run = self._resolve_run_snapshot(
             market_date=normalized_market_date,
             symbols=normalized_symbols,
@@ -44,15 +39,26 @@ class AgentContextProgressService:
             state = runtime_feedback_state_store.get_run(normalized_market_date, run_id=run_id)
         elif resolved_run is not None:
             state = runtime_feedback_state_store.get_run(normalized_market_date, run_id=resolved_run['run_id'])
-        if state is None and run_id is None and resolved_run is None:
+        if state is None and run_id is None and resolved_run is None and normalized_symbols is None:
             state = runtime_feedback_state_store.get_run(normalized_market_date, logical=True)
+
+        scoped_symbols, scope_resolved_from_run = self._resolve_progress_scope_symbols(
+            requested_symbols=normalized_symbols,
+            resolved_run=resolved_run,
+            runtime_state=state,
+        )
+        persisted_progress = self._build_persisted_progress(
+            market_date=normalized_market_date,
+            symbols=scoped_symbols,
+            expected_agents=expected_agent_names,
+        )
 
         result_payload = persisted_progress['result']
         summary_payload = persisted_progress['summary']
         resolved_run_mode = self._resolve_run_mode(resolved_run)
         if state is not None:
             runtime_summary = state.to_progress_summary()
-            if resolved_run is not None and resolved_run_mode == DAILY_RETRY_CYCLE_MODE and normalized_symbols is None:
+            if resolved_run is not None and resolved_run_mode == DAILY_RETRY_CYCLE_MODE and scope_resolved_from_run:
                 summary_payload = self._merge_live_retry_summary_with_persisted_progress(
                     persisted_summary=persisted_progress['summary'],
                     runtime_summary=runtime_summary,
@@ -88,6 +94,32 @@ class AgentContextProgressService:
             'result': result_payload,
             'summary': summary_payload,
         }
+
+    def _resolve_progress_scope_symbols(
+        self,
+        *,
+        requested_symbols: Sequence[str] | None,
+        resolved_run: dict[str, Any] | None,
+        runtime_state: Any,
+    ) -> tuple[list[str] | None, bool]:
+        if isinstance(resolved_run, dict):
+            run_scope_symbols = agent_context_feedback_run_state_service.resolve_run_requested_symbols(
+                run_snapshot=resolved_run,
+            )
+            if run_scope_symbols is not None:
+                return run_scope_symbols, True
+        if requested_symbols is not None:
+            return list(requested_symbols), False
+        runtime_symbols = self._normalize_scope_symbols(getattr(runtime_state, 'requested_symbols', None))
+        if runtime_symbols is not None:
+            return runtime_symbols, resolved_run is not None
+        return None, False
+
+    @staticmethod
+    def _normalize_scope_symbols(symbols: Any) -> list[str] | None:
+        if symbols is None:
+            return None
+        return _normalize_symbols(symbols)
 
     @staticmethod
     def _resolve_run_mode(run_snapshot: dict[str, Any] | None) -> str | None:
