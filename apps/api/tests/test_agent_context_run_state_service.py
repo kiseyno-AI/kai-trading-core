@@ -169,6 +169,22 @@ class AgentContextFeedbackRunStateServiceTests(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(result['run_id'], 'matching-run')
 
+    def test_resolve_run_requested_symbols_prefers_actual_dispatch_scope(self):
+        service = AgentContextFeedbackRunStateService()
+
+        result = service.resolve_run_requested_symbols(
+            run_snapshot={
+                'symbols_total': 1,
+                'request_payload': {
+                    'symbols': ['005930'],
+                    'requested_symbols': ['005930', '000660'],
+                },
+                'summary_payload': {},
+            }
+        )
+
+        self.assertEqual(result, ['005930'])
+
 
 if __name__ == '__main__':
     unittest.main()

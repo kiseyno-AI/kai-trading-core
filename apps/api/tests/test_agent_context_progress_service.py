@@ -29,6 +29,7 @@ class FakeExecuteResult:
 class FakeProgressSession:
     def __init__(self):
         self.statements = []
+        self.market_universe_symbols = ['005930', '000660']
         self.filtered_first_feedback_at = datetime(2026, 4, 14, 1, 0, tzinfo=timezone.utc)
         self.filtered_latest_feedback_at = datetime(2026, 4, 14, 1, 5, tzinfo=timezone.utc)
         self.feedback_rows = [
@@ -110,7 +111,7 @@ class FakeProgressSession:
         self.statements.append(statement)
         sql = self._compile(statement)
         if 'daily_price_bars' in sql:
-            return FakeExecuteResult(scalars=['005930', '000660'])
+            return FakeExecuteResult(scalars=self.market_universe_symbols)
         if 'agent_context_feedback_failures' in sql:
             return FakeExecuteResult(rows=self.failure_rows)
         return FakeExecuteResult(rows=self.feedback_rows)
@@ -280,6 +281,7 @@ class AgentContextProgressServiceTests(unittest.TestCase):
 
     def test_feedback_progress_prefers_persisted_counts_for_live_daily_retry_cycle_runs(self):
         fake_session = FakeProgressSession()
+        fake_session.market_universe_symbols = ['005930', '000660', '035420']
         runtime_summary = {
             'run_id': 'retry-run',
             'run_status': 'running',
@@ -294,14 +296,14 @@ class AgentContextProgressServiceTests(unittest.TestCase):
             'cycle_mode': 'daily_retry_cycle_role_sequenced',
             'cycle_status': 'running',
             'parallel_per_role': 2,
-            'total_symbols': 2,
+            'total_symbols': 1,
             'processed_symbols': 0,
             'completed_symbols': 0,
-            'in_progress_symbols': 0,
-            'pending_symbols': 2,
+            'in_progress_symbols': 1,
+            'pending_symbols': 0,
             'failed_items': 0,
             'completed_feedback_count': 0,
-            'expected_feedback_count': 8,
+            'expected_feedback_count': 4,
             'buffered_feedback_count': 0,
             'buffered_failure_count': 0,
             'pending_feedback_count': 0,
@@ -311,15 +313,15 @@ class AgentContextProgressServiceTests(unittest.TestCase):
             'role_progress': {
                 'technical-summarizer': {
                     'role': 'technical-summarizer',
-                    'status': 'pending',
-                    'total_symbols': 2,
-                    'processed_symbols': 0,
+                    'status': 'running',
+                    'total_symbols': 1,
+                    'processed_symbols': 1,
                     'completed_symbols': 0,
-                    'in_progress_symbols': 0,
-                    'pending_symbols': 2,
+                    'in_progress_symbols': 1,
+                    'pending_symbols': 0,
                     'failed_items': 0,
-                    'progress_ratio': 0.0,
-                    'progress_percent': 0.0,
+                    'progress_ratio': 1.0,
+                    'progress_percent': 100.0,
                 }
             },
         }
@@ -327,6 +329,7 @@ class AgentContextProgressServiceTests(unittest.TestCase):
         run_snapshot = {
             'run_id': 'retry-run',
             'status': 'running',
+            'symbols_total': 1,
             'started_at': datetime(2026, 4, 14, 1, 0, tzinfo=timezone.utc),
             'completed_at': None,
             'summary_payload': {
@@ -347,6 +350,8 @@ class AgentContextProgressServiceTests(unittest.TestCase):
             },
             'request_payload': {
                 'mode': 'daily_retry_cycle_role_sequenced',
+                'symbols': ['005930'],
+                'requested_symbols': ['005930', '000660'],
             },
         }
 
@@ -370,10 +375,12 @@ class AgentContextProgressServiceTests(unittest.TestCase):
         self.assertEqual(result['summary']['current_role'], 'technical-summarizer')
         self.assertEqual(result['summary']['completed_roles'], ['eod-summarizer'])
         self.assertEqual(result['summary']['cycle_mode'], 'daily_retry_cycle_role_sequenced')
-        self.assertEqual(result['result']['roles']['eod-summarizer']['completed_count'], 2)
+        self.assertEqual(result['summary']['total_symbols'], 1)
+        self.assertEqual(result['summary']['expected_feedback_count'], 4)
+        self.assertEqual(result['result']['roles']['eod-summarizer']['completed_count'], 1)
         self.assertEqual(result['result']['roles']['technical-summarizer']['completed_count'], 1)
-        self.assertEqual(result['summary']['completed_feedback_count'], 5)
-        self.assertEqual(result['summary']['failed_items'], 2)
+        self.assertEqual(result['summary']['completed_feedback_count'], 4)
+        self.assertEqual(result['summary']['failed_items'], 0)
 
     def _call_service(self, fake_session, *, symbols, expected_agents=None):
         @contextmanager
@@ -510,6 +517,84 @@ class AgentContextProgressServiceTests(unittest.TestCase):
         self.assertEqual(result['summary']['role_progress']['signal-decider']['retry_pending_symbols'], 1)
         self.assertEqual(result['result']['roles']['signal-decider']['error_count'], 1)
         self.assertEqual(find_latest_run.call_args.kwargs['request_modes'], ['daily_retry_cycle_role_sequenced'])
+
+    def test_feedback_progress_prefers_run_scope_over_requested_symbols_when_run_was_filtered(self):
+        fake_session = FakeProgressSession()
+        run_snapshot = {
+            'run_id': 'run-filtered',
+            'status': 'partial',
+            'symbols_total': 1,
+            'started_at': datetime(2026, 4, 14, 1, 0, tzinfo=timezone.utc),
+            'completed_at': datetime(2026, 4, 14, 1, 10, tzinfo=timezone.utc),
+            'request_payload': {
+                'symbols': ['005930'],
+                'requested_symbols': ['005930', '000660'],
+                'roles': ['technical-summarizer'],
+            },
+            'summary_payload': {},
+        }
+
+        @contextmanager
+        def fake_session_scope():
+            yield fake_session
+
+        with patch('app.agent_context.progress_service.session_scope', fake_session_scope):
+            with patch('app.agent_context.progress_service.runtime_feedback_state_store.get_run', return_value=None):
+                with patch(
+                    'app.agent_context.progress_service.agent_context_feedback_run_state_service.find_latest_run',
+                    return_value=run_snapshot,
+                ):
+                    result = AgentContextProgressService().get_feedback_progress(
+                        market_date='2026-04-14',
+                        symbols=['005930', '000660'],
+                        expected_agents=['technical-summarizer'],
+                    )
+
+        feedback_sql = fake_session._compile(fake_session.statements[0])
+        self.assertIn("IN ('005930')", feedback_sql)
+        self.assertEqual(result['summary']['total_symbols'], 1)
+        self.assertEqual(result['result']['roles']['technical-summarizer']['requested_count'], 1)
+        self.assertEqual(result['result']['roles']['technical-summarizer']['completed_count'], 1)
+
+    def test_feedback_progress_without_symbols_uses_run_scope_before_market_universe_fallback(self):
+        fake_session = FakeProgressSession()
+        fake_session.market_universe_symbols = ['005930', '000660', '035420']
+        run_snapshot = {
+            'run_id': 'run-filtered',
+            'status': 'partial',
+            'symbols_total': 1,
+            'started_at': datetime(2026, 4, 14, 1, 0, tzinfo=timezone.utc),
+            'completed_at': datetime(2026, 4, 14, 1, 10, tzinfo=timezone.utc),
+            'request_payload': {
+                'symbols': ['005930'],
+                'requested_symbols': ['005930', '000660'],
+                'roles': ['technical-summarizer'],
+                'mode': 'daily_retry_cycle_role_sequenced',
+            },
+            'summary_payload': {},
+        }
+
+        @contextmanager
+        def fake_session_scope():
+            yield fake_session
+
+        with patch('app.agent_context.progress_service.session_scope', fake_session_scope):
+            with patch('app.agent_context.progress_service.runtime_feedback_state_store.get_run', return_value=None):
+                with patch(
+                    'app.agent_context.progress_service.agent_context_feedback_run_state_service.find_latest_run',
+                    return_value=run_snapshot,
+                ):
+                    result = AgentContextProgressService().get_feedback_progress(
+                        market_date='2026-04-14',
+                        symbols=None,
+                        expected_agents=['technical-summarizer'],
+                    )
+
+        compiled_statements = [fake_session._compile(statement) for statement in fake_session.statements]
+        self.assertFalse(any('daily_price_bars' in sql for sql in compiled_statements))
+        self.assertEqual(result['summary']['total_symbols'], 1)
+        self.assertEqual(result['result']['roles']['technical-summarizer']['requested_count'], 1)
+        self.assertEqual(result['result']['roles']['technical-summarizer']['completed_count'], 1)
 
     def test_feedback_progress_returns_timing_rate_and_eta_fields(self):
         fake_session = FakeProgressSession()

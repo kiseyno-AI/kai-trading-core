@@ -16,6 +16,79 @@ class AgentContextFeedbackRunStateService:
         return sorted(list(values or []))
 
     @staticmethod
+    def _normalize_scope_items(values: Any) -> list[str] | None:
+        if not isinstance(values, list):
+            return None
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            symbol = str(value or '').strip().upper()
+            if not symbol or symbol in seen:
+                continue
+            seen.add(symbol)
+            normalized.append(symbol)
+        return normalized
+
+    def _iter_scope_payloads(self, run_snapshot: dict[str, Any]) -> list[dict[str, Any]]:
+        payloads: list[dict[str, Any]] = []
+        request_payload = run_snapshot.get('request_payload') if isinstance(run_snapshot.get('request_payload'), dict) else None
+        summary_payload = run_snapshot.get('summary_payload') if isinstance(run_snapshot.get('summary_payload'), dict) else None
+        summary_request = summary_payload.get('request') if isinstance(summary_payload, dict) and isinstance(summary_payload.get('request'), dict) else None
+        for payload in (request_payload, summary_request):
+            if payload is None:
+                continue
+            payloads.append(payload)
+        return payloads
+
+    def _collect_run_symbol_scopes(self, run_snapshot: dict[str, Any]) -> list[list[str]]:
+        scopes: list[list[str]] = []
+        for payload in self._iter_scope_payloads(run_snapshot):
+            for key in ('requested_symbols', 'symbols'):
+                normalized_scope = self._normalize_scope_items(payload.get(key))
+                if normalized_scope is None:
+                    continue
+                comparable_scope = self._normalize_scope(normalized_scope)
+                if comparable_scope in scopes:
+                    continue
+                scopes.append(comparable_scope)
+        return scopes
+
+    def resolve_run_requested_symbols(self, *, run_snapshot: dict[str, Any]) -> list[str] | None:
+        payloads = self._iter_scope_payloads(run_snapshot)
+        if not payloads:
+            return None
+
+        symbols_total = run_snapshot.get('symbols_total')
+        try:
+            expected_total = int(symbols_total) if symbols_total is not None else None
+        except (TypeError, ValueError):
+            expected_total = None
+
+        requested_fallback: list[str] | None = None
+        symbols_fallback: list[str] | None = None
+        for payload in payloads:
+            dispatch_symbols = self._normalize_scope_items(payload.get('symbols'))
+            requested_symbols = self._normalize_scope_items(payload.get('requested_symbols'))
+
+            if dispatch_symbols is not None:
+                if expected_total is not None and len(dispatch_symbols) == expected_total:
+                    return dispatch_symbols
+                if requested_symbols is None or len(dispatch_symbols) != len(requested_symbols):
+                    return dispatch_symbols
+                if symbols_fallback is None:
+                    symbols_fallback = dispatch_symbols
+
+            if requested_symbols is not None:
+                if expected_total is not None and len(requested_symbols) == expected_total:
+                    return requested_symbols
+                if requested_fallback is None:
+                    requested_fallback = requested_symbols
+
+        if symbols_fallback is not None:
+            return symbols_fallback
+        return requested_fallback
+
+    @staticmethod
     def _serialize_run(row: AgentContextFeedbackRun) -> dict[str, Any]:
         return {
             'id': row.id,
@@ -150,14 +223,7 @@ class AgentContextFeedbackRunStateService:
         normalized_modes = set(self._normalize_scope(list(request_modes) if request_modes is not None else None))
         for row in serialized_rows:
             request_payload = row.get('request_payload') if isinstance(row.get('request_payload'), dict) else {}
-            run_symbol_scopes: list[list[str]] = []
-            for key in ('requested_symbols', 'symbols'):
-                candidate = request_payload.get(key)
-                if not isinstance(candidate, list):
-                    continue
-                normalized_candidate = self._normalize_scope(candidate)
-                if normalized_candidate not in run_symbol_scopes:
-                    run_symbol_scopes.append(normalized_candidate)
+            run_symbol_scopes = self._collect_run_symbol_scopes(row)
             run_roles = request_payload.get('roles')
             run_mode = str(request_payload.get('mode') or '').strip()
             if normalized_symbols:
