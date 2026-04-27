@@ -932,6 +932,53 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(result['feedback_followup'], {'completed': True, 'final_pending': 0})
 
+    async def test_daily_incremental_refresh_can_disable_hidden_followups_for_stage_orchestration(self):
+        client = FakeCaptureClient()
+        repository = FakeCaptureRepository()
+        repository.symbol_states = {
+            '005930': {
+                'stock_code': '005930',
+                'has_fundamentals': True,
+                'latest_fundamentals_receipt_date': '2026-04-01',
+                'latest_snapshot': {'id': 100},
+            },
+        }
+        service = DartFundamentalsCaptureService(
+            client=client,
+            repository=repository,
+            active_symbol_loader=lambda: [{'symbol': '005930'}],
+        )
+
+        with (
+            patch(
+                'app.dart.sync_service.dart_disclosure_sync_service.sync_disclosures_for_corporations',
+                return_value={
+                    'run_id': 77,
+                    'status': 'completed',
+                    'financial_report_events': 1,
+                },
+            ),
+            patch(
+                'app.dart.fundamentals_capture_service.daily_piotroski_filter_service.rebuild_for_market_date',
+            ) as piotroski_followup,
+            patch(
+                'app.dart.fundamentals_capture_service.agent_feedback_retry_service.run_retry_cycles',
+            ) as feedback_followup,
+        ):
+            result = await service.run_daily_incremental_refresh(
+                market_date=date(2026, 4, 14),
+                capture_limit=10,
+                fs_div='CFS',
+                trigger='test_daily',
+                run_piotroski_followup=False,
+                run_feedback_followup=False,
+            )
+
+        piotroski_followup.assert_not_called()
+        feedback_followup.assert_not_called()
+        self.assertEqual(result['piotroski_filter']['reason'], 'followup_disabled')
+        self.assertEqual(result['feedback_followup']['reason'], 'followup_disabled')
+
     async def test_daily_incremental_refresh_filters_candidates_by_symbol_resolved_baseline(self):
         client = FakeCaptureClient()
         repository = FakeCaptureRepository()

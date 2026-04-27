@@ -15,6 +15,15 @@ from app.signals.market_risk_filter import MARKET_RISK_FILTER_SOURCE
 
 logger = logging.getLogger(__name__)
 
+PYKRX_DAILY_STAGE_ORDER: tuple[str, ...] = (
+    'price_collection',
+    'technical_snapshots',
+    'action_summaries',
+    'trending_ranks',
+    'signal_features',
+    'market_risk_filter',
+)
+
 
 @dataclass(frozen=True)
 class PykrxPipelineDependencies:
@@ -50,9 +59,14 @@ def run_market_data_pipeline(
     symbol: str | None = None,
     symbols_override: Sequence[Any] | None = None,
     retry_context: dict | None = None,
+    selected_stages: Sequence[str] | None = None,
+    chain_fundamentals_followup: bool = True,
 ) -> dict:
     normalized_start = dependencies.normalize_yyyymmdd(start_date)
     normalized_end = dependencies.normalize_yyyymmdd(end_date)
+    requested_stage_set = set(selected_stages or PYKRX_DAILY_STAGE_ORDER)
+    if 'price_collection' not in requested_stage_set:
+        raise ValueError('price_collection stage is required for pykrx pipeline execution')
     dependencies.log_fetch(
         'run_collection',
         'started',
@@ -66,6 +80,7 @@ def run_market_data_pipeline(
         symbols_override_count=len(symbols_override) if symbols_override is not None else None,
         refresh_universe=refresh_universe,
         retry=retry_context,
+        selected_stages=list(selected_stages or PYKRX_DAILY_STAGE_ORDER),
     )
 
     effective_refresh_universe = refresh_universe and symbols_override is None
@@ -328,268 +343,320 @@ def run_market_data_pipeline(
     price_context_symbols = [item.symbol for item in symbols if item.symbol not in failed_symbol_set]
     price_context_result: dict
     price_context_error_message: str | None = None
-    try:
-        price_context_result = dependencies.price_context_service.rebuild_for_market_date(
-            market_date=latest_trade_date,
-            symbols=price_context_symbols,
-            source='pykrx',
-            run_id=run_id,
-        )
-    except Exception as exc:
-        price_context_result = build_stage_failure_result(
-            market_date=latest_trade_date,
-            source='pykrx',
-            error=exc,
-            totals={
-                'requested_symbols': len(price_context_symbols),
-                'contexts_persisted': 0,
-                'contexts_failed': len(price_context_symbols),
-            },
-            failed_symbols=price_context_symbols,
-            items_key='items',
-        )
-        price_context_error_message = f'Price context persistence failed: {exc}'
+    if mode != 'daily_stage_run':
+        try:
+            price_context_result = dependencies.price_context_service.rebuild_for_market_date(
+                market_date=latest_trade_date,
+                symbols=price_context_symbols,
+                source='pykrx',
+                run_id=run_id,
+            )
+        except Exception as exc:
+            price_context_result = build_stage_failure_result(
+                market_date=latest_trade_date,
+                source='pykrx',
+                error=exc,
+                totals={
+                    'requested_symbols': len(price_context_symbols),
+                    'contexts_persisted': 0,
+                    'contexts_failed': len(price_context_symbols),
+                },
+                failed_symbols=price_context_symbols,
+                items_key='items',
+            )
+            price_context_error_message = f'Price context persistence failed: {exc}'
+    else:
+        price_context_result = {
+            'skipped': True,
+            'reason': 'stage_orchestrator_skipped_implicit_price_contexts',
+            'market_date': latest_trade_date,
+            'source': 'pykrx',
+        }
 
     technical_snapshot_result: dict
     snapshot_error_message: str | None = None
-    try:
-        technical_snapshot_result = dependencies.technical_snapshot_service.rebuild_for_market_date(
-            market_date=latest_trade_date,
-            symbols=[item.symbol for item in symbols],
-            source='pykrx',
-            run_id=run_id,
-            progress_callback=make_stage_progress_callback(
-                persist_stage_progress,
+    if 'technical_snapshots' in requested_stage_set:
+        try:
+            technical_snapshot_result = dependencies.technical_snapshot_service.rebuild_for_market_date(
+                market_date=latest_trade_date,
+                symbols=[item.symbol for item in symbols],
+                source='pykrx',
+                run_id=run_id,
+                progress_callback=make_stage_progress_callback(
+                    persist_stage_progress,
+                    stage='technical_snapshots',
+                    default_step='computing_symbol_snapshot',
+                    default_activity='Computing daily technical snapshots',
+                    include_current_symbol=True,
+                ),
+            )
+        except Exception as exc:
+            technical_snapshot_result = build_stage_failure_result(
+                market_date=latest_trade_date,
+                source='pykrx',
+                error=exc,
+                totals={
+                    'requested_symbols': len(symbols),
+                    'snapshots_persisted': 0,
+                    'snapshots_failed': len(symbols),
+                },
+                failed_symbols=[item.symbol for item in symbols],
+                items_key='items',
+            )
+            snapshot_error_message = f'Technical snapshot persistence failed: {exc}'
+            persist_stage_progress(
                 stage='technical_snapshots',
-                default_step='computing_symbol_snapshot',
-                default_activity='Computing daily technical snapshots',
-                include_current_symbol=True,
-            ),
-        )
-    except Exception as exc:
-        technical_snapshot_result = build_stage_failure_result(
-            market_date=latest_trade_date,
-            source='pykrx',
-            error=exc,
-            totals={
-                'requested_symbols': len(symbols),
-                'snapshots_persisted': 0,
-                'snapshots_failed': len(symbols),
-            },
-            failed_symbols=[item.symbol for item in symbols],
-            items_key='items',
-        )
-        snapshot_error_message = f'Technical snapshot persistence failed: {exc}'
-        persist_stage_progress(
-            stage='technical_snapshots',
-            status='failed',
-            current_step='technical_snapshots_failed',
-            current_activity='Daily technical snapshot persistence failed',
-            processed=0,
-            total=len(symbols),
-            succeeded=0,
-            failed=len(symbols),
-        )
+                status='failed',
+                current_step='technical_snapshots_failed',
+                current_activity='Daily technical snapshot persistence failed',
+                processed=0,
+                total=len(symbols),
+                succeeded=0,
+                failed=len(symbols),
+            )
+    else:
+        technical_snapshot_result = {
+            'skipped': True,
+            'reason': 'stage_not_requested',
+            'market_date': latest_trade_date,
+            'source': 'pykrx',
+        }
 
     action_summary_result: dict
     action_summary_error_message: str | None = None
-    try:
-        action_summary_result = dependencies.action_summary_service.rebuild_for_market_date(
-            market_date=latest_trade_date,
-            symbols=[item.symbol for item in symbols],
-            source='pykrx',
-            run_id=run_id,
-            progress_callback=make_stage_progress_callback(
-                persist_stage_progress,
+    if 'action_summaries' in requested_stage_set:
+        try:
+            action_summary_result = dependencies.action_summary_service.rebuild_for_market_date(
+                market_date=latest_trade_date,
+                symbols=[item.symbol for item in symbols],
+                source='pykrx',
+                run_id=run_id,
+                progress_callback=make_stage_progress_callback(
+                    persist_stage_progress,
+                    stage='action_summaries',
+                    default_step='computing_action_summary',
+                    default_activity='Computing daily action summaries',
+                    include_current_symbol=True,
+                ),
+            )
+        except Exception as exc:
+            action_summary_result = build_stage_failure_result(
+                market_date=latest_trade_date,
+                source='pykrx',
+                error=exc,
+                totals={
+                    'requested_symbols': len(symbols),
+                    'action_summaries_persisted': 0,
+                    'action_summaries_failed': len(symbols),
+                },
+                failed_symbols=[item.symbol for item in symbols],
+                items_key='items',
+            )
+            action_summary_error_message = f'Action summary persistence failed: {exc}'
+            persist_stage_progress(
                 stage='action_summaries',
-                default_step='computing_action_summary',
-                default_activity='Computing daily action summaries',
-                include_current_symbol=True,
-            ),
-        )
-    except Exception as exc:
-        action_summary_result = build_stage_failure_result(
-            market_date=latest_trade_date,
-            source='pykrx',
-            error=exc,
-            totals={
-                'requested_symbols': len(symbols),
-                'action_summaries_persisted': 0,
-                'action_summaries_failed': len(symbols),
-            },
-            failed_symbols=[item.symbol for item in symbols],
-            items_key='items',
-        )
-        action_summary_error_message = f'Action summary persistence failed: {exc}'
-        persist_stage_progress(
-            stage='action_summaries',
-            status='failed',
-            current_step='action_summaries_failed',
-            current_activity='Daily action summary persistence failed',
-            processed=0,
-            total=len(symbols),
-            succeeded=0,
-            failed=len(symbols),
-        )
+                status='failed',
+                current_step='action_summaries_failed',
+                current_activity='Daily action summary persistence failed',
+                processed=0,
+                total=len(symbols),
+                succeeded=0,
+                failed=len(symbols),
+            )
+    else:
+        action_summary_result = {
+            'skipped': True,
+            'reason': 'stage_not_requested',
+            'market_date': latest_trade_date,
+            'source': 'pykrx',
+        }
 
     trending_rank_result: dict
     trending_rank_error_message: str | None = None
-    try:
-        trending_rank_result = dependencies.compute_trending_ranks(
-            market_date=latest_trade_date,
-            source='pykrx',
-            run_id=run_id,
-            progress_callback=make_stage_progress_callback(
-                persist_stage_progress,
+    if 'trending_ranks' in requested_stage_set:
+        try:
+            trending_rank_result = dependencies.compute_trending_ranks(
+                market_date=latest_trade_date,
+                source='pykrx',
+                run_id=run_id,
+                progress_callback=make_stage_progress_callback(
+                    persist_stage_progress,
+                    stage='trending_ranks',
+                    default_step='computing_trending_period',
+                    default_activity='Computing daily trending ranks',
+                    include_current_period=True,
+                ),
+            )
+        except Exception as exc:
+            trending_rank_result = build_stage_failure_result(
+                market_date=latest_trade_date,
+                source='pykrx',
+                error=exc,
+                totals={
+                    'periods': [],
+                    'trending_ranks_persisted': 0,
+                },
+            )
+            trending_rank_error_message = f'Trending rank persistence failed: {exc}'
+            persist_stage_progress(
                 stage='trending_ranks',
-                default_step='computing_trending_period',
-                default_activity='Computing daily trending ranks',
-                include_current_period=True,
-            ),
-        )
-    except Exception as exc:
-        trending_rank_result = build_stage_failure_result(
-            market_date=latest_trade_date,
-            source='pykrx',
-            error=exc,
-            totals={
-                'periods': [],
-                'trending_ranks_persisted': 0,
-            },
-        )
-        trending_rank_error_message = f'Trending rank persistence failed: {exc}'
-        persist_stage_progress(
-            stage='trending_ranks',
-            status='failed',
-            current_step='trending_ranks_failed',
-            current_activity='Daily trending rank persistence failed',
-            processed=0,
-            total=0,
-            succeeded=0,
-            failed=1,
-        )
+                status='failed',
+                current_step='trending_ranks_failed',
+                current_activity='Daily trending rank persistence failed',
+                processed=0,
+                total=0,
+                succeeded=0,
+                failed=1,
+            )
+    else:
+        trending_rank_result = {
+            'skipped': True,
+            'reason': 'stage_not_requested',
+            'market_date': latest_trade_date,
+            'source': 'pykrx',
+        }
 
     signal_feature_result: dict
     signal_feature_error_message: str | None = None
-    try:
-        persist_stage_progress(
-            stage='signal_features',
-            status='running',
-            current_step='collecting_daily_signal_features',
-            current_activity='Collecting daily KIS signal features',
-            processed=0,
-            total=3,
-            succeeded=0,
-            failed=0,
-        )
-        signal_feature_result = asyncio.run(
-            dependencies.signal_feature_service.refresh_for_market_date(
-                market_date=latest_trade_date,
+    if 'signal_features' in requested_stage_set:
+        try:
+            persist_stage_progress(
+                stage='signal_features',
+                status='running',
+                current_step='collecting_daily_signal_features',
+                current_activity='Collecting daily KIS signal features',
+                processed=0,
+                total=3,
+                succeeded=0,
+                failed=0,
             )
-        )
-        signal_total = int(signal_feature_result.get('features_persisted', 0)) + int(signal_feature_result.get('features_failed', 0))
-        persist_stage_progress(
-            stage='signal_features',
-            status='completed' if not signal_feature_result.get('features_failed') else 'partial',
-            current_step='signal_features_completed',
-            current_activity='Daily KIS signal features collected',
-            processed=signal_total,
-            total=signal_total,
-            succeeded=signal_feature_result.get('features_persisted'),
-            failed=signal_feature_result.get('features_failed'),
-            extra={
-                'sources': signal_feature_result.get('sources'),
-                'source_counts': signal_feature_result.get('source_counts'),
-            },
-        )
-    except Exception as exc:
-        signal_feature_result = build_stage_failure_result(
-            market_date=latest_trade_date,
-            source='kis_ranking',
-            error=exc,
-            totals={
-                'sources': [],
-                'source_counts': {},
-                'features_persisted': 0,
-                'features_failed': 0,
-            },
-            failed_symbols=[],
-            items_key='items',
-            extra={'participation_context': {'error': str(exc)}},
-        )
-        signal_feature_error_message = f'Daily signal feature collection failed: {exc}'
-        persist_stage_progress(
-            stage='signal_features',
-            status='failed',
-            current_step='signal_features_failed',
-            current_activity='Daily KIS signal feature collection failed',
-            processed=0,
-            total=3,
-            succeeded=0,
-            failed=1,
-        )
+            signal_feature_result = asyncio.run(
+                dependencies.signal_feature_service.refresh_for_market_date(
+                    market_date=latest_trade_date,
+                )
+            )
+            signal_total = int(signal_feature_result.get('features_persisted', 0)) + int(
+                signal_feature_result.get('features_failed', 0)
+            )
+            persist_stage_progress(
+                stage='signal_features',
+                status='completed' if not signal_feature_result.get('features_failed') else 'partial',
+                current_step='signal_features_completed',
+                current_activity='Daily KIS signal features collected',
+                processed=signal_total,
+                total=signal_total,
+                succeeded=signal_feature_result.get('features_persisted'),
+                failed=signal_feature_result.get('features_failed'),
+                extra={
+                    'sources': signal_feature_result.get('sources'),
+                    'source_counts': signal_feature_result.get('source_counts'),
+                },
+            )
+        except Exception as exc:
+            signal_feature_result = build_stage_failure_result(
+                market_date=latest_trade_date,
+                source='kis_ranking',
+                error=exc,
+                totals={
+                    'sources': [],
+                    'source_counts': {},
+                    'features_persisted': 0,
+                    'features_failed': 0,
+                },
+                failed_symbols=[],
+                items_key='items',
+                extra={'participation_context': {'error': str(exc)}},
+            )
+            signal_feature_error_message = f'Daily signal feature collection failed: {exc}'
+            persist_stage_progress(
+                stage='signal_features',
+                status='failed',
+                current_step='signal_features_failed',
+                current_activity='Daily KIS signal feature collection failed',
+                processed=0,
+                total=3,
+                succeeded=0,
+                failed=1,
+            )
+    else:
+        signal_feature_result = {
+            'skipped': True,
+            'reason': 'stage_not_requested',
+            'market_date': latest_trade_date,
+            'source': 'kis_ranking',
+        }
 
     market_risk_filter_result: dict
     market_risk_filter_error_message: str | None = None
-    try:
-        persist_stage_progress(
-            stage='market_risk_filter',
-            status='running',
-            current_step='collecting_market_risk_snapshots_and_filters',
-            current_activity='Collecting daily KIS risk snapshots and evaluating market risk filter',
-            processed=0,
-            total=len(price_context_symbols),
-            succeeded=0,
-            failed=0,
-        )
-        market_risk_filter_result = asyncio.run(
-            dependencies.market_risk_filter_service.rebuild_for_market_date(
-                market_date=latest_trade_date,
-                symbols=price_context_symbols,
-                source=MARKET_RISK_FILTER_SOURCE,
-                run_id=run_id,
+    if 'market_risk_filter' in requested_stage_set:
+        try:
+            persist_stage_progress(
+                stage='market_risk_filter',
+                status='running',
+                current_step='collecting_market_risk_snapshots_and_filters',
+                current_activity='Collecting daily KIS risk snapshots and evaluating market risk filter',
+                processed=0,
+                total=len(price_context_symbols),
+                succeeded=0,
+                failed=0,
             )
-        )
-        market_risk_total = len(market_risk_filter_result.get('matched_symbols') or [])
-        market_risk_failed = int(market_risk_filter_result.get('results_failed') or 0)
-        persist_stage_progress(
-            stage='market_risk_filter',
-            status='completed' if market_risk_failed == 0 else 'partial',
-            current_step='market_risk_filter_completed',
-            current_activity='Daily KIS market risk filter computed',
-            processed=(int(market_risk_filter_result.get('results_persisted') or 0) + market_risk_failed),
-            total=market_risk_total,
-            succeeded=market_risk_filter_result.get('results_persisted'),
-            failed=market_risk_failed,
-            extra={
-                'snapshot_results_failed': market_risk_filter_result.get('snapshot_collection', {}).get('snapshots_failed'),
-                'passed_count': market_risk_filter_result.get('summary', {}).get('passed_count'),
-                'watchlist_count': market_risk_filter_result.get('summary', {}).get('watchlist_count'),
-            },
-        )
-    except Exception as exc:
-        market_risk_filter_result = build_stage_failure_result(
-            market_date=latest_trade_date,
-            source=MARKET_RISK_FILTER_SOURCE,
-            error=exc,
-            totals={
-                'results_persisted': 0,
-                'results_failed': len(price_context_symbols),
-            },
-            failed_symbols=price_context_symbols,
-            items_key='items',
-        )
-        market_risk_filter_error_message = f'Market risk filter persistence failed: {exc}'
-        persist_stage_progress(
-            stage='market_risk_filter',
-            status='failed',
-            current_step='market_risk_filter_failed',
-            current_activity='Daily KIS market risk filter persistence failed',
-            processed=0,
-            total=len(price_context_symbols),
-            succeeded=0,
-            failed=len(price_context_symbols),
-        )
+            market_risk_filter_result = asyncio.run(
+                dependencies.market_risk_filter_service.rebuild_for_market_date(
+                    market_date=latest_trade_date,
+                    symbols=price_context_symbols,
+                    source=MARKET_RISK_FILTER_SOURCE,
+                    run_id=run_id,
+                )
+            )
+            market_risk_total = len(market_risk_filter_result.get('matched_symbols') or [])
+            market_risk_failed = int(market_risk_filter_result.get('results_failed') or 0)
+            persist_stage_progress(
+                stage='market_risk_filter',
+                status='completed' if market_risk_failed == 0 else 'partial',
+                current_step='market_risk_filter_completed',
+                current_activity='Daily KIS market risk filter computed',
+                processed=(int(market_risk_filter_result.get('results_persisted') or 0) + market_risk_failed),
+                total=market_risk_total,
+                succeeded=market_risk_filter_result.get('results_persisted'),
+                failed=market_risk_failed,
+                extra={
+                    'snapshot_results_failed': market_risk_filter_result.get('snapshot_collection', {}).get(
+                        'snapshots_failed'
+                    ),
+                    'passed_count': market_risk_filter_result.get('summary', {}).get('passed_count'),
+                    'watchlist_count': market_risk_filter_result.get('summary', {}).get('watchlist_count'),
+                },
+            )
+        except Exception as exc:
+            market_risk_filter_result = build_stage_failure_result(
+                market_date=latest_trade_date,
+                source=MARKET_RISK_FILTER_SOURCE,
+                error=exc,
+                totals={
+                    'results_persisted': 0,
+                    'results_failed': len(price_context_symbols),
+                },
+                failed_symbols=price_context_symbols,
+                items_key='items',
+            )
+            market_risk_filter_error_message = f'Market risk filter persistence failed: {exc}'
+            persist_stage_progress(
+                stage='market_risk_filter',
+                status='failed',
+                current_step='market_risk_filter_failed',
+                current_activity='Daily KIS market risk filter persistence failed',
+                processed=0,
+                total=len(price_context_symbols),
+                succeeded=0,
+                failed=len(price_context_symbols),
+            )
+    else:
+        market_risk_filter_result = {
+            'skipped': True,
+            'reason': 'stage_not_requested',
+            'market_date': latest_trade_date,
+            'source': MARKET_RISK_FILTER_SOURCE,
+        }
 
     run_errors: list[str] = []
     if failed_symbols:
@@ -647,6 +714,7 @@ def run_market_data_pipeline(
         'run_id': run_id,
         'source': 'pykrx',
         'status': status,
+        'selected_stages': list(selected_stages or PYKRX_DAILY_STAGE_ORDER),
         'markets': list(markets),
         'start_date': normalized_start,
         'requested_end_date': normalized_end,
@@ -667,7 +735,9 @@ def run_market_data_pipeline(
     }
     dart_auto_followup_enabled = bool((dependencies.settings.dart_api_key or '').strip())
     should_chain_fundamentals = (
-        dart_auto_followup_enabled
+        chain_fundamentals_followup
+        and 'market_risk_filter' in requested_stage_set
+        and dart_auto_followup_enabled
         and mode == 'daily_auto'
         and status in {'completed', 'completed_with_errors'}
     )
@@ -679,7 +749,7 @@ def run_market_data_pipeline(
                 trigger='eod_pykrx_followup',
             )
         )
-    elif mode == 'daily_auto' and status in {'completed', 'completed_with_errors'}:
+    elif chain_fundamentals_followup and mode == 'daily_auto' and status in {'completed', 'completed_with_errors'}:
         result['fundamentals_followup'] = {
             'triggered': False,
             'reason': 'dart_api_key_not_configured',

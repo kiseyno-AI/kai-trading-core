@@ -1278,6 +1278,8 @@ class DartFundamentalsCaptureService:
         fs_div: str | None = None,
         trigger: str = 'manual_daily_api',
         retry_cycles: int | None = None,
+        run_piotroski_followup: bool = True,
+        run_feedback_followup: bool | None = None,
     ) -> dict[str, Any]:
         if symbol_offset < 0:
             raise ValueError('symbol_offset must be greater than or equal to 0')
@@ -1929,7 +1931,7 @@ class DartFundamentalsCaptureService:
 
             piotroski_filter_followup = None
             piotroski_filter_followup_error = None
-            if status in {'completed', 'partial'}:
+            if status in {'completed', 'partial'} and run_piotroski_followup:
                 try:
                     piotroski_filter_followup = await asyncio.to_thread(
                         daily_piotroski_filter_service.rebuild_for_market_date,
@@ -1941,6 +1943,12 @@ class DartFundamentalsCaptureService:
                     piotroski_filter_followup_error = str(exc)
                     partial_reasons.append('piotroski_filter_followup_failed')
                 status = 'partial' if partial_reasons else 'completed'
+            elif status in {'completed', 'partial'}:
+                piotroski_filter_followup = {
+                    'triggered': False,
+                    'reason': 'followup_disabled',
+                    'market_date': resolved_market_date.isoformat(),
+                }
 
             metadata = {
                 **run_metadata,
@@ -2011,17 +2019,28 @@ class DartFundamentalsCaptureService:
             )
             feedback_followup = None
             feedback_followup_error = None
-            should_trigger_feedback_followup = (
+            feedback_followup_requested = (
                 settings.openclaw_feedback_trigger_after_fundamentals_refresh
+                if run_feedback_followup is None
+                else run_feedback_followup
+            )
+            should_trigger_feedback_followup = (
+                feedback_followup_requested
                 and status in {'completed', 'partial'}
                 and piotroski_filter_followup is not None
                 and not piotroski_filter_followup_error
                 and int(piotroski_filter_followup.get('results_failed') or 0) == 0
             )
-            if settings.openclaw_feedback_trigger_after_fundamentals_refresh and not should_trigger_feedback_followup:
+            if feedback_followup_requested and not should_trigger_feedback_followup:
                 feedback_followup = {
                     'triggered': False,
                     'reason': 'piotroski_filter_followup_incomplete',
+                    'market_date': resolved_market_date.isoformat(),
+                }
+            elif not feedback_followup_requested:
+                feedback_followup = {
+                    'triggered': False,
+                    'reason': 'followup_disabled',
                     'market_date': resolved_market_date.isoformat(),
                 }
             if should_trigger_feedback_followup:

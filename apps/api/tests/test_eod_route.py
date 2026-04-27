@@ -730,6 +730,40 @@ class FakePipelineStatusService:
         }
 
 
+class FakeDailyPipelineStageService:
+    def __init__(self):
+        self.describe_called = False
+        self.run_args = None
+
+    def describe(self):
+        self.describe_called = True
+        return {
+            'stage_order': ['price_collection', 'technical_snapshots', 'signal_decider'],
+            'default_daily_stage_order': ['price_collection', 'technical_snapshots', 'signal_decider'],
+            'stages': [
+                {
+                    'id': 'price_collection',
+                    'label': 'pykrx daily price collection',
+                    'supports_symbols': True,
+                }
+            ],
+        }
+
+    def run(self, **kwargs):
+        self.run_args = kwargs
+        return {
+            'market_date': kwargs.get('market_date') or '2026-04-21',
+            'resolved_stages': kwargs.get('stages') or ['price_collection'],
+            'status': 'completed',
+            'stages': {
+                'price_collection': {
+                    'status': 'completed',
+                    'result': {'bars_upserted': 2},
+                }
+            },
+        }
+
+
 class EODRouteTests(unittest.TestCase):
     def setUp(self):
         self.app = FastAPI()
@@ -782,6 +816,57 @@ class EODRouteTests(unittest.TestCase):
             payload['stages']['technical_snapshots']['current_activity'],
             'Computing daily technical snapshots for 000660',
         )
+
+    def test_get_eod_pipeline_stages_route_returns_stage_catalog(self):
+        fake_service = FakeDailyPipelineStageService()
+        original_service = routes_eod.daily_pipeline_stage_service
+        routes_eod.daily_pipeline_stage_service = fake_service
+        try:
+            client = TestClient(self.app)
+            response = client.get('/eod/pipeline/stages')
+        finally:
+            routes_eod.daily_pipeline_stage_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(fake_service.describe_called)
+        payload = response.json()
+        self.assertEqual(payload['stage_order'][0], 'price_collection')
+        self.assertEqual(payload['stages'][0]['id'], 'price_collection')
+
+    def test_run_eod_pipeline_route_calls_stage_service(self):
+        fake_service = FakeDailyPipelineStageService()
+        original_service = routes_eod.daily_pipeline_stage_service
+        routes_eod.daily_pipeline_stage_service = fake_service
+        try:
+            client = TestClient(self.app)
+            response = client.post(
+                '/eod/pipeline/run',
+                json={
+                    'market_date': '2026-04-21',
+                    'stages': ['signal_decider', 'technical_snapshots'],
+                    'symbols': ['005930', '000660'],
+                    'markets': ['KOSPI', 'KOSDAQ'],
+                    'force': True,
+                    'fs_div': 'OFS',
+                    'symbol_limit': 25,
+                    'capture_limit': 100,
+                    'retry_cycles': 2,
+                    'feedback_max_cycles': 4,
+                    'feedback_outer_batch_size': 10,
+                    'reuse_existing_feedback': False,
+                },
+            )
+        finally:
+            routes_eod.daily_pipeline_stage_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(fake_service.run_args['market_date'], '2026-04-21')
+        self.assertEqual(fake_service.run_args['stages'], ['signal_decider', 'technical_snapshots'])
+        self.assertEqual(fake_service.run_args['symbols'], ['005930', '000660'])
+        self.assertEqual(fake_service.run_args['markets'], ['KOSPI', 'KOSDAQ'])
+        self.assertEqual(fake_service.run_args['feedback_max_cycles'], 4)
+        self.assertFalse(fake_service.run_args['reuse_existing_feedback'])
+        self.assertEqual(response.json()['status'], 'completed')
 
     def test_compute_technical_snapshots_route_calls_service(self):
         fake_service = FakeTechnicalSnapshotService()

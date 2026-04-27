@@ -39,10 +39,12 @@ What it does:
 - `GET /scanner/trending-stocks?period=5d&direction=both&limit=20`
 - `GET /eod/status`
 - `GET /eod/pipeline/status`
+- `GET /eod/pipeline/stages`
 - `POST /eod/master/refresh-if-due`
 - `POST /eod/pykrx/universe/refresh`
 - `POST /eod/pykrx/backfill`
 - `POST /eod/pykrx/daily/run-if-due`
+- `POST /eod/pipeline/run`
 - `POST /eod/technical-snapshots/compute`
 - `GET /eod/technical-snapshots`
 - `POST /eod/action-summaries/compute`
@@ -141,7 +143,11 @@ Useful limited-scope runs:
 - DART filing XBRL smoke test: `curl -OJ "http://127.0.0.1:8000/disclosures/dart/filings/xbrl?rcept_no=20260407000001&report_code=11011"`
 - ECOS series smoke test: `curl "http://127.0.0.1:8000/macro/ecos/series?stat_code=722Y001&cycle=M&start_period=202401&end_period=202403&item_code_1=0101000"`
 - API-triggered daily auto path: `curl -X POST "http://127.0.0.1:8000/eod/pykrx/daily/run-if-due?market_date=2026-04-03&force=true"`
+- Stage catalog inspect path: `curl "http://127.0.0.1:8000/eod/pipeline/stages"`
+- API-triggered explicit stage run: `curl -X POST "http://127.0.0.1:8000/eod/pipeline/run" -H "Content-Type: application/json" -d '{"market_date":"2026-04-03","stages":["price_collection","technical_snapshots","agent_feedback_summaries"],"symbols":["005930"]}'`
 - Preferred internal daily auto path: `python3.11 -m app.internal.ops eod-pykrx-daily-run-if-due --market-date 2026-04-03 --force`
+- Internal stage catalog path: `python3.11 -m app.internal.ops eod-pipeline-stages`
+- Internal explicit stage run path: `python3.11 -m app.internal.ops eod-pipeline-run --market-date 2026-04-03 --stages price_collection,technical_snapshots --symbols 005930`
 - Manual technical snapshot rerun after EOD: `python3.11 -m app.eod.technical_snapshots --market-date 2026-04-07`
 - Manual action summary rerun after EOD: `python3.11 -m app.eod.action_summaries --market-date 2026-04-07`
 - Manual low-risk factor rerun from stored bars: `python3.11 -m app.internal.ops eod-low-risk-factors-compute --market-date 2026-04-23`
@@ -174,6 +180,8 @@ Internal ops commands from `apps/api`:
 - `python3.11 -m app.internal.ops quotes-tracked`
 - `python3.11 -m app.internal.ops scanner-tracked-symbols`
 - `python3.11 -m app.internal.ops eod-status`
+- `python3.11 -m app.internal.ops eod-pipeline-stages`
+- `python3.11 -m app.internal.ops eod-pipeline-run --market-date 2026-04-08 --stages price_collection,technical_snapshots`
 - `python3.11 -m app.internal.ops eod-master-refresh-if-due --force`
 - `python3.11 -m app.internal.ops eod-pykrx-daily-run-if-due --market-date 2026-04-08 --force`
 - `python3.11 -m app.internal.ops eod-trending-ranks-compute --market-date 2026-04-08`

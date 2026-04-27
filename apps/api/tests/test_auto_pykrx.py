@@ -9,7 +9,7 @@ from unittest.mock import ANY, AsyncMock, patch
 import pandas as pd
 
 from app.eod.auto_pykrx import AutoPykrxEODScheduler
-from app.eod.pykrx_backfill import PykrxBackfillService, PykrxSymbol
+from app.eod.pykrx_backfill import PYKRX_STAGE_SEQUENCE, PykrxBackfillService, PykrxSymbol
 from app.market.clock import KST, MarketState
 
 
@@ -548,6 +548,80 @@ class PykrxBackfillServiceTests(TestCase):
             market_date='2026-04-03',
             capture_limit=500,
             trigger='eod_pykrx_followup',
+        )
+
+    def test_run_collection_daily_auto_rebuilds_price_contexts_when_selected_stages_are_explicit(self) -> None:
+        service = PykrxBackfillService()
+
+        with (
+            patch.object(
+                service,
+                'load_active_universe',
+                return_value=[PykrxSymbol(symbol='005930', market='KOSPI', name_ko='Samsung Electronics')],
+            ),
+            patch.object(service, 'resolve_latest_trade_date', return_value='2026-04-03'),
+            patch.object(service, '_load_symbol_fundamentals', return_value=None),
+            patch.object(service, '_map_symbol_bars', return_value=[{
+                'trade_date': '2026-04-03',
+                'open_price': 1,
+                'high_price': 2,
+                'low_price': 1,
+                'close_price': 2,
+                'volume': 3,
+                'turnover': 4,
+            }]),
+            patch('app.eod.pykrx_backfill.create_eod_collection_run', return_value=12),
+            patch('app.eod.pykrx_backfill._get_market_ohlcv_by_date', return_value=SimpleNamespace(empty=False)),
+            patch('app.eod.pykrx_backfill.persist_daily_price_bars', return_value=1),
+            patch('app.eod.pykrx_backfill.update_eod_collection_run_progress'),
+            patch(
+                'app.eod.pykrx_backfill.daily_price_context_service.rebuild_for_market_date',
+                return_value={'contexts_persisted': 1, 'contexts_failed': 0},
+            ) as price_contexts,
+            patch(
+                'app.eod.pykrx_backfill.daily_technical_snapshot_service.rebuild_for_market_date',
+                return_value={'snapshots_persisted': 1, 'snapshots_failed': 0},
+            ),
+            patch(
+                'app.eod.pykrx_backfill.daily_action_summary_service.rebuild_for_market_date',
+                return_value={'action_summaries_persisted': 1, 'action_summaries_failed': 0},
+            ),
+            patch(
+                'app.eod.pykrx_backfill.compute_and_persist_daily_trending_ranks',
+                return_value={'trending_ranks_persisted': 3},
+            ),
+            patch(
+                'app.eod.pykrx_backfill.daily_signal_feature_service.refresh_for_market_date',
+                return_value={'features_persisted': 0, 'features_failed': 0, 'sources': [], 'source_counts': {}},
+            ),
+            patch(
+                'app.eod.pykrx_backfill.daily_market_risk_filter_service.rebuild_for_market_date',
+                return_value={
+                    'results_persisted': 1,
+                    'results_failed': 0,
+                    'summary': {'passed_count': 1, 'watchlist_count': 0},
+                },
+            ),
+            patch('app.eod.pykrx_backfill.complete_eod_collection_run'),
+        ):
+            result = service._run_market_data_pipeline(
+                start_date='20260403',
+                end_date='20260403',
+                markets=('KOSPI',),
+                trigger='auto_close_scheduler',
+                refresh_universe=False,
+                mode='daily_auto',
+                selected_stages=PYKRX_STAGE_SEQUENCE,
+                chain_fundamentals_followup=False,
+            )
+
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['price_contexts']['contexts_persisted'], 1)
+        price_contexts.assert_called_once_with(
+            market_date='2026-04-03',
+            symbols=['005930'],
+            source='pykrx',
+            run_id=12,
         )
 
     def test_run_collection_skips_fundamentals_followup_when_dart_is_not_configured(self) -> None:

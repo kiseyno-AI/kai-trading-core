@@ -64,6 +64,8 @@
 - `GET /eod/status`
 - `GET /eod/freshness`
 - `GET /eod/pipeline/status?market_date=YYYY-MM-DD&fs_div=CFS`
+- `GET /eod/pipeline/stages`
+- `POST /eod/pipeline/run`
 - `POST /eod/master/refresh-if-due?force=false`
 - `POST /eod/capture-if-due`
 - `POST /eod/capture?market_date=YYYY-MM-DD`
@@ -134,6 +136,13 @@
 - The current pykrx pipeline stages are `price_collection`, `technical_snapshots`, `action_summaries`, and `trending_ranks`. The same payload also reports the latest DART `fundamentals_daily_refresh` run for the requested `market_date` and `fs_div`.
 - While a pykrx run is `running`, the inferred current stage is authoritative for live display: that stage remains `running`, later pykrx stages stay `pending` until they actually start, and stale `stage_progress.status=running` entries must be downgraded once the owning run is no longer running.
 - Stage payloads include normalized status, timestamps, processed or total or failed counts where available, current step or activity text, and linked source run IDs so operators can correlate the live run with existing inspect routes.
+
+## EOD pipeline stage orchestration notes
+- `GET /eod/pipeline/stages` is the operator-facing stage catalog for the explicit daily pipeline orchestrator.
+- The catalog exposes the canonical stage order, the default daily run sequence, per-stage dependency metadata, supported inputs, inspect routes, and output-table hints.
+- `POST /eod/pipeline/run` executes an explicit stage subset in canonical order while reusing the underlying stage operations rather than duplicating orchestration logic.
+- Requested stages are reordered to the canonical sequence before execution. The response preserves both `requested_stages` and `resolved_stages` so operators can audit what was asked for versus what ran.
+- The route does not silently inject missing dependencies. Callers can inspect `depends_on` from the catalog and choose whether they want a narrow rerun or a wider prerequisite-inclusive slice.
 
 ## EOD technical snapshot notes
 - `daily_technical_snapshots` is the DB-backed post-EOD signal layer keyed by `symbol_id + market_date`.

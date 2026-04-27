@@ -165,6 +165,53 @@ class InternalOpsTests(unittest.TestCase):
         self.assertEqual(result, {'symbols_evaluated': 2})
         self.assertEqual(collect_filter.call_args.kwargs['market_date'], '2026-04-14')
 
+    def test_list_daily_pipeline_stages_uses_stage_service(self) -> None:
+        with (
+            patch('app.internal.ops.bootstrap_runtime') as bootstrap_runtime,
+            patch(
+                'app.internal.ops.daily_pipeline_stage_service.describe',
+                return_value={'stage_order': ['price_collection']},
+            ) as describe_stages,
+        ):
+            result = ops.list_daily_pipeline_stages()
+
+        bootstrap_runtime.assert_called_once_with()
+        self.assertEqual(result, {'stage_order': ['price_collection']})
+        describe_stages.assert_called_once_with()
+
+    def test_run_daily_pipeline_stages_uses_stage_service(self) -> None:
+        with (
+            patch('app.internal.ops.bootstrap_runtime') as bootstrap_runtime,
+            patch(
+                'app.internal.ops.daily_pipeline_stage_service.run',
+                return_value={'resolved_stages': ['technical_snapshots']},
+            ) as run_stages,
+        ):
+            result = ops.run_daily_pipeline_stages(
+                market_date='2026-04-14',
+                stages='technical_snapshots,signal_decider',
+                symbols='005930,000660',
+                markets='KOSPI,KOSDAQ',
+                force=True,
+                fs_div='CFS',
+                symbol_limit=25,
+                symbol_offset=5,
+                capture_limit=100,
+                retry_cycles=2,
+                feedback_max_cycles=4,
+                feedback_outer_batch_size=12,
+                reuse_existing_feedback=False,
+            )
+
+        bootstrap_runtime.assert_called_once_with()
+        self.assertEqual(result, {'resolved_stages': ['technical_snapshots']})
+        self.assertEqual(run_stages.call_args.kwargs['market_date'], '2026-04-14')
+        self.assertEqual(run_stages.call_args.kwargs['stages'], ['technical_snapshots', 'signal_decider'])
+        self.assertEqual(run_stages.call_args.kwargs['symbols'], ['005930', '000660'])
+        self.assertEqual(run_stages.call_args.kwargs['markets'], ['KOSPI', 'KOSDAQ'])
+        self.assertEqual(run_stages.call_args.kwargs['feedback_max_cycles'], 4)
+        self.assertFalse(run_stages.call_args.kwargs['reuse_existing_feedback'])
+
     def test_run_agent_feedback_retry_cycles_passes_explicit_symbols_to_retry_service(self) -> None:
         with (
             patch('app.internal.ops.bootstrap_runtime') as bootstrap_runtime,
