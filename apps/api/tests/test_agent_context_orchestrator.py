@@ -7,7 +7,7 @@ from unittest.mock import patch
 from app.agent_context import orchestrator as orchestrator_module
 from app.agent_context.orchestrator import AgentFeedbackOrchestrator, OpenClawAgentClient
 from app.agent_context.orchestrator_helpers import correlate_decoded_batch_response
-from app.agent_context.runtime_state import RuntimeFeedbackStateStore
+from app.agent_context.runtime_state import RuntimeFeedbackRunState, RuntimeFeedbackStateStore
 
 
 def _batch_result(symbol: str) -> dict:
@@ -406,6 +406,15 @@ class PartiallyFailingBatchClient(RecordingBatchClient):
                 'session_ref': {'session_key': batch_items[0]['session_key']},
             }
         return super().dispatch_batch(**kwargs)
+
+
+class AlwaysFailingBatchClient:
+    def __init__(self):
+        self.calls = []
+
+    def dispatch_batch(self, **kwargs):
+        self.calls.append(kwargs)
+        raise orchestrator_module.AgentDispatchRetryableError('agent failed before feedback row')
 
 
 def _reuse_decision(should_dispatch: bool):
@@ -1114,6 +1123,119 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertEqual(run_state_service.finished[0]['status'], 'partial')
         self.assertEqual(run_state_service.finished[0]['summary_payload']['flush_result']['status'], 'noop')
         self.assertEqual(run_state_service.finished[0]['summary_payload']['role_statuses']['fundamental-summarizer'], 'completed')
+
+    def test_dispatch_finalization_persists_failure_rows_when_batch_checkpoint_is_interrupted(self):
+        service = AgentFeedbackOrchestrator()
+        client = AlwaysFailingBatchClient()
+        service.client = client
+        feedback_service = FakeFeedbackService()
+        cleanup_service = FakeSessionCleanupService()
+        failure_service = RecordingFailureService()
+        run_state_service = RecordingRunStateService()
+        captured_logs = []
+        fake_settings = SimpleNamespace(openclaw_agent_symbol_chunk_size=1, openclaw_agent_parallel_subtasks=1)
+        original_flush_and_checkpoint = service._flush_and_checkpoint_pending_run_buffers
+
+        def interrupt_batch_checkpoint(**kwargs):
+            if str(kwargs.get('reason') or '').startswith('batch_completed:'):
+                raise RuntimeError('checkpoint interrupted after failure buffered')
+            return original_flush_and_checkpoint(**kwargs)
+
+        def capture_log(stage, **kwargs):
+            captured_logs.append({'stage': stage, **kwargs})
+
+        with patch.object(service, '_flush_and_checkpoint_pending_run_buffers', side_effect=interrupt_batch_checkpoint):
+            with patch.object(orchestrator_module, 'settings', fake_settings):
+                with patch.object(orchestrator_module, 'log_agent_feedback_event', side_effect=capture_log):
+                    with patch.object(orchestrator_module, 'agent_context_feedback_run_state_service', run_state_service):
+                        with patch.object(orchestrator_module, 'agent_context_read_service', DynamicFakeAgentContextReadService()):
+                            with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
+                                with patch.object(orchestrator_module, 'agent_context_feedback_failure_service', failure_service):
+                                    with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
+                                        with patch.object(
+                                            orchestrator_module,
+                                            'load_daily_piotroski_filter_results',
+                                            return_value=_passed_filter_rows('005930'),
+                                        ):
+                                            with self.assertRaisesRegex(RuntimeError, 'checkpoint interrupted after failure buffered'):
+                                                service.dispatch_for_symbols(
+                                                    market_date='2026-04-14',
+                                                    symbols=['005930'],
+                                                    roles=['eod-summarizer'],
+                                                    reuse_existing=False,
+                                                )
+
+        self.assertEqual(len(feedback_service.bulk_calls), 0)
+        self.assertEqual(len(failure_service.recorded), 1)
+        self.assertEqual(failure_service.recorded[0]['agent_name'], 'eod-summarizer')
+        self.assertIn('AgentDispatchRetryableError', failure_service.recorded[0]['failure_kind'])
+        self.assertEqual(failure_service.recorded[0]['summary']['origin'], 'agent_dispatch_failure')
+        self.assertEqual(run_state_service.finished[0]['status'], 'partial')
+        self.assertEqual(run_state_service.finished[0]['summary_payload']['flush_result']['reason'], 'finalize')
+        self.assertEqual(run_state_service.finished[0]['summary_payload']['flush_result']['failure_rows_persisted'], 1)
+
+        success_log = next(entry for entry in captured_logs if entry['stage'] == 'failure_persistence_success')
+        self.assertEqual(success_log['failure_origin'], 'agent_dispatch_failure')
+        self.assertEqual(success_log['original_failure']['origin'], 'agent_dispatch_failure')
+
+    def test_failure_persistence_failure_log_separates_agent_failure_from_row_write_failure(self):
+        service = AgentFeedbackOrchestrator()
+        market_date = orchestrator_module.date.fromisoformat('2026-04-14')
+        request_run_id = 'run-logging'
+        runtime_store = RuntimeFeedbackStateStore()
+        state = RuntimeFeedbackRunState(
+            run_id=request_run_id,
+            market_date=market_date,
+            requested_symbols=['005930'],
+            requested_roles=['eod-summarizer'],
+            role_sequence=['eod-summarizer'],
+            parallel_per_role=1,
+            batch_size=1,
+            started_at=orchestrator_module.datetime.now(orchestrator_module.timezone.utc),
+            current_role='eod-summarizer',
+        )
+        state.pending_failures.append(
+            {
+                'role': 'eod-summarizer',
+                'agent_name': 'eod-summarizer',
+                'symbol': '005930',
+                'status': 'failed',
+                'retryable': True,
+                'error': 'agent failed before feedback row',
+                'failure_kind': 'agent_failed',
+                'dispatch_id': 'dispatch-1',
+                'attempt_id': 'dispatch-1:attempt-1',
+                'slot': 1,
+                'session_key': 'feedback/eod-summarizer/slot-01',
+                'batch_symbols': ['005930'],
+                'context': {'symbol': '005930'},
+            }
+        )
+        runtime_store.start_run(state)
+        captured_logs = []
+
+        class FailingFailureService:
+            def record_failure(self, **kwargs):
+                raise RuntimeError('failure table unavailable')
+
+        def capture_log(stage, **kwargs):
+            captured_logs.append({'stage': stage, **kwargs})
+
+        with patch.object(orchestrator_module, 'runtime_feedback_state_store', runtime_store):
+            with patch.object(orchestrator_module, 'agent_context_feedback_failure_service', FailingFailureService()):
+                with patch.object(orchestrator_module, 'log_agent_feedback_event', side_effect=capture_log):
+                    with self.assertRaisesRegex(RuntimeError, 'failure table unavailable'):
+                        service._flush_pending_run_buffers(
+                            market_date=market_date,
+                            request_run_id=request_run_id,
+                            reason='finalize',
+                        )
+
+        persistence_failure_log = next(entry for entry in captured_logs if entry['stage'] == 'failure_persistence_failure')
+        self.assertEqual(persistence_failure_log['failure_origin'], 'agent_dispatch_failure')
+        self.assertEqual(persistence_failure_log['persistence_error_origin'], 'failure_row_persistence')
+        self.assertEqual(persistence_failure_log['original_failure']['error_message'], 'agent failed before feedback row')
+        self.assertEqual(persistence_failure_log['error_type'], 'RuntimeError')
 
     def test_openclaw_batch_dispatch_logs_request_response_and_symbol_mismatch(self):
         dispatch_id = 'symbol-run-2026-04-14-abc123:eod-summarizer:slot-1:batch-1'
