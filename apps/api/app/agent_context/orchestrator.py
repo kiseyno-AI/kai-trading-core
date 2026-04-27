@@ -1128,6 +1128,33 @@ class AgentFeedbackOrchestrator:
             return None
         return session_key.strip()
 
+    @staticmethod
+    def _session_key_from_failure(failure: dict[str, Any]) -> str | None:
+        context = failure.get('context') if isinstance(failure.get('context'), dict) else {}
+        session_key = failure.get('session_key') or context.get('session_key')
+        if not isinstance(session_key, str) or not session_key.strip():
+            return None
+        return session_key.strip()
+
+    def _cleanup_session_key(
+        self,
+        *,
+        market_date: date,
+        symbol: str,
+        agent_name: str,
+        run_id: str | None,
+        session_key: str,
+    ) -> dict[str, Any]:
+        return agent_feedback_session_cleanup_service.delete_now(
+            target=SessionCleanupTarget(
+                market_date=market_date,
+                symbol=symbol,
+                agent_name=agent_name,
+                run_id=run_id,
+                session_key=session_key,
+            )
+        )
+
     def _cleanup_feedback_session(
         self,
         *,
@@ -1140,14 +1167,12 @@ class AgentFeedbackOrchestrator:
         session_key = self._session_key_from_response(response)
         if session_key is None:
             return None
-        return agent_feedback_session_cleanup_service.delete_now(
-            target=SessionCleanupTarget(
-                market_date=market_date,
-                symbol=symbol,
-                agent_name=agent_name,
-                run_id=run_id,
-                session_key=session_key,
-            )
+        return self._cleanup_session_key(
+            market_date=market_date,
+            symbol=symbol,
+            agent_name=agent_name,
+            run_id=run_id,
+            session_key=session_key,
         )
 
     def _cleanup_buffered_feedback_sessions(self, *, rows: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1182,6 +1207,7 @@ class AgentFeedbackOrchestrator:
             return []
 
         rows_to_cleanup: list[dict[str, Any]] = []
+        failure_cleanup_targets: list[dict[str, Any]] = []
         cleaned_session_keys = set(state.cleaned_session_keys)
         for row in state.buffered_feedback_rows:
             agent_name = str(row.get('agent_name') or '')
@@ -1194,10 +1220,30 @@ class AgentFeedbackOrchestrator:
             rows_to_cleanup.append(row)
             cleaned_session_keys.add(session_key)
 
-        if not rows_to_cleanup:
+        for failure in state.buffered_failures:
+            agent_name = str(failure.get('agent_name') or failure.get('role') or '')
+            if role is not None and agent_name != role:
+                continue
+            session_key = self._session_key_from_failure(failure)
+            if session_key is None or session_key in cleaned_session_keys:
+                continue
+            failure_cleanup_targets.append(
+                {
+                    'market_date': market_date,
+                    'symbol': str(failure.get('symbol') or ''),
+                    'agent_name': agent_name,
+                    'run_id': request_run_id,
+                    'session_key': session_key,
+                }
+            )
+            cleaned_session_keys.add(session_key)
+
+        if not rows_to_cleanup and not failure_cleanup_targets:
             return []
 
         cleanup_results = self._cleanup_buffered_feedback_sessions(rows=rows_to_cleanup)
+        for target in failure_cleanup_targets:
+            cleanup_results.append(self._cleanup_session_key(**target))
         session_keys = {
             session_key
             for session_key in (
@@ -1206,6 +1252,11 @@ class AgentFeedbackOrchestrator:
             )
             if session_key is not None
         }
+        session_keys.update(
+            target['session_key']
+            for target in failure_cleanup_targets
+            if isinstance(target.get('session_key'), str)
+        )
 
         def _mark_cleaned(current: RuntimeFeedbackRunState) -> None:
             current.cleaned_session_keys.update(session_keys)

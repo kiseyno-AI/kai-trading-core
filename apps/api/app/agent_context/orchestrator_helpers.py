@@ -192,9 +192,8 @@ def correlate_decoded_batch_response(
         feedback = item.get('feedback')
         item_symbol = _canonical_symbol(item.get('symbol'))
         feedback_symbol = _feedback_reported_symbol(feedback)
-        item_symbol_matches = item_symbol == expected_symbol
         feedback_symbol_matches = feedback_symbol in (None, expected_symbol)
-        if not item_symbol_matches and feedback_symbol_matches:
+        if item_symbol is None and feedback_symbol_matches:
             fallback_reason = 'single_symbol_batch'
             item['symbol'] = expected_symbol
             _annotate_feedback_attribution(
