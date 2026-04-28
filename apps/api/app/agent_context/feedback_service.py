@@ -214,7 +214,26 @@ class AgentContextFeedbackRepository:
             record = session.get(AgentContextFeedback, record_id)
             if record is None:
                 raise RuntimeError('Failed to load stored feedback record after upsert')
-            return _serialize_feedback(record)
+            serialized = _serialize_feedback(record)
+            snapshot_item = signal_decider_loop_service.prepare_snapshot_persistence_item(
+                feedback_id=record.id,
+                market_date=record.market_date,
+                symbol=record.symbol,
+                agent_name=record.agent_name,
+                agent_version=record.agent_version,
+                run_id=record.run_id,
+                summary_payload=record.summary_payload,
+                feedback_payload=record.feedback_payload,
+                normalized_feedback_payload=record.normalized_feedback_payload,
+                context_payload=record.context_payload,
+                received_at=record.received_at,
+            )
+            if snapshot_item is not None:
+                signal_decider_loop_service.repository.insert_decision_snapshots(
+                    session=session,
+                    items=[snapshot_item],
+                )
+            return serialized
 
     def bulk_upsert_feedback(
         self,
@@ -283,12 +302,28 @@ class AgentContextFeedbackRepository:
                     AgentContextFeedback.received_at,
                 )
                 returned_rows = session.execute(stmt).mappings().all()
+                snapshot_items: list[dict[str, Any]] = []
                 rows_by_key = {
                     (row['market_date'], row['symbol'], row['agent_name']): row
                     for row in returned_rows
                 }
                 for item in chunk:
                     row = rows_by_key[(item['market_date'], item['symbol'], item['agent_name'])]
+                    snapshot_item = signal_decider_loop_service.prepare_snapshot_persistence_item(
+                        feedback_id=row['id'],
+                        market_date=row['market_date'],
+                        symbol=row['symbol'],
+                        agent_name=row['agent_name'],
+                        agent_version=row['agent_version'],
+                        run_id=row['run_id'],
+                        summary_payload=row['summary_payload'],
+                        feedback_payload=row['feedback_payload'],
+                        normalized_feedback_payload=row['normalized_feedback_payload'],
+                        context_payload=row['context_payload'],
+                        received_at=row['received_at'],
+                    )
+                    if snapshot_item is not None:
+                        snapshot_items.append(snapshot_item)
                     accepted.append(
                         {
                             'id': row['id'],
@@ -316,6 +351,11 @@ class AgentContextFeedbackRepository:
                             'context': row['context_payload'],
                             'received_at': row['received_at'].isoformat() if row['received_at'] else None,
                         }
+                    )
+                if snapshot_items:
+                    signal_decider_loop_service.repository.insert_decision_snapshots(
+                        session=session,
+                        items=snapshot_items,
                     )
         return accepted
 

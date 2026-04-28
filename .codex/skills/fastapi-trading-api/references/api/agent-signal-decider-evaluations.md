@@ -1,7 +1,7 @@
 # POST /agent-context/signal-decider/evaluations/compute
 
 ## Summary
-Computes or refreshes raw realized outcomes plus versioned grading rows for stored `signal-decider` decisions over a date range.
+Computes or refreshes raw realized outcomes plus versioned grading rows for immutable stored `signal-decider` decision snapshots over a date range.
 
 ## Example request
 ```http
@@ -34,7 +34,7 @@ Content-Type: application/json
 # GET /agent-context/signal-decider/evaluations
 
 ## Summary
-Reads the persisted outcome-plus-grade bundle back per stored `signal-decider` decision for one market date.
+Reads the persisted outcome-plus-grade bundle back per immutable stored `signal-decider` decision snapshot for one market date.
 
 ## Example request
 ```http
@@ -46,11 +46,14 @@ GET /agent-context/signal-decider/evaluations?market_date=2026-04-23&symbol=0059
 {
   "items": [
     {
+      "snapshot_id": 84,
       "feedback_id": 42,
+      "decision_run_id": "symbol-run-2026-04-23-abc123",
       "symbol": "005930",
       "policy_version": "signal_decider_policy_v1",
       "outcomes": [
         {
+          "decision_snapshot_id": 84,
           "horizon_days": 5,
           "outcome_status": "complete",
           "entry_trade_date": "2026-04-24",
@@ -61,6 +64,7 @@ GET /agent-context/signal-decider/evaluations?market_date=2026-04-23&symbol=0059
       ],
       "evaluations": [
         {
+          "decision_snapshot_id": 84,
           "horizon_days": 5,
           "evaluation_version": "signal_decider_eval_v1",
           "evaluation_status": "graded",

@@ -1,7 +1,7 @@
 # POST /agent-context/signal-decider/policy-candidates/generate
 
 ## Summary
-Refreshes the requested evaluation slice and generates manual-only candidate policy improvements from accumulated `signal-decider` evidence.
+Refreshes the requested evaluation slice and generates manual-only candidate policy improvements from accumulated immutable `signal-decider` snapshot evidence.
 
 ## Example request
 ```http

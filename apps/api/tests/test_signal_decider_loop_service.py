@@ -15,11 +15,12 @@ def _feedback_row(
     market_date: str,
     symbol: str,
     action: str,
+    snapshot_id: int | None = None,
     signal_score: int = 78,
     breakout_20d: bool = True,
     policy_version: str = DEFAULT_SIGNAL_DECIDER_POLICY_VERSION,
 ) -> SimpleNamespace:
-    context_payload = {
+    request_payload = {
         'symbol_day_context': {
             'technical_snapshot': {
                 'trend_state': 'uptrend',
@@ -51,7 +52,7 @@ def _feedback_row(
             },
         }
     }
-    feedback_payload = {
+    response_payload = {
         'role': 'signal-decider',
         'agent_name': 'signal-decider',
         'symbol': symbol,
@@ -69,26 +70,104 @@ def _feedback_row(
         'thesis_summary': f'{action} decision for {symbol}',
         'supporting_evidence': ['Breadth improved into the close.'],
         'decision_risks': ['Leadership remained narrow.'],
+        'invalidation_conditions': ['이탈 종가가 반복되면 보수적으로 본다.'],
         'data_quality_warnings': [],
         'specialist_disagreement': [],
         'traceability': {'agent_name': 'signal-decider', 'symbol': symbol, 'market_date': market_date},
     }
+    traceability_payload = {
+        'schema_version': 'signal_decider_trace_v2',
+        'agent': {
+            'agent_name': 'signal-decider',
+            'agent_version': 'openclaw-v1',
+            'feedback_id': feedback_id,
+            'decision_run_id': f'signal-run-{snapshot_id or feedback_id}',
+        },
+        'policy': {'version': policy_version, 'activation_mode': 'manual_only'},
+        'upstream_references': {},
+        'gate_checks': {'required_upstream_roles': [], 'available_upstream_roles': []},
+        'factor_contributions': {'feature_flags': [{'key': 'technical.breakout_20d', 'value': str(breakout_20d).lower()}]},
+        'final_action_rationale': {'decision_action': action, 'summary': f'{action} decision for {symbol}'},
+        'raw_traceability': response_payload['traceability'],
+    }
+    snapshot_key = snapshot_id or feedback_id
     return SimpleNamespace(
-        id=feedback_id,
+        id=snapshot_key,
+        feedback_id=feedback_id,
         market_date=date.fromisoformat(market_date),
         symbol=symbol,
         agent_name='signal-decider',
-        summary_payload={'model': 'openclaw/signal-decider', 'policy_version': policy_version},
-        feedback_payload=feedback_payload,
-        normalized_feedback_payload=feedback_payload,
-        context_payload=context_payload,
-        received_at=datetime(2026, 4, 23, 6, 0, tzinfo=timezone.utc),
+        agent_version='openclaw-v1',
+        decision_run_id=f'signal-run-{snapshot_key}',
+        feedback_received_at=datetime(2026, 4, 23, 6, 0, tzinfo=timezone.utc),
+        policy_version=policy_version,
+        decision_action=action,
+        preferred_action=action,
+        next_day_open_action=action,
+        entry_price_basis='next_open',
+        target_price=105 if action == 'buy' else None,
+        expected_return_pct=4.0,
+        stop_loss_price=96 if action == 'buy' else None,
+        suggested_holding_period='3-10 trading days',
+        confidence_score_10=7,
+        conviction_score_10=6,
+        thesis_summary=f'{action} decision for {symbol}',
+        supporting_evidence_payload=['Breadth improved into the close.'],
+        decision_risks_payload=['Leadership remained narrow.'],
+        invalidation_conditions_payload=['이탈 종가가 반복되면 보수적으로 본다.'],
+        data_quality_warnings_payload=[],
+        specialist_disagreement_payload=[],
+        traceability_payload=traceability_payload,
+        input_feature_snapshot_payload={
+            'technical': {
+                'trend_state': 'uptrend',
+                'ma_alignment': 'bullish',
+                'breakout_20d': breakout_20d,
+                'breakdown_20d': False,
+                'return_5d': 2.4,
+                'return_20d': 8.1,
+                'volume_ratio_20d': 1.6,
+                'atr_pct_14': 2.2,
+            },
+            'action_summary': {
+                'action_label': 'long_breakout',
+                'bias_direction': 'bullish',
+                'signal_score': signal_score,
+                'signal_score_bucket': 'high',
+                'confidence_tier': 'high',
+                'risk_tier': 'low',
+            },
+            'signal_features': {
+                'signal_count': 3,
+                'signal_count_bucket': '3plus',
+                'volume_power_rank': 2,
+                'overtime_volume_rank': 3,
+                'overtime_fluctuation_rank': 1,
+            },
+            'price_context': {
+                'close_location_ratio': 0.82,
+                'gap_vs_prev_close_pct': 0.3,
+                'range_pct': 4.1,
+            },
+            'meta': {
+                'supporting_evidence_count': 1,
+                'decision_risk_count': 1,
+                'data_warning_count': 0,
+                'disagreement_count': 0,
+                'has_data_warnings': False,
+                'has_disagreement': False,
+            },
+        },
+        request_payload=request_payload,
+        response_payload=response_payload,
+        response_summary_payload={'model': 'openclaw/signal-decider', 'policy_version': policy_version},
+        created_at=datetime(2026, 4, 23, 6, 0, tzinfo=timezone.utc),
     )
 
 
 class FakeSignalDeciderLoopRepository:
-    def __init__(self, feedback_rows):
-        self.feedback_rows = list(feedback_rows)
+    def __init__(self, snapshot_rows):
+        self.snapshot_rows = list(snapshot_rows)
         self.outcomes = {}
         self.evaluations = {}
         self.candidates = {}
@@ -96,7 +175,7 @@ class FakeSignalDeciderLoopRepository:
         self.next_evaluation_id = 1
         self.next_candidate_id = 1
 
-    def list_signal_decider_feedback(
+    def list_decision_snapshots(
         self,
         *,
         market_date=None,
@@ -105,7 +184,7 @@ class FakeSignalDeciderLoopRepository:
         symbols=None,
         limit=None,
     ):
-        rows = list(self.feedback_rows)
+        rows = list(self.snapshot_rows)
         if market_date is not None:
             rows = [row for row in rows if row.market_date == market_date]
         if market_date_from is not None:
@@ -115,28 +194,28 @@ class FakeSignalDeciderLoopRepository:
         normalized_symbols = set(symbols or [])
         if normalized_symbols:
             rows = [row for row in rows if row.symbol in normalized_symbols]
-        rows.sort(key=lambda row: (row.market_date, row.symbol), reverse=True)
+        rows.sort(key=lambda row: (row.market_date, row.created_at, row.id), reverse=True)
         return rows[:limit] if limit is not None else rows
 
-    def list_realized_outcomes(self, *, feedback_ids, horizons=None):
+    def list_realized_outcomes(self, *, decision_snapshot_ids, horizons=None):
         rows = [
             item
             for item in self.outcomes.values()
-            if item['feedback_id'] in set(feedback_ids)
+            if item['decision_snapshot_id'] in set(decision_snapshot_ids)
             and (horizons is None or item['horizon_days'] in set(horizons))
         ]
-        rows.sort(key=lambda item: (item['feedback_id'], item['horizon_days']))
+        rows.sort(key=lambda item: (item['decision_snapshot_id'], item['horizon_days']))
         return rows
 
-    def list_evaluations(self, *, feedback_ids, horizons=None, evaluation_version=None):
+    def list_evaluations(self, *, decision_snapshot_ids, horizons=None, evaluation_version=None):
         rows = [
             item
             for item in self.evaluations.values()
-            if item['feedback_id'] in set(feedback_ids)
+            if item['decision_snapshot_id'] in set(decision_snapshot_ids)
             and (horizons is None or item['horizon_days'] in set(horizons))
             and (evaluation_version is None or item['evaluation_version'] == evaluation_version)
         ]
-        rows.sort(key=lambda item: (item['feedback_id'], item['horizon_days']))
+        rows.sort(key=lambda item: (item['decision_snapshot_id'], item['horizon_days']))
         return rows
 
     def list_evaluations_by_range(
@@ -173,7 +252,7 @@ class FakeSignalDeciderLoopRepository:
     def bulk_upsert_realized_outcomes(self, *, items):
         persisted = []
         for item in items:
-            key = (item['feedback_id'], item['horizon_days'])
+            key = (item['decision_snapshot_id'], item['horizon_days'])
             stored = dict(item)
             stored.setdefault('id', self.outcomes.get(key, {}).get('id', self.next_outcome_id))
             if key not in self.outcomes:
@@ -189,7 +268,7 @@ class FakeSignalDeciderLoopRepository:
     def bulk_upsert_evaluations(self, *, items):
         persisted = []
         for item in items:
-            key = (item['feedback_id'], item['horizon_days'], item['evaluation_version'])
+            key = (item['decision_snapshot_id'], item['horizon_days'], item['evaluation_version'])
             stored = dict(item)
             stored.setdefault('id', self.evaluations.get(key, {}).get('id', self.next_evaluation_id))
             if key not in self.evaluations:
@@ -244,6 +323,81 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
         self.assertEqual(
             context['signal_decider_trace']['feature_snapshot']['action_summary']['signal_score_bucket'],
             'high',
+        )
+
+    def test_prepare_snapshot_persistence_item_builds_structured_traceability(self):
+        service = SignalDeciderLoopService(repository=FakeSignalDeciderLoopRepository([]))
+        snapshot_item = service.prepare_snapshot_persistence_item(
+            feedback_id=11,
+            market_date='2026-04-23',
+            symbol='005930',
+            agent_name='signal-decider',
+            agent_version='openclaw-v1',
+            run_id='signal-run-11',
+            summary_payload={'model': 'openclaw/signal-decider'},
+            feedback_payload={
+                'preferred_action': 'wait',
+                'next_day_open_action': 'wait',
+                'thesis_summary': '보수적으로 대기한다.',
+                'supporting_evidence': ['장 마감 수급이 개선됐다.'],
+                'decision_risks': ['주도주 폭이 좁다.'],
+                'invalidation_conditions': ['지지선 이탈 종가가 반복되면 무효화한다.'],
+                'traceability': {'symbol': '005930', 'market_date': '2026-04-23'},
+            },
+            context_payload={
+                'symbol_day_context': {
+                    'technical_snapshot': {'breakout_20d': True, 'trend_state': 'uptrend'},
+                    'action_summary': {'signal_score': 78, 'confidence_tier': 'high'},
+                    'signal_features': {'signal_count': 3},
+                    'price_context': {'close_location_ratio': 0.8},
+                },
+                'upstream_traceability': {
+                    'technical-summarizer': {'feedback_id': 7, 'run_id': 'upstream-7', 'source': 'persisted_feedback'}
+                },
+                'orchestration': {'required_upstream_roles': ['technical-summarizer']},
+            },
+            received_at='2026-04-23T06:00:00+00:00',
+        )
+
+        self.assertEqual(snapshot_item['policy_version'], DEFAULT_SIGNAL_DECIDER_POLICY_VERSION)
+        self.assertEqual(snapshot_item['traceability_payload']['schema_version'], 'signal_decider_trace_v2')
+        self.assertEqual(
+            snapshot_item['traceability_payload']['upstream_references']['technical-summarizer']['feedback_id'],
+            7,
+        )
+        self.assertTrue(snapshot_item['traceability_payload']['gate_checks']['traceability_symbol_matches'])
+        self.assertEqual(snapshot_item['input_feature_snapshot_payload']['technical']['breakout_20d'], True)
+
+    def test_list_decisions_preserves_multiple_snapshots_for_one_symbol_date(self):
+        repository = FakeSignalDeciderLoopRepository(
+            [
+                _feedback_row(
+                    feedback_id=41,
+                    snapshot_id=101,
+                    market_date='2026-04-23',
+                    symbol='005930',
+                    action='wait',
+                ),
+                _feedback_row(
+                    feedback_id=41,
+                    snapshot_id=102,
+                    market_date='2026-04-23',
+                    symbol='005930',
+                    action='buy',
+                    policy_version='signal_decider_policy_v2',
+                ),
+            ]
+        )
+        service = SignalDeciderLoopService(repository=repository)
+
+        result = service.list_decisions(market_date='2026-04-23', symbol='005930', limit=20)
+
+        self.assertEqual(result['summary']['count'], 2)
+        self.assertEqual([item['snapshot_id'] for item in result['items']], [102, 101])
+        self.assertEqual([item['decision']['action'] for item in result['items']], ['buy', 'wait'])
+        self.assertEqual(
+            {item['policy_version'] for item in result['items']},
+            {'signal_decider_policy_v1', 'signal_decider_policy_v2'},
         )
 
     def test_compute_evaluations_grades_buy_and_wait_across_horizons(self):
