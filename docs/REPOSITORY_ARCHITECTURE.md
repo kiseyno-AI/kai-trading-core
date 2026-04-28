@@ -503,6 +503,7 @@ Interpretation:
 - `/broker/kis/*`
 - `/macro/*`
 - `/fx/koreaexim/*`
+- `/market/snapshot`
 - `/disclosures/dart/company-snapshot`
 - `/disclosures/dart/fundamentals`
 - `/disclosures/dart/filings/*`
