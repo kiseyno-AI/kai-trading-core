@@ -116,7 +116,8 @@ DISPATCH_SPECS: tuple[AgentDispatchSpec, ...] = (
         instruction=(
             'Synthesize the three specialist summaries into conservative next-trading-day decision support only, '
             'choosing buy, wait, or reject while surfacing evidence, disagreement, invalidation, data-quality warnings, '
-            'and realistic target or stop levels without execution logic, leverage, sizing, or fake precision.'
+            'and explicit realistic target and stop-loss levels for every symbol. '
+            'Write all operator-facing feedback in Korean while staying JSON-only, and avoid execution logic, leverage, sizing, or fake precision.'
         ),
     ),
 )
@@ -245,6 +246,8 @@ class OpenClawAgentClient:
                 "- Every item.symbol is mandatory and must exactly match one assigned symbol string.\n"
                 "- Every feedback.symbol and feedback.traceability.symbol is mandatory and must exactly match its item.symbol.\n"
                 "- One-symbol requests still require the same batch envelope with exactly one item; never collapse the response to a single feedback object.\n"
+                "- All operator-facing natural-language fields must be written in Korean, while the overall output remains raw JSON only.\n"
+                "- Every signal-decider item must include explicit target_price and stop_loss_price values; do not leave them unspecified unless the payload makes a justified level impossible, and in that rare case explain the limitation in data_quality_warnings.\n"
                 "- If context is weak, missing, conflicting, or truncated, emit a complete conservative wait or reject item instead of prose, placeholders, omissions, or malformed JSON.\n"
                 "- Self-check before final answer: JSON parses; top-level object has items; item count matches assigned symbols; assigned symbols are exact and unique; no assigned symbol is missing; no unexpected symbol appears; required feedback fields exist.\n"
             )
@@ -258,9 +261,9 @@ class OpenClawAgentClient:
                 'preferred_action': 'wait',
                 'next_day_open_action': 'wait',
                 'entry_price_basis': 'next_open',
-                'target_price': None,
+                'target_price': 10500,
                 'expected_return_pct': None,
-                'stop_loss_price': None,
+                'stop_loss_price': 9800,
                 'suggested_holding_period': '3-10 trading days',
                 'confidence_score_10': 6,
                 'conviction_score_10': 5,
@@ -322,6 +325,8 @@ class OpenClawAgentClient:
             "Use details only for compact interpretation, relationships, anomalies, conservative takeaways, and missing-context notes that add new value beyond the payload.\n"
             "Prefer derived judgments over restating inputs; if a field is already in the payload, reference its implication instead of copying it.\n"
             "If some inputs are weak or missing, still return conservative structured feedback for that symbol instead of prose or placeholders.\n"
+            "All operator-facing natural-language fields inside the JSON must be written in Korean.\n"
+            "For signal-decider outputs, provide explicit target_price and stop_loss_price levels for each symbol whenever possible; if a level is genuinely not supportable, keep the key and explain the limitation in data_quality_warnings.\n"
             f"{signal_decider_batch_rules}"
             "Do not mention subagents, children, spawning, waiting, or internal orchestration.\n"
             "Do not output tool_code, python, print(...), json.dumps(...), markdown fences, code blocks, intent tags, analysis, reasoning, or explanatory prose.\n"
@@ -348,6 +353,8 @@ class OpenClawAgentClient:
                 "item.symbol must exactly match an assigned symbol string.\n"
                 f"{signal_decider_batch_rules}"
                 "No tool_code, no print(json.dumps(...)), no markdown fences, no intent tags, no prose, no request restatement, raw JSON object only.\n"
+                "All operator-facing natural-language fields inside the JSON must be written in Korean.\n"
+                "For signal-decider outputs, provide explicit target_price and stop_loss_price levels for each symbol whenever possible; if a level is genuinely not supportable, keep the key and explain the limitation in data_quality_warnings.\n"
                 f"{build_contract_prompt_suffix(role=spec.role)}\n"
                 f"Market date: {market_date.isoformat()}\n"
                 f"Assigned batch payload:\n{json.dumps(list(prepared_items), ensure_ascii=False)}"
@@ -367,6 +374,8 @@ class OpenClawAgentClient:
             "The one item.symbol must exactly match the assigned symbol string; do not omit feedback.symbol when the role contract requires it.\n"
             f"{_signal_decider_batch_rules(fallback_assigned_symbols)}"
             "No tool_code, no print(json.dumps(...)), no markdown fences, no intent tags, no prose, no request restatement, raw JSON object only.\n"
+            "All operator-facing natural-language fields inside the JSON must be written in Korean.\n"
+            "For signal-decider outputs, provide explicit target_price and stop_loss_price levels for the assigned symbol whenever possible; if a level is genuinely not supportable, keep the key and explain the limitation in data_quality_warnings.\n"
             f"{build_contract_prompt_suffix(role=spec.role)}\n"
             f"Market date: {market_date.isoformat()}\n"
             f"Assigned batch payload:\n{json.dumps([fallback_item], ensure_ascii=False)}"
@@ -488,7 +497,7 @@ class OpenClawAgentClient:
             "You are a leaf worker, not a conversational assistant.\n"
             "Analyze exactly one assigned symbol. Do not spawn children.\n"
             "Return JSON only in the worker output shape: {\"items\":[{\"symbol\":\"...\",\"feedback\":{...}}]}.\n"
-            "Do not return free-form Korean prose, explanations, or partial notes.\n"
+            "Do not return free-form prose, explanations, or partial notes outside the JSON.\n"
             "Do not say things like '정리됐습니다', '추가 정리본입니다', or '요약 나왔습니다'.\n"
             "Each assigned symbol must appear exactly once in items.\n"
             "Inside feedback, use top-level keys role, summary, confidence, risk_flags, details, improvement_notes.\n"
