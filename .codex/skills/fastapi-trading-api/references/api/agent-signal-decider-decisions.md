@@ -1,59 +1,69 @@
 # GET /agent-context/signal-decider/decisions
 
 ## Summary
-Reads immutable persisted `signal-decider` decision snapshots with compact traceability, policy version, and feature-snapshot data for one market date.
+Searches immutable persisted `signal-decider` decision snapshots over one market date or a bounded date range. The route keeps the compact snapshot payload, adds a stable `explanation` block so operators can answer "why did this become buy/wait/reject?" without reading raw prompt text, and exposes `evaluation_summary` for verdict-aware list views.
 
 ## Example request
 ```http
-GET /agent-context/signal-decider/decisions?market_date=2026-04-23&symbol=005930&limit=20
+GET /agent-context/signal-decider/decisions?market_date_from=2026-04-20&market_date_to=2026-04-23&action=wait&policy_version=signal_decider_policy_v1&verdict=missed_opportunity_after_wait&has_missed_opportunity=true&horizons=5&evaluation_version=signal_decider_eval_v1&limit=20
 ```
 
 ## Example response
 ```json
 {
+  "request": {
+    "market_date_from": "2026-04-20",
+    "market_date_to": "2026-04-23",
+    "action": "wait",
+    "policy_version": "signal_decider_policy_v1",
+    "verdict": "missed_opportunity_after_wait",
+    "has_missed_opportunity": true,
+    "horizons": [5],
+    "evaluation_version": "signal_decider_eval_v1"
+  },
+  "summary": {
+    "count": 1,
+    "evaluated_count": 1,
+    "decision_actions": {
+      "wait": 1
+    },
+    "verdict_counts": {
+      "missed_opportunity_after_wait": 1
+    }
+  },
   "items": [
     {
       "snapshot_id": 84,
-      "feedback_id": 42,
       "decision_run_id": "symbol-run-2026-04-23-abc123",
-      "market_date": "2026-04-23",
       "symbol": "005930",
       "policy_version": "signal_decider_policy_v1",
       "decision": {
         "action": "wait",
-        "preferred_action": "wait",
-        "next_day_open_action": "wait",
         "entry_price_basis": "next_open",
         "target_price": null,
         "expected_return_pct": 4.0,
         "stop_loss_price": null
       },
       "summary": "Momentum is constructive, but confirmation is incomplete.",
-      "traceability": {
-        "schema_version": "signal_decider_trace_v2",
-        "agent": {
-          "agent_name": "signal-decider",
-          "decision_run_id": "symbol-run-2026-04-23-abc123"
-        },
+      "explanation": {
+        "supporting_evidence": ["Breadth improved into the close."],
+        "decision_risks": ["Leadership remained narrow."],
+        "feature_flags": [
+          {"key": "technical.breakout_20d", "value": "true"},
+          {"key": "action_summary.signal_score_bucket", "value": "high"}
+        ],
         "gate_checks": {
-          "required_upstream_roles": ["eod-summarizer", "technical-summarizer", "fundamental-summarizer"],
-          "available_upstream_roles": ["eod-summarizer", "technical-summarizer", "fundamental-summarizer"]
-        },
-        "factor_contributions": {
-          "feature_flags": [
-            {"key": "technical.trend_state", "value": "uptrend"},
-            {"key": "action_summary.signal_score_bucket", "value": "high"}
-          ]
+          "missing_upstream_roles": [],
+          "has_data_warnings": false,
+          "has_specialist_disagreement": false
         }
       },
-      "feature_snapshot": {
-        "technical": {
-          "trend_state": "uptrend",
-          "breakout_20d": true
-        },
-        "action_summary": {
-          "action_label": "long_breakout",
-          "signal_score_bucket": "high"
+      "evaluation_summary": {
+        "evaluation_version": "signal_decider_eval_v1",
+        "has_missed_opportunity": true,
+        "latest_graded": {
+          "horizon_days": 5,
+          "grade_label": "missed_opportunity_after_wait"
         }
       }
     }
@@ -62,10 +72,61 @@ GET /agent-context/signal-decider/decisions?market_date=2026-04-23&symbol=005930
 ```
 
 
+# GET /agent-context/signal-decider/decisions/{snapshot_id}
+
+## Summary
+Reads one immutable `signal-decider` decision snapshot by `snapshot_id`, including the stable explanation block, frozen request/response payloads, upstream references, realized outcomes, and versioned evaluations in one place.
+
+## Example request
+```http
+GET /agent-context/signal-decider/decisions/84?horizons=1&horizons=5&evaluation_version=signal_decider_eval_v1
+```
+
+## Example response
+```json
+{
+  "item": {
+    "snapshot_id": 84,
+    "symbol": "005930",
+    "explanation": {
+      "decision_action": "wait",
+      "summary": "Momentum is constructive, but confirmation is incomplete.",
+      "feature_flags": [
+        {"key": "technical.breakout_20d", "value": "true"}
+      ]
+    },
+    "request_payload": {
+      "signal_decider_policy": {
+        "current_version": "signal_decider_policy_v1"
+      }
+    },
+    "response_payload": {
+      "next_day_open_action": "wait",
+      "supporting_evidence": ["Breadth improved into the close."]
+    },
+    "outcomes": [
+      {
+        "horizon_days": 5,
+        "outcome_status": "complete",
+        "close_return_pct": 0.041
+      }
+    ],
+    "evaluations": [
+      {
+        "horizon_days": 5,
+        "evaluation_status": "graded",
+        "grade_label": "missed_opportunity_after_wait"
+      }
+    ]
+  }
+}
+```
+
+
 # GET /agent-context/signal-decider/diagnostics
 
 ## Summary
-Reads the deeper immutable `signal-decider` trace bundle for one market date or symbol slice, including frozen request/response payloads, upstream summaries, realized outcomes, and versioned evaluation rows.
+Reads the deeper immutable `signal-decider` trace bundle for one market date or symbol slice, including frozen request/response payloads, upstream summaries, realized outcomes, and versioned evaluation rows for audit or missed-opportunity review.
 
 ## Example request
 ```http
@@ -78,16 +139,17 @@ GET /agent-context/signal-decider/diagnostics?market_date=2026-04-23&symbol=0059
   "items": [
     {
       "snapshot_id": 84,
-      "feedback_id": 42,
       "symbol": "005930",
+      "evaluation_summary": {
+        "latest_graded": {
+          "horizon_days": 5,
+          "grade_label": "missed_opportunity_after_wait"
+        }
+      },
       "request_payload": {
         "signal_decider_policy": {
           "current_version": "signal_decider_policy_v1"
         }
-      },
-      "response_payload": {
-        "next_day_open_action": "wait",
-        "supporting_evidence": ["Breadth improved into the close."]
       },
       "outcomes": [
         {
@@ -105,5 +167,71 @@ GET /agent-context/signal-decider/diagnostics?market_date=2026-04-23&symbol=0059
       ]
     }
   ]
+}
+```
+
+
+# GET /agent-context/signal-decider/diagnostics/summary
+
+## Summary
+Aggregates decision quality over a bounded date window for dashboard or policy-review use. The response groups quality metrics by horizon and policy version, and it also surfaces factor and gate contributor buckets so operators can investigate which features or guardrails correlate with `bad_buy` or missed-opportunity verdicts.
+
+## Example request
+```http
+GET /agent-context/signal-decider/diagnostics/summary?market_date_from=2026-04-20&market_date_to=2026-04-30&symbols=005930&symbols=000660&horizons=5&evaluation_version=signal_decider_eval_v1&contributor_limit=10
+```
+
+## Example response
+```json
+{
+  "summary": {
+    "decision_count": 24,
+    "evaluation_count": 24,
+    "graded_count": 21,
+    "pending_count": 3,
+    "verdict_counts": {
+      "bad_buy": 4,
+      "good_buy": 6,
+      "missed_opportunity_after_wait": 5
+    }
+  },
+  "aggregates": {
+    "by_horizon": [
+      {
+        "horizon_days": 5,
+        "buy_precision": 0.6,
+        "avg_close_return_pct": 0.021,
+        "stop_hit_rate": 0.2,
+        "wait_missed_opportunity_rate": 0.5
+      }
+    ],
+    "by_policy_version": [
+      {
+        "policy_version": "signal_decider_policy_v1",
+        "buy_precision": 0.6,
+        "reject_missed_opportunity_rate": 0.25
+      }
+    ]
+  },
+  "contributors": {
+    "factors": [
+      {
+        "key": "technical.breakout_20d",
+        "value": "true",
+        "sample_count": 8,
+        "negative_outcome_rate": 0.625,
+        "bad_buy_rate": 0.5,
+        "missed_opportunity_rate": 0.75
+      }
+    ],
+    "gates": [
+      {
+        "key": "has_specialist_disagreement",
+        "value": "true",
+        "sample_count": 3,
+        "negative_outcome_rate": 0.667
+      }
+    ]
+  }
 }
 ```

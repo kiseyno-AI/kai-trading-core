@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from decimal import Decimal
@@ -25,6 +26,21 @@ DEFAULT_SIGNAL_DECIDER_EVALUATION_VERSION = 'signal_decider_eval_v1'
 DEFAULT_POLICY_CANDIDATE_STATUS = 'generated'
 DEFAULT_SIGNAL_DECIDER_EVALUATION_LOOKBACK_DAYS = 30
 SIGNAL_DECIDER_EVALUATION_HORIZONS: tuple[int, ...] = (1, 3, 5, 10)
+SIGNAL_DECIDER_ACTIONS: tuple[str, ...] = ('buy', 'wait', 'reject')
+SIGNAL_DECIDER_GRADE_LABELS: tuple[str, ...] = (
+    'good_buy',
+    'bad_buy',
+    'missed_opportunity_after_wait',
+    'correct_wait',
+    'missed_opportunity_after_reject',
+    'correct_reject',
+    'pending_horizon',
+)
+NEGATIVE_SIGNAL_DECIDER_GRADE_LABELS: tuple[str, ...] = (
+    'bad_buy',
+    'missed_opportunity_after_wait',
+    'missed_opportunity_after_reject',
+)
 
 
 @dataclass(frozen=True)
@@ -77,6 +93,28 @@ def _normalize_symbols(symbols: Sequence[str] | None) -> list[str]:
     return normalized
 
 
+def _normalize_optional_action_filter(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip().lower()
+    if not normalized:
+        return None
+    if normalized not in SIGNAL_DECIDER_ACTIONS:
+        raise ValueError(f'action must be one of {list(SIGNAL_DECIDER_ACTIONS)}')
+    return normalized
+
+
+def _normalize_optional_verdict(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip().lower()
+    if not normalized:
+        return None
+    if normalized not in SIGNAL_DECIDER_GRADE_LABELS:
+        raise ValueError(f'verdict must be one of {list(SIGNAL_DECIDER_GRADE_LABELS)}')
+    return normalized
+
+
 def _normalize_limit(limit: int | None, *, default: int) -> int:
     if limit is None:
         return default
@@ -93,6 +131,24 @@ def _normalize_horizons(horizons: Sequence[int] | None) -> list[int]:
             f'horizons must be drawn from {list(SIGNAL_DECIDER_EVALUATION_HORIZONS)}; got {invalid}'
         )
     return normalized
+
+
+def _resolve_market_date_window(
+    *,
+    market_date: str | date | None = None,
+    market_date_from: str | date | None = None,
+    market_date_to: str | date | None = None,
+) -> tuple[date, date]:
+    if market_date is not None:
+        resolved = _normalize_market_date(market_date)
+        return resolved, resolved
+    if market_date_from is None and market_date_to is None:
+        raise ValueError('market_date or market_date_from/market_date_to is required')
+    resolved_from = _normalize_market_date(market_date_from or market_date_to)
+    resolved_to = _normalize_market_date(market_date_to or market_date_from)
+    if resolved_from > resolved_to:
+        raise ValueError('market_date_from must be on or before market_date_to')
+    return resolved_from, resolved_to
 
 
 def _normalize_optional_text(value: str | None, *, default: str | None = None) -> str | None:
@@ -587,9 +643,21 @@ class SignalDeciderLoopRepository:
         market_date_from: date | None = None,
         market_date_to: date | None = None,
         symbols: Sequence[str] | None = None,
+        decision_actions: Sequence[str] | None = None,
+        policy_versions: Sequence[str] | None = None,
         limit: int | None = None,
     ) -> list[SignalDeciderDecisionSnapshot]:
         normalized_symbols = _normalize_symbols(symbols)
+        normalized_actions = [_normalize_optional_action_filter(value) for value in decision_actions or []]
+        normalized_actions = [value for value in normalized_actions if value]
+        normalized_policy_versions = [
+            value
+            for value in (
+                _normalize_optional_text(str(raw_value)) if raw_value is not None else None
+                for raw_value in (policy_versions or [])
+            )
+            if value
+        ]
         with session_scope() as session:
             stmt = select(SignalDeciderDecisionSnapshot).where(
                 SignalDeciderDecisionSnapshot.agent_name == SIGNAL_DECIDER_AGENT_NAME
@@ -602,6 +670,10 @@ class SignalDeciderLoopRepository:
                 stmt = stmt.where(SignalDeciderDecisionSnapshot.market_date <= market_date_to)
             if normalized_symbols:
                 stmt = stmt.where(SignalDeciderDecisionSnapshot.symbol.in_(normalized_symbols))
+            if normalized_actions:
+                stmt = stmt.where(SignalDeciderDecisionSnapshot.decision_action.in_(normalized_actions))
+            if normalized_policy_versions:
+                stmt = stmt.where(SignalDeciderDecisionSnapshot.policy_version.in_(normalized_policy_versions))
             stmt = stmt.order_by(
                 SignalDeciderDecisionSnapshot.market_date.desc(),
                 SignalDeciderDecisionSnapshot.created_at.desc(),
@@ -610,6 +682,14 @@ class SignalDeciderLoopRepository:
             if limit is not None:
                 stmt = stmt.limit(limit)
             return session.execute(stmt).scalars().all()
+
+    def get_decision_snapshot(self, *, snapshot_id: int) -> SignalDeciderDecisionSnapshot | None:
+        with session_scope() as session:
+            stmt = select(SignalDeciderDecisionSnapshot).where(
+                SignalDeciderDecisionSnapshot.id == int(snapshot_id),
+                SignalDeciderDecisionSnapshot.agent_name == SIGNAL_DECIDER_AGENT_NAME,
+            )
+            return session.execute(stmt).scalar_one_or_none()
 
     def list_realized_outcomes(
         self,
@@ -990,29 +1070,135 @@ class SignalDeciderLoopService:
     def list_decisions(
         self,
         *,
-        market_date: str | date,
+        market_date: str | date | None = None,
+        market_date_from: str | date | None = None,
+        market_date_to: str | date | None = None,
         symbol: str | None = None,
+        action: str | None = None,
+        policy_version: str | None = None,
+        verdict: str | None = None,
+        has_missed_opportunity: bool | None = None,
+        horizons: Sequence[int] | None = None,
+        evaluation_version: str | None = None,
         limit: int = 50,
     ) -> dict[str, Any]:
-        normalized_market_date = _normalize_market_date(market_date)
-        normalized_symbol = _normalize_optional_symbol(symbol)
-        rows = self.repository.list_decision_snapshots(
-            market_date=normalized_market_date,
-            symbols=[normalized_symbol] if normalized_symbol else None,
-            limit=_normalize_limit(limit, default=50),
+        normalized_from, normalized_to = _resolve_market_date_window(
+            market_date=market_date,
+            market_date_from=market_date_from,
+            market_date_to=market_date_to,
         )
-        items = [self._build_decision_snapshot(row) for row in rows]
+        normalized_symbol = _normalize_optional_symbol(symbol)
+        normalized_action = _normalize_optional_action_filter(action)
+        normalized_policy_version = _normalize_optional_text(policy_version)
+        normalized_verdict = _normalize_optional_verdict(verdict)
+        normalized_horizons = _normalize_horizons(horizons)
+        resolved_limit = _normalize_limit(limit, default=50)
+        resolved_evaluation_version = (
+            _normalize_optional_text(evaluation_version, default=DEFAULT_SIGNAL_DECIDER_EVALUATION_VERSION)
+            or DEFAULT_SIGNAL_DECIDER_EVALUATION_VERSION
+        )
+        rows = self.repository.list_decision_snapshots(
+            market_date_from=normalized_from,
+            market_date_to=normalized_to,
+            symbols=[normalized_symbol] if normalized_symbol else None,
+            decision_actions=[normalized_action] if normalized_action else None,
+            policy_versions=[normalized_policy_version] if normalized_policy_version else None,
+        )
+        snapshot_ids = [row.id for row in rows]
+        evaluations_by_snapshot = self._group_by_snapshot_id(
+            self.repository.list_evaluations(
+                decision_snapshot_ids=snapshot_ids,
+                horizons=normalized_horizons,
+                evaluation_version=resolved_evaluation_version,
+            )
+        )
+        action_counts: Counter[str] = Counter()
+        verdict_counts: Counter[str] = Counter()
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            evaluations = evaluations_by_snapshot.get(row.id, [])
+            if not self._decision_matches_evaluation_filters(
+                evaluations=evaluations,
+                verdict=normalized_verdict,
+                has_missed_opportunity=has_missed_opportunity,
+            ):
+                continue
+            decision = self._build_decision_snapshot(row)
+            evaluation_summary = self._build_evaluation_summary(
+                evaluations=evaluations,
+                evaluation_version=resolved_evaluation_version,
+            )
+            item = {
+                **decision,
+                'explanation': self._build_decision_explanation(
+                    decision=decision,
+                    evaluations=evaluations,
+                ),
+                'evaluation_summary': evaluation_summary,
+            }
+            items.append(item)
+            action_counts[decision['decision']['action']] += 1
+            verdict_counts.update(evaluation_summary.get('verdict_counts') or {})
+            if len(items) >= resolved_limit:
+                break
         return {
             'request': {
-                'market_date': normalized_market_date.isoformat(),
+                'market_date': normalized_from.isoformat() if normalized_from == normalized_to else None,
+                'market_date_from': normalized_from.isoformat(),
+                'market_date_to': normalized_to.isoformat(),
                 'symbol': normalized_symbol,
+                'action': normalized_action,
+                'policy_version': normalized_policy_version,
+                'verdict': normalized_verdict,
+                'has_missed_opportunity': has_missed_opportunity,
+                'horizons': normalized_horizons,
+                'evaluation_version': resolved_evaluation_version,
                 'limit': limit,
             },
             'summary': {
                 'count': len(items),
+                'evaluated_count': sum(
+                    1 for item in items if _maybe_dict(item.get('evaluation_summary')).get('evaluated')
+                ),
+                'decision_actions': dict(sorted(action_counts.items())),
                 'policy_versions': sorted({item['policy_version'] for item in items}),
+                'verdict_counts': dict(sorted(verdict_counts.items())),
             },
             'items': items,
+        }
+
+    def get_decision_detail(
+        self,
+        *,
+        snapshot_id: int,
+        horizons: Sequence[int] | None = None,
+        evaluation_version: str | None = None,
+    ) -> dict[str, Any]:
+        normalized_snapshot_id = int(snapshot_id)
+        normalized_horizons = _normalize_horizons(horizons)
+        resolved_evaluation_version = (
+            _normalize_optional_text(evaluation_version, default=DEFAULT_SIGNAL_DECIDER_EVALUATION_VERSION)
+            or DEFAULT_SIGNAL_DECIDER_EVALUATION_VERSION
+        )
+        row = self.repository.get_decision_snapshot(snapshot_id=normalized_snapshot_id)
+        if row is None:
+            raise ValueError(f'signal-decider decision snapshot {normalized_snapshot_id} was not found')
+        detail_item = self._build_decision_detail_item(
+            row=row,
+            horizons=normalized_horizons,
+            evaluation_version=resolved_evaluation_version,
+        )
+        return {
+            'request': {
+                'snapshot_id': normalized_snapshot_id,
+                'horizons': normalized_horizons,
+                'evaluation_version': resolved_evaluation_version,
+            },
+            'summary': {
+                'evaluated_count': len(detail_item['evaluations']),
+                'outcome_count': len(detail_item['outcomes']),
+            },
+            'item': detail_item,
         }
 
     def get_diagnostics(
@@ -1034,33 +1220,14 @@ class SignalDeciderLoopService:
             symbols=[normalized_symbol] if normalized_symbol else None,
             limit=_normalize_limit(limit, default=20),
         )
-        snapshot_ids = [row.id for row in rows]
-        outcomes_by_snapshot = self._group_by_snapshot_id(
-            self.repository.list_realized_outcomes(decision_snapshot_ids=snapshot_ids, horizons=None)
-        )
-        evaluations_by_snapshot = self._group_by_snapshot_id(
-            self.repository.list_evaluations(
-                decision_snapshot_ids=snapshot_ids,
+        items = [
+            self._build_decision_detail_item(
+                row=row,
                 horizons=None,
                 evaluation_version=resolved_evaluation_version,
             )
-        )
-        items = []
-        for row in rows:
-            decision = self._build_decision_snapshot(row)
-            request_payload = _maybe_dict(row.request_payload)
-            items.append(
-                {
-                    **decision,
-                    'request_payload': request_payload,
-                    'response_payload': _maybe_dict(row.response_payload),
-                    'response_summary': _maybe_dict(row.response_summary_payload),
-                    'upstream_summaries': request_payload.get('upstream_summaries'),
-                    'upstream_traceability': request_payload.get('upstream_traceability'),
-                    'outcomes': outcomes_by_snapshot.get(row.id, []),
-                    'evaluations': evaluations_by_snapshot.get(row.id, []),
-                }
-            )
+            for row in rows
+        ]
         return {
             'request': {
                 'market_date': normalized_market_date.isoformat(),
@@ -1073,6 +1240,76 @@ class SignalDeciderLoopService:
                 'evaluated_count': sum(1 for item in items if item['evaluations']),
             },
             'items': items,
+        }
+
+    def get_aggregate_diagnostics(
+        self,
+        *,
+        market_date: str | date | None = None,
+        market_date_from: str | date | None = None,
+        market_date_to: str | date | None = None,
+        symbols: Sequence[str] | None = None,
+        action: str | None = None,
+        policy_version: str | None = None,
+        horizons: Sequence[int] | None = None,
+        evaluation_version: str | None = None,
+        contributor_limit: int = 20,
+    ) -> dict[str, Any]:
+        normalized_from, normalized_to = _resolve_market_date_window(
+            market_date=market_date,
+            market_date_from=market_date_from,
+            market_date_to=market_date_to,
+        )
+        normalized_symbols = _normalize_symbols(symbols)
+        normalized_action = _normalize_optional_action_filter(action)
+        normalized_policy_version = _normalize_optional_text(policy_version)
+        normalized_horizons = _normalize_horizons(horizons)
+        resolved_evaluation_version = (
+            _normalize_optional_text(evaluation_version, default=DEFAULT_SIGNAL_DECIDER_EVALUATION_VERSION)
+            or DEFAULT_SIGNAL_DECIDER_EVALUATION_VERSION
+        )
+        rows = self.repository.list_decision_snapshots(
+            market_date_from=normalized_from,
+            market_date_to=normalized_to,
+            symbols=normalized_symbols or None,
+            decision_actions=[normalized_action] if normalized_action else None,
+            policy_versions=[normalized_policy_version] if normalized_policy_version else None,
+        )
+        snapshot_ids = [row.id for row in rows]
+        evaluations = self.repository.list_evaluations(
+            decision_snapshot_ids=snapshot_ids,
+            horizons=normalized_horizons,
+            evaluation_version=resolved_evaluation_version,
+        )
+        evaluations_by_snapshot = self._group_by_snapshot_id(evaluations)
+        return {
+            'request': {
+                'market_date': normalized_from.isoformat() if normalized_from == normalized_to else None,
+                'market_date_from': normalized_from.isoformat(),
+                'market_date_to': normalized_to.isoformat(),
+                'symbols': normalized_symbols,
+                'action': normalized_action,
+                'policy_version': normalized_policy_version,
+                'horizons': normalized_horizons,
+                'evaluation_version': resolved_evaluation_version,
+                'contributor_limit': _normalize_limit(contributor_limit, default=20),
+            },
+            'summary': self._build_aggregate_summary(rows=rows, evaluations=evaluations),
+            'aggregates': {
+                'by_horizon': self._build_aggregate_groups(
+                    evaluations=evaluations,
+                    group_key='horizon_days',
+                ),
+                'by_policy_version': self._build_aggregate_groups(
+                    evaluations=evaluations,
+                    group_key='policy_version',
+                ),
+            },
+            'contributors': self._build_contributor_report(
+                rows=rows,
+                evaluations_by_snapshot=evaluations_by_snapshot,
+                limit=_normalize_limit(contributor_limit, default=20),
+            ),
         }
 
     def compute_evaluations(
@@ -1521,6 +1758,495 @@ class SignalDeciderLoopService:
             },
             'items': items,
         }
+
+    def _build_decision_detail_item(
+        self,
+        *,
+        row: SignalDeciderDecisionSnapshot,
+        horizons: Sequence[int] | None,
+        evaluation_version: str,
+    ) -> dict[str, Any]:
+        outcomes = self.repository.list_realized_outcomes(
+            decision_snapshot_ids=[row.id],
+            horizons=horizons,
+        )
+        evaluations = self.repository.list_evaluations(
+            decision_snapshot_ids=[row.id],
+            horizons=horizons,
+            evaluation_version=evaluation_version,
+        )
+        decision = self._build_decision_snapshot(row)
+        request_payload = _maybe_dict(row.request_payload)
+        return {
+            **decision,
+            'explanation': self._build_decision_explanation(
+                decision=decision,
+                evaluations=evaluations,
+            ),
+            'evaluation_summary': self._build_evaluation_summary(
+                evaluations=evaluations,
+                evaluation_version=evaluation_version,
+            ),
+            'request_payload': request_payload,
+            'response_payload': _maybe_dict(row.response_payload),
+            'response_summary': _maybe_dict(row.response_summary_payload),
+            'upstream_summaries': request_payload.get('upstream_summaries'),
+            'upstream_traceability': request_payload.get('upstream_traceability'),
+            'outcomes': outcomes,
+            'evaluations': evaluations,
+        }
+
+    def _decision_matches_evaluation_filters(
+        self,
+        *,
+        evaluations: Sequence[dict[str, Any]],
+        verdict: str | None,
+        has_missed_opportunity: bool | None,
+    ) -> bool:
+        if verdict is not None and not any(item.get('grade_label') == verdict for item in evaluations):
+            return False
+        if has_missed_opportunity is not None:
+            resolved_has_missed = any(item.get('missed_opportunity') is True for item in evaluations)
+            if resolved_has_missed != has_missed_opportunity:
+                return False
+        return True
+
+    def _build_decision_explanation(
+        self,
+        *,
+        decision: dict[str, Any],
+        evaluations: Sequence[dict[str, Any]],
+    ) -> dict[str, Any]:
+        traceability = _maybe_dict(decision.get('traceability'))
+        factor_contributions = _maybe_dict(traceability.get('factor_contributions'))
+        gate_checks = _maybe_dict(traceability.get('gate_checks'))
+        evaluation_summary = self._build_evaluation_summary(
+            evaluations=evaluations,
+            evaluation_version=None,
+        )
+        return {
+            'decision_action': _maybe_dict(decision.get('decision')).get('action'),
+            'summary': decision.get('summary'),
+            'supporting_evidence': list(decision.get('supporting_evidence') or []),
+            'decision_risks': list(decision.get('decision_risks') or []),
+            'invalidation_conditions': list(decision.get('invalidation_conditions') or []),
+            'feature_flags': list(factor_contributions.get('feature_flags') or []),
+            'data_quality_warnings': list(
+                factor_contributions.get('data_quality_warnings') or decision.get('data_quality_warnings') or []
+            ),
+            'specialist_disagreement': list(
+                factor_contributions.get('specialist_disagreement') or decision.get('specialist_disagreement') or []
+            ),
+            'gate_checks': {
+                'required_upstream_roles': list(gate_checks.get('required_upstream_roles') or []),
+                'available_upstream_roles': list(gate_checks.get('available_upstream_roles') or []),
+                'missing_upstream_roles': list(gate_checks.get('missing_upstream_roles') or []),
+                'decision_support_only': bool(gate_checks.get('decision_support_only')),
+                'allow_execution_logic': bool(gate_checks.get('allow_execution_logic')),
+                'has_data_warnings': bool(gate_checks.get('has_data_warnings')),
+                'has_specialist_disagreement': bool(gate_checks.get('has_specialist_disagreement')),
+                'traceability_symbol_matches': bool(gate_checks.get('traceability_symbol_matches', True)),
+                'traceability_market_date_matches': bool(gate_checks.get('traceability_market_date_matches', True)),
+                'traceability_agent_name_matches': bool(gate_checks.get('traceability_agent_name_matches', True)),
+            },
+            'upstream_references': _maybe_dict(traceability.get('upstream_references')),
+            'latest_evaluation': evaluation_summary.get('latest_graded'),
+        }
+
+    def _build_evaluation_summary(
+        self,
+        *,
+        evaluations: Sequence[dict[str, Any]],
+        evaluation_version: str | None,
+    ) -> dict[str, Any]:
+        sorted_evaluations = sorted(evaluations, key=lambda item: int(item.get('horizon_days') or 0))
+        verdict_counts: Counter[str] = Counter()
+        graded_count = 0
+        pending_count = 0
+        latest_graded: dict[str, Any] | None = None
+        horizons: list[dict[str, Any]] = []
+        for evaluation in sorted_evaluations:
+            evaluation_status = str(evaluation.get('evaluation_status') or '')
+            grade_label = str(evaluation.get('grade_label') or '')
+            horizon_days = int(evaluation.get('horizon_days') or 0)
+            projection = {
+                'horizon_days': horizon_days,
+                'evaluation_status': evaluation_status,
+                'grade_label': grade_label,
+                'missed_opportunity': evaluation.get('missed_opportunity'),
+                'grade_score': _to_float(evaluation.get('grade_score')),
+            }
+            horizons.append(projection)
+            if evaluation_status == 'graded':
+                graded_count += 1
+                if grade_label:
+                    verdict_counts[grade_label] += 1
+                latest_graded = projection
+            else:
+                pending_count += 1
+        return {
+            'evaluation_version': evaluation_version,
+            'evaluated': bool(sorted_evaluations),
+            'graded_horizon_count': graded_count,
+            'pending_horizon_count': pending_count,
+            'has_missed_opportunity': any(item.get('missed_opportunity') is True for item in sorted_evaluations),
+            'verdict_counts': dict(sorted(verdict_counts.items())),
+            'latest_graded': latest_graded,
+            'horizons': horizons,
+        }
+
+    def _build_aggregate_summary(
+        self,
+        *,
+        rows: Sequence[SignalDeciderDecisionSnapshot],
+        evaluations: Sequence[dict[str, Any]],
+    ) -> dict[str, Any]:
+        verdict_counts: Counter[str] = Counter(
+            str(item.get('grade_label'))
+            for item in evaluations
+            if item.get('evaluation_status') == 'graded' and item.get('grade_label')
+        )
+        return {
+            'decision_count': len(rows),
+            'symbol_count': len({row.symbol for row in rows}),
+            'policy_versions': sorted({row.policy_version for row in rows if row.policy_version}),
+            'decision_actions': dict(
+                sorted(Counter(row.decision_action for row in rows if row.decision_action).items())
+            ),
+            'evaluation_count': len(evaluations),
+            'graded_count': sum(1 for item in evaluations if item.get('evaluation_status') == 'graded'),
+            'pending_count': sum(1 for item in evaluations if item.get('evaluation_status') != 'graded'),
+            'verdict_counts': dict(sorted(verdict_counts.items())),
+        }
+
+    def _build_aggregate_groups(
+        self,
+        *,
+        evaluations: Sequence[dict[str, Any]],
+        group_key: str,
+    ) -> list[dict[str, Any]]:
+        grouped: dict[Any, list[dict[str, Any]]] = {}
+        for evaluation in evaluations:
+            grouped.setdefault(evaluation.get(group_key), []).append(evaluation)
+        items: list[dict[str, Any]] = []
+        for group_value, group_evaluations in grouped.items():
+            payload = self._aggregate_metric_payload(group_evaluations)
+            payload[group_key] = group_value
+            items.append(payload)
+        if group_key == 'horizon_days':
+            items.sort(key=lambda item: int(item.get('horizon_days') or 0))
+        else:
+            items.sort(key=lambda item: str(item.get(group_key) or ''))
+        return items
+
+    def _aggregate_metric_payload(self, evaluations: Sequence[dict[str, Any]]) -> dict[str, Any]:
+        graded = [item for item in evaluations if item.get('evaluation_status') == 'graded']
+        verdict_counts: Counter[str] = Counter(
+            str(item.get('grade_label')) for item in graded if item.get('grade_label')
+        )
+        action_counts: Counter[str] = Counter(
+            str(item.get('decision_action')) for item in evaluations if item.get('decision_action')
+        )
+        buy_items = [item for item in graded if item.get('decision_action') == 'buy']
+        wait_items = [item for item in graded if item.get('decision_action') == 'wait']
+        reject_items = [item for item in graded if item.get('decision_action') == 'reject']
+        close_returns = self._collect_diagnostic_metric(graded, 'close_return_pct')
+        max_upside_returns = self._collect_diagnostic_metric(graded, 'max_upside_return_pct')
+        max_drawdown_returns = self._collect_diagnostic_metric(graded, 'max_drawdown_return_pct')
+        grade_scores = [_to_float(item.get('grade_score')) for item in graded if _to_float(item.get('grade_score')) is not None]
+        return {
+            'evaluation_count': len(evaluations),
+            'graded_count': len(graded),
+            'pending_count': len(evaluations) - len(graded),
+            'decision_action_counts': dict(sorted(action_counts.items())),
+            'verdict_counts': dict(sorted(verdict_counts.items())),
+            'buy_precision': self._rate(
+                numerator=sum(1 for item in buy_items if item.get('grade_label') == 'good_buy'),
+                denominator=len(buy_items),
+            ),
+            'avg_close_return_pct': self._average(close_returns),
+            'avg_max_upside_return_pct': self._average(max_upside_returns),
+            'avg_max_drawdown_return_pct': self._average(max_drawdown_returns),
+            'avg_grade_score': self._average(grade_scores),
+            'stop_hit_rate': self._diagnostic_bool_rate(buy_items, 'stop_hit'),
+            'target_hit_rate': self._diagnostic_bool_rate(buy_items, 'target_hit'),
+            'severe_drawdown_before_target_rate': self._diagnostic_bool_rate(
+                buy_items,
+                'severe_drawdown_before_target',
+            ),
+            'wait_missed_opportunity_rate': self._rate(
+                numerator=sum(1 for item in wait_items if item.get('missed_opportunity') is True),
+                denominator=len(wait_items),
+            ),
+            'reject_missed_opportunity_rate': self._rate(
+                numerator=sum(1 for item in reject_items if item.get('missed_opportunity') is True),
+                denominator=len(reject_items),
+            ),
+        }
+
+    def _build_contributor_report(
+        self,
+        *,
+        rows: Sequence[SignalDeciderDecisionSnapshot],
+        evaluations_by_snapshot: dict[int, list[dict[str, Any]]],
+        limit: int,
+    ) -> dict[str, Any]:
+        factor_buckets: dict[tuple[str, str], dict[str, Any]] = {}
+        gate_buckets: dict[tuple[str, str], dict[str, Any]] = {}
+        for row in rows:
+            evaluations = [
+                item
+                for item in evaluations_by_snapshot.get(row.id, [])
+                if item.get('evaluation_status') == 'graded'
+            ]
+            if not evaluations:
+                continue
+            decision = self._build_decision_snapshot(row)
+            factor_tokens, gate_tokens = self._build_contributor_tokens(
+                _maybe_dict(decision.get('traceability'))
+            )
+            for evaluation in evaluations:
+                self._update_contributor_buckets(
+                    buckets=factor_buckets,
+                    tokens=factor_tokens,
+                    row=row,
+                    evaluation=evaluation,
+                )
+                self._update_contributor_buckets(
+                    buckets=gate_buckets,
+                    tokens=gate_tokens,
+                    row=row,
+                    evaluation=evaluation,
+                )
+        return {
+            'factors': self._finalize_contributor_buckets(factor_buckets, limit=limit),
+            'gates': self._finalize_contributor_buckets(gate_buckets, limit=limit),
+        }
+
+    def _build_contributor_tokens(
+        self,
+        traceability: dict[str, Any],
+    ) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+        factor_tokens: list[tuple[str, str]] = []
+        gate_tokens: list[tuple[str, str]] = []
+        factor_contributions = _maybe_dict(traceability.get('factor_contributions'))
+        gate_checks = _maybe_dict(traceability.get('gate_checks'))
+        seen_factors: set[tuple[str, str]] = set()
+        for raw_item in factor_contributions.get('feature_flags') or []:
+            item = _maybe_dict(raw_item)
+            key = _normalize_optional_text(
+                str(item.get('key')) if item.get('key') is not None else None
+            )
+            value = _normalize_optional_text(
+                str(item.get('value')) if item.get('value') is not None else None
+            )
+            if not key or not value:
+                continue
+            token = (key, value)
+            if token in seen_factors:
+                continue
+            seen_factors.add(token)
+            factor_tokens.append(token)
+        seen_gates: set[tuple[str, str]] = set()
+        for gate_key in (
+            'decision_support_only',
+            'allow_execution_logic',
+            'has_data_warnings',
+            'has_specialist_disagreement',
+        ):
+            if gate_checks.get(gate_key) is True:
+                token = (gate_key, 'true')
+                if token not in seen_gates:
+                    seen_gates.add(token)
+                    gate_tokens.append(token)
+        for gate_key in (
+            'traceability_symbol_matches',
+            'traceability_market_date_matches',
+            'traceability_agent_name_matches',
+        ):
+            if gate_checks.get(gate_key) is False:
+                token = (gate_key, 'false')
+                if token not in seen_gates:
+                    seen_gates.add(token)
+                    gate_tokens.append(token)
+        for raw_role in gate_checks.get('missing_upstream_roles') or []:
+            role = _normalize_optional_text(str(raw_role) if raw_role is not None else None)
+            if not role:
+                continue
+            token = ('missing_upstream_role', role)
+            if token in seen_gates:
+                continue
+            seen_gates.add(token)
+            gate_tokens.append(token)
+        return factor_tokens, gate_tokens
+
+    def _update_contributor_buckets(
+        self,
+        *,
+        buckets: dict[tuple[str, str], dict[str, Any]],
+        tokens: Sequence[tuple[str, str]],
+        row: SignalDeciderDecisionSnapshot,
+        evaluation: dict[str, Any],
+    ) -> None:
+        for key, value in tokens:
+            bucket = buckets.setdefault(
+                (key, value),
+                {
+                    'key': key,
+                    'value': value,
+                    'sample_count': 0,
+                    'decision_action_counts': Counter(),
+                    'verdict_counts': Counter(),
+                    'negative_outcome_count': 0,
+                    'buy_sample_count': 0,
+                    'buy_bad_count': 0,
+                    'wait_reject_sample_count': 0,
+                    'missed_opportunity_count': 0,
+                    'close_return_sum': 0.0,
+                    'close_return_count': 0,
+                    'max_upside_sum': 0.0,
+                    'max_upside_count': 0,
+                    'grade_score_sum': 0.0,
+                    'grade_score_count': 0,
+                    'examples': [],
+                },
+            )
+            decision_action = str(evaluation.get('decision_action') or '')
+            grade_label = str(evaluation.get('grade_label') or '')
+            bucket['sample_count'] += 1
+            if decision_action:
+                bucket['decision_action_counts'][decision_action] += 1
+            if grade_label:
+                bucket['verdict_counts'][grade_label] += 1
+            if grade_label in NEGATIVE_SIGNAL_DECIDER_GRADE_LABELS:
+                bucket['negative_outcome_count'] += 1
+            if decision_action == 'buy':
+                bucket['buy_sample_count'] += 1
+                if grade_label == 'bad_buy':
+                    bucket['buy_bad_count'] += 1
+            if decision_action in {'wait', 'reject'}:
+                bucket['wait_reject_sample_count'] += 1
+                if evaluation.get('missed_opportunity') is True:
+                    bucket['missed_opportunity_count'] += 1
+            diagnostics = _maybe_dict(evaluation.get('diagnostics'))
+            close_return_pct = _to_float(diagnostics.get('close_return_pct'))
+            if close_return_pct is not None:
+                bucket['close_return_sum'] += close_return_pct
+                bucket['close_return_count'] += 1
+            max_upside_return_pct = _to_float(diagnostics.get('max_upside_return_pct'))
+            if max_upside_return_pct is not None:
+                bucket['max_upside_sum'] += max_upside_return_pct
+                bucket['max_upside_count'] += 1
+            grade_score = _to_float(evaluation.get('grade_score'))
+            if grade_score is not None:
+                bucket['grade_score_sum'] += grade_score
+                bucket['grade_score_count'] += 1
+            examples: list[dict[str, Any]] = bucket['examples']
+            if len(examples) < 3:
+                examples.append(
+                    {
+                        'snapshot_id': row.id,
+                        'symbol': row.symbol,
+                        'market_date': row.market_date.isoformat(),
+                        'decision_action': decision_action,
+                        'horizon_days': evaluation.get('horizon_days'),
+                        'grade_label': grade_label,
+                    }
+                )
+
+    def _finalize_contributor_buckets(
+        self,
+        buckets: dict[tuple[str, str], dict[str, Any]],
+        *,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        for bucket in buckets.values():
+            items.append(
+                {
+                    'key': bucket['key'],
+                    'value': bucket['value'],
+                    'sample_count': bucket['sample_count'],
+                    'decision_action_counts': dict(sorted(bucket['decision_action_counts'].items())),
+                    'verdict_counts': dict(sorted(bucket['verdict_counts'].items())),
+                    'negative_outcome_count': bucket['negative_outcome_count'],
+                    'negative_outcome_rate': self._rate(
+                        numerator=bucket['negative_outcome_count'],
+                        denominator=bucket['sample_count'],
+                    ),
+                    'bad_buy_rate': self._rate(
+                        numerator=bucket['buy_bad_count'],
+                        denominator=bucket['buy_sample_count'],
+                    ),
+                    'missed_opportunity_rate': self._rate(
+                        numerator=bucket['missed_opportunity_count'],
+                        denominator=bucket['wait_reject_sample_count'],
+                    ),
+                    'avg_close_return_pct': self._ratio_from_sums(
+                        total=bucket['close_return_sum'],
+                        count=bucket['close_return_count'],
+                    ),
+                    'avg_max_upside_return_pct': self._ratio_from_sums(
+                        total=bucket['max_upside_sum'],
+                        count=bucket['max_upside_count'],
+                    ),
+                    'avg_grade_score': self._ratio_from_sums(
+                        total=bucket['grade_score_sum'],
+                        count=bucket['grade_score_count'],
+                    ),
+                    'examples': list(bucket['examples']),
+                }
+            )
+        items.sort(
+            key=lambda item: (
+                -int(item.get('negative_outcome_count') or 0),
+                -int(item.get('sample_count') or 0),
+                str(item.get('key') or ''),
+                str(item.get('value') or ''),
+            )
+        )
+        return items[:limit]
+
+    def _collect_diagnostic_metric(
+        self,
+        evaluations: Sequence[dict[str, Any]],
+        key: str,
+    ) -> list[float]:
+        values: list[float] = []
+        for evaluation in evaluations:
+            metric = _to_float(_maybe_dict(evaluation.get('diagnostics')).get(key))
+            if metric is not None:
+                values.append(metric)
+        return values
+
+    def _diagnostic_bool_rate(
+        self,
+        evaluations: Sequence[dict[str, Any]],
+        key: str,
+    ) -> float | None:
+        values = [
+            bool(_maybe_dict(item.get('diagnostics')).get(key))
+            for item in evaluations
+            if _maybe_dict(item.get('diagnostics')).get(key) is not None
+        ]
+        if not values:
+            return None
+        return round(sum(1 for value in values if value) / len(values), 6)
+
+    def _average(self, values: Sequence[float]) -> float | None:
+        if not values:
+            return None
+        return round(sum(values) / len(values), 6)
+
+    def _rate(self, *, numerator: int, denominator: int) -> float | None:
+        if denominator <= 0:
+            return None
+        return round(numerator / denominator, 6)
+
+    def _ratio_from_sums(self, *, total: float, count: int) -> float | None:
+        if count <= 0:
+            return None
+        return round(total / count, 6)
 
     def _build_decision_snapshot(self, row: SignalDeciderDecisionSnapshot) -> dict[str, Any]:
         summary_payload = _maybe_dict(row.response_summary_payload)

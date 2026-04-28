@@ -238,7 +238,9 @@ class FakeAgentContextProgressService:
 class FakeSignalDeciderLoopService:
     def __init__(self):
         self.decision_args = None
+        self.detail_args = None
         self.diagnostics_args = None
+        self.aggregate_diagnostics_args = None
         self.compute_args = None
         self.evaluation_args = None
         self.candidate_generate_args = None
@@ -247,9 +249,35 @@ class FakeSignalDeciderLoopService:
     def list_decisions(self, **kwargs):
         self.decision_args = kwargs
         return {
-            'request': {'market_date': kwargs['market_date'].isoformat(), 'symbol': kwargs['symbol']},
+            'request': {
+                'market_date': kwargs['market_date'].isoformat() if kwargs['market_date'] is not None else None,
+                'market_date_from': kwargs['market_date_from'].isoformat() if kwargs['market_date_from'] is not None else None,
+                'market_date_to': kwargs['market_date_to'].isoformat() if kwargs['market_date_to'] is not None else None,
+                'symbol': kwargs['symbol'],
+                'action': kwargs['action'],
+                'policy_version': kwargs['policy_version'],
+                'verdict': kwargs['verdict'],
+                'has_missed_opportunity': kwargs['has_missed_opportunity'],
+                'horizons': kwargs['horizons'],
+                'evaluation_version': kwargs['evaluation_version'],
+            },
             'summary': {'count': 1},
-            'items': [{'feedback_id': 11, 'symbol': kwargs['symbol'] or '005930', 'policy_version': 'signal_decider_policy_v1'}],
+            'items': [
+                {
+                    'feedback_id': 11,
+                    'symbol': kwargs['symbol'] or '005930',
+                    'policy_version': 'signal_decider_policy_v1',
+                    'evaluation_summary': {'evaluated': True},
+                }
+            ],
+        }
+
+    def get_decision_detail(self, **kwargs):
+        self.detail_args = kwargs
+        return {
+            'request': {'snapshot_id': kwargs['snapshot_id']},
+            'summary': {'evaluated_count': 1},
+            'item': {'snapshot_id': kwargs['snapshot_id'], 'evaluation_summary': {'evaluated': True}},
         }
 
     def get_diagnostics(self, **kwargs):
@@ -262,6 +290,25 @@ class FakeSignalDeciderLoopService:
             },
             'summary': {'count': 1},
             'items': [{'feedback_id': 11, 'symbol': kwargs['symbol'] or '005930', 'evaluations': []}],
+        }
+
+    def get_aggregate_diagnostics(self, **kwargs):
+        self.aggregate_diagnostics_args = kwargs
+        return {
+            'request': {
+                'market_date': kwargs['market_date'].isoformat() if kwargs['market_date'] is not None else None,
+                'market_date_from': kwargs['market_date_from'].isoformat() if kwargs['market_date_from'] is not None else None,
+                'market_date_to': kwargs['market_date_to'].isoformat() if kwargs['market_date_to'] is not None else None,
+                'symbols': kwargs['symbols'],
+                'action': kwargs['action'],
+                'policy_version': kwargs['policy_version'],
+                'horizons': kwargs['horizons'],
+                'evaluation_version': kwargs['evaluation_version'],
+                'contributor_limit': kwargs['contributor_limit'],
+            },
+            'summary': {'decision_count': 2, 'evaluation_count': 4},
+            'aggregates': {'by_horizon': [{'horizon_days': 5, 'buy_precision': 0.5}], 'by_policy_version': []},
+            'contributors': {'factors': [{'key': 'technical.breakout_20d', 'sample_count': 2}], 'gates': []},
         }
 
     def compute_evaluations(self, **kwargs):
@@ -673,9 +720,104 @@ class AgentContextRouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(fake_service.decision_args['market_date'], date.fromisoformat('2026-04-23'))
+        self.assertIsNone(fake_service.decision_args['market_date_from'])
+        self.assertIsNone(fake_service.decision_args['market_date_to'])
         self.assertEqual(fake_service.decision_args['symbol'], '005930')
         self.assertEqual(fake_service.decision_args['limit'], 10)
         self.assertEqual(response.json()['items'][0]['policy_version'], 'signal_decider_policy_v1')
+
+    def test_signal_decider_decisions_route_accepts_search_filters(self):
+        fake_service = FakeSignalDeciderLoopService()
+        original_service = routes_agent_context.signal_decider_loop_service
+        routes_agent_context.signal_decider_loop_service = fake_service
+        try:
+            client = TestClient(self.app)
+            response = client.get(
+                '/agent-context/signal-decider/decisions',
+                params=[
+                    ('market_date_from', '2026-04-20'),
+                    ('market_date_to', '2026-04-23'),
+                    ('action', 'wait'),
+                    ('policy_version', 'signal_decider_policy_v1'),
+                    ('verdict', 'missed_opportunity_after_wait'),
+                    ('has_missed_opportunity', 'true'),
+                    ('horizons', '5'),
+                    ('evaluation_version', 'signal_decider_eval_v1'),
+                    ('limit', '25'),
+                ],
+            )
+        finally:
+            routes_agent_context.signal_decider_loop_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(fake_service.decision_args['market_date'])
+        self.assertEqual(fake_service.decision_args['market_date_from'], date.fromisoformat('2026-04-20'))
+        self.assertEqual(fake_service.decision_args['market_date_to'], date.fromisoformat('2026-04-23'))
+        self.assertEqual(fake_service.decision_args['action'], 'wait')
+        self.assertEqual(fake_service.decision_args['policy_version'], 'signal_decider_policy_v1')
+        self.assertEqual(fake_service.decision_args['verdict'], 'missed_opportunity_after_wait')
+        self.assertTrue(fake_service.decision_args['has_missed_opportunity'])
+        self.assertEqual(fake_service.decision_args['horizons'], [5])
+        self.assertEqual(fake_service.decision_args['evaluation_version'], 'signal_decider_eval_v1')
+
+    def test_signal_decider_decision_detail_route_calls_service(self):
+        fake_service = FakeSignalDeciderLoopService()
+        original_service = routes_agent_context.signal_decider_loop_service
+        routes_agent_context.signal_decider_loop_service = fake_service
+        try:
+            client = TestClient(self.app)
+            response = client.get(
+                '/agent-context/signal-decider/decisions/84',
+                params=[('horizons', '1'), ('horizons', '5'), ('evaluation_version', 'signal_decider_eval_v1')],
+            )
+        finally:
+            routes_agent_context.signal_decider_loop_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(fake_service.detail_args['snapshot_id'], 84)
+        self.assertEqual(fake_service.detail_args['horizons'], [1, 5])
+        self.assertEqual(fake_service.detail_args['evaluation_version'], 'signal_decider_eval_v1')
+        self.assertEqual(response.json()['item']['snapshot_id'], 84)
+
+    def test_signal_decider_diagnostics_summary_route_calls_service(self):
+        fake_service = FakeSignalDeciderLoopService()
+        original_service = routes_agent_context.signal_decider_loop_service
+        routes_agent_context.signal_decider_loop_service = fake_service
+        try:
+            client = TestClient(self.app)
+            response = client.get(
+                '/agent-context/signal-decider/diagnostics/summary',
+                params=[
+                    ('market_date_from', '2026-04-20'),
+                    ('market_date_to', '2026-04-23'),
+                    ('symbols', '005930'),
+                    ('symbols', '000660'),
+                    ('action', 'buy'),
+                    ('policy_version', 'signal_decider_policy_v1'),
+                    ('horizons', '5'),
+                    ('evaluation_version', 'signal_decider_eval_v1'),
+                    ('contributor_limit', '15'),
+                ],
+            )
+        finally:
+            routes_agent_context.signal_decider_loop_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            fake_service.aggregate_diagnostics_args['market_date_from'],
+            date.fromisoformat('2026-04-20'),
+        )
+        self.assertEqual(
+            fake_service.aggregate_diagnostics_args['market_date_to'],
+            date.fromisoformat('2026-04-23'),
+        )
+        self.assertEqual(fake_service.aggregate_diagnostics_args['symbols'], ['005930', '000660'])
+        self.assertEqual(fake_service.aggregate_diagnostics_args['action'], 'buy')
+        self.assertEqual(fake_service.aggregate_diagnostics_args['policy_version'], 'signal_decider_policy_v1')
+        self.assertEqual(fake_service.aggregate_diagnostics_args['horizons'], [5])
+        self.assertEqual(fake_service.aggregate_diagnostics_args['evaluation_version'], 'signal_decider_eval_v1')
+        self.assertEqual(fake_service.aggregate_diagnostics_args['contributor_limit'], 15)
+        self.assertEqual(response.json()['contributors']['factors'][0]['key'], 'technical.breakout_20d')
 
     def test_signal_decider_evaluation_compute_route_calls_service(self):
         fake_service = FakeSignalDeciderLoopService()
