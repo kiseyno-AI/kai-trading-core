@@ -136,6 +136,11 @@
 - `GET /agent-context/signal-decider/diagnostics/summary?market_date_from=YYYY-MM-DD&market_date_to=YYYY-MM-DD&symbols=005930&symbols=000660&horizons=5&evaluation_version=signal_decider_eval_v1&contributor_limit=20`
 - `POST /agent-context/signal-decider/evaluations/compute`
 - `GET /agent-context/signal-decider/evaluations?market_date=YYYY-MM-DD&symbol=005930&horizons=1&horizons=5`
+- `GET /agent-context/signal-decider/decision-policies?status=active&limit=20`
+- `GET /agent-context/signal-decider/decision-policies/signal_decider_policy_v1`
+- `POST /agent-context/signal-decider/decision-policies/signal_decider_policy_v2/activate`
+- `POST /agent-context/signal-decider/decision-policies/candidates/generate`
+- `GET /agent-context/signal-decider/decision-policies/candidates?status=generated&evaluation_version=signal_decider_eval_v1`
 - `POST /agent-context/signal-decider/policy-candidates/generate`
 - `GET /agent-context/signal-decider/policy-candidates?status=generated&evaluation_version=signal_decider_eval_v1`
 
@@ -287,8 +292,12 @@
 - The default `signal_decider_eval_v1` rule set now explicitly treats severe pre-target drawdowns as `bad_buy` even when the symbol later recovers, and the stored evaluation rationale/diagnostics persist the rule-set version plus the triggered drawdown guard.
 - `GET /agent-context/signal-decider/evaluations` reads the persisted outcome-plus-grade bundle back per stored decision for the requested `market_date`, optional symbol, and optional horizon subset.
 - The daily EOD stage catalog now includes `signal_decider_evaluations`, which refreshes the recent realized-outcome/evaluation window after `signal_decider` dispatch so the same pipeline can keep older decisions moving from `pending_horizon` to graded outcomes automatically.
-- `POST /agent-context/signal-decider/policy-candidates/generate` automatically refreshes the requested evaluation horizon slice, scans the accumulated immutable snapshot evidence, and stores manual-only policy candidates in `signal_decider_policy_candidates`.
-- `GET /agent-context/signal-decider/policy-candidates` reads the generated candidates. Candidate generation is automatic, but activation is intentionally manual-only: the stored rows carry `activation_mode=manual_only`, and this repo does not auto-promote or auto-activate them.
+- `POST /agent-context/signal-decider/policy-candidates/generate` and the alias `POST /agent-context/signal-decider/decision-policies/candidates/generate` automatically refresh the requested evaluation horizon slice, scan the accumulated immutable snapshot evidence, store manual-only candidate rows in `signal_decider_policy_candidates`, and upsert durable candidate policy-version rows in `signal_decider_policy_versions`.
+- `signal_decider_policy_versions` is the durable registry for signal-decider decision-policy history. Each row stores `policy_version`, `status`, `parent_policy_version`, `change_summary`, `rule_bundle`, freeform metadata, and created or activated audit fields so candidate rulesets stay queryable even before activation.
+- `GET /agent-context/signal-decider/policy-candidates` and the alias `GET /agent-context/signal-decider/decision-policies/candidates` read the generated candidates and now surface the linked policy-version registry status for each candidate version.
+- `GET /agent-context/signal-decider/decision-policies` lists the durable policy-version registry, and `GET /agent-context/signal-decider/decision-policies/{policy_version}` returns one version's rule bundle, candidate linkage, and activation metadata.
+- `POST /agent-context/signal-decider/decision-policies/{policy_version}/activate` is the explicit human approval step. Candidate generation remains automatic, but activation is intentionally manual-only: this repo does not auto-promote or auto-activate candidate rulesets.
+- Signal-decider dispatch payloads now carry the active registry-backed policy context, including `current_version`, `change_summary`, and `rule_bundle`, so later decider runs can see which manually approved policy is active.
 - Feedback is append-only and stored separately from deterministic `daily_action_summaries`; it does not create orders, positions, or live-trading behavior.
 - `GET /agent-context/feedback` reads stored feedback for a requested `market_date`, optionally filtered by symbol and `agent_name`, so operators or later jobs can inspect the summaries Core received.
 - `GET /agent-context/feedback/technical-summaries` is the bounded persisted read for the `technical-summarizer` role. `market_date` is required, `symbol` is optional, and `limit` bounds the returned stored rows for that date.

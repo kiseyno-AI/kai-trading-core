@@ -137,6 +137,13 @@ class SignalDeciderPolicyCandidateRequest(BaseModel):
         return self
 
 
+class SignalDeciderPolicyActivationRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+    activated_by: str = Field(..., min_length=1, max_length=128)
+    activation_note: str | None = Field(default=None, max_length=500)
+
+
 class AgentSubagentExperimentRequest(BaseModel):
     model_config = ConfigDict(extra='forbid')
 
@@ -861,6 +868,11 @@ async def generate_signal_decider_policy_candidates(payload: SignalDeciderPolicy
         raise HTTPException(status_code=500, detail=f'Signal-decider policy candidate generation failed: {exc}') from exc
 
 
+@router.post('/signal-decider/decision-policies/candidates/generate')
+async def generate_signal_decider_decision_policy_candidates(payload: SignalDeciderPolicyCandidateRequest) -> dict:
+    return await generate_signal_decider_policy_candidates(payload)
+
+
 @router.get('/signal-decider/policy-candidates')
 async def list_signal_decider_policy_candidates(
     status: str | None = Query(default=None),
@@ -880,6 +892,73 @@ async def list_signal_decider_policy_candidates(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f'Signal-decider policy candidate read failed: {exc}') from exc
+
+
+@router.get('/signal-decider/decision-policies/candidates')
+async def list_signal_decider_decision_policy_candidates(
+    status: str | None = Query(default=None),
+    evaluation_version: str | None = Query(default=None),
+    base_policy_version: str | None = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=200),
+) -> dict:
+    return await list_signal_decider_policy_candidates(
+        status=status,
+        evaluation_version=evaluation_version,
+        base_policy_version=base_policy_version,
+        limit=limit,
+    )
+
+
+@router.get('/signal-decider/decision-policies')
+async def list_signal_decider_decision_policies(
+    status: str | None = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=200),
+) -> dict:
+    try:
+        return await run_in_threadpool(
+            signal_decider_loop_service.list_policy_versions,
+            status=status,
+            limit=limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'Signal-decider decision policy read failed: {exc}') from exc
+
+
+@router.get('/signal-decider/decision-policies/{policy_version}')
+async def get_signal_decider_decision_policy_detail(policy_version: str) -> dict:
+    try:
+        return await run_in_threadpool(
+            signal_decider_loop_service.get_policy_version_detail,
+            policy_version=policy_version,
+        )
+    except ValueError as exc:
+        if 'was not found' in str(exc):
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'Signal-decider decision policy detail read failed: {exc}') from exc
+
+
+@router.post('/signal-decider/decision-policies/{policy_version}/activate')
+async def activate_signal_decider_decision_policy(
+    policy_version: str,
+    payload: SignalDeciderPolicyActivationRequest,
+) -> dict:
+    try:
+        return await run_in_threadpool(
+            signal_decider_loop_service.activate_policy_version,
+            policy_version=policy_version,
+            activated_by=payload.activated_by,
+            activation_note=payload.activation_note,
+        )
+    except ValueError as exc:
+        if 'was not found' in str(exc):
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'Signal-decider decision policy activation failed: {exc}') from exc
 
 
 class CoreControlRequest(BaseModel):

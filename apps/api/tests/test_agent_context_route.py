@@ -245,6 +245,9 @@ class FakeSignalDeciderLoopService:
         self.evaluation_args = None
         self.candidate_generate_args = None
         self.candidate_list_args = None
+        self.policy_list_args = None
+        self.policy_detail_args = None
+        self.policy_activate_args = None
 
     def list_decisions(self, **kwargs):
         self.decision_args = kwargs
@@ -348,7 +351,13 @@ class FakeSignalDeciderLoopService:
                 'min_sample_size': kwargs['min_sample_size'],
             },
             'summary': {'candidates_generated': 1},
-            'items': [{'candidate_version': 'signal_decider_policy_v1-h5-relax_wait_gate-abc123'}],
+            'items': [
+                {
+                    'candidate_version': 'signal_decider_policy_v1-h5-relax_wait_gate-abc123',
+                    'policy_version': 'signal_decider_policy_v1-h5-relax_wait_gate-abc123',
+                    'policy_status': 'candidate',
+                }
+            ],
         }
 
     def list_policy_candidates(self, **kwargs):
@@ -356,7 +365,44 @@ class FakeSignalDeciderLoopService:
         return {
             'request': {'status': kwargs['status'], 'limit': kwargs['limit']},
             'summary': {'count': 1},
-            'items': [{'candidate_version': 'signal_decider_policy_v1-h5-relax_wait_gate-abc123'}],
+            'items': [
+                {
+                    'candidate_version': 'signal_decider_policy_v1-h5-relax_wait_gate-abc123',
+                    'policy_version': 'signal_decider_policy_v1-h5-relax_wait_gate-abc123',
+                    'policy_status': 'candidate',
+                }
+            ],
+        }
+
+    def list_policy_versions(self, **kwargs):
+        self.policy_list_args = kwargs
+        return {
+            'request': {'status': kwargs['status'], 'limit': kwargs['limit']},
+            'summary': {'count': 2, 'active_policy_version': 'signal_decider_policy_v1'},
+            'items': [
+                {'policy_version': 'signal_decider_policy_v1', 'status': 'active'},
+                {'policy_version': 'signal_decider_policy_v2', 'status': 'candidate'},
+            ],
+        }
+
+    def get_policy_version_detail(self, **kwargs):
+        self.policy_detail_args = kwargs
+        return {
+            'request': {'policy_version': kwargs['policy_version']},
+            'summary': {'is_active': False},
+            'item': {'policy_version': kwargs['policy_version'], 'status': 'candidate'},
+        }
+
+    def activate_policy_version(self, **kwargs):
+        self.policy_activate_args = kwargs
+        return {
+            'request': {
+                'policy_version': kwargs['policy_version'],
+                'activated_by': kwargs['activated_by'],
+                'activation_note': kwargs['activation_note'],
+            },
+            'summary': {'activated': True, 'already_active': False},
+            'item': {'policy_version': kwargs['policy_version'], 'status': 'active'},
         }
 
 
@@ -877,3 +923,86 @@ class AgentContextRouteTests(unittest.TestCase):
             response.json()['items'][0]['candidate_version'],
             'signal_decider_policy_v1-h5-relax_wait_gate-abc123',
         )
+
+    def test_signal_decider_decision_policy_candidate_generation_alias_route_calls_service(self):
+        fake_service = FakeSignalDeciderLoopService()
+        original_service = routes_agent_context.signal_decider_loop_service
+        routes_agent_context.signal_decider_loop_service = fake_service
+        try:
+            client = TestClient(self.app)
+            response = client.post(
+                '/agent-context/signal-decider/decision-policies/candidates/generate',
+                json={
+                    'market_date_from': '2026-04-20',
+                    'market_date_to': '2026-04-23',
+                    'symbols': ['005930'],
+                    'horizons': [5],
+                    'primary_horizon_days': 5,
+                    'min_sample_size': 2,
+                },
+            )
+        finally:
+            routes_agent_context.signal_decider_loop_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(fake_service.candidate_generate_args['primary_horizon_days'], 5)
+        self.assertEqual(response.json()['items'][0]['policy_status'], 'candidate')
+
+    def test_signal_decider_decision_policies_list_route_calls_service(self):
+        fake_service = FakeSignalDeciderLoopService()
+        original_service = routes_agent_context.signal_decider_loop_service
+        routes_agent_context.signal_decider_loop_service = fake_service
+        try:
+            client = TestClient(self.app)
+            response = client.get(
+                '/agent-context/signal-decider/decision-policies',
+                params={'status': 'candidate', 'limit': '25'},
+            )
+        finally:
+            routes_agent_context.signal_decider_loop_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(fake_service.policy_list_args, {'status': 'candidate', 'limit': 25})
+        self.assertEqual(response.json()['summary']['active_policy_version'], 'signal_decider_policy_v1')
+        self.assertEqual(response.json()['items'][1]['status'], 'candidate')
+
+    def test_signal_decider_decision_policy_detail_route_calls_service(self):
+        fake_service = FakeSignalDeciderLoopService()
+        original_service = routes_agent_context.signal_decider_loop_service
+        routes_agent_context.signal_decider_loop_service = fake_service
+        try:
+            client = TestClient(self.app)
+            response = client.get('/agent-context/signal-decider/decision-policies/signal_decider_policy_v2')
+        finally:
+            routes_agent_context.signal_decider_loop_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(fake_service.policy_detail_args, {'policy_version': 'signal_decider_policy_v2'})
+        self.assertEqual(response.json()['item']['policy_version'], 'signal_decider_policy_v2')
+
+    def test_signal_decider_decision_policy_activation_route_calls_service(self):
+        fake_service = FakeSignalDeciderLoopService()
+        original_service = routes_agent_context.signal_decider_loop_service
+        routes_agent_context.signal_decider_loop_service = fake_service
+        try:
+            client = TestClient(self.app)
+            response = client.post(
+                '/agent-context/signal-decider/decision-policies/signal_decider_policy_v2/activate',
+                json={
+                    'activated_by': 'human.reviewer',
+                    'activation_note': 'Approved after diagnostics review.',
+                },
+            )
+        finally:
+            routes_agent_context.signal_decider_loop_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            fake_service.policy_activate_args,
+            {
+                'policy_version': 'signal_decider_policy_v2',
+                'activated_by': 'human.reviewer',
+                'activation_note': 'Approved after diagnostics review.',
+            },
+        )
+        self.assertEqual(response.json()['item']['status'], 'active')

@@ -64,6 +64,7 @@ from app.agent_context.run_state_service import agent_context_feedback_run_state
 from app.agent_context.response_contract import build_contract_prompt_suffix, normalize_agent_response
 from app.agent_context.reuse_service import agent_context_reuse_service
 from app.agent_context.session_cleanup_service import SessionCleanupTarget, agent_feedback_session_cleanup_service
+from app.agent_context.signal_decider_loop_service import signal_decider_loop_service
 from app.core.settings import settings
 from app.db import session_scope
 from app.db_models import AgentContextFeedback, EODCollectionRun
@@ -1046,6 +1047,7 @@ class AgentFeedbackOrchestrator:
         request_run_id: str,
         upstream_summaries: dict[str, dict[str, Any]],
         upstream_traceability: dict[str, dict[str, Any]],
+        signal_decider_policy: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         payload = _build_signal_decider_payload_helper(
             item=item,
@@ -1054,6 +1056,7 @@ class AgentFeedbackOrchestrator:
             upstream_summaries=upstream_summaries,
             upstream_traceability=upstream_traceability,
             signal_decider_agent_name=SIGNAL_DECIDER_AGENT_NAME,
+            signal_decider_policy=signal_decider_policy,
         )
         payload['orchestration']['required_upstream_roles'] = list(UPSTREAM_SUMMARY_ROLES)
         return payload
@@ -1071,6 +1074,7 @@ class AgentFeedbackOrchestrator:
         buffer_failure,
     ) -> list[dict[str, Any]]:
         buffered_lookup = {}
+        active_signal_decider_policy = None
         if role == SIGNAL_DECIDER_AGENT_NAME:
             snapshot = runtime_feedback_state_store.get_run(market_date, run_id=request_run_id) or RuntimeFeedbackRunState(
                 run_id=request_run_id,
@@ -1083,6 +1087,7 @@ class AgentFeedbackOrchestrator:
                 started_at=datetime.now(timezone.utc),
             )
             buffered_lookup = _feedback_row_lookup(snapshot.buffered_feedback_rows)
+            active_signal_decider_policy = signal_decider_loop_service.get_active_policy_context()
 
         dispatch_items: list[dict[str, Any]] = []
         for item in symbol_context_items:
@@ -1138,6 +1143,7 @@ class AgentFeedbackOrchestrator:
                     request_run_id=request_run_id,
                     upstream_summaries=upstream_summaries,
                     upstream_traceability=upstream_traceability,
+                    signal_decider_policy=active_signal_decider_policy,
                 )
             )
         return dispatch_items

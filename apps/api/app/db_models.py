@@ -1057,6 +1057,36 @@ class SignalDeciderEvaluation(Base, TimestampMixin):
     evaluated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
+class SignalDeciderPolicyVersion(Base, TimestampMixin):
+    __tablename__ = 'signal_decider_policy_versions'
+    __table_args__ = (
+        UniqueConstraint('policy_version', name='uq_signal_decider_policy_versions_version'),
+        Index(
+            'ix_signal_decider_policy_versions_status_created',
+            'status',
+            'created_at',
+        ),
+        Index(
+            'ix_signal_decider_policy_versions_parent_status',
+            'parent_policy_version',
+            'status',
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    policy_version: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default='draft', index=True)
+    parent_policy_version: Mapped[str | None] = mapped_column(String(128), index=True)
+    source_candidate_version: Mapped[str | None] = mapped_column(String(128), index=True)
+    change_summary: Mapped[str] = mapped_column(Text, nullable=False)
+    rule_bundle_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    metadata_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    created_by: Mapped[str] = mapped_column(String(128), nullable=False, default='system:bootstrap')
+    activated_by: Mapped[str | None] = mapped_column(String(128), index=True)
+    activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    retired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+
+
 class SignalDeciderPolicyCandidate(Base, TimestampMixin):
     __tablename__ = 'signal_decider_policy_candidates'
     __table_args__ = (
