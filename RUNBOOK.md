@@ -145,9 +145,11 @@ Useful limited-scope runs:
 - API-triggered daily auto path: `curl -X POST "http://127.0.0.1:8000/eod/pykrx/daily/run-if-due?market_date=2026-04-03&force=true"`
 - Stage catalog inspect path: `curl "http://127.0.0.1:8000/eod/pipeline/stages"`
 - API-triggered explicit stage run: `curl -X POST "http://127.0.0.1:8000/eod/pipeline/run" -H "Content-Type: application/json" -d '{"market_date":"2026-04-03","stages":["price_collection","technical_snapshots","agent_feedback_summaries"],"symbols":["005930"]}'`
+- API-triggered explicit stage run with signal-decider evaluation refresh: `curl -X POST "http://127.0.0.1:8000/eod/pipeline/run" -H "Content-Type: application/json" -d '{"market_date":"2026-04-30","stages":["price_collection","technical_snapshots","agent_feedback_summaries","signal_decider","signal_decider_evaluations"],"symbols":["005930"]}'`
 - Preferred internal daily auto path: `python3.11 -m app.internal.ops eod-pykrx-daily-run-if-due --market-date 2026-04-03 --force`
 - Internal stage catalog path: `python3.11 -m app.internal.ops eod-pipeline-stages`
 - Internal explicit stage run path: `python3.11 -m app.internal.ops eod-pipeline-run --market-date 2026-04-03 --stages price_collection,technical_snapshots --symbols 005930`
+- Manual signal-decider evaluation refresh over the recent window: `python3.11 -m app.internal.ops agent-signal-decider-evaluations-compute --market-date 2026-04-30 --symbols 005930 --horizons 1,3,5,10`
 - Manual technical snapshot rerun after EOD: `python3.11 -m app.eod.technical_snapshots --market-date 2026-04-07`
 - Manual action summary rerun after EOD: `python3.11 -m app.eod.action_summaries --market-date 2026-04-07`
 - Manual low-risk factor rerun from stored bars: `python3.11 -m app.internal.ops eod-low-risk-factors-compute --market-date 2026-04-23`
@@ -195,6 +197,7 @@ Internal ops commands from `apps/api`:
 - `python3.11 -m app.internal.ops eod-composite-factors-compute --market-date 2026-04-24`
 - `python3.11 -m app.internal.ops dart-fundamentals-daily-run-if-due --market-date 2026-04-14 --symbol-limit 250 --capture-limit 500`
 - `python3.11 -m app.internal.ops agent-feedback-retry-cycles --market-date 2026-04-14 --symbols 005930`
+- `python3.11 -m app.internal.ops agent-signal-decider-evaluations-compute --market-date 2026-04-30 --horizons 1,3,5,10`
 - `python3.11 -m app.internal.ops kis-daily-signal-features-collect --market-date 2026-04-14`
 - `python3.11 -m app.internal.ops agent-derived-contexts-backfill-recent`
 - `python3.11 -m app.internal.index_audit`

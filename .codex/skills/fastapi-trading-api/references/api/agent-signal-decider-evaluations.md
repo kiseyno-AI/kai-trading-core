@@ -3,6 +3,8 @@
 ## Summary
 Computes or refreshes raw realized outcomes plus versioned grading rows for immutable stored `signal-decider` decision snapshots over a date range.
 
+The same evaluation refresh now also runs in the default daily EOD stage catalog as `signal_decider_evaluations`, which revisits the recent decision window after new price bars arrive.
+
 ## Example request
 ```http
 POST /agent-context/signal-decider/evaluations/compute
@@ -58,6 +60,8 @@ GET /agent-context/signal-decider/evaluations?market_date=2026-04-23&symbol=0059
           "outcome_status": "complete",
           "entry_trade_date": "2026-04-24",
           "exit_trade_date": "2026-04-30",
+          "best_exit_trade_date": "2026-04-29",
+          "worst_drawdown_trade_date": "2026-04-25",
           "close_return_pct": 0.041,
           "max_upside_return_pct": 0.062
         }
@@ -69,7 +73,13 @@ GET /agent-context/signal-decider/evaluations?market_date=2026-04-23&symbol=0059
           "evaluation_version": "signal_decider_eval_v1",
           "evaluation_status": "graded",
           "grade_label": "missed_opportunity_after_wait",
-          "counterfactual_action": "buy"
+          "counterfactual_action": "buy",
+          "rationale": {
+            "evaluation_profile": {
+              "requested_version": "signal_decider_eval_v1",
+              "rule_set_version": "signal_decider_eval_v1"
+            }
+          }
         }
       ]
     }

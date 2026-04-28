@@ -4,6 +4,7 @@ import unittest
 from unittest.mock import patch
 
 from app.agent_context.signal_decider_loop_service import (
+    DEFAULT_SIGNAL_DECIDER_EVALUATION_LOOKBACK_DAYS,
     DEFAULT_SIGNAL_DECIDER_POLICY_VERSION,
     SignalDeciderLoopService,
 )
@@ -261,6 +262,13 @@ class FakeSignalDeciderLoopRepository:
             stored['entry_trade_date'] = stored['entry_trade_date'].isoformat() if stored['entry_trade_date'] else None
             stored['exit_trade_date'] = stored['exit_trade_date'].isoformat() if stored['exit_trade_date'] else None
             stored['computed_at'] = stored['computed_at'].isoformat()
+            diagnostics = dict(stored.get('diagnostics_payload') or {})
+            stored['best_exit_trade_date'] = diagnostics.get('best_exit_trade_date')
+            stored['worst_drawdown_trade_date'] = diagnostics.get('worst_drawdown_trade_date')
+            stored['first_target_hit_trade_date'] = diagnostics.get('first_target_hit_trade_date')
+            stored['first_stop_loss_hit_trade_date'] = diagnostics.get('first_stop_loss_hit_trade_date')
+            stored['price_path'] = stored.get('price_path_payload')
+            stored['diagnostics'] = diagnostics
             self.outcomes[key] = stored
             persisted.append(stored)
         return persisted
@@ -275,6 +283,8 @@ class FakeSignalDeciderLoopRepository:
                 self.next_evaluation_id += 1
             stored['market_date'] = stored['market_date'].isoformat()
             stored['evaluated_at'] = stored['evaluated_at'].isoformat()
+            stored['rationale'] = dict(stored.get('rationale_payload') or {})
+            stored['diagnostics'] = dict(stored.get('diagnostics_payload') or {})
             self.evaluations[key] = stored
             persisted.append(stored)
         return persisted
@@ -497,6 +507,61 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
         self.assertEqual(outcome['entry_trade_date'], '2026-04-21')
         self.assertEqual(outcome['exit_trade_date'], '2026-04-27')
         self.assertEqual(outcome['bars_observed'], 5)
+
+    def test_compute_evaluations_marks_severe_drawdown_recovery_buy_as_bad_buy(self):
+        repository = FakeSignalDeciderLoopRepository(
+            [_feedback_row(feedback_id=1, market_date='2026-04-20', symbol='005930', action='buy')]
+        )
+        service = SignalDeciderLoopService(repository=repository)
+
+        bars = [
+            {'trade_date': '2026-04-20', 'open_price': 98, 'high_price': 99, 'low_price': 97, 'close_price': 98, 'volume': 1000},
+            {'trade_date': '2026-04-21', 'open_price': 100, 'high_price': 103, 'low_price': 96, 'close_price': 101, 'volume': 1000},
+            {'trade_date': '2026-04-22', 'open_price': 101, 'high_price': 107, 'low_price': 100, 'close_price': 106, 'volume': 1000},
+            {'trade_date': '2026-04-23', 'open_price': 106, 'high_price': 108, 'low_price': 104, 'close_price': 107, 'volume': 1000},
+            {'trade_date': '2026-04-24', 'open_price': 107, 'high_price': 109, 'low_price': 105, 'close_price': 108, 'volume': 1000},
+            {'trade_date': '2026-04-27', 'open_price': 108, 'high_price': 110, 'low_price': 107, 'close_price': 109, 'volume': 1000},
+        ]
+
+        with patch(
+            'app.agent_context.signal_decider_loop_service.load_daily_bars_for_symbol_range',
+            return_value=bars,
+        ):
+            result = service.compute_evaluations(
+                market_date_from='2026-04-20',
+                market_date_to='2026-04-20',
+                horizons=[5],
+                evaluation_version='signal_decider_eval_test',
+            )
+
+        evaluation = result['items'][0]['evaluations'][0]
+        outcome = result['items'][0]['outcomes'][0]
+        self.assertEqual(evaluation['grade_label'], 'bad_buy')
+        self.assertTrue(evaluation['rationale']['severe_drawdown_before_target'])
+        self.assertEqual(outcome['worst_drawdown_trade_date'], '2026-04-21')
+        self.assertEqual(outcome['first_target_hit_trade_date'], '2026-04-22')
+
+    def test_compute_recent_evaluations_uses_trailing_calendar_window(self):
+        repository = FakeSignalDeciderLoopRepository([])
+        service = SignalDeciderLoopService(repository=repository)
+
+        with patch.object(service, 'compute_evaluations', return_value={'request': {}, 'summary': {}, 'items': []}) as compute:
+            result = service.compute_recent_evaluations(
+                as_of_market_date='2026-04-30',
+                symbols=['005930'],
+            )
+
+        self.assertEqual(
+            compute.call_args.kwargs['market_date_from'].isoformat(),
+            '2026-03-31',
+        )
+        self.assertEqual(
+            compute.call_args.kwargs['market_date_to'].isoformat(),
+            '2026-04-30',
+        )
+        self.assertEqual(compute.call_args.kwargs['symbols'], ['005930'])
+        self.assertEqual(result['request']['lookback_days'], DEFAULT_SIGNAL_DECIDER_EVALUATION_LOOKBACK_DAYS)
+        self.assertEqual(result['request']['as_of_market_date'], '2026-04-30')
 
     def test_generate_policy_candidates_builds_manual_relax_wait_candidates(self):
         repository = FakeSignalDeciderLoopRepository(
