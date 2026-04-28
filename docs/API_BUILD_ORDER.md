@@ -46,6 +46,11 @@
 - `GET /trading/orders/{client_order_id}?account_reference=KIS:12345678-01&refresh=false`
 - `GET /trading/orders?account_reference=KIS:12345678-01&status=submitted&limit=100`
 - `GET /trading/orders/inspect?account_reference=KIS:12345678-01&limit=50`
+- `GET /trading/orders/lifecycle?account_reference=KIS:12345678-01&limit=25`
+- `GET /trading/orders/mismatches?account_reference=KIS:12345678-01&limit=50`
+- `GET /trading/orders/stale-pending?account_reference=KIS:12345678-01&limit=50`
+- `GET /trading/orders/realtime-health`
+- `GET /trading/orders/{client_order_id}/timeline?account_reference=KIS:12345678-01&refresh=false`
 - `GET /market/status`
 - `GET /quotes/tracked`
 - `GET /quotes/005930`
@@ -127,6 +132,10 @@
 - `POST /trading/orders/reconcile` runs an operator-triggered recent-order sweep over persisted KIS orders, and `POST /trading/orders/{client_order_id}/reconcile` forces the same broker-truth repair path for one order.
 - `GET /trading/orders/{client_order_id}` and `GET /trading/orders` expose the persisted request snapshot, current broker-order snapshot, event timeline, and the persisted `last_reconciled_at` / `last_reconcile_status` state. `refresh=true` on the single-order read triggers KIS inquiry-based reconciliation before the response is returned.
 - `GET /trading/orders/inspect` is the internal read surface for reconciliation operations. It returns the in-process scheduler snapshot plus the latest mismatch, stale-pending, and missing-fill-detail order buckets.
+- `GET /trading/orders/lifecycle` is the web-facing monitor view for recent KIS orders. It groups today, open, partially filled, filled, canceled or rejected, and replaced orders into explicit buckets, and it also surfaces mismatch/stale counts plus realtime stream readiness so clients do not have to infer lifecycle groupings from raw statuses.
+- `GET /trading/orders/mismatches` and `GET /trading/orders/stale-pending` are the direct operator review lists for reconcile mismatches and stale active submissions. They reuse the reconciliation inspect semantics but return web-friendly monitoring items with explicit attention flags and derived status labels.
+- `GET /trading/orders/{client_order_id}/timeline` is the normalized timeline read for one order. It keeps the raw request/order payloads alongside a labeled event history so a web detail page can render lifecycle activity without reverse-mapping event codes client-side.
+- `GET /trading/orders/realtime-health` is the trading-order-specific realtime websocket health view. It narrows the broader `GET /broker/kis/health` payload down to the order-notice stream and adds an explicit `healthy` summary plus operator attention flags.
 - Submit idempotency is keyed by `broker_name + account_reference + client_order_id`. A repeated submit with the same payload returns the stored order snapshot instead of sending a second broker order. A repeated submit with a different payload returns an idempotency conflict.
 - Durable persistence spans `order_requests`, `broker_orders`, and `broker_order_events`. KIS request and response payloads are preserved in the request snapshot, current broker snapshot, and event history for later debugging and reconciliation.
 - Broker-truth repair is append-only: each reconcile pass writes a deduplicated reconciliation event when the observed broker truth changes, preserves the local-before vs local-after evidence in `last_reconcile_payload`, and never rewrites prior execution history.

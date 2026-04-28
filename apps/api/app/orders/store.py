@@ -589,6 +589,8 @@ def list_broker_orders(
     symbol: str | None = None,
     statuses: list[str] | tuple[str, ...] | None = None,
     reconcile_statuses: list[str] | tuple[str, ...] | None = None,
+    submitted_after: datetime | str | None = None,
+    submitted_before: datetime | str | None = None,
     limit: int = 100,
 ) -> list[dict[str, Any]]:
     normalized_broker_name = _normalize_required_text(broker_name, field='broker_name', lowercase=True)
@@ -602,8 +604,17 @@ def list_broker_orders(
         _normalize_required_text(status, field='reconcile_status', lowercase=True)
         for status in (reconcile_statuses or [])
     ]
+    normalized_submitted_after = _normalize_datetime(
+        submitted_after,
+        field='submitted_after',
+    )
+    normalized_submitted_before = _normalize_datetime(
+        submitted_before,
+        field='submitted_before',
+    )
 
     with session_scope() as session:
+        submitted_at_expr = func.coalesce(BrokerOrder.first_submitted_at, BrokerOrder.created_at)
         stmt = (
             select(BrokerOrder)
             .where(BrokerOrder.broker_name == normalized_broker_name)
@@ -618,6 +629,10 @@ def list_broker_orders(
             stmt = stmt.where(BrokerOrder.current_status.in_(normalized_statuses))
         if normalized_reconcile_statuses:
             stmt = stmt.where(BrokerOrder.last_reconcile_status.in_(normalized_reconcile_statuses))
+        if normalized_submitted_after is not None:
+            stmt = stmt.where(submitted_at_expr >= normalized_submitted_after)
+        if normalized_submitted_before is not None:
+            stmt = stmt.where(submitted_at_expr < normalized_submitted_before)
         rows = session.execute(stmt).scalars().all()
         return [_serialize_broker_order(row) for row in rows]
 

@@ -7,6 +7,7 @@ from fastapi import APIRouter, HTTPException, Query, Response
 from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from app.orders.monitoring import trading_order_monitoring_service
 from app.orders.reconciliation import trading_order_reconciliation_service
 from app.orders.service import (
     TradingOrderIdempotencyConflictError,
@@ -153,6 +154,72 @@ async def inspect_reconcile_state(
         raise HTTPException(status_code=500, detail=f'Trading order inspect failed: {exc}') from exc
 
 
+@router.get('/lifecycle')
+async def get_lifecycle_view(
+    account_reference: str | None = Query(default=None, min_length=1, max_length=128),
+    symbol: str | None = Query(default=None, min_length=1, max_length=32),
+    limit: int = Query(default=25, ge=1, le=200),
+    stale_after_minutes: int | None = Query(default=None, ge=1, le=1440),
+) -> dict[str, Any]:
+    try:
+        return trading_order_monitoring_service.lifecycle_view(
+            account_reference=account_reference,
+            symbol=symbol,
+            limit=limit,
+            stale_after_minutes=stale_after_minutes,
+        )
+    except Exception as exc:
+        _raise_order_http_error(exc)
+        raise HTTPException(status_code=500, detail=f'Trading order lifecycle read failed: {exc}') from exc
+
+
+@router.get('/mismatches')
+async def get_order_mismatches(
+    account_reference: str | None = Query(default=None, min_length=1, max_length=128),
+    symbol: str | None = Query(default=None, min_length=1, max_length=32),
+    limit: int = Query(default=50, ge=1, le=200),
+    stale_after_minutes: int | None = Query(default=None, ge=1, le=1440),
+) -> dict[str, Any]:
+    try:
+        return trading_order_monitoring_service.mismatches_view(
+            account_reference=account_reference,
+            symbol=symbol,
+            limit=limit,
+            stale_after_minutes=stale_after_minutes,
+        )
+    except Exception as exc:
+        _raise_order_http_error(exc)
+        raise HTTPException(status_code=500, detail=f'Trading order mismatch read failed: {exc}') from exc
+
+
+@router.get('/stale-pending')
+async def get_stale_pending_orders(
+    account_reference: str | None = Query(default=None, min_length=1, max_length=128),
+    symbol: str | None = Query(default=None, min_length=1, max_length=32),
+    limit: int = Query(default=50, ge=1, le=200),
+    stale_after_minutes: int | None = Query(default=None, ge=1, le=1440),
+) -> dict[str, Any]:
+    try:
+        return trading_order_monitoring_service.stale_pending_view(
+            account_reference=account_reference,
+            symbol=symbol,
+            limit=limit,
+            stale_after_minutes=stale_after_minutes,
+        )
+    except Exception as exc:
+        _raise_order_http_error(exc)
+        raise HTTPException(status_code=500, detail=f'Trading order stale pending read failed: {exc}') from exc
+
+
+@router.get('/realtime-health')
+async def get_realtime_health() -> dict[str, Any]:
+    try:
+        return trading_order_monitoring_service.realtime_health()
+    except Exception as exc:
+        _raise_order_http_error(exc)
+        raise HTTPException(status_code=500, detail=f'Trading order realtime health read failed: {exc}') from exc
+
+
 @router.post('/{client_order_id}/cancel')
 async def cancel_order(client_order_id: str, payload: TradingOrderCancelRequest) -> dict[str, Any]:
     try:
@@ -196,6 +263,23 @@ async def reconcile_order(client_order_id: str, payload: TradingOrderReconcileSi
     except Exception as exc:
         _raise_order_http_error(exc)
         raise HTTPException(status_code=500, detail=f'Trading order reconcile failed: {exc}') from exc
+
+
+@router.get('/{client_order_id}/timeline')
+async def get_order_timeline(
+    client_order_id: str,
+    account_reference: str = Query(..., min_length=1, max_length=128),
+    refresh: bool = Query(default=False),
+) -> dict[str, Any]:
+    try:
+        return await trading_order_monitoring_service.order_timeline_view(
+            client_order_id=client_order_id,
+            account_reference=account_reference,
+            refresh=refresh,
+        )
+    except Exception as exc:
+        _raise_order_http_error(exc)
+        raise HTTPException(status_code=500, detail=f'Trading order timeline read failed: {exc}') from exc
 
 
 @router.get('/{client_order_id}')
