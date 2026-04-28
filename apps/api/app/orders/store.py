@@ -191,6 +191,10 @@ def _serialize_broker_order(row: BrokerOrder) -> dict[str, Any]:
         'first_submitted_at': row.first_submitted_at,
         'last_broker_update_at': row.last_broker_update_at,
         'last_fill_at': row.last_fill_at,
+        'last_reconciled_at': row.last_reconciled_at,
+        'last_reconcile_status': row.last_reconcile_status,
+        'last_reconcile_trigger': row.last_reconcile_trigger,
+        'last_reconcile_payload': row.last_reconcile_payload,
         'raw_latest_payload': row.raw_latest_payload,
         'snapshot_payload': row.snapshot_payload,
         'created_at': row.created_at,
@@ -513,6 +517,26 @@ def upsert_broker_order(snapshot: dict[str, Any]) -> dict[str, Any]:
             )
         if 'last_fill_at' in snapshot:
             row.last_fill_at = _normalize_datetime(snapshot.get('last_fill_at'), field='last_fill_at')
+        if 'last_reconciled_at' in snapshot:
+            row.last_reconciled_at = _normalize_datetime(
+                snapshot.get('last_reconciled_at'),
+                field='last_reconciled_at',
+            )
+        if 'last_reconcile_status' in snapshot:
+            row.last_reconcile_status = _normalize_optional_text(
+                snapshot.get('last_reconcile_status'),
+                lowercase=True,
+            )
+        if 'last_reconcile_trigger' in snapshot:
+            row.last_reconcile_trigger = _normalize_optional_text(
+                snapshot.get('last_reconcile_trigger'),
+                lowercase=True,
+            )
+        if 'last_reconcile_payload' in snapshot:
+            row.last_reconcile_payload = _normalize_json_payload(
+                snapshot.get('last_reconcile_payload'),
+                field='last_reconcile_payload',
+            )
         if 'raw_latest_payload' in snapshot:
             row.raw_latest_payload = _normalize_json_payload(
                 snapshot.get('raw_latest_payload'),
@@ -564,6 +588,7 @@ def list_broker_orders(
     account_reference: str | None = None,
     symbol: str | None = None,
     statuses: list[str] | tuple[str, ...] | None = None,
+    reconcile_statuses: list[str] | tuple[str, ...] | None = None,
     limit: int = 100,
 ) -> list[dict[str, Any]]:
     normalized_broker_name = _normalize_required_text(broker_name, field='broker_name', lowercase=True)
@@ -572,6 +597,10 @@ def list_broker_orders(
     normalized_statuses = [
         _normalize_required_text(status, field='status', lowercase=True)
         for status in (statuses or [])
+    ]
+    normalized_reconcile_statuses = [
+        _normalize_required_text(status, field='reconcile_status', lowercase=True)
+        for status in (reconcile_statuses or [])
     ]
 
     with session_scope() as session:
@@ -587,6 +616,8 @@ def list_broker_orders(
             stmt = stmt.where(BrokerOrder.symbol == normalized_symbol.upper())
         if normalized_statuses:
             stmt = stmt.where(BrokerOrder.current_status.in_(normalized_statuses))
+        if normalized_reconcile_statuses:
+            stmt = stmt.where(BrokerOrder.last_reconcile_status.in_(normalized_reconcile_statuses))
         rows = session.execute(stmt).scalars().all()
         return [_serialize_broker_order(row) for row in rows]
 

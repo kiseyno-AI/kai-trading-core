@@ -232,6 +232,13 @@ class BrokerOrder(Base, TimestampMixin):
         ),
         Index('ix_broker_orders_account_updated', 'account_reference', 'updated_at'),
         Index('ix_broker_orders_last_broker_update_at', 'last_broker_update_at'),
+        Index('ix_broker_orders_last_reconciled_at', 'last_reconciled_at'),
+        Index(
+            'ix_broker_orders_account_reconcile_status',
+            'account_reference',
+            'last_reconcile_status',
+            'last_reconciled_at',
+        ),
         Index('ix_broker_orders_order_request_id', 'order_request_id'),
     )
 
@@ -264,6 +271,10 @@ class BrokerOrder(Base, TimestampMixin):
     first_submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_broker_update_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_fill_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_reconciled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_reconcile_status: Mapped[str | None] = mapped_column(String(32))
+    last_reconcile_trigger: Mapped[str | None] = mapped_column(String(32))
+    last_reconcile_payload: Mapped[dict | None] = mapped_column(JSON)
     raw_latest_payload: Mapped[dict | None] = mapped_column(JSON)
     snapshot_payload: Mapped[dict | None] = mapped_column(JSON)
 

@@ -24,6 +24,7 @@ from app.brokers.kis.client import (
 from app.brokers.kis.provider import kis_client
 from app.core.settings import settings
 from app.orders.domain import BrokerOrderEventSource, BrokerOrderEventType, BrokerOrderStatus
+from app.orders.reconciliation import trading_order_reconciliation_service
 from app.orders.store import append_broker_order_event, list_broker_order_events, load_broker_order
 
 logger = logging.getLogger(__name__)
@@ -474,7 +475,9 @@ class KISRealtimeOrderNoticeService:
 
         self._notice_key = notice_key
         self._notice_iv = notice_iv
+        had_previous_disconnect = False
         with self._health_lock:
+            had_previous_disconnect = self._health.get('last_disconnected_at') is not None
             self._health['status'] = 'subscribed'
             self._health['subscription'] = {
                 'status': 'succeeded',
@@ -483,6 +486,8 @@ class KISRealtimeOrderNoticeService:
                 'aes_key_active': True,
                 'aes_key_received_at': _isoformat(received_at),
             }
+        if had_previous_disconnect:
+            trading_order_reconciliation_service.schedule_reconnect_reconcile()
 
     async def _handle_notice_message(self, message: str, *, received_at: datetime) -> None:
         if not self._notice_key or not self._notice_iv:

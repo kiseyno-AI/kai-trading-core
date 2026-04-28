@@ -55,16 +55,53 @@ class FakeTradingOrderService:
         return {'count': 1, 'items': [{'client_order_id': 'TEST-ORDER-1'}]}
 
 
+class FakeTradingOrderReconciliationService:
+    def __init__(self) -> None:
+        self.bulk_calls: list[dict] = []
+        self.inspect_calls: list[dict] = []
+        self.single_calls: list[dict] = []
+
+    async def reconcile_recent_orders(self, **kwargs):
+        self.bulk_calls.append(kwargs)
+        return {
+            'triggered': True,
+            'trigger': kwargs.get('trigger'),
+            'selected_count': 1,
+            'orders': [{'client_order_id': 'ROUTE-ORDER-1'}] if kwargs.get('include_orders') else [],
+        }
+
+    def inspect_orders(self, **kwargs):
+        self.inspect_calls.append(kwargs)
+        return {
+            'reconciliation': {'last_trigger': 'manual'},
+            'mismatches': {'count': 1, 'items': [{'client_order_id': 'ROUTE-ORDER-1'}]},
+            'stale_pending_orders': {'count': 0, 'items': []},
+            'missing_fill_detail_orders': {'count': 0, 'items': []},
+        }
+
+    async def reconcile_single_order(self, **kwargs):
+        self.single_calls.append(kwargs)
+        return {
+            'operation': 'reconcile',
+            'order': {'client_order_id': kwargs['client_order_id'], 'current_status': 'filled'},
+            'reconcile': {'reconcile_status': 'repaired'},
+        }
+
+
 class TradingOrderRouteTests(unittest.TestCase):
     def setUp(self) -> None:
         self.app = FastAPI()
         self.app.include_router(routes_trading.router)
         self.service = FakeTradingOrderService()
+        self.reconcile_service = FakeTradingOrderReconciliationService()
         self.original_service = routes_trading.trading_order_service
+        self.original_reconcile_service = routes_trading.trading_order_reconciliation_service
         routes_trading.trading_order_service = self.service
+        routes_trading.trading_order_reconciliation_service = self.reconcile_service
 
     def tearDown(self) -> None:
         routes_trading.trading_order_service = self.original_service
+        routes_trading.trading_order_reconciliation_service = self.original_reconcile_service
 
     def test_buy_route_returns_created_payload(self) -> None:
         client = TestClient(self.app)
@@ -133,6 +170,42 @@ class TradingOrderRouteTests(unittest.TestCase):
         self.assertTrue(self.service.amend_calls)
         self.assertTrue(self.service.get_calls)
         self.assertTrue(self.service.list_calls)
+
+    def test_reconcile_and_inspect_routes_use_reconciliation_service(self) -> None:
+        client = TestClient(self.app)
+
+        bulk_response = client.post(
+            '/trading/orders/reconcile',
+            json={
+                'account_reference': 'KIS:12345678-01',
+                'symbol': '005930',
+                'limit': 25,
+                'reason': 'manual-audit',
+                'include_orders': True,
+            },
+        )
+        inspect_response = client.get(
+            '/trading/orders/inspect',
+            params={
+                'account_reference': 'KIS:12345678-01',
+                'limit': 25,
+                'stale_after_minutes': 30,
+            },
+        )
+        single_response = client.post(
+            '/trading/orders/ROUTE-ORDER-1/reconcile',
+            json={'account_reference': 'KIS:12345678-01', 'reason': 'single-repair'},
+        )
+
+        self.assertEqual(bulk_response.status_code, 200)
+        self.assertEqual(bulk_response.json()['selected_count'], 1)
+        self.assertEqual(inspect_response.status_code, 200)
+        self.assertEqual(inspect_response.json()['mismatches']['count'], 1)
+        self.assertEqual(single_response.status_code, 200)
+        self.assertEqual(single_response.json()['order']['current_status'], 'filled')
+        self.assertEqual(self.reconcile_service.bulk_calls[0]['trigger'], 'manual')
+        self.assertEqual(self.reconcile_service.single_calls[0]['trigger'], 'manual_single')
+        self.assertEqual(self.reconcile_service.inspect_calls[0]['stale_after_minutes'], 30)
 
 
 if __name__ == '__main__':

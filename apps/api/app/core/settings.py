@@ -43,6 +43,13 @@ class Settings(BaseSettings):
     kis_realtime_mock_ws_url: str = 'ws://ops.koreainvestment.com:31000'
     kis_realtime_reconnect_base_delay_seconds: float = 3.0
     kis_realtime_reconnect_max_delay_seconds: float = 30.0
+    kis_order_reconcile_enabled: bool = True
+    kis_order_reconcile_startup_enabled: bool = True
+    kis_order_reconcile_on_reconnect_enabled: bool = True
+    kis_order_reconcile_interval_seconds: int = 300
+    kis_order_reconcile_stale_after_minutes: int = 15
+    kis_order_reconcile_recent_days: int = 3
+    kis_order_reconcile_batch_limit: int = 100
 
     bok_ecos_api_key: str = Field(
         default='',

@@ -7,6 +7,7 @@ from fastapi import APIRouter, HTTPException, Query, Response
 from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from app.orders.reconciliation import trading_order_reconciliation_service
 from app.orders.service import (
     TradingOrderIdempotencyConflictError,
     TradingOrderNotFoundError,
@@ -64,6 +65,23 @@ class TradingOrderAmendRequest(BaseModel):
         return self
 
 
+class TradingOrdersReconcileRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+    account_reference: str | None = Field(default=None, min_length=1, max_length=128)
+    symbol: str | None = Field(default=None, min_length=1, max_length=32)
+    limit: int = Field(default=100, ge=1, le=500)
+    reason: str | None = Field(default=None, max_length=256)
+    include_orders: bool = True
+
+
+class TradingOrderReconcileSingleRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+    account_reference: str = Field(..., min_length=1, max_length=128)
+    reason: str | None = Field(default=None, max_length=256)
+
+
 def _raise_order_http_error(exc: Exception) -> None:
     if isinstance(exc, TradingOrderValidationError):
         raise HTTPException(status_code=400, detail=jsonable_encoder(exc.payload or {'detail': str(exc)})) from exc
@@ -100,6 +118,41 @@ async def submit_sell_order(payload: TradingOrderSubmitRequest, response: Respon
         raise HTTPException(status_code=500, detail=f'Trading order submit failed: {exc}') from exc
 
 
+@router.post('/reconcile')
+async def reconcile_orders(payload: TradingOrdersReconcileRequest) -> dict[str, Any]:
+    try:
+        return await trading_order_reconciliation_service.reconcile_recent_orders(
+            account_reference=payload.account_reference,
+            symbol=payload.symbol,
+            limit=payload.limit,
+            trigger='manual',
+            reason=payload.reason,
+            include_orders=payload.include_orders,
+        )
+    except Exception as exc:
+        _raise_order_http_error(exc)
+        raise HTTPException(status_code=500, detail=f'Trading order reconcile failed: {exc}') from exc
+
+
+@router.get('/inspect')
+async def inspect_reconcile_state(
+    account_reference: str | None = Query(default=None, min_length=1, max_length=128),
+    symbol: str | None = Query(default=None, min_length=1, max_length=32),
+    limit: int = Query(default=50, ge=1, le=200),
+    stale_after_minutes: int | None = Query(default=None, ge=1, le=1440),
+) -> dict[str, Any]:
+    try:
+        return trading_order_reconciliation_service.inspect_orders(
+            account_reference=account_reference,
+            symbol=symbol,
+            limit=limit,
+            stale_after_minutes=stale_after_minutes,
+        )
+    except Exception as exc:
+        _raise_order_http_error(exc)
+        raise HTTPException(status_code=500, detail=f'Trading order inspect failed: {exc}') from exc
+
+
 @router.post('/{client_order_id}/cancel')
 async def cancel_order(client_order_id: str, payload: TradingOrderCancelRequest) -> dict[str, Any]:
     try:
@@ -129,6 +182,20 @@ async def amend_order(client_order_id: str, payload: TradingOrderAmendRequest) -
     except Exception as exc:
         _raise_order_http_error(exc)
         raise HTTPException(status_code=500, detail=f'Trading order amend failed: {exc}') from exc
+
+
+@router.post('/{client_order_id}/reconcile')
+async def reconcile_order(client_order_id: str, payload: TradingOrderReconcileSingleRequest) -> dict[str, Any]:
+    try:
+        return await trading_order_reconciliation_service.reconcile_single_order(
+            account_reference=payload.account_reference,
+            client_order_id=client_order_id,
+            trigger='manual_single',
+            reason=payload.reason,
+        )
+    except Exception as exc:
+        _raise_order_http_error(exc)
+        raise HTTPException(status_code=500, detail=f'Trading order reconcile failed: {exc}') from exc
 
 
 @router.get('/{client_order_id}')

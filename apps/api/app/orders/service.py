@@ -16,6 +16,7 @@ from app.brokers.kis.client import (
     KISTransportError,
 )
 from app.brokers.kis.provider import kis_client
+from app.core.settings import settings
 from app.orders.domain import (
     BrokerOrderEventSource,
     BrokerOrderEventType,
@@ -792,8 +793,14 @@ class TradingOrderService:
             )
 
         broker_inquiry = None
+        reconcile_summary = None
         if refresh and order_row is not None and order_row.get('broker_order_id'):
-            broker_inquiry = await self._refresh_from_broker(order_row=order_row)
+            broker_inquiry, reconcile_summary = await self._refresh_from_broker(
+                order_row=order_row,
+                trigger='read_refresh',
+                source=BrokerOrderEventSource.REST_QUERY.value,
+                reason='get_order_refresh',
+            )
             request_row = load_order_request(account_reference=account_reference, client_order_id=client_order_id)
             order_row = load_broker_order(account_reference=account_reference, client_order_id=client_order_id)
 
@@ -808,7 +815,79 @@ class TradingOrderService:
             ),
             operation='get',
             broker_inquiry=broker_inquiry,
+            reconcile=reconcile_summary,
         )
+
+    async def reconcile_order(
+        self,
+        *,
+        account_reference: str,
+        client_order_id: str,
+        trigger: str = 'manual',
+        source: str = BrokerOrderEventSource.POLL_RECONCILE.value,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        account_reference = _normalize_text(account_reference, field='account_reference')
+        client_order_id = _normalize_text(client_order_id, field='client_order_id')
+        request_row = load_order_request(account_reference=account_reference, client_order_id=client_order_id)
+        order_row = load_broker_order(account_reference=account_reference, client_order_id=client_order_id)
+        if order_row is None:
+            raise TradingOrderNotFoundError(
+                'order not found',
+                payload={
+                    'account_reference': account_reference,
+                    'client_order_id': client_order_id,
+                },
+            )
+
+        broker_inquiry, reconcile_summary = await self._refresh_from_broker(
+            order_row=order_row,
+            trigger=trigger,
+            source=source,
+            reason=reason,
+        )
+        request_row = load_order_request(account_reference=account_reference, client_order_id=client_order_id)
+        refreshed_row = load_broker_order(account_reference=account_reference, client_order_id=client_order_id)
+        return self._build_order_response(
+            account_reference=account_reference,
+            client_order_id=client_order_id,
+            request_row=request_row,
+            order_row=refreshed_row,
+            events=list_broker_order_events(
+                account_reference=account_reference,
+                client_order_id=client_order_id,
+            ),
+            operation='reconcile',
+            broker_inquiry=broker_inquiry,
+            reconcile=reconcile_summary,
+        )
+
+    async def reconcile_persisted_order(
+        self,
+        *,
+        order_row: dict[str, Any],
+        trigger: str = 'manual',
+        source: str = BrokerOrderEventSource.POLL_RECONCILE.value,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        account_reference = _normalize_text(order_row['account_reference'], field='account_reference')
+        client_order_id = _normalize_text(order_row['client_order_id'], field='client_order_id')
+        broker_inquiry, reconcile_summary = await self._refresh_from_broker(
+            order_row=order_row,
+            trigger=trigger,
+            source=source,
+            reason=reason,
+        )
+        return {
+            'account_reference': account_reference,
+            'client_order_id': client_order_id,
+            'broker_inquiry': broker_inquiry,
+            'reconcile': reconcile_summary,
+            'order': load_broker_order(
+                account_reference=account_reference,
+                client_order_id=client_order_id,
+            ),
+        }
 
     def list_orders(
         self,
@@ -1346,7 +1425,14 @@ class TradingOrderService:
         }
         return upsert_order_request(merged)
 
-    async def _refresh_from_broker(self, *, order_row: dict[str, Any]) -> dict[str, Any]:
+    async def _refresh_from_broker(
+        self,
+        *,
+        order_row: dict[str, Any],
+        trigger: str = 'read_refresh',
+        source: str = BrokerOrderEventSource.REST_QUERY.value,
+        reason: str | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
         account_reference = _normalize_text(order_row['account_reference'], field='account_reference')
         broker_order_id = _normalize_text(order_row['broker_order_id'], field='broker_order_id')
         now = _utc_now()
@@ -1378,36 +1464,61 @@ class TradingOrderService:
         )
         matched_daily = self._find_daily_fill_row(order_row=order_row, inquiry_rows=daily.get('output1') or [])
         matched_cancelable = self._find_cancelable_row(order_row=order_row, cancelable_rows=cancelable.get('output') or [])
-        if matched_daily is None and matched_cancelable is None:
-            return {
-                'daily_ccld': daily,
-                'cancelable_orders': cancelable,
-                'matched_daily_order': None,
-                'matched_cancelable_order': None,
-            }
-
-        status, event_type = self._map_inquiry_state(
-            order_row=order_row,
-            daily_row=matched_daily,
-            cancelable_row=matched_cancelable,
-        )
-        filled_quantity = _safe_decimal(_pick_first(matched_daily, 'tot_ccld_qty')) or _safe_decimal(order_row.get('filled_quantity')) or Decimal('0')
-        remaining_quantity = (
-            _safe_decimal(_pick_first(matched_daily, 'rmn_qty'))
-            or _safe_decimal(_pick_first(matched_cancelable, 'psbl_qty'))
-            or _safe_decimal(order_row.get('remaining_quantity'))
-        )
-        requested_quantity = _safe_decimal(_pick_first(matched_daily, 'ord_qty')) or _safe_decimal(order_row.get('requested_quantity')) or Decimal('0')
-        average_fill_price = _safe_decimal(_pick_first(matched_daily, 'avg_prvs')) or _safe_decimal(order_row.get('average_fill_price'))
-        requested_price = _safe_decimal(_pick_first(matched_daily, 'ord_unpr')) or _safe_decimal(order_row.get('requested_price'))
-        snapshot_payload = {
-            'status': status,
-            'action': 'reconcile',
+        broker_inquiry = {
+            'daily_ccld': daily,
+            'cancelable_orders': cancelable,
             'matched_daily_order': matched_daily,
             'matched_cancelable_order': matched_cancelable,
         }
-        refreshed_row = upsert_broker_order(
-            {
+        local_before = self._build_order_state_snapshot(order_row)
+        event_source = _normalize_optional_text(source, lowercase=True) or BrokerOrderEventSource.POLL_RECONCILE.value
+        broker_truth_found = matched_daily is not None or matched_cancelable is not None
+        stale_pending = self._is_stale_pending(order_row, reference_time=now)
+
+        if broker_truth_found:
+            status, event_type = self._map_inquiry_state(
+                order_row=order_row,
+                daily_row=matched_daily,
+                cancelable_row=matched_cancelable,
+            )
+            filled_quantity = _safe_decimal(_pick_first(matched_daily, 'tot_ccld_qty'))
+            if filled_quantity is None:
+                filled_quantity = _safe_decimal(order_row.get('filled_quantity')) or Decimal('0')
+            remaining_quantity = _safe_decimal(_pick_first(matched_daily, 'rmn_qty'))
+            if remaining_quantity is None:
+                remaining_quantity = _safe_decimal(_pick_first(matched_cancelable, 'psbl_qty'))
+            if remaining_quantity is None:
+                remaining_quantity = _safe_decimal(order_row.get('remaining_quantity'))
+            requested_quantity = _safe_decimal(_pick_first(matched_daily, 'ord_qty'))
+            if requested_quantity is None:
+                requested_quantity = _safe_decimal(order_row.get('requested_quantity')) or Decimal('0')
+            average_fill_price = _safe_decimal(_pick_first(matched_daily, 'avg_prvs'))
+            if average_fill_price is None:
+                average_fill_price = _safe_decimal(order_row.get('average_fill_price'))
+            requested_price = _safe_decimal(_pick_first(matched_daily, 'ord_unpr'))
+            if requested_price is None:
+                requested_price = _safe_decimal(order_row.get('requested_price'))
+            raw_latest_payload = {
+                'daily_ccld': matched_daily,
+                'cancelable_order': matched_cancelable,
+            }
+            snapshot_payload = {
+                'status': status,
+                'action': 'reconcile',
+                'trigger': trigger,
+                'source': event_source,
+                'matched_daily_order': matched_daily,
+                'matched_cancelable_order': matched_cancelable,
+            }
+            mismatch_reasons = self._collect_reconcile_mismatch_reasons(
+                order_row=order_row,
+                broker_status=status,
+                broker_filled_quantity=filled_quantity,
+                broker_remaining_quantity=remaining_quantity,
+                broker_average_fill_price=average_fill_price,
+                broker_requested_price=requested_price,
+            )
+            desired_order = {
                 'id': order_row['id'],
                 'order_request_id': order_row['order_request_id'],
                 'broker_name': 'kis',
@@ -1426,45 +1537,167 @@ class TradingOrderService:
                 'average_fill_price': average_fill_price,
                 'time_in_force': order_row.get('time_in_force'),
                 'current_status': status,
-                'status_reason': f'refreshed_from_{event_type}',
+                'status_reason': f'reconciled_from_{event_type}',
                 'last_broker_update_at': now,
-                'raw_latest_payload': {
-                    'daily_ccld': matched_daily,
-                    'cancelable_order': matched_cancelable,
-                },
+                'last_fill_at': now if status in {BrokerOrderStatus.PARTIAL_FILL.value, BrokerOrderStatus.FILLED.value} else order_row.get('last_fill_at'),
+                'raw_latest_payload': raw_latest_payload,
                 'snapshot_payload': snapshot_payload,
             }
-        )
-        append_broker_order_event(
-            {
+            event = {
                 'broker_name': 'kis',
                 'account_reference': account_reference,
                 'client_order_id': order_row['client_order_id'],
-                'broker_order_id': refreshed_row['broker_order_id'],
+                'broker_order_id': broker_order_id,
                 'event_type': event_type,
                 'event_occurred_at': now,
-                'source': BrokerOrderEventSource.REST_QUERY.value,
+                'source': event_source,
                 'event_dedup_key': (
                     f'reconcile:{order_row["client_order_id"]}:{status}:'
                     f'{_decimal_to_text(filled_quantity)}:{_decimal_to_text(remaining_quantity)}'
                 ),
-                'raw_payload': {
-                    'daily_ccld': matched_daily,
-                    'cancelable_order': matched_cancelable,
-                },
+                'raw_payload': raw_latest_payload,
                 'normalized_payload': snapshot_payload,
                 'resulting_status': status,
                 'cumulative_filled_quantity': filled_quantity,
+                'remaining_quantity': remaining_quantity,
                 'quantity_delta': None,
                 'fill_price': average_fill_price,
             }
+        else:
+            status = str(order_row.get('current_status') or BrokerOrderStatus.SUBMITTED.value)
+            event_type = BrokerOrderEventType.RECONCILE_SNAPSHOT.value
+            filled_quantity = _safe_decimal(order_row.get('filled_quantity')) or Decimal('0')
+            remaining_quantity = _safe_decimal(order_row.get('remaining_quantity'))
+            requested_quantity = _safe_decimal(order_row.get('requested_quantity')) or Decimal('0')
+            average_fill_price = _safe_decimal(order_row.get('average_fill_price'))
+            requested_price = _safe_decimal(order_row.get('requested_price'))
+            mismatch_reasons = []
+            raw_latest_payload = order_row.get('raw_latest_payload') or {}
+            snapshot_payload = order_row.get('snapshot_payload') or {}
+            desired_order = {
+                'id': order_row['id'],
+                'order_request_id': order_row['order_request_id'],
+                'broker_name': 'kis',
+                'client_order_id': order_row['client_order_id'],
+                'broker_order_id': order_row['broker_order_id'],
+                'account_reference': account_reference,
+                'symbol': order_row['symbol'],
+                'side': order_row['side'],
+                'order_type': order_row['order_type'],
+                'requested_quantity': requested_quantity,
+                'requested_price': requested_price,
+                'accepted_quantity': order_row.get('accepted_quantity'),
+                'accepted_price': order_row.get('accepted_price'),
+                'filled_quantity': filled_quantity,
+                'remaining_quantity': remaining_quantity,
+                'average_fill_price': average_fill_price,
+                'time_in_force': order_row.get('time_in_force'),
+                'current_status': status,
+                'status_reason': order_row.get('status_reason'),
+                'first_submitted_at': order_row.get('first_submitted_at'),
+                'last_broker_update_at': order_row.get('last_broker_update_at'),
+                'last_fill_at': order_row.get('last_fill_at'),
+                'raw_latest_payload': raw_latest_payload,
+                'snapshot_payload': snapshot_payload,
+            }
+            event = {
+                'broker_name': 'kis',
+                'account_reference': account_reference,
+                'client_order_id': order_row['client_order_id'],
+                'broker_order_id': broker_order_id,
+                'event_type': event_type,
+                'event_occurred_at': now,
+                'source': event_source,
+                'event_dedup_key': (
+                    f'reconcile:{order_row["client_order_id"]}:not_found:{status}:'
+                    f'{_decimal_to_text(filled_quantity)}:{_decimal_to_text(remaining_quantity)}'
+                ),
+                'raw_payload': broker_inquiry,
+                'normalized_payload': {
+                    'status': status,
+                    'action': 'reconcile',
+                    'trigger': trigger,
+                    'source': event_source,
+                    'broker_truth_found': False,
+                    'stale_pending': stale_pending,
+                },
+                'resulting_status': status,
+                'cumulative_filled_quantity': filled_quantity,
+                'remaining_quantity': remaining_quantity,
+                'quantity_delta': None,
+                'fill_price': average_fill_price,
+            }
+
+        append_result = append_broker_order_event(event)
+        refreshed_row = upsert_broker_order(desired_order)
+        local_after = self._build_order_state_snapshot(refreshed_row)
+        missing_fill_detail_after = self._has_missing_fill_detail(refreshed_row)
+        repair_applied = broker_truth_found and bool(mismatch_reasons)
+        reconcile_status = self._resolve_reconcile_status(
+            broker_truth_found=broker_truth_found,
+            repair_applied=repair_applied,
+            stale_pending=stale_pending,
+            missing_fill_detail=missing_fill_detail_after,
         )
-        return {
-            'daily_ccld': daily,
-            'cancelable_orders': cancelable,
-            'matched_daily_order': matched_daily,
-            'matched_cancelable_order': matched_cancelable,
+        reconcile_summary = {
+            'trigger': trigger,
+            'source': event_source,
+            'reason': reason or trigger,
+            'reconciled_at': now.isoformat(),
+            'broker_truth_found': broker_truth_found,
+            'event_appended': bool(append_result.get('inserted')),
+            'event_type': event_type,
+            'reconcile_status': reconcile_status,
+            'repair_applied': repair_applied,
+            'mismatch_reasons': mismatch_reasons,
+            'stale_pending': stale_pending,
+            'missing_fill_detail': missing_fill_detail_after,
+            'local_before': local_before,
+            'local_after': local_after,
+            'broker_truth': {
+                'status': status if broker_truth_found else None,
+                'filled_quantity': _decimal_to_text(filled_quantity),
+                'remaining_quantity': _decimal_to_text(remaining_quantity),
+                'average_fill_price': _decimal_to_text(average_fill_price),
+                'requested_price': _decimal_to_text(requested_price),
+                'matched_daily_order': matched_daily,
+                'matched_cancelable_order': matched_cancelable,
+            },
         }
+        refreshed_row = upsert_broker_order(
+            {
+                'id': refreshed_row['id'],
+                'order_request_id': refreshed_row['order_request_id'],
+                'broker_name': refreshed_row['broker_name'],
+                'client_order_id': refreshed_row['client_order_id'],
+                'broker_order_id': refreshed_row['broker_order_id'],
+                'account_reference': refreshed_row['account_reference'],
+                'symbol': refreshed_row['symbol'],
+                'side': refreshed_row['side'],
+                'order_type': refreshed_row['order_type'],
+                'requested_quantity': refreshed_row['requested_quantity'],
+                'requested_price': refreshed_row['requested_price'],
+                'accepted_quantity': refreshed_row['accepted_quantity'],
+                'accepted_price': refreshed_row['accepted_price'],
+                'filled_quantity': refreshed_row['filled_quantity'],
+                'remaining_quantity': refreshed_row['remaining_quantity'],
+                'average_fill_price': refreshed_row['average_fill_price'],
+                'time_in_force': refreshed_row.get('time_in_force'),
+                'current_status': refreshed_row['current_status'],
+                'status_reason': refreshed_row.get('status_reason'),
+                'first_submitted_at': refreshed_row.get('first_submitted_at'),
+                'last_broker_update_at': refreshed_row.get('last_broker_update_at'),
+                'last_fill_at': refreshed_row.get('last_fill_at'),
+                'last_reconciled_at': now,
+                'last_reconcile_status': reconcile_status,
+                'last_reconcile_trigger': trigger,
+                'last_reconcile_payload': reconcile_summary,
+                'raw_latest_payload': refreshed_row.get('raw_latest_payload'),
+                'snapshot_payload': refreshed_row.get('snapshot_payload'),
+            }
+        )
+        broker_inquiry['reconcile'] = reconcile_summary
+        return broker_inquiry, reconcile_summary
 
     def _map_inquiry_state(
         self,
@@ -1533,6 +1766,91 @@ class TradingOrderService:
             return row
         return None
 
+    def _build_order_state_snapshot(self, order_row: dict[str, Any]) -> dict[str, Any]:
+        return {
+            'current_status': str(order_row.get('current_status') or ''),
+            'requested_quantity': _decimal_to_text(_safe_decimal(order_row.get('requested_quantity'))),
+            'requested_price': _decimal_to_text(_safe_decimal(order_row.get('requested_price'))),
+            'filled_quantity': _decimal_to_text(_safe_decimal(order_row.get('filled_quantity'))),
+            'remaining_quantity': _decimal_to_text(_safe_decimal(order_row.get('remaining_quantity'))),
+            'average_fill_price': _decimal_to_text(_safe_decimal(order_row.get('average_fill_price'))),
+            'last_broker_update_at': (
+                order_row['last_broker_update_at'].isoformat()
+                if isinstance(order_row.get('last_broker_update_at'), datetime)
+                else order_row.get('last_broker_update_at')
+            ),
+        }
+
+    def _collect_reconcile_mismatch_reasons(
+        self,
+        *,
+        order_row: dict[str, Any],
+        broker_status: str,
+        broker_filled_quantity: Decimal,
+        broker_remaining_quantity: Decimal | None,
+        broker_average_fill_price: Decimal | None,
+        broker_requested_price: Decimal | None,
+    ) -> list[str]:
+        reasons: list[str] = []
+        if str(order_row.get('current_status') or '') != broker_status:
+            reasons.append('status')
+        if (_safe_decimal(order_row.get('filled_quantity')) or Decimal('0')) != broker_filled_quantity:
+            reasons.append('filled_quantity')
+        if (_safe_decimal(order_row.get('remaining_quantity'))) != broker_remaining_quantity:
+            reasons.append('remaining_quantity')
+        if (_safe_decimal(order_row.get('requested_price'))) != broker_requested_price:
+            reasons.append('requested_price')
+        if (_safe_decimal(order_row.get('average_fill_price'))) != broker_average_fill_price:
+            reasons.append('average_fill_price')
+        return reasons
+
+    def _has_missing_fill_detail(self, order_row: dict[str, Any]) -> bool:
+        status = str(order_row.get('current_status') or '').strip().lower()
+        filled_quantity = _safe_decimal(order_row.get('filled_quantity')) or Decimal('0')
+        average_fill_price = _safe_decimal(order_row.get('average_fill_price'))
+        return (
+            status in {BrokerOrderStatus.PARTIAL_FILL.value, BrokerOrderStatus.FILLED.value}
+            and filled_quantity > Decimal('0')
+            and average_fill_price is None
+        )
+
+    def _is_stale_pending(self, order_row: dict[str, Any], *, reference_time: datetime) -> bool:
+        status = str(order_row.get('current_status') or '').strip().lower()
+        if status not in {
+            BrokerOrderStatus.PENDING_SUBMIT.value,
+            BrokerOrderStatus.SUBMITTED.value,
+            BrokerOrderStatus.ACCEPTED.value,
+            BrokerOrderStatus.CANCEL_PENDING.value,
+            BrokerOrderStatus.REPLACE_PENDING.value,
+        }:
+            return False
+        last_update = order_row.get('last_broker_update_at') or order_row.get('updated_at') or order_row.get('created_at')
+        if isinstance(last_update, str):
+            last_update = datetime.fromisoformat(last_update.replace('Z', '+00:00'))
+        if not isinstance(last_update, datetime):
+            return False
+        return reference_time - last_update >= timedelta(
+            minutes=max(1, int(settings.kis_order_reconcile_stale_after_minutes))
+        )
+
+    def _resolve_reconcile_status(
+        self,
+        *,
+        broker_truth_found: bool,
+        repair_applied: bool,
+        stale_pending: bool,
+        missing_fill_detail: bool,
+    ) -> str:
+        if missing_fill_detail:
+            return 'missing_fill_detail'
+        if repair_applied:
+            return 'repaired'
+        if broker_truth_found:
+            return 'matched'
+        if stale_pending:
+            return 'stale_pending'
+        return 'not_found'
+
     def _extract_forward_orgno(self, order_row: dict[str, Any]) -> str | None:
         snapshot_payload = order_row.get('snapshot_payload') or {}
         return _normalize_optional_text(snapshot_payload.get('krx_fwdg_ord_orgno'))
@@ -1547,6 +1865,7 @@ class TradingOrderService:
         events: list[dict[str, Any]],
         operation: str,
         broker_inquiry: dict[str, Any] | None = None,
+        reconcile: dict[str, Any] | None = None,
         created: bool | None = None,
         idempotent_replay: bool = False,
     ) -> dict[str, Any]:
@@ -1564,6 +1883,8 @@ class TradingOrderService:
             payload['created'] = created
         if broker_inquiry is not None:
             payload['broker_inquiry'] = broker_inquiry
+        if reconcile is not None:
+            payload['reconcile'] = reconcile
         return payload
 
     def _map_upstream_error(
