@@ -1,11 +1,76 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from typing import Any, Mapping
 
 import httpx
 
 from app.core.audit_logging import request_with_audit
 from app.core.settings import settings
+
+
+class KISClientError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        payload: dict[str, Any] | None = None,
+        status_code: int | None = None,
+        retryable: bool = False,
+        ambiguous_submission: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.payload = payload or {}
+        self.status_code = status_code
+        self.retryable = retryable
+        self.ambiguous_submission = ambiguous_submission
+
+
+class KISConfigurationError(KISClientError):
+    pass
+
+
+class KISTimeoutError(KISClientError):
+    pass
+
+
+class KISTransportError(KISClientError):
+    pass
+
+
+class KISHTTPError(KISClientError):
+    pass
+
+
+class KISAPIError(KISClientError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        payload: dict[str, Any] | None = None,
+        status_code: int | None = None,
+        msg_code: str | None = None,
+        result_code: str | None = None,
+        retryable: bool = False,
+        ambiguous_submission: bool = False,
+    ) -> None:
+        super().__init__(
+            message,
+            payload=payload,
+            status_code=status_code,
+            retryable=retryable,
+            ambiguous_submission=ambiguous_submission,
+        )
+        self.msg_code = msg_code
+        self.result_code = result_code
+
+
+def _safe_json(response: httpx.Response) -> dict[str, Any]:
+    try:
+        payload = response.json()
+    except ValueError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
 
 
 class KISClient:
@@ -17,6 +82,9 @@ class KISClient:
 
     def __init__(self) -> None:
         self.base_url = settings.kis_mock_base_url if settings.kis_use_mock else settings.kis_base_url
+
+    def _environment(self) -> str:
+        return 'demo' if settings.kis_use_mock else 'real'
 
     def _get_cached_token(self) -> dict | None:
         now = datetime.now(timezone.utc)
@@ -32,7 +100,15 @@ class KISClient:
             }
         return None
 
+    def _resolve_tr_id(self, *, real: str, demo: str | None = None) -> str:
+        if self._environment() == 'demo' and demo:
+            return demo
+        return real
+
     async def issue_access_token(self, force_refresh: bool = False) -> dict:
+        if not settings.kis_app_key or not settings.kis_app_secret:
+            raise KISConfigurationError('KIS_APP_KEY and KIS_APP_SECRET must be configured')
+
         if not force_refresh:
             cached = self._get_cached_token()
             if cached:
@@ -44,15 +120,27 @@ class KISClient:
             'appsecret': settings.kis_app_secret,
         }
         async with httpx.AsyncClient(base_url=self.base_url, timeout=15.0) as client:
-            response = await request_with_audit(
-                client,
-                'kis',
-                'POST',
-                '/oauth2/tokenP',
-                json_body=payload,
-            )
+            try:
+                response = await request_with_audit(
+                    client,
+                    'kis',
+                    'POST',
+                    '/oauth2/tokenP',
+                    json_body=payload,
+                )
+            except httpx.TimeoutException as exc:
+                raise KISTimeoutError('KIS token issue timed out', retryable=True) from exc
+            except httpx.HTTPError as exc:
+                raise KISTransportError('KIS token issue transport failure', retryable=True) from exc
             if response.status_code >= 400:
-                raise RuntimeError(f'KIS token issue failed [{response.status_code}]: {response.text}')
+                error_payload = _safe_json(response)
+                message = error_payload.get('msg1') or response.text
+                raise KISHTTPError(
+                    f'KIS token issue failed [{response.status_code}]: {message}',
+                    payload=error_payload,
+                    status_code=response.status_code,
+                    retryable=response.status_code >= 500,
+                )
             token = response.json()
 
         now = datetime.now(timezone.utc)
@@ -71,49 +159,149 @@ class KISClient:
         return {
             'broker': 'kis',
             'base_url': self.base_url,
+            'environment': self._environment(),
             'use_mock': settings.kis_use_mock,
             'app_key_configured': bool(settings.kis_app_key),
             'app_secret_configured': bool(settings.kis_app_secret),
         }
 
-    async def _get_response(self, path: str, *, tr_id: str, params: dict, tr_cont: str = '') -> tuple[dict, str]:
+    async def _issue_hashkey(self, *, headers: Mapping[str, str], payload: Mapping[str, Any]) -> str | None:
+        async with httpx.AsyncClient(base_url=self.base_url, timeout=15.0) as client:
+            try:
+                response = await request_with_audit(
+                    client,
+                    'kis',
+                    'POST',
+                    '/uapi/hashkey',
+                    headers=headers,
+                    json_body=dict(payload),
+                )
+            except httpx.TimeoutException as exc:
+                raise KISTimeoutError('KIS hashkey request timed out', retryable=True) from exc
+            except httpx.HTTPError as exc:
+                raise KISTransportError('KIS hashkey transport failure', retryable=True) from exc
+            if response.status_code >= 400:
+                error_payload = _safe_json(response)
+                message = error_payload.get('msg1') or response.text
+                raise KISHTTPError(
+                    f'KIS hashkey request failed [{response.status_code}]: {message}',
+                    payload=error_payload,
+                    status_code=response.status_code,
+                    retryable=response.status_code >= 500,
+                )
+            hash_payload = _safe_json(response)
+            return str(hash_payload.get('HASH') or '').strip() or None
+
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        tr_id: str,
+        params: Mapping[str, Any] | None = None,
+        json_body: Mapping[str, Any] | None = None,
+        tr_cont: str = '',
+        use_hashkey: bool = False,
+    ) -> tuple[dict[str, Any], str]:
         token = await self.issue_access_token()
         headers = {
             'authorization': f"Bearer {token['access_token']}",
             'appkey': settings.kis_app_key,
             'appsecret': settings.kis_app_secret,
             'tr_id': tr_id,
+            'custtype': 'P',
         }
         if tr_cont:
             headers['tr_cont'] = tr_cont
-        async with httpx.AsyncClient(base_url=self.base_url, timeout=15.0) as client:
-            response = await request_with_audit(
-                client,
-                'kis',
-                'GET',
-                path,
-                headers=headers,
-                params=params,
-            )
-            if response.status_code >= 400:
-                raise RuntimeError(f'KIS request failed [{response.status_code}] {path}: {response.text}')
-            return response.json(), response.headers.get('tr_cont', '')
+        if use_hashkey and json_body:
+            hashkey = await self._issue_hashkey(headers=headers, payload=json_body)
+            if hashkey:
+                headers['hashkey'] = hashkey
 
-    async def _get(self, path: str, *, tr_id: str, params: dict) -> dict:
+        async with httpx.AsyncClient(base_url=self.base_url, timeout=15.0) as client:
+            try:
+                response = await request_with_audit(
+                    client,
+                    'kis',
+                    method.upper(),
+                    path,
+                    headers=headers,
+                    params=dict(params or {}),
+                    json_body=dict(json_body) if json_body is not None else None,
+                )
+            except httpx.TimeoutException as exc:
+                raise KISTimeoutError(
+                    f'KIS request timed out for {path}',
+                    retryable=True,
+                    ambiguous_submission=method.upper() == 'POST',
+                ) from exc
+            except httpx.HTTPError as exc:
+                raise KISTransportError(
+                    f'KIS transport failure for {path}',
+                    retryable=True,
+                    ambiguous_submission=method.upper() == 'POST',
+                ) from exc
+
+        if response.status_code >= 400:
+            error_payload = _safe_json(response)
+            message = error_payload.get('msg1') or response.text
+            raise KISHTTPError(
+                f'KIS request failed [{response.status_code}] {path}: {message}',
+                payload=error_payload,
+                status_code=response.status_code,
+                retryable=response.status_code >= 500,
+                ambiguous_submission=method.upper() == 'POST' and response.status_code >= 500,
+            )
+
+        payload = _safe_json(response)
+        result_code = str(payload.get('rt_cd') if payload.get('rt_cd') is not None else '').strip()
+        if result_code and result_code != '0':
+            message = payload.get('msg1') or 'KIS request rejected'
+            raise KISAPIError(
+                f'KIS request rejected {path}: {message}',
+                payload=payload,
+                status_code=response.status_code,
+                msg_code=str(payload.get('msg_cd') or '').strip() or None,
+                result_code=result_code,
+            )
+
+        return payload, response.headers.get('tr_cont', '')
+
+    async def _get(self, path: str, *, tr_id: str, params: Mapping[str, Any]) -> dict[str, Any]:
         body, _ = await self._get_response(path, tr_id=tr_id, params=params)
         return body
+
+    async def _get_response(
+        self,
+        path: str,
+        *,
+        tr_id: str,
+        params: Mapping[str, Any],
+        tr_cont: str = '',
+    ) -> tuple[dict[str, Any], str]:
+        return await self._request('GET', path, tr_id=tr_id, params=params, tr_cont=tr_cont)
+
+    async def _post(self, path: str, *, tr_id: str, body: Mapping[str, Any]) -> dict[str, Any]:
+        response_body, _ = await self._request(
+            'POST',
+            path,
+            tr_id=tr_id,
+            json_body=body,
+            use_hashkey=True,
+        )
+        return response_body
 
     async def _get_paginated_ranking(
         self,
         path: str,
         *,
         tr_id: str,
-        params: dict,
+        params: dict[str, Any],
         output_keys: tuple[str, ...],
         max_pages: int = 10,
     ) -> dict:
         merged: dict[str, list] = {key: [] for key in output_keys}
-        pages: list[dict] = []
+        pages: list[dict[str, Any]] = []
         tr_cont = ''
         continuation_pending = False
 
@@ -201,6 +389,201 @@ class KISClient:
                 'FID_ORG_ADJ_PRC': adjusted_price,
             },
         )
+
+    async def submit_domestic_cash_order(
+        self,
+        *,
+        order_side: str,
+        account_number: str,
+        account_product_code: str,
+        symbol: str,
+        order_division_code: str,
+        order_quantity: str,
+        order_price: str,
+        exchange_id_division_code: str = 'KRX',
+        sell_type: str = '',
+        condition_price: str = '',
+    ) -> dict[str, Any]:
+        normalized_side = order_side.strip().lower()
+        if normalized_side not in {'buy', 'sell'}:
+            raise ValueError('order_side must be buy or sell')
+
+        tr_id = self._resolve_tr_id(
+            real='TTTC0012U' if normalized_side == 'buy' else 'TTTC0011U',
+            demo='VTTC0012U' if normalized_side == 'buy' else 'VTTC0011U',
+        )
+        body = {
+            'CANO': account_number,
+            'ACNT_PRDT_CD': account_product_code,
+            'PDNO': symbol,
+            'ORD_DVSN': order_division_code,
+            'ORD_QTY': order_quantity,
+            'ORD_UNPR': order_price,
+            'EXCG_ID_DVSN_CD': exchange_id_division_code,
+            'SLL_TYPE': sell_type,
+            'CNDT_PRIC': condition_price,
+        }
+        return await self._post('/uapi/domestic-stock/v1/trading/order-cash', tr_id=tr_id, body=body)
+
+    async def submit_domestic_order_cancel_replace(
+        self,
+        *,
+        account_number: str,
+        account_product_code: str,
+        broker_order_id: str,
+        exchange_forward_order_orgno: str,
+        order_division_code: str,
+        replace_cancel_division_code: str,
+        order_quantity: str,
+        order_price: str,
+        all_quantity_order_yn: str,
+        exchange_id_division_code: str = 'KRX',
+        condition_price: str = '',
+    ) -> dict[str, Any]:
+        tr_id = self._resolve_tr_id(real='TTTC0013U', demo='VTTC0013U')
+        body = {
+            'CANO': account_number,
+            'ACNT_PRDT_CD': account_product_code,
+            'KRX_FWDG_ORD_ORGNO': exchange_forward_order_orgno,
+            'ORGN_ODNO': broker_order_id,
+            'ORD_DVSN': order_division_code,
+            'RVSE_CNCL_DVSN_CD': replace_cancel_division_code,
+            'ORD_QTY': order_quantity,
+            'ORD_UNPR': order_price,
+            'QTY_ALL_ORD_YN': all_quantity_order_yn,
+            'EXCG_ID_DVSN_CD': exchange_id_division_code,
+        }
+        if condition_price:
+            body['CNDT_PRIC'] = condition_price
+        return await self._post('/uapi/domestic-stock/v1/trading/order-rvsecncl', tr_id=tr_id, body=body)
+
+    async def fetch_domestic_cancelable_orders(
+        self,
+        *,
+        account_number: str,
+        account_product_code: str,
+        inquiry_division_1: str = '0',
+        inquiry_division_2: str = '0',
+        max_pages: int = 10,
+    ) -> dict[str, Any]:
+        params = {
+            'CANO': account_number,
+            'ACNT_PRDT_CD': account_product_code,
+            'INQR_DVSN_1': inquiry_division_1,
+            'INQR_DVSN_2': inquiry_division_2,
+            'CTX_AREA_FK100': '',
+            'CTX_AREA_NK100': '',
+        }
+        items: list[dict[str, Any]] = []
+        pages: list[dict[str, Any]] = []
+        tr_cont = ''
+        continuation_pending = False
+
+        for _ in range(max_pages):
+            body, next_tr_cont = await self._request(
+                'GET',
+                '/uapi/domestic-stock/v1/trading/inquire-psbl-rvsecncl',
+                tr_id='TTTC0084R',
+                params=params,
+                tr_cont=tr_cont,
+            )
+            pages.append(body)
+            value = body.get('output')
+            if isinstance(value, list):
+                items.extend(value)
+            params['CTX_AREA_FK100'] = str(body.get('ctx_area_fk100') or '')
+            params['CTX_AREA_NK100'] = str(body.get('ctx_area_nk100') or '')
+            continuation_pending = next_tr_cont in {'M', 'F'}
+            if not continuation_pending:
+                break
+            tr_cont = 'N'
+
+        return {
+            'output': items,
+            'page_count': len(pages),
+            'max_pages_reached': continuation_pending and len(pages) >= max_pages,
+            'raw_pages': pages,
+        }
+
+    async def fetch_domestic_daily_order_fills(
+        self,
+        *,
+        period_division: str,
+        account_number: str,
+        account_product_code: str,
+        inquiry_start_date: str,
+        inquiry_end_date: str,
+        sell_buy_division_code: str,
+        conclusion_division: str,
+        inquiry_division: str,
+        inquiry_division_3: str,
+        symbol: str = '',
+        order_branch_number: str = '',
+        broker_order_id: str = '',
+        inquiry_division_1: str = '',
+        exchange_id_division_code: str = 'KRX',
+        max_pages: int = 10,
+    ) -> dict[str, Any]:
+        normalized_period = period_division.strip().lower()
+        if normalized_period not in {'before', 'inner'}:
+            raise ValueError('period_division must be before or inner')
+
+        tr_id = self._resolve_tr_id(
+            real='CTSC9215R' if normalized_period == 'before' else 'TTTC0081R',
+            demo='VTSC9215R' if normalized_period == 'before' else 'VTTC0081R',
+        )
+        params = {
+            'CANO': account_number,
+            'ACNT_PRDT_CD': account_product_code,
+            'INQR_STRT_DT': inquiry_start_date,
+            'INQR_END_DT': inquiry_end_date,
+            'SLL_BUY_DVSN_CD': sell_buy_division_code,
+            'PDNO': symbol,
+            'CCLD_DVSN': conclusion_division,
+            'INQR_DVSN': inquiry_division,
+            'INQR_DVSN_3': inquiry_division_3,
+            'ORD_GNO_BRNO': order_branch_number,
+            'ODNO': broker_order_id,
+            'INQR_DVSN_1': inquiry_division_1,
+            'CTX_AREA_FK100': '',
+            'CTX_AREA_NK100': '',
+            'EXCG_ID_DVSN_CD': exchange_id_division_code,
+        }
+        rows: list[dict[str, Any]] = []
+        pages: list[dict[str, Any]] = []
+        summary: dict[str, Any] = {}
+        tr_cont = ''
+        continuation_pending = False
+
+        for _ in range(max_pages):
+            body, next_tr_cont = await self._request(
+                'GET',
+                '/uapi/domestic-stock/v1/trading/inquire-daily-ccld',
+                tr_id=tr_id,
+                params=params,
+                tr_cont=tr_cont,
+            )
+            pages.append(body)
+            output_rows = body.get('output1')
+            if isinstance(output_rows, list):
+                rows.extend(output_rows)
+            output_summary = body.get('output2')
+            if isinstance(output_summary, dict):
+                summary = output_summary
+            params['CTX_AREA_FK100'] = str(body.get('ctx_area_fk100') or '')
+            params['CTX_AREA_NK100'] = str(body.get('ctx_area_nk100') or '')
+            continuation_pending = next_tr_cont in {'M', 'F'}
+            if not continuation_pending:
+                break
+            tr_cont = 'N'
+
+        return {
+            'output1': rows,
+            'output2': summary,
+            'page_count': len(pages),
+            'max_pages_reached': continuation_pending and len(pages) >= max_pages,
+            'raw_pages': pages,
+        }
 
     async def fetch_domestic_ranking_volume_power(
         self,

@@ -31,11 +31,18 @@
 28. Daily beta factor compute/read routes
 29. Daily advanced value factor compute/read routes
 30. Daily composite factor compute/read routes
+31. Internal trading order control + inquiry routes
 
 ## Current routes
 - `POST /broker/kis/token`
 - `GET /broker/kis/health`
 - `GET /broker/kis/quote?symbol=005930&market_code=J`
+- `POST /trading/orders/buy`
+- `POST /trading/orders/sell`
+- `POST /trading/orders/{client_order_id}/cancel`
+- `POST /trading/orders/{client_order_id}/amend`
+- `GET /trading/orders/{client_order_id}?account_reference=KIS:12345678-01&refresh=false`
+- `GET /trading/orders?account_reference=KIS:12345678-01&status=submitted&limit=100`
 - `GET /market/status`
 - `GET /quotes/tracked`
 - `GET /quotes/005930`
@@ -110,6 +117,14 @@
 - `GET /agent-context/feedback/requests?market_date=YYYY-MM-DD&symbols=005930`
 - `GET /agent-context/feedback/status?market_date=YYYY-MM-DD&symbols=005930&symbols=000660`
 - `GET /agent-context/feedback/progress?market_date=YYYY-MM-DD&run_id=symbol-run-...`
+
+## Trading order adapter notes
+- `POST /trading/orders/buy` and `POST /trading/orders/sell` are the internal order-control submit routes for the first KIS domestic cash adapter.
+- `POST /trading/orders/{client_order_id}/cancel` and `POST /trading/orders/{client_order_id}/amend` are account-scoped control routes. They require `account_reference` in `KIS:<account_number>-<product_code>` format so the service can reconcile and control the correct broker account without exposing credentials.
+- `GET /trading/orders/{client_order_id}` and `GET /trading/orders` expose the persisted order-request snapshot, current broker-order snapshot, and event timeline. `refresh=true` on the single-order read triggers KIS inquiry-based reconciliation before the response is returned.
+- Submit idempotency is keyed by `broker_name + account_reference + client_order_id`. A repeated submit with the same payload returns the stored order snapshot instead of sending a second broker order. A repeated submit with a different payload returns an idempotency conflict.
+- Durable persistence spans `order_requests`, `broker_orders`, and `broker_order_events`. KIS request and response payloads are preserved in the request snapshot, current broker snapshot, and event history for later debugging and reconciliation.
+- The stable KIS result-code and inquiry-state mapping contract for this adapter is documented in [docs/KIS_ORDER_RESULT_CODE_MAPPING.md](./KIS_ORDER_RESULT_CODE_MAPPING.md).
 
 ## EOD freshness read-layer notes
 - Canonical semantics live in `docs/EOD_STATUS_SEMANTICS_CONTRACT.md`.
