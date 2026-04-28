@@ -7,7 +7,7 @@ The compute path now runs in two layers:
 - collect or reuse stored KIS `inquire-price-2` snapshots first
 - evaluate focused policy rules second and store the downstream result rows in `daily_market_risk_filter_results`
 
-The read path is intentionally filter-focused: it returns policy state plus explicit blocking or watchlist reasons, not the full normalized snapshot field set.
+The read path is intentionally filter-focused: it returns policy state plus explicit blocking or watchlist reasons, not the full normalized snapshot field set. These persisted rows are also one half of agent-feedback eligibility: symbol-level feedback now requires `passed_filter=true` here and in the same-day Piotroski rows.
 
 ## Example compute request
 ```http

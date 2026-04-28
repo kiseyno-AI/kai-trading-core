@@ -4,9 +4,10 @@
 Reports aggregate progress for the default four-role symbol feedback workflow.
 
 The response is now a stable coverage and liveness snapshot:
-- `total_symbols` uses the active symbol set with `daily_price_bars` for the requested market date, optionally narrowed to requested symbols
+- `total_symbols` uses the durable run scope when a matching dispatch or retry run exists; otherwise it falls back to the active symbol set with `daily_price_bars` for the requested market date, optionally narrowed to requested symbols
 - `result.market_date` echoes the requested market date, and `result.roles[role]` reports durable persisted `requested_count`, `completed_count`, and `error_count`
 - `run_id` is optional and lets operators inspect the exact durable run returned by dispatch or retry endpoints
+- dispatch and retry run scopes now reflect the intersection of the active pre-filters, not Piotroski alone
 - when a matching retry-cycle `agent_context_feedback_runs` row exists, aggregate counts stay grounded in persisted feedback and failure rows while live lifecycle fields such as `current_role`, `completed_roles`, and `cycle_status` still come from the active run metadata
 - top-level `progress_ratio` and `progress_percent` represent whole-cycle completion across all expected symbol-role feedback items
 - `boundary_progress_ratio` and `boundary_progress_percent` keep the separate symbol-boundary coverage signal that used to drive the top-level percentage

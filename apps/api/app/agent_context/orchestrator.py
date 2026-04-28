@@ -18,6 +18,12 @@ from fastapi.encoders import jsonable_encoder
 from sqlalchemy import select
 
 from app.agent_context.feedback_service import agent_context_feedback_service
+from app.agent_context.eligibility import (
+    AGENT_FEEDBACK_ELIGIBILITY_FILTERS,
+    AGENT_FEEDBACK_ELIGIBILITY_RULE,
+    load_agent_feedback_eligible_symbols,
+    resolve_agent_feedback_scope,
+)
 from app.agent_context.feedback_failure_service import agent_context_feedback_failure_service
 from app.agent_context.orchestrator_helpers import (
     build_completed_dispatch_item as _build_completed_dispatch_item,
@@ -69,7 +75,6 @@ from app.agent_context.signal_decider_loop_service import signal_decider_loop_se
 from app.core.settings import settings
 from app.db import session_scope
 from app.db_models import AgentContextFeedback, EODCollectionRun
-from app.market_data_store import load_daily_piotroski_filter_results
 
 logger = logging.getLogger(__name__)
 
@@ -127,20 +132,17 @@ DISPATCH_SPECS: tuple[AgentDispatchSpec, ...] = (
 )
 
 
-def _split_requested_symbols_by_piotroski_passed_filter(
+def _split_requested_symbols_by_agent_feedback_eligibility(
     *,
     market_date: date,
     requested_symbols: Sequence[str],
 ) -> tuple[list[str], list[str]]:
-    passed_rows = load_daily_piotroski_filter_results(
+    eligible_symbols = load_agent_feedback_eligible_symbols(
         market_date=market_date,
-        symbols=list(requested_symbols),
-        passed_filter=True,
-        limit=None,
+        requested_symbols=requested_symbols,
     )
-    passed_symbol_set = {str(item['symbol']) for item in passed_rows}
-    eligible_symbols = [symbol for symbol in requested_symbols if symbol in passed_symbol_set]
-    skipped_symbols = [symbol for symbol in requested_symbols if symbol not in passed_symbol_set]
+    eligible_symbol_set = set(eligible_symbols)
+    skipped_symbols = [symbol for symbol in requested_symbols if symbol not in eligible_symbol_set]
     return eligible_symbols, skipped_symbols
 
 
@@ -2224,7 +2226,7 @@ class AgentFeedbackOrchestrator:
         normalized_market_date = market_date if isinstance(market_date, date) else date.fromisoformat(market_date)
         specs = self._select_specs(roles=roles)
         requested_symbols = _normalize_requested_symbols(symbols)
-        dispatch_symbols, skipped_symbols = _split_requested_symbols_by_piotroski_passed_filter(
+        dispatch_symbols, skipped_symbols = _split_requested_symbols_by_agent_feedback_eligibility(
             market_date=normalized_market_date,
             requested_symbols=requested_symbols,
         )
@@ -2244,7 +2246,9 @@ class AgentFeedbackOrchestrator:
             'role_parallel_subtasks': role_parallelism,
             'total_parallel_subtasks': role_parallelism,
             'reuse_existing': reuse_existing,
-            'scope': 'piotroski_passed_symbols_only',
+            'scope': resolve_agent_feedback_scope(requested_symbols=requested_symbols),
+            'eligibility_rule': AGENT_FEEDBACK_ELIGIBILITY_RULE,
+            'eligibility_filters': list(AGENT_FEEDBACK_ELIGIBILITY_FILTERS),
             'skipped_symbols': skipped_symbols,
             'mode': 'role_sequential_runtime_buffered',
         }
@@ -3237,7 +3241,7 @@ class AgentFeedbackOrchestrator:
             per_role_parallelism=per_role_parallelism,
             signal_decider_agent_name=SIGNAL_DECIDER_AGENT_NAME,
             normalize_requested_symbols=_normalize_requested_symbols,
-            split_requested_symbols_by_piotroski_passed_filter=_split_requested_symbols_by_piotroski_passed_filter,
+            split_requested_symbols_by_agent_feedback_eligibility=_split_requested_symbols_by_agent_feedback_eligibility,
             agent_context_read_service=agent_context_read_service,
             normalize_agent_response=normalize_agent_response,
             build_response_storage_payload=_build_response_storage_payload,

@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 import json
 from pathlib import Path
 import tempfile
@@ -464,14 +465,18 @@ def _reuse_decision(should_dispatch: bool):
     return SimpleNamespace(should_dispatch=should_dispatch)
 
 
-def _passed_filter_rows(*symbols: str) -> list[dict]:
-    return [
-        {
-            'symbol': symbol,
-            'passed_filter': True,
-        }
-        for symbol in symbols
-    ]
+def _passed_filter_rows(*symbols: str) -> list[str]:
+    return list(symbols)
+
+
+@contextmanager
+def _patch_feedback_eligibility(*symbols: str):
+    with patch.object(
+        orchestrator_module,
+        'load_agent_feedback_eligible_symbols',
+        return_value=_passed_filter_rows(*symbols),
+    ):
+        yield
 
 
 class AgentFeedbackOrchestratorTests(unittest.TestCase):
@@ -562,11 +567,7 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
                 with patch.object(orchestrator_module, 'agent_context_reuse_service', reuse_service):
                     with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
                         with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
-                            with patch.object(
-                                orchestrator_module,
-                                'load_daily_piotroski_filter_results',
-                                return_value=_passed_filter_rows('005930', '000660'),
-                            ):
+                            with _patch_feedback_eligibility('005930', '000660'):
                                 result = service.dispatch_for_symbols(
                                     market_date='2026-04-14',
                                     symbols=['005930', '000660'],
@@ -597,11 +598,7 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
             with patch.object(orchestrator_module, 'agent_context_read_service', DynamicFakeAgentContextReadService()):
                 with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
                     with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
-                        with patch.object(
-                            orchestrator_module,
-                            'load_daily_piotroski_filter_results',
-                            return_value=_passed_filter_rows('005930', '000660'),
-                        ):
+                        with _patch_feedback_eligibility('005930', '000660'):
                             result = service.dispatch_for_symbols(
                                 market_date='2026-04-14',
                                 symbols=['005930', '000660'],
@@ -628,11 +625,7 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
                 with patch.object(orchestrator_module, 'agent_context_read_service', DynamicFakeAgentContextReadService()):
                     with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
                         with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
-                            with patch.object(
-                                orchestrator_module,
-                                'load_daily_piotroski_filter_results',
-                                return_value=_passed_filter_rows('005930', '000660'),
-                            ):
+                            with _patch_feedback_eligibility('005930', '000660'):
                                 result = service.dispatch_for_symbols(
                                     market_date='2026-04-14',
                                     symbols=['005930', '000660'],
@@ -672,11 +665,7 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
                 with patch.object(orchestrator_module, 'agent_context_read_service', DynamicFakeAgentContextReadService()):
                     with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
                         with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
-                            with patch.object(
-                                orchestrator_module,
-                                'load_daily_piotroski_filter_results',
-                                return_value=_passed_filter_rows('005930', '000660'),
-                            ):
+                            with _patch_feedback_eligibility('005930', '000660'):
                                 result = service.dispatch_for_symbols(
                                     market_date='2026-04-14',
                                     symbols=['005930', '000660'],
@@ -712,11 +701,7 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
             with patch.object(orchestrator_module, 'agent_context_read_service', DynamicFakeAgentContextReadService()):
                 with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
                     with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
-                        with patch.object(
-                            orchestrator_module,
-                            'load_daily_piotroski_filter_results',
-                            return_value=_passed_filter_rows(*symbols),
-                        ):
+                        with _patch_feedback_eligibility(*symbols):
                             result = service.dispatch_for_symbols(
                                 market_date='2026-04-14',
                                 symbols=symbols,
@@ -741,11 +726,7 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         with patch.object(orchestrator_module, 'agent_context_read_service', DynamicFakeAgentContextReadService()):
             with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
                 with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
-                    with patch.object(
-                        orchestrator_module,
-                        'load_daily_piotroski_filter_results',
-                        return_value=_passed_filter_rows(*symbols),
-                    ):
+                    with _patch_feedback_eligibility(*symbols):
                         result = service.dispatch_for_symbols_via_subagents(
                             market_date='2026-04-14',
                             symbols=symbols,
@@ -797,11 +778,7 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
             with patch.object(orchestrator_module, 'agent_context_read_service', FakeAgentContextReadService()):
                 with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
                     with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
-                        with patch.object(
-                            orchestrator_module,
-                            'load_daily_piotroski_filter_results',
-                            return_value=_passed_filter_rows('005930', '000660'),
-                        ):
+                        with _patch_feedback_eligibility('005930', '000660'):
                             with patch(
                                 'app.agent_context.orchestrator.concurrent.futures.ThreadPoolExecutor',
                                 side_effect=lambda max_workers: fake_executor,
@@ -826,7 +803,7 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertEqual(len(cleanup_service.targets), 1)
         self.assertEqual(result['summary']['failed'], 0)
 
-    def test_dispatch_for_symbols_skips_symbols_not_in_passed_filter(self):
+    def test_dispatch_for_symbols_skips_symbols_outside_active_filter_intersection(self):
         service = AgentFeedbackOrchestrator()
         client = RecordingBatchClient()
         service.client = client
@@ -839,11 +816,7 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
             with patch.object(orchestrator_module, 'agent_context_read_service', read_service):
                 with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
                     with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
-                        with patch.object(
-                            orchestrator_module,
-                            'load_daily_piotroski_filter_results',
-                            return_value=_passed_filter_rows('005930'),
-                        ):
+                        with _patch_feedback_eligibility('005930'):
                             result = service.dispatch_for_symbols(
                                 market_date='2026-04-14',
                                 symbols=['005930', '000660'],
@@ -872,11 +845,7 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
             with patch.object(orchestrator_module, 'agent_context_read_service', DynamicFakeAgentContextReadService()):
                 with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
                     with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
-                        with patch.object(
-                            orchestrator_module,
-                            'load_daily_piotroski_filter_results',
-                            return_value=_passed_filter_rows('005930'),
-                        ):
+                        with _patch_feedback_eligibility('005930'):
                             result = service.dispatch_for_symbols(
                                 market_date='2026-04-14',
                                 symbols=['005930'],
@@ -905,11 +874,7 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
                 with patch.object(orchestrator_module, 'agent_context_reuse_service', reuse_service):
                     with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
                         with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
-                            with patch.object(
-                                orchestrator_module,
-                                'load_daily_piotroski_filter_results',
-                                return_value=_passed_filter_rows('005930'),
-                            ):
+                            with _patch_feedback_eligibility('005930'):
                                 result = service.dispatch_for_symbols(
                                     market_date='2026-04-14',
                                     symbols=['005930'],
@@ -998,11 +963,7 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
                     with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
                         with patch.object(orchestrator_module, 'agent_context_feedback_failure_service', failure_service):
                             with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
-                                with patch.object(
-                                    orchestrator_module,
-                                    'load_daily_piotroski_filter_results',
-                                    return_value=_passed_filter_rows('005930'),
-                                ):
+                                with _patch_feedback_eligibility('005930'):
                                     result = service.dispatch_for_symbols(
                                         market_date='2026-04-14',
                                         symbols=['005930'],
@@ -1087,11 +1048,7 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
                     with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
                         with patch.object(orchestrator_module, 'agent_context_feedback_failure_service', failure_service):
                             with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
-                                with patch.object(
-                                    orchestrator_module,
-                                    'load_daily_piotroski_filter_results',
-                                    return_value=_passed_filter_rows('005930'),
-                                ):
+                                with _patch_feedback_eligibility('005930'):
                                     result = service.dispatch_for_symbols(
                                         market_date='2026-04-14',
                                         symbols=['005930'],
@@ -1129,11 +1086,7 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
                         with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
                             with patch.object(orchestrator_module, 'agent_context_feedback_failure_service', failure_service):
                                 with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
-                                    with patch.object(
-                                        orchestrator_module,
-                                        'load_daily_piotroski_filter_results',
-                                        return_value=_passed_filter_rows('005930'),
-                                    ):
+                                    with _patch_feedback_eligibility('005930'):
                                         result = service.dispatch_for_symbols(
                                             market_date='2026-04-14',
                                             symbols=['005930'],
@@ -1171,11 +1124,7 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
                         with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
                             with patch.object(orchestrator_module, 'agent_context_feedback_failure_service', failure_service):
                                 with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
-                                    with patch.object(
-                                        orchestrator_module,
-                                        'load_daily_piotroski_filter_results',
-                                        return_value=_passed_filter_rows('005930'),
-                                    ):
+                                    with _patch_feedback_eligibility('005930'):
                                         with self.assertRaisesRegex(RuntimeError, 'boom'):
                                             service.dispatch_for_symbols(
                                                 market_date='2026-04-14',
@@ -1215,11 +1164,7 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
                     with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
                         with patch.object(orchestrator_module, 'agent_context_feedback_failure_service', failure_service):
                             with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
-                                with patch.object(
-                                    orchestrator_module,
-                                    'load_daily_piotroski_filter_results',
-                                    return_value=_passed_filter_rows('005930', '000660'),
-                                ):
+                                with _patch_feedback_eligibility('005930', '000660'):
                                     result = service.dispatch_for_symbols(
                                         market_date='2026-04-14',
                                         symbols=['005930', '000660'],
@@ -1273,11 +1218,7 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
                             with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
                                 with patch.object(orchestrator_module, 'agent_context_feedback_failure_service', failure_service):
                                     with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
-                                        with patch.object(
-                                            orchestrator_module,
-                                            'load_daily_piotroski_filter_results',
-                                            return_value=_passed_filter_rows('005930'),
-                                        ):
+                                        with _patch_feedback_eligibility('005930'):
                                             with self.assertRaisesRegex(RuntimeError, 'checkpoint interrupted after failure buffered'):
                                                 service.dispatch_for_symbols(
                                                     market_date='2026-04-14',
@@ -1315,11 +1256,7 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
                     with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
                         with patch.object(orchestrator_module, 'agent_context_feedback_failure_service', failure_service):
                             with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
-                                with patch.object(
-                                    orchestrator_module,
-                                    'load_daily_piotroski_filter_results',
-                                    return_value=_passed_filter_rows('005930'),
-                                ):
+                                with _patch_feedback_eligibility('005930'):
                                     result = service.dispatch_for_symbols(
                                         market_date='2026-04-14',
                                         symbols=['005930'],
@@ -2056,11 +1993,7 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
                 with patch.object(orchestrator_module, 'agent_context_read_service', DynamicFakeAgentContextReadService()):
                     with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
                         with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
-                            with patch.object(
-                                orchestrator_module,
-                                'load_daily_piotroski_filter_results',
-                                return_value=_passed_filter_rows('005930'),
-                            ):
+                            with _patch_feedback_eligibility('005930'):
                                 with patch.object(
                                     orchestrator_module,
                                     'log_agent_feedback_event',
@@ -2130,11 +2063,7 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
                     with patch.object(orchestrator_module, 'agent_context_read_service', DynamicFakeAgentContextReadService()):
                         with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
                             with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
-                                with patch.object(
-                                    orchestrator_module,
-                                    'load_daily_piotroski_filter_results',
-                                    return_value=_passed_filter_rows('005930'),
-                                ):
+                                with _patch_feedback_eligibility('005930'):
                                     with patch.object(
                                         orchestrator_module,
                                         'log_agent_feedback_event',

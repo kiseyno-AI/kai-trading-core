@@ -94,6 +94,15 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         )
         self.assertIn('fundamentals_daily_refresh', payload['default_daily_stage_order'])
         self.assertIn('signal_decider', payload['default_daily_stage_order'])
+        agent_feedback_stage = next(
+            stage
+            for stage in payload['stages']
+            if stage['id'] == 'agent_feedback_summaries'
+        )
+        self.assertEqual(
+            agent_feedback_stage['depends_on'],
+            ['market_risk_filter', 'piotroski_filter'],
+        )
 
     def test_run_reorders_requested_subset_and_splits_feedback_stages(self) -> None:
         pykrx_runner = _FakePykrxStageRunner()

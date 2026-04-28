@@ -506,6 +506,18 @@ class AgentContextRouteTests(unittest.TestCase):
             fake_run_state_service.started[0]['request_payload']['requested_symbols'],
             ['005930', '000660'],
         )
+        self.assertEqual(
+            fake_run_state_service.started[0]['request_payload']['scope'],
+            'requested_symbols_intersected_with_active_pre_filters',
+        )
+        self.assertEqual(
+            fake_run_state_service.started[0]['request_payload']['eligibility_filters'],
+            ['market_risk_filter', 'piotroski_filter'],
+        )
+        self.assertEqual(
+            payload['request']['scope'],
+            'requested_symbols_intersected_with_active_pre_filters',
+        )
         self.assertEqual(fake_orchestrator.calls[0]['request_run_id'], request_run_id)
         self.assertEqual(fake_orchestrator.calls[0]['symbols'], ['005930', '000660'])
         self.assertEqual(fake_orchestrator.calls[0]['roles'], ['eod-summarizer', 'technical-summarizer'])

@@ -12,6 +12,11 @@ from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.agent_context.eod_summaries_service import agent_context_eod_summaries_service
+from app.agent_context.eligibility import (
+    AGENT_FEEDBACK_ELIGIBILITY_FILTERS,
+    AGENT_FEEDBACK_ELIGIBILITY_RULE,
+    resolve_agent_feedback_scope,
+)
 from app.agent_context.feedback_service import agent_context_feedback_service
 from app.agent_context.orchestrator import agent_feedback_orchestrator
 from app.agent_context.progress_service import agent_context_progress_service
@@ -239,7 +244,9 @@ async def dispatch_symbol_agent_feedback(
             'fs_div': payload.fs_div,
             'disclosures_limit': payload.disclosures_limit,
             'reuse_existing': payload.reuse_existing,
-            'scope': 'piotroski_passed_symbols_only',
+            'scope': resolve_agent_feedback_scope(requested_symbols=requested_symbols),
+            'eligibility_rule': AGENT_FEEDBACK_ELIGIBILITY_RULE,
+            'eligibility_filters': list(AGENT_FEEDBACK_ELIGIBILITY_FILTERS),
             'mode': 'role_sequential_runtime_buffered',
         }
 
@@ -368,10 +375,14 @@ async def dispatch_symbol_agent_feedback(
             'request': {
                 'market_date': payload.market_date.isoformat(),
                 'symbols': requested_symbols,
+                'requested_symbols': requested_symbols,
                 'roles': requested_roles,
                 'fs_div': payload.fs_div,
                 'disclosures_limit': payload.disclosures_limit,
                 'reuse_existing': payload.reuse_existing,
+                'scope': resolve_agent_feedback_scope(requested_symbols=requested_symbols),
+                'eligibility_rule': AGENT_FEEDBACK_ELIGIBILITY_RULE,
+                'eligibility_filters': list(AGENT_FEEDBACK_ELIGIBILITY_FILTERS),
                 'request_run_id': request_run_id,
                 'wait_for_completion': False,
             },
