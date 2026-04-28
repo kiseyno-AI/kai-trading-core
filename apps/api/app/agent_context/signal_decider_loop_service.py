@@ -1777,6 +1777,7 @@ class SignalDeciderLoopService:
             thresholds.loss_return_pct * evaluation_profile.buy_severe_drawdown_multiplier,
             6,
         )
+        price_path = outcome.get('price_path')
         worst_drawdown_trade_date = _normalize_optional_text(
             str(outcome_diagnostics.get('worst_drawdown_trade_date'))
             if outcome_diagnostics.get('worst_drawdown_trade_date') is not None
@@ -1787,17 +1788,25 @@ class SignalDeciderLoopService:
             if outcome_diagnostics.get('first_target_hit_trade_date') is not None
             else None
         )
-        severe_drawdown_before_target = bool(
-            max_drawdown_return_pct is not None
-            and max_drawdown_return_pct <= -severe_drawdown_limit_pct
-            and (
-                first_target_hit_trade_date is None
-                or (
-                    worst_drawdown_trade_date is not None
-                    and worst_drawdown_trade_date <= first_target_hit_trade_date
+        first_severe_drawdown_trade_date = self._first_severe_drawdown_trade_date(
+            entry_price=_to_int(outcome.get('entry_price')),
+            price_path=price_path,
+            severe_drawdown_limit_pct=severe_drawdown_limit_pct,
+            first_target_hit_trade_date=first_target_hit_trade_date,
+        )
+        severe_drawdown_before_target = bool(first_severe_drawdown_trade_date)
+        if not isinstance(price_path, list) or not price_path:
+            severe_drawdown_before_target = bool(
+                max_drawdown_return_pct is not None
+                and max_drawdown_return_pct <= -severe_drawdown_limit_pct
+                and (
+                    first_target_hit_trade_date is None
+                    or (
+                        worst_drawdown_trade_date is not None
+                        and worst_drawdown_trade_date <= first_target_hit_trade_date
+                    )
                 )
             )
-        )
         evaluation_status = 'graded'
         grade_label = 'pending_horizon'
         missed_opportunity: bool | None = None
@@ -1887,6 +1896,7 @@ class SignalDeciderLoopService:
             'stop_loss_hit': stop_loss_hit,
             'best_exit_trade_date': outcome_diagnostics.get('best_exit_trade_date'),
             'worst_drawdown_trade_date': outcome_diagnostics.get('worst_drawdown_trade_date'),
+            'first_severe_drawdown_trade_date': first_severe_drawdown_trade_date,
             'first_target_hit_trade_date': outcome_diagnostics.get('first_target_hit_trade_date'),
             'first_stop_loss_hit_trade_date': outcome_diagnostics.get('first_stop_loss_hit_trade_date'),
             'severe_drawdown_before_target': severe_drawdown_before_target if decision_action == 'buy' else None,
@@ -2055,6 +2065,30 @@ class SignalDeciderLoopService:
         if numerator_price is None or denominator_price is None or denominator_price <= 0:
             return None
         return round((numerator_price / denominator_price) - 1.0, 6)
+
+    def _first_severe_drawdown_trade_date(
+        self,
+        *,
+        entry_price: int | None,
+        price_path: Any,
+        severe_drawdown_limit_pct: float,
+        first_target_hit_trade_date: str | None,
+    ) -> str | None:
+        if entry_price is None or not isinstance(price_path, list):
+            return None
+        for bar in price_path:
+            bar_payload = _maybe_dict(bar)
+            trade_date = _normalize_optional_text(
+                str(bar_payload.get('trade_date')) if bar_payload.get('trade_date') is not None else None
+            )
+            if trade_date is None:
+                continue
+            if first_target_hit_trade_date is not None and trade_date > first_target_hit_trade_date:
+                continue
+            low_return_pct = self._return_pct(_to_int(bar_payload.get('low_price')), entry_price)
+            if low_return_pct is not None and low_return_pct <= -severe_drawdown_limit_pct:
+                return trade_date
+        return None
 
     def _buy_grade_score(
         self,

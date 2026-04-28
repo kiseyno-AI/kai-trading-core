@@ -541,6 +541,40 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
         self.assertEqual(outcome['worst_drawdown_trade_date'], '2026-04-21')
         self.assertEqual(outcome['first_target_hit_trade_date'], '2026-04-22')
 
+    def test_compute_evaluations_detects_pre_target_severe_drawdown_when_worst_low_is_later(self):
+        repository = FakeSignalDeciderLoopRepository(
+            [_feedback_row(feedback_id=1, market_date='2026-04-20', symbol='005930', action='buy')]
+        )
+        service = SignalDeciderLoopService(repository=repository)
+
+        bars = [
+            {'trade_date': '2026-04-20', 'open_price': 98, 'high_price': 99, 'low_price': 97, 'close_price': 98, 'volume': 1000},
+            {'trade_date': '2026-04-21', 'open_price': 100, 'high_price': 103, 'low_price': 96, 'close_price': 100, 'volume': 1000},
+            {'trade_date': '2026-04-22', 'open_price': 100, 'high_price': 106, 'low_price': 99, 'close_price': 105, 'volume': 1000},
+            {'trade_date': '2026-04-23', 'open_price': 105, 'high_price': 106, 'low_price': 93, 'close_price': 95, 'volume': 1000},
+            {'trade_date': '2026-04-24', 'open_price': 95, 'high_price': 98, 'low_price': 94, 'close_price': 96, 'volume': 1000},
+            {'trade_date': '2026-04-27', 'open_price': 96, 'high_price': 99, 'low_price': 95, 'close_price': 97, 'volume': 1000},
+        ]
+
+        with patch(
+            'app.agent_context.signal_decider_loop_service.load_daily_bars_for_symbol_range',
+            return_value=bars,
+        ):
+            result = service.compute_evaluations(
+                market_date_from='2026-04-20',
+                market_date_to='2026-04-20',
+                horizons=[5],
+                evaluation_version='signal_decider_eval_test',
+            )
+
+        evaluation = result['items'][0]['evaluations'][0]
+        outcome = result['items'][0]['outcomes'][0]
+        self.assertEqual(evaluation['grade_label'], 'bad_buy')
+        self.assertTrue(evaluation['rationale']['severe_drawdown_before_target'])
+        self.assertEqual(evaluation['diagnostics']['first_severe_drawdown_trade_date'], '2026-04-21')
+        self.assertEqual(outcome['worst_drawdown_trade_date'], '2026-04-23')
+        self.assertEqual(outcome['first_target_hit_trade_date'], '2026-04-22')
+
     def test_compute_recent_evaluations_uses_trailing_calendar_window(self):
         repository = FakeSignalDeciderLoopRepository([])
         service = SignalDeciderLoopService(repository=repository)
