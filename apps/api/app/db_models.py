@@ -902,10 +902,66 @@ class AgentContextFeedback(Base, TimestampMixin):
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
 
 
+class SignalDeciderDecisionSnapshot(Base, TimestampMixin):
+    __tablename__ = 'signal_decider_decision_snapshots'
+    __table_args__ = (
+        Index(
+            'ix_signal_decider_decision_snapshots_market_symbol_created',
+            'market_date',
+            'symbol',
+            'created_at',
+        ),
+        Index(
+            'ix_signal_decider_decision_snapshots_policy_action_created',
+            'policy_version',
+            'decision_action',
+            'created_at',
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    feedback_id: Mapped[int | None] = mapped_column(
+        ForeignKey('agent_context_feedback.id', ondelete='SET NULL'),
+        index=True,
+    )
+    market_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    symbol: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    agent_name: Mapped[str] = mapped_column(String(64), nullable=False, default='signal-decider', index=True)
+    agent_version: Mapped[str | None] = mapped_column(String(64))
+    decision_run_id: Mapped[str | None] = mapped_column(String(128), index=True)
+    feedback_received_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    policy_version: Mapped[str] = mapped_column(String(64), nullable=False, default='signal_decider_policy_v1', index=True)
+    decision_action: Mapped[str] = mapped_column(String(16), nullable=False, default='wait', index=True)
+    preferred_action: Mapped[str] = mapped_column(String(16), nullable=False, default='wait')
+    next_day_open_action: Mapped[str] = mapped_column(String(16), nullable=False, default='wait')
+    entry_price_basis: Mapped[str] = mapped_column(String(32), nullable=False, default='next_open')
+    target_price: Mapped[int | None] = mapped_column(BigInteger)
+    expected_return_pct: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    stop_loss_price: Mapped[int | None] = mapped_column(BigInteger)
+    suggested_holding_period: Mapped[str | None] = mapped_column(String(64))
+    confidence_score_10: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    conviction_score_10: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    thesis_summary: Mapped[str] = mapped_column(Text, nullable=False)
+    supporting_evidence_payload: Mapped[list | dict] = mapped_column(JSON, nullable=False)
+    decision_risks_payload: Mapped[list | dict] = mapped_column(JSON, nullable=False)
+    invalidation_conditions_payload: Mapped[list | dict] = mapped_column(JSON, nullable=False)
+    data_quality_warnings_payload: Mapped[list | dict] = mapped_column(JSON, nullable=False)
+    specialist_disagreement_payload: Mapped[list | dict] = mapped_column(JSON, nullable=False)
+    traceability_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    input_feature_snapshot_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    request_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    response_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    response_summary_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+
+
 class SignalDeciderRealizedOutcome(Base, TimestampMixin):
     __tablename__ = 'signal_decider_realized_outcomes'
     __table_args__ = (
-        UniqueConstraint('feedback_id', 'horizon_days', name='uq_signal_decider_realized_outcomes_feedback_horizon'),
+        UniqueConstraint(
+            'decision_snapshot_id',
+            'horizon_days',
+            name='uq_signal_decider_realized_outcomes_snapshot_horizon',
+        ),
         Index(
             'ix_signal_decider_realized_outcomes_market_symbol_horizon',
             'market_date',
@@ -915,9 +971,13 @@ class SignalDeciderRealizedOutcome(Base, TimestampMixin):
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    feedback_id: Mapped[int] = mapped_column(
-        ForeignKey('agent_context_feedback.id', ondelete='CASCADE'),
+    decision_snapshot_id: Mapped[int] = mapped_column(
+        ForeignKey('signal_decider_decision_snapshots.id', ondelete='CASCADE'),
         nullable=False,
+        index=True,
+    )
+    feedback_id: Mapped[int | None] = mapped_column(
+        ForeignKey('agent_context_feedback.id', ondelete='CASCADE'),
         index=True,
     )
     market_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
@@ -951,10 +1011,10 @@ class SignalDeciderEvaluation(Base, TimestampMixin):
     __tablename__ = 'signal_decider_evaluations'
     __table_args__ = (
         UniqueConstraint(
-            'feedback_id',
+            'decision_snapshot_id',
             'horizon_days',
             'evaluation_version',
-            name='uq_signal_decider_evaluations_feedback_horizon_version',
+            name='uq_signal_decider_evaluations_snapshot_horizon_version',
         ),
         Index(
             'ix_signal_decider_evaluations_market_symbol_horizon_version',
@@ -966,9 +1026,13 @@ class SignalDeciderEvaluation(Base, TimestampMixin):
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    feedback_id: Mapped[int] = mapped_column(
-        ForeignKey('agent_context_feedback.id', ondelete='CASCADE'),
+    decision_snapshot_id: Mapped[int] = mapped_column(
+        ForeignKey('signal_decider_decision_snapshots.id', ondelete='CASCADE'),
         nullable=False,
+        index=True,
+    )
+    feedback_id: Mapped[int | None] = mapped_column(
+        ForeignKey('agent_context_feedback.id', ondelete='CASCADE'),
         index=True,
     )
     realized_outcome_id: Mapped[int | None] = mapped_column(

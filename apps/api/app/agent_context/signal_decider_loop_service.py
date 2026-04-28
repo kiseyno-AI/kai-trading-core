@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 import hashlib
 from typing import Any, Sequence
@@ -13,6 +13,7 @@ from app.agent_context.roles import SIGNAL_DECIDER_AGENT_NAME
 from app.db import session_scope
 from app.db_models import (
     AgentContextFeedback,
+    SignalDeciderDecisionSnapshot,
     SignalDeciderEvaluation,
     SignalDeciderPolicyCandidate,
     SignalDeciderRealizedOutcome,
@@ -91,6 +92,19 @@ def _normalize_optional_text(value: str | None, *, default: str | None = None) -
     if normalized:
         return normalized
     return default
+
+
+def _normalize_optional_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip()
+        if not normalized:
+            return None
+        if normalized.endswith('Z'):
+            normalized = normalized[:-1] + '+00:00'
+        return datetime.fromisoformat(normalized)
+    return None
 
 
 def _normalize_action(value: Any) -> str:
@@ -256,6 +270,34 @@ def build_signal_decider_feature_snapshot(
     }
 
 
+def _build_feature_flags(feature_snapshot: dict[str, Any]) -> list[tuple[str, str]]:
+    technical = _maybe_dict(feature_snapshot.get('technical'))
+    action_summary = _maybe_dict(feature_snapshot.get('action_summary'))
+    signal_features = _maybe_dict(feature_snapshot.get('signal_features'))
+    meta = _maybe_dict(feature_snapshot.get('meta'))
+    flags: list[tuple[str, str]] = []
+    for key in ('trend_state', 'ma_alignment'):
+        value = _normalize_optional_text(technical.get(key))
+        if value:
+            flags.append((f'technical.{key}', value))
+    if technical.get('breakout_20d') is True:
+        flags.append(('technical.breakout_20d', 'true'))
+    if technical.get('breakdown_20d') is True:
+        flags.append(('technical.breakdown_20d', 'true'))
+    for key in ('action_label', 'confidence_tier', 'risk_tier', 'signal_score_bucket'):
+        value = _normalize_optional_text(action_summary.get(key))
+        if value:
+            flags.append((f'action_summary.{key}', value))
+    signal_count_bucket = _normalize_optional_text(signal_features.get('signal_count_bucket'))
+    if signal_count_bucket:
+        flags.append(('signal_features.signal_count_bucket', signal_count_bucket))
+    if meta.get('has_data_warnings') is True:
+        flags.append(('meta.has_data_warnings', 'true'))
+    if meta.get('has_disagreement') is True:
+        flags.append(('meta.has_disagreement', 'true'))
+    return flags
+
+
 def _policy_version_from_payloads(
     *,
     summary_payload: dict[str, Any],
@@ -274,9 +316,163 @@ def _policy_version_from_payloads(
     )
 
 
+def build_signal_decider_traceability_snapshot(
+    *,
+    agent_name: str,
+    agent_version: str | None,
+    feedback_id: int | None,
+    decision_run_id: str | None,
+    market_date: date,
+    symbol: str,
+    policy_version: str,
+    decision_action: str,
+    thesis_summary: str,
+    summary_payload: dict[str, Any],
+    feedback_payload: dict[str, Any],
+    context_payload: dict[str, Any] | None,
+    feature_snapshot: dict[str, Any],
+) -> dict[str, Any]:
+    context = _maybe_dict(context_payload)
+    raw_traceability = _maybe_dict(feedback_payload.get('traceability'))
+    decision_support = _maybe_dict(_maybe_dict(feedback_payload.get('details')).get('decision_support'))
+    policy_payload = _maybe_dict(context.get('signal_decider_policy'))
+    orchestration = _maybe_dict(context.get('orchestration'))
+    decision_support_constraints = _maybe_dict(context.get('decision_support_constraints'))
+    upstream_traceability = _maybe_dict(context.get('upstream_traceability'))
+    upstream_summaries = _maybe_dict(context.get('upstream_summaries'))
+    supporting_evidence = _normalize_text_list(
+        feedback_payload.get('supporting_evidence') or decision_support.get('supporting_evidence')
+    )
+    decision_risks = _normalize_text_list(
+        feedback_payload.get('decision_risks') or decision_support.get('decision_risks')
+    )
+    invalidation_conditions = _normalize_text_list(
+        feedback_payload.get('invalidation_conditions') or decision_support.get('invalidation_conditions')
+    )
+    data_quality_warnings = _normalize_text_list(
+        feedback_payload.get('data_quality_warnings') or decision_support.get('data_quality_warnings')
+    )
+    specialist_disagreement = _normalize_text_list(
+        feedback_payload.get('specialist_disagreement') or decision_support.get('specialist_disagreement')
+    )
+    required_upstream_roles = [
+        str(role).strip()
+        for role in orchestration.get('required_upstream_roles', [])
+        if str(role).strip()
+    ]
+    if not required_upstream_roles:
+        required_upstream_roles = sorted(
+            {
+                *[
+                    str(role).strip()
+                    for role in upstream_traceability.keys()
+                    if str(role).strip()
+                ],
+                *[
+                    str(role).strip()
+                    for role in upstream_summaries.keys()
+                    if str(role).strip()
+                ],
+            }
+        )
+    available_upstream_roles = sorted(
+        {
+            *[
+                str(role).strip()
+                for role in upstream_traceability.keys()
+                if str(role).strip()
+            ],
+            *[
+                str(role).strip()
+                for role in upstream_summaries.keys()
+                if str(role).strip()
+            ],
+        }
+    )
+    factor_flags = [{'key': key, 'value': value} for key, value in _build_feature_flags(feature_snapshot)]
+    traceability_symbol = _normalize_optional_text(
+        str(raw_traceability.get('symbol')) if raw_traceability.get('symbol') is not None else None
+    )
+    traceability_market_date = _normalize_optional_text(
+        str(raw_traceability.get('market_date')) if raw_traceability.get('market_date') is not None else None
+    )
+    traceability_agent_name = _normalize_optional_text(
+        str(raw_traceability.get('agent_name')) if raw_traceability.get('agent_name') is not None else None
+    )
+    upstream_references: dict[str, dict[str, Any]] = {}
+    for role in available_upstream_roles:
+        trace_info = _maybe_dict(upstream_traceability.get(role))
+        upstream_references[role] = {
+            'feedback_id': trace_info.get('feedback_id'),
+            'run_id': trace_info.get('run_id'),
+            'market_date': trace_info.get('market_date'),
+            'received_at': trace_info.get('received_at'),
+            'source': trace_info.get('source'),
+        }
+    return {
+        'schema_version': 'signal_decider_trace_v2',
+        'agent': {
+            'agent_name': agent_name,
+            'agent_version': agent_version,
+            'model': summary_payload.get('model'),
+            'feedback_id': feedback_id,
+            'decision_run_id': decision_run_id,
+        },
+        'policy': {
+            'version': policy_version,
+            'activation_mode': policy_payload.get('activation_mode', 'manual_only'),
+            'candidate_activation_required': bool(policy_payload.get('candidate_activation_required', True)),
+        },
+        'orchestration': orchestration,
+        'upstream_references': upstream_references,
+        'gate_checks': {
+            'required_upstream_roles': required_upstream_roles,
+            'available_upstream_roles': available_upstream_roles,
+            'missing_upstream_roles': [
+                role for role in required_upstream_roles if role not in set(available_upstream_roles)
+            ],
+            'decision_support_only': bool(decision_support_constraints.get('decision_support_only')),
+            'allow_execution_logic': bool(decision_support_constraints.get('allow_execution_logic', False)),
+            'has_data_warnings': bool(data_quality_warnings),
+            'has_specialist_disagreement': bool(specialist_disagreement),
+            'traceability_symbol_matches': traceability_symbol in {None, symbol},
+            'traceability_market_date_matches': traceability_market_date in {None, market_date.isoformat()},
+            'traceability_agent_name_matches': traceability_agent_name in {None, agent_name},
+        },
+        'factor_contributions': {
+            'supporting_evidence': supporting_evidence,
+            'decision_risks': decision_risks,
+            'invalidation_conditions': invalidation_conditions,
+            'data_quality_warnings': data_quality_warnings,
+            'specialist_disagreement': specialist_disagreement,
+            'feature_flags': factor_flags,
+            'feature_snapshot_meta': _maybe_dict(feature_snapshot.get('meta')),
+        },
+        'final_action_rationale': {
+            'decision_action': decision_action,
+            'summary': thesis_summary,
+            'confidence_score_10': _to_float(
+                feedback_payload.get('confidence_score_10') or decision_support.get('confidence_score_10')
+            ),
+            'conviction_score_10': _to_float(
+                feedback_payload.get('conviction_score_10') or decision_support.get('conviction_score_10')
+            ),
+            'expected_return_pct': _to_float(
+                feedback_payload.get('expected_return_pct') or decision_support.get('expected_return_pct')
+            ),
+            'target_price': _to_int(feedback_payload.get('target_price') or decision_support.get('target_price')),
+            'stop_loss_price': _to_int(
+                feedback_payload.get('stop_loss_price') or decision_support.get('stop_loss_price')
+            ),
+        },
+        'raw_traceability': raw_traceability,
+    }
+
+
 def _serialize_outcome_row(row: SignalDeciderRealizedOutcome) -> dict[str, Any]:
     return {
         'id': row.id,
+        'decision_snapshot_id': row.decision_snapshot_id,
         'feedback_id': row.feedback_id,
         'market_date': row.market_date.isoformat(),
         'symbol': row.symbol,
@@ -309,6 +505,7 @@ def _serialize_outcome_row(row: SignalDeciderRealizedOutcome) -> dict[str, Any]:
 def _serialize_evaluation_row(row: SignalDeciderEvaluation) -> dict[str, Any]:
     return {
         'id': row.id,
+        'decision_snapshot_id': row.decision_snapshot_id,
         'feedback_id': row.feedback_id,
         'realized_outcome_id': row.realized_outcome_id,
         'market_date': row.market_date.isoformat(),
@@ -357,7 +554,20 @@ def _serialize_policy_candidate_row(row: SignalDeciderPolicyCandidate) -> dict[s
 
 
 class SignalDeciderLoopRepository:
-    def list_signal_decider_feedback(
+    def insert_decision_snapshots(
+        self,
+        *,
+        session,
+        items: Sequence[dict[str, Any]],
+    ) -> list[SignalDeciderDecisionSnapshot]:
+        if not items:
+            return []
+        rows = [SignalDeciderDecisionSnapshot(**item) for item in items]
+        session.add_all(rows)
+        session.flush()
+        return rows
+
+    def list_decision_snapshots(
         self,
         *,
         market_date: date | None = None,
@@ -365,24 +575,24 @@ class SignalDeciderLoopRepository:
         market_date_to: date | None = None,
         symbols: Sequence[str] | None = None,
         limit: int | None = None,
-    ) -> list[AgentContextFeedback]:
+    ) -> list[SignalDeciderDecisionSnapshot]:
         normalized_symbols = _normalize_symbols(symbols)
         with session_scope() as session:
-            stmt = select(AgentContextFeedback).where(
-                AgentContextFeedback.agent_name == SIGNAL_DECIDER_AGENT_NAME
+            stmt = select(SignalDeciderDecisionSnapshot).where(
+                SignalDeciderDecisionSnapshot.agent_name == SIGNAL_DECIDER_AGENT_NAME
             )
             if market_date is not None:
-                stmt = stmt.where(AgentContextFeedback.market_date == market_date)
+                stmt = stmt.where(SignalDeciderDecisionSnapshot.market_date == market_date)
             if market_date_from is not None:
-                stmt = stmt.where(AgentContextFeedback.market_date >= market_date_from)
+                stmt = stmt.where(SignalDeciderDecisionSnapshot.market_date >= market_date_from)
             if market_date_to is not None:
-                stmt = stmt.where(AgentContextFeedback.market_date <= market_date_to)
+                stmt = stmt.where(SignalDeciderDecisionSnapshot.market_date <= market_date_to)
             if normalized_symbols:
-                stmt = stmt.where(AgentContextFeedback.symbol.in_(normalized_symbols))
+                stmt = stmt.where(SignalDeciderDecisionSnapshot.symbol.in_(normalized_symbols))
             stmt = stmt.order_by(
-                AgentContextFeedback.market_date.desc(),
-                AgentContextFeedback.received_at.desc(),
-                AgentContextFeedback.id.desc(),
+                SignalDeciderDecisionSnapshot.market_date.desc(),
+                SignalDeciderDecisionSnapshot.created_at.desc(),
+                SignalDeciderDecisionSnapshot.id.desc(),
             )
             if limit is not None:
                 stmt = stmt.limit(limit)
@@ -391,15 +601,15 @@ class SignalDeciderLoopRepository:
     def list_realized_outcomes(
         self,
         *,
-        feedback_ids: Sequence[int],
+        decision_snapshot_ids: Sequence[int],
         horizons: Sequence[int] | None = None,
     ) -> list[dict[str, Any]]:
-        if not feedback_ids:
+        if not decision_snapshot_ids:
             return []
         normalized_horizons = _normalize_horizons(horizons)
         with session_scope() as session:
             stmt = select(SignalDeciderRealizedOutcome).where(
-                SignalDeciderRealizedOutcome.feedback_id.in_(feedback_ids)
+                SignalDeciderRealizedOutcome.decision_snapshot_id.in_(decision_snapshot_ids)
             )
             if normalized_horizons:
                 stmt = stmt.where(SignalDeciderRealizedOutcome.horizon_days.in_(normalized_horizons))
@@ -409,15 +619,17 @@ class SignalDeciderLoopRepository:
     def list_evaluations(
         self,
         *,
-        feedback_ids: Sequence[int],
+        decision_snapshot_ids: Sequence[int],
         horizons: Sequence[int] | None = None,
         evaluation_version: str | None = None,
     ) -> list[dict[str, Any]]:
-        if not feedback_ids:
+        if not decision_snapshot_ids:
             return []
         normalized_horizons = _normalize_horizons(horizons)
         with session_scope() as session:
-            stmt = select(SignalDeciderEvaluation).where(SignalDeciderEvaluation.feedback_id.in_(feedback_ids))
+            stmt = select(SignalDeciderEvaluation).where(
+                SignalDeciderEvaluation.decision_snapshot_id.in_(decision_snapshot_ids)
+            )
             if normalized_horizons:
                 stmt = stmt.where(SignalDeciderEvaluation.horizon_days.in_(normalized_horizons))
             if evaluation_version:
@@ -487,8 +699,9 @@ class SignalDeciderLoopRepository:
             stmt = insert(SignalDeciderRealizedOutcome).values(list(items))
             excluded = stmt.excluded
             stmt = stmt.on_conflict_do_update(
-                constraint='uq_signal_decider_realized_outcomes_feedback_horizon',
+                constraint='uq_signal_decider_realized_outcomes_snapshot_horizon',
                 set_={
+                    'feedback_id': excluded.feedback_id,
                     'market_date': excluded.market_date,
                     'symbol': excluded.symbol,
                     'policy_version': excluded.policy_version,
@@ -522,8 +735,11 @@ class SignalDeciderLoopRepository:
                 .where(SignalDeciderRealizedOutcome.id.in_(ids))
                 .order_by(SignalDeciderRealizedOutcome.id.asc())
             ).scalars().all()
-            by_key = {(row.feedback_id, row.horizon_days): _serialize_outcome_row(row) for row in rows}
-            return [by_key[(item['feedback_id'], item['horizon_days'])] for item in items]
+            by_key = {
+                (row.decision_snapshot_id, row.horizon_days): _serialize_outcome_row(row)
+                for row in rows
+            }
+            return [by_key[(item['decision_snapshot_id'], item['horizon_days'])] for item in items]
 
     def bulk_upsert_evaluations(self, *, items: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
         if not items:
@@ -532,9 +748,10 @@ class SignalDeciderLoopRepository:
             stmt = insert(SignalDeciderEvaluation).values(list(items))
             excluded = stmt.excluded
             stmt = stmt.on_conflict_do_update(
-                constraint='uq_signal_decider_evaluations_feedback_horizon_version',
+                constraint='uq_signal_decider_evaluations_snapshot_horizon_version',
                 set_={
                     'realized_outcome_id': excluded.realized_outcome_id,
+                    'feedback_id': excluded.feedback_id,
                     'market_date': excluded.market_date,
                     'symbol': excluded.symbol,
                     'policy_version': excluded.policy_version,
@@ -557,11 +774,11 @@ class SignalDeciderLoopRepository:
                 .order_by(SignalDeciderEvaluation.id.asc())
             ).scalars().all()
             by_key = {
-                (row.feedback_id, row.horizon_days, row.evaluation_version): _serialize_evaluation_row(row)
+                (row.decision_snapshot_id, row.horizon_days, row.evaluation_version): _serialize_evaluation_row(row)
                 for row in rows
             }
             return [
-                by_key[(item['feedback_id'], item['horizon_days'], item['evaluation_version'])]
+                by_key[(item['decision_snapshot_id'], item['horizon_days'], item['evaluation_version'])]
                 for item in items
             ]
 
@@ -651,6 +868,112 @@ class SignalDeciderLoopService:
         }
         return enriched_summary, enriched_feedback, context
 
+    def prepare_snapshot_persistence_item(
+        self,
+        *,
+        feedback_id: int | None,
+        market_date: str | date,
+        symbol: str,
+        agent_name: str,
+        agent_version: str | None,
+        run_id: str | None,
+        summary_payload: dict[str, Any],
+        feedback_payload: dict[str, Any],
+        normalized_feedback_payload: dict[str, Any] | None = None,
+        context_payload: dict[str, Any] | None,
+        received_at: str | datetime | None,
+    ) -> dict[str, Any] | None:
+        if agent_name != SIGNAL_DECIDER_AGENT_NAME:
+            return None
+
+        normalized_market_date = _normalize_market_date(market_date)
+        response_payload = _maybe_dict(normalized_feedback_payload) or _maybe_dict(feedback_payload)
+        request_payload = _maybe_dict(context_payload)
+        policy_version = _policy_version_from_payloads(
+            summary_payload=summary_payload,
+            feedback_payload=response_payload,
+            context_payload=request_payload,
+        )
+        feature_snapshot = _maybe_dict(
+            _maybe_dict(request_payload.get('signal_decider_trace')).get('feature_snapshot')
+        )
+        if not feature_snapshot:
+            feature_snapshot = build_signal_decider_feature_snapshot(
+                symbol_day_context=_maybe_dict(request_payload.get('symbol_day_context')),
+                feedback_payload=response_payload,
+            )
+        decision_action = _normalize_action(
+            response_payload.get('next_day_open_action') or response_payload.get('preferred_action')
+        )
+        thesis_summary = str(
+            response_payload.get('thesis_summary')
+            or response_payload.get('summary')
+            or summary_payload.get('summary')
+            or ''
+        ).strip()
+        traceability_payload = _maybe_dict(request_payload.get('signal_decider_trace')).get('traceability')
+        if not isinstance(traceability_payload, dict) or not traceability_payload.get('schema_version'):
+            traceability_payload = build_signal_decider_traceability_snapshot(
+                agent_name=agent_name,
+                agent_version=agent_version,
+                feedback_id=feedback_id,
+                decision_run_id=run_id,
+                market_date=normalized_market_date,
+                symbol=symbol,
+                policy_version=policy_version,
+                decision_action=decision_action,
+                thesis_summary=thesis_summary,
+                summary_payload=summary_payload,
+                feedback_payload=response_payload,
+                context_payload=request_payload,
+                feature_snapshot=feature_snapshot,
+            )
+        return {
+            'feedback_id': feedback_id,
+            'market_date': normalized_market_date,
+            'symbol': symbol,
+            'agent_name': agent_name,
+            'agent_version': agent_version,
+            'decision_run_id': run_id,
+            'feedback_received_at': _normalize_optional_datetime(received_at),
+            'policy_version': policy_version,
+            'decision_action': decision_action,
+            'preferred_action': _normalize_action(response_payload.get('preferred_action')),
+            'next_day_open_action': _normalize_action(response_payload.get('next_day_open_action')),
+            'entry_price_basis': _normalize_optional_text(
+                str(response_payload.get('entry_price_basis')) if response_payload.get('entry_price_basis') is not None else None,
+                default='next_open',
+            )
+            or 'next_open',
+            'target_price': _to_int(response_payload.get('target_price')),
+            'expected_return_pct': _to_float(response_payload.get('expected_return_pct')),
+            'stop_loss_price': _to_int(response_payload.get('stop_loss_price')),
+            'suggested_holding_period': _normalize_optional_text(
+                str(response_payload.get('suggested_holding_period'))
+                if response_payload.get('suggested_holding_period') is not None
+                else None
+            ),
+            'confidence_score_10': _to_float(response_payload.get('confidence_score_10')),
+            'conviction_score_10': _to_float(response_payload.get('conviction_score_10')),
+            'thesis_summary': thesis_summary,
+            'supporting_evidence_payload': _normalize_text_list(response_payload.get('supporting_evidence')),
+            'decision_risks_payload': _normalize_text_list(response_payload.get('decision_risks')),
+            'invalidation_conditions_payload': _normalize_text_list(
+                response_payload.get('invalidation_conditions')
+            ),
+            'data_quality_warnings_payload': _normalize_text_list(
+                response_payload.get('data_quality_warnings')
+            ),
+            'specialist_disagreement_payload': _normalize_text_list(
+                response_payload.get('specialist_disagreement')
+            ),
+            'traceability_payload': traceability_payload,
+            'input_feature_snapshot_payload': feature_snapshot,
+            'request_payload': request_payload,
+            'response_payload': response_payload,
+            'response_summary_payload': _maybe_dict(summary_payload),
+        }
+
     def list_decisions(
         self,
         *,
@@ -660,7 +983,7 @@ class SignalDeciderLoopService:
     ) -> dict[str, Any]:
         normalized_market_date = _normalize_market_date(market_date)
         normalized_symbol = _normalize_optional_symbol(symbol)
-        rows = self.repository.list_signal_decider_feedback(
+        rows = self.repository.list_decision_snapshots(
             market_date=normalized_market_date,
             symbols=[normalized_symbol] if normalized_symbol else None,
             limit=_normalize_limit(limit, default=50),
@@ -693,18 +1016,18 @@ class SignalDeciderLoopService:
             _normalize_optional_text(evaluation_version, default=DEFAULT_SIGNAL_DECIDER_EVALUATION_VERSION)
             or DEFAULT_SIGNAL_DECIDER_EVALUATION_VERSION
         )
-        rows = self.repository.list_signal_decider_feedback(
+        rows = self.repository.list_decision_snapshots(
             market_date=normalized_market_date,
             symbols=[normalized_symbol] if normalized_symbol else None,
             limit=_normalize_limit(limit, default=20),
         )
-        feedback_ids = [row.id for row in rows]
-        outcomes_by_feedback = self._group_by_feedback_id(
-            self.repository.list_realized_outcomes(feedback_ids=feedback_ids, horizons=None)
+        snapshot_ids = [row.id for row in rows]
+        outcomes_by_snapshot = self._group_by_snapshot_id(
+            self.repository.list_realized_outcomes(decision_snapshot_ids=snapshot_ids, horizons=None)
         )
-        evaluations_by_feedback = self._group_by_feedback_id(
+        evaluations_by_snapshot = self._group_by_snapshot_id(
             self.repository.list_evaluations(
-                feedback_ids=feedback_ids,
+                decision_snapshot_ids=snapshot_ids,
                 horizons=None,
                 evaluation_version=resolved_evaluation_version,
             )
@@ -712,17 +1035,17 @@ class SignalDeciderLoopService:
         items = []
         for row in rows:
             decision = self._build_decision_snapshot(row)
-            context_payload = _maybe_dict(row.context_payload)
+            request_payload = _maybe_dict(row.request_payload)
             items.append(
                 {
                     **decision,
-                    'request_payload': context_payload,
-                    'response_payload': row.feedback_payload,
-                    'response_summary': row.summary_payload,
-                    'upstream_summaries': context_payload.get('upstream_summaries'),
-                    'upstream_traceability': context_payload.get('upstream_traceability'),
-                    'outcomes': outcomes_by_feedback.get(row.id, []),
-                    'evaluations': evaluations_by_feedback.get(row.id, []),
+                    'request_payload': request_payload,
+                    'response_payload': _maybe_dict(row.response_payload),
+                    'response_summary': _maybe_dict(row.response_summary_payload),
+                    'upstream_summaries': request_payload.get('upstream_summaries'),
+                    'upstream_traceability': request_payload.get('upstream_traceability'),
+                    'outcomes': outcomes_by_snapshot.get(row.id, []),
+                    'evaluations': evaluations_by_snapshot.get(row.id, []),
                 }
             )
         return {
@@ -759,7 +1082,7 @@ class SignalDeciderLoopService:
             _normalize_optional_text(evaluation_version, default=DEFAULT_SIGNAL_DECIDER_EVALUATION_VERSION)
             or DEFAULT_SIGNAL_DECIDER_EVALUATION_VERSION
         )
-        rows = self.repository.list_signal_decider_feedback(
+        rows = self.repository.list_decision_snapshots(
             market_date_from=normalized_from,
             market_date_to=normalized_to,
             symbols=normalized_symbols or None,
@@ -798,7 +1121,7 @@ class SignalDeciderLoopService:
             for horizon_days in normalized_horizons:
                 outcome_items.append(
                     self._build_realized_outcome_item(
-                        feedback_row=row,
+                        snapshot_row=row,
                         decision=decision,
                         future_bars=future_bars,
                         horizon_days=horizon_days,
@@ -807,7 +1130,8 @@ class SignalDeciderLoopService:
 
         persisted_outcomes = self.repository.bulk_upsert_realized_outcomes(items=outcome_items)
         outcomes_by_key = {
-            (item['feedback_id'], item['horizon_days']): item for item in persisted_outcomes
+            (item['decision_snapshot_id'], item['horizon_days']): item
+            for item in persisted_outcomes
         }
         evaluation_items: list[dict[str, Any]] = []
         for row in rows:
@@ -816,7 +1140,7 @@ class SignalDeciderLoopService:
                 outcome = outcomes_by_key[(row.id, horizon_days)]
                 evaluation_items.append(
                     self._build_evaluation_item(
-                        feedback_row=row,
+                        snapshot_row=row,
                         decision=decision,
                         outcome=outcome,
                         horizon_days=horizon_days,
@@ -824,13 +1148,13 @@ class SignalDeciderLoopService:
                     )
                 )
         persisted_evaluations = self.repository.bulk_upsert_evaluations(items=evaluation_items)
-        outcomes_by_feedback = self._group_by_feedback_id(persisted_outcomes)
-        evaluations_by_feedback = self._group_by_feedback_id(persisted_evaluations)
+        outcomes_by_snapshot = self._group_by_snapshot_id(persisted_outcomes)
+        evaluations_by_snapshot = self._group_by_snapshot_id(persisted_evaluations)
         items = [
             {
                 **decision_snapshots[row.id],
-                'outcomes': outcomes_by_feedback.get(row.id, []),
-                'evaluations': evaluations_by_feedback.get(row.id, []),
+                'outcomes': outcomes_by_snapshot.get(row.id, []),
+                'evaluations': evaluations_by_snapshot.get(row.id, []),
             }
             for row in rows
         ]
@@ -875,18 +1199,21 @@ class SignalDeciderLoopService:
             _normalize_optional_text(evaluation_version, default=DEFAULT_SIGNAL_DECIDER_EVALUATION_VERSION)
             or DEFAULT_SIGNAL_DECIDER_EVALUATION_VERSION
         )
-        rows = self.repository.list_signal_decider_feedback(
+        rows = self.repository.list_decision_snapshots(
             market_date=normalized_market_date,
             symbols=[normalized_symbol] if normalized_symbol else None,
             limit=_normalize_limit(limit, default=50),
         )
-        feedback_ids = [row.id for row in rows]
-        outcomes_by_feedback = self._group_by_feedback_id(
-            self.repository.list_realized_outcomes(feedback_ids=feedback_ids, horizons=normalized_horizons)
+        snapshot_ids = [row.id for row in rows]
+        outcomes_by_snapshot = self._group_by_snapshot_id(
+            self.repository.list_realized_outcomes(
+                decision_snapshot_ids=snapshot_ids,
+                horizons=normalized_horizons,
+            )
         )
-        evaluations_by_feedback = self._group_by_feedback_id(
+        evaluations_by_snapshot = self._group_by_snapshot_id(
             self.repository.list_evaluations(
-                feedback_ids=feedback_ids,
+                decision_snapshot_ids=snapshot_ids,
                 horizons=normalized_horizons,
                 evaluation_version=resolved_version,
             )
@@ -894,8 +1221,8 @@ class SignalDeciderLoopService:
         items = [
             {
                 **self._build_decision_snapshot(row),
-                'outcomes': outcomes_by_feedback.get(row.id, []),
-                'evaluations': evaluations_by_feedback.get(row.id, []),
+                'outcomes': outcomes_by_snapshot.get(row.id, []),
+                'evaluations': evaluations_by_snapshot.get(row.id, []),
             }
             for row in rows
         ]
@@ -944,12 +1271,12 @@ class SignalDeciderLoopService:
             evaluation_version=resolved_version,
             force_recompute=force_recompute,
         )
-        feedback_rows = self.repository.list_signal_decider_feedback(
+        snapshot_rows = self.repository.list_decision_snapshots(
             market_date_from=normalized_from,
             market_date_to=normalized_to,
             symbols=normalized_symbols or None,
         )
-        feedback_by_id = {row.id: row for row in feedback_rows}
+        snapshots_by_id = {row.id: row for row in snapshot_rows}
         evaluations = self.repository.list_evaluations_by_range(
             market_date_from=normalized_from,
             market_date_to=normalized_to,
@@ -961,11 +1288,11 @@ class SignalDeciderLoopService:
         for evaluation in evaluations:
             if evaluation.get('evaluation_status') != 'graded':
                 continue
-            feedback_id = int(evaluation['feedback_id'])
-            feedback_row = feedback_by_id.get(feedback_id)
-            if feedback_row is None:
+            snapshot_id = int(evaluation['decision_snapshot_id'])
+            snapshot_row = snapshots_by_id.get(snapshot_id)
+            if snapshot_row is None:
                 continue
-            decision = self._build_decision_snapshot(feedback_row)
+            decision = self._build_decision_snapshot(snapshot_row)
             feature_flags = self._build_feature_flags(decision['feature_snapshot'])
             if not feature_flags:
                 continue
@@ -1006,7 +1333,8 @@ class SignalDeciderLoopService:
                     if len(group['samples']) < 10:
                         group['samples'].append(
                             {
-                                'feedback_id': feedback_id,
+                                'snapshot_id': snapshot_id,
+                                'feedback_id': evaluation.get('feedback_id'),
                                 'symbol': decision['symbol'],
                                 'market_date': decision['market_date'],
                                 'grade_label': grade_label,
@@ -1150,53 +1478,73 @@ class SignalDeciderLoopService:
             'items': items,
         }
 
-    def _build_decision_snapshot(self, row: AgentContextFeedback) -> dict[str, Any]:
-        summary_payload = _maybe_dict(row.summary_payload)
-        feedback_payload = _maybe_dict(row.normalized_feedback_payload) or _maybe_dict(row.feedback_payload)
-        context_payload = _maybe_dict(row.context_payload)
-        trace_payload = _maybe_dict(context_payload.get('signal_decider_trace'))
-        feature_snapshot = _maybe_dict(trace_payload.get('feature_snapshot'))
+    def _build_decision_snapshot(self, row: SignalDeciderDecisionSnapshot) -> dict[str, Any]:
+        summary_payload = _maybe_dict(row.response_summary_payload)
+        feedback_payload = _maybe_dict(row.response_payload)
+        request_payload = _maybe_dict(row.request_payload)
+        feature_snapshot = _maybe_dict(row.input_feature_snapshot_payload)
         if not feature_snapshot:
             feature_snapshot = build_signal_decider_feature_snapshot(
-                symbol_day_context=_maybe_dict(context_payload.get('symbol_day_context')),
+                symbol_day_context=_maybe_dict(request_payload.get('symbol_day_context')),
                 feedback_payload=feedback_payload,
             )
-        policy_version = _policy_version_from_payloads(
-            summary_payload=summary_payload,
-            feedback_payload=feedback_payload,
-            context_payload=context_payload,
-        )
-        decision_action = _normalize_action(
-            feedback_payload.get('next_day_open_action') or feedback_payload.get('preferred_action')
-        )
+        policy_version = _normalize_optional_text(row.policy_version, default=DEFAULT_SIGNAL_DECIDER_POLICY_VERSION)
+        decision_action = _normalize_action(row.decision_action or feedback_payload.get('next_day_open_action'))
+        thesis_summary = str(
+            row.thesis_summary
+            or feedback_payload.get('thesis_summary')
+            or feedback_payload.get('summary')
+            or summary_payload.get('summary')
+            or ''
+        ).strip()
+        traceability = _maybe_dict(row.traceability_payload)
+        if not traceability.get('schema_version'):
+            traceability = build_signal_decider_traceability_snapshot(
+                agent_name=row.agent_name,
+                agent_version=row.agent_version,
+                feedback_id=row.feedback_id,
+                decision_run_id=row.decision_run_id,
+                market_date=row.market_date,
+                symbol=row.symbol,
+                policy_version=policy_version or DEFAULT_SIGNAL_DECIDER_POLICY_VERSION,
+                decision_action=decision_action,
+                thesis_summary=thesis_summary,
+                summary_payload=summary_payload,
+                feedback_payload=feedback_payload,
+                context_payload=request_payload,
+                feature_snapshot=feature_snapshot,
+            )
         return {
-            'feedback_id': row.id,
+            'snapshot_id': row.id,
+            'feedback_id': row.feedback_id,
+            'decision_run_id': row.decision_run_id,
             'market_date': row.market_date.isoformat(),
             'symbol': row.symbol,
             'policy_version': policy_version,
             'decision': {
                 'action': decision_action,
-                'entry_price_basis': feedback_payload.get('entry_price_basis'),
-                'target_price': _to_int(feedback_payload.get('target_price')),
-                'expected_return_pct': _to_float(feedback_payload.get('expected_return_pct')),
-                'stop_loss_price': _to_int(feedback_payload.get('stop_loss_price')),
-                'suggested_holding_period': feedback_payload.get('suggested_holding_period'),
-                'confidence_score_10': _to_float(feedback_payload.get('confidence_score_10')),
-                'conviction_score_10': _to_float(feedback_payload.get('conviction_score_10')),
+                'preferred_action': _normalize_action(row.preferred_action or feedback_payload.get('preferred_action')),
+                'next_day_open_action': _normalize_action(
+                    row.next_day_open_action or feedback_payload.get('next_day_open_action')
+                ),
+                'entry_price_basis': row.entry_price_basis,
+                'target_price': _to_int(row.target_price),
+                'expected_return_pct': _to_float(row.expected_return_pct),
+                'stop_loss_price': _to_int(row.stop_loss_price),
+                'suggested_holding_period': row.suggested_holding_period,
+                'confidence_score_10': _to_float(row.confidence_score_10),
+                'conviction_score_10': _to_float(row.conviction_score_10),
             },
-            'summary': str(
-                feedback_payload.get('thesis_summary')
-                or feedback_payload.get('summary')
-                or summary_payload.get('summary')
-                or ''
-            ).strip(),
-            'supporting_evidence': _normalize_text_list(feedback_payload.get('supporting_evidence')),
-            'decision_risks': _normalize_text_list(feedback_payload.get('decision_risks')),
-            'data_quality_warnings': _normalize_text_list(feedback_payload.get('data_quality_warnings')),
-            'specialist_disagreement': _normalize_text_list(feedback_payload.get('specialist_disagreement')),
-            'traceability': _maybe_dict(feedback_payload.get('traceability')),
+            'summary': thesis_summary,
+            'supporting_evidence': _normalize_text_list(row.supporting_evidence_payload),
+            'decision_risks': _normalize_text_list(row.decision_risks_payload),
+            'invalidation_conditions': _normalize_text_list(row.invalidation_conditions_payload),
+            'data_quality_warnings': _normalize_text_list(row.data_quality_warnings_payload),
+            'specialist_disagreement': _normalize_text_list(row.specialist_disagreement_payload),
+            'traceability': traceability,
             'feature_snapshot': feature_snapshot,
-            'received_at': row.received_at.isoformat() if row.received_at else None,
+            'received_at': row.feedback_received_at.isoformat() if row.feedback_received_at else None,
+            'created_at': row.created_at.isoformat() if row.created_at else None,
         }
 
     def _load_future_price_bars(
@@ -1221,7 +1569,7 @@ class SignalDeciderLoopService:
     def _build_realized_outcome_item(
         self,
         *,
-        feedback_row: AgentContextFeedback,
+        snapshot_row: SignalDeciderDecisionSnapshot,
         decision: dict[str, Any],
         future_bars: list[dict[str, Any]],
         horizon_days: int,
@@ -1237,9 +1585,10 @@ class SignalDeciderLoopService:
                 'required_horizon_days': horizon_days,
             }
             return {
-                'feedback_id': feedback_row.id,
-                'market_date': feedback_row.market_date,
-                'symbol': feedback_row.symbol,
+                'decision_snapshot_id': snapshot_row.id,
+                'feedback_id': snapshot_row.feedback_id,
+                'market_date': snapshot_row.market_date,
+                'symbol': snapshot_row.symbol,
                 'policy_version': decision['policy_version'],
                 'decision_action': decision_fields.get('action') or 'wait',
                 'horizon_days': horizon_days,
@@ -1299,9 +1648,10 @@ class SignalDeciderLoopService:
             'bars_observed': len(observed_bars),
         }
         return {
-            'feedback_id': feedback_row.id,
-            'market_date': feedback_row.market_date,
-            'symbol': feedback_row.symbol,
+            'decision_snapshot_id': snapshot_row.id,
+            'feedback_id': snapshot_row.feedback_id,
+            'market_date': snapshot_row.market_date,
+            'symbol': snapshot_row.symbol,
             'policy_version': decision['policy_version'],
             'decision_action': decision_fields.get('action') or 'wait',
             'horizon_days': horizon_days,
@@ -1342,7 +1692,7 @@ class SignalDeciderLoopService:
     def _build_evaluation_item(
         self,
         *,
-        feedback_row: AgentContextFeedback,
+        snapshot_row: SignalDeciderDecisionSnapshot,
         decision: dict[str, Any],
         outcome: dict[str, Any],
         horizon_days: int,
@@ -1431,10 +1781,11 @@ class SignalDeciderLoopService:
             'feature_snapshot': decision.get('feature_snapshot'),
         }
         return {
-            'feedback_id': feedback_row.id,
+            'decision_snapshot_id': snapshot_row.id,
+            'feedback_id': snapshot_row.feedback_id,
             'realized_outcome_id': outcome.get('id'),
-            'market_date': feedback_row.market_date,
-            'symbol': feedback_row.symbol,
+            'market_date': snapshot_row.market_date,
+            'symbol': snapshot_row.symbol,
             'policy_version': decision['policy_version'],
             'decision_action': decision_action,
             'horizon_days': horizon_days,
@@ -1470,31 +1821,7 @@ class SignalDeciderLoopService:
         return None
 
     def _build_feature_flags(self, feature_snapshot: dict[str, Any]) -> list[tuple[str, str]]:
-        technical = _maybe_dict(feature_snapshot.get('technical'))
-        action_summary = _maybe_dict(feature_snapshot.get('action_summary'))
-        signal_features = _maybe_dict(feature_snapshot.get('signal_features'))
-        meta = _maybe_dict(feature_snapshot.get('meta'))
-        flags: list[tuple[str, str]] = []
-        for key in ('trend_state', 'ma_alignment'):
-            value = _normalize_optional_text(technical.get(key))
-            if value:
-                flags.append((f'technical.{key}', value))
-        if technical.get('breakout_20d') is True:
-            flags.append(('technical.breakout_20d', 'true'))
-        if technical.get('breakdown_20d') is True:
-            flags.append(('technical.breakdown_20d', 'true'))
-        for key in ('action_label', 'confidence_tier', 'risk_tier', 'signal_score_bucket'):
-            value = _normalize_optional_text(action_summary.get(key))
-            if value:
-                flags.append((f'action_summary.{key}', value))
-        signal_count_bucket = _normalize_optional_text(signal_features.get('signal_count_bucket'))
-        if signal_count_bucket:
-            flags.append(('signal_features.signal_count_bucket', signal_count_bucket))
-        if meta.get('has_data_warnings') is True:
-            flags.append(('meta.has_data_warnings', 'true'))
-        if meta.get('has_disagreement') is True:
-            flags.append(('meta.has_disagreement', 'true'))
-        return flags
+        return _build_feature_flags(feature_snapshot)
 
     def _candidate_version(
         self,
@@ -1567,11 +1894,11 @@ class SignalDeciderLoopService:
             f'{horizon_days}-day horizon and should allow a looser path toward buy review.'
         )
 
-    def _group_by_feedback_id(self, rows: Sequence[dict[str, Any]]) -> dict[int, list[dict[str, Any]]]:
+    def _group_by_snapshot_id(self, rows: Sequence[dict[str, Any]]) -> dict[int, list[dict[str, Any]]]:
         grouped: dict[int, list[dict[str, Any]]] = {}
         for row in rows:
-            feedback_id = int(row['feedback_id'])
-            grouped.setdefault(feedback_id, []).append(row)
+            snapshot_id = int(row['decision_snapshot_id'])
+            grouped.setdefault(snapshot_id, []).append(row)
         for items in grouped.values():
             items.sort(key=lambda item: int(item.get('horizon_days') or 0))
         return grouped
