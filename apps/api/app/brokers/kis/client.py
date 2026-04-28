@@ -555,6 +555,116 @@ class KISClient:
             'raw_pages': pages,
         }
 
+    async def fetch_domestic_account_balance(
+        self,
+        *,
+        account_number: str,
+        account_product_code: str,
+        after_hours_price_flag: str = 'N',
+        inquiry_division: str = '02',
+        unit_price_division: str = '01',
+        include_fund_settlement: str = 'N',
+        finance_auto_repayment: str = 'N',
+        process_division: str = '00',
+        max_pages: int = 10,
+    ) -> dict[str, Any]:
+        tr_id = self._resolve_tr_id(real='TTTC8434R', demo='VTTC8434R')
+        params = {
+            'CANO': account_number,
+            'ACNT_PRDT_CD': account_product_code,
+            'AFHR_FLPR_YN': after_hours_price_flag,
+            'OFL_YN': '',
+            'INQR_DVSN': inquiry_division,
+            'UNPR_DVSN': unit_price_division,
+            'FUND_STTL_ICLD_YN': include_fund_settlement,
+            'FNCG_AMT_AUTO_RDPT_YN': finance_auto_repayment,
+            'PRCS_DVSN': process_division,
+            'CTX_AREA_FK100': '',
+            'CTX_AREA_NK100': '',
+        }
+        rows: list[dict[str, Any]] = []
+        pages: list[dict[str, Any]] = []
+        summary: dict[str, Any] = {}
+        tr_cont = ''
+        continuation_pending = False
+
+        for _ in range(max_pages):
+            body, next_tr_cont = await self._request(
+                'GET',
+                '/uapi/domestic-stock/v1/trading/inquire-balance',
+                tr_id=tr_id,
+                params=params,
+                tr_cont=tr_cont,
+            )
+            pages.append(body)
+            output_rows = body.get('output1')
+            if isinstance(output_rows, list):
+                rows.extend(item for item in output_rows if isinstance(item, dict))
+            output_summary = body.get('output2')
+            if isinstance(output_summary, dict):
+                summary = output_summary
+            elif isinstance(output_summary, list):
+                summary = next((item for item in reversed(output_summary) if isinstance(item, dict)), summary)
+            params['CTX_AREA_FK100'] = str(body.get('ctx_area_fk100') or '')
+            params['CTX_AREA_NK100'] = str(body.get('ctx_area_nk100') or '')
+            continuation_pending = next_tr_cont in {'M', 'F'}
+            if not continuation_pending:
+                break
+            tr_cont = 'N'
+
+        return {
+            'output1': rows,
+            'output2': summary,
+            'page_count': len(pages),
+            'max_pages_reached': continuation_pending and len(pages) >= max_pages,
+            'raw_pages': pages,
+        }
+
+    async def fetch_domestic_account_asset_summary(
+        self,
+        *,
+        account_number: str,
+        account_product_code: str,
+        inquiry_division_1: str = '',
+        apply_previous_base_date: str = '',
+    ) -> dict[str, Any]:
+        return await self._get(
+            '/uapi/domestic-stock/v1/trading/inquire-account-balance',
+            tr_id='CTRP6548R',
+            params={
+                'CANO': account_number,
+                'ACNT_PRDT_CD': account_product_code,
+                'INQR_DVSN_1': inquiry_division_1,
+                'BSPR_BF_DT_APLY_YN': apply_previous_base_date,
+            },
+        )
+
+    async def fetch_domestic_buying_power(
+        self,
+        *,
+        account_number: str,
+        account_product_code: str,
+        symbol: str,
+        order_price: str,
+        order_division_code: str,
+        include_cma_evaluation: str = 'N',
+        include_overseas: str = 'N',
+    ) -> dict[str, Any]:
+        tr_id = self._resolve_tr_id(real='TTTC8908R', demo='VTTC8908R')
+        return await self._get(
+            '/uapi/domestic-stock/v1/trading/inquire-psbl-order',
+            tr_id=tr_id,
+            params={
+                'CANO': account_number,
+                'ACNT_PRDT_CD': account_product_code,
+                'PDNO': symbol,
+                'ORD_UNPR': order_price,
+                'ORD_DVSN': order_division_code,
+                'CMA_EVLU_AMT_ICLD_YN': include_cma_evaluation,
+                'OVRS_ICLD_YN': include_overseas,
+            },
+        )
+
     async def fetch_domestic_daily_order_fills(
         self,
         *,

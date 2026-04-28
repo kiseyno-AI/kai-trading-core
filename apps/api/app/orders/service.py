@@ -27,6 +27,7 @@ from app.orders.domain import (
     OrderType,
     TimeInForce,
 )
+from app.orders.account_scope import AccountScope, build_kis_account_reference, parse_kis_account_reference
 from app.orders.store import (
     append_broker_order_event,
     create_order_request_if_absent,
@@ -152,13 +153,6 @@ class TradingOrderPendingSubmissionError(TradingOrderError):
 
 class TradingOrderUpstreamError(TradingOrderError):
     pass
-
-
-@dataclass(slots=True)
-class AccountScope:
-    account_reference: str
-    account_number: str
-    account_product_code: str
 
 
 @dataclass(slots=True)
@@ -1306,7 +1300,7 @@ class TradingOrderService:
             field='account_product_code',
         )
         account_reference = _normalize_optional_text(kwargs.get('account_reference'))
-        expected_account_reference = f'KIS:{account_number}-{account_product_code}'
+        expected_account_reference = build_kis_account_reference(account_number, account_product_code)
         if account_reference is not None and account_reference != expected_account_reference:
             raise TradingOrderValidationError(
                 'account_reference must match account_number and account_product_code for submit operations',
@@ -1902,18 +1896,16 @@ class TradingOrderService:
         return TradingOrderUpstreamError(str(exc), payload=payload)
 
     def _account_number_from_reference(self, account_reference: str) -> str:
-        if account_reference.startswith('KIS:') and '-' in account_reference:
-            return account_reference.split(':', 1)[1].rsplit('-', 1)[0]
-        raise TradingOrderValidationError(
-            'account_reference must use the KIS:<account_number>-<product_code> format for control and inquiry operations'
-        )
+        try:
+            return parse_kis_account_reference(account_reference).account_number
+        except ValueError as exc:
+            raise TradingOrderValidationError(str(exc)) from exc
 
     def _account_product_code_from_reference(self, account_reference: str) -> str:
-        if account_reference.startswith('KIS:') and '-' in account_reference:
-            return account_reference.rsplit('-', 1)[1]
-        raise TradingOrderValidationError(
-            'account_reference must use the KIS:<account_number>-<product_code> format for control and inquiry operations'
-        )
+        try:
+            return parse_kis_account_reference(account_reference).account_product_code
+        except ValueError as exc:
+            raise TradingOrderValidationError(str(exc)) from exc
 
 
 trading_order_service = TradingOrderService()
