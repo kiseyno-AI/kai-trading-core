@@ -3,6 +3,7 @@ from __future__ import annotations
 import concurrent.futures
 import json
 import logging
+from pathlib import Path
 import re
 import threading
 import time
@@ -74,7 +75,9 @@ logger = logging.getLogger(__name__)
 
 
 class AgentDispatchError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, details: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.details = details or {}
 
 
 class AgentDispatchRetryableError(AgentDispatchError):
@@ -193,7 +196,12 @@ class OpenClawAgentClient:
     @staticmethod
     def _extract_session_ref(parsed: dict[str, Any], *, explicit_session_key: str | None = None) -> dict[str, Any] | None:
         session_key = explicit_session_key
-        session_id = parsed.get('id')
+        response_id = parsed.get('id')
+        session_id = None
+        if isinstance(parsed.get('session'), dict):
+            session_id = parsed['session'].get('id') or parsed['session'].get('session_id')
+        if not session_id and isinstance(parsed.get('metadata'), dict):
+            session_id = parsed['metadata'].get('session_id')
         if not session_key and isinstance(parsed.get('session'), dict):
             session_key = parsed['session'].get('key')
         if not session_key and isinstance(parsed.get('metadata'), dict):
@@ -204,12 +212,317 @@ class OpenClawAgentClient:
             session_key = result.get('childSessionKey') or result.get('sessionKey')
         if not session_key and details:
             session_key = details.get('childSessionKey') or details.get('sessionKey')
-        if session_key or session_id:
+        if not session_id and isinstance(result, dict):
+            session_id = result.get('childSessionId') or result.get('sessionId')
+        if not session_id and details:
+            session_id = details.get('childSessionId') or details.get('sessionId')
+        if session_key or session_id or response_id:
             return {
                 'session_key': session_key,
                 'session_id': session_id,
+                'response_id': response_id,
             }
         return None
+
+    @staticmethod
+    def _message_text(message: dict[str, Any], *, allowed_types: set[str]) -> str:
+        text_chunks: list[str] = []
+        content = message.get('content')
+        if isinstance(content, str) and content.strip():
+            return content.strip()
+        if not isinstance(content, list):
+            return ''
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            if item.get('type') not in allowed_types:
+                continue
+            text = item.get('text')
+            if isinstance(text, str) and text.strip():
+                text_chunks.append(text)
+        return '\n'.join(text_chunks).strip()
+
+    @staticmethod
+    def _decode_candidate_json(candidate_text: str | None) -> tuple[dict[str, Any] | None, str | None]:
+        normalized_text = _extract_json_object(candidate_text)
+        if not normalized_text:
+            return None, 'json_object_not_found'
+        try:
+            candidate_decoded = json.loads(normalized_text)
+        except json.JSONDecodeError:
+            return None, 'json_decode_error'
+        if isinstance(candidate_decoded, list):
+            return {'items': candidate_decoded}, None
+        if isinstance(candidate_decoded, dict):
+            return candidate_decoded, None
+        return None, 'json_shape_not_object'
+
+    @staticmethod
+    def _failure_class_for_mode(failure_mode: str | None) -> str:
+        if failure_mode in {
+            None,
+            'json_object_not_found',
+            'json_decode_error',
+            'json_shape_not_object',
+            'session_history_assistant_non_json_after_marker',
+            'trajectory_assistant_non_json',
+        }:
+            return 'invalid_json'
+        return str(failure_mode)
+
+    def _recover_from_session_history(
+        self,
+        *,
+        session_history: list[dict[str, Any]],
+        request_marker: str,
+    ) -> dict[str, Any]:
+        diagnostics: dict[str, Any] = {
+            'checked': True,
+            'message_count': len(session_history),
+            'request_marker': request_marker,
+            'marker_found': False,
+            'assistant_messages_after_marker': 0,
+            'assistant_text_messages_after_marker': 0,
+            'failure_mode': None,
+            'json_failure_class': None,
+        }
+        if not session_history:
+            diagnostics['failure_mode'] = 'session_history_missing_or_empty'
+            return {
+                'decoded': None,
+                'output_text': None,
+                'diagnostics': diagnostics,
+            }
+
+        marker_index = None
+        for idx, message in enumerate(session_history):
+            if str(message.get('role') or '') != 'user':
+                continue
+            candidate_text = self._message_text(
+                message,
+                allowed_types={'text', 'input_text', 'output_text'},
+            )
+            if request_marker in candidate_text:
+                marker_index = idx
+
+        diagnostics['marker_found'] = marker_index is not None
+        if marker_index is None:
+            diagnostics['failure_mode'] = 'session_history_marker_not_found'
+            return {
+                'decoded': None,
+                'output_text': None,
+                'diagnostics': diagnostics,
+            }
+
+        last_json_failure = None
+        for message in session_history[marker_index + 1:]:
+            if str(message.get('role') or '') != 'assistant':
+                continue
+            diagnostics['assistant_messages_after_marker'] += 1
+            candidate_text = self._message_text(
+                message,
+                allowed_types={'text', 'output_text'},
+            )
+            if not candidate_text:
+                continue
+            diagnostics['assistant_text_messages_after_marker'] += 1
+            decoded, json_failure_class = self._decode_candidate_json(candidate_text)
+            if decoded is not None:
+                diagnostics['json_failure_class'] = None
+                return {
+                    'decoded': decoded,
+                    'output_text': candidate_text,
+                    'diagnostics': diagnostics,
+                }
+            last_json_failure = json_failure_class
+
+        diagnostics['json_failure_class'] = last_json_failure
+        if diagnostics['assistant_messages_after_marker'] == 0 or diagnostics['assistant_text_messages_after_marker'] == 0:
+            diagnostics['failure_mode'] = 'session_history_assistant_missing_after_marker'
+        else:
+            diagnostics['failure_mode'] = 'session_history_assistant_non_json_after_marker'
+        return {
+            'decoded': None,
+            'output_text': None,
+            'diagnostics': diagnostics,
+        }
+
+    def _session_artifacts_dir(self, *, agent_name: str) -> Path:
+        return Path(settings.openclaw_state_dir).expanduser() / 'agents' / agent_name / 'sessions'
+
+    def _find_trajectory_file(
+        self,
+        *,
+        agent_name: str,
+        session_key: str,
+    ) -> tuple[Path | None, dict[str, Any]]:
+        sessions_dir = self._session_artifacts_dir(agent_name=agent_name)
+        diagnostics: dict[str, Any] = {
+            'sessions_dir': str(sessions_dir),
+            'lookup_mode': None,
+            'session_id': None,
+            'trajectory_file': None,
+        }
+        if not sessions_dir.is_dir():
+            diagnostics['failure_mode'] = 'trajectory_sessions_dir_missing'
+            return None, diagnostics
+
+        registry_path = sessions_dir / 'sessions.json'
+        if registry_path.is_file():
+            try:
+                registry = json.loads(registry_path.read_text(encoding='utf-8'))
+            except (OSError, json.JSONDecodeError) as exc:
+                diagnostics['registry_error'] = f'{type(exc).__name__}: {exc}'
+            else:
+                entry = registry.get(session_key) if isinstance(registry, dict) else None
+                if isinstance(entry, dict):
+                    session_id = entry.get('sessionId')
+                    diagnostics['session_id'] = session_id
+                    if isinstance(session_id, str) and session_id.strip():
+                        trajectory_path = sessions_dir / f'{session_id}.trajectory.jsonl'
+                        if trajectory_path.is_file():
+                            diagnostics['lookup_mode'] = 'sessions_registry'
+                            diagnostics['trajectory_file'] = str(trajectory_path)
+                            return trajectory_path, diagnostics
+
+        for trajectory_path in sessions_dir.glob('*.trajectory.jsonl'):
+            try:
+                with trajectory_path.open('r', encoding='utf-8') as handle:
+                    for _ in range(3):
+                        line = handle.readline()
+                        if not line:
+                            break
+                        if session_key not in line:
+                            continue
+                        try:
+                            event = json.loads(line)
+                        except json.JSONDecodeError:
+                            event = {}
+                        diagnostics['lookup_mode'] = 'trajectory_scan'
+                        diagnostics['trajectory_file'] = str(trajectory_path)
+                        diagnostics['session_id'] = event.get('sessionId')
+                        return trajectory_path, diagnostics
+            except OSError:
+                continue
+
+        diagnostics['failure_mode'] = 'trajectory_artifacts_not_found'
+        return None, diagnostics
+
+    def _recover_from_trajectory_artifacts(
+        self,
+        *,
+        agent_name: str,
+        session_key: str,
+        response_id: str | None,
+    ) -> dict[str, Any]:
+        trajectory_path, diagnostics = self._find_trajectory_file(
+            agent_name=agent_name,
+            session_key=session_key,
+        )
+        diagnostics = {
+            **diagnostics,
+            'checked': True,
+            'requested_response_id': response_id,
+            'matched_response_id': False,
+            'matched_event_type': None,
+            'trajectory_run_id': None,
+            'trajectory_final_status': None,
+            'assistant_text_count': 0,
+            'status': 'not_recovered',
+            'failure_mode': diagnostics.get('failure_mode'),
+            'json_failure_class': None,
+        }
+        if trajectory_path is None:
+            return {
+                'decoded': None,
+                'output_text': None,
+                'diagnostics': diagnostics,
+            }
+
+        candidate_events: list[dict[str, Any]] = []
+        try:
+            with trajectory_path.open('r', encoding='utf-8') as handle:
+                for line in handle:
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if str(event.get('sessionKey') or '') != session_key:
+                        continue
+                    if diagnostics.get('session_id') is None and isinstance(event.get('sessionId'), str):
+                        diagnostics['session_id'] = event.get('sessionId')
+                    if str(event.get('type') or '') not in {'trace.artifacts', 'model.completed'}:
+                        continue
+                    data = event.get('data') if isinstance(event.get('data'), dict) else {}
+                    assistant_texts = data.get('assistantTexts')
+                    if not isinstance(assistant_texts, list) or not assistant_texts:
+                        continue
+                    candidate_events.append(
+                        {
+                            'type': str(event.get('type') or ''),
+                            'run_id': str(event.get('runId') or ''),
+                            'session_id': event.get('sessionId'),
+                            'final_status': data.get('finalStatus') or data.get('status'),
+                            'assistant_texts': [text for text in assistant_texts if isinstance(text, str) and text.strip()],
+                        }
+                    )
+        except OSError as exc:
+            diagnostics['failure_mode'] = 'trajectory_artifacts_unreadable'
+            diagnostics['read_error'] = f'{type(exc).__name__}: {exc}'
+            return {
+                'decoded': None,
+                'output_text': None,
+                'diagnostics': diagnostics,
+            }
+
+        if not candidate_events:
+            diagnostics['failure_mode'] = 'trajectory_assistant_texts_missing'
+            return {
+                'decoded': None,
+                'output_text': None,
+                'diagnostics': diagnostics,
+            }
+
+        preferred_events = [event for event in candidate_events if response_id and event['run_id'] == response_id]
+        diagnostics['matched_response_id'] = bool(preferred_events)
+        if not preferred_events:
+            preferred_events = candidate_events
+        preferred_events.sort(
+            key=lambda event: (
+                0 if event['type'] == 'trace.artifacts' else 1,
+                0 if response_id and event['run_id'] == response_id else 1,
+            )
+        )
+
+        last_json_failure = None
+        for event in preferred_events:
+            assistant_texts = list(reversed(event['assistant_texts']))
+            diagnostics['assistant_text_count'] = len(assistant_texts)
+            diagnostics['matched_event_type'] = event['type']
+            diagnostics['trajectory_run_id'] = event['run_id'] or None
+            diagnostics['trajectory_final_status'] = event['final_status']
+            if diagnostics.get('session_id') is None:
+                diagnostics['session_id'] = event.get('session_id')
+            for candidate_text in assistant_texts:
+                decoded, json_failure_class = self._decode_candidate_json(candidate_text)
+                if decoded is not None:
+                    diagnostics['status'] = 'recovered'
+                    diagnostics['failure_mode'] = None
+                    diagnostics['json_failure_class'] = None
+                    return {
+                        'decoded': decoded,
+                        'output_text': candidate_text,
+                        'diagnostics': diagnostics,
+                    }
+                last_json_failure = json_failure_class
+
+        diagnostics['json_failure_class'] = last_json_failure
+        diagnostics['failure_mode'] = 'trajectory_assistant_non_json'
+        return {
+            'decoded': None,
+            'output_text': None,
+            'diagnostics': diagnostics,
+        }
 
     def _build_message(self, *, spec: AgentDispatchSpec, payload: dict[str, Any]) -> str:
         return (
@@ -764,73 +1077,71 @@ class OpenClawAgentClient:
                     raise AgentDispatchRetryableError(
                         f"OpenClaw batch ended with status={parsed.get('status')}"
                     )
-                normalized_text = _extract_json_object(output_text)
-                decoded: dict[str, Any] | None = None
+                decoded, json_failure_class = self._decode_candidate_json(output_text)
                 decoded_source = 'output_text'
-                json_failure_class = 'json_object_not_found'
-                if normalized_text:
-                    try:
-                        candidate_decoded = json.loads(normalized_text)
-                    except json.JSONDecodeError:
-                        json_failure_class = 'json_decode_error'
-                    else:
-                        if isinstance(candidate_decoded, dict):
-                            decoded = candidate_decoded
-                            json_failure_class = None
-                        elif isinstance(candidate_decoded, list):
-                            decoded = {'items': candidate_decoded}
-                            json_failure_class = None
-                        else:
-                            json_failure_class = 'json_shape_not_object'
-                session_ref = self._extract_session_ref(parsed, explicit_session_key=request_session_key)
-                session_history = None
+                session_ref = self._extract_session_ref(parsed, explicit_session_key=request_session_key) or {
+                    'session_key': request_session_key,
+                    'session_id': None,
+                    'response_id': parsed.get('id'),
+                }
+                if session_ref.get('response_id') is None:
+                    session_ref['response_id'] = parsed.get('id')
+                response_id = (
+                    str(session_ref.get('response_id')).strip()
+                    if session_ref.get('response_id') is not None
+                    else None
+                ) or None
+                session_history: list[dict[str, Any]] | None = None
+                session_history_diagnostics: dict[str, Any] = {'checked': False, 'request_marker': request_marker}
+                trajectory_diagnostics: dict[str, Any] = {'checked': False}
                 history_marker_found = None
+                failure_mode = json_failure_class
                 if decoded is None and request_session_key:
                     session_history = self.fetch_session_history(session_key=request_session_key, limit=80, include_tools=True)
-                    marker_index = None
-                    for idx, message in enumerate(session_history):
-                        if message.get('role') != 'user':
-                            continue
-                        text_chunks: list[str] = []
-                        for content in message.get('content', []):
-                            if content.get('type') in {'text', 'input_text', 'output_text'} and isinstance(content.get('text'), str):
-                                text_chunks.append(content['text'])
-                        candidate_text = '\n'.join(text_chunks)
-                        if request_marker in candidate_text:
-                            marker_index = idx
-                    history_marker_found = marker_index is not None
-                    if marker_index is not None:
-                        for message in session_history[marker_index + 1:]:
-                            if message.get('role') != 'assistant':
-                                continue
-                            text_chunks = []
-                            for content in message.get('content', []):
-                                if content.get('type') in {'text', 'output_text'} and isinstance(content.get('text'), str):
-                                    text_chunks.append(content['text'])
-                            candidate_text = '\n'.join(text_chunks).strip()
-                            candidate_json = _extract_json_object(candidate_text)
-                            if not candidate_json:
-                                continue
-                            try:
-                                candidate_decoded = json.loads(candidate_json)
-                            except json.JSONDecodeError:
-                                continue
-                            if isinstance(candidate_decoded, list):
-                                decoded = {'items': candidate_decoded}
-                            elif isinstance(candidate_decoded, dict):
-                                decoded = candidate_decoded
-                            if decoded is not None:
-                                decoded_source = 'session_history_after_marker'
-                                json_failure_class = None
-                                output_text = candidate_text
-                                break
-                    if decoded is None:
-                        json_failure_class = (
-                            'session_history_marker_not_found'
-                            if marker_index is None
-                            else 'session_history_response_json_not_found'
+                    history_recovery = self._recover_from_session_history(
+                        session_history=session_history,
+                        request_marker=request_marker,
+                    )
+                    session_history_diagnostics = history_recovery.get('diagnostics') or session_history_diagnostics
+                    history_marker_found = session_history_diagnostics.get('marker_found')
+                    if history_recovery.get('decoded') is not None:
+                        decoded = history_recovery['decoded']
+                        decoded_source = 'session_history_after_marker'
+                        json_failure_class = None
+                        failure_mode = None
+                        output_text = history_recovery.get('output_text')
+                    else:
+                        failure_mode = session_history_diagnostics.get('failure_mode') or failure_mode
+                        trajectory_recovery = self._recover_from_trajectory_artifacts(
+                            agent_name=spec.agent_name,
+                            session_key=request_session_key,
+                            response_id=response_id,
                         )
+                        trajectory_diagnostics = trajectory_recovery.get('diagnostics') or trajectory_diagnostics
+                        if trajectory_diagnostics.get('session_id') and not session_ref.get('session_id'):
+                            session_ref['session_id'] = trajectory_diagnostics.get('session_id')
+                        if trajectory_recovery.get('decoded') is not None:
+                            decoded = trajectory_recovery['decoded']
+                            decoded_source = 'trajectory_artifacts'
+                            json_failure_class = None
+                            failure_mode = None
+                            output_text = trajectory_recovery.get('output_text')
+                        else:
+                            trajectory_failure_mode = trajectory_diagnostics.get('failure_mode')
+                            if trajectory_failure_mode in {'trajectory_assistant_non_json'}:
+                                failure_mode = trajectory_failure_mode
+                            if trajectory_diagnostics.get('json_failure_class'):
+                                json_failure_class = trajectory_diagnostics.get('json_failure_class')
                 if decoded is None:
+                    failure_class = self._failure_class_for_mode(failure_mode)
+                    response_recovery = {
+                        'session_key': request_session_key,
+                        'session_id': session_ref.get('session_id'),
+                        'response_id': response_id,
+                        'request_marker': request_marker,
+                        'history': session_history_diagnostics,
+                        'trajectory': trajectory_diagnostics,
+                    }
                     response_correlation = {
                         'expected_symbols': batch_symbols,
                         'parsed_symbols': [],
@@ -839,12 +1150,14 @@ class OpenClawAgentClient:
                         'unexpected_symbols': [],
                         'fallback_attributions': [],
                         'attribution_status': 'not_decoded',
-                        'failure_class': 'invalid_json',
+                        'failure_class': failure_class,
+                        'failure_mode': failure_mode,
                         'json_failure_class': json_failure_class,
                         'decoded_source': decoded_source,
-                        'history_checked': bool(session_history) if session_history is not None else False,
+                        'history_checked': bool(session_history_diagnostics.get('checked')),
                         'history_marker_found': history_marker_found,
                         'session_reuse_mode': session_reuse_mode,
+                        'response_recovery': response_recovery,
                     }
                     log_agent_feedback_event(
                         'batch_response_parse_failed',
@@ -856,14 +1169,40 @@ class OpenClawAgentClient:
                         role=spec.role,
                         market_date=market_date.isoformat(),
                         session_key=request_session_key,
+                        session_id=session_ref.get('session_id'),
+                        response_id=response_id,
+                        request_marker=request_marker,
                         batch_symbols=batch_symbols,
                         slot=slot,
                         session_reuse_mode=session_reuse_mode,
-                        failure_class='invalid_json',
+                        failure_class=failure_class,
+                        failure_mode=failure_mode,
                         json_failure_class=json_failure_class,
                         response_correlation=response_correlation,
                     )
-                    raise AgentDispatchRetryableError(f'OpenClaw batch response invalid_json:{json_failure_class}')
+                    error_message = (
+                        f'OpenClaw batch response {failure_class}:{failure_mode}'
+                        if failure_mode and failure_mode != failure_class
+                        else f'OpenClaw batch response {failure_class}'
+                    )
+                    raise AgentDispatchRetryableError(
+                        error_message,
+                        details={
+                            'failure_kind': failure_mode or failure_class,
+                            'failure_class': failure_class,
+                            'failure_mode': failure_mode,
+                            'json_failure_class': json_failure_class,
+                            'session_key': request_session_key,
+                            'session_id': session_ref.get('session_id'),
+                            'response_id': response_id,
+                            'request_marker': request_marker,
+                            'response_recovery': response_recovery,
+                            'batch_symbols': batch_symbols,
+                            'dispatch_id': dispatch_id,
+                            'attempt_id': attempt_id,
+                            'slot': slot,
+                        },
+                    )
                 top_level_object_fallback = False
                 if isinstance(decoded, dict) and not isinstance(decoded.get('items'), list):
                     top_level_object_fallback = True
@@ -897,10 +1236,18 @@ class OpenClawAgentClient:
                 response_correlation = {
                     **response_correlation,
                     'decoded_source': decoded_source,
-                    'history_checked': bool(session_history) if session_history is not None else False,
+                    'history_checked': bool(session_history_diagnostics.get('checked')),
                     'history_marker_found': history_marker_found,
                     'top_level_object_fallback': top_level_object_fallback,
                     'json_failure_class': json_failure_class,
+                    'response_recovery': {
+                        'session_key': request_session_key,
+                        'session_id': session_ref.get('session_id'),
+                        'response_id': response_id,
+                        'request_marker': request_marker,
+                        'history': session_history_diagnostics,
+                        'trajectory': trajectory_diagnostics,
+                    },
                 }
                 response_symbols = response_correlation.get('response_symbols') or []
                 unexpected_symbols = response_correlation.get('unexpected_symbols') or []
@@ -940,7 +1287,7 @@ class OpenClawAgentClient:
                         response_symbols=response_symbols,
                         unexpected_symbols=unexpected_symbols,
                         missing_symbols=missing_symbols,
-                        history_checked=bool(session_history) if session_history is not None else False,
+                        history_checked=bool(session_history_diagnostics.get('checked')),
                         failure_class=response_correlation.get('failure_class') or 'batch_response_attribution_mismatch',
                         session_reuse_mode=session_reuse_mode,
                         response_correlation=response_correlation,
@@ -952,6 +1299,7 @@ class OpenClawAgentClient:
                     'attempt_id': attempt_id,
                     'dispatch_id': dispatch_id,
                     'request_run_id': request_run_id,
+                    'request_marker': request_marker,
                     'market_date': market_date.isoformat(),
                     'role': spec.role,
                     'agent_name': spec.agent_name,
@@ -963,7 +1311,7 @@ class OpenClawAgentClient:
                     'output_text': output_text,
                     'session_ref': session_ref,
                     'decoded': decoded,
-                    'history_checked': bool(session_history) if session_history is not None else False,
+                    'history_checked': bool(session_history_diagnostics.get('checked')),
                     'response_correlation': response_correlation,
                     'session_reuse_mode': session_reuse_mode,
                 }
@@ -973,6 +1321,7 @@ class OpenClawAgentClient:
                 last_error = exc
                 error_type = type(exc).__name__
                 error_message = str(exc)
+                error_details = exc.details if isinstance(exc, AgentDispatchError) else {}
                 log_agent_feedback_event(
                     'dispatch_batch_response_error',
                     status='retryable' if attempt <= self.max_retries else 'failed',
@@ -983,11 +1332,21 @@ class OpenClawAgentClient:
                     role=spec.role,
                     market_date=market_date.isoformat(),
                     session_key=request_session_key,
+                    session_id=error_details.get('session_id') if isinstance(error_details, dict) else None,
+                    response_id=error_details.get('response_id') if isinstance(error_details, dict) else None,
+                    request_marker=error_details.get('request_marker') if isinstance(error_details, dict) else None,
                     batch_symbols=batch_symbols,
                     slot=slot,
                     session_reuse_mode=session_reuse_mode,
                     error_type=error_type,
                     error_message=error_message,
+                    failure_kind=error_details.get('failure_kind') if isinstance(error_details, dict) else None,
+                    failure_mode=error_details.get('failure_mode') if isinstance(error_details, dict) else None,
+                    failure_diagnostics=(
+                        error_details.get('response_recovery')
+                        if isinstance(error_details, dict)
+                        else None
+                    ),
                     response_snapshot=(
                         None
                         if response is None
@@ -1006,6 +1365,8 @@ class OpenClawAgentClient:
                         'max_retries': self.max_retries,
                         'batch_size': len(batch_items),
                         'session_key': request_session_key,
+                        'session_id': error_details.get('session_id') if isinstance(error_details, dict) else None,
+                        'response_id': error_details.get('response_id') if isinstance(error_details, dict) else None,
                         'error_type': type(exc).__name__,
                         'error': str(exc),
                         'response_status_code': response.status_code if response is not None else None,
@@ -1016,6 +1377,8 @@ class OpenClawAgentClient:
                     break
                 if self.retry_backoff_seconds > 0:
                     time.sleep(self.retry_backoff_seconds * attempt)
+        if isinstance(last_error, AgentDispatchError):
+            raise last_error
         raise AgentDispatchRetryableError(str(last_error) if last_error else 'unknown batch dispatch failure')
 
 
@@ -1643,6 +2006,9 @@ class AgentFeedbackOrchestrator:
                         batch_symbols=failure_log_fields['batch_symbols'],
                         slot=failure_log_fields['slot'],
                         session_key=failure_log_fields['session_key'],
+                        session_id=failure_log_fields['session_id'],
+                        response_id=failure_log_fields['response_id'],
+                        request_marker=failure_log_fields['request_marker'],
                         persistence_target={
                             'table': 'agent_context_feedback_failures',
                             'operation': 'upsert',
@@ -1650,6 +2016,7 @@ class AgentFeedbackOrchestrator:
                         },
                         failure_origin='agent_dispatch_failure',
                         original_failure=original_failure,
+                        failure_diagnostics=failure_log_fields['diagnostics'],
                     )
                     try:
                         persisted_failure = agent_context_feedback_failure_service.record_failure(
@@ -1670,7 +2037,12 @@ class AgentFeedbackOrchestrator:
                                 'attempt_id': failure_log_fields['attempt_id'],
                                 'slot': failure_log_fields['slot'],
                                 'session_key': failure_log_fields['session_key'],
+                                'session_id': failure_log_fields['session_id'],
+                                'response_id': failure_log_fields['response_id'],
+                                'request_marker': failure_log_fields['request_marker'],
                                 'batch_symbols': failure_log_fields['batch_symbols'],
+                                'failure_mode': failure.get('failure_kind'),
+                                'failure_diagnostics': failure_log_fields['diagnostics'],
                             },
                             context=failure.get('context') if isinstance(failure.get('context'), dict) else None,
                         )
@@ -1688,6 +2060,9 @@ class AgentFeedbackOrchestrator:
                             batch_symbols=failure_log_fields['batch_symbols'],
                             slot=failure_log_fields['slot'],
                             session_key=failure_log_fields['session_key'],
+                            session_id=failure_log_fields['session_id'],
+                            response_id=failure_log_fields['response_id'],
+                            request_marker=failure_log_fields['request_marker'],
                             persistence_target={
                                 'table': 'agent_context_feedback_failures',
                                 'operation': 'upsert',
@@ -1695,6 +2070,7 @@ class AgentFeedbackOrchestrator:
                             },
                             failure_origin='agent_dispatch_failure',
                             original_failure=original_failure,
+                            failure_diagnostics=failure_log_fields['diagnostics'],
                             persistence_error_origin='failure_row_persistence',
                             error_type=type(exc).__name__,
                             error_message=str(exc),
@@ -1714,6 +2090,9 @@ class AgentFeedbackOrchestrator:
                         batch_symbols=failure_log_fields['batch_symbols'],
                         slot=failure_log_fields['slot'],
                         session_key=failure_log_fields['session_key'],
+                        session_id=failure_log_fields['session_id'],
+                        response_id=failure_log_fields['response_id'],
+                        request_marker=failure_log_fields['request_marker'],
                         persistence_target={
                             'table': 'agent_context_feedback_failures',
                             'operation': 'upsert',
@@ -1726,6 +2105,7 @@ class AgentFeedbackOrchestrator:
                         },
                         failure_origin='agent_dispatch_failure',
                         original_failure=original_failure,
+                        failure_diagnostics=failure_log_fields['diagnostics'],
                     )
             except Exception as exc:  # noqa: BLE001
                 flush_result['failure_error'] = f'{type(exc).__name__}: {exc}'
@@ -2004,12 +2384,17 @@ class AgentFeedbackOrchestrator:
             error: str,
             retryable: bool,
             *,
+            failure_kind: str | None = None,
             context: dict[str, Any] | None = None,
             agent_name: str | None = None,
             dispatch_id: str | None = None,
             attempt_id: str | None = None,
             slot: int | None = None,
             session_key: str | None = None,
+            session_id: str | None = None,
+            response_id: str | None = None,
+            request_marker: str | None = None,
+            diagnostics: dict[str, Any] | None = None,
             batch_symbols: Sequence[str] | None = None,
         ) -> None:
             def _update(current: RuntimeFeedbackRunState) -> None:
@@ -2021,11 +2406,16 @@ class AgentFeedbackOrchestrator:
                         error=error,
                         retryable=retryable,
                         agent_name=agent_name,
+                        failure_kind=failure_kind,
                         context=context,
                         dispatch_id=dispatch_id,
                         attempt_id=attempt_id,
                         slot=slot,
                         session_key=session_key,
+                        session_id=session_id,
+                        response_id=response_id,
+                        request_marker=request_marker,
+                        diagnostics=diagnostics,
                         batch_symbols=batch_symbols,
                     )
                 )
@@ -2048,9 +2438,14 @@ class AgentFeedbackOrchestrator:
                 batch_symbols=list(batch_symbols) if batch_symbols is not None else None,
                 slot=slot,
                 session_key=session_key,
+                session_id=session_id,
+                response_id=response_id,
+                request_marker=request_marker,
                 error_message=error,
                 retryable=retryable,
                 **_build_buffer_counts(snapshot),
+                failure_kind=failure_kind,
+                failure_diagnostics=diagnostics,
                 failure_context=context,
             )
 
@@ -2298,6 +2693,9 @@ class AgentFeedbackOrchestrator:
                                         attempt_id = dispatch_context['attempt_id']
                                         batch_symbols = dispatch_context['batch_symbols']
                                         session_key = dispatch_context['session_key']
+                                        session_id = dispatch_context.get('session_id')
+                                        response_id = dispatch_context.get('response_id')
+                                        request_marker = dispatch_context.get('request_marker')
                                         feedback_candidate = by_symbol.get(symbol_key, {}).get('feedback')
                                         if not feedback_candidate:
                                             failure_class = (
@@ -2305,6 +2703,7 @@ class AgentFeedbackOrchestrator:
                                                 if response_correlation.get('failure_class')
                                                 else 'missing_batch_feedback'
                                             )
+                                            failure_mode = response_correlation.get('failure_mode')
                                             failure_context = {
                                                 **source_item,
                                                 'response_correlation': response_correlation or None,
@@ -2315,11 +2714,20 @@ class AgentFeedbackOrchestrator:
                                                 symbol=symbol,
                                                 error=str(failure_class),
                                                 retryable=True,
+                                                failure_kind=str(failure_mode or failure_class),
                                                 context=failure_context,
                                                 dispatch_id=dispatch_id,
                                                 attempt_id=attempt_id,
                                                 slot=slot,
                                                 session_key=session_key,
+                                                session_id=session_id,
+                                                response_id=response_id,
+                                                request_marker=request_marker,
+                                                diagnostics=(
+                                                    response_correlation.get('response_recovery')
+                                                    if isinstance(response_correlation.get('response_recovery'), dict)
+                                                    else None
+                                                ),
                                                 batch_symbols=batch_symbols,
                                             )
                                             all_failures.append(failure)
@@ -2336,9 +2744,13 @@ class AgentFeedbackOrchestrator:
                                                 batch_symbols=batch_symbols,
                                                 slot=slot,
                                                 session_key=session_key,
+                                                session_id=session_id,
+                                                response_id=response_id,
+                                                request_marker=request_marker,
                                                 error_type='MissingBatchFeedback',
                                                 error_message=str(failure_class),
                                                 failure_class=failure_class,
+                                                failure_mode=failure_mode,
                                                 response_symbols=response_symbols,
                                                 response_correlation=response_correlation,
                                             )
@@ -2347,12 +2759,21 @@ class AgentFeedbackOrchestrator:
                                                 symbol,
                                                 str(failure_class),
                                                 True,
+                                                failure_kind=str(failure_mode or failure_class),
                                                 context=failure_context,
                                                 agent_name=spec.agent_name,
                                                 dispatch_id=dispatch_id,
                                                 attempt_id=attempt_id,
                                                 slot=slot,
                                                 session_key=session_key,
+                                                session_id=session_id,
+                                                response_id=response_id,
+                                                request_marker=request_marker,
+                                                diagnostics=(
+                                                    response_correlation.get('response_recovery')
+                                                    if isinstance(response_correlation.get('response_recovery'), dict)
+                                                    else None
+                                                ),
                                                 batch_symbols=batch_symbols,
                                             )
                                             staged_batch_outcomes = True
@@ -2428,6 +2849,7 @@ class AgentFeedbackOrchestrator:
                                         )
                                     staged_batch_outcomes = True
                                 except Exception as exc:
+                                    error_details = exc.details if isinstance(exc, AgentDispatchError) else {}
                                     for source_item in batch:
                                         dispatch_context = _resolve_batch_dispatch_context(
                                             batch_result=None,
@@ -2437,15 +2859,53 @@ class AgentFeedbackOrchestrator:
                                         )
                                         dispatch_id = dispatch_context['dispatch_id']
                                         batch_symbols = dispatch_context['batch_symbols']
+                                        failure_context = dict(source_item)
+                                        if isinstance(error_details, dict) and error_details:
+                                            failure_context['dispatch_diagnostics'] = error_details
                                         failure = _build_failed_dispatch_item(
                                             role=role,
                                             agent_name=spec.agent_name,
                                             symbol=source_item['symbol'],
                                             error=f'{type(exc).__name__}: {exc}',
                                             retryable=True,
+                                            failure_kind=(
+                                                str(error_details.get('failure_kind'))
+                                                if isinstance(error_details, dict) and error_details.get('failure_kind')
+                                                else None
+                                            ),
+                                            context=failure_context,
                                             dispatch_id=dispatch_id,
+                                            attempt_id=(
+                                                error_details.get('attempt_id')
+                                                if isinstance(error_details, dict)
+                                                else None
+                                            ),
                                             slot=slot,
-                                            session_key=dispatch_context['session_key'],
+                                            session_key=(
+                                                error_details.get('session_key')
+                                                if isinstance(error_details, dict) and error_details.get('session_key')
+                                                else dispatch_context['session_key']
+                                            ),
+                                            session_id=(
+                                                error_details.get('session_id')
+                                                if isinstance(error_details, dict)
+                                                else None
+                                            ),
+                                            response_id=(
+                                                error_details.get('response_id')
+                                                if isinstance(error_details, dict)
+                                                else None
+                                            ),
+                                            request_marker=(
+                                                error_details.get('request_marker')
+                                                if isinstance(error_details, dict)
+                                                else None
+                                            ),
+                                            diagnostics=(
+                                                error_details.get('response_recovery')
+                                                if isinstance(error_details, dict) and isinstance(error_details.get('response_recovery'), dict)
+                                                else None
+                                            ),
                                             batch_symbols=batch_symbols,
                                         )
                                         all_failures.append(failure)
@@ -2454,11 +2914,45 @@ class AgentFeedbackOrchestrator:
                                             source_item['symbol'],
                                             f'{type(exc).__name__}: {exc}',
                                             True,
-                                            context=source_item,
+                                            failure_kind=(
+                                                str(error_details.get('failure_kind'))
+                                                if isinstance(error_details, dict) and error_details.get('failure_kind')
+                                                else None
+                                            ),
+                                            context=failure_context,
                                             agent_name=spec.agent_name,
                                             dispatch_id=dispatch_id,
+                                            attempt_id=(
+                                                error_details.get('attempt_id')
+                                                if isinstance(error_details, dict)
+                                                else None
+                                            ),
                                             slot=slot,
-                                            session_key=dispatch_context['session_key'],
+                                            session_key=(
+                                                error_details.get('session_key')
+                                                if isinstance(error_details, dict) and error_details.get('session_key')
+                                                else dispatch_context['session_key']
+                                            ),
+                                            session_id=(
+                                                error_details.get('session_id')
+                                                if isinstance(error_details, dict)
+                                                else None
+                                            ),
+                                            response_id=(
+                                                error_details.get('response_id')
+                                                if isinstance(error_details, dict)
+                                                else None
+                                            ),
+                                            request_marker=(
+                                                error_details.get('request_marker')
+                                                if isinstance(error_details, dict)
+                                                else None
+                                            ),
+                                            diagnostics=(
+                                                error_details.get('response_recovery')
+                                                if isinstance(error_details, dict) and isinstance(error_details.get('response_recovery'), dict)
+                                                else None
+                                            ),
                                             batch_symbols=batch_symbols,
                                         )
                                         log_agent_feedback_event(
@@ -2472,9 +2966,38 @@ class AgentFeedbackOrchestrator:
                                             symbol=source_item['symbol'],
                                             batch_symbols=batch_symbols,
                                             slot=slot,
-                                            session_key=dispatch_context['session_key'],
+                                            session_key=(
+                                                error_details.get('session_key')
+                                                if isinstance(error_details, dict) and error_details.get('session_key')
+                                                else dispatch_context['session_key']
+                                            ),
+                                            session_id=(
+                                                error_details.get('session_id')
+                                                if isinstance(error_details, dict)
+                                                else None
+                                            ),
+                                            response_id=(
+                                                error_details.get('response_id')
+                                                if isinstance(error_details, dict)
+                                                else None
+                                            ),
+                                            request_marker=(
+                                                error_details.get('request_marker')
+                                                if isinstance(error_details, dict)
+                                                else None
+                                            ),
                                             error_type=type(exc).__name__,
                                             error_message=str(exc),
+                                            failure_kind=(
+                                                error_details.get('failure_kind')
+                                                if isinstance(error_details, dict)
+                                                else None
+                                            ),
+                                            failure_diagnostics=(
+                                                error_details.get('response_recovery')
+                                                if isinstance(error_details, dict)
+                                                else None
+                                            ),
                                         )
                                     staged_batch_outcomes = True
                                 try:

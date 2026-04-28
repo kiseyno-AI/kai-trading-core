@@ -60,11 +60,16 @@ def build_pending_failure_row(
     error: str,
     retryable: bool,
     agent_name: str | None = None,
+    failure_kind: str | None = None,
     context: dict[str, Any] | None = None,
     dispatch_id: str | None = None,
     attempt_id: str | None = None,
     slot: int | None = None,
     session_key: str | None = None,
+    session_id: str | None = None,
+    response_id: str | None = None,
+    request_marker: str | None = None,
+    diagnostics: dict[str, Any] | None = None,
     batch_symbols: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     return {
@@ -74,11 +79,15 @@ def build_pending_failure_row(
         'status': 'failed',
         'retryable': retryable,
         'error': error,
-        'failure_kind': error,
+        'failure_kind': failure_kind or error,
         'dispatch_id': dispatch_id,
         'attempt_id': attempt_id,
         'slot': slot,
         'session_key': session_key,
+        'session_id': session_id,
+        'response_id': response_id,
+        'request_marker': request_marker,
+        'diagnostics': jsonable_encoder(diagnostics) if isinstance(diagnostics, dict) else None,
         'batch_symbols': list(batch_symbols) if batch_symbols is not None else None,
         'context': jsonable_encoder(context) if isinstance(context, dict) else None,
     }
@@ -102,6 +111,9 @@ def resolve_batch_dispatch_context(
         'batch_symbols': batch_symbols,
         'slot': slot,
         'session_key': session_ref.get('session_key') or source_item.get('session_key'),
+        'session_id': session_ref.get('session_id') or source_item.get('session_id'),
+        'response_id': session_ref.get('response_id') or source_item.get('response_id'),
+        'request_marker': resolved_batch_result.get('request_marker') or source_item.get('request_marker'),
     }
 
 
