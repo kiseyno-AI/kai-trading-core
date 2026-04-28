@@ -646,6 +646,7 @@ class SignalDeciderLoopRepository:
         decision_actions: Sequence[str] | None = None,
         policy_versions: Sequence[str] | None = None,
         limit: int | None = None,
+        offset: int = 0,
     ) -> list[SignalDeciderDecisionSnapshot]:
         normalized_symbols = _normalize_symbols(symbols)
         normalized_actions = [_normalize_optional_action_filter(value) for value in decision_actions or []]
@@ -679,6 +680,8 @@ class SignalDeciderLoopRepository:
                 SignalDeciderDecisionSnapshot.created_at.desc(),
                 SignalDeciderDecisionSnapshot.id.desc(),
             )
+            if offset > 0:
+                stmt = stmt.offset(offset)
             if limit is not None:
                 stmt = stmt.limit(limit)
             return session.execute(stmt).scalars().all()
@@ -1097,49 +1100,58 @@ class SignalDeciderLoopService:
             _normalize_optional_text(evaluation_version, default=DEFAULT_SIGNAL_DECIDER_EVALUATION_VERSION)
             or DEFAULT_SIGNAL_DECIDER_EVALUATION_VERSION
         )
-        rows = self.repository.list_decision_snapshots(
-            market_date_from=normalized_from,
-            market_date_to=normalized_to,
-            symbols=[normalized_symbol] if normalized_symbol else None,
-            decision_actions=[normalized_action] if normalized_action else None,
-            policy_versions=[normalized_policy_version] if normalized_policy_version else None,
-        )
-        snapshot_ids = [row.id for row in rows]
-        evaluations_by_snapshot = self._group_by_snapshot_id(
-            self.repository.list_evaluations(
-                decision_snapshot_ids=snapshot_ids,
-                horizons=normalized_horizons,
-                evaluation_version=resolved_evaluation_version,
-            )
-        )
         action_counts: Counter[str] = Counter()
         verdict_counts: Counter[str] = Counter()
         items: list[dict[str, Any]] = []
-        for row in rows:
-            evaluations = evaluations_by_snapshot.get(row.id, [])
-            if not self._decision_matches_evaluation_filters(
-                evaluations=evaluations,
-                verdict=normalized_verdict,
-                has_missed_opportunity=has_missed_opportunity,
-            ):
-                continue
-            decision = self._build_decision_snapshot(row)
-            evaluation_summary = self._build_evaluation_summary(
-                evaluations=evaluations,
-                evaluation_version=resolved_evaluation_version,
+        snapshot_offset = 0
+        while len(items) < resolved_limit:
+            batch_limit = resolved_limit - len(items)
+            rows = self.repository.list_decision_snapshots(
+                market_date_from=normalized_from,
+                market_date_to=normalized_to,
+                symbols=[normalized_symbol] if normalized_symbol else None,
+                decision_actions=[normalized_action] if normalized_action else None,
+                policy_versions=[normalized_policy_version] if normalized_policy_version else None,
+                limit=batch_limit,
+                offset=snapshot_offset,
             )
-            item = {
-                **decision,
-                'explanation': self._build_decision_explanation(
-                    decision=decision,
+            if not rows:
+                break
+            snapshot_offset += len(rows)
+            evaluations_by_snapshot = self._group_by_snapshot_id(
+                self.repository.list_evaluations(
+                    decision_snapshot_ids=[row.id for row in rows],
+                    horizons=normalized_horizons,
+                    evaluation_version=resolved_evaluation_version,
+                )
+            )
+            for row in rows:
+                evaluations = evaluations_by_snapshot.get(row.id, [])
+                if not self._decision_matches_evaluation_filters(
                     evaluations=evaluations,
-                ),
-                'evaluation_summary': evaluation_summary,
-            }
-            items.append(item)
-            action_counts[decision['decision']['action']] += 1
-            verdict_counts.update(evaluation_summary.get('verdict_counts') or {})
-            if len(items) >= resolved_limit:
+                    verdict=normalized_verdict,
+                    has_missed_opportunity=has_missed_opportunity,
+                ):
+                    continue
+                decision = self._build_decision_snapshot(row)
+                evaluation_summary = self._build_evaluation_summary(
+                    evaluations=evaluations,
+                    evaluation_version=resolved_evaluation_version,
+                )
+                item = {
+                    **decision,
+                    'explanation': self._build_decision_explanation(
+                        decision=decision,
+                        evaluations=evaluations,
+                    ),
+                    'evaluation_summary': evaluation_summary,
+                }
+                items.append(item)
+                action_counts[decision['decision']['action']] += 1
+                verdict_counts.update(evaluation_summary.get('verdict_counts') or {})
+                if len(items) >= resolved_limit:
+                    break
+            if len(rows) < batch_limit:
                 break
         return {
             'request': {
@@ -1183,11 +1195,11 @@ class SignalDeciderLoopService:
         row = self.repository.get_decision_snapshot(snapshot_id=normalized_snapshot_id)
         if row is None:
             raise ValueError(f'signal-decider decision snapshot {normalized_snapshot_id} was not found')
-        detail_item = self._build_decision_detail_item(
-            row=row,
+        detail_item = self._build_decision_detail_items(
+            rows=[row],
             horizons=normalized_horizons,
             evaluation_version=resolved_evaluation_version,
-        )
+        )[0]
         return {
             'request': {
                 'snapshot_id': normalized_snapshot_id,
@@ -1220,14 +1232,11 @@ class SignalDeciderLoopService:
             symbols=[normalized_symbol] if normalized_symbol else None,
             limit=_normalize_limit(limit, default=20),
         )
-        items = [
-            self._build_decision_detail_item(
-                row=row,
-                horizons=None,
-                evaluation_version=resolved_evaluation_version,
-            )
-            for row in rows
-        ]
+        items = self._build_decision_detail_items(
+            rows=rows,
+            horizons=None,
+            evaluation_version=resolved_evaluation_version,
+        )
         return {
             'request': {
                 'market_date': normalized_market_date.isoformat(),
@@ -1759,21 +1768,61 @@ class SignalDeciderLoopService:
             'items': items,
         }
 
+    def _build_decision_detail_items(
+        self,
+        *,
+        rows: Sequence[SignalDeciderDecisionSnapshot],
+        horizons: Sequence[int] | None,
+        evaluation_version: str,
+    ) -> list[dict[str, Any]]:
+        snapshot_ids = [row.id for row in rows]
+        if not snapshot_ids:
+            return []
+        outcomes_by_snapshot = self._group_by_snapshot_id(
+            self.repository.list_realized_outcomes(
+                decision_snapshot_ids=snapshot_ids,
+                horizons=horizons,
+            )
+        )
+        evaluations_by_snapshot = self._group_by_snapshot_id(
+            self.repository.list_evaluations(
+                decision_snapshot_ids=snapshot_ids,
+                horizons=horizons,
+                evaluation_version=evaluation_version,
+            )
+        )
+        return [
+            self._build_decision_detail_item(
+                row=row,
+                horizons=horizons,
+                evaluation_version=evaluation_version,
+                outcomes=outcomes_by_snapshot.get(row.id, []),
+                evaluations=evaluations_by_snapshot.get(row.id, []),
+            )
+            for row in rows
+        ]
+
     def _build_decision_detail_item(
         self,
         *,
         row: SignalDeciderDecisionSnapshot,
         horizons: Sequence[int] | None,
         evaluation_version: str,
+        outcomes: Sequence[dict[str, Any]] | None = None,
+        evaluations: Sequence[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        outcomes = self.repository.list_realized_outcomes(
+        resolved_outcomes = list(outcomes) if outcomes is not None else self.repository.list_realized_outcomes(
             decision_snapshot_ids=[row.id],
             horizons=horizons,
         )
-        evaluations = self.repository.list_evaluations(
-            decision_snapshot_ids=[row.id],
-            horizons=horizons,
-            evaluation_version=evaluation_version,
+        resolved_evaluations = (
+            list(evaluations)
+            if evaluations is not None
+            else self.repository.list_evaluations(
+                decision_snapshot_ids=[row.id],
+                horizons=horizons,
+                evaluation_version=evaluation_version,
+            )
         )
         decision = self._build_decision_snapshot(row)
         request_payload = _maybe_dict(row.request_payload)
@@ -1781,10 +1830,10 @@ class SignalDeciderLoopService:
             **decision,
             'explanation': self._build_decision_explanation(
                 decision=decision,
-                evaluations=evaluations,
+                evaluations=resolved_evaluations,
             ),
             'evaluation_summary': self._build_evaluation_summary(
-                evaluations=evaluations,
+                evaluations=resolved_evaluations,
                 evaluation_version=evaluation_version,
             ),
             'request_payload': request_payload,
@@ -1792,8 +1841,8 @@ class SignalDeciderLoopService:
             'response_summary': _maybe_dict(row.response_summary_payload),
             'upstream_summaries': request_payload.get('upstream_summaries'),
             'upstream_traceability': request_payload.get('upstream_traceability'),
-            'outcomes': outcomes,
-            'evaluations': evaluations,
+            'outcomes': resolved_outcomes,
+            'evaluations': resolved_evaluations,
         }
 
     def _decision_matches_evaluation_filters(
