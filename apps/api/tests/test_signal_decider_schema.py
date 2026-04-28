@@ -11,6 +11,7 @@ from app.db_models import (
     Base,
     SignalDeciderDecisionSnapshot,
     SignalDeciderEvaluation,
+    SignalDeciderPolicyVersion,
     SignalDeciderRealizedOutcome,
 )
 
@@ -107,6 +108,19 @@ def _evaluation_row(snapshot_id: int, feedback_id: int, realized_outcome_id: int
     )
 
 
+def _policy_version_row() -> SignalDeciderPolicyVersion:
+    return SignalDeciderPolicyVersion(
+        policy_version='signal_decider_policy_v2',
+        status='candidate',
+        parent_policy_version='signal_decider_policy_v1',
+        source_candidate_version='signal_decider_policy_v2',
+        change_summary='Relax wait decisions after repeated breakout evidence.',
+        rule_bundle_payload={'schema_version': 'signal_decider_policy_bundle_v1'},
+        metadata_payload={'activation_mode': 'manual_only', 'candidate_activation_required': True},
+        created_by='system:auto_candidate_generation',
+    )
+
+
 class SignalDeciderSchemaTests(unittest.TestCase):
     def setUp(self) -> None:
         self.engine = create_engine('sqlite+pysqlite:///:memory:')
@@ -118,6 +132,7 @@ class SignalDeciderSchemaTests(unittest.TestCase):
                 SignalDeciderDecisionSnapshot.__table__,
                 SignalDeciderRealizedOutcome.__table__,
                 SignalDeciderEvaluation.__table__,
+                SignalDeciderPolicyVersion.__table__,
             ],
         )
 
@@ -128,6 +143,7 @@ class SignalDeciderSchemaTests(unittest.TestCase):
                 SignalDeciderEvaluation.__table__,
                 SignalDeciderRealizedOutcome.__table__,
                 SignalDeciderDecisionSnapshot.__table__,
+                SignalDeciderPolicyVersion.__table__,
                 AgentContextFeedback.__table__,
             ],
         )
@@ -189,3 +205,26 @@ class SignalDeciderSchemaTests(unittest.TestCase):
             self.assertEqual(surviving_outcome.decision_snapshot_id, snapshot_id)
             self.assertEqual(surviving_evaluation.decision_snapshot_id, snapshot_id)
             self.assertEqual(surviving_evaluation.realized_outcome_id, outcome_id)
+
+    def test_policy_version_registry_persists_manual_activation_metadata(self) -> None:
+        with Session(self.engine) as session:
+            policy_version = _policy_version_row()
+            session.add(policy_version)
+            session.commit()
+
+            persisted = session.query(SignalDeciderPolicyVersion).filter_by(policy_version='signal_decider_policy_v2').one()
+            persisted.status = 'active'
+            persisted.activated_by = 'human.reviewer'
+            persisted.metadata_payload = {
+                **persisted.metadata_payload,
+                'activation_mode': 'manual_only',
+                'candidate_activation_required': True,
+            }
+            session.commit()
+
+        with Session(self.engine) as session:
+            reloaded = session.query(SignalDeciderPolicyVersion).filter_by(policy_version='signal_decider_policy_v2').one()
+            self.assertEqual(reloaded.status, 'active')
+            self.assertEqual(reloaded.parent_policy_version, 'signal_decider_policy_v1')
+            self.assertEqual(reloaded.activated_by, 'human.reviewer')
+            self.assertEqual(reloaded.metadata_payload['activation_mode'], 'manual_only')

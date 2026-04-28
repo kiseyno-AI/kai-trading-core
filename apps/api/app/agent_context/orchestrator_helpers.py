@@ -7,7 +7,7 @@ from datetime import date, datetime, timezone
 from typing import Any, Sequence
 
 from fastapi.encoders import jsonable_encoder
-from app.agent_context.signal_decider_loop_service import DEFAULT_SIGNAL_DECIDER_POLICY_VERSION
+from app.agent_context.signal_decider_loop_service import signal_decider_loop_service
 
 ABORTLIKE_ERROR_MARKERS = (
     'this operation was aborted',
@@ -537,10 +537,14 @@ def build_signal_decider_payload(
     upstream_summaries: dict[str, dict[str, Any]],
     upstream_traceability: dict[str, dict[str, Any]],
     signal_decider_agent_name: str,
+    signal_decider_policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     symbol_day_context = jsonable_encoder(strip_runtime_session_fields(item))
     requested_at = datetime.now(timezone.utc).isoformat()
     symbol = str(item.get('symbol') or '')
+    resolved_signal_decider_policy = jsonable_encoder(
+        signal_decider_policy or signal_decider_loop_service.get_active_policy_context()
+    )
     return {
         'role': signal_decider_agent_name,
         'agent_name': signal_decider_agent_name,
@@ -556,11 +560,7 @@ def build_signal_decider_payload(
             'allow_leverage_guidance': False,
             'avoid_fake_precision': True,
         },
-        'signal_decider_policy': {
-            'current_version': DEFAULT_SIGNAL_DECIDER_POLICY_VERSION,
-            'activation_mode': 'manual_only',
-            'candidate_activation_required': True,
-        },
+        'signal_decider_policy': resolved_signal_decider_policy,
         'output_contract': {
             'batch_envelope_required': True,
             'assigned_symbol': symbol,

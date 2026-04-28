@@ -7,6 +7,7 @@ from app.agent_context.signal_decider_loop_service import (
     DEFAULT_SIGNAL_DECIDER_EVALUATION_LOOKBACK_DAYS,
     DEFAULT_SIGNAL_DECIDER_POLICY_VERSION,
     SignalDeciderLoopService,
+    _merge_policy_metadata_preserving_audit,
 )
 
 
@@ -166,15 +167,61 @@ def _feedback_row(
     )
 
 
+def _policy_version_record(
+    *,
+    policy_version: str = DEFAULT_SIGNAL_DECIDER_POLICY_VERSION,
+    status: str = 'active',
+    parent_policy_version: str | None = None,
+    source_candidate_version: str | None = None,
+    change_summary: str | None = None,
+    created_by: str = 'system:bootstrap',
+    activated_by: str | None = 'system:bootstrap',
+    created_at: str = '2026-04-23T06:00:00+00:00',
+    activated_at: str | None = '2026-04-23T06:00:00+00:00',
+    retired_at: str | None = None,
+) -> dict:
+    return {
+        'id': None,
+        'policy_version': policy_version,
+        'status': status,
+        'parent_policy_version': parent_policy_version,
+        'source_candidate_version': source_candidate_version,
+        'change_summary': change_summary or 'Baseline manual-only signal-decider policy.',
+        'rule_bundle': {
+            'schema_version': 'signal_decider_policy_bundle_v1',
+            'policy_version': policy_version,
+            'review_mode': 'manual_only',
+            'human_activation_required': True,
+        },
+        'metadata': {
+            'schema_version': 'signal_decider_policy_metadata_v1',
+            'activation_mode': 'manual_only',
+            'candidate_activation_required': True,
+        },
+        'created_by': created_by,
+        'activated_by': activated_by if status == 'active' else None,
+        'created_at': created_at,
+        'activated_at': activated_at if status == 'active' else None,
+        'retired_at': retired_at,
+    }
+
+
 class FakeSignalDeciderLoopRepository:
     def __init__(self, snapshot_rows):
         self.snapshot_rows = list(snapshot_rows)
         self.outcomes = {}
         self.evaluations = {}
         self.candidates = {}
+        self.policy_versions = {
+            DEFAULT_SIGNAL_DECIDER_POLICY_VERSION: {
+                **_policy_version_record(),
+                'id': 1,
+            }
+        }
         self.next_outcome_id = 1
         self.next_evaluation_id = 1
         self.next_candidate_id = 1
+        self.next_policy_version_id = 2
         self.list_decision_snapshots_calls = []
         self.list_realized_outcomes_calls = []
         self.list_evaluations_calls = []
@@ -300,6 +347,37 @@ class FakeSignalDeciderLoopRepository:
         rows.sort(key=lambda row: row['candidate_version'])
         return rows[:limit]
 
+    def get_policy_candidate(self, *, candidate_version):
+        return self.candidates.get(candidate_version)
+
+    def list_policy_versions(self, *, status=None, policy_versions=None, limit=50):
+        rows = list(self.policy_versions.values())
+        if status is not None:
+            rows = [row for row in rows if row['status'] == status]
+        normalized_policy_versions = set(policy_versions or [])
+        if normalized_policy_versions:
+            rows = [row for row in rows if row['policy_version'] in normalized_policy_versions]
+        rows.sort(
+            key=lambda row: (
+                0 if row['status'] == 'active' else 1,
+                -(1 if row['activated_at'] else 0),
+                row['activated_at'] or '',
+                row['created_at'] or '',
+                row['policy_version'],
+            ),
+        )
+        return rows[:limit]
+
+    def get_policy_version(self, *, policy_version):
+        return self.policy_versions.get(policy_version)
+
+    def get_active_policy_version(self):
+        active_rows = [row for row in self.policy_versions.values() if row['status'] == 'active']
+        if not active_rows:
+            return None
+        active_rows.sort(key=lambda row: (row['activated_at'] or '', row['created_at'] or '', row['policy_version']), reverse=True)
+        return active_rows[0]
+
     def bulk_upsert_realized_outcomes(self, *, items):
         persisted = []
         for item in items:
@@ -350,9 +428,70 @@ class FakeSignalDeciderLoopRepository:
             stored['market_date_from'] = stored['market_date_from'].isoformat()
             stored['market_date_to'] = stored['market_date_to'].isoformat()
             stored['generated_at'] = stored['generated_at'].isoformat()
+            existing = self.candidates.get(key)
+            if existing and existing.get('activated_at') is not None:
+                stored['status'] = existing['status']
+                stored['activated_at'] = existing['activated_at']
             self.candidates[key] = stored
             persisted.append(stored)
         return persisted
+
+    def bulk_upsert_policy_versions(self, *, items):
+        persisted = []
+        for item in items:
+            key = item['policy_version']
+            existing = self.policy_versions.get(key)
+            stored = {
+                'id': existing.get('id') if existing else self.next_policy_version_id,
+                'policy_version': key,
+                'status': item['status'],
+                'parent_policy_version': item['parent_policy_version'],
+                'source_candidate_version': item['source_candidate_version'],
+                'change_summary': item['change_summary'],
+                'rule_bundle': item['rule_bundle_payload'],
+                'metadata': item['metadata_payload'],
+                'created_by': existing.get('created_by') if existing else item['created_by'],
+                'activated_by': item['activated_by'],
+                'created_at': existing.get('created_at') if existing else item['created_at'].isoformat(),
+                'activated_at': item['activated_at'].isoformat() if item['activated_at'] else None,
+                'retired_at': item['retired_at'].isoformat() if item['retired_at'] else None,
+            }
+            if existing and existing['status'] in {'active', 'retired'}:
+                stored['status'] = existing['status']
+                stored['metadata'] = _merge_policy_metadata_preserving_audit(
+                    metadata_payload=stored['metadata'],
+                    existing_metadata_payload=existing.get('metadata'),
+                )
+                stored['activated_by'] = existing['activated_by']
+                stored['activated_at'] = existing['activated_at']
+                stored['retired_at'] = existing['retired_at']
+            if not existing:
+                self.next_policy_version_id += 1
+            self.policy_versions[key] = stored
+            persisted.append(stored)
+        return persisted
+
+    def activate_policy_version(self, *, policy_version, activated_by, activation_note, activated_at):
+        target = self.policy_versions.get(policy_version)
+        if target is None:
+            return None
+        activated_at_text = activated_at.isoformat()
+        for row in self.policy_versions.values():
+            if row['status'] == 'active' and row['policy_version'] != policy_version:
+                row['status'] = 'retired'
+                row['retired_at'] = activated_at_text
+        target['status'] = 'active'
+        target['activated_by'] = activated_by
+        target['activated_at'] = activated_at_text
+        target['retired_at'] = None
+        metadata = dict(target.get('metadata') or {})
+        metadata['last_activation_note'] = activation_note
+        target['metadata'] = metadata
+        candidate_version = target.get('source_candidate_version') or policy_version
+        if candidate_version in self.candidates:
+            self.candidates[candidate_version]['status'] = 'activated'
+            self.candidates[candidate_version]['activated_at'] = activated_at_text
+        return target
 
 
 class SignalDeciderLoopServiceTests(unittest.TestCase):
@@ -1023,8 +1162,11 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
 
         self.assertGreaterEqual(result['summary']['candidates_generated'], 1)
         self.assertTrue(result['summary']['manual_activation_required'])
+        self.assertGreaterEqual(result['summary']['policy_versions_registered'], 1)
         self.assertTrue(any(item['candidate_kind'] == 'relax_wait_gate' for item in result['items']))
         self.assertTrue(all(item['activation_mode'] == 'manual_only' for item in result['items']))
+        self.assertTrue(all(item['policy_status'] == 'candidate' for item in result['items']))
+        self.assertTrue(all(item['policy_version_record']['status'] == 'candidate' for item in result['items']))
 
     def test_generate_policy_candidates_keeps_base_policy_versions_separate(self):
         repository = FakeSignalDeciderLoopRepository(
@@ -1100,6 +1242,233 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
         )
         self.assertTrue(all(item['support_count'] == 2 for item in grouped_candidates))
         self.assertTrue(all(item['affected_decisions_count'] == 2 for item in grouped_candidates))
+
+    def test_list_policy_versions_returns_registry_summary(self):
+        repository = FakeSignalDeciderLoopRepository([])
+        repository.policy_versions['signal_decider_policy_v2'] = {
+            **_policy_version_record(
+                policy_version='signal_decider_policy_v2',
+                status='candidate',
+                parent_policy_version='signal_decider_policy_v1',
+                source_candidate_version='signal_decider_policy_v2',
+                change_summary='Relax wait decisions under repeated breakout evidence.',
+                activated_by=None,
+                activated_at=None,
+            ),
+            'id': 2,
+        }
+        service = SignalDeciderLoopService(repository=repository)
+
+        result = service.list_policy_versions(limit=10)
+
+        self.assertEqual(result['summary']['count'], 2)
+        self.assertEqual(result['summary']['active_policy_version'], DEFAULT_SIGNAL_DECIDER_POLICY_VERSION)
+        self.assertEqual(result['summary']['status_counts']['active'], 1)
+        self.assertEqual(result['summary']['status_counts']['candidate'], 1)
+        self.assertEqual(result['items'][0]['policy_version'], DEFAULT_SIGNAL_DECIDER_POLICY_VERSION)
+        self.assertEqual(result['items'][1]['activation_mode'], 'manual_only')
+
+    def test_list_policy_versions_status_filter_preserves_active_policy_summary(self):
+        repository = FakeSignalDeciderLoopRepository([])
+        repository.policy_versions['signal_decider_policy_v2'] = {
+            **_policy_version_record(
+                policy_version='signal_decider_policy_v2',
+                status='candidate',
+                parent_policy_version='signal_decider_policy_v1',
+                source_candidate_version='signal_decider_policy_v2',
+                change_summary='Relax wait decisions under repeated breakout evidence.',
+                activated_by=None,
+                activated_at=None,
+            ),
+            'id': 2,
+        }
+        service = SignalDeciderLoopService(repository=repository)
+
+        result = service.list_policy_versions(status='candidate', limit=10)
+
+        self.assertEqual(result['summary']['count'], 1)
+        self.assertEqual(result['summary']['active_policy_version'], DEFAULT_SIGNAL_DECIDER_POLICY_VERSION)
+        self.assertEqual(result['summary']['status_counts'], {'candidate': 1})
+        self.assertEqual([item['policy_version'] for item in result['items']], ['signal_decider_policy_v2'])
+
+    def test_bulk_upsert_policy_versions_preserves_audit_metadata_for_active_and_retired_rows(self):
+        for existing_status in ('active', 'retired'):
+            with self.subTest(existing_status=existing_status):
+                repository = FakeSignalDeciderLoopRepository([])
+                repository.policy_versions['signal_decider_policy_v2'] = {
+                    **_policy_version_record(
+                        policy_version='signal_decider_policy_v2',
+                        status=existing_status,
+                        parent_policy_version='signal_decider_policy_v1',
+                        source_candidate_version='signal_decider_policy_v2',
+                        change_summary='Previously approved candidate.',
+                        activated_by='human.reviewer',
+                        activated_at='2026-04-29T06:30:00+00:00',
+                        retired_at='2026-04-30T06:30:00+00:00' if existing_status == 'retired' else None,
+                    ),
+                    'id': 2,
+                    'metadata': {
+                        'schema_version': 'signal_decider_policy_metadata_v1',
+                        'policy_origin': 'candidate_generation',
+                        'activation_mode': 'manual_only',
+                        'candidate_activation_required': True,
+                        'activation_history': [
+                            {
+                                'event': 'activated',
+                                'activated_at': '2026-04-29T06:30:00+00:00',
+                                'activated_by': 'human.reviewer',
+                            }
+                        ],
+                        'last_activation_note': 'Approved after review.',
+                        'retired_by_activation_of': (
+                            'signal_decider_policy_v3' if existing_status == 'retired' else None
+                        ),
+                    },
+                }
+
+                repository.bulk_upsert_policy_versions(
+                    items=[
+                        {
+                            'policy_version': 'signal_decider_policy_v2',
+                            'status': 'candidate',
+                            'parent_policy_version': 'signal_decider_policy_v1',
+                            'source_candidate_version': 'signal_decider_policy_v2',
+                            'change_summary': 'Regenerated candidate payload.',
+                            'rule_bundle_payload': {
+                                'schema_version': 'signal_decider_policy_bundle_v1',
+                                'policy_version': 'signal_decider_policy_v2',
+                            },
+                            'metadata_payload': {
+                                'schema_version': 'signal_decider_policy_metadata_v1',
+                                'policy_origin': 'candidate_generation',
+                                'activation_mode': 'manual_only',
+                                'candidate_activation_required': True,
+                                'evidence': {'support_ratio': 1.0},
+                            },
+                            'created_by': 'system:auto_candidate_generation',
+                            'activated_by': None,
+                            'activated_at': None,
+                            'retired_at': None,
+                            'created_at': datetime(2026, 5, 1, 6, 0, tzinfo=timezone.utc),
+                            'updated_at': datetime(2026, 5, 1, 6, 0, tzinfo=timezone.utc),
+                        }
+                    ]
+                )
+
+                persisted = repository.policy_versions['signal_decider_policy_v2']
+                self.assertEqual(persisted['status'], existing_status)
+                self.assertEqual(persisted['metadata']['policy_origin'], 'candidate_generation')
+                self.assertEqual(persisted['metadata']['evidence']['support_ratio'], 1.0)
+                self.assertEqual(
+                    persisted['metadata']['activation_history'][0]['activated_by'],
+                    'human.reviewer',
+                )
+                self.assertEqual(persisted['metadata']['last_activation_note'], 'Approved after review.')
+                self.assertEqual(
+                    persisted['metadata'].get('retired_by_activation_of'),
+                    'signal_decider_policy_v3' if existing_status == 'retired' else None,
+                )
+
+    def test_get_policy_version_detail_returns_candidate_evidence(self):
+        repository = FakeSignalDeciderLoopRepository([])
+        repository.policy_versions['signal_decider_policy_v2'] = {
+            **_policy_version_record(
+                policy_version='signal_decider_policy_v2',
+                status='candidate',
+                parent_policy_version='signal_decider_policy_v1',
+                source_candidate_version='signal_decider_policy_v2',
+                change_summary='Relax wait decisions under repeated breakout evidence.',
+                activated_by=None,
+                activated_at=None,
+            ),
+            'id': 2,
+        }
+        repository.candidates['signal_decider_policy_v2'] = {
+            'id': 1,
+            'candidate_version': 'signal_decider_policy_v2',
+            'base_policy_version': 'signal_decider_policy_v1',
+            'evaluation_version': 'signal_decider_eval_v1',
+            'market_date_from': '2026-04-20',
+            'market_date_to': '2026-04-30',
+            'horizon_days': 5,
+            'focus_action': 'wait',
+            'candidate_kind': 'relax_wait_gate',
+            'feature_key': 'technical.breakout_20d',
+            'feature_value': 'true',
+            'affected_decisions_count': 3,
+            'support_count': 3,
+            'contradiction_count': 0,
+            'support_ratio': 1.0,
+            'status': 'generated',
+            'activation_mode': 'manual_only',
+            'summary': 'Relax wait decisions when breakout evidence repeats.',
+            'hypothesis': 'Repeated breakout evidence suggests wait is too conservative.',
+            'evidence': {'support_ratio': 1.0},
+            'recommendation': {'proposed_policy_version': 'signal_decider_policy_v2'},
+            'generated_at': '2026-04-30T06:00:00+00:00',
+            'activated_at': None,
+        }
+        service = SignalDeciderLoopService(repository=repository)
+
+        result = service.get_policy_version_detail(policy_version='signal_decider_policy_v2')
+
+        self.assertEqual(result['item']['policy_version'], 'signal_decider_policy_v2')
+        self.assertEqual(result['item']['status'], 'candidate')
+        self.assertEqual(result['item']['candidate']['candidate_kind'], 'relax_wait_gate')
+        self.assertEqual(result['item']['candidate_activation_required'], True)
+
+    def test_activate_policy_version_retires_previous_active_and_marks_candidate_activated(self):
+        repository = FakeSignalDeciderLoopRepository([])
+        repository.policy_versions['signal_decider_policy_v2'] = {
+            **_policy_version_record(
+                policy_version='signal_decider_policy_v2',
+                status='candidate',
+                parent_policy_version='signal_decider_policy_v1',
+                source_candidate_version='signal_decider_policy_v2',
+                change_summary='Relax wait decisions under repeated breakout evidence.',
+                activated_by=None,
+                activated_at=None,
+            ),
+            'id': 2,
+        }
+        repository.candidates['signal_decider_policy_v2'] = {
+            'id': 1,
+            'candidate_version': 'signal_decider_policy_v2',
+            'base_policy_version': 'signal_decider_policy_v1',
+            'evaluation_version': 'signal_decider_eval_v1',
+            'market_date_from': '2026-04-20',
+            'market_date_to': '2026-04-30',
+            'horizon_days': 5,
+            'focus_action': 'wait',
+            'candidate_kind': 'relax_wait_gate',
+            'feature_key': 'technical.breakout_20d',
+            'feature_value': 'true',
+            'affected_decisions_count': 3,
+            'support_count': 3,
+            'contradiction_count': 0,
+            'support_ratio': 1.0,
+            'status': 'generated',
+            'activation_mode': 'manual_only',
+            'summary': 'Relax wait decisions when breakout evidence repeats.',
+            'hypothesis': 'Repeated breakout evidence suggests wait is too conservative.',
+            'evidence': {'support_ratio': 1.0},
+            'recommendation': {'proposed_policy_version': 'signal_decider_policy_v2'},
+            'generated_at': '2026-04-30T06:00:00+00:00',
+            'activated_at': None,
+        }
+        service = SignalDeciderLoopService(repository=repository)
+
+        result = service.activate_policy_version(
+            policy_version='signal_decider_policy_v2',
+            activated_by='human.reviewer',
+            activation_note='Reviewed diagnostics and approved the candidate.',
+        )
+
+        self.assertTrue(result['summary']['activated'])
+        self.assertEqual(result['summary']['previous_active_policy_version'], DEFAULT_SIGNAL_DECIDER_POLICY_VERSION)
+        self.assertEqual(result['item']['status'], 'active')
+        self.assertEqual(repository.policy_versions[DEFAULT_SIGNAL_DECIDER_POLICY_VERSION]['status'], 'retired')
+        self.assertEqual(repository.candidates['signal_decider_policy_v2']['status'], 'activated')
 
 
 if __name__ == '__main__':

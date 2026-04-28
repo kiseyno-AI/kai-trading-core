@@ -7,8 +7,9 @@ from decimal import Decimal
 import hashlib
 from typing import Any, Sequence
 
-from sqlalchemy import select
+from sqlalchemy import case, select
 from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.agent_context.roles import SIGNAL_DECIDER_AGENT_NAME
 from app.db import session_scope
@@ -17,14 +18,18 @@ from app.db_models import (
     SignalDeciderDecisionSnapshot,
     SignalDeciderEvaluation,
     SignalDeciderPolicyCandidate,
+    SignalDeciderPolicyVersion,
     SignalDeciderRealizedOutcome,
 )
 from app.market_data_store import load_daily_bars_for_symbol_range
 
 DEFAULT_SIGNAL_DECIDER_POLICY_VERSION = 'signal_decider_policy_v1'
 DEFAULT_SIGNAL_DECIDER_EVALUATION_VERSION = 'signal_decider_eval_v1'
+DEFAULT_SIGNAL_DECIDER_POLICY_CREATED_BY = 'system:bootstrap'
+DEFAULT_SIGNAL_DECIDER_POLICY_ACTIVATION_MODE = 'manual_only'
 DEFAULT_POLICY_CANDIDATE_STATUS = 'generated'
 DEFAULT_SIGNAL_DECIDER_EVALUATION_LOOKBACK_DAYS = 30
+SIGNAL_DECIDER_POLICY_STATUSES: tuple[str, ...] = ('draft', 'candidate', 'active', 'retired')
 SIGNAL_DECIDER_EVALUATION_HORIZONS: tuple[int, ...] = (1, 3, 5, 10)
 SIGNAL_DECIDER_ACTIONS: tuple[str, ...] = ('buy', 'wait', 'reject')
 SIGNAL_DECIDER_GRADE_LABELS: tuple[str, ...] = (
@@ -40,6 +45,11 @@ NEGATIVE_SIGNAL_DECIDER_GRADE_LABELS: tuple[str, ...] = (
     'bad_buy',
     'missed_opportunity_after_wait',
     'missed_opportunity_after_reject',
+)
+POLICY_VERSION_AUDIT_METADATA_KEYS: tuple[str, ...] = (
+    'activation_history',
+    'last_activation_note',
+    'retired_by_activation_of',
 )
 
 
@@ -112,6 +122,17 @@ def _normalize_optional_verdict(value: str | None) -> str | None:
         return None
     if normalized not in SIGNAL_DECIDER_GRADE_LABELS:
         raise ValueError(f'verdict must be one of {list(SIGNAL_DECIDER_GRADE_LABELS)}')
+    return normalized
+
+
+def _normalize_optional_policy_status(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip().lower()
+    if not normalized:
+        return None
+    if normalized not in SIGNAL_DECIDER_POLICY_STATUSES:
+        raise ValueError(f'status must be one of {list(SIGNAL_DECIDER_POLICY_STATUSES)}')
     return normalized
 
 
@@ -238,6 +259,19 @@ def _maybe_dict(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
         return value
     return {}
+
+
+def _merge_policy_metadata_preserving_audit(
+    *,
+    metadata_payload: Any,
+    existing_metadata_payload: Any,
+) -> dict[str, Any]:
+    merged_metadata = dict(_maybe_dict(metadata_payload))
+    existing_metadata = _maybe_dict(existing_metadata_payload)
+    for key in POLICY_VERSION_AUDIT_METADATA_KEYS:
+        if key in existing_metadata:
+            merged_metadata[key] = existing_metadata[key]
+    return merged_metadata
 
 
 def _signal_score_bucket(score: float | None) -> str | None:
@@ -367,6 +401,7 @@ def _policy_version_from_payloads(
     summary_payload: dict[str, Any],
     feedback_payload: dict[str, Any],
     context_payload: dict[str, Any] | None,
+    default_policy_version: str | None = None,
 ) -> str:
     context = _maybe_dict(context_payload)
     policy_info = _maybe_dict(context.get('signal_decider_policy'))
@@ -376,6 +411,7 @@ def _policy_version_from_payloads(
         or _normalize_optional_text(summary_payload.get('policy_version'))
         or _normalize_optional_text(policy_info.get('current_version'))
         or _normalize_optional_text(trace_info.get('policy_version'))
+        or default_policy_version
         or DEFAULT_SIGNAL_DECIDER_POLICY_VERSION
     )
 
@@ -622,6 +658,24 @@ def _serialize_policy_candidate_row(row: SignalDeciderPolicyCandidate) -> dict[s
     }
 
 
+def _serialize_policy_version_row(row: SignalDeciderPolicyVersion) -> dict[str, Any]:
+    return {
+        'id': row.id,
+        'policy_version': row.policy_version,
+        'status': row.status,
+        'parent_policy_version': row.parent_policy_version,
+        'source_candidate_version': row.source_candidate_version,
+        'change_summary': row.change_summary,
+        'rule_bundle': row.rule_bundle_payload,
+        'metadata': row.metadata_payload,
+        'created_by': row.created_by,
+        'activated_by': row.activated_by,
+        'created_at': row.created_at.isoformat() if row.created_at else None,
+        'activated_at': row.activated_at.isoformat() if row.activated_at else None,
+        'retired_at': row.retired_at.isoformat() if row.retired_at else None,
+    }
+
+
 class SignalDeciderLoopRepository:
     def insert_decision_snapshots(
         self,
@@ -788,6 +842,75 @@ class SignalDeciderLoopRepository:
             ).scalars().all()
             return [_serialize_policy_candidate_row(row) for row in rows]
 
+    def get_policy_candidate(self, *, candidate_version: str) -> dict[str, Any] | None:
+        normalized_candidate_version = _normalize_optional_text(candidate_version)
+        if not normalized_candidate_version:
+            return None
+        with session_scope() as session:
+            stmt = select(SignalDeciderPolicyCandidate).where(
+                SignalDeciderPolicyCandidate.candidate_version == normalized_candidate_version
+            )
+            row = session.execute(stmt).scalar_one_or_none()
+            return _serialize_policy_candidate_row(row) if row is not None else None
+
+    def list_policy_versions(
+        self,
+        *,
+        status: str | None = None,
+        policy_versions: Sequence[str] | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        normalized_status = _normalize_optional_policy_status(status)
+        normalized_policy_versions = [
+            value
+            for value in (
+                _normalize_optional_text(str(raw_value)) if raw_value is not None else None
+                for raw_value in (policy_versions or [])
+            )
+            if value
+        ]
+        with session_scope() as session:
+            stmt = select(SignalDeciderPolicyVersion)
+            if normalized_status:
+                stmt = stmt.where(SignalDeciderPolicyVersion.status == normalized_status)
+            if normalized_policy_versions:
+                stmt = stmt.where(SignalDeciderPolicyVersion.policy_version.in_(normalized_policy_versions))
+            rows = session.execute(
+                stmt.order_by(
+                    case((SignalDeciderPolicyVersion.status == 'active', 0), else_=1),
+                    SignalDeciderPolicyVersion.activated_at.desc().nullslast(),
+                    SignalDeciderPolicyVersion.created_at.desc(),
+                    SignalDeciderPolicyVersion.id.desc(),
+                ).limit(limit)
+            ).scalars().all()
+            return [_serialize_policy_version_row(row) for row in rows]
+
+    def get_policy_version(self, *, policy_version: str) -> dict[str, Any] | None:
+        normalized_policy_version = _normalize_optional_text(policy_version)
+        if not normalized_policy_version:
+            return None
+        with session_scope() as session:
+            stmt = select(SignalDeciderPolicyVersion).where(
+                SignalDeciderPolicyVersion.policy_version == normalized_policy_version
+            )
+            row = session.execute(stmt).scalar_one_or_none()
+            return _serialize_policy_version_row(row) if row is not None else None
+
+    def get_active_policy_version(self) -> dict[str, Any] | None:
+        with session_scope() as session:
+            stmt = (
+                select(SignalDeciderPolicyVersion)
+                .where(SignalDeciderPolicyVersion.status == 'active')
+                .order_by(
+                    SignalDeciderPolicyVersion.activated_at.desc().nullslast(),
+                    SignalDeciderPolicyVersion.created_at.desc(),
+                    SignalDeciderPolicyVersion.id.desc(),
+                )
+                .limit(1)
+            )
+            row = session.execute(stmt).scalar_one_or_none()
+            return _serialize_policy_version_row(row) if row is not None else None
+
     def bulk_upsert_realized_outcomes(self, *, items: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
         if not items:
             return []
@@ -900,13 +1023,20 @@ class SignalDeciderLoopRepository:
                     'support_count': excluded.support_count,
                     'contradiction_count': excluded.contradiction_count,
                     'support_ratio': excluded.support_ratio,
-                    'status': excluded.status,
+                    'status': case(
+                        (SignalDeciderPolicyCandidate.activated_at.is_not(None), SignalDeciderPolicyCandidate.status),
+                        else_=excluded.status,
+                    ),
                     'activation_mode': excluded.activation_mode,
                     'summary': excluded.summary,
                     'hypothesis': excluded.hypothesis,
                     'evidence_payload': excluded.evidence_payload,
                     'recommendation_payload': excluded.recommendation_payload,
                     'generated_at': excluded.generated_at,
+                    'activated_at': case(
+                        (SignalDeciderPolicyCandidate.activated_at.is_not(None), SignalDeciderPolicyCandidate.activated_at),
+                        else_=excluded.activated_at,
+                    ),
                     'updated_at': excluded.updated_at,
                 },
             ).returning(SignalDeciderPolicyCandidate.id)
@@ -919,10 +1049,555 @@ class SignalDeciderLoopRepository:
             by_key = {row.candidate_version: _serialize_policy_candidate_row(row) for row in rows}
             return [by_key[item['candidate_version']] for item in items]
 
+    def bulk_upsert_policy_versions(self, *, items: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not items:
+            return []
+        input_items = [dict(item) for item in items]
+        with session_scope() as session:
+            policy_versions = sorted(
+                {
+                    value
+                    for value in (
+                        _normalize_optional_text(str(item.get('policy_version')))
+                        for item in input_items
+                    )
+                    if value
+                }
+            )
+            existing_rows = {}
+            if policy_versions:
+                rows = session.execute(
+                    select(SignalDeciderPolicyVersion).where(
+                        SignalDeciderPolicyVersion.policy_version.in_(policy_versions)
+                    )
+                ).scalars().all()
+                existing_rows = {row.policy_version: row for row in rows}
+
+            upsert_items: list[dict[str, Any]] = []
+            for item in input_items:
+                merged_item = dict(item)
+                existing_row = existing_rows.get(str(merged_item['policy_version']))
+                if existing_row is not None and existing_row.status in {'active', 'retired'}:
+                    merged_item['metadata_payload'] = _merge_policy_metadata_preserving_audit(
+                        metadata_payload=merged_item.get('metadata_payload'),
+                        existing_metadata_payload=existing_row.metadata_payload,
+                    )
+                upsert_items.append(merged_item)
+
+            stmt = insert(SignalDeciderPolicyVersion).values(upsert_items)
+            excluded = stmt.excluded
+            stmt = stmt.on_conflict_do_update(
+                constraint='uq_signal_decider_policy_versions_version',
+                set_={
+                    'status': case(
+                        (
+                            SignalDeciderPolicyVersion.status.in_(('active', 'retired')),
+                            SignalDeciderPolicyVersion.status,
+                        ),
+                        else_=excluded.status,
+                    ),
+                    'parent_policy_version': excluded.parent_policy_version,
+                    'source_candidate_version': excluded.source_candidate_version,
+                    'change_summary': excluded.change_summary,
+                    'rule_bundle_payload': excluded.rule_bundle_payload,
+                    'metadata_payload': excluded.metadata_payload,
+                    'activated_by': case(
+                        (
+                            SignalDeciderPolicyVersion.status.in_(('active', 'retired')),
+                            SignalDeciderPolicyVersion.activated_by,
+                        ),
+                        else_=excluded.activated_by,
+                    ),
+                    'activated_at': case(
+                        (
+                            SignalDeciderPolicyVersion.status.in_(('active', 'retired')),
+                            SignalDeciderPolicyVersion.activated_at,
+                        ),
+                        else_=excluded.activated_at,
+                    ),
+                    'retired_at': case(
+                        (SignalDeciderPolicyVersion.status == 'retired', SignalDeciderPolicyVersion.retired_at),
+                        else_=excluded.retired_at,
+                    ),
+                    'updated_at': excluded.updated_at,
+                },
+            ).returning(SignalDeciderPolicyVersion.id)
+            ids = session.execute(stmt).scalars().all()
+            rows = session.execute(
+                select(SignalDeciderPolicyVersion)
+                .where(SignalDeciderPolicyVersion.id.in_(ids))
+                .order_by(SignalDeciderPolicyVersion.id.asc())
+            ).scalars().all()
+            by_key = {row.policy_version: _serialize_policy_version_row(row) for row in rows}
+            return [by_key[item['policy_version']] for item in upsert_items]
+
+    def activate_policy_version(
+        self,
+        *,
+        policy_version: str,
+        activated_by: str,
+        activation_note: str | None,
+        activated_at: datetime,
+    ) -> dict[str, Any] | None:
+        with session_scope() as session:
+            target = session.execute(
+                select(SignalDeciderPolicyVersion).where(
+                    SignalDeciderPolicyVersion.policy_version == policy_version
+                )
+            ).scalar_one_or_none()
+            if target is None:
+                return None
+
+            previously_active_rows = session.execute(
+                select(SignalDeciderPolicyVersion).where(
+                    SignalDeciderPolicyVersion.status == 'active',
+                    SignalDeciderPolicyVersion.policy_version != policy_version,
+                )
+            ).scalars().all()
+            for row in previously_active_rows:
+                metadata = dict(row.metadata_payload or {})
+                activation_history = list(metadata.get('activation_history') or [])
+                activation_history.append(
+                    {
+                        'event': 'retired',
+                        'retired_at': activated_at.isoformat(),
+                        'retired_by_activation_of': policy_version,
+                    }
+                )
+                metadata['activation_history'] = activation_history[-10:]
+                metadata['retired_by_activation_of'] = policy_version
+                row.metadata_payload = metadata
+                row.status = 'retired'
+                row.retired_at = activated_at
+                row.updated_at = activated_at
+
+            target_metadata = dict(target.metadata_payload or {})
+            activation_history = list(target_metadata.get('activation_history') or [])
+            activation_history.append(
+                {
+                    'event': 'activated',
+                    'activated_at': activated_at.isoformat(),
+                    'activated_by': activated_by,
+                    'activation_note': activation_note,
+                    'previous_status': target.status,
+                }
+            )
+            target_metadata['activation_history'] = activation_history[-10:]
+            if activation_note:
+                target_metadata['last_activation_note'] = activation_note
+            target.metadata_payload = target_metadata
+            target.status = 'active'
+            target.activated_by = activated_by
+            target.activated_at = activated_at
+            target.retired_at = None
+            target.updated_at = activated_at
+
+            candidate_version = target.source_candidate_version or target.policy_version
+            candidate_row = session.execute(
+                select(SignalDeciderPolicyCandidate).where(
+                    SignalDeciderPolicyCandidate.candidate_version == candidate_version
+                )
+            ).scalar_one_or_none()
+            if candidate_row is not None:
+                candidate_row.status = 'activated'
+                candidate_row.activated_at = activated_at
+                candidate_row.updated_at = activated_at
+
+            session.flush()
+            session.refresh(target)
+            return _serialize_policy_version_row(target)
+
 
 class SignalDeciderLoopService:
     def __init__(self, *, repository: SignalDeciderLoopRepository | None = None) -> None:
         self.repository = repository or SignalDeciderLoopRepository()
+
+    def get_active_policy_context(self) -> dict[str, Any]:
+        try:
+            policy_record = self.repository.get_active_policy_version()
+            if policy_record is None:
+                self._ensure_default_policy_version_registered()
+                policy_record = self.repository.get_active_policy_version()
+            if policy_record is None:
+                policy_record = self._default_policy_version_record(status='active')
+            return self._policy_prompt_context(policy_record=policy_record)
+        except SQLAlchemyError:
+            return self._fallback_policy_prompt_context(
+                policy_version=DEFAULT_SIGNAL_DECIDER_POLICY_VERSION,
+                status='active',
+                change_summary='Baseline manual-only signal-decider policy.',
+            )
+
+    def get_policy_prompt_context(self, *, policy_version: str | None = None) -> dict[str, Any]:
+        normalized_policy_version = _normalize_optional_text(policy_version)
+        if normalized_policy_version is None:
+            return self.get_active_policy_context()
+        try:
+            self._ensure_policy_versions_registered([normalized_policy_version])
+            policy_record = self.repository.get_policy_version(policy_version=normalized_policy_version)
+            if policy_record is None:
+                return self._fallback_policy_prompt_context(
+                    policy_version=normalized_policy_version,
+                    status='draft',
+                    change_summary='Unregistered signal-decider policy version observed in runtime payload.',
+                )
+            return self._policy_prompt_context(policy_record=policy_record)
+        except SQLAlchemyError:
+            return self._fallback_policy_prompt_context(
+                policy_version=normalized_policy_version,
+                status='draft',
+                change_summary='Signal-decider policy registry unavailable; using observed runtime version context.',
+            )
+
+    def list_policy_versions(
+        self,
+        *,
+        status: str | None = None,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        self._ensure_default_policy_version_registered()
+        resolved_status = _normalize_optional_policy_status(status)
+        items = [
+            self._enrich_policy_version_item(item)
+            for item in self.repository.list_policy_versions(
+                status=resolved_status,
+                limit=_normalize_limit(limit, default=50),
+            )
+        ]
+        status_counts = Counter(str(item.get('status') or '') for item in items if item.get('status'))
+        active_policy = self.repository.get_active_policy_version()
+        active_policy_version = (
+            active_policy.get('policy_version')
+            if active_policy is not None
+            else next((item['policy_version'] for item in items if item.get('status') == 'active'), None)
+        )
+        return {
+            'request': {
+                'status': resolved_status,
+                'limit': limit,
+            },
+            'summary': {
+                'count': len(items),
+                'status_counts': dict(sorted(status_counts.items())),
+                'active_policy_version': active_policy_version,
+                'manual_activation_required': True,
+            },
+            'items': items,
+        }
+
+    def get_policy_version_detail(self, *, policy_version: str) -> dict[str, Any]:
+        normalized_policy_version = _normalize_optional_text(policy_version)
+        if not normalized_policy_version:
+            raise ValueError('policy_version is required')
+        self._ensure_policy_versions_registered([normalized_policy_version])
+        item = self.repository.get_policy_version(policy_version=normalized_policy_version)
+        if item is None:
+            raise ValueError(f'signal-decider policy version {normalized_policy_version} was not found')
+        candidate = self.repository.get_policy_candidate(
+            candidate_version=item.get('source_candidate_version') or normalized_policy_version
+        )
+        enriched_item = self._enrich_policy_version_item(item, candidate=candidate)
+        return {
+            'request': {
+                'policy_version': normalized_policy_version,
+            },
+            'summary': {
+                'is_active': enriched_item.get('status') == 'active',
+                'manual_activation_required': True,
+            },
+            'item': enriched_item,
+        }
+
+    def activate_policy_version(
+        self,
+        *,
+        policy_version: str,
+        activated_by: str,
+        activation_note: str | None = None,
+    ) -> dict[str, Any]:
+        normalized_policy_version = _normalize_optional_text(policy_version)
+        if not normalized_policy_version:
+            raise ValueError('policy_version is required')
+        normalized_activated_by = _normalize_optional_text(activated_by)
+        if not normalized_activated_by:
+            raise ValueError('activated_by is required')
+        normalized_activation_note = _normalize_optional_text(activation_note)
+
+        self._ensure_default_policy_version_registered()
+        self._ensure_policy_versions_registered([normalized_policy_version])
+        target = self.repository.get_policy_version(policy_version=normalized_policy_version)
+        if target is None:
+            raise ValueError(f'signal-decider policy version {normalized_policy_version} was not found')
+        if target.get('status') == 'retired':
+            raise ValueError('retired policy versions cannot be re-activated')
+        if target.get('status') == 'active':
+            candidate = self.repository.get_policy_candidate(
+                candidate_version=target.get('source_candidate_version') or normalized_policy_version
+            )
+            return {
+                'request': {
+                    'policy_version': normalized_policy_version,
+                    'activated_by': normalized_activated_by,
+                    'activation_note': normalized_activation_note,
+                },
+                'summary': {
+                    'activated': False,
+                    'already_active': True,
+                    'previous_active_policy_version': normalized_policy_version,
+                    'manual_activation_required': True,
+                },
+                'item': self._enrich_policy_version_item(target, candidate=candidate),
+            }
+
+        previous_active = self.repository.get_active_policy_version()
+        activated_record = self.repository.activate_policy_version(
+            policy_version=normalized_policy_version,
+            activated_by=normalized_activated_by,
+            activation_note=normalized_activation_note,
+            activated_at=self._utcnow(),
+        )
+        if activated_record is None:
+            raise ValueError(f'signal-decider policy version {normalized_policy_version} was not found')
+        candidate = self.repository.get_policy_candidate(
+            candidate_version=activated_record.get('source_candidate_version') or normalized_policy_version
+        )
+        return {
+            'request': {
+                'policy_version': normalized_policy_version,
+                'activated_by': normalized_activated_by,
+                'activation_note': normalized_activation_note,
+            },
+            'summary': {
+                'activated': True,
+                'already_active': False,
+                'previous_active_policy_version': (
+                    previous_active.get('policy_version')
+                    if previous_active is not None and previous_active.get('policy_version') != normalized_policy_version
+                    else None
+                ),
+                'manual_activation_required': True,
+            },
+            'item': self._enrich_policy_version_item(activated_record, candidate=candidate),
+        }
+
+    def _default_policy_version_record(self, *, status: str) -> dict[str, Any]:
+        now = self._utcnow()
+        item = self._default_policy_version_item(status=status, now=now)
+        return {
+            'id': None,
+            'policy_version': item['policy_version'],
+            'status': item['status'],
+            'parent_policy_version': item['parent_policy_version'],
+            'source_candidate_version': item['source_candidate_version'],
+            'change_summary': item['change_summary'],
+            'rule_bundle': item['rule_bundle_payload'],
+            'metadata': item['metadata_payload'],
+            'created_by': item['created_by'],
+            'activated_by': item['activated_by'],
+            'created_at': now.isoformat(),
+            'activated_at': item['activated_at'].isoformat() if item['activated_at'] else None,
+            'retired_at': item['retired_at'].isoformat() if item['retired_at'] else None,
+        }
+
+    def _ensure_default_policy_version_registered(self) -> dict[str, Any]:
+        existing_default = self.repository.get_policy_version(policy_version=DEFAULT_SIGNAL_DECIDER_POLICY_VERSION)
+        if existing_default is not None:
+            return existing_default
+        current_active = self.repository.get_active_policy_version()
+        default_status = 'active' if current_active is None else 'retired'
+        default_row = self.repository.bulk_upsert_policy_versions(
+            items=[self._default_policy_version_item(status=default_status, now=self._utcnow())]
+        )[0]
+        return default_row
+
+    def _ensure_policy_versions_registered(self, policy_versions: Sequence[str]) -> dict[str, dict[str, Any]]:
+        normalized_policy_versions = sorted(
+            {
+                value
+                for value in (
+                    _normalize_optional_text(policy_version)
+                    for policy_version in policy_versions
+                )
+                if value
+            }
+        )
+        if not normalized_policy_versions:
+            return {}
+        self._ensure_default_policy_version_registered()
+        existing_rows = {
+            item['policy_version']: item
+            for item in self.repository.list_policy_versions(
+                policy_versions=normalized_policy_versions,
+                limit=max(50, len(normalized_policy_versions) * 2),
+            )
+        }
+        missing_versions = [value for value in normalized_policy_versions if value not in existing_rows]
+        if missing_versions:
+            current_active = self.repository.get_active_policy_version()
+            current_active_version = current_active.get('policy_version') if current_active is not None else None
+            observed_rows = []
+            for policy_version in missing_versions:
+                if policy_version == DEFAULT_SIGNAL_DECIDER_POLICY_VERSION:
+                    observed_rows.append(
+                        self._observed_policy_version_item(
+                            policy_version=policy_version,
+                            status='active' if policy_version == current_active_version else 'draft',
+                            now=self._utcnow(),
+                        )
+                    )
+                    continue
+                snapshot_rows = self.repository.list_decision_snapshots(
+                    policy_versions=[policy_version],
+                    limit=1,
+                )
+                if not snapshot_rows:
+                    continue
+                observed_rows.append(
+                    self._observed_policy_version_item(
+                        policy_version=policy_version,
+                        status='active' if policy_version == current_active_version else 'draft',
+                        now=self._utcnow(),
+                    )
+                )
+            if observed_rows:
+                created_rows = self.repository.bulk_upsert_policy_versions(items=observed_rows)
+                existing_rows.update({item['policy_version']: item for item in created_rows})
+        return existing_rows
+
+    def _policy_prompt_context(self, *, policy_record: dict[str, Any]) -> dict[str, Any]:
+        metadata = _maybe_dict(policy_record.get('metadata'))
+        return {
+            'current_version': policy_record.get('policy_version') or DEFAULT_SIGNAL_DECIDER_POLICY_VERSION,
+            'status': policy_record.get('status') or 'draft',
+            'parent_policy_version': policy_record.get('parent_policy_version'),
+            'activation_mode': metadata.get('activation_mode', DEFAULT_SIGNAL_DECIDER_POLICY_ACTIVATION_MODE),
+            'candidate_activation_required': bool(metadata.get('candidate_activation_required', True)),
+            'change_summary': policy_record.get('change_summary'),
+            'rule_bundle': _maybe_dict(policy_record.get('rule_bundle')),
+            'activated_at': policy_record.get('activated_at'),
+            'activated_by': policy_record.get('activated_by'),
+        }
+
+    def _enrich_policy_version_item(
+        self,
+        policy_record: dict[str, Any],
+        *,
+        candidate: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        prompt_context = self._policy_prompt_context(policy_record=policy_record)
+        return {
+            **policy_record,
+            'activation_mode': prompt_context['activation_mode'],
+            'candidate_activation_required': prompt_context['candidate_activation_required'],
+            'candidate': candidate,
+        }
+
+    def _default_policy_version_item(
+        self,
+        *,
+        status: str,
+        now: datetime,
+    ) -> dict[str, Any]:
+        activated_at = now if status == 'active' else None
+        retired_at = now if status == 'retired' else None
+        metadata_payload = {
+            'schema_version': 'signal_decider_policy_metadata_v1',
+            'policy_origin': 'bootstrap',
+            'activation_mode': DEFAULT_SIGNAL_DECIDER_POLICY_ACTIVATION_MODE,
+            'candidate_activation_required': True,
+            'notes': ['Baseline signal-decider policy registry entry.'],
+        }
+        if activated_at is not None:
+            metadata_payload['activation_history'] = [
+                {
+                    'event': 'activated',
+                    'activated_at': activated_at.isoformat(),
+                    'activated_by': DEFAULT_SIGNAL_DECIDER_POLICY_CREATED_BY,
+                    'activation_note': 'Baseline policy registry bootstrap.',
+                    'previous_status': 'draft',
+                }
+            ]
+        return {
+            'policy_version': DEFAULT_SIGNAL_DECIDER_POLICY_VERSION,
+            'status': status,
+            'parent_policy_version': None,
+            'source_candidate_version': None,
+            'change_summary': 'Baseline manual-only signal-decider policy.',
+            'rule_bundle_payload': self._baseline_rule_bundle(DEFAULT_SIGNAL_DECIDER_POLICY_VERSION),
+            'metadata_payload': metadata_payload,
+            'created_by': DEFAULT_SIGNAL_DECIDER_POLICY_CREATED_BY,
+            'activated_by': DEFAULT_SIGNAL_DECIDER_POLICY_CREATED_BY if activated_at is not None else None,
+            'activated_at': activated_at,
+            'retired_at': retired_at,
+            'created_at': now,
+            'updated_at': now,
+        }
+
+    def _observed_policy_version_item(
+        self,
+        *,
+        policy_version: str,
+        status: str,
+        now: datetime,
+    ) -> dict[str, Any]:
+        activated_at = now if status == 'active' else None
+        metadata_payload = {
+            'schema_version': 'signal_decider_policy_metadata_v1',
+            'policy_origin': 'observed_snapshot_backfill',
+            'activation_mode': DEFAULT_SIGNAL_DECIDER_POLICY_ACTIVATION_MODE,
+            'candidate_activation_required': True,
+            'notes': ['Observed legacy signal-decider policy version registered for queryability.'],
+        }
+        return {
+            'policy_version': policy_version,
+            'status': status,
+            'parent_policy_version': None,
+            'source_candidate_version': None,
+            'change_summary': 'Observed legacy signal-decider policy version registered from persisted history.',
+            'rule_bundle_payload': self._baseline_rule_bundle(policy_version),
+            'metadata_payload': metadata_payload,
+            'created_by': 'system:observed_snapshot_backfill',
+            'activated_by': 'system:observed_snapshot_backfill' if activated_at is not None else None,
+            'activated_at': activated_at,
+            'retired_at': None,
+            'created_at': now,
+            'updated_at': now,
+        }
+
+    def _baseline_rule_bundle(self, policy_version: str) -> dict[str, Any]:
+        return {
+            'schema_version': 'signal_decider_policy_bundle_v1',
+            'policy_version': policy_version,
+            'review_mode': DEFAULT_SIGNAL_DECIDER_POLICY_ACTIVATION_MODE,
+            'human_activation_required': True,
+            'policy_constraints': {
+                'decision_support_only': True,
+                'allow_execution_logic': False,
+                'allow_position_sizing': False,
+                'allow_leverage_guidance': False,
+                'avoid_fake_precision': True,
+            },
+            'change_set': [],
+        }
+
+    def _fallback_policy_prompt_context(
+        self,
+        *,
+        policy_version: str,
+        status: str,
+        change_summary: str,
+    ) -> dict[str, Any]:
+        return {
+            'current_version': policy_version,
+            'status': status,
+            'parent_policy_version': None,
+            'activation_mode': DEFAULT_SIGNAL_DECIDER_POLICY_ACTIVATION_MODE,
+            'candidate_activation_required': True,
+            'change_summary': change_summary,
+            'rule_bundle': self._baseline_rule_bundle(policy_version),
+            'activated_at': None,
+            'activated_by': None,
+        }
 
     def prepare_feedback_persistence(
         self,
@@ -936,11 +1611,14 @@ class SignalDeciderLoopService:
             return summary_payload, feedback_payload, context_payload
 
         context = dict(context_payload or {})
+        default_policy_context = self.get_active_policy_context()
         policy_version = _policy_version_from_payloads(
             summary_payload=summary_payload,
             feedback_payload=feedback_payload,
             context_payload=context,
+            default_policy_version=default_policy_context.get('current_version'),
         )
+        policy_context = self.get_policy_prompt_context(policy_version=policy_version)
         feature_snapshot = build_signal_decider_feature_snapshot(
             symbol_day_context=_maybe_dict(context.get('symbol_day_context')),
             feedback_payload=feedback_payload,
@@ -949,11 +1627,7 @@ class SignalDeciderLoopService:
         enriched_feedback = dict(feedback_payload)
         enriched_summary.setdefault('policy_version', policy_version)
         enriched_feedback.setdefault('policy_version', policy_version)
-        context['signal_decider_policy'] = {
-            'current_version': policy_version,
-            'activation_mode': 'manual_only',
-            'candidate_activation_required': True,
-        }
+        context['signal_decider_policy'] = policy_context
         context['signal_decider_trace'] = {
             'policy_version': policy_version,
             'decision_action': _normalize_action(
@@ -984,12 +1658,17 @@ class SignalDeciderLoopService:
 
         normalized_market_date = _normalize_market_date(market_date)
         response_payload = _maybe_dict(normalized_feedback_payload) or _maybe_dict(feedback_payload)
-        request_payload = _maybe_dict(context_payload)
+        request_payload = dict(_maybe_dict(context_payload))
+        default_policy_context = self.get_policy_prompt_context(
+            policy_version=_maybe_dict(request_payload.get('signal_decider_policy')).get('current_version')
+        )
         policy_version = _policy_version_from_payloads(
             summary_payload=summary_payload,
             feedback_payload=response_payload,
             context_payload=request_payload,
+            default_policy_version=default_policy_context.get('current_version'),
         )
+        request_payload.setdefault('signal_decider_policy', self.get_policy_prompt_context(policy_version=policy_version))
         feature_snapshot = _maybe_dict(
             _maybe_dict(request_payload.get('signal_decider_trace')).get('feature_snapshot')
         )
@@ -1717,7 +2396,29 @@ class SignalDeciderLoopService:
                 }
             )
 
+        self._ensure_policy_versions_registered(
+            [item['base_policy_version'] for item in candidate_items]
+        )
         persisted_candidates = self.repository.bulk_upsert_policy_candidates(items=candidate_items)
+        persisted_policy_versions = self.repository.bulk_upsert_policy_versions(
+            items=[
+                self._policy_version_item_from_candidate(candidate_item)
+                for candidate_item in candidate_items
+            ]
+        )
+        policy_versions_by_version = {
+            item['policy_version']: self._enrich_policy_version_item(item)
+            for item in persisted_policy_versions
+        }
+        enriched_candidates = [
+            {
+                **candidate,
+                'policy_version': candidate['candidate_version'],
+                'policy_status': policy_versions_by_version.get(candidate['candidate_version'], {}).get('status'),
+                'policy_version_record': policy_versions_by_version.get(candidate['candidate_version']),
+            }
+            for candidate in persisted_candidates
+        ]
         return {
             'request': {
                 'market_date_from': normalized_from.isoformat(),
@@ -1731,10 +2432,11 @@ class SignalDeciderLoopService:
             },
             'summary': {
                 'evaluations_considered': len(evaluations),
-                'candidates_generated': len(persisted_candidates),
+                'candidates_generated': len(enriched_candidates),
+                'policy_versions_registered': len(persisted_policy_versions),
                 'manual_activation_required': True,
             },
-            'items': persisted_candidates,
+            'items': enriched_candidates,
         }
 
     def list_policy_candidates(
@@ -1754,6 +2456,22 @@ class SignalDeciderLoopService:
             base_policy_version=resolved_policy_version,
             limit=_normalize_limit(limit, default=50),
         )
+        policy_versions_by_version = {
+            item['policy_version']: self._enrich_policy_version_item(item)
+            for item in self.repository.list_policy_versions(
+                policy_versions=[candidate['candidate_version'] for candidate in items],
+                limit=max(50, len(items) * 2),
+            )
+        }
+        enriched_items = [
+            {
+                **candidate,
+                'policy_version': candidate['candidate_version'],
+                'policy_status': policy_versions_by_version.get(candidate['candidate_version'], {}).get('status'),
+                'policy_version_record': policy_versions_by_version.get(candidate['candidate_version']),
+            }
+            for candidate in items
+        ]
         return {
             'request': {
                 'status': resolved_status,
@@ -1762,10 +2480,10 @@ class SignalDeciderLoopService:
                 'limit': limit,
             },
             'summary': {
-                'count': len(items),
+                'count': len(enriched_items),
                 'manual_activation_required': True,
             },
-            'items': items,
+            'items': enriched_items,
         }
 
     def _build_decision_detail_items(
@@ -2791,6 +3509,74 @@ class SignalDeciderLoopService:
             f'When {feature_key}={feature_value}, {decision_action} decisions appear too conservative on the '
             f'{horizon_days}-day horizon and should allow a looser path toward buy review.'
         )
+
+    def _policy_version_item_from_candidate(self, candidate_item: dict[str, Any]) -> dict[str, Any]:
+        now = self._utcnow()
+        candidate_version = str(candidate_item['candidate_version'])
+        metadata_payload = {
+            'schema_version': 'signal_decider_policy_metadata_v1',
+            'policy_origin': 'candidate_generation',
+            'activation_mode': DEFAULT_SIGNAL_DECIDER_POLICY_ACTIVATION_MODE,
+            'candidate_activation_required': True,
+            'evaluation_summary': {
+                'evaluation_version': candidate_item['evaluation_version'],
+                'market_date_from': candidate_item['market_date_from'].isoformat(),
+                'market_date_to': candidate_item['market_date_to'].isoformat(),
+                'horizon_days': candidate_item['horizon_days'],
+                'focus_action': candidate_item['focus_action'],
+                'support_ratio': candidate_item['support_ratio'],
+                'support_count': candidate_item['support_count'],
+                'contradiction_count': candidate_item['contradiction_count'],
+                'affected_decisions_count': candidate_item['affected_decisions_count'],
+            },
+            'evidence': candidate_item['evidence_payload'],
+            'recommendation': candidate_item['recommendation_payload'],
+        }
+        return {
+            'policy_version': candidate_version,
+            'status': 'candidate',
+            'parent_policy_version': candidate_item['base_policy_version'],
+            'source_candidate_version': candidate_version,
+            'change_summary': candidate_item['summary'],
+            'rule_bundle_payload': self._candidate_rule_bundle(candidate_item),
+            'metadata_payload': metadata_payload,
+            'created_by': 'system:auto_candidate_generation',
+            'activated_by': None,
+            'activated_at': None,
+            'retired_at': None,
+            'created_at': now,
+            'updated_at': now,
+        }
+
+    def _candidate_rule_bundle(self, candidate_item: dict[str, Any]) -> dict[str, Any]:
+        return {
+            'schema_version': 'signal_decider_policy_bundle_v1',
+            'policy_version': candidate_item['candidate_version'],
+            'base_policy_version': candidate_item['base_policy_version'],
+            'evaluation_version': candidate_item['evaluation_version'],
+            'review_mode': DEFAULT_SIGNAL_DECIDER_POLICY_ACTIVATION_MODE,
+            'human_activation_required': True,
+            'market_date_window': {
+                'from': candidate_item['market_date_from'].isoformat(),
+                'to': candidate_item['market_date_to'].isoformat(),
+            },
+            'primary_horizon_days': candidate_item['horizon_days'],
+            'focus_action': candidate_item['focus_action'],
+            'candidate_kind': candidate_item['candidate_kind'],
+            'proposed_changes': [
+                {
+                    'change_type': candidate_item['candidate_kind'],
+                    'feature_gate': {
+                        'key': candidate_item['feature_key'],
+                        'value': candidate_item['feature_value'],
+                    },
+                    'support_ratio': candidate_item['support_ratio'],
+                    'support_count': candidate_item['support_count'],
+                    'contradiction_count': candidate_item['contradiction_count'],
+                    'review_note': 'Candidate generation is automatic; activation remains manual-only.',
+                }
+            ],
+        }
 
     def _group_by_snapshot_id(self, rows: Sequence[dict[str, Any]]) -> dict[int, list[dict[str, Any]]]:
         grouped: dict[int, list[dict[str, Any]]] = {}
