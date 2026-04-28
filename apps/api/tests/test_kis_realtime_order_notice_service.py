@@ -1,4 +1,5 @@
 import unittest
+from datetime import datetime, timezone
 from decimal import Decimal
 from uuid import uuid4
 
@@ -8,6 +9,7 @@ from app.db import engine, session_scope
 from app.db_models import BrokerOrder, BrokerOrderEvent, OrderRequest
 from app.orders.kis_realtime_order_notices import KISRealtimeOrderNoticeService
 from app.orders.store import (
+    append_broker_order_event,
     list_broker_order_events,
     load_broker_order,
     upsert_broker_order,
@@ -207,6 +209,57 @@ class KISRealtimeOrderNoticeServiceTests(unittest.TestCase):
         self.assertEqual(order_row['filled_quantity'], Decimal('10'))
         self.assertEqual(order_row['remaining_quantity'], Decimal('0'))
         self.assertEqual([event['event_type'] for event in events], ['partial_fill', 'fill'])
+
+    def test_later_ws_fill_notice_preserves_reconciled_filled_snapshot(self) -> None:
+        self._seed_order()
+        append_broker_order_event(
+            {
+                'broker_name': 'kis',
+                'account_reference': self.account_reference,
+                'client_order_id': self.client_order_id,
+                'broker_order_id': self.broker_order_id,
+                'symbol': '005930',
+                'event_type': 'fill',
+                'event_occurred_at': '2026-04-28T00:20:00+00:00',
+                'source': 'rest_query',
+                'event_dedup_key': f'reconcile:{self.client_order_id}:filled:10:0',
+                'raw_payload': {'source': 'reconcile'},
+                'normalized_payload': {'status': 'filled', 'action': 'reconcile'},
+                'resulting_status': 'filled',
+                'cumulative_filled_quantity': '10',
+                'remaining_quantity': '0',
+                'average_fill_price': '70080',
+                'fill_price': '70080',
+            }
+        )
+
+        result = self.service.ingest_notice_fields(
+            self._build_notice(
+                cntg_yn='2',
+                stock_cntg_hour='092500',
+                cntg_qty='4',
+                cntg_unpr='70010',
+            ),
+            received_at=datetime(2026, 4, 28, 0, 25, tzinfo=timezone.utc),
+        )
+
+        order_row = load_broker_order(
+            account_reference=self.account_reference,
+            broker_order_id=self.broker_order_id,
+        )
+        events = list_broker_order_events(
+            account_reference=self.account_reference,
+            client_order_id=self.client_order_id,
+        )
+
+        self.assertTrue(result['inserted'])
+        self.assertIsNotNone(order_row)
+        self.assertEqual(order_row['current_status'], 'filled')
+        self.assertEqual(order_row['filled_quantity'], Decimal('10'))
+        self.assertEqual(order_row['remaining_quantity'], Decimal('0'))
+        self.assertEqual(order_row['average_fill_price'], Decimal('70080'))
+        self.assertEqual(events[-1]['source'], 'ws_notice')
+        self.assertEqual(events[-1]['cumulative_filled_quantity'], Decimal('10'))
 
 
 if __name__ == '__main__':

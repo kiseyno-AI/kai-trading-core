@@ -644,10 +644,13 @@ class KISRealtimeOrderNoticeService:
         fill_price = _normalize_decimal(fields.get('CNTG_UNPR'))
         order_price = _normalize_decimal(fields.get('ODER_PRC'))
         current_filled_quantity = _normalize_decimal(order_row.get('filled_quantity')) or Decimal('0')
+        current_average_fill_price = _normalize_decimal(order_row.get('average_fill_price'))
+        last_broker_update_at = order_row.get('last_broker_update_at')
         occurred_at = _combine_notice_time(
             hhmmss=_normalize_text(fields.get('STCK_CNTG_HOUR')),
             received_at=received_at,
         )
+        preserve_snapshot_fill = not isinstance(last_broker_update_at, datetime) or occurred_at >= last_broker_update_at
         prior_filled_quantity, prior_filled_value = self._summarize_prior_fill_events(
             order_row=order_row,
             occurred_at=occurred_at,
@@ -675,6 +678,8 @@ class KISRealtimeOrderNoticeService:
             notice_kind = 'fill'
             quantity_delta = notice_quantity
             cumulative_filled_quantity = prior_filled_quantity + notice_quantity
+            if preserve_snapshot_fill:
+                cumulative_filled_quantity = max(current_filled_quantity, cumulative_filled_quantity)
             if requested_quantity > Decimal('0'):
                 cumulative_filled_quantity = min(requested_quantity, cumulative_filled_quantity)
             remaining_quantity = (
@@ -693,10 +698,17 @@ class KISRealtimeOrderNoticeService:
                 else BrokerOrderEventType.PARTIAL_FILL.value
             )
             if fill_price is not None and quantity_delta > Decimal('0'):
-                total_value = prior_filled_value + (fill_price * quantity_delta)
-                total_quantity = prior_filled_quantity + quantity_delta
-                if total_quantity > Decimal('0'):
-                    average_fill_price = total_value / total_quantity
+                if (
+                    preserve_snapshot_fill
+                    and cumulative_filled_quantity <= current_filled_quantity
+                    and current_average_fill_price is not None
+                ):
+                    average_fill_price = current_average_fill_price
+                else:
+                    total_value = prior_filled_value + (fill_price * quantity_delta)
+                    total_quantity = prior_filled_quantity + quantity_delta
+                    if total_quantity > Decimal('0'):
+                        average_fill_price = total_value / total_quantity
         elif correction_kind == 'cancel':
             notice_kind = 'cancel'
             event_type = BrokerOrderEventType.CANCEL_CONFIRMED.value
