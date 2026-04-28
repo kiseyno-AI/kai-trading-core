@@ -957,7 +957,7 @@ class SignalDeciderLoopService:
             horizons=[primary_horizon_days],
             evaluation_version=resolved_version,
         )
-        candidate_groups: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+        candidate_groups: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
         for evaluation in evaluations:
             if evaluation.get('evaluation_status') != 'graded':
                 continue
@@ -978,10 +978,18 @@ class SignalDeciderLoopService:
             if support_flag is None:
                 continue
             for feature_key, feature_value in feature_flags:
-                group_key = (decision_action, support_flag['candidate_kind'], feature_key, feature_value)
+                base_policy_version = decision['policy_version']
+                group_key = (
+                    base_policy_version,
+                    decision_action,
+                    support_flag['candidate_kind'],
+                    feature_key,
+                    feature_value,
+                )
                 group = candidate_groups.setdefault(
                     group_key,
                     {
+                        'base_policy_version': base_policy_version,
                         'decision_action': decision_action,
                         'candidate_kind': support_flag['candidate_kind'],
                         'feature_key': feature_key,
@@ -989,7 +997,6 @@ class SignalDeciderLoopService:
                         'total_count': 0,
                         'support_count': 0,
                         'counterexamples': 0,
-                        'base_policy_version': decision['policy_version'],
                         'samples': [],
                     },
                 )
@@ -1203,12 +1210,13 @@ class SignalDeciderLoopService:
             symbol,
             start_date=market_date,
             limit=max_horizon + 2,
+            prefer_recent_limit=False,
         )
         return [
             bar
             for bar in bars
             if str(bar.get('trade_date') or '') > market_date.isoformat()
-        ]
+        ][:max_horizon]
 
     def _build_realized_outcome_item(
         self,

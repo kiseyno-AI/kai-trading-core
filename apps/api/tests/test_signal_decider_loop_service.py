@@ -17,6 +17,7 @@ def _feedback_row(
     action: str,
     signal_score: int = 78,
     breakout_20d: bool = True,
+    policy_version: str = DEFAULT_SIGNAL_DECIDER_POLICY_VERSION,
 ) -> SimpleNamespace:
     context_payload = {
         'symbol_day_context': {
@@ -55,6 +56,7 @@ def _feedback_row(
         'agent_name': 'signal-decider',
         'symbol': symbol,
         'market_date': market_date,
+        'policy_version': policy_version,
         'preferred_action': action,
         'next_day_open_action': action,
         'entry_price_basis': 'next_open',
@@ -76,7 +78,7 @@ def _feedback_row(
         market_date=date.fromisoformat(market_date),
         symbol=symbol,
         agent_name='signal-decider',
-        summary_payload={'model': 'openclaw/signal-decider'},
+        summary_payload={'model': 'openclaw/signal-decider', 'policy_version': policy_version},
         feedback_payload=feedback_payload,
         normalized_feedback_payload=feedback_payload,
         context_payload=context_payload,
@@ -296,6 +298,52 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
         self.assertEqual(buy_outcomes[1]['entry_trade_date'], '2026-04-21')
         self.assertEqual(buy_outcomes[5]['exit_trade_date'], '2026-04-27')
 
+    def test_compute_evaluations_uses_earliest_future_bars_for_realized_outcomes(self):
+        repository = FakeSignalDeciderLoopRepository(
+            [_feedback_row(feedback_id=1, market_date='2026-04-20', symbol='005930', action='buy')]
+        )
+        service = SignalDeciderLoopService(repository=repository)
+
+        future_bars = [
+            {'trade_date': '2026-04-20', 'open_price': 98, 'high_price': 99, 'low_price': 97, 'close_price': 98, 'volume': 1000},
+            {'trade_date': '2026-04-21', 'open_price': 100, 'high_price': 104, 'low_price': 99, 'close_price': 103, 'volume': 1000},
+            {'trade_date': '2026-04-22', 'open_price': 103, 'high_price': 106, 'low_price': 102, 'close_price': 105, 'volume': 1000},
+            {'trade_date': '2026-04-23', 'open_price': 105, 'high_price': 108, 'low_price': 104, 'close_price': 107, 'volume': 1000},
+            {'trade_date': '2026-04-24', 'open_price': 107, 'high_price': 109, 'low_price': 106, 'close_price': 108, 'volume': 1000},
+            {'trade_date': '2026-04-27', 'open_price': 108, 'high_price': 112, 'low_price': 107, 'close_price': 111, 'volume': 1000},
+            {'trade_date': '2026-04-28', 'open_price': 111, 'high_price': 114, 'low_price': 110, 'close_price': 113, 'volume': 1000},
+            {'trade_date': '2026-04-29', 'open_price': 113, 'high_price': 116, 'low_price': 112, 'close_price': 115, 'volume': 1000},
+            {'trade_date': '2026-04-30', 'open_price': 115, 'high_price': 118, 'low_price': 114, 'close_price': 117, 'volume': 1000},
+        ]
+        captured_kwargs = []
+
+        def fake_load(symbol, **kwargs):
+            self.assertEqual(symbol, '005930')
+            captured_kwargs.append(kwargs)
+            limit = kwargs.get('limit')
+            if limit is None:
+                return future_bars
+            if kwargs.get('prefer_recent_limit', True):
+                return future_bars[-limit:]
+            return future_bars[:limit]
+
+        with patch(
+            'app.agent_context.signal_decider_loop_service.load_daily_bars_for_symbol_range',
+            side_effect=fake_load,
+        ):
+            result = service.compute_evaluations(
+                market_date_from='2026-04-20',
+                market_date_to='2026-04-20',
+                horizons=[5],
+                evaluation_version='signal_decider_eval_test',
+            )
+
+        self.assertEqual(captured_kwargs[0]['prefer_recent_limit'], False)
+        outcome = result['items'][0]['outcomes'][0]
+        self.assertEqual(outcome['entry_trade_date'], '2026-04-21')
+        self.assertEqual(outcome['exit_trade_date'], '2026-04-27')
+        self.assertEqual(outcome['bars_observed'], 5)
+
     def test_generate_policy_candidates_builds_manual_relax_wait_candidates(self):
         repository = FakeSignalDeciderLoopRepository(
             [
@@ -335,6 +383,81 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
         self.assertTrue(result['summary']['manual_activation_required'])
         self.assertTrue(any(item['candidate_kind'] == 'relax_wait_gate' for item in result['items']))
         self.assertTrue(all(item['activation_mode'] == 'manual_only' for item in result['items']))
+
+    def test_generate_policy_candidates_keeps_base_policy_versions_separate(self):
+        repository = FakeSignalDeciderLoopRepository(
+            [
+                _feedback_row(
+                    feedback_id=2,
+                    market_date='2026-04-20',
+                    symbol='000660',
+                    action='wait',
+                    policy_version='signal_decider_policy_v1',
+                ),
+                _feedback_row(
+                    feedback_id=3,
+                    market_date='2026-04-20',
+                    symbol='035420',
+                    action='wait',
+                    policy_version='signal_decider_policy_v1',
+                ),
+                _feedback_row(
+                    feedback_id=4,
+                    market_date='2026-04-20',
+                    symbol='051910',
+                    action='wait',
+                    policy_version='signal_decider_policy_v2',
+                ),
+                _feedback_row(
+                    feedback_id=5,
+                    market_date='2026-04-20',
+                    symbol='068270',
+                    action='wait',
+                    policy_version='signal_decider_policy_v2',
+                ),
+            ]
+        )
+        service = SignalDeciderLoopService(repository=repository)
+
+        bars_by_symbol = {
+            symbol: [
+                {'trade_date': '2026-04-20', 'open_price': 48, 'high_price': 49, 'low_price': 47, 'close_price': 48, 'volume': 900},
+                {'trade_date': '2026-04-21', 'open_price': 50, 'high_price': 53, 'low_price': 49, 'close_price': 52, 'volume': 900},
+                {'trade_date': '2026-04-22', 'open_price': 52, 'high_price': 55, 'low_price': 51, 'close_price': 54, 'volume': 900},
+                {'trade_date': '2026-04-23', 'open_price': 54, 'high_price': 57, 'low_price': 53, 'close_price': 56, 'volume': 900},
+                {'trade_date': '2026-04-24', 'open_price': 56, 'high_price': 60, 'low_price': 55, 'close_price': 59, 'volume': 900},
+                {'trade_date': '2026-04-27', 'open_price': 59, 'high_price': 63, 'low_price': 58, 'close_price': 62, 'volume': 900},
+            ]
+            for symbol in ('000660', '035420', '051910', '068270')
+        }
+
+        with patch(
+            'app.agent_context.signal_decider_loop_service.load_daily_bars_for_symbol_range',
+            side_effect=lambda symbol, **kwargs: bars_by_symbol[symbol],
+        ):
+            result = service.generate_policy_candidates(
+                market_date_from='2026-04-20',
+                market_date_to='2026-04-20',
+                horizons=[5],
+                primary_horizon_days=5,
+                evaluation_version='signal_decider_eval_test',
+                min_sample_size=2,
+            )
+
+        grouped_candidates = [
+            item
+            for item in result['items']
+            if item['candidate_kind'] == 'relax_wait_gate'
+            and item['feature_key'] == 'technical.trend_state'
+            and item['feature_value'] == 'uptrend'
+        ]
+        self.assertEqual(len(grouped_candidates), 2)
+        self.assertEqual(
+            {item['base_policy_version'] for item in grouped_candidates},
+            {'signal_decider_policy_v1', 'signal_decider_policy_v2'},
+        )
+        self.assertTrue(all(item['support_count'] == 2 for item in grouped_candidates))
+        self.assertTrue(all(item['affected_decisions_count'] == 2 for item in grouped_candidates))
 
 
 if __name__ == '__main__':

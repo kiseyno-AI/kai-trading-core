@@ -520,9 +520,10 @@ def load_daily_bars_for_symbol_range(
     start_date: str | date | None = None,
     end_date: str | date | None = None,
     limit: int | None = None,
+    prefer_recent_limit: bool = True,
 ) -> list[dict]:
     with session_scope() as session:
-        descending_window = limit is not None
+        descending_window = limit is not None and prefer_recent_limit
         stmt = (
             select(
                 DailyPriceBar.trade_date,
