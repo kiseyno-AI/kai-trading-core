@@ -424,6 +424,7 @@ class OpenClawAgentClient:
             'checked': True,
             'requested_response_id': response_id,
             'matched_response_id': False,
+            'candidate_run_ids': [],
             'matched_event_type': None,
             'trajectory_run_id': None,
             'trajectory_final_status': None,
@@ -483,9 +484,18 @@ class OpenClawAgentClient:
                 'diagnostics': diagnostics,
             }
 
-        preferred_events = [event for event in candidate_events if response_id and event['run_id'] == response_id]
-        diagnostics['matched_response_id'] = bool(preferred_events)
-        if not preferred_events:
+        diagnostics['candidate_run_ids'] = [event['run_id'] for event in candidate_events if event['run_id']]
+        if response_id:
+            preferred_events = [event for event in candidate_events if event['run_id'] == response_id]
+            diagnostics['matched_response_id'] = bool(preferred_events)
+            if not preferred_events:
+                diagnostics['failure_mode'] = 'trajectory_response_id_mismatch'
+                return {
+                    'decoded': None,
+                    'output_text': None,
+                    'diagnostics': diagnostics,
+                }
+        else:
             preferred_events = candidate_events
         preferred_events.sort(
             key=lambda event: (
@@ -1128,7 +1138,7 @@ class OpenClawAgentClient:
                             output_text = trajectory_recovery.get('output_text')
                         else:
                             trajectory_failure_mode = trajectory_diagnostics.get('failure_mode')
-                            if trajectory_failure_mode in {'trajectory_assistant_non_json'}:
+                            if trajectory_failure_mode in {'trajectory_assistant_non_json', 'trajectory_response_id_mismatch'}:
                                 failure_mode = trajectory_failure_mode
                             if trajectory_diagnostics.get('json_failure_class'):
                                 json_failure_class = trajectory_diagnostics.get('json_failure_class')

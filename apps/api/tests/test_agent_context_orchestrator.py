@@ -1861,6 +1861,138 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertTrue(recovery['trajectory']['matched_response_id'])
         self.assertNotIn('batch_response_parse_failed', [entry['stage'] for entry in captured_logs])
 
+    def test_openclaw_batch_dispatch_fails_with_trajectory_response_id_mismatch_when_only_stale_run_artifacts_exist(self):
+        dispatch_id = 'symbol-run-2026-04-14-abc123:signal-decider:slot-1:batch-1'
+        session_key = 'agent:signal-decider:feedback/signal-decider/slot-01'
+        http_calls = []
+        captured_logs = []
+        response_payload = {
+            'id': 'resp-decider-traj-expected',
+            'status': 'completed',
+            'model': 'openclaw/signal-decider',
+            'output': [
+                {
+                    'type': 'message',
+                    'content': [{'type': 'output_text', 'text': 'not json'}],
+                }
+            ],
+        }
+        stale_trajectory_text = json.dumps(
+            {
+                'items': [
+                    {
+                        'symbol': '005930',
+                        'feedback': {
+                            'role': 'signal-decider',
+                            'summary': 'Stale trajectory response that must not be reused.',
+                            'confidence': 0.6,
+                            'risk_flags': [],
+                            'details': {},
+                            'improvement_notes': [],
+                        },
+                    }
+                ]
+            }
+        )
+
+        def fake_client_factory(*args, **kwargs):
+            return FakeHTTPClient(
+                response=FakeHTTPResponse(200, response_payload),
+                calls=http_calls,
+                **kwargs,
+            )
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            sessions_dir = Path(tempdir) / 'agents' / 'signal-decider' / 'sessions'
+            sessions_dir.mkdir(parents=True)
+            trajectory_path = sessions_dir / 'session-traj-1.trajectory.jsonl'
+            trajectory_path.write_text(
+                '\n'.join(
+                    [
+                        json.dumps(
+                            {
+                                'type': 'session.started',
+                                'sessionId': 'session-traj-1',
+                                'sessionKey': session_key,
+                                'runId': 'stale-run-id',
+                                'data': {},
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                'type': 'trace.artifacts',
+                                'sessionId': 'session-traj-1',
+                                'sessionKey': session_key,
+                                'runId': 'stale-run-id',
+                                'data': {
+                                    'assistantTexts': [stale_trajectory_text],
+                                    'finalStatus': 'success',
+                                },
+                            }
+                        ),
+                    ]
+                )
+                + '\n',
+                encoding='utf-8',
+            )
+            fake_settings = SimpleNamespace(
+                openclaw_base_url='https://openclaw.example',
+                openclaw_gateway_token='gateway-token',
+                openclaw_agent_timeout_seconds=30,
+                openclaw_agent_max_retries=0,
+                openclaw_agent_retry_backoff_seconds=0,
+                openclaw_agent_max_prompt_chars=0,
+                openclaw_state_dir=tempdir,
+            )
+
+            with patch.object(orchestrator_module, 'settings', fake_settings):
+                with patch('app.agent_context.orchestrator.httpx.Client', side_effect=fake_client_factory):
+                    with patch.object(OpenClawAgentClient, 'fetch_session_history', return_value=[]):
+                        with patch.object(
+                            orchestrator_module,
+                            'log_agent_feedback_event',
+                            side_effect=lambda stage, **payload: captured_logs.append({'stage': stage, **payload}),
+                        ):
+                            client = OpenClawAgentClient()
+                            with self.assertRaisesRegex(
+                                orchestrator_module.AgentDispatchRetryableError,
+                                'trajectory_response_id_mismatch',
+                            ) as exc:
+                                client.dispatch_batch(
+                                    spec=orchestrator_module.DISPATCH_SPECS[-1],
+                                    market_date=orchestrator_module.date.fromisoformat('2026-04-14'),
+                                    batch_items=[
+                                        {
+                                            'symbol': '005930',
+                                            'market_date': '2026-04-14',
+                                            'request_run_id': 'symbol-run-2026-04-14-abc123',
+                                            'dispatch_id': dispatch_id,
+                                            'session_slot': 1,
+                                            'session_key': session_key,
+                                            'session_reuse_mode': 'fresh_per_batch',
+                                        }
+                                    ],
+                                )
+
+        self.assertEqual(exc.exception.details['failure_mode'], 'trajectory_response_id_mismatch')
+        self.assertEqual(exc.exception.details['failure_class'], 'trajectory_response_id_mismatch')
+        self.assertEqual(
+            exc.exception.details['response_recovery']['trajectory']['failure_mode'],
+            'trajectory_response_id_mismatch',
+        )
+        self.assertFalse(exc.exception.details['response_recovery']['trajectory']['matched_response_id'])
+        self.assertEqual(
+            exc.exception.details['response_recovery']['trajectory']['candidate_run_ids'],
+            ['stale-run-id'],
+        )
+        parse_log = next(entry for entry in captured_logs if entry['stage'] == 'batch_response_parse_failed')
+        self.assertEqual(parse_log['failure_mode'], 'trajectory_response_id_mismatch')
+        self.assertEqual(parse_log['failure_class'], 'trajectory_response_id_mismatch')
+        self.assertEqual(
+            parse_log['response_correlation']['response_recovery']['trajectory']['failure_mode'],
+            'trajectory_response_id_mismatch',
+        )
+
     def test_spawn_symbol_subagent_terminal_error_logs_only_in_scope_fields(self):
         http_calls = []
         captured_logs = []
