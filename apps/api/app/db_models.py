@@ -977,7 +977,8 @@ class SignalDeciderRealizedOutcome(Base, TimestampMixin):
         index=True,
     )
     feedback_id: Mapped[int | None] = mapped_column(
-        ForeignKey('agent_context_feedback.id', ondelete='CASCADE'),
+        ForeignKey('agent_context_feedback.id', ondelete='SET NULL'),
+        nullable=True,
         index=True,
     )
     market_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
@@ -1032,7 +1033,8 @@ class SignalDeciderEvaluation(Base, TimestampMixin):
         index=True,
     )
     feedback_id: Mapped[int | None] = mapped_column(
-        ForeignKey('agent_context_feedback.id', ondelete='CASCADE'),
+        ForeignKey('agent_context_feedback.id', ondelete='SET NULL'),
+        nullable=True,
         index=True,
     )
     realized_outcome_id: Mapped[int | None] = mapped_column(
