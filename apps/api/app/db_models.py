@@ -17,6 +17,8 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
+from app.orders.domain import BrokerOrderStatus, OrderRequestSubmissionStatus, OrderRequestValidationStatus
+
 
 class Base(DeclarativeBase):
     pass
@@ -145,6 +147,196 @@ class EODCollectionRun(Base):
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     run_metadata: Mapped[dict | None] = mapped_column(JSON)
+
+
+class OrderRequest(Base, TimestampMixin):
+    __tablename__ = 'order_requests'
+    __table_args__ = (
+        UniqueConstraint(
+            'broker_name',
+            'account_reference',
+            'client_order_id',
+            name='uq_order_requests_broker_account_client_order_id',
+        ),
+        Index(
+            'ix_order_requests_account_submission_created',
+            'account_reference',
+            'submission_status',
+            'created_at',
+        ),
+        Index(
+            'ix_order_requests_account_validation_created',
+            'account_reference',
+            'validation_status',
+            'created_at',
+        ),
+        Index('ix_order_requests_symbol_created', 'symbol', 'created_at'),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    broker_name: Mapped[str] = mapped_column(String(32), nullable=False, default='kis')
+    client_order_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default='manual')
+    account_reference: Mapped[str] = mapped_column(String(128), nullable=False)
+    symbol: Mapped[str] = mapped_column(String(32), nullable=False)
+    side: Mapped[str] = mapped_column(String(16), nullable=False)
+    order_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    requested_quantity: Mapped[float] = mapped_column(Numeric(20, 8), nullable=False)
+    requested_price: Mapped[float | None] = mapped_column(Numeric(20, 8))
+    time_in_force: Mapped[str | None] = mapped_column(String(32))
+    strategy_context_payload: Mapped[dict | None] = mapped_column(JSON)
+    request_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    validation_status: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default=OrderRequestValidationStatus.PENDING.value,
+    )
+    validation_payload: Mapped[dict | None] = mapped_column(JSON)
+    submission_status: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default=OrderRequestSubmissionStatus.PENDING_SUBMIT.value,
+    )
+    submission_payload: Mapped[dict | None] = mapped_column(JSON)
+    submission_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_submission_error: Mapped[str | None] = mapped_column(Text)
+    submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class BrokerOrder(Base, TimestampMixin):
+    __tablename__ = 'broker_orders'
+    __table_args__ = (
+        UniqueConstraint(
+            'broker_name',
+            'account_reference',
+            'client_order_id',
+            name='uq_broker_orders_broker_account_client_order_id',
+        ),
+        UniqueConstraint(
+            'broker_name',
+            'account_reference',
+            'broker_order_id',
+            name='uq_broker_orders_broker_account_broker_order_id',
+        ),
+        Index(
+            'ix_broker_orders_account_status_updated',
+            'account_reference',
+            'current_status',
+            'updated_at',
+        ),
+        Index(
+            'ix_broker_orders_symbol_status_updated',
+            'symbol',
+            'current_status',
+            'updated_at',
+        ),
+        Index('ix_broker_orders_account_updated', 'account_reference', 'updated_at'),
+        Index('ix_broker_orders_last_broker_update_at', 'last_broker_update_at'),
+        Index('ix_broker_orders_order_request_id', 'order_request_id'),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    order_request_id: Mapped[int | None] = mapped_column(
+        ForeignKey('order_requests.id', ondelete='SET NULL'),
+        nullable=True,
+    )
+    broker_name: Mapped[str] = mapped_column(String(32), nullable=False, default='kis')
+    broker_order_id: Mapped[str | None] = mapped_column(String(128))
+    client_order_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    account_reference: Mapped[str] = mapped_column(String(128), nullable=False)
+    symbol: Mapped[str] = mapped_column(String(32), nullable=False)
+    side: Mapped[str] = mapped_column(String(16), nullable=False)
+    order_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    requested_quantity: Mapped[float] = mapped_column(Numeric(20, 8), nullable=False)
+    requested_price: Mapped[float | None] = mapped_column(Numeric(20, 8))
+    accepted_quantity: Mapped[float | None] = mapped_column(Numeric(20, 8))
+    accepted_price: Mapped[float | None] = mapped_column(Numeric(20, 8))
+    filled_quantity: Mapped[float] = mapped_column(Numeric(20, 8), nullable=False, default=0)
+    remaining_quantity: Mapped[float | None] = mapped_column(Numeric(20, 8))
+    average_fill_price: Mapped[float | None] = mapped_column(Numeric(20, 8))
+    time_in_force: Mapped[str | None] = mapped_column(String(32))
+    current_status: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default=BrokerOrderStatus.PENDING_SUBMIT.value,
+    )
+    status_reason: Mapped[str | None] = mapped_column(Text)
+    first_submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_broker_update_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_fill_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    raw_latest_payload: Mapped[dict | None] = mapped_column(JSON)
+    snapshot_payload: Mapped[dict | None] = mapped_column(JSON)
+
+
+class BrokerOrderEvent(Base):
+    __tablename__ = 'broker_order_events'
+    __table_args__ = (
+        UniqueConstraint(
+            'broker_order_row_id',
+            'event_dedup_key',
+            name='uq_broker_order_events_broker_order_dedup_key',
+        ),
+        Index(
+            'ix_broker_order_events_order_timeline',
+            'broker_order_row_id',
+            'event_occurred_at',
+            'id',
+        ),
+        Index(
+            'ix_broker_order_events_account_recency',
+            'account_reference',
+            'event_occurred_at',
+        ),
+        Index(
+            'ix_broker_order_events_symbol_recency',
+            'symbol',
+            'event_occurred_at',
+        ),
+        Index(
+            'ix_broker_order_events_client_order_recency',
+            'client_order_id',
+            'event_occurred_at',
+        ),
+        Index(
+            'ix_broker_order_events_broker_order_recency',
+            'broker_order_id',
+            'event_occurred_at',
+        ),
+        Index(
+            'ix_broker_order_events_status_recency',
+            'resulting_status',
+            'event_occurred_at',
+        ),
+        Index('ix_broker_order_events_order_request_id', 'order_request_id'),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    broker_order_row_id: Mapped[int] = mapped_column(
+        ForeignKey('broker_orders.id', ondelete='CASCADE'),
+        nullable=False,
+    )
+    order_request_id: Mapped[int | None] = mapped_column(
+        ForeignKey('order_requests.id', ondelete='SET NULL'),
+        nullable=True,
+    )
+    broker_name: Mapped[str] = mapped_column(String(32), nullable=False, default='kis')
+    broker_order_id: Mapped[str | None] = mapped_column(String(128))
+    client_order_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    account_reference: Mapped[str] = mapped_column(String(128), nullable=False)
+    symbol: Mapped[str] = mapped_column(String(32), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    event_sequence: Mapped[str | None] = mapped_column(String(64))
+    broker_event_id: Mapped[str | None] = mapped_column(String(128))
+    resulting_status: Mapped[str | None] = mapped_column(String(32))
+    event_occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    quantity_delta: Mapped[float | None] = mapped_column(Numeric(20, 8))
+    cumulative_filled_quantity: Mapped[float | None] = mapped_column(Numeric(20, 8))
+    fill_price: Mapped[float | None] = mapped_column(Numeric(20, 8))
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    event_dedup_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    raw_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    normalized_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
 class DailyPriceBar(Base):
