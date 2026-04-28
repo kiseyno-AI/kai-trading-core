@@ -50,6 +50,7 @@ class Settings(BaseSettings):
     kis_order_reconcile_stale_after_minutes: int = 15
     kis_order_reconcile_recent_days: int = 3
     kis_order_reconcile_batch_limit: int = 100
+    portfolio_account_references: str = ''
 
     bok_ecos_api_key: str = Field(
         default='',
