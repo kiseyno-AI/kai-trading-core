@@ -167,6 +167,59 @@ def _serialize_broker_order_event(row: BrokerOrderEvent) -> dict[str, Any]:
     }
 
 
+def _normalize_order_request_values(request: dict[str, Any]) -> tuple[str, str, str, dict[str, Any]]:
+    broker_name = _normalize_required_text(request.get('broker_name') or 'kis', field='broker_name', lowercase=True)
+    account_reference = _normalize_required_text(request.get('account_reference'), field='account_reference')
+    client_order_id = _normalize_required_text(request.get('client_order_id'), field='client_order_id')
+    values = {
+        'broker_name': broker_name,
+        'client_order_id': client_order_id,
+        'source': _normalize_required_text(request.get('source') or 'manual', field='source', lowercase=True),
+        'account_reference': account_reference,
+        'symbol': _normalize_symbol(request.get('symbol')),
+        'side': _normalize_required_text(request.get('side'), field='side', lowercase=True),
+        'order_type': _normalize_required_text(request.get('order_type'), field='order_type', lowercase=True),
+        'requested_quantity': _normalize_decimal(
+            request.get('requested_quantity'),
+            field='requested_quantity',
+            required=True,
+        ),
+        'requested_price': _normalize_decimal(request.get('requested_price'), field='requested_price'),
+        'time_in_force': _normalize_optional_text(request.get('time_in_force'), lowercase=True),
+        'strategy_context_payload': _normalize_json_payload(
+            request.get('strategy_context_payload'),
+            field='strategy_context_payload',
+        ),
+        'request_payload': _normalize_json_payload(
+            request.get('request_payload'),
+            field='request_payload',
+            required=True,
+        ),
+        'validation_status': _normalize_required_text(
+            request.get('validation_status') or OrderRequestValidationStatus.PENDING.value,
+            field='validation_status',
+            lowercase=True,
+        ),
+        'validation_payload': _normalize_json_payload(
+            request.get('validation_payload'),
+            field='validation_payload',
+        ),
+        'submission_status': _normalize_required_text(
+            request.get('submission_status') or OrderRequestSubmissionStatus.PENDING_SUBMIT.value,
+            field='submission_status',
+            lowercase=True,
+        ),
+        'submission_payload': _normalize_json_payload(
+            request.get('submission_payload'),
+            field='submission_payload',
+        ),
+        'submission_attempts': int(request.get('submission_attempts') or 0),
+        'last_submission_error': _normalize_optional_text(request.get('last_submission_error')),
+        'submitted_at': _normalize_datetime(request.get('submitted_at'), field='submitted_at'),
+    }
+    return broker_name, account_reference, client_order_id, values
+
+
 def _load_order_request_row(
     session,
     *,
@@ -225,56 +278,7 @@ def _load_broker_order_row(
 
 def upsert_order_request(request: dict[str, Any]) -> dict[str, Any]:
     now = _now_utc()
-    broker_name = _normalize_required_text(request.get('broker_name') or 'kis', field='broker_name', lowercase=True)
-    account_reference = _normalize_required_text(request.get('account_reference'), field='account_reference')
-    client_order_id = _normalize_required_text(request.get('client_order_id'), field='client_order_id')
-
-    values = {
-        'broker_name': broker_name,
-        'client_order_id': client_order_id,
-        'source': _normalize_required_text(request.get('source') or 'manual', field='source', lowercase=True),
-        'account_reference': account_reference,
-        'symbol': _normalize_symbol(request.get('symbol')),
-        'side': _normalize_required_text(request.get('side'), field='side', lowercase=True),
-        'order_type': _normalize_required_text(request.get('order_type'), field='order_type', lowercase=True),
-        'requested_quantity': _normalize_decimal(
-            request.get('requested_quantity'),
-            field='requested_quantity',
-            required=True,
-        ),
-        'requested_price': _normalize_decimal(request.get('requested_price'), field='requested_price'),
-        'time_in_force': _normalize_optional_text(request.get('time_in_force'), lowercase=True),
-        'strategy_context_payload': _normalize_json_payload(
-            request.get('strategy_context_payload'),
-            field='strategy_context_payload',
-        ),
-        'request_payload': _normalize_json_payload(
-            request.get('request_payload'),
-            field='request_payload',
-            required=True,
-        ),
-        'validation_status': _normalize_required_text(
-            request.get('validation_status') or OrderRequestValidationStatus.PENDING.value,
-            field='validation_status',
-            lowercase=True,
-        ),
-        'validation_payload': _normalize_json_payload(
-            request.get('validation_payload'),
-            field='validation_payload',
-        ),
-        'submission_status': _normalize_required_text(
-            request.get('submission_status') or OrderRequestSubmissionStatus.PENDING_SUBMIT.value,
-            field='submission_status',
-            lowercase=True,
-        ),
-        'submission_payload': _normalize_json_payload(
-            request.get('submission_payload'),
-            field='submission_payload',
-        ),
-        'submission_attempts': int(request.get('submission_attempts') or 0),
-        'last_submission_error': _normalize_optional_text(request.get('last_submission_error')),
-        'submitted_at': _normalize_datetime(request.get('submitted_at'), field='submitted_at'),
-    }
+    _, _, _, values = _normalize_order_request_values(request)
 
     stmt = pg_insert(OrderRequest).values(**values)
     stmt = stmt.on_conflict_do_update(
@@ -304,6 +308,31 @@ def upsert_order_request(request: dict[str, Any]) -> dict[str, Any]:
         order_request_id = session.execute(stmt).scalar_one()
         row = session.execute(select(OrderRequest).where(OrderRequest.id == order_request_id)).scalar_one()
         return _serialize_order_request(row)
+
+
+def create_order_request_if_absent(request: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    broker_name, account_reference, client_order_id, values = _normalize_order_request_values(request)
+
+    stmt = pg_insert(OrderRequest).values(**values)
+    stmt = stmt.on_conflict_do_nothing(
+        constraint='uq_order_requests_broker_account_client_order_id'
+    ).returning(OrderRequest.id)
+
+    with session_scope() as session:
+        inserted_id = session.execute(stmt).scalar_one_or_none()
+        if inserted_id is not None:
+            row = session.execute(select(OrderRequest).where(OrderRequest.id == inserted_id)).scalar_one()
+            return _serialize_order_request(row), True
+
+        row = _load_order_request_row(
+            session,
+            broker_name=broker_name,
+            account_reference=account_reference,
+            client_order_id=client_order_id,
+        )
+        if row is None:
+            raise RuntimeError('order request insert conflict returned no existing row')
+        return _serialize_order_request(row), False
 
 
 def load_order_request(

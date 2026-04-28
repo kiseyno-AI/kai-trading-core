@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 from decimal import Decimal
 from uuid import uuid4
@@ -10,6 +11,7 @@ from app.db_models import BrokerOrder, BrokerOrderEvent, OrderRequest
 from app.orders.service import (
     TradingOrderPendingSubmissionError,
     TradingOrderRejectedError,
+    TradingOrderValidationError,
     trading_order_service as default_service,
     TradingOrderService,
 )
@@ -26,6 +28,9 @@ class FakeKISOrderClient:
         self.cancel_replace_calls = 0
         self.daily_fill_calls = 0
         self.cancelable_calls = 0
+        self.submit_started = asyncio.Event()
+        self.resume_submit = asyncio.Event()
+        self.resume_submit.set()
         self.submit_result = {
             'rt_cd': '0',
             'msg_cd': 'APBK0013',
@@ -56,6 +61,8 @@ class FakeKISOrderClient:
 
     async def submit_domestic_cash_order(self, **kwargs):
         self.submit_calls += 1
+        self.submit_started.set()
+        await self.resume_submit.wait()
         if self.submit_exception is not None:
             raise self.submit_exception
         return self.submit_result
@@ -177,6 +184,49 @@ class TradingOrderServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(retry_result['idempotent_replay'])
         self.assertEqual(request_row['submission_status'], 'submitting')
         self.assertEqual(order_row['current_status'], 'pending_submit')
+
+    async def test_submit_replay_is_atomic_while_first_request_is_in_flight(self) -> None:
+        self.fake_client.resume_submit.clear()
+
+        first_task = asyncio.create_task(self._submit_buy_order())
+        await self.fake_client.submit_started.wait()
+
+        replay_result = await self._submit_buy_order()
+
+        self.assertEqual(self.fake_client.submit_calls, 1)
+        self.assertTrue(replay_result['idempotent_replay'])
+        self.assertFalse(replay_result['created'])
+        self.assertEqual(replay_result['request']['submission_status'], 'submitting')
+        self.assertEqual(replay_result['order']['current_status'], 'pending_submit')
+
+        self.fake_client.resume_submit.set()
+        first_result = await first_task
+
+        self.assertTrue(first_result['created'])
+        self.assertFalse(first_result['idempotent_replay'])
+        self.assertEqual(self.fake_client.submit_calls, 1)
+
+    async def test_submit_rejects_mismatched_account_reference_scope(self) -> None:
+        mismatched_account_reference = f'KIS:{self.account_number}-99'
+
+        with self.assertRaises(TradingOrderValidationError):
+            await self.service.submit_buy_order(
+                client_order_id=self.client_order_id,
+                account_reference=mismatched_account_reference,
+                account_number=self.account_number,
+                account_product_code=self.account_product_code,
+                symbol=self.symbol,
+                quantity=Decimal('10'),
+                price=Decimal('70000'),
+                order_type='limit',
+                time_in_force='day',
+                source='api',
+            )
+
+        self.assertEqual(self.fake_client.submit_calls, 0)
+        self.assertIsNone(
+            load_order_request(account_reference=mismatched_account_reference, client_order_id=self.client_order_id)
+        )
 
     async def test_get_order_refresh_maps_partial_fill_from_broker_inquiry(self) -> None:
         await self._submit_buy_order()

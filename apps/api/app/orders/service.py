@@ -28,6 +28,7 @@ from app.orders.domain import (
 )
 from app.orders.store import (
     append_broker_order_event,
+    create_order_request_if_absent,
     list_broker_order_events,
     list_broker_orders,
     load_broker_order,
@@ -835,30 +836,6 @@ class TradingOrderService:
         now = _utc_now()
         normalized = self._normalize_submit_order(side=side, **kwargs)
 
-        existing_request = load_order_request(
-            account_reference=normalized.account_scope.account_reference,
-            client_order_id=normalized.client_order_id,
-        )
-        if existing_request is not None:
-            self._assert_same_submit_payload(existing_request=existing_request, normalized=normalized)
-            order_row = load_broker_order(
-                account_reference=normalized.account_scope.account_reference,
-                client_order_id=normalized.client_order_id,
-            )
-            return self._build_order_response(
-                account_reference=normalized.account_scope.account_reference,
-                client_order_id=normalized.client_order_id,
-                request_row=existing_request,
-                order_row=order_row,
-                events=list_broker_order_events(
-                    account_reference=normalized.account_scope.account_reference,
-                    client_order_id=normalized.client_order_id,
-                ),
-                operation='submit',
-                created=False,
-                idempotent_replay=True,
-            )
-
         request_payload = {
             'action': 'submit',
             'side': normalized.side,
@@ -875,7 +852,7 @@ class TradingOrderService:
             'sell_type': normalized.sell_type,
             'condition_price': _decimal_to_text(normalized.condition_price),
         }
-        request_row = upsert_order_request(
+        request_row, created = create_order_request_if_absent(
             {
                 'broker_name': 'kis',
                 'client_order_id': normalized.client_order_id,
@@ -899,6 +876,26 @@ class TradingOrderService:
                 'submission_attempts': 0,
             }
         )
+        if not created:
+            self._assert_same_submit_payload(existing_request=request_row, normalized=normalized)
+            order_row = load_broker_order(
+                account_reference=normalized.account_scope.account_reference,
+                client_order_id=normalized.client_order_id,
+            )
+            return self._build_order_response(
+                account_reference=normalized.account_scope.account_reference,
+                client_order_id=normalized.client_order_id,
+                request_row=request_row,
+                order_row=order_row,
+                events=list_broker_order_events(
+                    account_reference=normalized.account_scope.account_reference,
+                    client_order_id=normalized.client_order_id,
+                ),
+                operation='submit',
+                created=False,
+                idempotent_replay=True,
+            )
+
         order_row = upsert_broker_order(
             {
                 'order_request_id': request_row['id'],
@@ -1230,6 +1227,17 @@ class TradingOrderService:
             field='account_product_code',
         )
         account_reference = _normalize_optional_text(kwargs.get('account_reference'))
+        expected_account_reference = f'KIS:{account_number}-{account_product_code}'
+        if account_reference is not None and account_reference != expected_account_reference:
+            raise TradingOrderValidationError(
+                'account_reference must match account_number and account_product_code for submit operations',
+                payload={
+                    'account_reference': account_reference,
+                    'account_number': account_number,
+                    'account_product_code': account_product_code,
+                    'expected_account_reference': expected_account_reference,
+                },
+            )
         client_order_id = _normalize_optional_text(kwargs.get('client_order_id')) or uuid4().hex
         symbol = _normalize_text(kwargs.get('symbol'), field='symbol', uppercase=True)
         order_type = _normalize_optional_text(kwargs.get('order_type'), lowercase=True) or OrderType.LIMIT.value
@@ -1261,7 +1269,7 @@ class TradingOrderService:
             time_in_force=time_in_force,
             exchange_id=exchange_id,
             account_scope=AccountScope(
-                account_reference=account_reference or f'KIS:{account_number}-{account_product_code}',
+                account_reference=account_reference or expected_account_reference,
                 account_number=account_number,
                 account_product_code=account_product_code,
             ),
