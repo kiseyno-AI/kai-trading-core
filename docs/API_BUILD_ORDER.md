@@ -126,6 +126,13 @@
 - Durable persistence spans `order_requests`, `broker_orders`, and `broker_order_events`. KIS request and response payloads are preserved in the request snapshot, current broker snapshot, and event history for later debugging and reconciliation.
 - The stable KIS result-code and inquiry-state mapping contract for this adapter is documented in [docs/KIS_ORDER_RESULT_CODE_MAPPING.md](./KIS_ORDER_RESULT_CODE_MAPPING.md).
 
+## KIS realtime order notice notes
+- The API process now owns a background KIS websocket consumer for domestic order and execution notices when `KIS_REALTIME_ORDER_NOTICE_ENABLED=true` and `KIS_HTS_ID` is configured.
+- The consumer subscribes to `H0STCNI0` in real accounts and `H0STCNI9` in mock accounts using the user HTS ID as the `tr_key`, following the official KIS realtime order-notice mechanism.
+- Realtime notices append durable rows into `broker_order_events` with `source=ws_notice`, preserve the raw decrypted field payload, and patch the current `broker_orders` snapshot when the notice advances the known order state.
+- Duplicate notices are deduplicated through a stable websocket event fingerprint. Older notices can still be persisted for audit, but they do not regress a newer `broker_orders` snapshot.
+- `GET /broker/kis/health` now includes a `realtime_order_notices` block with connection status, last message timing, reconnect attempts, subscription or auth lifecycle state, last fatal vs recoverable error, and ingest counters.
+
 ## EOD freshness read-layer notes
 - Canonical semantics live in `docs/EOD_STATUS_SEMANTICS_CONTRACT.md`.
 - `GET /eod/freshness` is the compact web-facing read API for EOD ingestion freshness.

@@ -86,6 +86,9 @@ class KISClient:
     def _environment(self) -> str:
         return 'demo' if settings.kis_use_mock else 'real'
 
+    def websocket_url(self) -> str:
+        return settings.kis_realtime_mock_ws_url if settings.kis_use_mock else settings.kis_realtime_ws_url
+
     def _get_cached_token(self) -> dict | None:
         now = datetime.now(timezone.utc)
         cached_token = str(self._token_cache.get('access_token') or '')
@@ -159,10 +162,57 @@ class KISClient:
         return {
             'broker': 'kis',
             'base_url': self.base_url,
+            'websocket_url': self.websocket_url(),
             'environment': self._environment(),
             'use_mock': settings.kis_use_mock,
             'app_key_configured': bool(settings.kis_app_key),
             'app_secret_configured': bool(settings.kis_app_secret),
+            'hts_id_configured': bool(settings.kis_hts_id),
+            'realtime_order_notice_enabled': settings.kis_realtime_order_notice_enabled,
+        }
+
+    async def issue_approval_key(self) -> dict[str, Any]:
+        if not settings.kis_app_key or not settings.kis_app_secret:
+            raise KISConfigurationError('KIS_APP_KEY and KIS_APP_SECRET must be configured')
+
+        payload = {
+            'grant_type': 'client_credentials',
+            'appkey': settings.kis_app_key,
+            'secretkey': settings.kis_app_secret,
+        }
+        async with httpx.AsyncClient(base_url=self.base_url, timeout=15.0) as client:
+            try:
+                response = await request_with_audit(
+                    client,
+                    'kis',
+                    'POST',
+                    '/oauth2/Approval',
+                    json_body=payload,
+                )
+            except httpx.TimeoutException as exc:
+                raise KISTimeoutError('KIS approval key issue timed out', retryable=True) from exc
+            except httpx.HTTPError as exc:
+                raise KISTransportError('KIS approval key transport failure', retryable=True) from exc
+            if response.status_code >= 400:
+                error_payload = _safe_json(response)
+                message = error_payload.get('msg1') or response.text
+                raise KISHTTPError(
+                    f'KIS approval key issue failed [{response.status_code}]: {message}',
+                    payload=error_payload,
+                    status_code=response.status_code,
+                    retryable=response.status_code >= 500,
+                )
+            approval_payload = _safe_json(response)
+
+        approval_key = str(approval_payload.get('approval_key') or '').strip()
+        if not approval_key:
+            raise KISAPIError(
+                'KIS approval key response did not include approval_key',
+                payload=approval_payload,
+            )
+        return {
+            'approval_key': approval_key,
+            'cached': False,
         }
 
     async def _issue_hashkey(self, *, headers: Mapping[str, str], payload: Mapping[str, Any]) -> str | None:

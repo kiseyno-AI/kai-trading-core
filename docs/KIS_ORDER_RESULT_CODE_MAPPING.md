@@ -8,8 +8,6 @@ It is intentionally narrow:
 - amend or replace
 - inquiry-driven reconciliation
 
-Realtime execution notices and long-running reconciliation workers are out of scope for this issue.
-
 ## Submit / cancel / amend REST result mapping
 
 | KIS response shape | Internal request status | Internal order status | Event behavior |
@@ -40,6 +38,21 @@ The adapter maps the inquiry payloads into internal broker-order states as follo
 | row still present in cancelable inquiry after replace request | `replaced` | `replace_confirmed` |
 | row present in cancelable inquiry without fill/cancel evidence | `accepted` | `reconcile_snapshot` |
 | no stronger inquiry evidence but order already submitted | `submitted` | `reconcile_snapshot` |
+
+## Realtime notice mapping
+
+The KIS websocket order-notice consumer subscribes to `H0STCNI0` in real accounts and `H0STCNI9` in mock accounts. It maps domestic order-notice payloads into internal order events as follows.
+
+| Realtime evidence | Internal order status | Event type |
+| --- | --- | --- |
+| `RFUS_YN` indicates rejection | `rejected` | `reject` |
+| `CNTG_YN == "2"` and cumulative filled quantity is still below requested quantity | `partial_fill` | `partial_fill` |
+| `CNTG_YN == "2"` and cumulative filled quantity reaches requested quantity | `filled` | `fill` |
+| non-fill notice with cancel classification (`RCTF_CLS` cancel or local order already `cancel_pending`) | `canceled` | `cancel_confirmed` |
+| non-fill notice with replace classification (`RCTF_CLS` replace or local order already `replace_pending`) | `replaced` | `replace_confirmed` |
+| non-fill notice without reject/cancel/replace evidence | `accepted` | `accept` |
+
+Realtime-notice persistence is append-only. If an older notice arrives after a newer broker snapshot is already known, the older event is still stored for audit, but the current `broker_orders` row is not allowed to regress.
 
 ## Idempotency and persistence guardrails
 
