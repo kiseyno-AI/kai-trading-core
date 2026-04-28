@@ -51,6 +51,9 @@
 - `GET /trading/orders/stale-pending?account_reference=KIS:12345678-01&limit=50`
 - `GET /trading/orders/realtime-health`
 - `GET /trading/orders/{client_order_id}/timeline?account_reference=KIS:12345678-01&refresh=false`
+- `GET /trading/accounts/{account_reference}/summary`
+- `GET /trading/accounts/{account_reference}/positions?symbol=005930&include_zero=false`
+- `GET /trading/accounts/{account_reference}/buying-power?symbol=005930&price=57000&order_type=market`
 - `GET /market/status`
 - `GET /quotes/tracked`
 - `GET /quotes/005930`
@@ -141,6 +144,12 @@
 - Broker-truth repair is append-only: each reconcile pass writes a deduplicated reconciliation event when the observed broker truth changes, preserves the local-before vs local-after evidence in `last_reconcile_payload`, and never rewrites prior execution history.
 - Automatic reconciliation now covers startup catch-up, periodic intraday sweeps, and realtime websocket reconnect recovery when the corresponding `KIS_ORDER_RECONCILE_*` settings are enabled. Manual shell access uses `python3.11 -m app.internal.ops trading-orders-reconcile ...` from `apps/api`.
 - The stable KIS result-code and inquiry-state mapping contract for this adapter is documented in [docs/KIS_ORDER_RESULT_CODE_MAPPING.md](./KIS_ORDER_RESULT_CODE_MAPPING.md).
+
+## Trading account inquiry notes
+- `GET /trading/accounts/{account_reference}/summary` is the normalized KIS-backed cash and valuation snapshot for one KIS account reference. It combines `inquire-balance` and `inquire-account-balance` so UI cards can read cash and valuation fields without mapping KIS names client-side.
+- `GET /trading/accounts/{account_reference}/positions` is the normalized holdings view. It defaults to active positions only, supports optional `symbol` filtering for pre-trade “already holding this?” checks, and exposes quantity, sellable quantity, pricing, market value, PnL, and derived weight per row.
+- `GET /trading/accounts/{account_reference}/buying-power` is the pre-trade orderability read. Clients should call it before order submission with the intended `symbol`, `price`, and `order_type` so Core asks KIS directly for buyable quantity and amount instead of estimating from cached cash.
+- The trading account inquiry routes reuse the same `KIS:<account_number>-<product_code>` account reference model already required by the order-control routes.
 
 ## KIS realtime order notice notes
 - The API process now owns a background KIS websocket consumer for domestic order and execution notices when `KIS_REALTIME_ORDER_NOTICE_ENABLED=true` and `KIS_HTS_ID` is configured.
