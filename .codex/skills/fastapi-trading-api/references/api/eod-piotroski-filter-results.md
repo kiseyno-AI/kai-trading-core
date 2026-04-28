@@ -7,7 +7,7 @@ When `market_date` is omitted, the endpoint resolves the latest stored Piotroski
 
 When `symbol` is omitted, the endpoint returns stored rows for the resolved date, optionally capped by `limit`. Rows are ordered with passed names first and then lower `pbr_percentile_rank` values first. When `symbol` is provided, the endpoint returns the single stored result for that symbol and resolved date, or `null` if none exists.
 
-These persisted rows are also the source of truth for symbol-level agent feedback eligibility: only rows with `passed_filter=true` are eligible for daily feedback dispatch and retry on that same `market_date`.
+These persisted rows are one half of symbol-level agent feedback eligibility. Daily feedback dispatch and retry on a `market_date` now require `passed_filter=true` here and `passed_filter=true` in the persisted market-risk filter rows for that same date.
 
 ## Query parameters
 - `market_date` (optional): ISO date for the persisted filter snapshot to inspect. If omitted, the route resolves the latest stored date for the request scope.

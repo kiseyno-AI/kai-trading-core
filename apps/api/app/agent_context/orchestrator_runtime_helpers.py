@@ -8,6 +8,11 @@ from typing import Any, Callable, Sequence
 
 from fastapi.encoders import jsonable_encoder
 
+from app.agent_context.eligibility import (
+    AGENT_FEEDBACK_ELIGIBILITY_FILTERS,
+    AGENT_FEEDBACK_ELIGIBILITY_RULE,
+    AGENT_FEEDBACK_SCOPE_REQUESTED,
+)
 from app.agent_context.orchestrator_helpers import (
     build_completed_dispatch_item,
     build_failed_dispatch_item,
@@ -194,14 +199,14 @@ def dispatch_for_symbols_via_subagents(
     per_role_parallelism: int,
     signal_decider_agent_name: str,
     normalize_requested_symbols: Callable[[Sequence[str]], list[str]],
-    split_requested_symbols_by_piotroski_passed_filter: Callable[..., tuple[list[str], list[str]]],
+    split_requested_symbols_by_agent_feedback_eligibility: Callable[..., tuple[list[str], list[str]]],
     agent_context_read_service,
     normalize_agent_response: Callable[..., dict[str, Any]],
     build_response_storage_payload: Callable[..., dict[str, Any]],
 ) -> dict[str, Any]:
     normalized_market_date = market_date if isinstance(market_date, date) else date.fromisoformat(market_date)
     requested_symbols = normalize_requested_symbols(symbols)
-    dispatch_symbols, skipped_symbols = split_requested_symbols_by_piotroski_passed_filter(
+    dispatch_symbols, skipped_symbols = split_requested_symbols_by_agent_feedback_eligibility(
         market_date=normalized_market_date,
         requested_symbols=requested_symbols,
     )
@@ -222,7 +227,9 @@ def dispatch_for_symbols_via_subagents(
                 'per_role_parallelism': max(1, int(per_role_parallelism)),
                 'batch_size': 2,
                 'total_parallel_subtasks': max(1, len(specs) * max(1, int(per_role_parallelism))),
-                'scope': 'piotroski_passed_symbols_only',
+                'scope': AGENT_FEEDBACK_SCOPE_REQUESTED,
+                'eligibility_rule': AGENT_FEEDBACK_ELIGIBILITY_RULE,
+                'eligibility_filters': list(AGENT_FEEDBACK_ELIGIBILITY_FILTERS),
                 'skipped_symbols': skipped_symbols,
                 'mode': 'slot_parent_subagent_fanout',
             },
@@ -354,7 +361,9 @@ def dispatch_for_symbols_via_subagents(
             'per_role_parallelism': role_worker_count,
             'batch_size': batch_size,
             'total_parallel_subtasks': total_max_workers,
-            'scope': 'piotroski_passed_symbols_only',
+            'scope': AGENT_FEEDBACK_SCOPE_REQUESTED,
+            'eligibility_rule': AGENT_FEEDBACK_ELIGIBILITY_RULE,
+            'eligibility_filters': list(AGENT_FEEDBACK_ELIGIBILITY_FILTERS),
             'skipped_symbols': skipped_symbols,
             'mode': 'slot_parent_subagent_fanout',
         },

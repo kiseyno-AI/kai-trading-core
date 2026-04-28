@@ -113,8 +113,8 @@ class FeedbackRetryCycleTests(unittest.TestCase):
         }
 
         with patch(
-            'app.agent_context.retry_service.load_daily_piotroski_filter_results',
-            return_value=[{'symbol': '005930', 'passed_filter': True}],
+            'app.agent_context.retry_service.load_agent_feedback_eligible_symbols',
+            return_value=['005930'],
         ):
             with patch(
                 'app.agent_context.retry_service.agent_context_reuse_service.build_latest_decisions',
@@ -138,8 +138,8 @@ class FeedbackRetryCycleTests(unittest.TestCase):
         }
 
         with patch(
-            'app.agent_context.retry_service.load_daily_piotroski_filter_results',
-            return_value=[{'symbol': '005930', 'passed_filter': True}],
+            'app.agent_context.retry_service.load_agent_feedback_eligible_symbols',
+            return_value=['005930'],
         ):
             with patch(
                 'app.agent_context.retry_service.agent_context_reuse_service.build_latest_decisions',
@@ -152,7 +152,7 @@ class FeedbackRetryCycleTests(unittest.TestCase):
 
         self.assertEqual(result, [])
 
-    def test_load_incomplete_symbols_uses_only_passed_piotroski_symbols(self):
+    def test_load_incomplete_symbols_uses_active_filter_intersection(self):
         service = AgentFeedbackRetryService()
         decisions = {
             '005930': {
@@ -162,9 +162,9 @@ class FeedbackRetryCycleTests(unittest.TestCase):
         }
 
         with patch(
-            'app.agent_context.retry_service.load_daily_piotroski_filter_results',
-            return_value=[{'symbol': '005930', 'passed_filter': True}],
-        ) as load_results:
+            'app.agent_context.retry_service.load_agent_feedback_eligible_symbols',
+            return_value=['005930'],
+        ) as load_eligible:
             with patch(
                 'app.agent_context.retry_service.agent_context_reuse_service.build_latest_decisions',
                 return_value=decisions,
@@ -174,10 +174,9 @@ class FeedbackRetryCycleTests(unittest.TestCase):
                     roles=EXPECTED_ROLES,
                 )
 
-        load_results.assert_called_once_with(
+        load_eligible.assert_called_once_with(
             market_date=date.fromisoformat('2026-04-16'),
-            passed_filter=True,
-            limit=None,
+            requested_symbols=None,
         )
         build_decisions.assert_called_once_with(
             market_date=date.fromisoformat('2026-04-16'),
@@ -190,18 +189,18 @@ class FeedbackRetryCycleTests(unittest.TestCase):
         service = AgentFeedbackRetryService()
 
         with patch(
-            'app.agent_context.retry_service.load_daily_piotroski_filter_results',
-            return_value=[
-                {'symbol': '000660', 'passed_filter': True},
-                {'symbol': '005930', 'passed_filter': True},
-                {'symbol': '035420', 'passed_filter': True},
-            ],
-        ):
+            'app.agent_context.retry_service.load_agent_feedback_eligible_symbols',
+            return_value=['035420', '005930'],
+        ) as load_eligible:
             result = service._load_eligible_symbols(
                 market_date=date.fromisoformat('2026-04-16'),
                 requested_symbols=('035420', '005930', '114630'),
             )
 
+        load_eligible.assert_called_once_with(
+            market_date=date.fromisoformat('2026-04-16'),
+            requested_symbols=('035420', '005930', '114630'),
+        )
         self.assertEqual(result, ['035420', '005930'])
 
     def test_parse_args_uses_env_market_date_default(self):
@@ -373,7 +372,7 @@ class FeedbackRetryCycleTests(unittest.TestCase):
         self.assertEqual(run_state_service.started[0]['request_payload']['symbols'], ['005930'])
         self.assertEqual(
             run_state_service.started[0]['request_payload']['scope'],
-            'requested_symbols_intersected_with_piotroski_passed_filter',
+            'requested_symbols_intersected_with_active_pre_filters',
         )
         self.assertEqual(result['requested_symbols'], ['005930'])
         self.assertEqual(result['eligible_symbols'], ['005930'])

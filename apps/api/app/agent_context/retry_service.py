@@ -9,6 +9,12 @@ from uuid import uuid4
 from sqlalchemy import select
 
 from app.agent_context.orchestrator_helpers import normalize_requested_symbols as _normalize_requested_symbols
+from app.agent_context.eligibility import (
+    AGENT_FEEDBACK_ELIGIBILITY_FILTERS,
+    AGENT_FEEDBACK_ELIGIBILITY_RULE,
+    load_agent_feedback_eligible_symbols,
+    resolve_agent_feedback_scope,
+)
 from app.agent_context.orchestrator import agent_feedback_orchestrator
 from app.agent_context.progress_service import agent_context_progress_service
 from app.agent_context.reuse_service import agent_context_reuse_service
@@ -19,7 +25,6 @@ from app.agent_context.runtime_state import RuntimeFeedbackRunState, runtime_fee
 from app.core.settings import settings
 from app.db import session_scope
 from app.db_models import AgentContextFeedback, AgentContextFeedbackFailure
-from app.market_data_store import load_daily_piotroski_filter_results
 
 EXPECTED_ROLES: tuple[str, ...] = DEFAULT_AGENT_NAMES
 
@@ -86,22 +91,10 @@ class AgentFeedbackRetryService:
         market_date: date,
         requested_symbols: Sequence[str] | None = None,
     ) -> list[str]:
-        passed_symbols: list[str] = []
-        seen: set[str] = set()
-        for item in load_daily_piotroski_filter_results(
+        return load_agent_feedback_eligible_symbols(
             market_date=market_date,
-            passed_filter=True,
-            limit=None,
-        ):
-            symbol = str(item.get('symbol') or '').strip().upper()
-            if not symbol or symbol in seen:
-                continue
-            seen.add(symbol)
-            passed_symbols.append(symbol)
-        if requested_symbols is None:
-            return passed_symbols
-        passed_symbol_set = set(passed_symbols)
-        return [symbol for symbol in requested_symbols if symbol in passed_symbol_set]
+            requested_symbols=requested_symbols,
+        )
 
     def load_incomplete_symbols(
         self,
@@ -544,11 +537,9 @@ class AgentFeedbackRetryService:
             'outer_batch_size': config.outer_batch_size,
             'parallel_subtasks': max(1, int(settings.openclaw_agent_parallel_subtasks)),
             'reuse_existing': config.reuse_existing,
-            'scope': (
-                'requested_symbols_intersected_with_piotroski_passed_filter'
-                if requested_symbols is not None
-                else 'piotroski_passed_symbols_only'
-            ),
+            'scope': resolve_agent_feedback_scope(requested_symbols=requested_symbols),
+            'eligibility_rule': AGENT_FEEDBACK_ELIGIBILITY_RULE,
+            'eligibility_filters': list(AGENT_FEEDBACK_ELIGIBILITY_FILTERS),
             'skipped_symbols': skipped_symbols,
             'mode': DAILY_RETRY_CYCLE_MODE,
             'resumed_from_run_id': previous_run.get('run_id') if isinstance(previous_run, dict) else None,
