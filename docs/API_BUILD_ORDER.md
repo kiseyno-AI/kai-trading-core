@@ -3,36 +3,37 @@
 ## Current milestone order
 1. KIS token + health + quote routes
 2. Market status route
-3. Scanner tracked-symbol routes
-4. Quotes tracked + single-symbol routes
-5. Symbol search route
-6. EOD status + master refresh + capture routes
-7. Macro BOK ECOS route
-8. FX Korea Exim route
-9. DART company snapshot route
-10. DART disclosure sync + inspect routes
-11. DART stored fundamentals history retrieval route
-12. EOD daily technical snapshot compute/inspect routes
-13. EOD daily action summary compute/inspect routes
-14. Agent symbol/day aggregate context read route
-15. DART daily incremental fundamentals refresh route
-16. Favorite symbol read/delete routes
-17. Stored trending stocks read route
-18. KIS realtime trending route
-19. KIS daily ranking signal-feature collect/inspect routes
-20. KIS daily market-risk snapshot collect/inspect routes
-21. KIS daily market-risk filter compute/read routes
-22. Daily Piotroski filter result read route
-23. Daily low-risk factor compute/read routes
-24. Agent feedback intake/read routes for OpenClaw summaries
-25. Role-specific post-EOD agent feedback dispatch route
-26. Daily price momentum factor compute/inspect routes
-27. Daily value factor compute/read routes
-28. Daily beta factor compute/read routes
-29. Daily advanced value factor compute/read routes
-30. Daily composite factor compute/read routes
-31. Signal-decider evaluation, diagnostics, and policy-candidate routes
-32. Internal trading order control, inquiry, and reconciliation routes
+3. Market snapshot route
+4. Scanner tracked-symbol routes
+5. Quotes tracked + single-symbol routes
+6. Symbol search route
+7. EOD status + master refresh + capture routes
+8. Macro BOK ECOS route
+9. FX Korea Exim route
+10. DART company snapshot route
+11. DART disclosure sync + inspect routes
+12. DART stored fundamentals history retrieval route
+13. EOD daily technical snapshot compute/inspect routes
+14. EOD daily action summary compute/inspect routes
+15. Agent symbol/day aggregate context read route
+16. DART daily incremental fundamentals refresh route
+17. Favorite symbol read/delete routes
+18. Stored trending stocks read route
+19. KIS realtime trending route
+20. KIS daily ranking signal-feature collect/inspect routes
+21. KIS daily market-risk snapshot collect/inspect routes
+22. KIS daily market-risk filter compute/read routes
+23. Daily Piotroski filter result read route
+24. Daily low-risk factor compute/read routes
+25. Agent feedback intake/read routes for OpenClaw summaries
+26. Role-specific post-EOD agent feedback dispatch route
+27. Daily price momentum factor compute/inspect routes
+28. Daily value factor compute/read routes
+29. Daily beta factor compute/read routes
+30. Daily advanced value factor compute/read routes
+31. Daily composite factor compute/read routes
+32. Signal-decider evaluation, diagnostics, and policy-candidate routes
+33. Internal trading order control, inquiry, and reconciliation routes
 
 ## Current routes
 - `POST /broker/kis/token`
@@ -56,6 +57,7 @@
 - `GET /trading/accounts/{account_reference}/positions?symbol=005930&include_zero=false`
 - `GET /trading/accounts/{account_reference}/buying-power?symbol=005930&price=57000&order_type=market`
 - `GET /market/status`
+- `GET /market/snapshot`
 - `GET /quotes/tracked`
 - `GET /quotes/005930`
 - `GET /scanner/tracked-symbols`
@@ -221,6 +223,13 @@
   - then same-day `quote_cache` or `current_quote_cache`
   - otherwise `available: false`
 - Multi-day stale quote cache must not be surfaced as if it were a current quote.
+
+## Market snapshot notes
+- `GET /market/snapshot` is the compact market-condition API for the dashboard card.
+- KOSPI/KOSDAQ snapshot uses KIS `국내업종 현재지수` at `/uapi/domestic-stock/v1/quotations/inquire-index-price` with TR `FHPUP02100000`, because it returns current level, delta, breadth, and trading activity in a single response. The historical `/uapi/domestic-stock/v1/quotations/inquire-daily-indexchartprice` API remains better suited to chart views than the card summary.
+- Foreign/institutional flow uses KIS `시장별 투자자매매동향(시세)` at `/uapi/domestic-stock/v1/quotations/inquire-investor-time-by-market` with TR `FHPTJ04030000`, because it returns market-level intraday participant flow for KOSPI/KOSDAQ directly. Per-symbol and top-list investor APIs were intentionally not used for this card payload.
+- USD/KRW is normalized through the existing Korea Exim service path, so the snapshot keeps the Korea Exim `effective_date` and fallback-date semantics instead of duplicating FX lookup logic.
+- The selected KIS index and investor-flow APIs are real-domain only; when `KIS_USE_MOCK=true`, the route returns `503` rather than silently fabricating snapshot data.
 
 ## Realtime trending notes
 - `GET /scanner/realtime-trending` is the user-facing realtime trending read API backed by KIS ranking sources only.

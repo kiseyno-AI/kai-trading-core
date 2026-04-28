@@ -78,7 +78,62 @@ Authorization: Bearer <token>
 
 ---
 
-## 1.2 `GET /quotes/{symbol}`
+## 1.2 `GET /market/snapshot`
+Returns a compact market-condition payload for the dashboard card.
+
+### Example request
+```http
+GET /market/snapshot
+Authorization: Bearer <token>
+```
+
+### Example response
+```json
+{
+  "as_of": "2026-04-29T10:05:12+09:00",
+  "markets": {
+    "kospi": {
+      "label": "KOSPI",
+      "index_code": "0001",
+      "value": 2642.07,
+      "change": 2.78,
+      "change_percent": 0.11,
+      "foreign_net_quantity": -5290,
+      "foreign_net_value": 148656,
+      "institution_net_quantity": 720,
+      "institution_net_value": -55532
+    },
+    "kosdaq": {
+      "label": "KOSDAQ",
+      "index_code": "1001",
+      "value": 857.6,
+      "change": -1.61,
+      "change_percent": -0.19,
+      "foreign_net_quantity": -18565,
+      "foreign_net_value": -597490,
+      "institution_net_quantity": -4738,
+      "institution_net_value": -150685
+    }
+  },
+  "usd_krw": {
+    "pair": "USD/KRW",
+    "rate": 1444.5,
+    "effective_date": "2026-04-28",
+    "fallback_applied": true
+  }
+}
+```
+
+### Notes
+- This route is intentionally compact and card-oriented rather than chart-oriented.
+- KOSPI/KOSDAQ index data comes from KIS `inquire-index-price`.
+- Market-level investor flow comes from KIS `inquire-investor-time-by-market`.
+- USD/KRW comes from the existing Korea Exim integration, including its fallback-date behavior.
+- The selected KIS endpoints are real-domain only; when `KIS_USE_MOCK=true`, this route returns `503`.
+
+---
+
+## 1.3 `GET /quotes/{symbol}`
 Returns a quote payload for a single symbol.
 
 ### Example request
@@ -117,7 +172,7 @@ If `available` is false:
 
 ---
 
-## 1.3 `GET /quotes/tracked`
+## 1.4 `GET /quotes/tracked`
 Returns tracked-universe quote data for dashboard-like surfaces.
 
 ### Example request
@@ -158,7 +213,7 @@ Authorization: Bearer <token>
 
 ---
 
-## 1.4 `GET /scanner/tracked-symbols`
+## 1.5 `GET /scanner/tracked-symbols`
 Returns tracked/scanner symbol universe information used by dashboard/tracker-like surfaces.
 
 ### Example request

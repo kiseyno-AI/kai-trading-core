@@ -440,6 +440,26 @@ class KISClient:
             },
         )
 
+    async def fetch_market_index_price(self, *, index_code: str) -> dict:
+        return await self._get(
+            '/uapi/domestic-stock/v1/quotations/inquire-index-price',
+            tr_id='FHPUP02100000',
+            params={
+                'fid_cond_mrkt_div_code': 'U',
+                'fid_input_iscd': index_code,
+            },
+        )
+
+    async def fetch_investor_time_by_market(self, *, market_code: str, sector_code: str) -> dict:
+        return await self._get(
+            '/uapi/domestic-stock/v1/quotations/inquire-investor-time-by-market',
+            tr_id='FHPTJ04030000',
+            params={
+                'FID_INPUT_ISCD': market_code,
+                'FID_INPUT_ISCD_2': sector_code,
+            },
+        )
+
     async def submit_domestic_cash_order(
         self,
         *,
