@@ -20,6 +20,7 @@ from app.api.routes_scanner import router as scanner_router
 from app.api.routes_market import router as market_router
 from app.api.routes_quotes import router as quotes_router
 from app.api.routes_symbols import router as symbols_router
+from app.api.routes_trading import router as trading_router
 from app.core.audit_logging import (
     build_api_request_event,
     configure_file_logging,
@@ -119,6 +120,7 @@ app.include_router(market_router)
 app.include_router(quotes_router)
 app.include_router(favorite_symbols_router)
 app.include_router(symbols_router)
+app.include_router(trading_router)
 app.include_router(eod_router)
 app.include_router(dart_router)
 app.include_router(agent_context_router)

@@ -8,6 +8,7 @@ from app.db import engine, session_scope
 from app.db_models import BrokerOrder, BrokerOrderEvent, OrderRequest
 from app.orders.store import (
     append_broker_order_event,
+    create_order_request_if_absent,
     list_broker_order_events,
     list_broker_orders,
     load_broker_order,
@@ -138,6 +139,58 @@ class OrderStorePersistenceTests(unittest.TestCase):
         self.assertEqual(updated['submission_status'], 'submitted')
         self.assertEqual(updated['submission_attempts'], 1)
         self.assertEqual(updated['request_payload']['retry'], 1)
+
+    def test_create_order_request_if_absent_preserves_existing_request_snapshot(self) -> None:
+        created, inserted = create_order_request_if_absent(
+            {
+                'broker_name': 'kis',
+                'client_order_id': self.client_order_id,
+                'source': 'strategy',
+                'account_reference': self.account_reference,
+                'symbol': '005930',
+                'side': 'buy',
+                'order_type': 'limit',
+                'requested_quantity': '10',
+                'requested_price': '70000',
+                'time_in_force': 'day',
+                'request_payload': {'requested_by': 'first'},
+                'validation_status': 'valid',
+                'submission_status': 'pending_submit',
+                'submission_attempts': 0,
+            }
+        )
+        existing, replay_inserted = create_order_request_if_absent(
+            {
+                'broker_name': 'kis',
+                'client_order_id': self.client_order_id,
+                'source': 'strategy',
+                'account_reference': self.account_reference,
+                'symbol': '005930',
+                'side': 'buy',
+                'order_type': 'limit',
+                'requested_quantity': '10',
+                'requested_price': '70000',
+                'time_in_force': 'day',
+                'request_payload': {'requested_by': 'second'},
+                'validation_status': 'valid',
+                'submission_status': 'submitted',
+                'submission_attempts': 1,
+            }
+        )
+
+        with session_scope() as session:
+            row_count = session.execute(
+                select(func.count()).select_from(OrderRequest).where(
+                    OrderRequest.account_reference == self.account_reference
+                )
+            ).scalar_one()
+
+        self.assertTrue(inserted)
+        self.assertFalse(replay_inserted)
+        self.assertEqual(created['id'], existing['id'])
+        self.assertEqual(row_count, 1)
+        self.assertEqual(existing['request_payload']['requested_by'], 'first')
+        self.assertEqual(existing['submission_status'], 'pending_submit')
 
     def test_upsert_broker_order_updates_current_snapshot_without_duplication(self) -> None:
         request_row = upsert_order_request(
