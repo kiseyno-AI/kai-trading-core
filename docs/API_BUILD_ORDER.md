@@ -53,6 +53,7 @@
 - `GET /trading/orders/stale-pending?account_reference=KIS:12345678-01&limit=50`
 - `GET /trading/orders/realtime-health`
 - `GET /trading/orders/{client_order_id}/timeline?account_reference=KIS:12345678-01&refresh=false`
+- `GET /portfolio/summary`
 - `GET /trading/accounts/{account_reference}/summary`
 - `GET /trading/accounts/{account_reference}/positions?symbol=005930&include_zero=false`
 - `GET /trading/accounts/{account_reference}/buying-power?symbol=005930&price=57000&order_type=market`
@@ -164,6 +165,9 @@
 - The stable KIS result-code and inquiry-state mapping contract for this adapter is documented in [docs/KIS_ORDER_RESULT_CODE_MAPPING.md](./KIS_ORDER_RESULT_CODE_MAPPING.md).
 
 ## Trading account inquiry notes
+- `GET /portfolio/summary` is the aggregate portfolio read for the dashboard and portfolio cards. It resolves the deployment-configured account list from `PORTFOLIO_ACCOUNT_REFERENCES`, reuses the KIS-backed account-summary and positions inquiries per account, and returns the web `PortfolioSummaryDto`-style shape with `accounts`, `holdings`, `allocation`, `recentActivity`, `sync`, and `notices`.
+- `PORTFOLIO_ACCOUNT_REFERENCES` accepts a comma-separated list of `KIS:<account_number>-<product_code>` entries, with optional labels in `Label=KIS:...` form. When the setting is missing or invalid, `GET /portfolio/summary` returns `200` with `sync.status=not_configured` and explanatory notices instead of an ambiguous empty success.
+- The portfolio summary route keeps sync state explicit: fully successful account reads report `sync.status=synced`, mixed-success reads report `sync.status=stale`, total upstream failure reports `sync.status=unavailable`, and deployment/account configuration problems report `sync.status=not_configured`.
 - `GET /trading/accounts/{account_reference}/summary` is the normalized KIS-backed cash and valuation snapshot for one KIS account reference. It combines `inquire-balance` and `inquire-account-balance` so UI cards can read cash and valuation fields without mapping KIS names client-side.
 - `GET /trading/accounts/{account_reference}/positions` is the normalized holdings view. It defaults to active positions only, supports optional `symbol` filtering for pre-trade “already holding this?” checks, and exposes quantity, sellable quantity, pricing, market value, PnL, and derived weight per row.
 - `GET /trading/accounts/{account_reference}/buying-power` is the pre-trade orderability read. Clients should call it before order submission with the intended `symbol`, `price`, and `order_type` so Core asks KIS directly for buyable quantity and amount instead of estimating from cached cash.

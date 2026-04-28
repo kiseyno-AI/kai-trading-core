@@ -213,7 +213,104 @@ Authorization: Bearer <token>
 
 ---
 
-## 1.5 `GET /scanner/tracked-symbols`
+## 1.5 `GET /portfolio/summary`
+Returns the aggregate portfolio payload used by the dashboard and portfolio pages.
+
+### Example request
+```http
+GET /portfolio/summary
+Authorization: Bearer <token>
+```
+
+### Example response
+```json
+{
+  "asOf": "2026-04-29T01:23:45+00:00",
+  "source": "kis_portfolio_summary_v1",
+  "sync": {
+    "status": "synced",
+    "lastSyncedAt": "2026-04-29T01:23:45+00:00",
+    "source": "kis_account_inquiry_v1",
+    "message": null
+  },
+  "accounts": [
+    {
+      "id": "KIS:12345678-01",
+      "label": "Main",
+      "broker": "kis",
+      "accountType": "Product 01",
+      "status": "synced",
+      "baseCurrency": "KRW",
+      "lastSyncedAt": "2026-04-29T01:23:45+00:00",
+      "summary": {
+        "totalAssets": {"amount": 3072000, "currency": "KRW"},
+        "cash": {"amount": 2400000, "currency": "KRW"},
+        "buyingPower": {"amount": 2500000, "currency": "KRW"},
+        "investedValue": {"amount": 572000, "currency": "KRW"},
+        "pnl": {
+          "unrealized": {"amount": 22000, "currency": "KRW"},
+          "total": {"amount": 22000, "currency": "KRW"},
+          "totalPercent": 4.0
+        }
+      },
+      "holdings": [
+        {
+          "id": "KIS:12345678-01:005930",
+          "symbol": "005930",
+          "name": "Samsung Electronics",
+          "market": "KRX",
+          "quantity": 10,
+          "averagePrice": {"amount": 55000, "currency": "KRW"},
+          "lastPrice": {"amount": 57200, "currency": "KRW"},
+          "marketValue": {"amount": 572000, "currency": "KRW"},
+          "unrealizedPnl": {"amount": 22000, "currency": "KRW"},
+          "unrealizedPnlPercent": 4.0,
+          "allocationPercent": 18.62,
+          "currency": "KRW",
+          "updatedAt": "2026-04-29T01:23:45+00:00"
+        }
+      ],
+      "allocation": [
+        {
+          "id": "KIS:12345678-01:005930",
+          "label": "Samsung Electronics",
+          "value": {"amount": 572000, "currency": "KRW"},
+          "percent": 18.62
+        }
+      ],
+      "recentActivity": [
+        {
+          "id": "ORDER-1",
+          "symbol": "005930",
+          "side": "buy",
+          "status": "filled",
+          "quantity": 5,
+          "filledQuantity": 5,
+          "averageFillPrice": {"amount": 57100, "currency": "KRW"},
+          "submittedAt": "2026-04-29T01:20:00+00:00",
+          "updatedAt": "2026-04-29T01:21:00+00:00"
+        }
+      ]
+    }
+  ],
+  "notices": []
+}
+```
+
+### Notes
+- The route resolves its account scope from `PORTFOLIO_ACCOUNT_REFERENCES`, a comma-separated list of `KIS:<account_number>-<product_code>` values. Optional labels can be supplied as `Label=KIS:...`.
+- This is a portfolio-level aggregation layer over the account-specific KIS inquiry routes. It reuses the same KIS account-reference model as `/trading/accounts/{account_reference}/summary` and `/positions`.
+- `sync.status` is the primary UX state. Current intended values are:
+  - `synced` when every configured account summary and holdings read succeeds
+  - `stale` when at least one account succeeds but one or more configured accounts fail
+  - `unavailable` when no configured account can be read from KIS
+  - `not_configured` when account resolution or KIS deployment configuration is missing or invalid
+- On degraded accounts, missing sections may be omitted instead of returned as misleading empty arrays, while `notices` explains which account or subsection failed.
+- Percent fields in this route use whole-percent values for direct UI rendering, for example `4.0` means `4.00%`.
+
+---
+
+## 1.6 `GET /scanner/tracked-symbols`
 Returns tracked/scanner symbol universe information used by dashboard/tracker-like surfaces.
 
 ### Example request
@@ -240,7 +337,7 @@ Authorization: Bearer <token>
 
 ---
 
-## 1.5 `GET /symbols/search`
+## 1.7 `GET /symbols/search`
 Searches symbol metadata.
 
 ### Example request
@@ -988,6 +1085,7 @@ If a UX or frontend team needs to plan against the current system, the most impo
 - `/market/status`
 - `/quotes/{symbol}`
 - `/quotes/tracked`
+- `/portfolio/summary`
 - `/scanner/tracked-symbols`
 - `/symbols/search`
 - `/symbols/{symbol}/price-bars`
@@ -1019,4 +1117,4 @@ The key design reality for consumers is that:
 - freshness differs by data layer,
 - nullability is sometimes expected and correct,
 - DART coverage is uneven,
-- aggregate consumers should treat sections as independently optional.
+- aggregate consumers should treat sections as independently optional, including portfolio account subsections that may degrade independently under upstream KIS failures.
