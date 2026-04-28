@@ -261,13 +261,38 @@ def extract_response_mismatch_flags(normalized_feedback: dict[str, Any] | None) 
 
 def failure_log_fields(failure: dict[str, Any]) -> dict[str, Any]:
     context = failure.get('context') if isinstance(failure.get('context'), dict) else {}
+    diagnostics = failure.get('diagnostics') if isinstance(failure.get('diagnostics'), dict) else {}
+    dispatch_diagnostics = (
+        context.get('dispatch_diagnostics')
+        if isinstance(context.get('dispatch_diagnostics'), dict)
+        else {}
+    )
     batch_symbols = context.get('batch_symbols')
     return {
         'dispatch_id': failure.get('dispatch_id') or context.get('dispatch_id'),
         'attempt_id': failure.get('attempt_id') or context.get('attempt_id'),
         'slot': failure.get('slot') or context.get('session_slot'),
         'session_key': failure.get('session_key') or context.get('session_key'),
+        'session_id': (
+            failure.get('session_id')
+            or context.get('session_id')
+            or diagnostics.get('session_id')
+            or dispatch_diagnostics.get('session_id')
+        ),
+        'response_id': (
+            failure.get('response_id')
+            or context.get('response_id')
+            or diagnostics.get('response_id')
+            or dispatch_diagnostics.get('response_id')
+        ),
+        'request_marker': (
+            failure.get('request_marker')
+            or context.get('request_marker')
+            or diagnostics.get('request_marker')
+            or dispatch_diagnostics.get('request_marker')
+        ),
         'batch_symbols': batch_symbols if isinstance(batch_symbols, list) else None,
+        'diagnostics': diagnostics or dispatch_diagnostics or None,
     }
 
 
@@ -301,11 +326,16 @@ def build_failed_dispatch_item(
     symbol: str,
     error: str,
     retryable: bool,
+    failure_kind: str | None = None,
     context: dict[str, Any] | None = None,
     dispatch_id: str | None = None,
     attempt_id: str | None = None,
     slot: int | None = None,
     session_key: str | None = None,
+    session_id: str | None = None,
+    response_id: str | None = None,
+    request_marker: str | None = None,
+    diagnostics: dict[str, Any] | None = None,
     batch_symbols: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     item = {
@@ -316,6 +346,8 @@ def build_failed_dispatch_item(
         'retryable': retryable,
         'error': error,
     }
+    if failure_kind is not None:
+        item['failure_kind'] = failure_kind
     if context is not None:
         item['context'] = context
     if dispatch_id is not None:
@@ -326,6 +358,14 @@ def build_failed_dispatch_item(
         item['slot'] = slot
     if session_key is not None:
         item['session_key'] = session_key
+    if session_id is not None:
+        item['session_id'] = session_id
+    if response_id is not None:
+        item['response_id'] = response_id
+    if request_marker is not None:
+        item['request_marker'] = request_marker
+    if diagnostics is not None:
+        item['diagnostics'] = diagnostics
     if batch_symbols is not None:
         item['batch_symbols'] = list(batch_symbols)
     return item
@@ -355,12 +395,15 @@ def build_response_storage_payload(
         'attempt_id': batch_result.get('attempt_id'),
         'dispatch_id': batch_result.get('dispatch_id'),
         'request_run_id': batch_result.get('request_run_id'),
+        'request_marker': batch_result.get('request_marker'),
         'market_date': batch_result.get('market_date'),
         'role': spec.role,
         'agent_name': spec.agent_name,
         'batch_symbols': batch_result.get('batch_symbols'),
         'slot': batch_result.get('slot'),
         'session_key': batch_result.get('session_ref', {}).get('session_key') if isinstance(batch_result.get('session_ref'), dict) else None,
+        'session_id': batch_result.get('session_ref', {}).get('session_id') if isinstance(batch_result.get('session_ref'), dict) else None,
+        'response_id': batch_result.get('session_ref', {}).get('response_id') if isinstance(batch_result.get('session_ref'), dict) else None,
         'started_at': batch_result.get('started_at'),
         'completed_at': batch_result.get('completed_at'),
         'model': model_name or f'openclaw/{spec.agent_name}',
