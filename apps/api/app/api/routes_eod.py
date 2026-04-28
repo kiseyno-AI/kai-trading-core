@@ -11,6 +11,7 @@ from app.eod.freshness import eod_freshness_service
 from app.eod.master import refresh_master_if_due
 from app.eod.pipeline_status import eod_pipeline_status_service
 from app.eod.pykrx_backfill import DEFAULT_MARKETS, PYKRX_BACKFILL_SERVICE
+from app.eod.screening_results import screening_result_read_service
 from app.eod.master_state import master_refresh_state
 from app.eod.service import EOD_SERVICE
 from app.eod.state import job_state
@@ -68,6 +69,27 @@ async def get_eod_status() -> dict:
 @router.get('/freshness')
 async def get_eod_freshness() -> dict:
     return eod_freshness_service.read()
+
+
+@router.get('/screening-results')
+async def get_eod_screening_results(
+    family: str,
+    market_date: str | None = None,
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0, le=20000),
+) -> dict:
+    try:
+        return await asyncio.to_thread(
+            screening_result_read_service.read,
+            family=family,
+            market_date=market_date,
+            limit=limit,
+            offset=offset,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'EOD screening result read failed: {exc}') from exc
 
 
 @router.get('/pipeline/status')

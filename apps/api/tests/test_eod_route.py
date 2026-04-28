@@ -102,6 +102,57 @@ class FakeFreshnessService:
         }
 
 
+class FakeScreeningResultReadService:
+    def __init__(self):
+        self.read_args = None
+
+    def read(self, **kwargs):
+        self.read_args = kwargs
+        return {
+            'family': kwargs['family'],
+            'detail_route': '/eod/composite-factors',
+            'read_mode': 'screening_compact',
+            'requested_market_date': kwargs.get('market_date'),
+            'resolved_market_date': kwargs.get('market_date') or '2026-04-24',
+            'market_date': kwargs.get('market_date') or '2026-04-24',
+            'latest_mode': kwargs.get('market_date') is None,
+            'is_latest_fallback': False,
+            'feature_version': 'composite_v1',
+            'summary': {
+                'entries': 2,
+                'eligible_count': 1,
+                'watchlist_count': 1,
+            },
+            'pagination': {
+                'limit': kwargs['limit'],
+                'offset': kwargs['offset'],
+                'returned': 2,
+                'total': 2,
+                'has_more': False,
+            },
+            'items': [
+                {
+                    'symbol': '005930',
+                    'name_ko': '삼성전자',
+                    'market': 'KOSPI',
+                    'market_date': kwargs.get('market_date') or '2026-04-24',
+                    'source': 'composite_v1',
+                    'composite_score': 0.91,
+                    'composite_classification': 'eligible',
+                },
+                {
+                    'symbol': '000660',
+                    'name_ko': 'SK하이닉스',
+                    'market': 'KOSPI',
+                    'market_date': kwargs.get('market_date') or '2026-04-24',
+                    'source': 'composite_v1',
+                    'composite_score': 0.58,
+                    'composite_classification': 'watchlist',
+                },
+            ],
+        }
+
+
 class FakeTechnicalSnapshotService:
     def __init__(self):
         self.compute_args = None
@@ -793,6 +844,36 @@ class EODRouteTests(unittest.TestCase):
         self.assertEqual(payload['latest']['symbols_succeeded'], 3)
         self.assertEqual(payload['latest']['action_market_date'], '2026-04-10')
         self.assertEqual(payload['latest']['fundamentals']['market_date'], '2026-04-10')
+
+    def test_get_eod_screening_results_route_calls_service(self):
+        fake_service = FakeScreeningResultReadService()
+        original_service = routes_eod.screening_result_read_service
+        routes_eod.screening_result_read_service = fake_service
+        try:
+            client = TestClient(self.app)
+            response = client.get(
+                '/eod/screening-results',
+                params={
+                    'family': 'composite',
+                    'market_date': '2026-04-24',
+                    'limit': 25,
+                    'offset': 50,
+                },
+            )
+        finally:
+            routes_eod.screening_result_read_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            fake_service.read_args,
+            {'family': 'composite', 'market_date': '2026-04-24', 'limit': 25, 'offset': 50},
+        )
+        payload = response.json()
+        self.assertEqual(payload['family'], 'composite')
+        self.assertEqual(payload['detail_route'], '/eod/composite-factors')
+        self.assertEqual(payload['summary']['entries'], 2)
+        self.assertEqual(payload['pagination']['offset'], 50)
+        self.assertEqual(payload['items'][0]['composite_classification'], 'eligible')
 
     def test_get_eod_pipeline_status_route_returns_service_payload(self):
         fake_service = FakePipelineStatusService()

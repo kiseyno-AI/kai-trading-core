@@ -114,6 +114,7 @@
 - `GET /eod/advanced-value-factors?market_date=YYYY-MM-DD&symbol=005930`
 - `POST /eod/composite-factors/compute?market_date=YYYY-MM-DD&symbols=005930,000660&source=composite_v1`
 - `GET /eod/composite-factors?market_date=YYYY-MM-DD&symbol=005930`
+- `GET /eod/screening-results?family=composite&market_date=YYYY-MM-DD&limit=100&offset=0`
 - `GET /agent-context/symbol-day?market_date=YYYY-MM-DD&symbols=005930&symbols=000660&fs_div=CFS&disclosures_limit=5`
 - `POST /agent-context/feedback`
 - `POST /agent-context/feedback/dispatch`
@@ -322,6 +323,13 @@
 - `GET /eod/market-risk-filters` is the thin persisted read API for the evaluator outputs. It returns policy state plus explicit blocking/watchlist reasons, not the full normalized KIS snapshot field set.
 - The automatic pykrx daily EOD pipeline now also collects and stores `daily_market_risk_snapshots`, then computes and stores `daily_market_risk_filter_results` for the symbols whose daily bars were persisted successfully. Per-symbol KIS failures are recorded as partial errors and do not abort the overall daily pipeline.
 - For shell-driven operations, use `python3.11 -m app.internal.ops eod-market-risk-snapshots-collect --market-date YYYY-MM-DD` for snapshot collection and `python3.11 -m app.internal.ops eod-market-risk-filters-compute --market-date YYYY-MM-DD` for the downstream filter run.
+
+## EOD screening result notes
+- `GET /eod/screening-results` is the compact dashboard-facing screening read across persisted factor and filter result families.
+- The existing family-specific inspect routes are still the canonical detail reads, but they hydrate full rows and return `factor_payload` or `filter_payload` JSON blocks. For interactive screening lists, the avoidable bottleneck was overfetch plus Python-side row shaping rather than missing canonical storage.
+- The screening route keeps the existing result tables, resolves the latest available `market_date` when omitted, computes summary counts in SQL, projects only list-needed columns, and pages collection reads with a default `limit=100`.
+- Supported `family` values are `market_risk_filter`, `piotroski_filter`, `momentum`, `value`, `low_risk`, `beta`, `advanced_value`, and `composite`.
+- Use the family-specific routes such as `GET /eod/composite-factors` or `GET /eod/market-risk-filters` when the client needs the full stored payload block or single-symbol inspection semantics.
 
 ## Daily momentum factor notes
 - `daily_momentum_factor_results` is the DB-backed price-factor layer keyed by `symbol_id + market_date`.
