@@ -31,7 +31,7 @@
 28. Daily beta factor compute/read routes
 29. Daily advanced value factor compute/read routes
 30. Daily composite factor compute/read routes
-31. Internal trading order control + inquiry routes
+31. Internal trading order control, inquiry, and reconciliation routes
 
 ## Current routes
 - `POST /broker/kis/token`
@@ -39,10 +39,13 @@
 - `GET /broker/kis/quote?symbol=005930&market_code=J`
 - `POST /trading/orders/buy`
 - `POST /trading/orders/sell`
+- `POST /trading/orders/reconcile`
 - `POST /trading/orders/{client_order_id}/cancel`
 - `POST /trading/orders/{client_order_id}/amend`
+- `POST /trading/orders/{client_order_id}/reconcile`
 - `GET /trading/orders/{client_order_id}?account_reference=KIS:12345678-01&refresh=false`
 - `GET /trading/orders?account_reference=KIS:12345678-01&status=submitted&limit=100`
+- `GET /trading/orders/inspect?account_reference=KIS:12345678-01&limit=50`
 - `GET /market/status`
 - `GET /quotes/tracked`
 - `GET /quotes/005930`
@@ -121,9 +124,13 @@
 ## Trading order adapter notes
 - `POST /trading/orders/buy` and `POST /trading/orders/sell` are the internal order-control submit routes for the first KIS domestic cash adapter.
 - `POST /trading/orders/{client_order_id}/cancel` and `POST /trading/orders/{client_order_id}/amend` are account-scoped control routes. They require `account_reference` in `KIS:<account_number>-<product_code>` format so the service can reconcile and control the correct broker account without exposing credentials.
-- `GET /trading/orders/{client_order_id}` and `GET /trading/orders` expose the persisted order-request snapshot, current broker-order snapshot, and event timeline. `refresh=true` on the single-order read triggers KIS inquiry-based reconciliation before the response is returned.
+- `POST /trading/orders/reconcile` runs an operator-triggered recent-order sweep over persisted KIS orders, and `POST /trading/orders/{client_order_id}/reconcile` forces the same broker-truth repair path for one order.
+- `GET /trading/orders/{client_order_id}` and `GET /trading/orders` expose the persisted request snapshot, current broker-order snapshot, event timeline, and the persisted `last_reconciled_at` / `last_reconcile_status` state. `refresh=true` on the single-order read triggers KIS inquiry-based reconciliation before the response is returned.
+- `GET /trading/orders/inspect` is the internal read surface for reconciliation operations. It returns the in-process scheduler snapshot plus the latest mismatch, stale-pending, and missing-fill-detail order buckets.
 - Submit idempotency is keyed by `broker_name + account_reference + client_order_id`. A repeated submit with the same payload returns the stored order snapshot instead of sending a second broker order. A repeated submit with a different payload returns an idempotency conflict.
 - Durable persistence spans `order_requests`, `broker_orders`, and `broker_order_events`. KIS request and response payloads are preserved in the request snapshot, current broker snapshot, and event history for later debugging and reconciliation.
+- Broker-truth repair is append-only: each reconcile pass writes a deduplicated reconciliation event when the observed broker truth changes, preserves the local-before vs local-after evidence in `last_reconcile_payload`, and never rewrites prior execution history.
+- Automatic reconciliation now covers startup catch-up, periodic intraday sweeps, and realtime websocket reconnect recovery when the corresponding `KIS_ORDER_RECONCILE_*` settings are enabled. Manual shell access uses `python3.11 -m app.internal.ops trading-orders-reconcile ...` from `apps/api`.
 - The stable KIS result-code and inquiry-state mapping contract for this adapter is documented in [docs/KIS_ORDER_RESULT_CODE_MAPPING.md](./KIS_ORDER_RESULT_CODE_MAPPING.md).
 
 ## KIS realtime order notice notes

@@ -276,6 +276,106 @@ class TradingOrderServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['order']['remaining_quantity'], Decimal('6'))
         self.assertEqual(result['events'][-1]['event_type'], 'partial_fill')
 
+    async def test_manual_reconcile_repairs_missed_notice_fill_state(self) -> None:
+        await self._submit_buy_order()
+        self.fake_client.daily_fill_result = {
+            'output1': [
+                {
+                    'odno': '0000123456',
+                    'pdno': self.symbol,
+                    'ord_qty': '10',
+                    'ord_unpr': '70000',
+                    'tot_ccld_qty': '10',
+                    'rmn_qty': '0',
+                    'avg_prvs': '70120',
+                    'cncl_yn': 'N',
+                    'rjct_qty': '0',
+                }
+            ],
+            'output2': {'tot_ord_qty': '10'},
+            'raw_pages': [],
+            'page_count': 1,
+            'max_pages_reached': False,
+        }
+        self.fake_client.cancelable_result = {
+            'output': [],
+            'raw_pages': [],
+            'page_count': 1,
+            'max_pages_reached': False,
+        }
+
+        result = await self.service.reconcile_order(
+            account_reference=self.account_reference,
+            client_order_id=self.client_order_id,
+            trigger='manual',
+            reason='missed_notice_recovery',
+        )
+
+        self.assertEqual(result['order']['current_status'], 'filled')
+        self.assertEqual(result['order']['filled_quantity'], Decimal('10'))
+        self.assertEqual(result['order']['remaining_quantity'], Decimal('0'))
+        self.assertEqual(result['order']['average_fill_price'], Decimal('70120'))
+        self.assertEqual(result['order']['last_reconcile_status'], 'repaired')
+        self.assertIn('status', result['reconcile']['mismatch_reasons'])
+        self.assertTrue(result['reconcile']['repair_applied'])
+        self.assertEqual(result['events'][-1]['event_type'], 'fill')
+        self.assertEqual(result['events'][-1]['source'], 'poll_reconcile')
+
+    async def test_repeated_manual_reconcile_is_idempotent_for_same_broker_truth(self) -> None:
+        await self._submit_buy_order()
+        self.fake_client.daily_fill_result = {
+            'output1': [
+                {
+                    'odno': '0000123456',
+                    'pdno': self.symbol,
+                    'ord_qty': '10',
+                    'ord_unpr': '70000',
+                    'tot_ccld_qty': '10',
+                    'rmn_qty': '0',
+                    'avg_prvs': '70120',
+                    'cncl_yn': 'N',
+                    'rjct_qty': '0',
+                }
+            ],
+            'output2': {'tot_ord_qty': '10'},
+            'raw_pages': [],
+            'page_count': 1,
+            'max_pages_reached': False,
+        }
+        self.fake_client.cancelable_result = {
+            'output': [],
+            'raw_pages': [],
+            'page_count': 1,
+            'max_pages_reached': False,
+        }
+
+        first = await self.service.reconcile_order(
+            account_reference=self.account_reference,
+            client_order_id=self.client_order_id,
+            trigger='manual',
+            reason='first_pass',
+        )
+        second = await self.service.reconcile_order(
+            account_reference=self.account_reference,
+            client_order_id=self.client_order_id,
+            trigger='manual',
+            reason='second_pass',
+        )
+        events = list_broker_order_events(
+            account_reference=self.account_reference,
+            client_order_id=self.client_order_id,
+        )
+
+        self.assertEqual(first['order']['current_status'], 'filled')
+        self.assertEqual(second['order']['current_status'], 'filled')
+        self.assertTrue(first['reconcile']['event_appended'])
+        self.assertFalse(second['reconcile']['event_appended'])
+        self.assertEqual(second['order']['last_reconcile_status'], 'matched')
+        self.assertEqual(
+            len([item for item in events if item['event_type'] == 'fill' and item['source'] == 'poll_reconcile']),
+            1,
+        )
+
     async def test_cancel_order_sets_cancel_pending_and_persists_request_events(self) -> None:
         await self._submit_buy_order()
         self.fake_client.cancelable_result = {

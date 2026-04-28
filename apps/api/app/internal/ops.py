@@ -28,6 +28,7 @@ from app.market_data_store import (
     load_tracked_symbols,
     persist_market_status_snapshot,
 )
+from app.orders.reconciliation import trading_order_reconciliation_service
 from app.quotes.service import QuoteService
 from app.signals.advanced_value_factor import (
     ADVANCED_VALUE_FACTOR_SOURCE,
@@ -431,6 +432,38 @@ def backfill_recent_derived_contexts(
     )
 
 
+def reconcile_trading_orders(
+    *,
+    account_reference: str | None = None,
+    client_order_id: str | None = None,
+    symbol: str | None = None,
+    limit: int | None = None,
+    reason: str | None = None,
+) -> dict[str, Any]:
+    bootstrap_runtime()
+    if client_order_id:
+        if not account_reference:
+            raise ValueError('account_reference is required when client_order_id is provided')
+        return asyncio.run(
+            trading_order_reconciliation_service.reconcile_single_order(
+                account_reference=account_reference,
+                client_order_id=client_order_id,
+                trigger='internal_ops_cli',
+                reason=reason,
+            )
+        )
+    return asyncio.run(
+        trading_order_reconciliation_service.reconcile_recent_orders(
+            account_reference=account_reference,
+            symbol=symbol,
+            limit=limit,
+            trigger='internal_ops_cli',
+            reason=reason,
+            include_orders=True,
+        )
+    )
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description='Internal kai-trading-core operations without self-HTTP.')
     subparsers = parser.add_subparsers(dest='command', required=True)
@@ -612,6 +645,16 @@ def _build_parser() -> argparse.ArgumentParser:
     derived_context_backfill_parser.add_argument('--end-date')
     derived_context_backfill_parser.add_argument('--trading-days', type=int, default=7)
     derived_context_backfill_parser.add_argument('--market', default='KRX')
+
+    trading_reconcile_parser = subparsers.add_parser(
+        'trading-orders-reconcile',
+        help='Reconcile recent or targeted KIS trading orders directly from persistence and broker inquiry truth',
+    )
+    trading_reconcile_parser.add_argument('--account-reference')
+    trading_reconcile_parser.add_argument('--client-order-id')
+    trading_reconcile_parser.add_argument('--symbol')
+    trading_reconcile_parser.add_argument('--limit', type=int)
+    trading_reconcile_parser.add_argument('--reason')
     return parser
 
 
@@ -741,6 +784,14 @@ def main(argv: Iterable[str] | None = None) -> int:
             end_date=args.end_date,
             trading_days=args.trading_days,
             market=args.market,
+        )
+    elif args.command == 'trading-orders-reconcile':
+        payload = reconcile_trading_orders(
+            account_reference=args.account_reference,
+            client_order_id=args.client_order_id,
+            symbol=args.symbol,
+            limit=args.limit,
+            reason=args.reason,
         )
     else:
         parser.error(f'Unsupported command: {args.command}')
