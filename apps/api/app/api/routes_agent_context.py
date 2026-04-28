@@ -19,6 +19,7 @@ from app.agent_context.reuse_service import agent_context_reuse_service
 from app.agent_context.read_service import agent_context_read_service
 from app.agent_context.run_state_service import agent_context_feedback_run_state_service
 from app.agent_context.session_cleanup_service import agent_feedback_session_cleanup_service
+from app.agent_context.signal_decider_loop_service import signal_decider_loop_service
 from app.agent_context.retry_service import (
     EXPECTED_ROLES,
     FeedbackRetryCycleConfig,
@@ -98,6 +99,42 @@ class AgentFeedbackCleanupRunRequest(BaseModel):
     model_config = ConfigDict(extra='forbid')
 
     limit: int = Field(default=100, ge=1, le=1000)
+
+
+class SignalDeciderEvaluationComputeRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+    market_date_from: date
+    market_date_to: date
+    symbols: list[str] | None = Field(default=None, min_length=1, max_length=500)
+    horizons: list[int] | None = None
+    evaluation_version: str | None = Field(default=None, max_length=64)
+    force_recompute: bool = False
+
+    @model_validator(mode='after')
+    def validate_window(self) -> 'SignalDeciderEvaluationComputeRequest':
+        if self.market_date_from > self.market_date_to:
+            raise ValueError('market_date_from must be on or before market_date_to')
+        return self
+
+
+class SignalDeciderPolicyCandidateRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+    market_date_from: date
+    market_date_to: date
+    symbols: list[str] | None = Field(default=None, min_length=1, max_length=500)
+    horizons: list[int] | None = None
+    primary_horizon_days: int = Field(default=5)
+    evaluation_version: str | None = Field(default=None, max_length=64)
+    min_sample_size: int = Field(default=3, ge=1, le=1000)
+    force_recompute: bool = False
+
+    @model_validator(mode='after')
+    def validate_window(self) -> 'SignalDeciderPolicyCandidateRequest':
+        if self.market_date_from > self.market_date_to:
+            raise ValueError('market_date_from must be on or before market_date_to')
+        return self
 
 
 class AgentSubagentExperimentRequest(BaseModel):
@@ -653,6 +690,128 @@ async def list_agent_feedback(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f'Agent feedback read failed: {exc}') from exc
+
+
+@router.get('/signal-decider/decisions')
+async def list_signal_decider_decisions(
+    market_date: date = Query(...),
+    symbol: str | None = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=200),
+) -> dict:
+    try:
+        return await run_in_threadpool(
+            signal_decider_loop_service.list_decisions,
+            market_date=market_date,
+            symbol=symbol,
+            limit=limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'Signal-decider decision read failed: {exc}') from exc
+
+
+@router.get('/signal-decider/diagnostics')
+async def get_signal_decider_diagnostics(
+    market_date: date = Query(...),
+    symbol: str | None = Query(default=None),
+    evaluation_version: str | None = Query(default=None),
+    limit: int = Query(default=20, ge=1, le=100),
+) -> dict:
+    try:
+        return await run_in_threadpool(
+            signal_decider_loop_service.get_diagnostics,
+            market_date=market_date,
+            symbol=symbol,
+            evaluation_version=evaluation_version,
+            limit=limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'Signal-decider diagnostics read failed: {exc}') from exc
+
+
+@router.post('/signal-decider/evaluations/compute')
+async def compute_signal_decider_evaluations(payload: SignalDeciderEvaluationComputeRequest) -> dict:
+    try:
+        return await run_in_threadpool(
+            signal_decider_loop_service.compute_evaluations,
+            market_date_from=payload.market_date_from,
+            market_date_to=payload.market_date_to,
+            symbols=payload.symbols,
+            horizons=payload.horizons,
+            evaluation_version=payload.evaluation_version,
+            force_recompute=payload.force_recompute,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'Signal-decider evaluation compute failed: {exc}') from exc
+
+
+@router.get('/signal-decider/evaluations')
+async def list_signal_decider_evaluations(
+    market_date: date = Query(...),
+    symbol: str | None = Query(default=None),
+    horizons: list[int] | None = Query(default=None),
+    evaluation_version: str | None = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=200),
+) -> dict:
+    try:
+        return await run_in_threadpool(
+            signal_decider_loop_service.list_evaluations,
+            market_date=market_date,
+            symbol=symbol,
+            horizons=horizons,
+            evaluation_version=evaluation_version,
+            limit=limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'Signal-decider evaluation read failed: {exc}') from exc
+
+
+@router.post('/signal-decider/policy-candidates/generate')
+async def generate_signal_decider_policy_candidates(payload: SignalDeciderPolicyCandidateRequest) -> dict:
+    try:
+        return await run_in_threadpool(
+            signal_decider_loop_service.generate_policy_candidates,
+            market_date_from=payload.market_date_from,
+            market_date_to=payload.market_date_to,
+            symbols=payload.symbols,
+            horizons=payload.horizons,
+            primary_horizon_days=payload.primary_horizon_days,
+            evaluation_version=payload.evaluation_version,
+            min_sample_size=payload.min_sample_size,
+            force_recompute=payload.force_recompute,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'Signal-decider policy candidate generation failed: {exc}') from exc
+
+
+@router.get('/signal-decider/policy-candidates')
+async def list_signal_decider_policy_candidates(
+    status: str | None = Query(default=None),
+    evaluation_version: str | None = Query(default=None),
+    base_policy_version: str | None = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=200),
+) -> dict:
+    try:
+        return await run_in_threadpool(
+            signal_decider_loop_service.list_policy_candidates,
+            status=status,
+            evaluation_version=evaluation_version,
+            base_policy_version=base_policy_version,
+            limit=limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'Signal-decider policy candidate read failed: {exc}') from exc
 
 
 class CoreControlRequest(BaseModel):

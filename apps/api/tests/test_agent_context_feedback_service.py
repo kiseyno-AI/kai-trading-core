@@ -68,6 +68,26 @@ class FakeFeedbackRepository:
         ]
 
 
+class FakeSignalDeciderLoopService:
+    def __init__(self):
+        self.calls = []
+
+    def prepare_feedback_persistence(self, **kwargs):
+        self.calls.append(kwargs)
+        summary_payload = dict(kwargs['summary_payload'])
+        feedback_payload = dict(kwargs['feedback_payload'])
+        context_payload = dict(kwargs['context_payload'] or {}) if kwargs['context_payload'] is not None else None
+        if kwargs['agent_name'] == 'signal-decider':
+            summary_payload['policy_version'] = 'signal_decider_policy_v1'
+            feedback_payload['policy_version'] = 'signal_decider_policy_v1'
+            context_payload = context_payload or {}
+            context_payload['signal_decider_trace'] = {
+                'policy_version': 'signal_decider_policy_v1',
+                'feature_snapshot': {'technical': {'breakout_20d': True}},
+            }
+        return summary_payload, feedback_payload, context_payload
+
+
 class AgentContextFeedbackServiceTests(unittest.TestCase):
     def test_dedupe_feedback_items_for_upsert_keeps_last_duplicate_per_conflict_key(self):
         items = [
@@ -101,7 +121,8 @@ class AgentContextFeedbackServiceTests(unittest.TestCase):
 
     def test_submit_feedback_normalizes_and_persists_json_payload(self):
         repository = FakeFeedbackRepository()
-        service = AgentContextFeedbackService(repository=repository)
+        loop_service = FakeSignalDeciderLoopService()
+        service = AgentContextFeedbackService(repository=repository, decision_loop_service=loop_service)
 
         result = service.submit_feedback(
             market_date='2026-04-14',
@@ -123,16 +144,21 @@ class AgentContextFeedbackServiceTests(unittest.TestCase):
         self.assertEqual(repository.created['summary_payload']['headline'], 'watch breakout')
         self.assertEqual(result['summary']['summary_keys'], ['headline'])
         self.assertEqual(result['summary']['feedback_keys'], ['confidence'])
+        self.assertEqual(loop_service.calls[0]['agent_name'], 'openclaw')
 
     def test_submit_feedback_requires_summary_or_feedback(self):
-        service = AgentContextFeedbackService(repository=FakeFeedbackRepository())
+        service = AgentContextFeedbackService(
+            repository=FakeFeedbackRepository(),
+            decision_loop_service=FakeSignalDeciderLoopService(),
+        )
 
         with self.assertRaisesRegex(ValueError, 'Either summary or feedback must be provided'):
             service.submit_feedback(market_date='2026-04-14', symbol='005930', summary={}, feedback={})
 
     def test_submit_feedback_preserves_signal_decider_request_and_response_payloads(self):
         repository = FakeFeedbackRepository()
-        service = AgentContextFeedbackService(repository=repository)
+        loop_service = FakeSignalDeciderLoopService()
+        service = AgentContextFeedbackService(repository=repository, decision_loop_service=loop_service)
 
         result = service.submit_feedback(
             market_date='2026-04-23',
@@ -172,6 +198,12 @@ class AgentContextFeedbackServiceTests(unittest.TestCase):
 
         self.assertEqual(repository.created['agent_name'], 'signal-decider')
         self.assertEqual(repository.created['summary_payload']['model'], 'openclaw/signal-decider')
+        self.assertEqual(repository.created['summary_payload']['policy_version'], 'signal_decider_policy_v1')
+        self.assertEqual(repository.created['feedback_payload']['policy_version'], 'signal_decider_policy_v1')
+        self.assertEqual(
+            repository.created['context_payload']['signal_decider_trace']['feature_snapshot']['technical']['breakout_20d'],
+            True,
+        )
         self.assertEqual(
             repository.created['context_payload']['upstream_summaries']['technical']['details']['support_resistance']['support_levels'],
             [80000],
@@ -181,7 +213,10 @@ class AgentContextFeedbackServiceTests(unittest.TestCase):
 
     def test_bulk_submit_feedback_normalizes_and_uses_bulk_upsert(self):
         repository = FakeFeedbackRepository()
-        service = AgentContextFeedbackService(repository=repository)
+        service = AgentContextFeedbackService(
+            repository=repository,
+            decision_loop_service=FakeSignalDeciderLoopService(),
+        )
 
         result = service.bulk_submit_feedback(
             items=[
@@ -220,7 +255,10 @@ class AgentContextFeedbackServiceTests(unittest.TestCase):
 
     def test_list_feedback_normalizes_filters(self):
         repository = FakeFeedbackRepository()
-        service = AgentContextFeedbackService(repository=repository)
+        service = AgentContextFeedbackService(
+            repository=repository,
+            decision_loop_service=FakeSignalDeciderLoopService(),
+        )
 
         result = service.list_feedback(
             market_date='2026-04-14',
