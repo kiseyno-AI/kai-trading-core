@@ -7,6 +7,7 @@ from app.agent_context.signal_decider_loop_service import (
     DEFAULT_SIGNAL_DECIDER_EVALUATION_LOOKBACK_DAYS,
     DEFAULT_SIGNAL_DECIDER_POLICY_VERSION,
     SignalDeciderLoopService,
+    _merge_policy_metadata_preserving_audit,
 )
 
 
@@ -457,6 +458,10 @@ class FakeSignalDeciderLoopRepository:
             }
             if existing and existing['status'] in {'active', 'retired'}:
                 stored['status'] = existing['status']
+                stored['metadata'] = _merge_policy_metadata_preserving_audit(
+                    metadata_payload=stored['metadata'],
+                    existing_metadata_payload=existing.get('metadata'),
+                )
                 stored['activated_by'] = existing['activated_by']
                 stored['activated_at'] = existing['activated_at']
                 stored['retired_at'] = existing['retired_at']
@@ -1262,6 +1267,107 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
         self.assertEqual(result['summary']['status_counts']['candidate'], 1)
         self.assertEqual(result['items'][0]['policy_version'], DEFAULT_SIGNAL_DECIDER_POLICY_VERSION)
         self.assertEqual(result['items'][1]['activation_mode'], 'manual_only')
+
+    def test_list_policy_versions_status_filter_preserves_active_policy_summary(self):
+        repository = FakeSignalDeciderLoopRepository([])
+        repository.policy_versions['signal_decider_policy_v2'] = {
+            **_policy_version_record(
+                policy_version='signal_decider_policy_v2',
+                status='candidate',
+                parent_policy_version='signal_decider_policy_v1',
+                source_candidate_version='signal_decider_policy_v2',
+                change_summary='Relax wait decisions under repeated breakout evidence.',
+                activated_by=None,
+                activated_at=None,
+            ),
+            'id': 2,
+        }
+        service = SignalDeciderLoopService(repository=repository)
+
+        result = service.list_policy_versions(status='candidate', limit=10)
+
+        self.assertEqual(result['summary']['count'], 1)
+        self.assertEqual(result['summary']['active_policy_version'], DEFAULT_SIGNAL_DECIDER_POLICY_VERSION)
+        self.assertEqual(result['summary']['status_counts'], {'candidate': 1})
+        self.assertEqual([item['policy_version'] for item in result['items']], ['signal_decider_policy_v2'])
+
+    def test_bulk_upsert_policy_versions_preserves_audit_metadata_for_active_and_retired_rows(self):
+        for existing_status in ('active', 'retired'):
+            with self.subTest(existing_status=existing_status):
+                repository = FakeSignalDeciderLoopRepository([])
+                repository.policy_versions['signal_decider_policy_v2'] = {
+                    **_policy_version_record(
+                        policy_version='signal_decider_policy_v2',
+                        status=existing_status,
+                        parent_policy_version='signal_decider_policy_v1',
+                        source_candidate_version='signal_decider_policy_v2',
+                        change_summary='Previously approved candidate.',
+                        activated_by='human.reviewer',
+                        activated_at='2026-04-29T06:30:00+00:00',
+                        retired_at='2026-04-30T06:30:00+00:00' if existing_status == 'retired' else None,
+                    ),
+                    'id': 2,
+                    'metadata': {
+                        'schema_version': 'signal_decider_policy_metadata_v1',
+                        'policy_origin': 'candidate_generation',
+                        'activation_mode': 'manual_only',
+                        'candidate_activation_required': True,
+                        'activation_history': [
+                            {
+                                'event': 'activated',
+                                'activated_at': '2026-04-29T06:30:00+00:00',
+                                'activated_by': 'human.reviewer',
+                            }
+                        ],
+                        'last_activation_note': 'Approved after review.',
+                        'retired_by_activation_of': (
+                            'signal_decider_policy_v3' if existing_status == 'retired' else None
+                        ),
+                    },
+                }
+
+                repository.bulk_upsert_policy_versions(
+                    items=[
+                        {
+                            'policy_version': 'signal_decider_policy_v2',
+                            'status': 'candidate',
+                            'parent_policy_version': 'signal_decider_policy_v1',
+                            'source_candidate_version': 'signal_decider_policy_v2',
+                            'change_summary': 'Regenerated candidate payload.',
+                            'rule_bundle_payload': {
+                                'schema_version': 'signal_decider_policy_bundle_v1',
+                                'policy_version': 'signal_decider_policy_v2',
+                            },
+                            'metadata_payload': {
+                                'schema_version': 'signal_decider_policy_metadata_v1',
+                                'policy_origin': 'candidate_generation',
+                                'activation_mode': 'manual_only',
+                                'candidate_activation_required': True,
+                                'evidence': {'support_ratio': 1.0},
+                            },
+                            'created_by': 'system:auto_candidate_generation',
+                            'activated_by': None,
+                            'activated_at': None,
+                            'retired_at': None,
+                            'created_at': datetime(2026, 5, 1, 6, 0, tzinfo=timezone.utc),
+                            'updated_at': datetime(2026, 5, 1, 6, 0, tzinfo=timezone.utc),
+                        }
+                    ]
+                )
+
+                persisted = repository.policy_versions['signal_decider_policy_v2']
+                self.assertEqual(persisted['status'], existing_status)
+                self.assertEqual(persisted['metadata']['policy_origin'], 'candidate_generation')
+                self.assertEqual(persisted['metadata']['evidence']['support_ratio'], 1.0)
+                self.assertEqual(
+                    persisted['metadata']['activation_history'][0]['activated_by'],
+                    'human.reviewer',
+                )
+                self.assertEqual(persisted['metadata']['last_activation_note'], 'Approved after review.')
+                self.assertEqual(
+                    persisted['metadata'].get('retired_by_activation_of'),
+                    'signal_decider_policy_v3' if existing_status == 'retired' else None,
+                )
 
     def test_get_policy_version_detail_returns_candidate_evidence(self):
         repository = FakeSignalDeciderLoopRepository([])

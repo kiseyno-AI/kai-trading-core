@@ -46,6 +46,11 @@ NEGATIVE_SIGNAL_DECIDER_GRADE_LABELS: tuple[str, ...] = (
     'missed_opportunity_after_wait',
     'missed_opportunity_after_reject',
 )
+POLICY_VERSION_AUDIT_METADATA_KEYS: tuple[str, ...] = (
+    'activation_history',
+    'last_activation_note',
+    'retired_by_activation_of',
+)
 
 
 @dataclass(frozen=True)
@@ -254,6 +259,19 @@ def _maybe_dict(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
         return value
     return {}
+
+
+def _merge_policy_metadata_preserving_audit(
+    *,
+    metadata_payload: Any,
+    existing_metadata_payload: Any,
+) -> dict[str, Any]:
+    merged_metadata = dict(_maybe_dict(metadata_payload))
+    existing_metadata = _maybe_dict(existing_metadata_payload)
+    for key in POLICY_VERSION_AUDIT_METADATA_KEYS:
+        if key in existing_metadata:
+            merged_metadata[key] = existing_metadata[key]
+    return merged_metadata
 
 
 def _signal_score_bucket(score: float | None) -> str | None:
@@ -1034,8 +1052,39 @@ class SignalDeciderLoopRepository:
     def bulk_upsert_policy_versions(self, *, items: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
         if not items:
             return []
+        input_items = [dict(item) for item in items]
         with session_scope() as session:
-            stmt = insert(SignalDeciderPolicyVersion).values(list(items))
+            policy_versions = sorted(
+                {
+                    value
+                    for value in (
+                        _normalize_optional_text(str(item.get('policy_version')))
+                        for item in input_items
+                    )
+                    if value
+                }
+            )
+            existing_rows = {}
+            if policy_versions:
+                rows = session.execute(
+                    select(SignalDeciderPolicyVersion).where(
+                        SignalDeciderPolicyVersion.policy_version.in_(policy_versions)
+                    )
+                ).scalars().all()
+                existing_rows = {row.policy_version: row for row in rows}
+
+            upsert_items: list[dict[str, Any]] = []
+            for item in input_items:
+                merged_item = dict(item)
+                existing_row = existing_rows.get(str(merged_item['policy_version']))
+                if existing_row is not None and existing_row.status in {'active', 'retired'}:
+                    merged_item['metadata_payload'] = _merge_policy_metadata_preserving_audit(
+                        metadata_payload=merged_item.get('metadata_payload'),
+                        existing_metadata_payload=existing_row.metadata_payload,
+                    )
+                upsert_items.append(merged_item)
+
+            stmt = insert(SignalDeciderPolicyVersion).values(upsert_items)
             excluded = stmt.excluded
             stmt = stmt.on_conflict_do_update(
                 constraint='uq_signal_decider_policy_versions_version',
@@ -1080,7 +1129,7 @@ class SignalDeciderLoopRepository:
                 .order_by(SignalDeciderPolicyVersion.id.asc())
             ).scalars().all()
             by_key = {row.policy_version: _serialize_policy_version_row(row) for row in rows}
-            return [by_key[item['policy_version']] for item in items]
+            return [by_key[item['policy_version']] for item in upsert_items]
 
     def activate_policy_version(
         self,
@@ -1216,9 +1265,11 @@ class SignalDeciderLoopService:
             )
         ]
         status_counts = Counter(str(item.get('status') or '') for item in items if item.get('status'))
-        active_policy_version = next(
-            (item['policy_version'] for item in items if item.get('status') == 'active'),
-            None,
+        active_policy = self.repository.get_active_policy_version()
+        active_policy_version = (
+            active_policy.get('policy_version')
+            if active_policy is not None
+            else next((item['policy_version'] for item in items if item.get('status') == 'active'), None)
         )
         return {
             'request': {
