@@ -7,6 +7,40 @@ from math import ceil
 from typing import Any
 
 
+def _build_top_level_progress_fields(
+    *,
+    processed_symbols: int,
+    total_symbols: int,
+    completed_feedback_count: int,
+    expected_feedback_count: int,
+    failed_items: int,
+) -> dict[str, float | int]:
+    bounded_total_symbols = max(0, int(total_symbols))
+    bounded_processed_symbols = min(bounded_total_symbols, max(0, int(processed_symbols)))
+    bounded_expected_feedback_count = max(0, int(expected_feedback_count))
+    terminal_feedback_count = min(
+        bounded_expected_feedback_count,
+        max(0, int(completed_feedback_count) + int(failed_items)),
+    )
+    boundary_progress_ratio = (
+        bounded_processed_symbols / bounded_total_symbols
+        if bounded_total_symbols
+        else 0.0
+    )
+    progress_ratio = (
+        terminal_feedback_count / bounded_expected_feedback_count
+        if bounded_expected_feedback_count
+        else 0.0
+    )
+    return {
+        'terminal_feedback_count': terminal_feedback_count,
+        'boundary_progress_ratio': round(boundary_progress_ratio, 6),
+        'boundary_progress_percent': round(boundary_progress_ratio * 100, 2),
+        'progress_ratio': round(progress_ratio, 6),
+        'progress_percent': round(progress_ratio * 100, 2),
+    }
+
+
 @dataclass
 class RuntimeFeedbackRunState:
     run_id: str
@@ -112,7 +146,13 @@ class RuntimeFeedbackRunState:
                         pending_symbols += 1
 
         processed_symbols = completed_symbols + in_progress_symbols
-        progress_ratio = (processed_symbols / total_symbols) if total_symbols else 0.0
+        progress_fields = _build_top_level_progress_fields(
+            processed_symbols=processed_symbols,
+            total_symbols=total_symbols,
+            completed_feedback_count=completed_feedback_count,
+            expected_feedback_count=expected_feedback_count,
+            failed_items=failed_items,
+        )
 
         role_progress: dict[str, dict[str, Any]] = {}
         for role in self.requested_roles:
@@ -208,7 +248,7 @@ class RuntimeFeedbackRunState:
         if elapsed_seconds > 0 and completed_feedback_count > 0:
             rate = completed_feedback_count / elapsed_seconds
             completed_feedback_per_minute = round(rate * 60, 2)
-            remaining = max(0, expected_feedback_count - completed_feedback_count - failed_items)
+            remaining = max(0, expected_feedback_count - progress_fields['terminal_feedback_count'])
             if remaining > 0 and rate > 0:
                 estimated_remaining_seconds = ceil(remaining / rate)
                 estimated_completion_at = (now + __import__('datetime').timedelta(seconds=estimated_remaining_seconds)).isoformat()
@@ -239,8 +279,11 @@ class RuntimeFeedbackRunState:
             'completed_symbols': completed_symbols,
             'in_progress_symbols': in_progress_symbols,
             'pending_symbols': pending_symbols,
-            'progress_ratio': round(progress_ratio, 6),
-            'progress_percent': round(progress_ratio * 100, 2),
+            'terminal_feedback_count': progress_fields['terminal_feedback_count'],
+            'boundary_progress_ratio': progress_fields['boundary_progress_ratio'],
+            'boundary_progress_percent': progress_fields['boundary_progress_percent'],
+            'progress_ratio': progress_fields['progress_ratio'],
+            'progress_percent': progress_fields['progress_percent'],
             'failed_items': failed_items,
             'completed_feedback_count': completed_feedback_count,
             'expected_feedback_count': expected_feedback_count,

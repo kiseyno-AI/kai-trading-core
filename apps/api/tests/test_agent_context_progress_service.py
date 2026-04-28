@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from app.agent_context.progress_service import AgentContextProgressService
+from app.agent_context.runtime_state import RuntimeFeedbackRunState
 
 
 class FakeExecuteResult:
@@ -207,10 +208,89 @@ class AgentContextProgressServiceTests(unittest.TestCase):
         self.assertEqual(result['summary']['remaining_roles'], ['fundamental-summarizer'])
         self.assertEqual(result['summary']['cycle_number'], 1)
         self.assertEqual(result['summary']['buffered_feedback_count'], 3)
+        self.assertEqual(result['summary']['terminal_feedback_count'], 4)
+        self.assertEqual(result['summary']['progress_ratio'], 1.0)
+        self.assertEqual(result['summary']['boundary_progress_ratio'], 1.0)
         self.assertEqual(
             result['result']['roles']['technical-summarizer'],
             {'requested_count': 2, 'completed_count': 1, 'error_count': 1},
         )
+
+    def test_feedback_progress_runtime_summary_tracks_whole_cycle_completion_not_symbol_boundary(self):
+        fake_session = FakeProgressSession()
+        state = RuntimeFeedbackRunState(
+            run_id='live-run',
+            market_date=datetime(2026, 4, 14, tzinfo=timezone.utc).date(),
+            requested_symbols=['005930', '000660'],
+            requested_roles=[
+                'eod-summarizer',
+                'technical-summarizer',
+                'fundamental-summarizer',
+                'signal-decider',
+            ],
+            role_sequence=[
+                'eod-summarizer',
+                'technical-summarizer',
+                'fundamental-summarizer',
+                'signal-decider',
+            ],
+            parallel_per_role=2,
+            batch_size=2,
+            started_at=datetime(2026, 4, 14, 1, 0, tzinfo=timezone.utc),
+            current_role='technical-summarizer',
+        )
+        state.completed_symbols_by_role = {
+            'eod-summarizer': {'005930', '000660'},
+            'technical-summarizer': {'005930'},
+        }
+        state.in_flight_slots_by_role = {
+            'technical-summarizer': {
+                1: {'symbols': ['000660']},
+            }
+        }
+        state.last_activity_at = datetime(2026, 4, 14, 1, 5, tzinfo=timezone.utc)
+        run_snapshot = {
+            'run_id': 'live-run',
+            'status': 'running',
+            'started_at': datetime(2026, 4, 14, 1, 0, tzinfo=timezone.utc),
+            'completed_at': None,
+            'summary_payload': {'progress_summary': {'run_status': 'running'}},
+        }
+
+        @contextmanager
+        def fake_session_scope():
+            yield fake_session
+
+        with patch('app.agent_context.progress_service.session_scope', fake_session_scope):
+            with patch('app.agent_context.progress_service.runtime_feedback_state_store.get_run', return_value=state):
+                with patch(
+                    'app.agent_context.progress_service.agent_context_feedback_run_state_service.get_run',
+                    return_value=run_snapshot,
+                ):
+                    result = AgentContextProgressService().get_feedback_progress(
+                        market_date='2026-04-14',
+                        symbols=['005930', '000660'],
+                        run_id='live-run',
+                    )
+
+        summary = result['summary']
+        self.assertEqual(summary['current_role'], 'technical-summarizer')
+        self.assertEqual(summary['completed_roles'], ['eod-summarizer'])
+        self.assertEqual(
+            summary['remaining_roles'],
+            ['technical-summarizer', 'fundamental-summarizer', 'signal-decider'],
+        )
+        self.assertEqual(summary['processed_symbols'], 2)
+        self.assertEqual(summary['boundary_progress_ratio'], 1.0)
+        self.assertEqual(summary['boundary_progress_percent'], 100.0)
+        self.assertEqual(summary['terminal_feedback_count'], 3)
+        self.assertEqual(summary['completed_feedback_count'], 3)
+        self.assertEqual(summary['expected_feedback_count'], 8)
+        self.assertEqual(summary['progress_ratio'], 0.375)
+        self.assertEqual(summary['progress_percent'], 37.5)
+        self.assertEqual(summary['role_progress']['technical-summarizer']['progress_percent'], 100.0)
+        self.assertEqual(summary['role_progress']['fundamental-summarizer']['progress_percent'], 0.0)
+        self.assertEqual(summary['role_progress']['signal-decider']['progress_percent'], 0.0)
 
     def test_feedback_progress_explicit_run_id_prefers_matching_runtime_state(self):
         fake_session = FakeProgressSession()
@@ -579,6 +659,9 @@ class AgentContextProgressServiceTests(unittest.TestCase):
         self.assertEqual(result['summary']['cycle_mode'], 'retry_followup')
         self.assertEqual(result['summary']['cycle_number'], 2)
         self.assertEqual(result['summary']['role_progress']['signal-decider']['retry_pending_symbols'], 1)
+        self.assertEqual(result['summary']['terminal_feedback_count'], 8)
+        self.assertEqual(result['summary']['progress_ratio'], 1.0)
+        self.assertEqual(result['summary']['boundary_progress_ratio'], 1.0)
         self.assertEqual(result['result']['roles']['signal-decider']['error_count'], 1)
         self.assertEqual(find_latest_run.call_args.kwargs['request_modes'], ['daily_retry_cycle_role_sequenced'])
 
@@ -728,6 +811,9 @@ class AgentContextProgressServiceTests(unittest.TestCase):
         self.assertEqual(summary['completed_symbols'], 0)
         self.assertEqual(summary['in_progress_symbols'], 1)
         self.assertEqual(summary['pending_symbols'], 0)
+        self.assertEqual(summary['terminal_feedback_count'], 1)
+        self.assertEqual(summary['boundary_progress_ratio'], 1.0)
+        self.assertEqual(summary['boundary_progress_percent'], 100.0)
         self.assertEqual(summary['progress_ratio'], 1.0)
         self.assertEqual(summary['progress_percent'], 100.0)
         self.assertEqual(summary['failed_items'], 1)

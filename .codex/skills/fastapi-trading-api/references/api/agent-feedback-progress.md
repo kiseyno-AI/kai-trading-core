@@ -8,6 +8,9 @@ The response is now a stable coverage and liveness snapshot:
 - `result.market_date` echoes the requested market date, and `result.roles[role]` reports durable persisted `requested_count`, `completed_count`, and `error_count`
 - `run_id` is optional and lets operators inspect the exact durable run returned by dispatch or retry endpoints
 - when a matching retry-cycle `agent_context_feedback_runs` row exists, aggregate counts stay grounded in persisted feedback and failure rows while live lifecycle fields such as `current_role`, `completed_roles`, and `cycle_status` still come from the active run metadata
+- top-level `progress_ratio` and `progress_percent` represent whole-cycle completion across all expected symbol-role feedback items
+- `boundary_progress_ratio` and `boundary_progress_percent` keep the separate symbol-boundary coverage signal that used to drive the top-level percentage
+- `terminal_feedback_count` shows how many expected feedback items are already terminal via either stored feedback or stored failure rows
 - `run_status` indicates whether feedback appears to be actively moving, stalled, pending, or completed
 - `latest_feedback_at` and `seconds_since_last_feedback` help operators tell whether a run is still alive
 - `first_feedback_at`, `elapsed_seconds`, rates, and ETA fields are calculated only from feedback rows for the same target symbol universe used by the progress counts
@@ -64,8 +67,11 @@ GET /agent-context/feedback/progress?market_date=2026-04-16&run_id=feedback-cycl
     "completed_symbols": 0,
     "in_progress_symbols": 397,
     "pending_symbols": 3934,
-    "progress_ratio": 0.091665,
-    "progress_percent": 9.17,
+    "terminal_feedback_count": 402,
+    "progress_ratio": 0.03094,
+    "progress_percent": 3.09,
+    "boundary_progress_ratio": 0.091665,
+    "boundary_progress_percent": 9.17,
     "failed_items": 0,
     "completed_feedback_count": 402,
     "expected_feedback_count": 12993,

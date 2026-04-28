@@ -11,7 +11,7 @@ from app.agent_context.feedback_service import _normalize_market_date, _normaliz
 from app.agent_context.run_modes import DAILY_RETRY_CYCLE_MODE
 from app.agent_context.run_state_service import agent_context_feedback_run_state_service
 from app.agent_context.status_service import EXPECTED_AGENT_NAMES
-from app.agent_context.runtime_state import runtime_feedback_state_store
+from app.agent_context.runtime_state import _build_top_level_progress_fields, runtime_feedback_state_store
 from app.db import session_scope
 from app.db_models import AgentContextFeedback, AgentContextFeedbackFailure, DailyPriceBar, Symbol
 
@@ -83,6 +83,7 @@ class AgentContextProgressService:
                 summary=summary_payload,
                 expected_agents=expected_agent_names,
             )
+        summary_payload = self._normalize_summary_progress_fields(summary_payload)
 
         return {
             'request': {
@@ -185,6 +186,20 @@ class AgentContextProgressService:
             role_progress = {**role_progress, current_role: updated_role_progress}
             merged['role_progress'] = role_progress
         return merged
+
+    @staticmethod
+    def _normalize_summary_progress_fields(summary: dict[str, Any]) -> dict[str, Any]:
+        normalized = dict(summary)
+        normalized.update(
+            _build_top_level_progress_fields(
+                processed_symbols=int(normalized.get('processed_symbols') or 0),
+                total_symbols=int(normalized.get('total_symbols') or 0),
+                completed_feedback_count=int(normalized.get('completed_feedback_count') or 0),
+                expected_feedback_count=int(normalized.get('expected_feedback_count') or 0),
+                failed_items=int(normalized.get('failed_items') or 0),
+            )
+        )
+        return normalized
 
     def _build_persisted_progress(
         self,
@@ -409,7 +424,13 @@ class AgentContextProgressService:
                 in_progress_symbols += 1
         pending_symbols = max(0, requested_count - completed_symbols - in_progress_symbols)
         processed_symbols = completed_symbols + in_progress_symbols
-        progress_ratio = (processed_symbols / requested_count) if requested_count else 0.0
+        progress_fields = _build_top_level_progress_fields(
+            processed_symbols=processed_symbols,
+            total_symbols=requested_count,
+            completed_feedback_count=completed_feedback_count,
+            expected_feedback_count=expected_feedback_count,
+            failed_items=failed_items,
+        )
 
         role_progress: dict[str, dict[str, Any]] = {}
         for agent_name in expected_agents:
@@ -452,7 +473,7 @@ class AgentContextProgressService:
         if first_feedback_at is not None and latest_feedback_at is not None:
             elapsed_seconds = max(0, int((latest_feedback_at - first_feedback_at).total_seconds()))
             seconds_since_last_feedback = max(0, int((now - latest_feedback_at.astimezone(timezone.utc)).total_seconds()))
-            remaining_feedback_count = max(0, expected_feedback_count - completed_feedback_count - failed_items)
+            remaining_feedback_count = max(0, expected_feedback_count - progress_fields['terminal_feedback_count'])
             if elapsed_seconds > 0 and completed_feedback_count > 0:
                 completed_rate = completed_feedback_count / elapsed_seconds
                 completed_feedback_per_minute = round(completed_rate * 60, 2)
@@ -491,8 +512,11 @@ class AgentContextProgressService:
             'completed_symbols': completed_symbols,
             'in_progress_symbols': in_progress_symbols,
             'pending_symbols': pending_symbols,
-            'progress_ratio': round(progress_ratio, 6),
-            'progress_percent': round(progress_ratio * 100, 2),
+            'terminal_feedback_count': progress_fields['terminal_feedback_count'],
+            'boundary_progress_ratio': progress_fields['boundary_progress_ratio'],
+            'boundary_progress_percent': progress_fields['boundary_progress_percent'],
+            'progress_ratio': progress_fields['progress_ratio'],
+            'progress_percent': progress_fields['progress_percent'],
             'failed_items': failed_items,
             'completed_feedback_count': completed_feedback_count,
             'expected_feedback_count': expected_feedback_count,
