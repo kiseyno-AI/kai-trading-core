@@ -55,6 +55,41 @@ class FakeTradingOrderService:
         return {'count': 1, 'items': [{'client_order_id': 'TEST-ORDER-1'}]}
 
 
+class FakeTradingOrderMonitoringService:
+    def __init__(self) -> None:
+        self.lifecycle_calls: list[dict] = []
+        self.mismatch_calls: list[dict] = []
+        self.stale_calls: list[dict] = []
+        self.timeline_calls: list[dict] = []
+        self.realtime_health_calls = 0
+
+    def lifecycle_view(self, **kwargs):
+        self.lifecycle_calls.append(kwargs)
+        return {
+            'summary': {'today_orders': 1, 'open_orders': 1},
+            'buckets': {'today_orders': {'count': 1, 'items': [{'client_order_id': 'LIFE-ORDER-1'}]}},
+        }
+
+    def mismatches_view(self, **kwargs):
+        self.mismatch_calls.append(kwargs)
+        return {'count': 1, 'items': [{'client_order_id': 'MISMATCH-ORDER-1'}]}
+
+    def stale_pending_view(self, **kwargs):
+        self.stale_calls.append(kwargs)
+        return {'count': 1, 'items': [{'client_order_id': 'STALE-ORDER-1'}]}
+
+    def realtime_health(self):
+        self.realtime_health_calls += 1
+        return {'summary': {'healthy': True, 'status': 'subscribed'}}
+
+    async def order_timeline_view(self, **kwargs):
+        self.timeline_calls.append(kwargs)
+        return {
+            'summary': {'client_order_id': kwargs['client_order_id']},
+            'timeline': {'count': 2, 'items': [{'event_type': 'submit_request'}, {'event_type': 'fill'}]},
+        }
+
+
 class FakeTradingOrderReconciliationService:
     def __init__(self) -> None:
         self.bulk_calls: list[dict] = []
@@ -93,14 +128,18 @@ class TradingOrderRouteTests(unittest.TestCase):
         self.app = FastAPI()
         self.app.include_router(routes_trading.router)
         self.service = FakeTradingOrderService()
+        self.monitoring_service = FakeTradingOrderMonitoringService()
         self.reconcile_service = FakeTradingOrderReconciliationService()
         self.original_service = routes_trading.trading_order_service
+        self.original_monitoring_service = routes_trading.trading_order_monitoring_service
         self.original_reconcile_service = routes_trading.trading_order_reconciliation_service
         routes_trading.trading_order_service = self.service
+        routes_trading.trading_order_monitoring_service = self.monitoring_service
         routes_trading.trading_order_reconciliation_service = self.reconcile_service
 
     def tearDown(self) -> None:
         routes_trading.trading_order_service = self.original_service
+        routes_trading.trading_order_monitoring_service = self.original_monitoring_service
         routes_trading.trading_order_reconciliation_service = self.original_reconcile_service
 
     def test_buy_route_returns_created_payload(self) -> None:
@@ -206,6 +245,41 @@ class TradingOrderRouteTests(unittest.TestCase):
         self.assertEqual(self.reconcile_service.bulk_calls[0]['trigger'], 'manual')
         self.assertEqual(self.reconcile_service.single_calls[0]['trigger'], 'manual_single')
         self.assertEqual(self.reconcile_service.inspect_calls[0]['stale_after_minutes'], 30)
+
+    def test_monitoring_routes_use_monitoring_service(self) -> None:
+        client = TestClient(self.app)
+
+        lifecycle_response = client.get(
+            '/trading/orders/lifecycle',
+            params={'account_reference': 'KIS:12345678-01', 'limit': 20, 'stale_after_minutes': 30},
+        )
+        mismatch_response = client.get(
+            '/trading/orders/mismatches',
+            params={'account_reference': 'KIS:12345678-01', 'symbol': '005930', 'limit': 10},
+        )
+        stale_response = client.get(
+            '/trading/orders/stale-pending',
+            params={'account_reference': 'KIS:12345678-01', 'limit': 10},
+        )
+        timeline_response = client.get(
+            '/trading/orders/ROUTE-ORDER-1/timeline',
+            params={'account_reference': 'KIS:12345678-01', 'refresh': 'true'},
+        )
+        realtime_response = client.get('/trading/orders/realtime-health')
+
+        self.assertEqual(lifecycle_response.status_code, 200)
+        self.assertEqual(lifecycle_response.json()['summary']['today_orders'], 1)
+        self.assertEqual(mismatch_response.status_code, 200)
+        self.assertEqual(mismatch_response.json()['items'][0]['client_order_id'], 'MISMATCH-ORDER-1')
+        self.assertEqual(stale_response.status_code, 200)
+        self.assertEqual(stale_response.json()['items'][0]['client_order_id'], 'STALE-ORDER-1')
+        self.assertEqual(timeline_response.status_code, 200)
+        self.assertEqual(timeline_response.json()['timeline']['count'], 2)
+        self.assertEqual(realtime_response.status_code, 200)
+        self.assertTrue(realtime_response.json()['summary']['healthy'])
+        self.assertEqual(self.monitoring_service.lifecycle_calls[0]['stale_after_minutes'], 30)
+        self.assertEqual(self.monitoring_service.timeline_calls[0]['refresh'], True)
+        self.assertEqual(self.monitoring_service.realtime_health_calls, 1)
 
 
 if __name__ == '__main__':
