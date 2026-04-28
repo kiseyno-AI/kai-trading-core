@@ -694,21 +694,89 @@ async def list_agent_feedback(
 
 @router.get('/signal-decider/decisions')
 async def list_signal_decider_decisions(
-    market_date: date = Query(...),
+    market_date: date | None = Query(default=None),
+    market_date_from: date | None = Query(default=None),
+    market_date_to: date | None = Query(default=None),
     symbol: str | None = Query(default=None),
+    action: str | None = Query(default=None),
+    policy_version: str | None = Query(default=None),
+    verdict: str | None = Query(default=None),
+    has_missed_opportunity: bool | None = Query(default=None),
+    horizons: list[int] | None = Query(default=None),
+    evaluation_version: str | None = Query(default=None),
     limit: int = Query(default=50, ge=1, le=200),
 ) -> dict:
     try:
         return await run_in_threadpool(
             signal_decider_loop_service.list_decisions,
             market_date=market_date,
+            market_date_from=market_date_from,
+            market_date_to=market_date_to,
             symbol=symbol,
+            action=action,
+            policy_version=policy_version,
+            verdict=verdict,
+            has_missed_opportunity=has_missed_opportunity,
+            horizons=horizons,
+            evaluation_version=evaluation_version,
             limit=limit,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f'Signal-decider decision read failed: {exc}') from exc
+
+
+@router.get('/signal-decider/decisions/{snapshot_id}')
+async def get_signal_decider_decision_detail(
+    snapshot_id: int,
+    horizons: list[int] | None = Query(default=None),
+    evaluation_version: str | None = Query(default=None),
+) -> dict:
+    try:
+        return await run_in_threadpool(
+            signal_decider_loop_service.get_decision_detail,
+            snapshot_id=snapshot_id,
+            horizons=horizons,
+            evaluation_version=evaluation_version,
+        )
+    except ValueError as exc:
+        if 'was not found' in str(exc):
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'Signal-decider decision detail read failed: {exc}') from exc
+
+
+@router.get('/signal-decider/diagnostics/summary')
+async def get_signal_decider_diagnostics_summary(
+    market_date: date | None = Query(default=None),
+    market_date_from: date | None = Query(default=None),
+    market_date_to: date | None = Query(default=None),
+    symbols: list[str] | None = Query(default=None),
+    action: str | None = Query(default=None),
+    policy_version: str | None = Query(default=None),
+    horizons: list[int] | None = Query(default=None),
+    evaluation_version: str | None = Query(default=None),
+    contributor_limit: int = Query(default=20, ge=1, le=100),
+) -> dict:
+    try:
+        return await run_in_threadpool(
+            signal_decider_loop_service.get_aggregate_diagnostics,
+            market_date=market_date,
+            market_date_from=market_date_from,
+            market_date_to=market_date_to,
+            symbols=symbols,
+            action=action,
+            policy_version=policy_version,
+            horizons=horizons,
+            evaluation_version=evaluation_version,
+            contributor_limit=contributor_limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'Signal-decider diagnostics summary read failed: {exc}') from exc
 
 
 @router.get('/signal-decider/diagnostics')

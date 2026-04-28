@@ -175,6 +175,14 @@ class FakeSignalDeciderLoopRepository:
         self.next_outcome_id = 1
         self.next_evaluation_id = 1
         self.next_candidate_id = 1
+        self.list_decision_snapshots_calls = []
+        self.list_realized_outcomes_calls = []
+        self.list_evaluations_calls = []
+
+    def reset_calls(self):
+        self.list_decision_snapshots_calls = []
+        self.list_realized_outcomes_calls = []
+        self.list_evaluations_calls = []
 
     def list_decision_snapshots(
         self,
@@ -183,8 +191,23 @@ class FakeSignalDeciderLoopRepository:
         market_date_from=None,
         market_date_to=None,
         symbols=None,
+        decision_actions=None,
+        policy_versions=None,
         limit=None,
+        offset=0,
     ):
+        self.list_decision_snapshots_calls.append(
+            {
+                'market_date': market_date,
+                'market_date_from': market_date_from,
+                'market_date_to': market_date_to,
+                'symbols': list(symbols or []),
+                'decision_actions': list(decision_actions or []),
+                'policy_versions': list(policy_versions or []),
+                'limit': limit,
+                'offset': offset,
+            }
+        )
         rows = list(self.snapshot_rows)
         if market_date is not None:
             rows = [row for row in rows if row.market_date == market_date]
@@ -195,10 +218,30 @@ class FakeSignalDeciderLoopRepository:
         normalized_symbols = set(symbols or [])
         if normalized_symbols:
             rows = [row for row in rows if row.symbol in normalized_symbols]
+        normalized_actions = set(decision_actions or [])
+        if normalized_actions:
+            rows = [row for row in rows if row.decision_action in normalized_actions]
+        normalized_policy_versions = set(policy_versions or [])
+        if normalized_policy_versions:
+            rows = [row for row in rows if row.policy_version in normalized_policy_versions]
         rows.sort(key=lambda row: (row.market_date, row.created_at, row.id), reverse=True)
+        if offset:
+            rows = rows[offset:]
         return rows[:limit] if limit is not None else rows
 
+    def get_decision_snapshot(self, *, snapshot_id):
+        for row in self.snapshot_rows:
+            if row.id == snapshot_id:
+                return row
+        return None
+
     def list_realized_outcomes(self, *, decision_snapshot_ids, horizons=None):
+        self.list_realized_outcomes_calls.append(
+            {
+                'decision_snapshot_ids': list(decision_snapshot_ids),
+                'horizons': None if horizons is None else list(horizons),
+            }
+        )
         rows = [
             item
             for item in self.outcomes.values()
@@ -209,6 +252,13 @@ class FakeSignalDeciderLoopRepository:
         return rows
 
     def list_evaluations(self, *, decision_snapshot_ids, horizons=None, evaluation_version=None):
+        self.list_evaluations_calls.append(
+            {
+                'decision_snapshot_ids': list(decision_snapshot_ids),
+                'horizons': None if horizons is None else list(horizons),
+                'evaluation_version': evaluation_version,
+            }
+        )
         rows = [
             item
             for item in self.evaluations.values()
@@ -410,6 +460,291 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
             {'signal_decider_policy_v1', 'signal_decider_policy_v2'},
         )
 
+    def test_list_decisions_filters_by_verdict_and_policy_version(self):
+        repository = FakeSignalDeciderLoopRepository(
+            [
+                _feedback_row(
+                    feedback_id=1,
+                    snapshot_id=101,
+                    market_date='2026-04-23',
+                    symbol='005930',
+                    action='wait',
+                    policy_version='signal_decider_policy_v1',
+                ),
+                _feedback_row(
+                    feedback_id=2,
+                    snapshot_id=102,
+                    market_date='2026-04-23',
+                    symbol='000660',
+                    action='buy',
+                    policy_version='signal_decider_policy_v1',
+                ),
+                _feedback_row(
+                    feedback_id=3,
+                    snapshot_id=103,
+                    market_date='2026-04-22',
+                    symbol='035420',
+                    action='wait',
+                    policy_version='signal_decider_policy_v2',
+                ),
+            ]
+        )
+        service = SignalDeciderLoopService(repository=repository)
+
+        bars_by_symbol = {
+            '005930': [
+                {'trade_date': '2026-04-23', 'open_price': 100, 'high_price': 101, 'low_price': 99, 'close_price': 100, 'volume': 1000},
+                {'trade_date': '2026-04-24', 'open_price': 100, 'high_price': 103, 'low_price': 99, 'close_price': 102, 'volume': 1000},
+                {'trade_date': '2026-04-25', 'open_price': 102, 'high_price': 106, 'low_price': 101, 'close_price': 105, 'volume': 1000},
+                {'trade_date': '2026-04-26', 'open_price': 105, 'high_price': 108, 'low_price': 104, 'close_price': 107, 'volume': 1000},
+                {'trade_date': '2026-04-27', 'open_price': 107, 'high_price': 109, 'low_price': 106, 'close_price': 108, 'volume': 1000},
+                {'trade_date': '2026-04-28', 'open_price': 108, 'high_price': 111, 'low_price': 107, 'close_price': 110, 'volume': 1000},
+            ],
+            '000660': [
+                {'trade_date': '2026-04-23', 'open_price': 100, 'high_price': 101, 'low_price': 99, 'close_price': 100, 'volume': 1000},
+                {'trade_date': '2026-04-24', 'open_price': 100, 'high_price': 101, 'low_price': 97, 'close_price': 98, 'volume': 1000},
+                {'trade_date': '2026-04-25', 'open_price': 98, 'high_price': 99, 'low_price': 94, 'close_price': 95, 'volume': 1000},
+                {'trade_date': '2026-04-26', 'open_price': 95, 'high_price': 96, 'low_price': 93, 'close_price': 94, 'volume': 1000},
+                {'trade_date': '2026-04-27', 'open_price': 94, 'high_price': 95, 'low_price': 92, 'close_price': 93, 'volume': 1000},
+                {'trade_date': '2026-04-28', 'open_price': 93, 'high_price': 94, 'low_price': 91, 'close_price': 92, 'volume': 1000},
+            ],
+            '035420': [
+                {'trade_date': '2026-04-22', 'open_price': 80, 'high_price': 81, 'low_price': 79, 'close_price': 80, 'volume': 1000},
+                {'trade_date': '2026-04-23', 'open_price': 80, 'high_price': 83, 'low_price': 79, 'close_price': 82, 'volume': 1000},
+                {'trade_date': '2026-04-24', 'open_price': 82, 'high_price': 86, 'low_price': 81, 'close_price': 85, 'volume': 1000},
+                {'trade_date': '2026-04-25', 'open_price': 85, 'high_price': 87, 'low_price': 84, 'close_price': 86, 'volume': 1000},
+                {'trade_date': '2026-04-26', 'open_price': 86, 'high_price': 89, 'low_price': 85, 'close_price': 88, 'volume': 1000},
+                {'trade_date': '2026-04-27', 'open_price': 88, 'high_price': 91, 'low_price': 87, 'close_price': 90, 'volume': 1000},
+            ],
+        }
+
+        with patch(
+            'app.agent_context.signal_decider_loop_service.load_daily_bars_for_symbol_range',
+            side_effect=lambda symbol, **kwargs: bars_by_symbol[symbol],
+        ):
+            service.compute_evaluations(
+                market_date_from='2026-04-22',
+                market_date_to='2026-04-23',
+                horizons=[5],
+                evaluation_version='signal_decider_eval_test',
+            )
+
+        result = service.list_decisions(
+            market_date_from='2026-04-22',
+            market_date_to='2026-04-23',
+            action='wait',
+            policy_version='signal_decider_policy_v1',
+            verdict='missed_opportunity_after_wait',
+            has_missed_opportunity=True,
+            horizons=[5],
+            evaluation_version='signal_decider_eval_test',
+            limit=20,
+        )
+
+        self.assertEqual(result['summary']['count'], 1)
+        self.assertEqual(result['items'][0]['snapshot_id'], 101)
+        self.assertEqual(result['items'][0]['evaluation_summary']['latest_graded']['grade_label'], 'missed_opportunity_after_wait')
+        self.assertTrue(result['items'][0]['evaluation_summary']['has_missed_opportunity'])
+        self.assertEqual(result['request']['policy_version'], 'signal_decider_policy_v1')
+        self.assertEqual(result['summary']['verdict_counts'], {'missed_opportunity_after_wait': 1})
+
+    def test_list_decisions_applies_limit_before_loading_evaluations(self):
+        repository = FakeSignalDeciderLoopRepository(
+            [
+                _feedback_row(feedback_id=1, snapshot_id=101, market_date='2026-04-21', symbol='005930', action='wait'),
+                _feedback_row(feedback_id=2, snapshot_id=102, market_date='2026-04-22', symbol='000660', action='buy'),
+                _feedback_row(feedback_id=3, snapshot_id=103, market_date='2026-04-23', symbol='035420', action='reject'),
+            ]
+        )
+        service = SignalDeciderLoopService(repository=repository)
+
+        result = service.list_decisions(
+            market_date_from='2026-04-21',
+            market_date_to='2026-04-23',
+            limit=1,
+        )
+
+        self.assertEqual(result['summary']['count'], 1)
+        self.assertEqual([item['snapshot_id'] for item in result['items']], [103])
+        self.assertEqual(len(repository.list_decision_snapshots_calls), 1)
+        self.assertEqual(repository.list_decision_snapshots_calls[0]['limit'], 1)
+        self.assertEqual(repository.list_decision_snapshots_calls[0]['offset'], 0)
+        self.assertEqual(len(repository.list_evaluations_calls), 1)
+        self.assertEqual(repository.list_evaluations_calls[0]['decision_snapshot_ids'], [103])
+
+    def test_list_decisions_pages_snapshot_batches_when_filtered_matches_are_later(self):
+        repository = FakeSignalDeciderLoopRepository(
+            [
+                _feedback_row(
+                    feedback_id=1,
+                    snapshot_id=101,
+                    market_date='2026-04-23',
+                    symbol='005930',
+                    action='wait',
+                    policy_version='signal_decider_policy_v1',
+                ),
+                _feedback_row(
+                    feedback_id=2,
+                    snapshot_id=102,
+                    market_date='2026-04-23',
+                    symbol='000660',
+                    action='buy',
+                    policy_version='signal_decider_policy_v1',
+                ),
+            ]
+        )
+        service = SignalDeciderLoopService(repository=repository)
+
+        bars_by_symbol = {
+            '005930': [
+                {'trade_date': '2026-04-23', 'open_price': 100, 'high_price': 101, 'low_price': 99, 'close_price': 100, 'volume': 1000},
+                {'trade_date': '2026-04-24', 'open_price': 100, 'high_price': 103, 'low_price': 99, 'close_price': 102, 'volume': 1000},
+                {'trade_date': '2026-04-25', 'open_price': 102, 'high_price': 106, 'low_price': 101, 'close_price': 105, 'volume': 1000},
+                {'trade_date': '2026-04-26', 'open_price': 105, 'high_price': 108, 'low_price': 104, 'close_price': 107, 'volume': 1000},
+                {'trade_date': '2026-04-27', 'open_price': 107, 'high_price': 109, 'low_price': 106, 'close_price': 108, 'volume': 1000},
+                {'trade_date': '2026-04-28', 'open_price': 108, 'high_price': 111, 'low_price': 107, 'close_price': 110, 'volume': 1000},
+            ],
+            '000660': [
+                {'trade_date': '2026-04-23', 'open_price': 100, 'high_price': 101, 'low_price': 99, 'close_price': 100, 'volume': 1000},
+                {'trade_date': '2026-04-24', 'open_price': 100, 'high_price': 101, 'low_price': 97, 'close_price': 98, 'volume': 1000},
+                {'trade_date': '2026-04-25', 'open_price': 98, 'high_price': 99, 'low_price': 94, 'close_price': 95, 'volume': 1000},
+                {'trade_date': '2026-04-26', 'open_price': 95, 'high_price': 96, 'low_price': 93, 'close_price': 94, 'volume': 1000},
+                {'trade_date': '2026-04-27', 'open_price': 94, 'high_price': 95, 'low_price': 92, 'close_price': 93, 'volume': 1000},
+                {'trade_date': '2026-04-28', 'open_price': 93, 'high_price': 94, 'low_price': 91, 'close_price': 92, 'volume': 1000},
+            ],
+        }
+
+        with patch(
+            'app.agent_context.signal_decider_loop_service.load_daily_bars_for_symbol_range',
+            side_effect=lambda symbol, **kwargs: bars_by_symbol[symbol],
+        ):
+            service.compute_evaluations(
+                market_date_from='2026-04-23',
+                market_date_to='2026-04-23',
+                horizons=[5],
+                evaluation_version='signal_decider_eval_test',
+            )
+
+        repository.reset_calls()
+
+        result = service.list_decisions(
+            market_date='2026-04-23',
+            verdict='missed_opportunity_after_wait',
+            has_missed_opportunity=True,
+            horizons=[5],
+            evaluation_version='signal_decider_eval_test',
+            limit=1,
+        )
+
+        self.assertEqual(result['summary']['count'], 1)
+        self.assertEqual(result['items'][0]['snapshot_id'], 101)
+        self.assertEqual(
+            [call['offset'] for call in repository.list_decision_snapshots_calls],
+            [0, 1],
+        )
+        self.assertEqual(
+            [call['decision_snapshot_ids'] for call in repository.list_evaluations_calls],
+            [[102], [101]],
+        )
+
+    def test_get_decision_detail_returns_explanation_and_evaluations(self):
+        repository = FakeSignalDeciderLoopRepository(
+            [_feedback_row(feedback_id=41, snapshot_id=101, market_date='2026-04-23', symbol='005930', action='buy')]
+        )
+        service = SignalDeciderLoopService(repository=repository)
+
+        bars = [
+            {'trade_date': '2026-04-23', 'open_price': 98, 'high_price': 99, 'low_price': 97, 'close_price': 98, 'volume': 1000},
+            {'trade_date': '2026-04-24', 'open_price': 100, 'high_price': 104, 'low_price': 99, 'close_price': 103, 'volume': 1000},
+            {'trade_date': '2026-04-25', 'open_price': 103, 'high_price': 106, 'low_price': 102, 'close_price': 105, 'volume': 1000},
+            {'trade_date': '2026-04-26', 'open_price': 105, 'high_price': 108, 'low_price': 104, 'close_price': 107, 'volume': 1000},
+            {'trade_date': '2026-04-27', 'open_price': 107, 'high_price': 109, 'low_price': 106, 'close_price': 108, 'volume': 1000},
+            {'trade_date': '2026-04-28', 'open_price': 108, 'high_price': 112, 'low_price': 107, 'close_price': 111, 'volume': 1000},
+        ]
+
+        with patch(
+            'app.agent_context.signal_decider_loop_service.load_daily_bars_for_symbol_range',
+            return_value=bars,
+        ):
+            service.compute_evaluations(
+                market_date_from='2026-04-23',
+                market_date_to='2026-04-23',
+                horizons=[5],
+                evaluation_version='signal_decider_eval_test',
+            )
+
+        result = service.get_decision_detail(
+            snapshot_id=101,
+            horizons=[5],
+            evaluation_version='signal_decider_eval_test',
+        )
+
+        self.assertEqual(result['item']['snapshot_id'], 101)
+        self.assertEqual(result['item']['explanation']['decision_action'], 'buy')
+        self.assertEqual(result['item']['explanation']['feature_flags'][0]['key'], 'technical.breakout_20d')
+        self.assertEqual(result['item']['evaluation_summary']['latest_graded']['grade_label'], 'good_buy')
+        self.assertEqual(result['item']['outcomes'][0]['horizon_days'], 5)
+        self.assertEqual(result['item']['evaluations'][0]['horizon_days'], 5)
+
+    def test_get_diagnostics_batches_outcomes_and_evaluations(self):
+        repository = FakeSignalDeciderLoopRepository(
+            [
+                _feedback_row(feedback_id=1, snapshot_id=101, market_date='2026-04-20', symbol='005930', action='buy'),
+                _feedback_row(feedback_id=2, snapshot_id=102, market_date='2026-04-20', symbol='000660', action='wait'),
+            ]
+        )
+        service = SignalDeciderLoopService(repository=repository)
+
+        bars_by_symbol = {
+            '005930': [
+                {'trade_date': '2026-04-20', 'open_price': 98, 'high_price': 99, 'low_price': 97, 'close_price': 98, 'volume': 1000},
+                {'trade_date': '2026-04-21', 'open_price': 100, 'high_price': 104, 'low_price': 99, 'close_price': 103, 'volume': 1000},
+                {'trade_date': '2026-04-22', 'open_price': 103, 'high_price': 106, 'low_price': 102, 'close_price': 105, 'volume': 1000},
+                {'trade_date': '2026-04-23', 'open_price': 105, 'high_price': 108, 'low_price': 104, 'close_price': 107, 'volume': 1000},
+                {'trade_date': '2026-04-24', 'open_price': 107, 'high_price': 109, 'low_price': 106, 'close_price': 108, 'volume': 1000},
+                {'trade_date': '2026-04-27', 'open_price': 108, 'high_price': 112, 'low_price': 107, 'close_price': 111, 'volume': 1000},
+            ],
+            '000660': [
+                {'trade_date': '2026-04-20', 'open_price': 48, 'high_price': 49, 'low_price': 47, 'close_price': 48, 'volume': 900},
+                {'trade_date': '2026-04-21', 'open_price': 50, 'high_price': 53, 'low_price': 49, 'close_price': 52, 'volume': 900},
+                {'trade_date': '2026-04-22', 'open_price': 52, 'high_price': 54, 'low_price': 51, 'close_price': 53, 'volume': 900},
+                {'trade_date': '2026-04-23', 'open_price': 53, 'high_price': 55, 'low_price': 52, 'close_price': 54, 'volume': 900},
+                {'trade_date': '2026-04-24', 'open_price': 54, 'high_price': 56, 'low_price': 53, 'close_price': 55, 'volume': 900},
+                {'trade_date': '2026-04-27', 'open_price': 55, 'high_price': 58, 'low_price': 54, 'close_price': 57, 'volume': 900},
+            ],
+        }
+
+        with patch(
+            'app.agent_context.signal_decider_loop_service.load_daily_bars_for_symbol_range',
+            side_effect=lambda symbol, **kwargs: bars_by_symbol[symbol],
+        ):
+            service.compute_evaluations(
+                market_date_from='2026-04-20',
+                market_date_to='2026-04-20',
+                horizons=[5],
+                evaluation_version='signal_decider_eval_test',
+            )
+
+        repository.reset_calls()
+
+        result = service.get_diagnostics(
+            market_date='2026-04-20',
+            evaluation_version='signal_decider_eval_test',
+            limit=20,
+        )
+
+        self.assertEqual(result['summary']['count'], 2)
+        self.assertEqual(len(repository.list_realized_outcomes_calls), 1)
+        self.assertEqual(len(repository.list_evaluations_calls), 1)
+        self.assertEqual(
+            repository.list_realized_outcomes_calls[0]['decision_snapshot_ids'],
+            [102, 101],
+        )
+        self.assertEqual(
+            repository.list_evaluations_calls[0]['decision_snapshot_ids'],
+            [102, 101],
+        )
+
     def test_compute_evaluations_grades_buy_and_wait_across_horizons(self):
         repository = FakeSignalDeciderLoopRepository(
             [
@@ -596,6 +931,60 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
         self.assertEqual(compute.call_args.kwargs['symbols'], ['005930'])
         self.assertEqual(result['request']['lookback_days'], DEFAULT_SIGNAL_DECIDER_EVALUATION_LOOKBACK_DAYS)
         self.assertEqual(result['request']['as_of_market_date'], '2026-04-30')
+
+    def test_get_aggregate_diagnostics_summarizes_horizon_metrics_and_contributors(self):
+        repository = FakeSignalDeciderLoopRepository(
+            [
+                _feedback_row(feedback_id=1, snapshot_id=101, market_date='2026-04-20', symbol='005930', action='buy'),
+                _feedback_row(feedback_id=2, snapshot_id=102, market_date='2026-04-20', symbol='000660', action='wait'),
+            ]
+        )
+        service = SignalDeciderLoopService(repository=repository)
+
+        bars_by_symbol = {
+            '005930': [
+                {'trade_date': '2026-04-20', 'open_price': 98, 'high_price': 99, 'low_price': 97, 'close_price': 98, 'volume': 1000},
+                {'trade_date': '2026-04-21', 'open_price': 100, 'high_price': 104, 'low_price': 99, 'close_price': 103, 'volume': 1000},
+                {'trade_date': '2026-04-22', 'open_price': 103, 'high_price': 106, 'low_price': 102, 'close_price': 105, 'volume': 1000},
+                {'trade_date': '2026-04-23', 'open_price': 105, 'high_price': 108, 'low_price': 104, 'close_price': 107, 'volume': 1000},
+                {'trade_date': '2026-04-24', 'open_price': 107, 'high_price': 109, 'low_price': 106, 'close_price': 108, 'volume': 1000},
+                {'trade_date': '2026-04-27', 'open_price': 108, 'high_price': 112, 'low_price': 107, 'close_price': 111, 'volume': 1000},
+            ],
+            '000660': [
+                {'trade_date': '2026-04-20', 'open_price': 48, 'high_price': 49, 'low_price': 47, 'close_price': 48, 'volume': 900},
+                {'trade_date': '2026-04-21', 'open_price': 50, 'high_price': 53, 'low_price': 49, 'close_price': 52, 'volume': 900},
+                {'trade_date': '2026-04-22', 'open_price': 52, 'high_price': 54, 'low_price': 51, 'close_price': 53, 'volume': 900},
+                {'trade_date': '2026-04-23', 'open_price': 53, 'high_price': 55, 'low_price': 52, 'close_price': 54, 'volume': 900},
+                {'trade_date': '2026-04-24', 'open_price': 54, 'high_price': 56, 'low_price': 53, 'close_price': 55, 'volume': 900},
+                {'trade_date': '2026-04-27', 'open_price': 55, 'high_price': 58, 'low_price': 54, 'close_price': 57, 'volume': 900},
+            ],
+        }
+
+        with patch(
+            'app.agent_context.signal_decider_loop_service.load_daily_bars_for_symbol_range',
+            side_effect=lambda symbol, **kwargs: bars_by_symbol[symbol],
+        ):
+            service.compute_evaluations(
+                market_date_from='2026-04-20',
+                market_date_to='2026-04-20',
+                horizons=[5],
+                evaluation_version='signal_decider_eval_test',
+            )
+
+        result = service.get_aggregate_diagnostics(
+            market_date='2026-04-20',
+            horizons=[5],
+            evaluation_version='signal_decider_eval_test',
+            contributor_limit=10,
+        )
+
+        self.assertEqual(result['summary']['decision_count'], 2)
+        self.assertEqual(result['summary']['evaluation_count'], 2)
+        self.assertEqual(result['aggregates']['by_horizon'][0]['horizon_days'], 5)
+        self.assertEqual(result['aggregates']['by_horizon'][0]['buy_precision'], 1.0)
+        self.assertEqual(result['aggregates']['by_horizon'][0]['wait_missed_opportunity_rate'], 1.0)
+        self.assertEqual(result['contributors']['factors'][0]['key'], 'technical.breakout_20d')
+        self.assertGreaterEqual(result['contributors']['factors'][0]['negative_outcome_count'], 1)
 
     def test_generate_policy_candidates_builds_manual_relax_wait_candidates(self):
         repository = FakeSignalDeciderLoopRepository(
