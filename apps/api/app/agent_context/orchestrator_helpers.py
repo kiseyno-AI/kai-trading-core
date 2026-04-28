@@ -7,6 +7,7 @@ from datetime import date, datetime, timezone
 from typing import Any, Sequence
 
 from fastapi.encoders import jsonable_encoder
+from app.agent_context.signal_decider_loop_service import DEFAULT_SIGNAL_DECIDER_POLICY_VERSION
 
 ABORTLIKE_ERROR_MARKERS = (
     'this operation was aborted',
@@ -554,6 +555,11 @@ def build_signal_decider_payload(
             'allow_position_sizing': False,
             'allow_leverage_guidance': False,
             'avoid_fake_precision': True,
+        },
+        'signal_decider_policy': {
+            'current_version': DEFAULT_SIGNAL_DECIDER_POLICY_VERSION,
+            'activation_mode': 'manual_only',
+            'candidate_activation_required': True,
         },
         'output_contract': {
             'batch_envelope_required': True,

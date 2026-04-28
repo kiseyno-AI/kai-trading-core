@@ -9,6 +9,7 @@ from sqlalchemy.orm import Query
 
 from app.db import session_scope
 from app.db_models import AgentContextFeedback
+from app.agent_context.signal_decider_loop_service import signal_decider_loop_service
 
 BULK_UPSERT_CHUNK_SIZE = 100
 
@@ -388,8 +389,14 @@ class AgentContextFeedbackRepository:
 
 
 class AgentContextFeedbackService:
-    def __init__(self, *, repository: AgentContextFeedbackRepository | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        repository: AgentContextFeedbackRepository | None = None,
+        decision_loop_service=None,
+    ) -> None:
         self.repository = repository or AgentContextFeedbackRepository()
+        self.decision_loop_service = decision_loop_service or signal_decider_loop_service
 
     def _normalize_feedback_item(
         self,
@@ -408,6 +415,12 @@ class AgentContextFeedbackService:
         context_payload = _normalize_json_object(context, field_name='context') if context is not None else None
         if not summary_payload and not feedback_payload:
             raise ValueError('Either summary or feedback must be provided')
+        summary_payload, feedback_payload, context_payload = self.decision_loop_service.prepare_feedback_persistence(
+            agent_name=_normalize_agent_name(agent_name),
+            summary_payload=summary_payload,
+            feedback_payload=feedback_payload,
+            context_payload=context_payload,
+        )
         details_payload = feedback_payload.get('details') if isinstance(feedback_payload.get('details'), dict) else {}
         return {
             'market_date': _normalize_market_date(market_date),

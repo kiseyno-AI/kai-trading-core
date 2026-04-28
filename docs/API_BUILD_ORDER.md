@@ -31,7 +31,8 @@
 28. Daily beta factor compute/read routes
 29. Daily advanced value factor compute/read routes
 30. Daily composite factor compute/read routes
-31. Internal trading order control, inquiry, and reconciliation routes
+31. Signal-decider evaluation, diagnostics, and policy-candidate routes
+32. Internal trading order control, inquiry, and reconciliation routes
 
 ## Current routes
 - `POST /broker/kis/token`
@@ -128,6 +129,12 @@
 - `GET /agent-context/feedback/requests?market_date=YYYY-MM-DD&symbols=005930`
 - `GET /agent-context/feedback/status?market_date=YYYY-MM-DD&symbols=005930&symbols=000660`
 - `GET /agent-context/feedback/progress?market_date=YYYY-MM-DD&run_id=symbol-run-...`
+- `GET /agent-context/signal-decider/decisions?market_date=YYYY-MM-DD&symbol=005930&limit=50`
+- `GET /agent-context/signal-decider/diagnostics?market_date=YYYY-MM-DD&symbol=005930&evaluation_version=signal_decider_eval_v1`
+- `POST /agent-context/signal-decider/evaluations/compute`
+- `GET /agent-context/signal-decider/evaluations?market_date=YYYY-MM-DD&symbol=005930&horizons=1&horizons=5`
+- `POST /agent-context/signal-decider/policy-candidates/generate`
+- `GET /agent-context/signal-decider/policy-candidates?status=generated&evaluation_version=signal_decider_eval_v1`
 
 ## Trading order adapter notes
 - `POST /trading/orders/buy` and `POST /trading/orders/sell` are the internal order-control submit routes for the first KIS domestic cash adapter.
@@ -264,7 +271,15 @@
 - The `signal-decider` request payload preserves the full normalized outputs from the three specialist summarizers under one symbol/day request, along with orchestration and traceability metadata, so the decider can synthesize evidence, disagreement, and data-quality warnings without flattening upstream structure away.
 - Dispatch requires `OPENCLAW_BASE_URL` and `OPENCLAW_GATEWAY_TOKEN` configuration, retries retryable failures, and persists successful responses into `agent_context_feedback` as either market-level rows with symbol `__MARKET__` or symbol-level rows for symbol dispatch.
 - Stored normalized feedback now includes a shared compatibility contract: `role`, `summary`, `confidence`, `risk_flags`, `details`, and `improvement_notes`. The `signal-decider` rows add a richer next-trading-day decision-support object with `next_day_open_action`, price-basis or target or stop fields, confidence or conviction scores, thesis or evidence or risk fields, disagreement notes, and traceability.
-- The stored request/context payload for `signal-decider` now captures what the decider saw, including symbol-day context, full upstream summarizer outputs, request model metadata, and orchestration metadata; the stored response payload keeps the normalized decision-support object plus raw response metadata when available for later audit.
+- The stored request/context payload for `signal-decider` now captures what the decider saw, including symbol-day context, full upstream summarizer outputs, request model metadata, orchestration metadata, the current policy version, and a compact feature snapshot for later evaluation.
+- `GET /agent-context/signal-decider/decisions` is the compact persisted decision read. It returns the stored action, target or stop fields, evidence and risk arrays, traceability, policy version, and compact feature snapshot for the requested `market_date`.
+- `GET /agent-context/signal-decider/diagnostics` is the deeper traceability read for one date or symbol slice. It adds the stored request payload, normalized response payload, upstream summarizer bundle, realized outcomes, and versioned evaluation rows for later audit and missed-opportunity analysis.
+- `POST /agent-context/signal-decider/evaluations/compute` computes or refreshes raw realized outcomes and versioned grading rows from stored `daily_price_bars`. The current raw outcome horizons are 1, 3, 5, and 10 trading days measured from the next available open after the decision date.
+- Raw realized outcomes now live in `signal_decider_realized_outcomes`, separate from the decision snapshot and separate from grading. Each row stores the observed entry or exit dates, close return, max upside, max drawdown, target or stop touches, and the compact price path used for evaluation.
+- Versioned grading now lives in `signal_decider_evaluations`, keyed by decision, horizon, and `evaluation_version`. The current deterministic labels are `good_buy`, `bad_buy`, `missed_opportunity_after_wait`, `correct_wait`, `missed_opportunity_after_reject`, `correct_reject`, plus `pending_horizon` when the full horizon is not available yet.
+- `GET /agent-context/signal-decider/evaluations` reads the persisted outcome-plus-grade bundle back per stored decision for the requested `market_date`, optional symbol, and optional horizon subset.
+- `POST /agent-context/signal-decider/policy-candidates/generate` automatically refreshes the requested evaluation horizon slice, scans the accumulated graded evidence, and stores manual-only policy candidates in `signal_decider_policy_candidates`.
+- `GET /agent-context/signal-decider/policy-candidates` reads the generated candidates. Candidate generation is automatic, but activation is intentionally manual-only: the stored rows carry `activation_mode=manual_only`, and this repo does not auto-promote or auto-activate them.
 - Feedback is append-only and stored separately from deterministic `daily_action_summaries`; it does not create orders, positions, or live-trading behavior.
 - `GET /agent-context/feedback` reads stored feedback for a requested `market_date`, optionally filtered by symbol and `agent_name`, so operators or later jobs can inspect the summaries Core received.
 - `GET /agent-context/feedback/technical-summaries` is the bounded persisted read for the `technical-summarizer` role. `market_date` is required, `symbol` is optional, and `limit` bounds the returned stored rows for that date.

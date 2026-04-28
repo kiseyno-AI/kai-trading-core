@@ -902,6 +902,132 @@ class AgentContextFeedback(Base, TimestampMixin):
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
 
 
+class SignalDeciderRealizedOutcome(Base, TimestampMixin):
+    __tablename__ = 'signal_decider_realized_outcomes'
+    __table_args__ = (
+        UniqueConstraint('feedback_id', 'horizon_days', name='uq_signal_decider_realized_outcomes_feedback_horizon'),
+        Index(
+            'ix_signal_decider_realized_outcomes_market_symbol_horizon',
+            'market_date',
+            'symbol',
+            'horizon_days',
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    feedback_id: Mapped[int] = mapped_column(
+        ForeignKey('agent_context_feedback.id', ondelete='CASCADE'),
+        nullable=False,
+        index=True,
+    )
+    market_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    symbol: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    policy_version: Mapped[str] = mapped_column(String(64), nullable=False, default='signal_decider_policy_v1', index=True)
+    decision_action: Mapped[str] = mapped_column(String(16), nullable=False, default='wait', index=True)
+    horizon_days: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    outcome_status: Mapped[str] = mapped_column(String(32), nullable=False, default='pending', index=True)
+    entry_trade_date: Mapped[date | None] = mapped_column(Date, index=True)
+    exit_trade_date: Mapped[date | None] = mapped_column(Date, index=True)
+    bars_observed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    entry_price: Mapped[int | None] = mapped_column(BigInteger)
+    exit_price: Mapped[int | None] = mapped_column(BigInteger)
+    max_high_price: Mapped[int | None] = mapped_column(BigInteger)
+    min_low_price: Mapped[int | None] = mapped_column(BigInteger)
+    close_return_pct: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    max_upside_return_pct: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    max_drawdown_return_pct: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    target_price: Mapped[int | None] = mapped_column(BigInteger)
+    stop_loss_price: Mapped[int | None] = mapped_column(BigInteger)
+    expected_return_pct: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    target_hit: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    stop_loss_hit: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    target_stop_collision: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    price_path_payload: Mapped[list | dict | None] = mapped_column(JSON)
+    diagnostics_payload: Mapped[dict | None] = mapped_column(JSON)
+    computed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class SignalDeciderEvaluation(Base, TimestampMixin):
+    __tablename__ = 'signal_decider_evaluations'
+    __table_args__ = (
+        UniqueConstraint(
+            'feedback_id',
+            'horizon_days',
+            'evaluation_version',
+            name='uq_signal_decider_evaluations_feedback_horizon_version',
+        ),
+        Index(
+            'ix_signal_decider_evaluations_market_symbol_horizon_version',
+            'market_date',
+            'symbol',
+            'horizon_days',
+            'evaluation_version',
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    feedback_id: Mapped[int] = mapped_column(
+        ForeignKey('agent_context_feedback.id', ondelete='CASCADE'),
+        nullable=False,
+        index=True,
+    )
+    realized_outcome_id: Mapped[int | None] = mapped_column(
+        ForeignKey('signal_decider_realized_outcomes.id', ondelete='SET NULL'),
+        index=True,
+    )
+    market_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    symbol: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    policy_version: Mapped[str] = mapped_column(String(64), nullable=False, default='signal_decider_policy_v1', index=True)
+    decision_action: Mapped[str] = mapped_column(String(16), nullable=False, default='wait', index=True)
+    horizon_days: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    evaluation_version: Mapped[str] = mapped_column(String(64), nullable=False, default='signal_decider_eval_v1', index=True)
+    evaluation_status: Mapped[str] = mapped_column(String(32), nullable=False, default='pending', index=True)
+    grade_label: Mapped[str] = mapped_column(String(64), nullable=False, default='pending_horizon', index=True)
+    grade_score: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    missed_opportunity: Mapped[bool | None] = mapped_column(Boolean)
+    counterfactual_action: Mapped[str | None] = mapped_column(String(16))
+    rationale_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    diagnostics_payload: Mapped[dict | None] = mapped_column(JSON)
+    evaluated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class SignalDeciderPolicyCandidate(Base, TimestampMixin):
+    __tablename__ = 'signal_decider_policy_candidates'
+    __table_args__ = (
+        UniqueConstraint('candidate_version', name='uq_signal_decider_policy_candidates_version'),
+        Index(
+            'ix_signal_decider_policy_candidates_policy_status_generated',
+            'base_policy_version',
+            'status',
+            'generated_at',
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    candidate_version: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    base_policy_version: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    evaluation_version: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    market_date_from: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    market_date_to: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    horizon_days: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    focus_action: Mapped[str | None] = mapped_column(String(16), index=True)
+    candidate_kind: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    feature_key: Mapped[str | None] = mapped_column(String(128), index=True)
+    feature_value: Mapped[str | None] = mapped_column(String(128), index=True)
+    affected_decisions_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    support_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    contradiction_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    support_ratio: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default='generated', index=True)
+    activation_mode: Mapped[str] = mapped_column(String(32), nullable=False, default='manual_only')
+    summary: Mapped[str] = mapped_column(Text, nullable=False)
+    hypothesis: Mapped[str] = mapped_column(Text, nullable=False)
+    evidence_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    recommendation_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    generated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+    activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+
+
 class AgentContextFeedbackFailure(Base, TimestampMixin):
     __tablename__ = 'agent_context_feedback_failures'
     __table_args__ = (
