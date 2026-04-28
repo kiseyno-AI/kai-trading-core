@@ -10,6 +10,10 @@ from app.agent_context.derived_contexts import derived_context_backfill_service
 from app.agent_context.orchestrator import agent_feedback_orchestrator
 from app.agent_context.retry_service import EXPECTED_ROLES, FeedbackRetryCycleConfig, agent_feedback_retry_service
 from app.agent_context.session_cleanup_service import agent_feedback_session_cleanup_service
+from app.agent_context.signal_decider_loop_service import (
+    DEFAULT_SIGNAL_DECIDER_EVALUATION_LOOKBACK_DAYS,
+    signal_decider_loop_service,
+)
 from app.core.settings import settings
 from app.dart.fundamentals_capture_service import dart_fundamentals_capture_service
 from app.dart.signals_service import dart_signals_service
@@ -221,6 +225,28 @@ def run_daily_pipeline_stages(
         feedback_max_cycles=feedback_max_cycles,
         feedback_outer_batch_size=feedback_outer_batch_size,
         reuse_existing_feedback=reuse_existing_feedback,
+    )
+
+
+def compute_signal_decider_evaluations(
+    *,
+    market_date: str,
+    lookback_days: int = DEFAULT_SIGNAL_DECIDER_EVALUATION_LOOKBACK_DAYS,
+    symbols: str | None = None,
+    horizons: str | None = None,
+    evaluation_version: str | None = None,
+    force_recompute: bool = False,
+) -> dict[str, Any]:
+    bootstrap_runtime()
+    parsed_symbols = [item.strip() for item in symbols.split(',') if item.strip()] if symbols else None
+    parsed_horizons = [int(item.strip()) for item in horizons.split(',') if item.strip()] if horizons else None
+    return signal_decider_loop_service.compute_recent_evaluations(
+        as_of_market_date=market_date,
+        lookback_days=lookback_days,
+        symbols=parsed_symbols,
+        horizons=parsed_horizons,
+        evaluation_version=evaluation_version,
+        force_recompute=force_recompute,
     )
 
 
@@ -626,6 +652,21 @@ def _build_parser() -> argparse.ArgumentParser:
     feedback_retry_parser.add_argument('--outer-batch-size', type=int, default=20)
     feedback_retry_parser.add_argument('--reuse-existing', choices=('true', 'false'), default='true')
 
+    signal_decider_evaluations_parser = subparsers.add_parser(
+        'agent-signal-decider-evaluations-compute',
+        help='Refresh recent signal-decider realized outcomes and verdict rows directly',
+    )
+    signal_decider_evaluations_parser.add_argument('--market-date', required=True)
+    signal_decider_evaluations_parser.add_argument(
+        '--lookback-days',
+        type=int,
+        default=DEFAULT_SIGNAL_DECIDER_EVALUATION_LOOKBACK_DAYS,
+    )
+    signal_decider_evaluations_parser.add_argument('--symbols')
+    signal_decider_evaluations_parser.add_argument('--horizons')
+    signal_decider_evaluations_parser.add_argument('--evaluation-version')
+    signal_decider_evaluations_parser.add_argument('--force-recompute', action='store_true')
+
     feedback_smoke_parser = subparsers.add_parser(
         'agent-feedback-symbol-cleanup-smoke',
         help='Dispatch symbol feedback, store rows, attempt immediate session deletion, then retry failed deletions once',
@@ -768,6 +809,15 @@ def main(argv: Iterable[str] | None = None) -> int:
             max_cycles=args.max_cycles,
             outer_batch_size=args.outer_batch_size,
             reuse_existing=args.reuse_existing == 'true',
+        )
+    elif args.command == 'agent-signal-decider-evaluations-compute':
+        payload = compute_signal_decider_evaluations(
+            market_date=args.market_date,
+            lookback_days=args.lookback_days,
+            symbols=args.symbols,
+            horizons=args.horizons,
+            evaluation_version=args.evaluation_version,
+            force_recompute=args.force_recompute,
         )
     elif args.command == 'agent-feedback-symbol-cleanup-smoke':
         payload = run_agent_feedback_symbol_cleanup_smoke(

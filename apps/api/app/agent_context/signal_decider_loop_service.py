@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 import hashlib
 from typing import Any, Sequence
@@ -23,6 +23,7 @@ from app.market_data_store import load_daily_bars_for_symbol_range
 DEFAULT_SIGNAL_DECIDER_POLICY_VERSION = 'signal_decider_policy_v1'
 DEFAULT_SIGNAL_DECIDER_EVALUATION_VERSION = 'signal_decider_eval_v1'
 DEFAULT_POLICY_CANDIDATE_STATUS = 'generated'
+DEFAULT_SIGNAL_DECIDER_EVALUATION_LOOKBACK_DAYS = 30
 SIGNAL_DECIDER_EVALUATION_HORIZONS: tuple[int, ...] = (1, 3, 5, 10)
 
 
@@ -31,6 +32,13 @@ class HorizonThreshold:
     good_return_pct: float
     opportunity_return_pct: float
     loss_return_pct: float
+
+
+@dataclass(frozen=True)
+class SignalDeciderEvaluationProfile:
+    requested_version: str
+    rule_set_version: str
+    buy_severe_drawdown_multiplier: float = 1.5
 
 
 HORIZON_THRESHOLDS: dict[int, HorizonThreshold] = {
@@ -470,6 +478,7 @@ def build_signal_decider_traceability_snapshot(
 
 
 def _serialize_outcome_row(row: SignalDeciderRealizedOutcome) -> dict[str, Any]:
+    diagnostics = _maybe_dict(row.diagnostics_payload)
     return {
         'id': row.id,
         'decision_snapshot_id': row.decision_snapshot_id,
@@ -496,8 +505,12 @@ def _serialize_outcome_row(row: SignalDeciderRealizedOutcome) -> dict[str, Any]:
         'target_hit': bool(row.target_hit),
         'stop_loss_hit': bool(row.stop_loss_hit),
         'target_stop_collision': bool(row.target_stop_collision),
+        'best_exit_trade_date': diagnostics.get('best_exit_trade_date'),
+        'worst_drawdown_trade_date': diagnostics.get('worst_drawdown_trade_date'),
+        'first_target_hit_trade_date': diagnostics.get('first_target_hit_trade_date'),
+        'first_stop_loss_hit_trade_date': diagnostics.get('first_stop_loss_hit_trade_date'),
         'price_path': row.price_path_payload,
-        'diagnostics': row.diagnostics_payload,
+        'diagnostics': diagnostics,
         'computed_at': row.computed_at.isoformat() if row.computed_at else None,
     }
 
@@ -1082,6 +1095,7 @@ class SignalDeciderLoopService:
             _normalize_optional_text(evaluation_version, default=DEFAULT_SIGNAL_DECIDER_EVALUATION_VERSION)
             or DEFAULT_SIGNAL_DECIDER_EVALUATION_VERSION
         )
+        evaluation_profile = self._resolve_evaluation_profile(resolved_version)
         rows = self.repository.list_decision_snapshots(
             market_date_from=normalized_from,
             market_date_to=normalized_to,
@@ -1095,6 +1109,7 @@ class SignalDeciderLoopService:
                     'symbols': normalized_symbols,
                     'horizons': normalized_horizons,
                     'evaluation_version': resolved_version,
+                    'evaluation_rule_set_version': evaluation_profile.rule_set_version,
                     'force_recompute': force_recompute,
                 },
                 'summary': {
@@ -1145,6 +1160,7 @@ class SignalDeciderLoopService:
                         outcome=outcome,
                         horizon_days=horizon_days,
                         evaluation_version=resolved_version,
+                        evaluation_profile=evaluation_profile,
                     )
                 )
         persisted_evaluations = self.repository.bulk_upsert_evaluations(items=evaluation_items)
@@ -1171,6 +1187,7 @@ class SignalDeciderLoopService:
                 'symbols': normalized_symbols,
                 'horizons': normalized_horizons,
                 'evaluation_version': resolved_version,
+                'evaluation_rule_set_version': evaluation_profile.rule_set_version,
                 'force_recompute': force_recompute,
             },
             'summary': {
@@ -1182,6 +1199,33 @@ class SignalDeciderLoopService:
             },
             'items': items,
         }
+
+    def compute_recent_evaluations(
+        self,
+        *,
+        as_of_market_date: str | date,
+        lookback_days: int = DEFAULT_SIGNAL_DECIDER_EVALUATION_LOOKBACK_DAYS,
+        symbols: Sequence[str] | None = None,
+        horizons: Sequence[int] | None = None,
+        evaluation_version: str | None = None,
+        force_recompute: bool = False,
+    ) -> dict[str, Any]:
+        normalized_market_date = _normalize_market_date(as_of_market_date)
+        resolved_lookback_days = max(1, int(lookback_days))
+        market_date_from = normalized_market_date - timedelta(days=resolved_lookback_days)
+        result = self.compute_evaluations(
+            market_date_from=market_date_from,
+            market_date_to=normalized_market_date,
+            symbols=symbols,
+            horizons=horizons,
+            evaluation_version=evaluation_version,
+            force_recompute=force_recompute,
+        )
+        request_payload = dict(result.get('request') or {})
+        request_payload['as_of_market_date'] = normalized_market_date.isoformat()
+        request_payload['lookback_days'] = resolved_lookback_days
+        result['request'] = request_payload
+        return result
 
     def list_evaluations(
         self,
@@ -1621,6 +1665,22 @@ class SignalDeciderLoopService:
         exit_price = _to_int(exit_bar.get('close_price'))
         max_high_price = max((_to_int(bar.get('high_price')) or 0) for bar in observed_bars) if observed_bars else None
         min_low_price = min((_to_int(bar.get('low_price')) or 0) for bar in observed_bars) if observed_bars else None
+        best_exit_bar = (
+            max(
+                observed_bars,
+                key=lambda bar: (_to_int(bar.get('high_price')) or 0, str(bar.get('trade_date') or '')),
+            )
+            if observed_bars
+            else None
+        )
+        worst_drawdown_bar = (
+            min(
+                observed_bars,
+                key=lambda bar: (_to_int(bar.get('low_price')) or 10**18, str(bar.get('trade_date') or '')),
+            )
+            if observed_bars
+            else None
+        )
         close_return_pct = self._return_pct(exit_price, entry_price)
         max_upside_return_pct = self._return_pct(max_high_price, entry_price)
         max_drawdown_return_pct = self._return_pct(min_low_price, entry_price)
@@ -1640,6 +1700,10 @@ class SignalDeciderLoopService:
         diagnostics = {
             'entry_trade_date': entry_bar.get('trade_date'),
             'exit_trade_date': exit_bar.get('trade_date'),
+            'best_exit_trade_date': best_exit_bar.get('trade_date') if best_exit_bar else None,
+            'worst_drawdown_trade_date': worst_drawdown_bar.get('trade_date') if worst_drawdown_bar else None,
+            'first_target_hit_trade_date': target_hits[0] if target_hits else None,
+            'first_stop_loss_hit_trade_date': stop_hits[0] if stop_hits else None,
             'observed_trade_dates': [bar.get('trade_date') for bar in observed_bars],
             'target_hit_trade_dates': target_hits,
             'stop_loss_hit_trade_dates': stop_hits,
@@ -1697,16 +1761,52 @@ class SignalDeciderLoopService:
         outcome: dict[str, Any],
         horizon_days: int,
         evaluation_version: str,
+        evaluation_profile: SignalDeciderEvaluationProfile,
     ) -> dict[str, Any]:
         now = self._utcnow()
         decision_fields = _maybe_dict(decision.get('decision'))
         thresholds = HORIZON_THRESHOLDS[horizon_days]
         decision_action = _normalize_action(decision_fields.get('action'))
+        outcome_diagnostics = _maybe_dict(outcome.get('diagnostics'))
         close_return_pct = _to_float(outcome.get('close_return_pct'))
         max_upside_return_pct = _to_float(outcome.get('max_upside_return_pct'))
         max_drawdown_return_pct = _to_float(outcome.get('max_drawdown_return_pct'))
         target_hit = bool(outcome.get('target_hit'))
         stop_loss_hit = bool(outcome.get('stop_loss_hit'))
+        severe_drawdown_limit_pct = round(
+            thresholds.loss_return_pct * evaluation_profile.buy_severe_drawdown_multiplier,
+            6,
+        )
+        price_path = outcome.get('price_path')
+        worst_drawdown_trade_date = _normalize_optional_text(
+            str(outcome_diagnostics.get('worst_drawdown_trade_date'))
+            if outcome_diagnostics.get('worst_drawdown_trade_date') is not None
+            else None
+        )
+        first_target_hit_trade_date = _normalize_optional_text(
+            str(outcome_diagnostics.get('first_target_hit_trade_date'))
+            if outcome_diagnostics.get('first_target_hit_trade_date') is not None
+            else None
+        )
+        first_severe_drawdown_trade_date = self._first_severe_drawdown_trade_date(
+            entry_price=_to_int(outcome.get('entry_price')),
+            price_path=price_path,
+            severe_drawdown_limit_pct=severe_drawdown_limit_pct,
+            first_target_hit_trade_date=first_target_hit_trade_date,
+        )
+        severe_drawdown_before_target = bool(first_severe_drawdown_trade_date)
+        if not isinstance(price_path, list) or not price_path:
+            severe_drawdown_before_target = bool(
+                max_drawdown_return_pct is not None
+                and max_drawdown_return_pct <= -severe_drawdown_limit_pct
+                and (
+                    first_target_hit_trade_date is None
+                    or (
+                        worst_drawdown_trade_date is not None
+                        and worst_drawdown_trade_date <= first_target_hit_trade_date
+                    )
+                )
+            )
         evaluation_status = 'graded'
         grade_label = 'pending_horizon'
         missed_opportunity: bool | None = None
@@ -1719,7 +1819,10 @@ class SignalDeciderLoopService:
             rationale = {
                 'status': 'pending_horizon',
                 'reason': 'insufficient_price_history',
-                'thresholds': self._threshold_payload(horizon_days),
+                'evaluation_profile': self._evaluation_profile_payload(
+                    evaluation_profile=evaluation_profile,
+                    horizon_days=horizon_days,
+                ),
             }
         elif decision_action == 'buy':
             positive_signals = int(target_hit)
@@ -1732,12 +1835,18 @@ class SignalDeciderLoopService:
                 negative_signals += 1
             if max_drawdown_return_pct is not None and max_drawdown_return_pct <= -thresholds.loss_return_pct:
                 negative_signals += 1
-            grade_label = 'good_buy' if positive_signals >= negative_signals else 'bad_buy'
+            if severe_drawdown_before_target:
+                negative_signals += 1
+            if severe_drawdown_before_target:
+                grade_label = 'bad_buy'
+            else:
+                grade_label = 'good_buy' if positive_signals >= negative_signals else 'bad_buy'
             grade_score = self._buy_grade_score(
                 close_return_pct=close_return_pct,
                 max_drawdown_return_pct=max_drawdown_return_pct,
                 target_hit=target_hit,
                 stop_loss_hit=stop_loss_hit,
+                severe_drawdown_before_target=severe_drawdown_before_target,
             )
             rationale = {
                 'status': 'graded',
@@ -1745,7 +1854,11 @@ class SignalDeciderLoopService:
                 'stop_loss_hit': stop_loss_hit,
                 'positive_signals': positive_signals,
                 'negative_signals': negative_signals,
-                'thresholds': self._threshold_payload(horizon_days),
+                'severe_drawdown_before_target': severe_drawdown_before_target,
+                'evaluation_profile': self._evaluation_profile_payload(
+                    evaluation_profile=evaluation_profile,
+                    horizon_days=horizon_days,
+                ),
             }
         else:
             missed = bool(
@@ -1768,15 +1881,25 @@ class SignalDeciderLoopService:
                 'status': 'graded',
                 'missed_opportunity': missed,
                 'counterfactual_action': counterfactual_action,
-                'thresholds': self._threshold_payload(horizon_days),
+                'evaluation_profile': self._evaluation_profile_payload(
+                    evaluation_profile=evaluation_profile,
+                    horizon_days=horizon_days,
+                ),
             }
 
         diagnostics = {
+            'evaluation_rule_set_version': evaluation_profile.rule_set_version,
             'close_return_pct': close_return_pct,
             'max_upside_return_pct': max_upside_return_pct,
             'max_drawdown_return_pct': max_drawdown_return_pct,
             'target_hit': target_hit,
             'stop_loss_hit': stop_loss_hit,
+            'best_exit_trade_date': outcome_diagnostics.get('best_exit_trade_date'),
+            'worst_drawdown_trade_date': outcome_diagnostics.get('worst_drawdown_trade_date'),
+            'first_severe_drawdown_trade_date': first_severe_drawdown_trade_date,
+            'first_target_hit_trade_date': outcome_diagnostics.get('first_target_hit_trade_date'),
+            'first_stop_loss_hit_trade_date': outcome_diagnostics.get('first_stop_loss_hit_trade_date'),
+            'severe_drawdown_before_target': severe_drawdown_before_target if decision_action == 'buy' else None,
             'expected_return_pct': decision_fields.get('expected_return_pct'),
             'feature_snapshot': decision.get('feature_snapshot'),
         }
@@ -1903,6 +2026,33 @@ class SignalDeciderLoopService:
             items.sort(key=lambda item: int(item.get('horizon_days') or 0))
         return grouped
 
+    def _resolve_evaluation_profile(self, evaluation_version: str) -> SignalDeciderEvaluationProfile:
+        requested_version = (
+            _normalize_optional_text(evaluation_version, default=DEFAULT_SIGNAL_DECIDER_EVALUATION_VERSION)
+            or DEFAULT_SIGNAL_DECIDER_EVALUATION_VERSION
+        )
+        return SignalDeciderEvaluationProfile(
+            requested_version=requested_version,
+            rule_set_version=DEFAULT_SIGNAL_DECIDER_EVALUATION_VERSION,
+        )
+
+    def _evaluation_profile_payload(
+        self,
+        *,
+        evaluation_profile: SignalDeciderEvaluationProfile,
+        horizon_days: int,
+    ) -> dict[str, Any]:
+        thresholds = self._threshold_payload(horizon_days)
+        return {
+            'requested_version': evaluation_profile.requested_version,
+            'rule_set_version': evaluation_profile.rule_set_version,
+            **thresholds,
+            'buy_severe_drawdown_pct': round(
+                thresholds['loss_return_pct'] * evaluation_profile.buy_severe_drawdown_multiplier,
+                6,
+            ),
+        }
+
     def _threshold_payload(self, horizon_days: int) -> dict[str, Any]:
         thresholds = HORIZON_THRESHOLDS[horizon_days]
         return {
@@ -1916,6 +2066,30 @@ class SignalDeciderLoopService:
             return None
         return round((numerator_price / denominator_price) - 1.0, 6)
 
+    def _first_severe_drawdown_trade_date(
+        self,
+        *,
+        entry_price: int | None,
+        price_path: Any,
+        severe_drawdown_limit_pct: float,
+        first_target_hit_trade_date: str | None,
+    ) -> str | None:
+        if entry_price is None or not isinstance(price_path, list):
+            return None
+        for bar in price_path:
+            bar_payload = _maybe_dict(bar)
+            trade_date = _normalize_optional_text(
+                str(bar_payload.get('trade_date')) if bar_payload.get('trade_date') is not None else None
+            )
+            if trade_date is None:
+                continue
+            if first_target_hit_trade_date is not None and trade_date > first_target_hit_trade_date:
+                continue
+            low_return_pct = self._return_pct(_to_int(bar_payload.get('low_price')), entry_price)
+            if low_return_pct is not None and low_return_pct <= -severe_drawdown_limit_pct:
+                return trade_date
+        return None
+
     def _buy_grade_score(
         self,
         *,
@@ -1923,12 +2097,14 @@ class SignalDeciderLoopService:
         max_drawdown_return_pct: float | None,
         target_hit: bool,
         stop_loss_hit: bool,
+        severe_drawdown_before_target: bool,
     ) -> float | None:
         if close_return_pct is None and max_drawdown_return_pct is None:
             return None
         score = float(close_return_pct or 0.0) * 100.0
         score += 5.0 if target_hit else 0.0
         score -= 5.0 if stop_loss_hit else 0.0
+        score -= 7.5 if severe_drawdown_before_target else 0.0
         if max_drawdown_return_pct is not None and max_drawdown_return_pct < 0:
             score += float(max_drawdown_return_pct) * 50.0
         return round(score, 6)

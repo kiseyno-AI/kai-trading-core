@@ -7,6 +7,10 @@ from typing import Any, Sequence
 
 from app.agent_context.retry_service import FeedbackRetryCycleConfig, agent_feedback_retry_service
 from app.agent_context.roles import SIGNAL_DECIDER_AGENT_NAME, SUMMARIZER_AGENT_NAMES
+from app.agent_context.signal_decider_loop_service import (
+    DEFAULT_SIGNAL_DECIDER_EVALUATION_LOOKBACK_DAYS,
+    signal_decider_loop_service,
+)
 from app.core.settings import settings
 from app.dart.fundamentals_capture_service import dart_fundamentals_capture_service
 from app.eod.action_summaries import daily_action_summary_service
@@ -61,6 +65,7 @@ DAILY_STAGE_ORDER: tuple[str, ...] = (
     *FACTOR_STAGE_ORDER,
     'agent_feedback_summaries',
     'signal_decider',
+    'signal_decider_evaluations',
 )
 DEFAULT_DAILY_STAGE_ORDER: tuple[str, ...] = (
     'master_refresh',
@@ -70,6 +75,7 @@ DEFAULT_DAILY_STAGE_ORDER: tuple[str, ...] = (
     'piotroski_filter',
     'agent_feedback_summaries',
     'signal_decider',
+    'signal_decider_evaluations',
 )
 
 
@@ -314,6 +320,18 @@ STAGE_DEFINITIONS: dict[str, DailyStageDefinition] = {
         output_tables=('agent_context_feedback', 'agent_context_feedback_runs'),
         default_selected=True,
     ),
+    'signal_decider_evaluations': DailyStageDefinition(
+        id='signal_decider_evaluations',
+        label='signal decider evaluation refresh',
+        group='agent_feedback',
+        description='Refresh realized outcomes and verdict rows for recent immutable signal-decider decision snapshots.',
+        depends_on=('signal_decider',),
+        supports_symbols=True,
+        supports_force=True,
+        inspect_routes=('/agent-context/signal-decider/evaluations', '/agent-context/signal-decider/diagnostics'),
+        output_tables=('signal_decider_realized_outcomes', 'signal_decider_evaluations'),
+        default_selected=True,
+    ),
 }
 
 
@@ -323,9 +341,11 @@ class DailyPipelineStageService:
         *,
         pykrx_service=PYKRX_BACKFILL_SERVICE,
         feedback_retry_service=agent_feedback_retry_service,
+        decision_loop_service=signal_decider_loop_service,
     ) -> None:
         self.pykrx_service = pykrx_service
         self.feedback_retry_service = feedback_retry_service
+        self.decision_loop_service = decision_loop_service
 
     def describe(self) -> dict[str, Any]:
         return {
@@ -550,6 +570,13 @@ class DailyPipelineStageService:
                     outer_batch_size=feedback_outer_batch_size,
                     reuse_existing=reuse_existing_feedback,
                 )
+            )
+        if stage_id == 'signal_decider_evaluations':
+            return self.decision_loop_service.compute_recent_evaluations(
+                as_of_market_date=market_date,
+                lookback_days=DEFAULT_SIGNAL_DECIDER_EVALUATION_LOOKBACK_DAYS,
+                symbols=symbols,
+                force_recompute=force,
             )
         raise ValueError(f'Unsupported daily stage: {stage_id}')
 

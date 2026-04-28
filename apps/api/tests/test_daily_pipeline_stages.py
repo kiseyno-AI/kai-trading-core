@@ -41,6 +41,25 @@ class _FakeFeedbackRetryService:
         }
 
 
+class _FakeSignalDeciderEvaluationService:
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def compute_recent_evaluations(self, **kwargs):
+        self.calls.append(kwargs)
+        return {
+            'request': {
+                'as_of_market_date': kwargs['as_of_market_date'],
+                'lookback_days': kwargs['lookback_days'],
+            },
+            'summary': {
+                'outcomes_upserted': 4,
+                'evaluations_upserted': 4,
+            },
+            'items': [],
+        }
+
+
 class _FakeSkippedPykrxStageRunner:
     def __init__(self) -> None:
         self.calls: list[dict] = []
@@ -79,9 +98,11 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
     def test_run_reorders_requested_subset_and_splits_feedback_stages(self) -> None:
         pykrx_runner = _FakePykrxStageRunner()
         feedback_retry_service = _FakeFeedbackRetryService()
+        evaluation_service = _FakeSignalDeciderEvaluationService()
         service = DailyPipelineStageService(
             pykrx_service=pykrx_runner,
             feedback_retry_service=feedback_retry_service,
+            decision_loop_service=evaluation_service,
         )
 
         with (
@@ -91,6 +112,7 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             result = service.run(
                 market_date='2026-04-14',
                 stages=[
+                    'signal_decider_evaluations',
                     'signal_decider',
                     'technical_snapshots',
                     'agent_feedback_summaries',
@@ -101,13 +123,21 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
 
         self.assertEqual(
             result['resolved_stages'],
-            ['price_collection', 'technical_snapshots', 'agent_feedback_summaries', 'signal_decider'],
+            [
+                'price_collection',
+                'technical_snapshots',
+                'agent_feedback_summaries',
+                'signal_decider',
+                'signal_decider_evaluations',
+            ],
         )
         self.assertEqual(pykrx_runner.calls[0]['stages'], ['price_collection', 'technical_snapshots'])
         self.assertEqual(pykrx_runner.calls[0]['symbols'], ['005930', '000660'])
         self.assertEqual(feedback_retry_service.calls[0]['config'].roles, SUMMARIZER_AGENT_NAMES)
         self.assertEqual(feedback_retry_service.calls[1]['config'].roles, (SIGNAL_DECIDER_AGENT_NAME,))
-        self.assertGreaterEqual(execute_stage.call_count, 2)
+        self.assertEqual(evaluation_service.calls[0]['as_of_market_date'], '2026-04-14')
+        self.assertEqual(evaluation_service.calls[0]['symbols'], ['005930', '000660'])
+        self.assertGreaterEqual(execute_stage.call_count, 3)
 
     def test_run_rejects_unknown_stage(self) -> None:
         service = DailyPipelineStageService()

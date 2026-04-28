@@ -19,7 +19,7 @@ Content-Type: application/json
 
 {
   "market_date": "2026-04-21",
-  "stages": ["signal_decider", "technical_snapshots", "price_collection", "agent_feedback_summaries"],
+  "stages": ["signal_decider_evaluations", "signal_decider", "technical_snapshots", "price_collection", "agent_feedback_summaries"],
   "symbols": ["005930", "000660"],
   "markets": ["KOSPI", "KOSDAQ"],
   "force": true,
@@ -33,6 +33,7 @@ Content-Type: application/json
 {
   "market_date": "2026-04-21",
   "requested_stages": [
+    "signal_decider_evaluations",
     "signal_decider",
     "technical_snapshots",
     "price_collection",
@@ -42,7 +43,8 @@ Content-Type: application/json
     "price_collection",
     "technical_snapshots",
     "agent_feedback_summaries",
-    "signal_decider"
+    "signal_decider",
+    "signal_decider_evaluations"
   ],
   "status": "completed",
   "stages": {
@@ -67,6 +69,18 @@ Content-Type: application/json
       "result": {
         "completed": true,
         "final_pending": 0
+      }
+    },
+    "signal_decider_evaluations": {
+      "stage": "signal_decider_evaluations",
+      "label": "signal decider evaluation refresh",
+      "group": "agent_feedback",
+      "status": "completed",
+      "result": {
+        "summary": {
+          "outcomes_upserted": 8,
+          "evaluations_upserted": 8
+        }
       }
     }
   }

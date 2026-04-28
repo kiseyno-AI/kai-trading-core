@@ -212,6 +212,32 @@ class InternalOpsTests(unittest.TestCase):
         self.assertEqual(run_stages.call_args.kwargs['feedback_max_cycles'], 4)
         self.assertFalse(run_stages.call_args.kwargs['reuse_existing_feedback'])
 
+    def test_compute_signal_decider_evaluations_uses_direct_service_call(self) -> None:
+        with (
+            patch('app.internal.ops.bootstrap_runtime') as bootstrap_runtime,
+            patch(
+                'app.internal.ops.signal_decider_loop_service.compute_recent_evaluations',
+                return_value={'summary': {'evaluations_upserted': 4}},
+            ) as compute_evaluations,
+        ):
+            result = ops.compute_signal_decider_evaluations(
+                market_date='2026-04-30',
+                lookback_days=21,
+                symbols='005930,000660',
+                horizons='1,5,10',
+                evaluation_version='signal_decider_eval_v1',
+                force_recompute=True,
+            )
+
+        bootstrap_runtime.assert_called_once_with()
+        self.assertEqual(result, {'summary': {'evaluations_upserted': 4}})
+        self.assertEqual(compute_evaluations.call_args.kwargs['as_of_market_date'], '2026-04-30')
+        self.assertEqual(compute_evaluations.call_args.kwargs['lookback_days'], 21)
+        self.assertEqual(compute_evaluations.call_args.kwargs['symbols'], ['005930', '000660'])
+        self.assertEqual(compute_evaluations.call_args.kwargs['horizons'], [1, 5, 10])
+        self.assertEqual(compute_evaluations.call_args.kwargs['evaluation_version'], 'signal_decider_eval_v1')
+        self.assertTrue(compute_evaluations.call_args.kwargs['force_recompute'])
+
     def test_run_agent_feedback_retry_cycles_passes_explicit_symbols_to_retry_service(self) -> None:
         with (
             patch('app.internal.ops.bootstrap_runtime') as bootstrap_runtime,
@@ -474,3 +500,28 @@ class InternalOpsTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(json.loads(stdout.getvalue()), {'state': 'CLOSED'})
+
+    def test_cli_signal_decider_evaluations_outputs_json(self) -> None:
+        stdout = io.StringIO()
+        with (
+            patch(
+                'app.internal.ops.compute_signal_decider_evaluations',
+                return_value={'summary': {'evaluations_upserted': 6}},
+            ),
+            redirect_stdout(stdout),
+        ):
+            exit_code = ops.main(
+                [
+                    'agent-signal-decider-evaluations-compute',
+                    '--market-date',
+                    '2026-04-30',
+                    '--symbols',
+                    '005930,000660',
+                    '--horizons',
+                    '1,5',
+                    '--force-recompute',
+                ]
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(json.loads(stdout.getvalue()), {'summary': {'evaluations_upserted': 6}})
