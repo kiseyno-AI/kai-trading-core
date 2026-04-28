@@ -572,6 +572,9 @@ def append_broker_order_event(event: dict[str, Any]) -> dict[str, Any]:
         if order_row is None:
             raise ValueError('broker order not found for event append')
 
+        if broker_order_id is not None and client_order_id != order_row.client_order_id:
+            raise ValueError('client_order_id does not match resolved broker order')
+
         values = {
             'broker_order_row_id': order_row.id,
             'order_request_id': event.get('order_request_id') or order_row.order_request_id,
@@ -579,7 +582,7 @@ def append_broker_order_event(event: dict[str, Any]) -> dict[str, Any]:
             'broker_order_id': broker_order_id or order_row.broker_order_id,
             'client_order_id': client_order_id,
             'account_reference': account_reference,
-            'symbol': _normalize_optional_text(event.get('symbol')) or order_row.symbol,
+            'symbol': _normalize_symbol(event.get('symbol')) if event.get('symbol') is not None else order_row.symbol,
             'event_type': _normalize_required_text(event.get('event_type'), field='event_type', lowercase=True),
             'event_sequence': _normalize_optional_text(event.get('event_sequence')),
             'broker_event_id': _normalize_optional_text(event.get('broker_event_id')),

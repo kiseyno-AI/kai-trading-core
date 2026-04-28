@@ -47,6 +47,45 @@ class OrderStorePersistenceTests(unittest.TestCase):
                 )
             )
 
+    def _seed_broker_order(self, *, symbol: str = '005930') -> dict:
+        request_row = upsert_order_request(
+            {
+                'broker_name': 'kis',
+                'client_order_id': self.client_order_id,
+                'source': 'api',
+                'account_reference': self.account_reference,
+                'symbol': symbol,
+                'side': 'buy',
+                'order_type': 'limit',
+                'requested_quantity': '10',
+                'requested_price': '70000',
+                'request_payload': {'requested_by': 'event-test'},
+                'validation_status': 'valid',
+            }
+        )
+        return upsert_broker_order(
+            {
+                'order_request_id': request_row['id'],
+                'broker_name': 'kis',
+                'broker_order_id': self.broker_order_id,
+                'client_order_id': self.client_order_id,
+                'account_reference': self.account_reference,
+                'symbol': symbol,
+                'side': 'buy',
+                'order_type': 'limit',
+                'requested_quantity': '10',
+                'requested_price': '70000',
+                'accepted_quantity': '10',
+                'accepted_price': '70000',
+                'filled_quantity': '0',
+                'remaining_quantity': '10',
+                'current_status': 'accepted',
+                'last_broker_update_at': '2026-04-28T00:04:00+00:00',
+                'raw_latest_payload': {'step': 'accept'},
+                'snapshot_payload': {'status': 'accepted'},
+            }
+        )
+
     def test_upsert_order_request_is_idempotent_by_client_order_scope(self) -> None:
         created = upsert_order_request(
             {
@@ -185,43 +224,7 @@ class OrderStorePersistenceTests(unittest.TestCase):
         self.assertEqual(len(partial_fill_rows), 1)
 
     def test_append_broker_order_event_deduplicates_repeated_notifications(self) -> None:
-        request_row = upsert_order_request(
-            {
-                'broker_name': 'kis',
-                'client_order_id': self.client_order_id,
-                'source': 'api',
-                'account_reference': self.account_reference,
-                'symbol': '005930',
-                'side': 'buy',
-                'order_type': 'limit',
-                'requested_quantity': '10',
-                'requested_price': '70000',
-                'request_payload': {'requested_by': 'event-test'},
-                'validation_status': 'valid',
-            }
-        )
-        upsert_broker_order(
-            {
-                'order_request_id': request_row['id'],
-                'broker_name': 'kis',
-                'broker_order_id': self.broker_order_id,
-                'client_order_id': self.client_order_id,
-                'account_reference': self.account_reference,
-                'symbol': '005930',
-                'side': 'buy',
-                'order_type': 'limit',
-                'requested_quantity': '10',
-                'requested_price': '70000',
-                'accepted_quantity': '10',
-                'accepted_price': '70000',
-                'filled_quantity': '0',
-                'remaining_quantity': '10',
-                'current_status': 'accepted',
-                'last_broker_update_at': '2026-04-28T00:04:00+00:00',
-                'raw_latest_payload': {'step': 'accept'},
-                'snapshot_payload': {'status': 'accepted'},
-            }
-        )
+        self._seed_broker_order()
 
         first_event = append_broker_order_event(
             {
@@ -300,6 +303,66 @@ class OrderStorePersistenceTests(unittest.TestCase):
         self.assertEqual(loaded['current_status'], 'partial_fill')
         self.assertEqual(loaded['filled_quantity'], Decimal('4'))
         self.assertEqual(loaded['remaining_quantity'], Decimal('6'))
+
+    def test_append_broker_order_event_rejects_client_order_id_mismatch_for_resolved_broker_order(self) -> None:
+        self._seed_broker_order()
+
+        with self.assertRaisesRegex(ValueError, 'client_order_id does not match resolved broker order'):
+            append_broker_order_event(
+                {
+                    'broker_name': 'kis',
+                    'account_reference': self.account_reference,
+                    'client_order_id': f'{self.client_order_id}-WRONG',
+                    'broker_order_id': self.broker_order_id,
+                    'event_type': 'partial_fill',
+                    'event_sequence': '1',
+                    'event_occurred_at': '2026-04-28T00:04:30+00:00',
+                    'quantity_delta': '4',
+                    'cumulative_filled_quantity': '4',
+                    'remaining_quantity': '6',
+                    'average_fill_price': '70010',
+                    'fill_price': '70010',
+                    'resulting_status': 'partial_fill',
+                    'source': 'ws_notice',
+                    'event_dedup_key': 'ws:fill-mismatch',
+                    'raw_payload': {'trade_id': 'fill-mismatch'},
+                    'normalized_payload': {'status': 'partial_fill'},
+                }
+            )
+
+    def test_append_broker_order_event_normalizes_symbol_for_symbol_filtered_reads(self) -> None:
+        self._seed_broker_order(symbol='AAPL')
+
+        append_broker_order_event(
+            {
+                'broker_name': 'kis',
+                'account_reference': self.account_reference,
+                'client_order_id': self.client_order_id,
+                'broker_order_id': self.broker_order_id,
+                'symbol': 'aapl',
+                'event_type': 'partial_fill',
+                'event_sequence': '1',
+                'event_occurred_at': '2026-04-28T00:04:30+00:00',
+                'quantity_delta': '4',
+                'cumulative_filled_quantity': '4',
+                'remaining_quantity': '6',
+                'average_fill_price': '70010',
+                'fill_price': '70010',
+                'resulting_status': 'partial_fill',
+                'source': 'ws_notice',
+                'event_dedup_key': 'ws:fill-aapl',
+                'raw_payload': {'trade_id': 'fill-aapl'},
+                'normalized_payload': {'status': 'partial_fill'},
+            }
+        )
+
+        events = list_broker_order_events(
+            account_reference=self.account_reference,
+            symbol='AAPL',
+        )
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]['symbol'], 'AAPL')
 
 
 if __name__ == '__main__':
