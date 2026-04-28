@@ -32,6 +32,7 @@ from app.core.settings import settings
 from app.db import check_database, init_database
 from app.eod.runner import background_runner
 from app.market_data_store import load_tracked_symbols
+from app.orders.kis_realtime_order_notices import kis_realtime_order_notice_service
 from app.scanner.state import scanner_state
 
 configure_file_logging()
@@ -46,10 +47,12 @@ async def lifespan(_: FastAPI):
         scanner_state.hydrate(tracked_symbols)
     except Exception as exc:
         logger.warning('Database initialization failed; starting in degraded mode: %s', exc)
+    await kis_realtime_order_notice_service.start()
     await background_runner.start()
     try:
         yield
     finally:
+        await kis_realtime_order_notice_service.stop()
         await background_runner.stop()
 
 

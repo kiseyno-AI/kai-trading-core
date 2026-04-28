@@ -1,13 +1,16 @@
 from fastapi import APIRouter, HTTPException
 
 from app.brokers.kis.provider import kis_client
+from app.orders.kis_realtime_order_notices import kis_realtime_order_notice_service
 
 router = APIRouter(prefix='/broker/kis', tags=['broker:kis'])
 
 
 @router.get('/health')
 async def kis_health() -> dict:
-    return await kis_client.healthcheck()
+    payload = await kis_client.healthcheck()
+    payload['realtime_order_notices'] = kis_realtime_order_notice_service.health_snapshot()
+    return payload
 
 
 @router.post('/token')

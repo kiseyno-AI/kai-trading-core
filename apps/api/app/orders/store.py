@@ -83,6 +83,63 @@ def _coalesce_remaining_quantity(
     return remainder if remainder >= Decimal('0') else Decimal('0')
 
 
+_STATUS_RANKS: dict[str, int] = {
+    BrokerOrderStatus.PENDING_SUBMIT.value: 0,
+    BrokerOrderStatus.SUBMITTED.value: 1,
+    BrokerOrderStatus.ACCEPTED.value: 2,
+    BrokerOrderStatus.CANCEL_PENDING.value: 2,
+    BrokerOrderStatus.REPLACE_PENDING.value: 2,
+    BrokerOrderStatus.RECONCILE_ONLY.value: 2,
+    BrokerOrderStatus.PARTIAL_FILL.value: 3,
+    BrokerOrderStatus.REPLACED.value: 4,
+    BrokerOrderStatus.CANCELED.value: 4,
+    BrokerOrderStatus.REJECTED.value: 4,
+    BrokerOrderStatus.FILLED.value: 5,
+}
+
+
+def _status_rank(value: str | None) -> int:
+    if value is None:
+        return -1
+    return _STATUS_RANKS.get(value, -1)
+
+
+def _should_apply_event_snapshot_patch(
+    row: BrokerOrder,
+    *,
+    event: dict[str, Any],
+    occurred_at: datetime,
+) -> bool:
+    last_broker_update_at = row.last_broker_update_at
+    if last_broker_update_at is None:
+        return True
+
+    new_status = _normalize_optional_text(event.get('resulting_status'), lowercase=True)
+    current_status = _normalize_optional_text(row.current_status, lowercase=True)
+    current_filled_quantity = row.filled_quantity if row.filled_quantity is not None else Decimal('0')
+    new_cumulative_filled_quantity = _normalize_decimal(
+        event.get('cumulative_filled_quantity'),
+        field='cumulative_filled_quantity',
+    )
+
+    if occurred_at > last_broker_update_at:
+        return True
+
+    if occurred_at < last_broker_update_at:
+        if new_cumulative_filled_quantity is not None and new_cumulative_filled_quantity > current_filled_quantity:
+            return True
+        if _status_rank(new_status) > _status_rank(current_status) and (
+            new_cumulative_filled_quantity is None
+            or new_cumulative_filled_quantity >= current_filled_quantity
+        ):
+            return True
+        return False
+
+    if new_cumulative_filled_quantity is not None and new_cumulative_filled_quantity > current_filled_quantity:
+        return True
+    return _status_rank(new_status) >= _status_rank(current_status)
+
+
 def _serialize_order_request(row: OrderRequest) -> dict[str, Any]:
     return {
         'id': row.id,
@@ -650,7 +707,8 @@ def append_broker_order_event(event: dict[str, Any]) -> dict[str, Any]:
             payload['inserted'] = False
             return payload
 
-        _apply_event_snapshot_patch(order_row, event=event, occurred_at=occurred_at, now=now)
+        if _should_apply_event_snapshot_patch(order_row, event=event, occurred_at=occurred_at):
+            _apply_event_snapshot_patch(order_row, event=event, occurred_at=occurred_at, now=now)
         inserted_row = session.execute(
             select(BrokerOrderEvent).where(BrokerOrderEvent.id == inserted_id)
         ).scalar_one()

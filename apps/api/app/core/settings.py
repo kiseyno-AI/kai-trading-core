@@ -35,8 +35,14 @@ class Settings(BaseSettings):
     kis_base_url: str = 'https://openapi.koreainvestment.com:9443'
     kis_mock_base_url: str = 'https://openapivts.koreainvestment.com:29443'
     kis_use_mock: bool = True
+    kis_hts_id: str = ''
     kis_token_refresh_margin_seconds: int = 300
     kis_realtime_trending_cache_ttl_seconds: int = 20
+    kis_realtime_order_notice_enabled: bool = True
+    kis_realtime_ws_url: str = 'ws://ops.koreainvestment.com:21000'
+    kis_realtime_mock_ws_url: str = 'ws://ops.koreainvestment.com:31000'
+    kis_realtime_reconnect_base_delay_seconds: float = 3.0
+    kis_realtime_reconnect_max_delay_seconds: float = 30.0
 
     bok_ecos_api_key: str = Field(
         default='',
