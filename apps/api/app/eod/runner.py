@@ -8,6 +8,7 @@ from app.core.settings import settings
 from app.eod.auto_pykrx import auto_pykrx_eod_scheduler
 from app.eod.master import refresh_master_if_due
 from app.market.clock import get_market_state
+from app.orders.next_open_execution import signal_decider_next_open_execution_service
 from app.orders.reconciliation import trading_order_reconciliation_service
 
 logger = logging.getLogger(__name__)
@@ -40,6 +41,11 @@ class EODBackgroundRunner:
                 market = get_market_state()
                 if market.state == 'PREOPEN':
                     refresh_master_if_due()
+                    signal_decider_next_open_execution_service.refresh_plan_if_due()
+                elif market.state == 'OPEN':
+                    await signal_decider_next_open_execution_service.run_market_open_execution_if_due(
+                        trigger='market_open_scheduler'
+                    )
                 elif market.state == 'CLOSED':
                     await auto_pykrx_eod_scheduler.schedule_daily_pipeline_if_due()
                 await trading_order_reconciliation_service.run_periodic_if_due()

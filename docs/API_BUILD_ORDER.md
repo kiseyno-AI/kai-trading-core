@@ -34,6 +34,7 @@
 31. Daily composite factor compute/read routes
 32. Signal-decider evaluation, diagnostics, and policy-candidate routes
 33. Internal trading order control, inquiry, and reconciliation routes
+34. Signal-decider next-open execution planning and market-open submit routes
 
 ## Current routes
 - `POST /broker/kis/token`
@@ -52,6 +53,8 @@
 - `GET /trading/orders/mismatches?account_reference=KIS:12345678-01&limit=50`
 - `GET /trading/orders/stale-pending?account_reference=KIS:12345678-01&limit=50`
 - `GET /trading/orders/realtime-health`
+- `GET /trading/orders/next-open-execution?target_trade_date=YYYY-MM-DD&refresh=false`
+- `POST /trading/orders/next-open-execution/run-if-due`
 - `GET /trading/orders/{client_order_id}/timeline?account_reference=KIS:12345678-01&refresh=false`
 - `GET /portfolio/summary`
 - `GET /trading/accounts/{account_reference}/summary`
@@ -163,6 +166,13 @@
 - Broker-truth repair is append-only: each reconcile pass writes a deduplicated reconciliation event when the observed broker truth changes, preserves the local-before vs local-after evidence in `last_reconcile_payload`, and never rewrites prior execution history.
 - Automatic reconciliation now covers startup catch-up, periodic intraday sweeps, and realtime websocket reconnect recovery when the corresponding `KIS_ORDER_RECONCILE_*` settings are enabled. Manual shell access uses `python3.11 -m app.internal.ops trading-orders-reconcile ...` from `apps/api`.
 - The stable KIS result-code and inquiry-state mapping contract for this adapter is documented in [docs/KIS_ORDER_RESULT_CODE_MAPPING.md](./KIS_ORDER_RESULT_CODE_MAPPING.md).
+
+## Next-open execution planning notes
+- `GET /trading/orders/next-open-execution` is the persisted inspection surface for the next-session buy list derived from the latest previous-trading-day `signal_decider_decision_snapshots`. `refresh=true` rebuilds the durable plan before returning it.
+- `POST /trading/orders/next-open-execution/run-if-due` is the operator-facing submit hook and the same service used by the background runner at market open. It refreshes the plan first, then either dry-runs or submits eligible rows through the existing `POST /trading/orders/buy` persistence path.
+- Durable plan rows live in `signal_decider_execution_plan_items` and link one `decision_snapshot_id` to one concrete `account_reference + target_trade_date + symbol` execution candidate, plus optional `order_request_id` and `broker_order_row_id` once submission starts.
+- Quantity sizing is explicit and account-scoped. `SIGNAL_DECIDER_NEXT_OPEN_ACCOUNT_TARGETS` maps one or more KIS account references to fixed KRW budgets in `Label=KIS:12345678-01@1500000` form, and the planner floors quantity off the source-market-date close before the open.
+- Safety rails are separate from the signal-decider prompt contract. Automation still respects active-policy checks, minimum confidence or expected-return thresholds, target/stop presence, missing upstream-role checks, data-warning and disagreement blockers, global live enable/disable, dry-run mode, and deterministic `client_order_id` duplicate-submit protection.
 
 ## Trading account inquiry notes
 - `GET /portfolio/summary` is the aggregate portfolio read for the dashboard and portfolio cards. It resolves the deployment-configured account list from `PORTFOLIO_ACCOUNT_REFERENCES`, reuses the KIS-backed account-summary and positions inquiries per account, and returns the web `PortfolioSummaryDto`-style shape with `accounts`, `holdings`, `allocation`, `recentActivity`, `sync`, and `notices`.

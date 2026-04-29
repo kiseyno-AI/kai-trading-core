@@ -123,6 +123,26 @@ class FakeTradingOrderReconciliationService:
         }
 
 
+class FakeNextOpenExecutionService:
+    def __init__(self) -> None:
+        self.list_calls: list[dict] = []
+        self.run_calls: list[dict] = []
+
+    def list_plan_items(self, **kwargs):
+        self.list_calls.append(kwargs)
+        return {
+            'summary': {'items_total': 1, 'eligible_count': 1},
+            'items': [{'plan_item_id': 8, 'symbol': '005930', 'execution_status': 'planned'}],
+        }
+
+    async def run_market_open_execution_if_due(self, **kwargs):
+        self.run_calls.append(kwargs)
+        return {
+            'summary': {'triggered': True, 'selected_count': 1, 'submitted_count': 1},
+            'items': [{'plan_item_id': 8, 'symbol': '005930', 'execution_status': 'submitted'}],
+        }
+
+
 class TradingOrderRouteTests(unittest.TestCase):
     def setUp(self) -> None:
         self.app = FastAPI()
@@ -130,17 +150,21 @@ class TradingOrderRouteTests(unittest.TestCase):
         self.service = FakeTradingOrderService()
         self.monitoring_service = FakeTradingOrderMonitoringService()
         self.reconcile_service = FakeTradingOrderReconciliationService()
+        self.next_open_service = FakeNextOpenExecutionService()
         self.original_service = routes_trading.trading_order_service
         self.original_monitoring_service = routes_trading.trading_order_monitoring_service
         self.original_reconcile_service = routes_trading.trading_order_reconciliation_service
+        self.original_next_open_service = routes_trading.signal_decider_next_open_execution_service
         routes_trading.trading_order_service = self.service
         routes_trading.trading_order_monitoring_service = self.monitoring_service
         routes_trading.trading_order_reconciliation_service = self.reconcile_service
+        routes_trading.signal_decider_next_open_execution_service = self.next_open_service
 
     def tearDown(self) -> None:
         routes_trading.trading_order_service = self.original_service
         routes_trading.trading_order_monitoring_service = self.original_monitoring_service
         routes_trading.trading_order_reconciliation_service = self.original_reconcile_service
+        routes_trading.signal_decider_next_open_execution_service = self.original_next_open_service
 
     def test_buy_route_returns_created_payload(self) -> None:
         client = TestClient(self.app)
@@ -280,6 +304,27 @@ class TradingOrderRouteTests(unittest.TestCase):
         self.assertEqual(self.monitoring_service.lifecycle_calls[0]['stale_after_minutes'], 30)
         self.assertEqual(self.monitoring_service.timeline_calls[0]['refresh'], True)
         self.assertEqual(self.monitoring_service.realtime_health_calls, 1)
+
+    def test_next_open_execution_routes_use_service(self) -> None:
+        client = TestClient(self.app)
+
+        list_response = client.get(
+            '/trading/orders/next-open-execution',
+            params={'target_trade_date': '2026-04-30', 'refresh': 'true'},
+        )
+        run_response = client.post(
+            '/trading/orders/next-open-execution/run-if-due',
+            json={'target_trade_date': '2026-04-30', 'dry_run': False, 'force': True},
+        )
+
+        self.assertEqual(list_response.status_code, 200)
+        self.assertEqual(list_response.json()['items'][0]['plan_item_id'], 8)
+        self.assertEqual(self.next_open_service.list_calls[0]['target_trade_date'].isoformat(), '2026-04-30')
+        self.assertTrue(self.next_open_service.list_calls[0]['refresh'])
+        self.assertEqual(run_response.status_code, 200)
+        self.assertEqual(run_response.json()['summary']['submitted_count'], 1)
+        self.assertEqual(self.next_open_service.run_calls[0]['target_trade_date'].isoformat(), '2026-04-30')
+        self.assertTrue(self.next_open_service.run_calls[0]['force'])
 
 
 if __name__ == '__main__':

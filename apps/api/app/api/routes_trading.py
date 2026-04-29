@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+from datetime import date
 from decimal import Decimal
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Response
+from fastapi.concurrency import run_in_threadpool
 from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.orders.monitoring import trading_order_monitoring_service
+from app.orders.next_open_execution import signal_decider_next_open_execution_service
 from app.orders.reconciliation import trading_order_reconciliation_service
 from app.orders.service import (
     TradingOrderIdempotencyConflictError,
@@ -81,6 +84,14 @@ class TradingOrderReconcileSingleRequest(BaseModel):
 
     account_reference: str = Field(..., min_length=1, max_length=128)
     reason: str | None = Field(default=None, max_length=256)
+
+
+class TradingNextOpenExecutionRunRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+    target_trade_date: date | None = None
+    dry_run: bool | None = None
+    force: bool = False
 
 
 def _raise_order_http_error(exc: Exception) -> None:
@@ -218,6 +229,41 @@ async def get_realtime_health() -> dict[str, Any]:
     except Exception as exc:
         _raise_order_http_error(exc)
         raise HTTPException(status_code=500, detail=f'Trading order realtime health read failed: {exc}') from exc
+
+
+@router.get('/next-open-execution')
+async def list_next_open_execution_plan(
+    target_trade_date: date | None = Query(default=None),
+    account_reference: str | None = Query(default=None, min_length=1, max_length=128),
+    refresh: bool = Query(default=False),
+) -> dict[str, Any]:
+    try:
+        return await run_in_threadpool(
+            signal_decider_next_open_execution_service.list_plan_items,
+            target_trade_date=target_trade_date,
+            account_reference=account_reference,
+            refresh=refresh,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'Next-open execution plan read failed: {exc}') from exc
+
+
+@router.post('/next-open-execution/run-if-due')
+async def run_next_open_execution_if_due(payload: TradingNextOpenExecutionRunRequest) -> dict[str, Any]:
+    try:
+        return await signal_decider_next_open_execution_service.run_market_open_execution_if_due(
+            target_trade_date=payload.target_trade_date,
+            dry_run=payload.dry_run,
+            force=payload.force,
+            trigger='api',
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        _raise_order_http_error(exc)
+        raise HTTPException(status_code=500, detail=f'Next-open execution submit failed: {exc}') from exc
 
 
 @router.post('/{client_order_id}/cancel')
