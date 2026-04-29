@@ -322,15 +322,14 @@ class SignalDeciderIntradayAutoSellService:
                 continue
 
             for position in positions_payload.get('items') or []:
-                item = await self._refresh_position_watch(
+                position_items = await self._refresh_position_watch_items(
                     account=account,
                     position=position,
                     positions_as_of=_normalize_optional_text(positions_payload.get('as_of')),
                     market_state=market_state,
                     trigger=trigger,
                 )
-                if item is not None:
-                    items.append(item)
+                items.extend(position_items)
 
         items.sort(
             key=lambda item: (
@@ -450,7 +449,7 @@ class SignalDeciderIntradayAutoSellService:
         }
         return payload
 
-    async def _refresh_position_watch(
+    async def _refresh_position_watch_items(
         self,
         *,
         account: MonitoredAccount,
@@ -458,27 +457,17 @@ class SignalDeciderIntradayAutoSellService:
         positions_as_of: str | None,
         market_state: MarketState,
         trigger: str,
-    ) -> dict[str, Any] | None:
+    ) -> list[dict[str, Any]]:
         symbol = _normalize_optional_text(position.get('symbol'), uppercase=True)
         if symbol is None:
-            return None
+            return []
 
-        source = self._load_latest_linked_source_plan(
+        sources = self._load_linked_source_plans(
             account_reference=account.account_reference,
             symbol=symbol,
         )
-        if source is None:
-            return None
-
-        snapshot = self._load_snapshot(source.row.decision_snapshot_id)
-        if snapshot is None:
-            logger.warning(
-                'Intraday auto-sell could not load snapshot %s for %s/%s',
-                source.row.decision_snapshot_id,
-                account.account_reference,
-                symbol,
-            )
-            return None
+        if not sources:
+            return []
 
         quantity = _safe_decimal(position.get('quantity')) or Decimal('0')
         sellable_quantity = _safe_decimal(position.get('sellable_quantity')) or Decimal('0')
@@ -487,189 +476,227 @@ class SignalDeciderIntradayAutoSellService:
             position=position,
             positions_as_of=positions_as_of,
         )
-
-        entry_filled_quantity = (
-            _safe_decimal((source.order or {}).get('filled_quantity'))
-            or _safe_decimal(source.row.planned_quantity)
-            or Decimal('0')
-        )
-        auto_sell_attempts = self._load_auto_sell_attempt_pairs(
-            account_reference=account.account_reference,
-            symbol=symbol,
-            decision_snapshot_id=snapshot.id,
-        )
-        latest_attempt = auto_sell_attempts[0] if auto_sell_attempts else None
-        prior_auto_sell_filled_quantity = sum(
-            _safe_decimal((pair.get('order') or {}).get('filled_quantity')) or Decimal('0')
-            for pair in auto_sell_attempts
-        )
-        watched_quantity = min(
-            sellable_quantity,
-            max(entry_filled_quantity - prior_auto_sell_filled_quantity, Decimal('0')),
-        )
-
-        holding_min_days, holding_max_days = _holding_period_bounds(snapshot.suggested_holding_period)
-        holding_period_expiry_trade_date = (
-            _advance_trading_days(source.row.target_trade_date, holding_max_days)
-            if holding_max_days is not None
-            else None
-        )
         current_trade_date = date.fromisoformat(market_state.server_time[:10])
-        holding_period_expired = bool(
-            holding_period_expiry_trade_date and current_trade_date > holding_period_expiry_trade_date
-        )
+        remaining_sellable_quantity = sellable_quantity
+        items: list[dict[str, Any]] = []
 
-        blocking_reasons: list[dict[str, Any]] = []
-        warnings: list[dict[str, Any]] = []
-        execution_status = self._derive_existing_execution_status(
-            latest_attempt=latest_attempt,
-        )
-        cooldown_until: str | None = None
+        for source in sorted(
+            sources,
+            key=lambda item: (
+                item.row.target_trade_date,
+                _sort_key_for_order_pair(item.order, item.request),
+                item.row.id,
+            ),
+        ):
+            snapshot = self._load_snapshot(source.row.decision_snapshot_id)
+            if snapshot is None:
+                logger.warning(
+                    'Intraday auto-sell could not load snapshot %s for %s/%s',
+                    source.row.decision_snapshot_id,
+                    account.account_reference,
+                    symbol,
+                )
+                continue
 
-        if snapshot.target_price is None or snapshot.stop_loss_price is None:
-            blocking_reasons.append(
-                _reason(
-                    'target_or_stop_missing',
-                    'The linked signal-decider snapshot does not have both target and stop prices.',
-                )
+            entry_filled_quantity = (
+                _safe_decimal((source.order or {}).get('filled_quantity'))
+                or _safe_decimal(source.row.planned_quantity)
+                or Decimal('0')
             )
-        elif snapshot.target_price <= snapshot.stop_loss_price:
-            blocking_reasons.append(
-                _reason(
-                    'target_stop_invalid',
-                    'The linked signal-decider snapshot has a non-sensical target/stop ordering.',
-                )
+            auto_sell_attempts = self._load_auto_sell_attempt_pairs(
+                account_reference=account.account_reference,
+                symbol=symbol,
+                decision_snapshot_id=snapshot.id,
             )
+            latest_attempt = auto_sell_attempts[0] if auto_sell_attempts else None
+            prior_auto_sell_filled_quantity = sum(
+                _safe_decimal((pair.get('order') or {}).get('filled_quantity')) or Decimal('0')
+                for pair in auto_sell_attempts
+            )
+            linked_remaining_quantity = max(entry_filled_quantity - prior_auto_sell_filled_quantity, Decimal('0'))
+            available_sellable_quantity = remaining_sellable_quantity
+            watched_quantity = min(available_sellable_quantity, linked_remaining_quantity)
+            remaining_sellable_quantity = max(remaining_sellable_quantity - watched_quantity, Decimal('0'))
 
-        if observed_price is None or observed_price <= Decimal('0'):
-            blocking_reasons.append(
-                _reason(
-                    'live_price_unavailable',
-                    'No usable live price was available for trigger evaluation.',
-                )
+            holding_min_days, holding_max_days = _holding_period_bounds(snapshot.suggested_holding_period)
+            holding_period_expiry_trade_date = (
+                _advance_trading_days(source.row.target_trade_date, holding_max_days)
+                if holding_max_days is not None
+                else None
             )
-        if sellable_quantity <= Decimal('0'):
-            blocking_reasons.append(
-                _reason(
-                    'sellable_quantity_zero',
-                    'The linked holding does not currently have sellable quantity available.',
-                )
-            )
-        if watched_quantity <= Decimal('0'):
-            blocking_reasons.append(
-                _reason(
-                    'linked_quantity_depleted',
-                    'The linked next-open entry has already been fully offset by prior auto-sell fills.',
-                )
-            )
-
-        trigger_rule: str | None = None
-        if observed_price is not None and observed_price > Decimal('0') and snapshot.target_price and snapshot.stop_loss_price:
-            trigger_rule = self._resolve_trigger_rule(
-                observed_price=observed_price,
-                target_price=Decimal(str(snapshot.target_price)),
-                stop_loss_price=Decimal(str(snapshot.stop_loss_price)),
+            holding_period_expired = bool(
+                holding_period_expiry_trade_date and current_trade_date > holding_period_expiry_trade_date
             )
 
-        if latest_attempt is not None:
-            existing_reason = self._classify_existing_attempt(
+            blocking_reasons: list[dict[str, Any]] = []
+            warnings: list[dict[str, Any]] = []
+            execution_status = self._derive_existing_execution_status(
                 latest_attempt=latest_attempt,
-                current_row=self._load_watch_row(
-                    target_trade_date=source.row.target_trade_date,
-                    account_reference=account.account_reference,
-                    symbol=symbol,
-                ),
-                trigger_rule=trigger_rule,
-                market_state=market_state,
             )
-            if existing_reason is not None:
-                cooldown_until = existing_reason.get('cooldown_until')
-                blocking_reasons.append(existing_reason['reason'])
-                execution_status = existing_reason['execution_status']
+            cooldown_until: str | None = None
 
-        if not blocking_reasons and trigger_rule is None:
-            blocking_reasons.append(
-                _reason(
-                    'trigger_not_hit',
-                    'The linked holding is active, but neither the target nor stop threshold has been hit.',
+            if snapshot.target_price is None or snapshot.stop_loss_price is None:
+                blocking_reasons.append(
+                    _reason(
+                        'target_or_stop_missing',
+                        'The linked signal-decider snapshot does not have both target and stop prices.',
+                    )
                 )
-            )
-
-        if holding_period_expired:
-            warnings.append(
-                _reason(
-                    'holding_period_expired',
-                    'The linked signal-decider suggested holding period has expired.',
-                    expiry_trade_date=holding_period_expiry_trade_date.isoformat()
-                    if holding_period_expiry_trade_date
-                    else None,
+            elif snapshot.target_price <= snapshot.stop_loss_price:
+                blocking_reasons.append(
+                    _reason(
+                        'target_stop_invalid',
+                        'The linked signal-decider snapshot has a non-sensical target/stop ordering.',
+                    )
                 )
-            )
 
-        eligibility_status = ELIGIBILITY_ELIGIBLE if not blocking_reasons else ELIGIBILITY_BLOCKED
-        if eligibility_status == ELIGIBILITY_ELIGIBLE:
-            execution_status = execution_status if execution_status == EXECUTION_STATUS_SUBMIT_FAILED else EXECUTION_STATUS_PLANNED
+            if observed_price is None or observed_price <= Decimal('0'):
+                blocking_reasons.append(
+                    _reason(
+                        'live_price_unavailable',
+                        'No usable live price was available for trigger evaluation.',
+                    )
+                )
+            if sellable_quantity <= Decimal('0'):
+                blocking_reasons.append(
+                    _reason(
+                        'sellable_quantity_zero',
+                        'The linked holding does not currently have sellable quantity available.',
+                    )
+                )
+            if linked_remaining_quantity <= Decimal('0'):
+                blocking_reasons.append(
+                    _reason(
+                        'linked_quantity_depleted',
+                        'The linked next-open entry has already been fully offset by prior auto-sell fills.',
+                    )
+                )
+            elif watched_quantity <= Decimal('0'):
+                blocking_reasons.append(
+                    _reason(
+                        'sellable_quantity_reserved',
+                        'The live holding has no remaining sellable quantity after allocating earlier linked tranches.',
+                    )
+                )
 
-        validation_payload = {
-            'blocking_reasons': blocking_reasons,
-            'warnings': warnings,
-            'trigger': {
-                'rule': trigger_rule,
-                'live_price': _to_json_number(observed_price),
+            trigger_rule: str | None = None
+            if (
+                observed_price is not None
+                and observed_price > Decimal('0')
+                and snapshot.target_price
+                and snapshot.stop_loss_price
+            ):
+                trigger_rule = self._resolve_trigger_rule(
+                    observed_price=observed_price,
+                    target_price=Decimal(str(snapshot.target_price)),
+                    stop_loss_price=Decimal(str(snapshot.stop_loss_price)),
+                )
+
+            if latest_attempt is not None:
+                existing_reason = self._classify_existing_attempt(
+                    latest_attempt=latest_attempt,
+                    current_row=self._load_watch_row(
+                        target_trade_date=source.row.target_trade_date,
+                        account_reference=account.account_reference,
+                        symbol=symbol,
+                    ),
+                    trigger_rule=trigger_rule,
+                    market_state=market_state,
+                )
+                if existing_reason is not None:
+                    cooldown_until = existing_reason.get('cooldown_until')
+                    blocking_reasons.append(existing_reason['reason'])
+                    execution_status = existing_reason['execution_status']
+
+            if not blocking_reasons and trigger_rule is None:
+                blocking_reasons.append(
+                    _reason(
+                        'trigger_not_hit',
+                        'The linked holding is active, but neither the target nor stop threshold has been hit.',
+                    )
+                )
+
+            if holding_period_expired:
+                warnings.append(
+                    _reason(
+                        'holding_period_expired',
+                        'The linked signal-decider suggested holding period has expired.',
+                        expiry_trade_date=holding_period_expiry_trade_date.isoformat()
+                        if holding_period_expiry_trade_date
+                        else None,
+                    )
+                )
+
+            eligibility_status = ELIGIBILITY_ELIGIBLE if not blocking_reasons else ELIGIBILITY_BLOCKED
+            if eligibility_status == ELIGIBILITY_ELIGIBLE:
+                execution_status = (
+                    execution_status if execution_status == EXECUTION_STATUS_SUBMIT_FAILED else EXECUTION_STATUS_PLANNED
+                )
+
+            validation_payload = {
+                'blocking_reasons': blocking_reasons,
+                'warnings': warnings,
+                'trigger': {
+                    'rule': trigger_rule,
+                    'live_price': _to_json_number(observed_price),
+                    'target_price': snapshot.target_price,
+                    'stop_loss_price': snapshot.stop_loss_price,
+                    'watched_quantity': _decimal_to_text(watched_quantity),
+                    'entry_filled_quantity': _decimal_to_text(entry_filled_quantity),
+                    'linked_remaining_quantity': _decimal_to_text(linked_remaining_quantity),
+                    'prior_auto_sell_filled_quantity': _decimal_to_text(prior_auto_sell_filled_quantity),
+                    'position_quantity': _decimal_to_text(quantity),
+                    'sellable_quantity': _decimal_to_text(sellable_quantity),
+                    'available_sellable_quantity': _decimal_to_text(available_sellable_quantity),
+                    'price_source': price_source,
+                    'observed_at': observed_at,
+                    'holding_period_expired': holding_period_expired,
+                    'cooldown_until': cooldown_until,
+                },
+                'position': {
+                    'quantity': _to_json_number(quantity),
+                    'sellable_quantity': _to_json_number(sellable_quantity),
+                    'market_value': position.get('market_value'),
+                    'average_price': position.get('average_price'),
+                },
+                'latest_auto_sell': self._summarize_attempt_pair(latest_attempt),
+                'triggered_by': trigger,
+            }
+            traceability_payload = {
+                'decision_snapshot_id': snapshot.id,
+                'linked_next_open_plan_item_id': source.row.id,
+                'linked_next_open_client_order_id': source.row.client_order_id,
+                'linked_next_open_order_request_id': source.row.order_request_id,
+                'linked_next_open_broker_order_row_id': source.row.broker_order_row_id,
+                'linked_target_trade_date': source.row.target_trade_date.isoformat(),
+                'linked_source_market_date': source.row.source_market_date.isoformat(),
+                'linked_entry_filled_quantity': _decimal_to_text(entry_filled_quantity),
                 'target_price': snapshot.target_price,
                 'stop_loss_price': snapshot.stop_loss_price,
-                'watched_quantity': _decimal_to_text(watched_quantity),
-                'entry_filled_quantity': _decimal_to_text(entry_filled_quantity),
-                'prior_auto_sell_filled_quantity': _decimal_to_text(prior_auto_sell_filled_quantity),
-                'position_quantity': _decimal_to_text(quantity),
-                'sellable_quantity': _decimal_to_text(sellable_quantity),
-                'price_source': price_source,
-                'observed_at': observed_at,
-                'holding_period_expired': holding_period_expired,
-                'cooldown_until': cooldown_until,
-            },
-            'position': {
-                'quantity': _to_json_number(quantity),
-                'sellable_quantity': _to_json_number(sellable_quantity),
-                'market_value': position.get('market_value'),
-                'average_price': position.get('average_price'),
-            },
-            'latest_auto_sell': self._summarize_attempt_pair(latest_attempt),
-            'triggered_by': trigger,
-        }
-        traceability_payload = {
-            'decision_snapshot_id': snapshot.id,
-            'linked_next_open_plan_item_id': source.row.id,
-            'linked_next_open_client_order_id': source.row.client_order_id,
-            'linked_next_open_order_request_id': source.row.order_request_id,
-            'linked_next_open_broker_order_row_id': source.row.broker_order_row_id,
-            'linked_target_trade_date': source.row.target_trade_date.isoformat(),
-            'linked_source_market_date': source.row.source_market_date.isoformat(),
-            'linked_entry_filled_quantity': _decimal_to_text(entry_filled_quantity),
-            'target_price': snapshot.target_price,
-            'stop_loss_price': snapshot.stop_loss_price,
-            'suggested_holding_period': snapshot.suggested_holding_period,
-            'holding_period_min_days': holding_min_days,
-            'holding_period_max_days': holding_max_days,
-            'holding_period_expiry_trade_date': holding_period_expiry_trade_date.isoformat()
-            if holding_period_expiry_trade_date
-            else None,
-        }
+                'suggested_holding_period': snapshot.suggested_holding_period,
+                'holding_period_min_days': holding_min_days,
+                'holding_period_max_days': holding_max_days,
+                'holding_period_expiry_trade_date': holding_period_expiry_trade_date.isoformat()
+                if holding_period_expiry_trade_date
+                else None,
+            }
 
-        row_id = self._upsert_watch_row(
-            account=account,
-            source=source,
-            snapshot=snapshot,
-            symbol=symbol,
-            observed_price=observed_price,
-            watched_quantity=watched_quantity,
-            eligibility_status=eligibility_status,
-            execution_status=execution_status,
-            validation_payload=validation_payload,
-            traceability_payload=traceability_payload,
-            latest_attempt=latest_attempt,
-        )
-        return self._serialize_row(self._load_watch_row_by_id(row_id=row_id))
+            row_id = self._upsert_watch_row(
+                account=account,
+                source=source,
+                snapshot=snapshot,
+                symbol=symbol,
+                observed_price=observed_price,
+                watched_quantity=watched_quantity,
+                eligibility_status=eligibility_status,
+                execution_status=execution_status,
+                validation_payload=validation_payload,
+                traceability_payload=traceability_payload,
+                latest_attempt=latest_attempt,
+            )
+            items.append(self._serialize_row(self._load_watch_row_by_id(row_id=row_id)))
+
+        return items
 
     async def _resolve_observed_price(
         self,
@@ -915,12 +942,12 @@ class SignalDeciderIntradayAutoSellService:
             )
         return accounts, errors, 'next_open_execution_history'
 
-    def _load_latest_linked_source_plan(
+    def _load_linked_source_plans(
         self,
         *,
         account_reference: str,
         symbol: str,
-    ) -> LinkedNextOpenPlan | None:
+    ) -> list[LinkedNextOpenPlan]:
         with session_scope() as session:
             rows = session.execute(
                 select(SignalDeciderExecutionPlanItem)
@@ -939,6 +966,7 @@ class SignalDeciderIntradayAutoSellService:
             for row in rows:
                 session.expunge(row)
 
+        matches: list[LinkedNextOpenPlan] = []
         for row in rows:
             request = (
                 load_order_request(
@@ -962,8 +990,8 @@ class SignalDeciderIntradayAutoSellService:
                 BrokerOrderStatus.PARTIAL_FILL.value,
                 BrokerOrderStatus.FILLED.value,
             }:
-                return LinkedNextOpenPlan(row=row, request=request, order=order)
-        return None
+                matches.append(LinkedNextOpenPlan(row=row, request=request, order=order))
+        return matches
 
     def _load_auto_sell_attempt_pairs(
         self,

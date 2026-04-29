@@ -249,7 +249,16 @@ class IntradayAutoSellServiceTests(unittest.IsolatedAsyncioTestCase):
             session.flush()
             return row.id
 
-    def _seed_next_open_entry(self, *, filled_quantity: str = '5', planned_quantity: str = '5') -> int:
+    def _seed_next_open_entry(
+        self,
+        *,
+        filled_quantity: str = '5',
+        planned_quantity: str = '5',
+        market_date: date | None = None,
+        target_trade_date: date | None = None,
+    ) -> int:
+        market_date = market_date or self.market_date
+        target_trade_date = target_trade_date or self.target_trade_date
         snapshot_id = self._seed_snapshot()
         buy_client_order_id = f'BUY-{uuid4().hex[:10].upper()}'
         request_row = upsert_order_request(
@@ -266,7 +275,7 @@ class IntradayAutoSellServiceTests(unittest.IsolatedAsyncioTestCase):
                 'time_in_force': 'day',
                 'strategy_context_payload': {
                     'signal_decider_next_open': {
-                        'target_trade_date': self.target_trade_date.isoformat(),
+                        'target_trade_date': target_trade_date.isoformat(),
                     }
                 },
                 'request_payload': {'from': 'seed-next-open-entry'},
@@ -306,8 +315,8 @@ class IntradayAutoSellServiceTests(unittest.IsolatedAsyncioTestCase):
                 order_request_id=request_row['id'],
                 broker_order_row_id=order_row['id'],
                 broker_name='kis',
-                target_trade_date=self.target_trade_date,
-                source_market_date=self.market_date,
+                target_trade_date=target_trade_date,
+                source_market_date=market_date,
                 account_reference=self.account_reference,
                 account_label='Main',
                 symbol=self.symbol,
@@ -454,6 +463,42 @@ class IntradayAutoSellServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result['summary']['submitted_count'], 1)
         self.assertEqual(self.order_service.calls[0]['quantity'], Decimal('3'))
+
+    async def test_refresh_and_run_track_all_linked_filled_tranches_for_same_symbol(self) -> None:
+        older_entry_plan_item_id = self._seed_next_open_entry(
+            filled_quantity='3',
+            planned_quantity='3',
+            market_date=date(2026, 4, 28),
+            target_trade_date=date(2026, 4, 29),
+        )
+        newer_entry_plan_item_id = self._seed_next_open_entry(
+            filled_quantity='5',
+            planned_quantity='5',
+            market_date=date(2026, 4, 29),
+            target_trade_date=date(2026, 4, 30),
+        )
+        self._set_live_position(quantity='8', sellable_quantity='8')
+        self._set_live_quote(price=55000)
+
+        service = self._service()
+        refresh = await service.refresh_watch_items(trigger='test_refresh')
+
+        self.assertEqual(refresh['summary']['items_total'], 2)
+        self.assertEqual(refresh['summary']['ready_count'], 2)
+        self.assertEqual(
+            [item['traceability']['linked_next_open_plan_item_id'] for item in refresh['items']],
+            [older_entry_plan_item_id, newer_entry_plan_item_id],
+        )
+        self.assertEqual(
+            [Decimal(item['validation']['trigger']['watched_quantity']) for item in refresh['items']],
+            [Decimal('3'), Decimal('5')],
+        )
+
+        result = await service.run_intraday_auto_sell_if_due(force=True, trigger='test')
+
+        self.assertEqual(result['summary']['selected_count'], 2)
+        self.assertEqual(result['summary']['submitted_count'], 2)
+        self.assertEqual([call['quantity'] for call in self.order_service.calls], [Decimal('3'), Decimal('5')])
 
 
 if __name__ == '__main__':
