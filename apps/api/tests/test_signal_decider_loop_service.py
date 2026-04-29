@@ -1,14 +1,27 @@
+from contextlib import contextmanager
 from datetime import date, datetime, timezone
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+from sqlalchemy import create_engine, event
+from sqlalchemy.orm import sessionmaker
+
 from app.agent_context.signal_decider_loop_service import (
     DEFAULT_SIGNAL_DECIDER_EVALUATION_LOOKBACK_DAYS,
+    DEFAULT_SIGNAL_DECIDER_EVALUATION_VERSION,
     DEFAULT_SIGNAL_DECIDER_POLICY_VERSION,
     SignalDeciderLoopService,
+    SignalDeciderLoopRepository,
     _merge_policy_metadata_preserving_audit,
 )
+from app.db_models import AgentContextFeedback, Base, SignalDeciderDecisionSnapshot, SignalDeciderEvaluation
+
+
+def _enable_sqlite_foreign_keys(dbapi_connection, _connection_record) -> None:
+    cursor = dbapi_connection.cursor()
+    cursor.execute('PRAGMA foreign_keys=ON')
+    cursor.close()
 
 
 def _feedback_row(
@@ -603,6 +616,102 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
             {item['policy_version'] for item in result['items']},
             {'signal_decider_policy_v1', 'signal_decider_policy_v2'},
         )
+
+    def test_list_decisions_materializes_snapshot_rows_before_session_close(self):
+        engine = create_engine('sqlite+pysqlite:///:memory:')
+        event.listen(engine, 'connect', _enable_sqlite_foreign_keys)
+        Base.metadata.create_all(
+            engine,
+            tables=[
+                AgentContextFeedback.__table__,
+                SignalDeciderDecisionSnapshot.__table__,
+                SignalDeciderEvaluation.__table__,
+            ],
+        )
+        TestSessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+
+        @contextmanager
+        def test_session_scope():
+            session = TestSessionLocal()
+            try:
+                yield session
+                session.commit()
+            except Exception:
+                session.rollback()
+                raise
+            finally:
+                session.close()
+
+        try:
+            with TestSessionLocal() as session:
+                snapshot = SignalDeciderDecisionSnapshot(
+                    feedback_id=None,
+                    market_date=date(2026, 4, 29),
+                    symbol='005930',
+                    agent_name='signal-decider',
+                    agent_version='openclaw-v1',
+                    decision_run_id='signal-run-274',
+                    feedback_received_at=datetime(2026, 4, 29, 6, 0, tzinfo=timezone.utc),
+                    policy_version='signal_decider_policy_v1',
+                    decision_action='buy',
+                    preferred_action='buy',
+                    next_day_open_action='buy',
+                    entry_price_basis='next_open',
+                    target_price=105000,
+                    expected_return_pct=4.0,
+                    stop_loss_price=99000,
+                    suggested_holding_period='3-10 trading days',
+                    confidence_score_10=7.0,
+                    conviction_score_10=6.0,
+                    thesis_summary='Breakout continuation with manageable risk.',
+                    supporting_evidence_payload=['Breadth improved.'],
+                    decision_risks_payload=['Leadership remained narrow.'],
+                    invalidation_conditions_payload=['Close back below breakout level.'],
+                    data_quality_warnings_payload=[],
+                    specialist_disagreement_payload=[],
+                    traceability_payload={'agent_name': 'signal-decider'},
+                    input_feature_snapshot_payload={'technical': {'breakout_20d': True}},
+                    request_payload={'symbol_day_context': {}},
+                    response_payload={'preferred_action': 'buy', 'next_day_open_action': 'buy'},
+                    response_summary_payload={'summary': 'buy setup'},
+                )
+                session.add(snapshot)
+                session.commit()
+                snapshot_id = snapshot.id
+
+            with patch('app.agent_context.signal_decider_loop_service.session_scope', test_session_scope):
+                service = SignalDeciderLoopService(repository=SignalDeciderLoopRepository())
+                result = service.list_decisions(market_date='2026-04-29', limit=1)
+
+            self.assertEqual(result['summary']['count'], 1)
+            self.assertEqual(result['summary']['evaluated_count'], 0)
+            self.assertEqual(result['summary']['verdict_counts'], {})
+            self.assertEqual(result['items'][0]['snapshot_id'], snapshot_id)
+            self.assertEqual(result['items'][0]['market_date'], '2026-04-29')
+            self.assertEqual(
+                result['items'][0]['evaluation_summary'],
+                {
+                    'evaluation_version': DEFAULT_SIGNAL_DECIDER_EVALUATION_VERSION,
+                    'evaluated': False,
+                    'graded_horizon_count': 0,
+                    'pending_horizon_count': 0,
+                    'has_missed_opportunity': False,
+                    'verdict_counts': {},
+                    'latest_graded': None,
+                    'horizons': [],
+                },
+            )
+            self.assertIsNone(result['items'][0]['explanation']['latest_evaluation'])
+        finally:
+            Base.metadata.drop_all(
+                engine,
+                tables=[
+                    SignalDeciderEvaluation.__table__,
+                    SignalDeciderDecisionSnapshot.__table__,
+                    AgentContextFeedback.__table__,
+                ],
+            )
+            engine.dispose()
 
     def test_list_decisions_filters_by_verdict_and_policy_version(self):
         repository = FakeSignalDeciderLoopRepository(
