@@ -101,6 +101,9 @@ class FakeDisclosureRepository:
 
 
 class AgentContextReadServiceTests(unittest.TestCase):
+    @patch('app.agent_context.read_service.load_daily_momentum_factor_results')
+    @patch('app.agent_context.read_service.load_daily_quality_factor_results')
+    @patch('app.agent_context.read_service.load_daily_unified_value_factor_results')
     @patch('app.agent_context.read_service.load_daily_price_context_history')
     @patch('app.agent_context.read_service.load_daily_price_contexts')
     @patch('app.agent_context.read_service.load_daily_action_summaries')
@@ -115,6 +118,9 @@ class AgentContextReadServiceTests(unittest.TestCase):
         load_actions_mock,
         load_price_contexts_mock,
         load_price_context_history_mock,
+        load_unified_value_mock,
+        load_quality_mock,
+        load_momentum_mock,
     ):
         load_symbols_mock.return_value = [
             {
@@ -182,6 +188,146 @@ class AgentContextReadServiceTests(unittest.TestCase):
                 'overtime_fluctuation_rate': None,
                 'feature_payload': {'sources': {'volume-power': {'rank': 3}}},
                 'captured_at': '2026-04-08T15:00:00+09:00',
+            }
+        ]
+        load_unified_value_mock.return_value = [
+            {
+                'symbol': '005930',
+                'market_date': '2026-04-08',
+                'source': 'unified_value_v1',
+                'feature_version': 'unified_value_v1',
+                'unified_value_score': 0.84,
+                'unified_value_rank': 5,
+                'unified_value_percentile': 0.96,
+                'components_used': 5,
+                'unified_value_status': 'scored',
+                'factor_payload': {
+                    'availability': {
+                        'components_used': 5,
+                        'components_required': 5,
+                        'valid_component_keys': ['per', 'pbr', 'dividend_yield', 'fcf_yield', 'ev_to_ebitda'],
+                        'missing_component_keys': [],
+                    },
+                    'component_statuses': {
+                        'per': 'available',
+                        'pbr': 'available',
+                        'dividend_yield': 'available',
+                        'fcf_yield': 'available',
+                        'ev_to_ebitda': 'available',
+                    },
+                    'methodology': {
+                        'score_method': 'equal_weight_mean_of_five_component_percentiles',
+                        'score_requirement': 'all_five_components_required',
+                        'ranking_directions': {
+                            'per': 'lower_better_positive_only',
+                            'pbr': 'lower_better_positive_only',
+                            'dividend_yield': 'higher_better_non_negative',
+                            'fcf_yield': 'higher_better',
+                            'ev_to_ebitda': 'lower_better',
+                            'unified_value_score': 'higher_better',
+                        },
+                    },
+                },
+            }
+        ]
+        load_quality_mock.return_value = [
+            {
+                'symbol': '005930',
+                'market_date': '2026-04-08',
+                'source': 'quality_v1',
+                'feature_version': 'quality_v1',
+                'quality_score': 0.741,
+                'quality_rank': 7,
+                'quality_percentile': 0.88,
+                'components_used': 5,
+                'components_possible': 6,
+                'is_quality_score_complete': False,
+                'quality_status': 'scored_partial',
+                'factor_payload': {
+                    'availability': {
+                        'components_used': 5,
+                        'components_possible': 6,
+                        'is_quality_score_complete': False,
+                        'valid_component_keys': [
+                            'roe',
+                            'roa',
+                            'gross_profit_to_assets',
+                            'operating_cash_flow_to_net_income',
+                            'debt_ratio',
+                        ],
+                        'missing_component_keys': ['accruals_ratio'],
+                    },
+                    'component_statuses': {
+                        'roe': 'available',
+                        'roa': 'available',
+                        'gross_profit_to_assets': 'available',
+                        'operating_cash_flow_to_net_income': 'available',
+                        'debt_ratio': 'available',
+                        'accruals_ratio': 'missing_total_assets',
+                    },
+                    'methodology': {
+                        'score_method': 'equal_weight_mean_of_available_component_percentiles',
+                        'score_requirement': 'at_least_one_component_required',
+                        'complete_requirement': 'all_six_components_required',
+                        'ranking_directions': {
+                            'roe': 'higher_better',
+                            'roa': 'higher_better',
+                            'gross_profit_to_assets': 'higher_better',
+                            'operating_cash_flow_to_net_income': 'higher_better_positive_net_income_required',
+                            'debt_ratio': 'lower_better',
+                            'accruals_ratio': 'lower_better',
+                            'quality_score': 'higher_better',
+                        },
+                    },
+                },
+            }
+        ]
+        load_momentum_mock.return_value = [
+            {
+                'symbol': '005930',
+                'market_date': '2026-04-08',
+                'source': 'daily_price_bars',
+                'feature_version': 'price_momentum_v1',
+                'close_price': 71500,
+                'ma_60': 68500.0,
+                'ma_120': 64100.0,
+                'momentum_12_1': 0.421,
+                'return_5d': 0.052,
+                'momentum_rank': 12,
+                'momentum_percentile': 0.91,
+                'momentum_percentile_threshold': 0.8,
+                'passes_momentum_top_percentile': True,
+                'is_momentum_eligible': True,
+                'factor_payload': {
+                    'feature_version': 'price_momentum_v1',
+                    'ranking': {
+                        'momentum_percentile_threshold': 0.8,
+                    },
+                    'eligibility': {
+                        'passes_trend_confirmation': True,
+                        'passes_momentum_top_percentile': True,
+                        'momentum_eligibility_status': 'eligible',
+                        'is_momentum_eligible': True,
+                    },
+                    'eligibility_rule': {
+                        'rule_version': 'momentum_top_percentile_v1',
+                        'percentile_gate': {
+                            'field': 'momentum_percentile',
+                            'comparison': '>=',
+                            'threshold': 0.8,
+                        },
+                    },
+                    'overheat': {
+                        'has_sufficient_cross_sectional_context': True,
+                        'is_recent_overheated': False,
+                    },
+                    'overheat_rule': {
+                        'rule_version': 'momentum_overheat_v2',
+                    },
+                    'volatility': {
+                        'return_5d_vol_adjusted': 1.4,
+                    },
+                },
             }
         ]
         load_price_contexts_mock.return_value = [
@@ -298,6 +444,15 @@ class AgentContextReadServiceTests(unittest.TestCase):
         self.assertEqual(first_item['technical_snapshot']['trend_state'], 'uptrend')
         self.assertEqual(first_item['action_summary']['action_label'], 'long_breakout')
         self.assertEqual(first_item['signal_features']['signal_count'], 2)
+        self.assertEqual(first_item['scores']['unified_value']['status'], 'available')
+        self.assertEqual(first_item['scores']['unified_value']['score'], 0.84)
+        self.assertEqual(first_item['scores']['quality']['status'], 'partial')
+        self.assertEqual(first_item['scores']['quality']['components_used'], 5)
+        self.assertEqual(first_item['scores']['quality']['components_possible'], 6)
+        self.assertIn('Missing quality components: accruals_ratio.', first_item['scores']['quality']['coverage_notes'])
+        self.assertEqual(first_item['scores']['momentum']['status'], 'available')
+        self.assertEqual(first_item['scores']['momentum']['score'], 0.91)
+        self.assertEqual(first_item['scores']['momentum']['components_possible'], 3)
         self.assertEqual(first_item['fundamentals']['latest_snapshot']['period']['period_end_date'], '2024-12-31')
         self.assertEqual(first_item['fundamentals']['latest_snapshot']['statement']['row_count'], 1)
         self.assertEqual(first_item['recent_disclosures']['count'], 1)
@@ -309,6 +464,9 @@ class AgentContextReadServiceTests(unittest.TestCase):
         self.assertEqual(second_item['price_context_history'], [])
         self.assertIsNone(second_item['technical_snapshot'])
         self.assertIsNone(second_item['signal_features'])
+        self.assertEqual(second_item['scores']['unified_value']['status'], 'unavailable')
+        self.assertEqual(second_item['scores']['quality']['status'], 'unavailable')
+        self.assertEqual(second_item['scores']['momentum']['status'], 'unavailable')
         self.assertIsNone(second_item['fundamentals']['latest_snapshot'])
         self.assertEqual(second_item['recent_disclosures']['count'], 0)
         self.assertFalse(second_item['availability']['price_context'])

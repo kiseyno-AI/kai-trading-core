@@ -70,7 +70,42 @@ def _feedback_row(
                 'gap_vs_prev_close_pct': 0.3,
                 'range_pct': 4.1,
             },
-        }
+        },
+        'scores': {
+            'unified_value': {
+                'status': 'available',
+                'score': 0.84,
+                'higher_is_better': True,
+                'meaning': 'Composite value attractiveness score across stored cross-sectional value percentiles.',
+                'method': 'Equal-weight mean of PER, PBR, dividend yield, FCF yield, and EV/EBITDA percentiles.',
+                'components_used': 5,
+                'components_possible': 5,
+                'coverage_notes': [],
+                'as_of_market_date': market_date,
+            },
+            'quality': {
+                'status': 'partial',
+                'score': 0.74,
+                'higher_is_better': True,
+                'meaning': 'Business quality score across profitability, cash-flow quality, and balance-sheet quality inputs.',
+                'method': 'Equal-weight mean of the available quality component percentiles.',
+                'components_used': 5,
+                'components_possible': 6,
+                'coverage_notes': ['Missing quality components: accruals_ratio.'],
+                'as_of_market_date': market_date,
+            },
+            'momentum': {
+                'status': 'available',
+                'score': 0.91,
+                'higher_is_better': True,
+                'meaning': 'Medium-term price-strength score plus trend and overheat gating context from stored daily bars.',
+                'method': 'Ranks 12-1 momentum from stored daily closes, then records trend confirmation, a top-percentile eligibility gate, and the configured recent-overheat guard.',
+                'components_used': 3,
+                'components_possible': 3,
+                'coverage_notes': [],
+                'as_of_market_date': market_date,
+            },
+        },
     }
     response_payload = {
         'role': 'signal-decider',
@@ -169,6 +204,7 @@ def _feedback_row(
                 'gap_vs_prev_close_pct': 0.3,
                 'range_pct': 4.1,
             },
+            'scores': request_payload['scores'],
             'meta': {
                 'supporting_evidence_count': 1,
                 'decision_risk_count': 1,
@@ -176,6 +212,7 @@ def _feedback_row(
                 'disagreement_count': 0,
                 'has_data_warnings': False,
                 'has_disagreement': False,
+                'has_score_context': True,
             },
         },
         request_payload=request_payload,
@@ -529,7 +566,17 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
                     'action_summary': {'signal_score': 78, 'confidence_tier': 'high'},
                     'signal_features': {'signal_count': 3},
                     'price_context': {'close_location_ratio': 0.8},
-                }
+                },
+                'scores': {
+                    'unified_value': {
+                        'status': 'available',
+                        'score': 0.83,
+                        'components_used': 5,
+                        'components_possible': 5,
+                        'coverage_notes': [],
+                        'as_of_market_date': '2026-04-23',
+                    }
+                },
             },
         )
 
@@ -541,6 +588,11 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
             context['signal_decider_trace']['feature_snapshot']['action_summary']['signal_score_bucket'],
             'high',
         )
+        self.assertEqual(
+            context['signal_decider_trace']['feature_snapshot']['scores']['unified_value']['score'],
+            0.83,
+        )
+        self.assertTrue(context['signal_decider_trace']['feature_snapshot']['meta']['has_score_context'])
 
     def test_prepare_snapshot_persistence_item_builds_structured_traceability(self):
         service = SignalDeciderLoopService(repository=FakeSignalDeciderLoopRepository([]))
@@ -568,6 +620,16 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
                     'signal_features': {'signal_count': 3},
                     'price_context': {'close_location_ratio': 0.8},
                 },
+                'scores': {
+                    'quality': {
+                        'status': 'partial',
+                        'score': 0.74,
+                        'components_used': 5,
+                        'components_possible': 6,
+                        'coverage_notes': ['Missing quality components: accruals_ratio.'],
+                        'as_of_market_date': '2026-04-23',
+                    }
+                },
                 'upstream_traceability': {
                     'technical-summarizer': {'feedback_id': 7, 'run_id': 'upstream-7', 'source': 'persisted_feedback'}
                 },
@@ -584,6 +646,8 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
         )
         self.assertTrue(snapshot_item['traceability_payload']['gate_checks']['traceability_symbol_matches'])
         self.assertEqual(snapshot_item['input_feature_snapshot_payload']['technical']['breakout_20d'], True)
+        self.assertEqual(snapshot_item['request_payload']['scores']['quality']['status'], 'partial')
+        self.assertEqual(snapshot_item['input_feature_snapshot_payload']['scores']['quality']['components_possible'], 6)
 
     def test_list_decisions_preserves_multiple_snapshots_for_one_symbol_date(self):
         repository = FakeSignalDeciderLoopRepository(

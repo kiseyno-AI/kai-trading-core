@@ -5,15 +5,19 @@ from datetime import date
 from typing import Any, Sequence
 
 from app.agent_context.derived_contexts import DEFAULT_DERIVED_CONTEXT_HISTORY_DAYS, build_price_context
+from app.agent_context.score_context import build_signal_decider_scores
 from app.dart.fundamentals_store import DartFundamentalsRepository, dart_fundamentals_repository
 from app.dart.service import FS_DIV_TO_STATEMENT_TYPE, REPORT_CODE_METADATA
 from app.dart.store import DartSyncRepository, dart_sync_repository
 from app.market_data_store import (
     load_daily_action_summaries,
+    load_daily_momentum_factor_results,
     load_daily_price_context_history,
     load_daily_price_contexts,
+    load_daily_quality_factor_results,
     load_daily_signal_features,
     load_daily_technical_snapshots,
+    load_daily_unified_value_factor_results,
     load_symbols,
 )
 
@@ -256,6 +260,21 @@ class AgentContextReadService:
             symbols=normalized_symbols,
             limit=max(len(normalized_symbols), 1000),
         )
+        unified_value_rows = load_daily_unified_value_factor_results(
+            market_date=normalized_market_date,
+            symbols=normalized_symbols,
+            limit=max(len(normalized_symbols), 1000),
+        )
+        quality_rows = load_daily_quality_factor_results(
+            market_date=normalized_market_date,
+            symbols=normalized_symbols,
+            limit=max(len(normalized_symbols), 1000),
+        )
+        momentum_rows = load_daily_momentum_factor_results(
+            market_date=normalized_market_date,
+            symbols=normalized_symbols,
+            limit=max(len(normalized_symbols), 1000),
+        )
         price_context_rows = load_daily_price_contexts(
             market_date=normalized_market_date,
             symbols=normalized_symbols,
@@ -280,6 +299,9 @@ class AgentContextReadService:
         technical_map = {item['symbol']: item for item in technical_rows}
         action_map = {item['symbol']: item for item in action_rows}
         signal_feature_map = {item['symbol']: item for item in signal_feature_rows}
+        unified_value_map = {item['symbol']: item for item in unified_value_rows}
+        quality_map = {item['symbol']: item for item in quality_rows}
+        momentum_map = {item['symbol']: item for item in momentum_rows}
         price_context_map = {item['symbol']: item['context_payload'] for item in price_context_rows}
         price_context_history_map = _group_price_context_history(
             price_context_history_rows,
@@ -301,6 +323,12 @@ class AgentContextReadService:
             technical_snapshot = technical_map.get(symbol)
             action_summary = action_map.get(symbol)
             signal_features = signal_feature_map.get(symbol)
+            scores = build_signal_decider_scores(
+                market_date=normalized_market_date,
+                unified_value_row=unified_value_map.get(symbol),
+                quality_row=quality_map.get(symbol),
+                momentum_row=momentum_map.get(symbol),
+            )
             fundamentals = _build_fundamentals_summary(
                 fundamentals_map.get(symbol, []),
                 market_date=normalized_market_date,
@@ -363,6 +391,7 @@ class AgentContextReadService:
                     'technical_snapshot': technical_snapshot,
                     'action_summary': action_summary,
                     'signal_features': signal_features,
+                    'scores': scores,
                     'fundamentals': fundamentals,
                     'recent_disclosures': {
                         'count': len(recent_disclosures),

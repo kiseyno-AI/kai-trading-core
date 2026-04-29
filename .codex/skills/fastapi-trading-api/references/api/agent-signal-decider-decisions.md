@@ -75,7 +75,7 @@ GET /agent-context/signal-decider/decisions?market_date_from=2026-04-20&market_d
 # GET /agent-context/signal-decider/decisions/{snapshot_id}
 
 ## Summary
-Reads one immutable `signal-decider` decision snapshot by `snapshot_id`, including the stable explanation block, frozen request/response payloads, upstream references, synthetic realized outcomes, separate actual execution outcomes, and versioned evaluations in one place.
+Reads one immutable `signal-decider` decision snapshot by `snapshot_id`, including the stable explanation block, frozen request/response payloads, upstream references, synthetic realized outcomes, separate actual execution outcomes, and versioned evaluations in one place. The frozen request payload now preserves the structured unified-value, quality, and momentum `scores` block exactly as the decider saw it.
 
 ## Example request
 ```http
@@ -96,6 +96,35 @@ GET /agent-context/signal-decider/decisions/84?horizons=1&horizons=5&evaluation_
       ]
     },
     "request_payload": {
+      "scores": {
+        "unified_value": {
+          "status": "available",
+          "score": 0.873,
+          "higher_is_better": true,
+          "components_used": 5,
+          "components_possible": 5,
+          "coverage_notes": [],
+          "as_of_market_date": "2026-04-23"
+        },
+        "quality": {
+          "status": "partial",
+          "score": 0.741,
+          "higher_is_better": true,
+          "components_used": 5,
+          "components_possible": 6,
+          "coverage_notes": ["Missing quality components: accruals_ratio."],
+          "as_of_market_date": "2026-04-23"
+        },
+        "momentum": {
+          "status": "available",
+          "score": 0.914,
+          "higher_is_better": true,
+          "components_used": 3,
+          "components_possible": 3,
+          "coverage_notes": [],
+          "as_of_market_date": "2026-04-23"
+        }
+      },
       "signal_decider_policy": {
         "current_version": "signal_decider_policy_v1"
       }
