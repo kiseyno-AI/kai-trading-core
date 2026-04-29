@@ -61,6 +61,9 @@ class Settings(BaseSettings):
     signal_decider_next_open_block_on_data_warnings: bool = True
     signal_decider_next_open_block_on_specialist_disagreement: bool = True
     signal_decider_next_open_require_target_and_stop: bool = True
+    signal_decider_intraday_auto_sell_enabled: bool = False
+    signal_decider_intraday_auto_sell_dry_run: bool = True
+    signal_decider_intraday_auto_sell_cooldown_seconds: int = 120
 
     bok_ecos_api_key: str = Field(
         default='',

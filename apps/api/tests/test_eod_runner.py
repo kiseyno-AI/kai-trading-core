@@ -60,6 +60,10 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
                 new=AsyncMock(),
             ) as run_execution,
             patch(
+                'app.eod.runner.signal_decider_intraday_auto_sell_service.run_intraday_auto_sell_if_due',
+                new=AsyncMock(),
+            ) as run_intraday_auto_sell,
+            patch(
                 'app.eod.runner.trading_order_reconciliation_service.run_periodic_if_due',
                 new=AsyncMock(),
             ) as reconcile,
@@ -69,4 +73,5 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
             await runner._run_loop()
 
         run_execution.assert_awaited_once_with(trigger='market_open_scheduler')
+        run_intraday_auto_sell.assert_awaited_once_with(trigger='market_open_scheduler')
         reconcile.assert_awaited_once_with()

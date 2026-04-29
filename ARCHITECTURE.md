@@ -17,6 +17,7 @@
 - **`app/dart/`** — DART company snapshot logic plus incremental disclosure-event sync, fundamentals capture, and DART persistence/repository code.
 - **`app/brokers/kis/`** — KIS client/provider/schemas.
 - **`app/orders/next_open_execution.py`** — persisted next-open execution planner that derives signal-decider buy candidates, applies account/allocation safety gates, and submits through the durable order flow at market open.
+- **`app/orders/intraday_auto_sell.py`** — persisted intraday watcher for linked next-open positions that evaluates live target/stop thresholds, suppresses duplicate exits, and submits sell orders through the durable order flow.
 - **`app/integrations/`** — BOK, FX (Korea Exim), etc.
 - **`app/fx/`** — Korea Exim FX service-level normalization, filtering, and date fallback behavior.
 - **`app/quotes/`**, **`app/market/`**, **`app/scanner/`**, **`app/eod/`**, **`app/signals/`** — domain services and background behavior, including pykrx-based historical EOD backfill and daily KIS ranking signal features.

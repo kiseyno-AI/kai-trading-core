@@ -32,6 +32,7 @@ from app.market_data_store import (
     load_tracked_symbols,
     persist_market_status_snapshot,
 )
+from app.orders.intraday_auto_sell import signal_decider_intraday_auto_sell_service
 from app.orders.next_open_execution import signal_decider_next_open_execution_service
 from app.orders.reconciliation import trading_order_reconciliation_service
 from app.quotes.service import QuoteService
@@ -508,6 +509,25 @@ def run_next_open_execution_if_due(
     )
 
 
+def run_intraday_auto_sell_if_due(
+    *,
+    account_reference: str | None = None,
+    symbol: str | None = None,
+    dry_run: bool | None = None,
+    force: bool = False,
+) -> dict[str, Any]:
+    bootstrap_runtime()
+    return asyncio.run(
+        signal_decider_intraday_auto_sell_service.run_intraday_auto_sell_if_due(
+            account_reference=account_reference,
+            symbol=symbol,
+            dry_run=dry_run,
+            force=force,
+            trigger='internal_ops_cli',
+        )
+    )
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description='Internal kai-trading-core operations without self-HTTP.')
     subparsers = parser.add_subparsers(dest='command', required=True)
@@ -722,6 +742,15 @@ def _build_parser() -> argparse.ArgumentParser:
     next_open_execution_parser.add_argument('--target-trade-date')
     next_open_execution_parser.add_argument('--dry-run', choices=('true', 'false'))
     next_open_execution_parser.add_argument('--force', action='store_true')
+
+    intraday_auto_sell_parser = subparsers.add_parser(
+        'trading-intraday-auto-sell-run-if-due',
+        help='Evaluate linked next-open positions and execute signal-decider intraday auto-sells directly',
+    )
+    intraday_auto_sell_parser.add_argument('--account-reference')
+    intraday_auto_sell_parser.add_argument('--symbol')
+    intraday_auto_sell_parser.add_argument('--dry-run', choices=('true', 'false'))
+    intraday_auto_sell_parser.add_argument('--force', action='store_true')
     return parser
 
 
@@ -872,6 +901,13 @@ def main(argv: Iterable[str] | None = None) -> int:
     elif args.command == 'trading-next-open-execution-run-if-due':
         payload = run_next_open_execution_if_due(
             target_trade_date=args.target_trade_date,
+            dry_run=None if args.dry_run is None else args.dry_run == 'true',
+            force=args.force,
+        )
+    elif args.command == 'trading-intraday-auto-sell-run-if-due':
+        payload = run_intraday_auto_sell_if_due(
+            account_reference=args.account_reference,
+            symbol=args.symbol,
             dry_run=None if args.dry_run is None else args.dry_run == 'true',
             force=args.force,
         )

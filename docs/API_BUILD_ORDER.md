@@ -35,6 +35,7 @@
 32. Signal-decider evaluation, diagnostics, and policy-candidate routes
 33. Internal trading order control, inquiry, and reconciliation routes
 34. Signal-decider next-open execution planning and market-open submit routes
+35. Signal-decider intraday auto-sell diagnostics and runtime submit routes
 
 ## Current routes
 - `POST /broker/kis/token`
@@ -55,6 +56,8 @@
 - `GET /trading/orders/realtime-health`
 - `GET /trading/orders/next-open-execution?target_trade_date=YYYY-MM-DD&refresh=false`
 - `POST /trading/orders/next-open-execution/run-if-due`
+- `GET /trading/orders/intraday-auto-sell?account_reference=KIS:12345678-01&symbol=005930&refresh=false`
+- `POST /trading/orders/intraday-auto-sell/run-if-due`
 - `GET /trading/orders/{client_order_id}/timeline?account_reference=KIS:12345678-01&refresh=false`
 - `GET /portfolio/summary`
 - `GET /trading/accounts/{account_reference}/summary`
@@ -173,6 +176,14 @@
 - Durable plan rows live in `signal_decider_execution_plan_items` and link one `decision_snapshot_id` to one concrete `account_reference + target_trade_date + symbol` execution candidate, plus optional `order_request_id` and `broker_order_row_id` once submission starts.
 - Quantity sizing is explicit and account-scoped. `SIGNAL_DECIDER_NEXT_OPEN_ACCOUNT_TARGETS` maps one or more KIS account references to fixed KRW budgets in `Label=KIS:12345678-01@1500000` form, and the planner floors quantity off the source-market-date close before the open.
 - Safety rails are separate from the signal-decider prompt contract. Automation still respects active-policy checks, minimum confidence or expected-return thresholds, target/stop presence, missing upstream-role checks, data-warning and disagreement blockers, global live enable/disable, dry-run mode, and deterministic `client_order_id` duplicate-submit protection.
+
+## Intraday auto-sell execution notes
+- `GET /trading/orders/intraday-auto-sell` is the persisted diagnostics surface for linked next-open positions. `refresh=true` re-evaluates live positions and quote state without submitting orders.
+- `POST /trading/orders/intraday-auto-sell/run-if-due` is the operator-facing runtime hook and the same service used by the background runner while the market is open. It evaluates current holdings against persisted signal-decider `target_price` and `stop_loss_price` thresholds and submits eligible exits through the existing `POST /trading/orders/sell` persistence path.
+- Intraday rows reuse `signal_decider_execution_plan_items` under `execution_window=intraday_auto_sell`. Each row links back to the originating submitted next-open buy plan item, carries the originating `decision_snapshot_id`, and keeps the latest sell `order_request_id` / `broker_order_row_id` once the auto-sell path fires.
+- Linked-quantity attribution is conservative by design: the watcher caps each symbol’s sell quantity to the originating next-open buy order’s filled quantity minus any prior auto-sell fills, so it does not automatically liquidate unrelated holdings in the same account and symbol.
+- Duplicate protection is layered. Active auto-sell orders suppress new submissions, failed or rejected attempts respect `SIGNAL_DECIDER_INTRADAY_AUTO_SELL_COOLDOWN_SECONDS`, and retries use incremented deterministic `client_order_id` suffixes so operator-visible order history stays traceable.
+- Diagnostics expose why a row did or did not trigger: current live quote availability, linked position and sellable quantity, remaining attributed quantity, latest auto-sell order status, cooldown windows, and the specific rule hit (`target_hit` or `stop_loss_hit`).
 
 ## Trading account inquiry notes
 - `GET /portfolio/summary` is the aggregate portfolio read for the dashboard and portfolio cards. It resolves the deployment-configured account list from `PORTFOLIO_ACCOUNT_REFERENCES`, reuses the KIS-backed account-summary and positions inquiries per account, and returns the web `PortfolioSummaryDto`-style shape with `accounts`, `holdings`, `allocation`, `recentActivity`, `sync`, and `notices`.

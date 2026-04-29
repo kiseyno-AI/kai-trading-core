@@ -143,6 +143,26 @@ class FakeNextOpenExecutionService:
         }
 
 
+class FakeIntradayAutoSellService:
+    def __init__(self) -> None:
+        self.list_calls: list[dict] = []
+        self.run_calls: list[dict] = []
+
+    async def list_watch_items(self, **kwargs):
+        self.list_calls.append(kwargs)
+        return {
+            'summary': {'items_total': 1, 'ready_count': 1},
+            'items': [{'plan_item_id': 12, 'symbol': '005930', 'execution_status': 'planned'}],
+        }
+
+    async def run_intraday_auto_sell_if_due(self, **kwargs):
+        self.run_calls.append(kwargs)
+        return {
+            'summary': {'triggered': True, 'selected_count': 1, 'submitted_count': 1},
+            'items': [{'plan_item_id': 12, 'symbol': '005930', 'execution_status': 'submitted'}],
+        }
+
+
 class TradingOrderRouteTests(unittest.TestCase):
     def setUp(self) -> None:
         self.app = FastAPI()
@@ -151,20 +171,24 @@ class TradingOrderRouteTests(unittest.TestCase):
         self.monitoring_service = FakeTradingOrderMonitoringService()
         self.reconcile_service = FakeTradingOrderReconciliationService()
         self.next_open_service = FakeNextOpenExecutionService()
+        self.intraday_auto_sell_service = FakeIntradayAutoSellService()
         self.original_service = routes_trading.trading_order_service
         self.original_monitoring_service = routes_trading.trading_order_monitoring_service
         self.original_reconcile_service = routes_trading.trading_order_reconciliation_service
         self.original_next_open_service = routes_trading.signal_decider_next_open_execution_service
+        self.original_intraday_auto_sell_service = routes_trading.signal_decider_intraday_auto_sell_service
         routes_trading.trading_order_service = self.service
         routes_trading.trading_order_monitoring_service = self.monitoring_service
         routes_trading.trading_order_reconciliation_service = self.reconcile_service
         routes_trading.signal_decider_next_open_execution_service = self.next_open_service
+        routes_trading.signal_decider_intraday_auto_sell_service = self.intraday_auto_sell_service
 
     def tearDown(self) -> None:
         routes_trading.trading_order_service = self.original_service
         routes_trading.trading_order_monitoring_service = self.original_monitoring_service
         routes_trading.trading_order_reconciliation_service = self.original_reconcile_service
         routes_trading.signal_decider_next_open_execution_service = self.original_next_open_service
+        routes_trading.signal_decider_intraday_auto_sell_service = self.original_intraday_auto_sell_service
 
     def test_buy_route_returns_created_payload(self) -> None:
         client = TestClient(self.app)
@@ -325,6 +349,33 @@ class TradingOrderRouteTests(unittest.TestCase):
         self.assertEqual(run_response.json()['summary']['submitted_count'], 1)
         self.assertEqual(self.next_open_service.run_calls[0]['target_trade_date'].isoformat(), '2026-04-30')
         self.assertTrue(self.next_open_service.run_calls[0]['force'])
+
+    def test_intraday_auto_sell_routes_use_service(self) -> None:
+        client = TestClient(self.app)
+
+        list_response = client.get(
+            '/trading/orders/intraday-auto-sell',
+            params={'account_reference': 'KIS:12345678-01', 'symbol': '005930', 'refresh': 'true'},
+        )
+        run_response = client.post(
+            '/trading/orders/intraday-auto-sell/run-if-due',
+            json={
+                'account_reference': 'KIS:12345678-01',
+                'symbol': '005930',
+                'dry_run': False,
+                'force': True,
+            },
+        )
+
+        self.assertEqual(list_response.status_code, 200)
+        self.assertEqual(list_response.json()['items'][0]['plan_item_id'], 12)
+        self.assertEqual(self.intraday_auto_sell_service.list_calls[0]['account_reference'], 'KIS:12345678-01')
+        self.assertTrue(self.intraday_auto_sell_service.list_calls[0]['refresh'])
+        self.assertEqual(run_response.status_code, 200)
+        self.assertEqual(run_response.json()['summary']['submitted_count'], 1)
+        self.assertEqual(self.intraday_auto_sell_service.run_calls[0]['account_reference'], 'KIS:12345678-01')
+        self.assertEqual(self.intraday_auto_sell_service.run_calls[0]['symbol'], '005930')
+        self.assertTrue(self.intraday_auto_sell_service.run_calls[0]['force'])
 
 
 if __name__ == '__main__':

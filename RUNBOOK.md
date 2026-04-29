@@ -23,6 +23,8 @@ What it does:
 ## Health checks
 - `GET /health`
 - `GET /portfolio/summary`
+- `GET /trading/orders/intraday-auto-sell?account_reference=KIS:12345678-01&symbol=005930&refresh=true`
+- `POST /trading/orders/intraday-auto-sell/run-if-due`
 - `GET /macro/ecos/series?stat_code=722Y001&cycle=M&start_period=202401&end_period=202403&item_code_1=0101000`
 - `GET /disclosures/dart/company-snapshot?stock_code=005930`
 - `POST /disclosures/dart/sync/events?days=7`
@@ -74,6 +76,7 @@ What it does:
 - During `PREOPEN`, it refreshes the daily master if needed.
 - During `PREOPEN`, it also refreshes the persisted signal-decider next-open execution plan for the current trade date when account targets are configured.
 - During `OPEN`, it submits or dry-runs eligible next-open execution-plan rows through the existing trading order service, using the `SIGNAL_DECIDER_NEXT_OPEN_*` safety settings and deterministic client-order ids for duplicate protection.
+- During `OPEN`, it also evaluates linked next-open positions against persisted signal-decider target/stop thresholds and submits intraday auto-sell market orders when the live KIS quote crosses a configured exit rule.
 - During `CLOSED`, after `EOD_AUTO_PYKRX_AFTER_CLOSE_MINUTES`, it schedules a thread-based pykrx daily EOD run if that trade date is available and not already completed.
 - Database persistence stores symbol master data, tracked symbols, quote cache/history, market status snapshots, EOD bars, EOD run records, persisted daily price contexts, daily technical/action snapshots, KIS daily signal features, KIS daily market-risk snapshots, persisted daily market-risk filter results, persisted daily momentum factor results, persisted daily low-risk factor results, persisted daily beta factor results, persisted daily advanced value factor results, persisted daily composite factor results, persisted daily market participation context, and stored day-based trending ranks.
 
@@ -201,6 +204,7 @@ Internal ops commands from `apps/api`:
 - `python3.11 -m app.internal.ops eod-beta-factors-compute --market-date 2026-04-23`
 - `python3.11 -m app.internal.ops eod-advanced-value-factors-compute --market-date 2026-04-24`
 - `python3.11 -m app.internal.ops eod-composite-factors-compute --market-date 2026-04-24`
+- `python3.11 -m app.internal.ops trading-intraday-auto-sell-run-if-due --account-reference KIS:12345678-01 --symbol 005930 --force`
 - `python3.11 -m app.internal.ops trading-next-open-execution-run-if-due --target-trade-date 2026-04-30 --dry-run true --force`
 - `python3.11 -m app.internal.ops dart-fundamentals-daily-run-if-due --market-date 2026-04-14 --symbol-limit 250 --capture-limit 500`
 - `python3.11 -m app.internal.ops agent-feedback-retry-cycles --market-date 2026-04-14 --symbols 005930`

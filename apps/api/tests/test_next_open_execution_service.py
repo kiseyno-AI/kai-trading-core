@@ -324,6 +324,8 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(call['source'], 'signal_decider_next_open')
         self.assertEqual(call['order_type'], 'market')
         self.assertEqual(call['strategy_context_payload']['signal_decider_next_open']['target_trade_date'], '2026-04-30')
+        self.assertEqual(call['strategy_context_payload']['signal_decider_next_open']['target_price'], 54000)
+        self.assertEqual(call['strategy_context_payload']['signal_decider_next_open']['stop_loss_price'], 47000)
         item = first_result['items'][0]
         self.assertEqual(item['execution_status'], EXECUTION_STATUS_SUBMITTED)
         self.assertIsNotNone(item['order_request_id'])

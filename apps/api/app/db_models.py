@@ -15,6 +15,7 @@ from sqlalchemy import (
     UniqueConstraint,
     func,
 )
+from sqlalchemy.ext.mutable import MutableDict
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from app.orders.domain import BrokerOrderStatus, OrderRequestSubmissionStatus, OrderRequestValidationStatus
@@ -197,7 +198,7 @@ class OrderRequest(Base, TimestampMixin):
         nullable=False,
         default=OrderRequestSubmissionStatus.PENDING_SUBMIT.value,
     )
-    submission_payload: Mapped[dict | None] = mapped_column(JSON)
+    submission_payload: Mapped[dict | None] = mapped_column(MutableDict.as_mutable(JSON))
     submission_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     last_submission_error: Mapped[str | None] = mapped_column(Text)
     submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

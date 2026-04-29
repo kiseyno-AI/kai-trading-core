@@ -9,6 +9,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from app.orders.intraday_auto_sell import signal_decider_intraday_auto_sell_service
 from app.orders.monitoring import trading_order_monitoring_service
 from app.orders.next_open_execution import signal_decider_next_open_execution_service
 from app.orders.reconciliation import trading_order_reconciliation_service
@@ -90,6 +91,15 @@ class TradingNextOpenExecutionRunRequest(BaseModel):
     model_config = ConfigDict(extra='forbid')
 
     target_trade_date: date | None = None
+    dry_run: bool | None = None
+    force: bool = False
+
+
+class TradingIntradayAutoSellRunRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+    account_reference: str | None = Field(default=None, min_length=1, max_length=128)
+    symbol: str | None = Field(default=None, min_length=1, max_length=32)
     dry_run: bool | None = None
     force: bool = False
 
@@ -264,6 +274,41 @@ async def run_next_open_execution_if_due(payload: TradingNextOpenExecutionRunReq
     except Exception as exc:
         _raise_order_http_error(exc)
         raise HTTPException(status_code=500, detail=f'Next-open execution submit failed: {exc}') from exc
+
+
+@router.get('/intraday-auto-sell')
+async def list_intraday_auto_sell_watch(
+    account_reference: str | None = Query(default=None, min_length=1, max_length=128),
+    symbol: str | None = Query(default=None, min_length=1, max_length=32),
+    refresh: bool = Query(default=False),
+) -> dict[str, Any]:
+    try:
+        return await signal_decider_intraday_auto_sell_service.list_watch_items(
+            account_reference=account_reference,
+            symbol=symbol,
+            refresh=refresh,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'Intraday auto-sell diagnostics read failed: {exc}') from exc
+
+
+@router.post('/intraday-auto-sell/run-if-due')
+async def run_intraday_auto_sell_if_due(payload: TradingIntradayAutoSellRunRequest) -> dict[str, Any]:
+    try:
+        return await signal_decider_intraday_auto_sell_service.run_intraday_auto_sell_if_due(
+            account_reference=payload.account_reference,
+            symbol=payload.symbol,
+            dry_run=payload.dry_run,
+            force=payload.force,
+            trigger='api',
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        _raise_order_http_error(exc)
+        raise HTTPException(status_code=500, detail=f'Intraday auto-sell execution failed: {exc}') from exc
 
 
 @router.post('/{client_order_id}/cancel')
