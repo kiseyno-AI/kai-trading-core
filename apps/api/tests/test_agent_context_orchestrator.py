@@ -134,6 +134,41 @@ class DeciderReadyAgentContextReadService:
                     'price_context': {'close_price': 85700},
                     'technical_snapshot': {'trend_state': 'uptrend'},
                     'action_summary': {'action_label': 'watch_long'},
+                    'scores': {
+                        'unified_value': {
+                            'status': 'available',
+                            'score': 0.87,
+                            'higher_is_better': True,
+                            'meaning': 'Composite value attractiveness score across stored cross-sectional value percentiles.',
+                            'method': 'Equal-weight mean of PER, PBR, dividend yield, FCF yield, and EV/EBITDA percentiles.',
+                            'components_used': 5,
+                            'components_possible': 5,
+                            'coverage_notes': [],
+                            'as_of_market_date': kwargs['market_date'].isoformat(),
+                        },
+                        'quality': {
+                            'status': 'partial',
+                            'score': 0.74,
+                            'higher_is_better': True,
+                            'meaning': 'Business quality score across profitability, cash-flow quality, and balance-sheet quality inputs.',
+                            'method': 'Equal-weight mean of the available quality component percentiles.',
+                            'components_used': 5,
+                            'components_possible': 6,
+                            'coverage_notes': ['Missing quality components: accruals_ratio.'],
+                            'as_of_market_date': kwargs['market_date'].isoformat(),
+                        },
+                        'momentum': {
+                            'status': 'available',
+                            'score': 0.91,
+                            'higher_is_better': True,
+                            'meaning': 'Medium-term price-strength score plus trend and overheat gating context from stored daily bars.',
+                            'method': 'Ranks 12-1 momentum from stored daily closes, then records trend confirmation, a top-percentile eligibility gate, and the configured recent-overheat guard.',
+                            'components_used': 3,
+                            'components_possible': 3,
+                            'coverage_notes': [],
+                            'as_of_market_date': kwargs['market_date'].isoformat(),
+                        },
+                    },
                     'fundamentals': {'latest_snapshot': {'highlights': {'operating_income': {'current_amount': 10}}}},
                     'recent_disclosures': {'count': 1, 'items': [{'rcept_no': '20260423000001'}]},
                 }
@@ -920,6 +955,10 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
             decider_payload['upstream_summaries']['fundamental-summarizer']['details']['fundamental_backdrop']['quality'],
             'improving',
         )
+        self.assertEqual(decider_payload['scores']['unified_value']['status'], 'available')
+        self.assertEqual(decider_payload['scores']['quality']['status'], 'partial')
+        self.assertEqual(decider_payload['scores']['momentum']['score'], 0.91)
+        self.assertNotIn('scores', decider_payload['symbol_day_context'])
         self.assertEqual(decider_payload['orchestration']['request_model'], 'openclaw/signal-decider')
         self.assertEqual(
             decider_payload['orchestration']['required_upstream_roles'],

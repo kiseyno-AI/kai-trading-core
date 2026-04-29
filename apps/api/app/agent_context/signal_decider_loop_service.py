@@ -475,6 +475,7 @@ def build_signal_decider_feature_snapshot(
     *,
     symbol_day_context: dict[str, Any] | None,
     feedback_payload: dict[str, Any] | None = None,
+    score_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     context = _maybe_dict(symbol_day_context)
     feedback = _maybe_dict(feedback_payload)
@@ -482,6 +483,7 @@ def build_signal_decider_feature_snapshot(
     action_summary = _maybe_dict(context.get('action_summary'))
     signal_features = _maybe_dict(context.get('signal_features'))
     price_context = _maybe_dict(context.get('price_context'))
+    scores = _maybe_dict(score_context) or _maybe_dict(context.get('scores'))
     decision_support = _maybe_dict(_maybe_dict(feedback.get('details')).get('decision_support'))
     signal_score = _to_float(action_summary.get('signal_score'))
     signal_count = _to_int(signal_features.get('signal_count'))
@@ -528,6 +530,7 @@ def build_signal_decider_feature_snapshot(
             'gap_vs_prev_close_pct': _to_float(price_context.get('gap_vs_prev_close_pct')),
             'range_pct': _to_float(price_context.get('range_pct')),
         },
+        'scores': scores,
         'meta': {
             'supporting_evidence_count': len(supporting_evidence),
             'decision_risk_count': len(decision_risks),
@@ -535,6 +538,7 @@ def build_signal_decider_feature_snapshot(
             'disagreement_count': len(disagreement),
             'has_data_warnings': bool(data_warnings),
             'has_disagreement': bool(disagreement),
+            'has_score_context': bool(scores),
         },
     }
 
@@ -1836,6 +1840,7 @@ class SignalDeciderLoopService:
         feature_snapshot = build_signal_decider_feature_snapshot(
             symbol_day_context=_maybe_dict(context.get('symbol_day_context')),
             feedback_payload=feedback_payload,
+            score_context=_maybe_dict(context.get('scores')),
         )
         enriched_summary = dict(summary_payload)
         enriched_feedback = dict(feedback_payload)
@@ -1890,6 +1895,10 @@ class SignalDeciderLoopService:
             feature_snapshot = build_signal_decider_feature_snapshot(
                 symbol_day_context=_maybe_dict(request_payload.get('symbol_day_context')),
                 feedback_payload=response_payload,
+                score_context=(
+                    _maybe_dict(request_payload.get('scores'))
+                    or _maybe_dict(_maybe_dict(request_payload.get('symbol_day_context')).get('scores'))
+                ),
             )
         decision_action = _normalize_action(
             response_payload.get('next_day_open_action') or response_payload.get('preferred_action')
@@ -3405,6 +3414,10 @@ class SignalDeciderLoopService:
             feature_snapshot = build_signal_decider_feature_snapshot(
                 symbol_day_context=_maybe_dict(request_payload.get('symbol_day_context')),
                 feedback_payload=feedback_payload,
+                score_context=(
+                    _maybe_dict(request_payload.get('scores'))
+                    or _maybe_dict(_maybe_dict(request_payload.get('symbol_day_context')).get('scores'))
+                ),
             )
         policy_version = _normalize_optional_text(row.policy_version, default=DEFAULT_SIGNAL_DECIDER_POLICY_VERSION)
         decision_action = _normalize_action(row.decision_action or feedback_payload.get('next_day_open_action'))
