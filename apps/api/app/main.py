@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.api.routes_agent_context import router as agent_context_router
+from app.api.routes_execution_runtime import router as execution_runtime_router
 from app.api.routes_eod import router as eod_router
 from app.api.routes_dart import router as dart_router
 from app.api.routes_kis import router as kis_router
@@ -133,6 +134,7 @@ app.include_router(symbols_router)
 app.include_router(portfolio_router)
 app.include_router(trading_router)
 app.include_router(trading_accounts_router)
+app.include_router(execution_runtime_router)
 app.include_router(eod_router)
 app.include_router(dart_router)
 app.include_router(agent_context_router)

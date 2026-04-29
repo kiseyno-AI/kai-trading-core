@@ -13,11 +13,13 @@ from app.db_models import (
     OrderRequest,
     SignalDeciderDecisionSnapshot,
     SignalDeciderExecutionPlanItem,
+    Symbol,
 )
 from app.orders.exec_integration import (
     EXEC_INTENT_NEXT_OPEN_BUY,
     EXEC_INTENT_STOP_SELL,
     EXEC_INTENT_TARGET_SELL,
+    SignalDeciderExecClientError,
     SignalDeciderExecIntegrationService,
 )
 from app.orders.next_open_execution import EXECUTION_STATUS_SUBMITTED
@@ -76,6 +78,16 @@ class FakeExecClient:
         return self.position_response
 
 
+class FailingRuntimeExecClient(FakeExecClient):
+    async def get_runtime_status(self) -> dict:
+        self.runtime_calls += 1
+        raise SignalDeciderExecClientError(
+            'exec transport failure',
+            code='unavailable',
+            retryable=True,
+        )
+
+
 class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -84,6 +96,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         BrokerOrder.__table__.create(bind=engine, checkfirst=True)
         SignalDeciderDecisionSnapshot.__table__.create(bind=engine, checkfirst=True)
         SignalDeciderExecutionPlanItem.__table__.create(bind=engine, checkfirst=True)
+        Symbol.__table__.create(bind=engine, checkfirst=True)
 
     def setUp(self) -> None:
         suffix = uuid4().hex[:8].upper()
@@ -110,6 +123,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         settings.signal_decider_next_open_dry_run = False
         self.client = FakeExecClient()
         self.service = SignalDeciderExecIntegrationService(client=self.client)
+        self._seed_symbol()
         self.snapshot_id = self._seed_snapshot()
         self.plan_item_id = self._seed_plan_item()
 
@@ -127,6 +141,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                     SignalDeciderDecisionSnapshot.policy_version == self.policy_version
                 )
             )
+            session.execute(delete(Symbol).where(Symbol.symbol == self.symbol))
 
     def _seed_snapshot(self) -> int:
         with session_scope() as session:
@@ -164,6 +179,22 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             session.add(row)
             session.flush()
             return row.id
+
+    def _seed_symbol(self) -> None:
+        with session_scope() as session:
+            session.execute(delete(Symbol).where(Symbol.symbol == self.symbol))
+            session.add(
+                Symbol(
+                    symbol=self.symbol,
+                    standard_code=None,
+                    name_ko='Samsung Electronics',
+                    market='KOSPI',
+                    instrument_type='equity',
+                    source='test',
+                    is_active=True,
+                )
+            )
+            session.flush()
 
     def _seed_plan_item(self) -> int:
         with session_scope() as session:
@@ -365,6 +396,204 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
             readback = row.submission_payload['exec_dispatch']['readback']
             self.assertEqual(readback['positions']['count'], 0)
+
+    async def test_dashboard_runtime_status_normalizes_exec_runtime_payload(self) -> None:
+        self.client.runtime_response = {
+            'mode': 'mock',
+            'ready': True,
+            'safety': {
+                'paused': False,
+                'kill_switch_enabled': False,
+                'automation_enabled': True,
+            },
+            'counts': {
+                'open_orders': 2,
+                'active_execution_jobs': 3,
+            },
+            'monitoring': {
+                'alive': True,
+                'last_heartbeat_at': '2026-04-30T00:05:00+00:00',
+            },
+            'readiness': {
+                'reasons': [],
+            },
+        }
+
+        result = await self.service.dashboard_runtime_status(refresh=True)
+
+        self.assertEqual(result['status'], 'ready')
+        self.assertTrue(result['exec_connected'])
+        self.assertTrue(result['automation_enabled'])
+        self.assertTrue(result['monitoring_alive'])
+        self.assertEqual(result['open_order_count'], 2)
+        self.assertEqual(result['active_execution_job_count'], 3)
+        self.assertEqual(result['last_heartbeat_at'], '2026-04-30T00:05:00+00:00')
+
+    async def test_dashboard_runtime_status_surfaces_exec_offline_state(self) -> None:
+        service = SignalDeciderExecIntegrationService(client=FailingRuntimeExecClient())
+
+        result = await service.dashboard_runtime_status(refresh=True)
+
+        self.assertEqual(result['status'], 'offline')
+        self.assertFalse(result['exec_connected'])
+        self.assertEqual(result['issues'][0]['code'], 'unavailable')
+
+    async def test_dashboard_runtime_status_refresh_false_keeps_ready_config_healthy(self) -> None:
+        result = await self.service.dashboard_runtime_status(refresh=False)
+
+        self.assertEqual(result['status'], 'degraded')
+        self.assertTrue(result['exec_connected'])
+        self.assertFalse(result['monitoring_alive'])
+        self.assertEqual(self.client.runtime_calls, 0)
+
+    async def test_runtime_dashboard_views_merge_core_plan_and_exec_truth(self) -> None:
+        dispatch_result = await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=False,
+            dry_run=False,
+            force=True,
+            trigger='test',
+        )
+        plan_id = dispatch_result['dispatch']['groups'][0]['plan_id']
+        self.client.runtime_response = {
+            'mode': 'mock',
+            'ready': True,
+            'safety': {
+                'paused': False,
+                'kill_switch_enabled': False,
+                'automation_enabled': True,
+            },
+            'counts': {
+                'open_orders': 1,
+                'active_execution_jobs': 1,
+            },
+        }
+        self.client.plan_response = {'items': [{'external_plan_id': plan_id, 'status': 'accepted'}]}
+        self.client.order_response = {
+            'items': [
+                {
+                    'id': 'order-1',
+                    'execution_plan_item_id': 'exec-item-1',
+                    'symbol': self.symbol,
+                    'status': 'submitted',
+                    'updated_at': '2026-04-30T00:05:00+00:00',
+                }
+            ]
+        }
+        self.client.execution_response = {
+            'items': [
+                {
+                    'broker_order_id': 'order-1',
+                    'symbol': self.symbol,
+                    'side': 'buy',
+                    'quantity': '5',
+                    'fill_price': '50100',
+                    'executed_at': '2026-04-30T00:06:00+00:00',
+                }
+            ]
+        }
+        self.client.position_response = {
+            'items': [
+                {
+                    'symbol': self.symbol,
+                    'quantity': '5',
+                    'average_price': '50100',
+                    'updated_at': '2026-04-30T00:07:00+00:00',
+                }
+            ]
+        }
+
+        board = await self.service.get_runtime_daily_board(
+            market_date=self.target_trade_date,
+            refresh=True,
+            trigger='test',
+        )
+        monitored = await self.service.list_runtime_monitored_symbols(
+            market_date=self.target_trade_date,
+            refresh=True,
+            trigger='test',
+        )
+        detail = await self.service.get_runtime_symbol_detail(
+            market_date=self.target_trade_date,
+            symbol=self.symbol,
+            refresh=True,
+            trigger='test',
+        )
+
+        self.assertEqual(board['runtime']['status'], 'ready')
+        self.assertEqual(board['summary']['filled'], 1)
+        self.assertEqual(board['items'][0]['status'], 'filled')
+        self.assertEqual(board['items'][0]['monitoring_state'], 'watching_target_stop')
+        self.assertEqual(board['items'][0]['filled_quantity'], 5)
+        self.assertEqual(board['items'][0]['avg_fill_price'], 50100)
+        self.assertEqual(board['items'][0]['execution_plan_id'], plan_id)
+
+        self.assertEqual(monitored['summary']['items_total'], 1)
+        self.assertEqual(monitored['items'][0]['symbol'], self.symbol)
+        self.assertEqual(monitored['items'][0]['monitoring_state'], 'watching_target_stop')
+        self.assertEqual(monitored['items'][0]['planned_intents'], ['stop_sell', 'target_sell'])
+
+        self.assertEqual(detail['summary']['items_total'], 1)
+        self.assertEqual(detail['monitoring']['state'], 'watching_target_stop')
+        self.assertEqual(detail['items'][0]['status'], 'filled')
+        self.assertEqual(detail['items'][0]['remote_state']['derived_status'], 'open')
+
+    async def test_runtime_dashboard_views_classify_cancelled_orders_before_failed(self) -> None:
+        dispatch_result = await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=False,
+            dry_run=False,
+            force=True,
+            trigger='test',
+        )
+        plan_id = dispatch_result['dispatch']['groups'][0]['plan_id']
+        self.client.runtime_response = {
+            'mode': 'mock',
+            'ready': True,
+            'safety': {
+                'paused': False,
+                'kill_switch_enabled': False,
+                'automation_enabled': True,
+            },
+            'monitoring': {
+                'alive': True,
+            },
+        }
+        self.client.plan_response = {'items': [{'external_plan_id': plan_id, 'status': 'accepted'}]}
+        self.client.execution_response = {'items': []}
+        self.client.position_response = {'items': []}
+
+        for remote_status in ('cancelled', 'canceled'):
+            with self.subTest(remote_status=remote_status):
+                self.client.order_response = {
+                    'items': [
+                        {
+                            'id': 'order-1',
+                            'execution_plan_item_id': 'exec-item-1',
+                            'symbol': self.symbol,
+                            'status': remote_status,
+                            'updated_at': '2026-04-30T00:05:00+00:00',
+                        }
+                    ]
+                }
+
+                board = await self.service.get_runtime_daily_board(
+                    market_date=self.target_trade_date,
+                    refresh=True,
+                    trigger='test',
+                )
+                detail = await self.service.get_runtime_symbol_detail(
+                    market_date=self.target_trade_date,
+                    symbol=self.symbol,
+                    refresh=True,
+                    trigger='test',
+                )
+
+                self.assertEqual(board['summary']['cancelled'], 1)
+                self.assertEqual(board['summary']['failed'], 0)
+                self.assertEqual(board['items'][0]['status'], 'cancelled')
+                self.assertEqual(detail['items'][0]['status'], 'cancelled')
+                self.assertEqual(detail['items'][0]['remote_state']['derived_status'], 'cancelled')
 
 
 if __name__ == '__main__':
