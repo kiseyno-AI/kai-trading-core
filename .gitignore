@@ -5,3 +5,6 @@ __pycache__/
 *.pyc
 
 apps/api/.env
+apps/api/*.log
+apps/api/var/
+var/
