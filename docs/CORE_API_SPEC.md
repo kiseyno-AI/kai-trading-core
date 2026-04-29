@@ -302,6 +302,7 @@ Authorization: Bearer <token>
 ### Notes
 - The route resolves its account scope from `PORTFOLIO_ACCOUNT_REFERENCES`, a comma-separated list of `KIS:<account_number>-<product_code>` values. Optional labels can be supplied as `Label=KIS:...`.
 - This is a portfolio-level aggregation layer over the account-specific KIS inquiry routes. It reuses the same KIS account-reference model as `/trading/accounts/{account_reference}/summary` and `/positions`.
+- Production portfolio aggregation also requires `KIS_APP_KEY`, `KIS_APP_SECRET`, and `KIS_USE_MOCK=false`. In `APP_ENV=production`, mock-KIS portfolio wiring is treated as `not_configured`.
 - `sync.status` is the primary UX state. Current intended values are:
   - `synced` when every configured account summary and holdings read succeeds
   - `stale` when at least one account succeeds but one or more configured accounts fail
@@ -309,6 +310,7 @@ Authorization: Bearer <token>
   - `not_configured` when account resolution or KIS deployment configuration is missing or invalid
 - On degraded accounts, missing sections may be omitted instead of returned as misleading empty arrays, while `notices` explains which account or subsection failed.
 - Percent fields in this route use whole-percent values for direct UI rendering, for example `4.0` means `4.00%`.
+- Runtime readiness is exposed through `GET /broker/kis/health` as `portfolio_summary_runtime`. Deploy preflight reports the same status under `runtime_checks.portfolio_summary`, and deploy smoke-check now expects `/portfolio/summary` to leave the `not_configured` state after restart.
 
 ---
 

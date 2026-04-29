@@ -22,6 +22,7 @@ What it does:
 
 ## Health checks
 - `GET /health`
+- `GET /portfolio/summary`
 - `GET /macro/ecos/series?stat_code=722Y001&cycle=M&start_period=202401&end_period=202403&item_code_1=0101000`
 - `GET /disclosures/dart/company-snapshot?stock_code=005930`
 - `POST /disclosures/dart/sync/events?days=7`
@@ -100,8 +101,10 @@ Notes:
 
 - The preflight is intentionally non-destructive. It does not mutate schema state.
 - The preflight now also reports whether `/market/snapshot` is runtime-ready before restart, including the resolved KIS environment and any missing required secrets.
+- The preflight now also reports whether `/portfolio/summary` is runtime-ready before restart, including whether `PORTFOLIO_ACCOUNT_REFERENCES` is present and whether production is still pointed at the mock KIS environment.
 - The duplicate-table warning is heuristic by design: it flags live tables that overlap with still-pending unguarded `create_table(...)` revisions, which is the common `alembic_version` lag pattern behind repeated `DuplicateTable` deploy failures.
-- The smoke command now exercises `/market/snapshot` in addition to `/health` and `/eod/freshness`, and automatically sends `Authorization: Bearer <token>` when `UPSTREAM_BEARER_TOKEN` is set in the current shell environment.
+- The smoke command now exercises `/portfolio/summary` in addition to `/health`, `/eod/freshness`, and `/market/snapshot`, and it fails when portfolio sync is still `not_configured` after restart.
+- The smoke command automatically sends `Authorization: Bearer <token>` when `UPSTREAM_BEARER_TOKEN` is set in the current shell environment.
 
 ## Duplicate-table drift recovery
 
@@ -248,8 +251,9 @@ Local validation:
 
 1. From `apps/api`, start the API with `python -m uvicorn app.main:app --reload`
 2. Call `curl -i -H "Authorization: Bearer <token>" http://127.0.0.1:8000/health` when `UPSTREAM_BEARER_TOKEN` is set
-3. Trigger an upstream-backed route such as `curl -H "Authorization: Bearer <token>" "http://127.0.0.1:8000/fx/koreaexim/rates?search_date=20260406&currency=USD"` when bearer auth is enabled
-4. Inspect `var/log/api-requests.log` and `var/log/upstream-http.log`
+3. Verify portfolio wiring with `curl -H "Authorization: Bearer <token>" http://127.0.0.1:8000/portfolio/summary` after setting `PORTFOLIO_ACCOUNT_REFERENCES`
+4. Trigger an upstream-backed route such as `curl -H "Authorization: Bearer <token>" "http://127.0.0.1:8000/fx/koreaexim/rates?search_date=20260406&currency=USD"` when bearer auth is enabled
+5. Inspect `var/log/api-requests.log` and `var/log/upstream-http.log`
 
 ## Next ops step
 Set this up under a long-running process manager (LaunchAgent, systemd, pm2, or equivalent).

@@ -20,6 +20,21 @@ GET /broker/kis/health
   "app_secret_configured": true,
   "hts_id_configured": true,
   "realtime_order_notice_enabled": true,
+  "market_snapshot_runtime": {
+    "ready": true,
+    "effective_kis_environment": "real",
+    "blocking_reasons": []
+  },
+  "portfolio_summary_runtime": {
+    "ready": true,
+    "app_env": "production",
+    "kis_environment": "real",
+    "kis_use_mock": false,
+    "portfolio_account_references_configured": true,
+    "portfolio_account_references_valid": true,
+    "configured_account_count": 2,
+    "blocking_reasons": []
+  },
   "realtime_order_notices": {
     "enabled": true,
     "configured": true,
@@ -54,3 +69,7 @@ GET /broker/kis/health
   }
 }
 ```
+
+## Notes
+- `market_snapshot_runtime` and `portfolio_summary_runtime` are route-specific readiness summaries for deploy and operator checks.
+- `portfolio_summary_runtime.ready=false` means `/portfolio/summary` is still blocked by config such as missing `PORTFOLIO_ACCOUNT_REFERENCES`, missing KIS secrets, or `KIS_USE_MOCK=true` in `APP_ENV=production`.
