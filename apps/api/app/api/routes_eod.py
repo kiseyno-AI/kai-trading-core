@@ -35,6 +35,7 @@ from app.signals.market_risk_snapshot import (
 )
 from app.signals.momentum_factor import daily_momentum_factor_service
 from app.signals.piotroski_filter import daily_piotroski_filter_service
+from app.signals.quality_factor import QUALITY_FACTOR_SOURCE, daily_quality_factor_service
 from app.signals.unified_value_factor import (
     UNIFIED_VALUE_FACTOR_SOURCE,
     daily_unified_value_factor_service,
@@ -662,6 +663,45 @@ async def inspect_daily_unified_value_factors(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f'Daily unified value factor read failed: {exc}') from exc
+
+
+@router.post('/quality-factors/compute')
+async def compute_daily_quality_factors(
+    market_date: str,
+    symbols: str | None = None,
+    source: str = QUALITY_FACTOR_SOURCE,
+) -> dict:
+    try:
+        parsed_symbols = [item.strip() for item in symbols.split(',') if item.strip()] if symbols else None
+        return await asyncio.to_thread(
+            daily_quality_factor_service.rebuild_for_market_date,
+            market_date=market_date,
+            symbols=parsed_symbols,
+            source=source,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f'Daily quality factor compute failed: {exc}') from exc
+
+
+@router.get('/quality-factors')
+async def inspect_daily_quality_factors(
+    market_date: str,
+    symbol: str | None = None,
+    limit: int | None = Query(default=None, ge=1, le=20000),
+) -> dict:
+    try:
+        return await asyncio.to_thread(
+            daily_quality_factor_service.inspect,
+            market_date=market_date,
+            symbol=symbol,
+            limit=limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'Daily quality factor read failed: {exc}') from exc
 
 
 @router.post('/composite-factors/compute')

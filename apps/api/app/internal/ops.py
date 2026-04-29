@@ -53,6 +53,7 @@ from app.signals.market_risk_snapshot import (
 )
 from app.signals.momentum_factor import daily_momentum_factor_service
 from app.signals.piotroski_filter import daily_piotroski_filter_service
+from app.signals.quality_factor import QUALITY_FACTOR_SOURCE, daily_quality_factor_service
 from app.signals.unified_value_factor import (
     UNIFIED_VALUE_FACTOR_SOURCE,
     daily_unified_value_factor_service,
@@ -350,6 +351,16 @@ def compute_unified_value_factors(*, market_date: str, symbols: str | None = Non
         market_date=market_date,
         symbols=parsed_symbols,
         source=UNIFIED_VALUE_FACTOR_SOURCE,
+    )
+
+
+def compute_quality_factors(*, market_date: str, symbols: str | None = None) -> dict[str, Any]:
+    bootstrap_runtime()
+    parsed_symbols = [item.strip() for item in symbols.split(',') if item.strip()] if symbols else None
+    return daily_quality_factor_service.rebuild_for_market_date(
+        market_date=market_date,
+        symbols=parsed_symbols,
+        source=QUALITY_FACTOR_SOURCE,
     )
 
 
@@ -686,6 +697,13 @@ def _build_parser() -> argparse.ArgumentParser:
     unified_value_parser.add_argument('--market-date', required=True)
     unified_value_parser.add_argument('--symbols')
 
+    quality_parser = subparsers.add_parser(
+        'eod-quality-factors-compute',
+        help='Compute practical quality factor rows directly',
+    )
+    quality_parser.add_argument('--market-date', required=True)
+    quality_parser.add_argument('--symbols')
+
     composite_parser = subparsers.add_parser(
         'eod-composite-factors-compute',
         help='Compute integrated composite factor rows directly',
@@ -875,6 +893,8 @@ def main(argv: Iterable[str] | None = None) -> int:
         payload = compute_advanced_value_factors(market_date=args.market_date, symbols=args.symbols)
     elif args.command == 'eod-unified-value-factors-compute':
         payload = compute_unified_value_factors(market_date=args.market_date, symbols=args.symbols)
+    elif args.command == 'eod-quality-factors-compute':
+        payload = compute_quality_factors(market_date=args.market_date, symbols=args.symbols)
     elif args.command == 'eod-composite-factors-compute':
         payload = compute_composite_factors(market_date=args.market_date, symbols=args.symbols)
     elif args.command == 'eod-trending-ranks-compute':

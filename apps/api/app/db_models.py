@@ -816,6 +816,67 @@ class DailyUnifiedValueFactorResult(Base, TimestampMixin):
     captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
+class DailyQualityFactorResult(Base, TimestampMixin):
+    __tablename__ = 'daily_quality_factor_results'
+    __table_args__ = (
+        UniqueConstraint(
+            'symbol_id',
+            'market_date',
+            name='uq_daily_quality_factor_results_symbol_market_date',
+        ),
+        Index('ix_daily_quality_factor_results_market_rank', 'market_date', 'quality_rank'),
+        Index('ix_daily_quality_factor_results_market_score', 'market_date', 'quality_score'),
+        Index('ix_daily_quality_factor_results_market_status', 'market_date', 'quality_status'),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol_id: Mapped[int] = mapped_column(ForeignKey('symbols.id', ondelete='CASCADE'), nullable=False, index=True)
+    market_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default='quality_v1')
+    roe: Mapped[float | None] = mapped_column(Numeric(18, 6))
+    roa: Mapped[float | None] = mapped_column(Numeric(18, 6))
+    gross_profit_to_assets: Mapped[float | None] = mapped_column(Numeric(18, 6))
+    operating_cash_flow_to_net_income: Mapped[float | None] = mapped_column(Numeric(18, 6))
+    debt_ratio: Mapped[float | None] = mapped_column(Numeric(18, 6))
+    accruals_ratio: Mapped[float | None] = mapped_column(Numeric(18, 6))
+    roe_status: Mapped[str] = mapped_column(String(48), nullable=False, default='missing_metric')
+    roa_status: Mapped[str] = mapped_column(String(48), nullable=False, default='missing_metric')
+    gross_profit_to_assets_status: Mapped[str] = mapped_column(String(48), nullable=False, default='missing_metric')
+    operating_cash_flow_to_net_income_status: Mapped[str] = mapped_column(
+        String(48),
+        nullable=False,
+        default='missing_metric',
+    )
+    debt_ratio_status: Mapped[str] = mapped_column(String(48), nullable=False, default='missing_metric')
+    accruals_ratio_status: Mapped[str] = mapped_column(String(48), nullable=False, default='missing_metric')
+    roe_rank: Mapped[int | None] = mapped_column(Integer, index=True)
+    roa_rank: Mapped[int | None] = mapped_column(Integer, index=True)
+    gross_profit_to_assets_rank: Mapped[int | None] = mapped_column(Integer, index=True)
+    operating_cash_flow_to_net_income_rank: Mapped[int | None] = mapped_column(Integer, index=True)
+    debt_ratio_rank: Mapped[int | None] = mapped_column(Integer, index=True)
+    accruals_ratio_rank: Mapped[int | None] = mapped_column(Integer, index=True)
+    roe_percentile: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    roa_percentile: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    gross_profit_to_assets_percentile: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    operating_cash_flow_to_net_income_percentile: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    debt_ratio_percentile: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    accruals_ratio_percentile: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    quality_score: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    quality_rank: Mapped[int | None] = mapped_column(Integer, index=True)
+    quality_percentile: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    components_possible: Mapped[int] = mapped_column(Integer, nullable=False, default=6)
+    components_used: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    is_quality_score_complete: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, index=True)
+    quality_status: Mapped[str] = mapped_column(
+        String(48),
+        nullable=False,
+        default='insufficient_components',
+        index=True,
+    )
+    factor_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
 class DailyCompositeFactorResult(Base, TimestampMixin):
     __tablename__ = 'daily_composite_factor_results'
     __table_args__ = (

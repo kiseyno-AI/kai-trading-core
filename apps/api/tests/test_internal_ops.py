@@ -18,6 +18,7 @@ from app.signals.low_risk_factor import LOW_RISK_SOURCE
 from app.signals.market_risk_filter import MARKET_RISK_FILTER_SOURCE
 from app.signals.market_risk_snapshot import MARKET_RISK_SNAPSHOT_SOURCE
 from app.signals.unified_value_factor import UNIFIED_VALUE_FACTOR_SOURCE
+from app.signals.quality_factor import QUALITY_FACTOR_SOURCE
 from app.signals.value_factor import VALUE_FACTOR_SOURCE
 
 
@@ -523,6 +524,44 @@ class InternalOpsTests(unittest.TestCase):
         self.assertEqual(compute_unified_value.call_args.kwargs['market_date'], '2026-04-24')
         self.assertEqual(compute_unified_value.call_args.kwargs['symbols'], [])
         self.assertEqual(compute_unified_value.call_args.kwargs['source'], UNIFIED_VALUE_FACTOR_SOURCE)
+
+    def test_compute_quality_factors_uses_canonical_feature_version(self) -> None:
+        with (
+            patch('app.internal.ops.bootstrap_runtime') as bootstrap_runtime,
+            patch(
+                'app.internal.ops.daily_quality_factor_service.rebuild_for_market_date',
+                return_value={'results_persisted': 2},
+            ) as compute_quality,
+        ):
+            result = ops.compute_quality_factors(
+                market_date='2026-04-24',
+                symbols='005930,000660',
+            )
+
+        bootstrap_runtime.assert_called_once_with()
+        self.assertEqual(result, {'results_persisted': 2})
+        self.assertEqual(compute_quality.call_args.kwargs['market_date'], '2026-04-24')
+        self.assertEqual(compute_quality.call_args.kwargs['symbols'], ['005930', '000660'])
+        self.assertEqual(compute_quality.call_args.kwargs['source'], QUALITY_FACTOR_SOURCE)
+
+    def test_compute_quality_factors_preserves_empty_symbol_subset(self) -> None:
+        with (
+            patch('app.internal.ops.bootstrap_runtime') as bootstrap_runtime,
+            patch(
+                'app.internal.ops.daily_quality_factor_service.rebuild_for_market_date',
+                return_value={'results_persisted': 0},
+            ) as compute_quality,
+        ):
+            result = ops.compute_quality_factors(
+                market_date='2026-04-24',
+                symbols=',',
+            )
+
+        bootstrap_runtime.assert_called_once_with()
+        self.assertEqual(result, {'results_persisted': 0})
+        self.assertEqual(compute_quality.call_args.kwargs['market_date'], '2026-04-24')
+        self.assertEqual(compute_quality.call_args.kwargs['symbols'], [])
+        self.assertEqual(compute_quality.call_args.kwargs['source'], QUALITY_FACTOR_SOURCE)
 
     def test_compute_composite_factors_uses_canonical_feature_version(self) -> None:
         with (

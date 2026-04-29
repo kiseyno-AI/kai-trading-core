@@ -578,6 +578,95 @@ class FakeUnifiedValueFactorService:
         }
 
 
+class FakeQualityFactorService:
+    def __init__(self):
+        self.compute_args = None
+        self.inspect_args = None
+
+    def rebuild_for_market_date(self, **kwargs):
+        self.compute_args = kwargs
+        return {
+            'market_date': kwargs['market_date'],
+            'feature_version': kwargs['source'],
+            'results_persisted': 2,
+            'results_failed': 0,
+            'items': [{'symbol': '005930', 'quality_score': 0.87}],
+        }
+
+    def inspect(self, **kwargs):
+        self.inspect_args = kwargs
+        market_date = kwargs['market_date']
+        symbol = kwargs.get('symbol')
+        if symbol:
+            return {
+                'market_date': market_date,
+                'feature_version': 'quality_v1',
+                'summary': {
+                    'entries': 1,
+                    'requested_symbol': symbol,
+                    'matched_symbols': [symbol],
+                    'missing_symbols': [],
+                    'scored_complete_count': 0,
+                    'scored_partial_count': 1,
+                    'invalid_assets_count': 0,
+                    'invalid_equity_count': 0,
+                    'invalid_net_income_count': 0,
+                    'missing_metric_count': 0,
+                    'insufficient_components_count': 0,
+                    'insufficient_fundamentals_count': 0,
+                    'missing_market_date_bar_count': 0,
+                },
+                'item': {
+                    'symbol': symbol,
+                    'market_date': market_date,
+                    'quality_score': 0.93,
+                    'quality_status': 'scored_partial',
+                    'components_possible': 6,
+                    'components_used': 4,
+                    'is_quality_score_complete': False,
+                },
+            }
+        return {
+            'market_date': market_date,
+            'feature_version': 'quality_v1',
+            'summary': {
+                'entries': 2,
+                'requested_symbol': None,
+                'matched_symbols': ['005930', '000660'],
+                'missing_symbols': [],
+                'scored_complete_count': 1,
+                'scored_partial_count': 1,
+                'invalid_assets_count': 0,
+                'invalid_equity_count': 0,
+                'invalid_net_income_count': 0,
+                'missing_metric_count': 0,
+                'insufficient_components_count': 0,
+                'insufficient_fundamentals_count': 0,
+                'missing_market_date_bar_count': 0,
+            },
+            'items': [
+                {
+                    'symbol': '005930',
+                    'market_date': market_date,
+                    'quality_score': 0.93,
+                    'quality_status': 'scored_complete',
+                    'components_possible': 6,
+                    'components_used': 6,
+                    'is_quality_score_complete': True,
+                },
+                {
+                    'symbol': '000660',
+                    'market_date': market_date,
+                    'quality_score': 0.58,
+                    'quality_status': 'scored_partial',
+                    'components_possible': 6,
+                    'components_used': 4,
+                    'is_quality_score_complete': False,
+                },
+            ],
+        }
+
+
 class FakeCompositeFactorService:
     def __init__(self):
         self.compute_args = None
@@ -1522,6 +1611,48 @@ class EODRouteTests(unittest.TestCase):
         self.assertEqual(fake_service.inspect_args['symbol'], '005930')
         self.assertEqual(response.json()['item']['unified_value_score'], 0.93)
         self.assertEqual(response.json()['item']['unified_value_status'], 'scored')
+
+    def test_compute_quality_factors_route_calls_service(self):
+        fake_service = FakeQualityFactorService()
+        original_service = routes_eod.daily_quality_factor_service
+        routes_eod.daily_quality_factor_service = fake_service
+        try:
+            client = TestClient(self.app)
+            response = client.post(
+                '/eod/quality-factors/compute',
+                params={
+                    'market_date': '2026-04-24',
+                    'symbols': '005930,000660',
+                    'source': 'quality_v1',
+                },
+            )
+        finally:
+            routes_eod.daily_quality_factor_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(fake_service.compute_args['market_date'], '2026-04-24')
+        self.assertEqual(fake_service.compute_args['symbols'], ['005930', '000660'])
+        self.assertEqual(fake_service.compute_args['source'], 'quality_v1')
+        self.assertEqual(response.json()['items'][0]['quality_score'], 0.87)
+
+    def test_inspect_quality_factors_route_returns_single_item_for_symbol(self):
+        fake_service = FakeQualityFactorService()
+        original_service = routes_eod.daily_quality_factor_service
+        routes_eod.daily_quality_factor_service = fake_service
+        try:
+            client = TestClient(self.app)
+            response = client.get(
+                '/eod/quality-factors',
+                params={'market_date': '2026-04-24', 'symbol': '005930'},
+            )
+        finally:
+            routes_eod.daily_quality_factor_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(fake_service.inspect_args['market_date'], '2026-04-24')
+        self.assertEqual(fake_service.inspect_args['symbol'], '005930')
+        self.assertEqual(response.json()['item']['quality_score'], 0.93)
+        self.assertEqual(response.json()['item']['quality_status'], 'scored_partial')
 
     def test_compute_composite_factors_route_calls_service(self):
         fake_service = FakeCompositeFactorService()
