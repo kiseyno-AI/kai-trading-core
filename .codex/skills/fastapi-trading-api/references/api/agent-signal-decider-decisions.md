@@ -75,7 +75,7 @@ GET /agent-context/signal-decider/decisions?market_date_from=2026-04-20&market_d
 # GET /agent-context/signal-decider/decisions/{snapshot_id}
 
 ## Summary
-Reads one immutable `signal-decider` decision snapshot by `snapshot_id`, including the stable explanation block, frozen request/response payloads, upstream references, synthetic realized outcomes, separate actual execution outcomes, and versioned evaluations in one place. The frozen request payload now preserves the structured unified-value, quality, and momentum `scores` block exactly as the decider saw it.
+Reads one immutable `signal-decider` decision snapshot by `snapshot_id`, including the stable explanation block, frozen request/response payloads, upstream references, synthetic realized outcomes, separate actual execution outcomes, and versioned evaluations in one place. The frozen request payload now preserves both the structured factor `scores` block and the compact `market_context` block exactly as the decider saw them, and the detail payload also exposes `market_context` directly for operator review.
 
 ## Example request
 ```http
@@ -95,7 +95,33 @@ GET /agent-context/signal-decider/decisions/84?horizons=1&horizons=5&evaluation_
         {"key": "technical.breakout_20d", "value": "true"}
       ]
     },
+    "market_context": {
+      "status": "stale",
+      "market_date": "2026-04-23",
+      "as_of": "2026-04-23T15:21:00+09:00",
+      "summary": {
+        "market_bias": "mixed",
+        "line": "KOSPI +0.11%; KOSDAQ -0.19%; USD/KRW 1444.5 (fallback).",
+        "breadth_summary": "KOSPI breadth 512/94/330; KOSDAQ breadth 828/94/716"
+      },
+      "indices": {
+        "kospi": {"level": 2642.07, "change": 2.78, "change_rate": 0.11},
+        "kosdaq": {"level": 857.6, "change": -1.61, "change_rate": -0.19}
+      },
+      "fx": {
+        "usdkrw": {"value": 1444.5, "effective_date": "2026-04-22", "fallback_applied": true}
+      },
+      "flows": {
+        "foreign": {"value": -448834, "unit": "KIS_NET_VALUE_RAW"},
+        "institutional": {"value": -206217, "unit": "KIS_NET_VALUE_RAW"}
+      },
+      "missing_fields": [],
+      "stale_reason": "usdkrw_fallback_applied"
+    },
     "request_payload": {
+      "market_context": {
+        "status": "stale"
+      },
       "scores": {
         "unified_value": {
           "status": "available",

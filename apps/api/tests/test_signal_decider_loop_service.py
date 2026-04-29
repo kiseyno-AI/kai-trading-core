@@ -37,6 +37,7 @@ def _feedback_row(
     target_price: int | None = None,
     stop_loss_price: int | None = None,
     expected_return_pct: float = 4.0,
+    market_context: dict[str, object] | None = None,
 ) -> SimpleNamespace:
     resolved_target_price = 105 if action == 'buy' and target_price is None else target_price
     resolved_stop_loss_price = 96 if action == 'buy' and stop_loss_price is None else stop_loss_price
@@ -107,6 +108,8 @@ def _feedback_row(
             },
         },
     }
+    if market_context is not None:
+        request_payload['market_context'] = market_context
     response_payload = {
         'role': 'signal-decider',
         'agent_name': 'signal-decider',
@@ -634,6 +637,16 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
                     'technical-summarizer': {'feedback_id': 7, 'run_id': 'upstream-7', 'source': 'persisted_feedback'}
                 },
                 'orchestration': {'required_upstream_roles': ['technical-summarizer']},
+                'market_context': {
+                    'status': 'partial',
+                    'market_date': '2026-04-23',
+                    'summary': {'market_bias': 'mixed', 'line': 'KOSPI +0.11%; USD/KRW 1444.5.', 'breadth_summary': None},
+                    'indices': {'kospi': {'level': 2642.07, 'change': 2.78, 'change_rate': 0.11}},
+                    'fx': {'usdkrw': {'value': 1444.5, 'effective_date': '2026-04-23', 'fallback_applied': False}},
+                    'flows': {},
+                    'missing_fields': ['indices.kosdaq', 'flows.foreign', 'flows.institutional'],
+                    'stale_reason': None,
+                },
             },
             received_at='2026-04-23T06:00:00+00:00',
         )
@@ -647,6 +660,7 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
         self.assertTrue(snapshot_item['traceability_payload']['gate_checks']['traceability_symbol_matches'])
         self.assertEqual(snapshot_item['input_feature_snapshot_payload']['technical']['breakout_20d'], True)
         self.assertEqual(snapshot_item['request_payload']['scores']['quality']['status'], 'partial')
+        self.assertEqual(snapshot_item['request_payload']['market_context']['status'], 'partial')
         self.assertEqual(snapshot_item['input_feature_snapshot_payload']['scores']['quality']['components_possible'], 6)
 
     def test_list_decisions_preserves_multiple_snapshots_for_one_symbol_date(self):
@@ -966,7 +980,35 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
 
     def test_get_decision_detail_returns_explanation_and_evaluations(self):
         repository = FakeSignalDeciderLoopRepository(
-            [_feedback_row(feedback_id=41, snapshot_id=101, market_date='2026-04-23', symbol='005930', action='buy')]
+            [
+                _feedback_row(
+                    feedback_id=41,
+                    snapshot_id=101,
+                    market_date='2026-04-23',
+                    symbol='005930',
+                    action='buy',
+                    market_context={
+                        'status': 'ready',
+                        'market_date': '2026-04-23',
+                        'summary': {
+                            'market_bias': 'risk_on',
+                            'line': 'KOSPI +0.45%; KOSDAQ +0.54%; USD/KRW 1444.5.',
+                            'breadth_summary': 'KOSPI breadth 702/81/198; KOSDAQ breadth 901/92/501',
+                        },
+                        'indices': {
+                            'kospi': {'level': 2642.07, 'change': 11.78, 'change_rate': 0.45},
+                            'kosdaq': {'level': 857.6, 'change': 4.61, 'change_rate': 0.54},
+                        },
+                        'fx': {'usdkrw': {'value': 1444.5, 'effective_date': '2026-04-23', 'fallback_applied': False}},
+                        'flows': {
+                            'foreign': {'value': 746146, 'unit': 'KIS_NET_VALUE_RAW'},
+                            'institutional': {'value': 206217, 'unit': 'KIS_NET_VALUE_RAW'},
+                        },
+                        'missing_fields': [],
+                        'stale_reason': None,
+                    },
+                )
+            ]
         )
         service = SignalDeciderLoopService(repository=repository)
 
@@ -1000,6 +1042,9 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
         self.assertEqual(result['item']['explanation']['decision_action'], 'buy')
         self.assertEqual(result['item']['explanation']['feature_flags'][0]['key'], 'technical.breakout_20d')
         self.assertEqual(result['item']['evaluation_summary']['latest_graded']['grade_label'], 'good_buy')
+        self.assertEqual(result['item']['market_context']['status'], 'ready')
+        self.assertEqual(result['item']['market_context']['indices']['kospi']['level'], 2642.07)
+        self.assertEqual(result['item']['request_payload']['market_context']['flows']['foreign']['value'], 746146)
         self.assertEqual(result['item']['outcomes'][0]['horizon_days'], 5)
         self.assertEqual(result['item']['evaluations'][0]['horizon_days'], 5)
 

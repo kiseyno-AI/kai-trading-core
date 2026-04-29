@@ -177,6 +177,16 @@ class DeciderReadyAgentContextReadService:
         }
 
 
+class FakeMarketContextBuilder:
+    def __init__(self, payload: dict):
+        self.payload = payload
+        self.calls = []
+
+    def build(self, *, market_date):
+        self.calls.append(market_date.isoformat())
+        return self.payload
+
+
 class RecordingBatchClient:
     def __init__(self):
         self.calls = []
@@ -927,18 +937,46 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         cleanup_service = FakeSessionCleanupService()
         fake_settings = SimpleNamespace(openclaw_agent_symbol_chunk_size=1, openclaw_agent_parallel_subtasks=2)
         reuse_service = SimpleNamespace(build_latest_decisions=lambda **kwargs: {})
+        market_context_builder = FakeMarketContextBuilder(
+            {
+                'status': 'ready',
+                'market_date': '2026-04-14',
+                'as_of': '2026-04-14T10:05:12+09:00',
+                'summary': {
+                    'market_bias': 'risk_on',
+                    'line': 'KOSPI +0.45%; KOSDAQ +0.54%; USD/KRW 1444.5.',
+                    'breadth_summary': 'KOSPI breadth 702/81/198; KOSDAQ breadth 901/92/501',
+                },
+                'indices': {
+                    'kospi': {'level': 2642.07, 'change': 11.78, 'change_rate': 0.45},
+                    'kosdaq': {'level': 857.60, 'change': 4.61, 'change_rate': 0.54},
+                },
+                'fx': {'usdkrw': {'value': 1444.5, 'effective_date': '2026-04-14', 'fallback_applied': False}},
+                'flows': {
+                    'foreign': {'value': 746146, 'unit': 'KIS_NET_VALUE_RAW'},
+                    'institutional': {'value': 206217, 'unit': 'KIS_NET_VALUE_RAW'},
+                },
+                'missing_fields': [],
+                'stale_reason': None,
+            }
+        )
 
         with patch.object(orchestrator_module, 'settings', fake_settings):
             with patch.object(orchestrator_module, 'agent_context_read_service', DeciderReadyAgentContextReadService()):
                 with patch.object(orchestrator_module, 'agent_context_reuse_service', reuse_service):
                     with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
                         with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
-                            with _patch_feedback_eligibility('005930'):
-                                result = service.dispatch_for_symbols(
-                                    market_date='2026-04-14',
-                                    symbols=['005930'],
-                                    reuse_existing=False,
-                                )
+                            with patch.object(
+                                orchestrator_module,
+                                'signal_decider_market_context_builder',
+                                market_context_builder,
+                            ):
+                                with _patch_feedback_eligibility('005930'):
+                                    result = service.dispatch_for_symbols(
+                                        market_date='2026-04-14',
+                                        symbols=['005930'],
+                                        reuse_existing=False,
+                                    )
 
         self.assertEqual(
             result['request']['roles'],
@@ -958,6 +996,9 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertEqual(decider_payload['scores']['unified_value']['status'], 'available')
         self.assertEqual(decider_payload['scores']['quality']['status'], 'partial')
         self.assertEqual(decider_payload['scores']['momentum']['score'], 0.91)
+        self.assertEqual(decider_payload['market_context']['status'], 'ready')
+        self.assertEqual(decider_payload['market_context']['summary']['market_bias'], 'risk_on')
+        self.assertEqual(decider_payload['market_context']['indices']['kospi']['level'], 2642.07)
         self.assertNotIn('scores', decider_payload['symbol_day_context'])
         self.assertEqual(decider_payload['orchestration']['request_model'], 'openclaw/signal-decider')
         self.assertEqual(
@@ -977,9 +1018,12 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertEqual(decider_row['feedback']['preferred_action'], 'buy')
         self.assertEqual(decider_row['summary']['model'], 'openclaw/signal-decider')
         self.assertIn('raw_response', decider_row['summary'])
+        self.assertEqual(decider_row['context']['market_context']['status'], 'ready')
+        self.assertEqual(decider_row['context']['market_context']['flows']['foreign']['value'], 746146)
         decider_call = next(call for call in client.calls if call['spec'].role == 'signal-decider')
         self.assertEqual(decider_call['batch_items'][0]['session_reuse_mode'], 'fresh_per_batch')
         self.assertIn(result['request']['request_run_id'], decider_call['batch_items'][0]['session_key'])
+        self.assertEqual(market_context_builder.calls, ['2026-04-14'])
         self.assertEqual(result['summary']['completed'], 4)
 
     def test_failed_fresh_signal_decider_batch_still_cleans_session(self):
