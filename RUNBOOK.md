@@ -23,6 +23,8 @@ What it does:
 ## Health checks
 - `GET /health`
 - `GET /portfolio/summary`
+- `GET /trading/orders/exec/runtime?refresh=true`
+- `GET /trading/orders/exec/signal-decider?target_trade_date=2026-04-30&refresh=true`
 - `GET /trading/orders/intraday-auto-sell?account_reference=KIS:12345678-01&symbol=005930&refresh=true`
 - `POST /trading/orders/intraday-auto-sell/run-if-due`
 - `GET /macro/ecos/series?stat_code=722Y001&cycle=M&start_period=202401&end_period=202403&item_code_1=0101000`
@@ -77,8 +79,10 @@ What it does:
 - A background runner checks market state every 60 seconds while the API process is alive.
 - During `PREOPEN`, it refreshes the daily master if needed.
 - During `PREOPEN`, it also refreshes the persisted signal-decider next-open execution plan for the current trade date when account targets are configured.
-- During `OPEN`, it submits or dry-runs eligible next-open execution-plan rows through the existing trading order service, using the `SIGNAL_DECIDER_NEXT_OPEN_*` safety settings and deterministic client-order ids for duplicate protection.
-- During `OPEN`, it also evaluates linked next-open positions against persisted signal-decider target/stop thresholds and submits intraday auto-sell market orders when the live KIS quote crosses a configured exit rule.
+- When `SIGNAL_DECIDER_EXEC_INTEGRATION_MODE=dispatch`, the same `PREOPEN` loop also translates eligible next-open rows into normalized exec plan items and dispatches them to `kai-trading-exec` using stable plan/item keys for idempotent redispatch.
+- During `OPEN`, if `SIGNAL_DECIDER_EXEC_INTEGRATION_MODE=disabled`, core submits or dry-runs eligible next-open execution-plan rows through the existing trading order service, using the `SIGNAL_DECIDER_NEXT_OPEN_*` safety settings and deterministic client-order ids for duplicate protection.
+- During `OPEN`, if `SIGNAL_DECIDER_EXEC_INTEGRATION_MODE=disabled`, core also evaluates linked next-open positions against persisted signal-decider target/stop thresholds and submits intraday auto-sell market orders when the live KIS quote crosses a configured exit rule.
+- During `OPEN`, if `SIGNAL_DECIDER_EXEC_INTEGRATION_MODE=dispatch`, core does not place those live signal-decider orders itself. Instead it refreshes the core-owned exec read model from the exec runtime APIs so operator and web views can read dispatch/runtime/order/execution state without double-submitting live actions from core.
 - During `CLOSED`, after `EOD_AUTO_PYKRX_AFTER_CLOSE_MINUTES`, it schedules a thread-based pykrx daily EOD run if that trade date is available and not already completed.
 - Database persistence stores symbol master data, tracked symbols, quote cache/history, market status snapshots, EOD bars, EOD run records, persisted daily price contexts, daily technical/action snapshots, KIS daily signal features, KIS daily market-risk snapshots, persisted daily market-risk filter results, persisted daily momentum factor results, persisted daily low-risk factor results, persisted daily beta factor results, persisted daily advanced value factor results, persisted daily unified value factor results, persisted daily composite factor results, persisted daily market participation context, and stored day-based trending ranks.
 
@@ -250,6 +254,7 @@ Local overrides:
 - Set `EOD_AUTO_PYKRX_ENABLED=false` in `apps/api/.env` to disable the recurring scheduler.
 - Tune `EOD_AUTO_PYKRX_AFTER_CLOSE_MINUTES`, `EOD_AUTO_PYKRX_POLL_SECONDS`, `EOD_AUTO_PYKRX_MARKETS`, `EOD_AUTO_PYKRX_REFRESH_UNIVERSE`, `EOD_AUTO_PYKRX_STALE_RUN_MINUTES`, and `EOD_PYKRX_REQUEST_TIMEOUT_SECONDS` in `apps/api/.env`, then restart the API.
 - Use `SIGNAL_DECIDER_NEXT_OPEN_ENABLED`, `SIGNAL_DECIDER_NEXT_OPEN_DRY_RUN`, `SIGNAL_DECIDER_NEXT_OPEN_ACCOUNT_TARGETS`, `SIGNAL_DECIDER_NEXT_OPEN_MIN_CONFIDENCE_SCORE_10`, `SIGNAL_DECIDER_NEXT_OPEN_MIN_EXPECTED_RETURN_PCT`, and the `SIGNAL_DECIDER_NEXT_OPEN_REQUIRE_*` / `...BLOCK_ON_*` guardrails in `apps/api/.env`, then restart the API.
+- Use `SIGNAL_DECIDER_EXEC_INTEGRATION_MODE=disabled|observe|dispatch`, `SIGNAL_DECIDER_EXEC_BASE_URL`, optional `SIGNAL_DECIDER_EXEC_BEARER_TOKEN`, `SIGNAL_DECIDER_EXEC_RUNTIME_MODE`, and `SIGNAL_DECIDER_EXEC_REQUEST_TIMEOUT_SECONDS` in `apps/api/.env` to control the core-to-exec integration lane, then restart the API.
 - Use `GET /eod/status` to inspect the scheduler state and last result.
 
 ## Audit logging

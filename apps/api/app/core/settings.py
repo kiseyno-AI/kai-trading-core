@@ -61,6 +61,12 @@ class Settings(BaseSettings):
     signal_decider_next_open_block_on_data_warnings: bool = True
     signal_decider_next_open_block_on_specialist_disagreement: bool = True
     signal_decider_next_open_require_target_and_stop: bool = True
+    signal_decider_exec_integration_mode: str = 'disabled'
+    signal_decider_exec_base_url: str = 'http://127.0.0.1:8010'
+    signal_decider_exec_bearer_token: Optional[str] = None
+    signal_decider_exec_dispatch_source: str = 'kai-trading-core'
+    signal_decider_exec_runtime_mode: str = 'mock'
+    signal_decider_exec_request_timeout_seconds: float = 10.0
     signal_decider_intraday_auto_sell_enabled: bool = False
     signal_decider_intraday_auto_sell_dry_run: bool = True
     signal_decider_intraday_auto_sell_cooldown_seconds: int = 120

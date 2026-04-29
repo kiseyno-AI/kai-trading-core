@@ -163,6 +163,46 @@ class FakeIntradayAutoSellService:
         }
 
 
+class FakeSignalDeciderExecIntegrationService:
+    def __init__(self) -> None:
+        self.delegate_execution = False
+        self.dispatch_calls: list[dict] = []
+        self.runtime_calls: list[dict] = []
+        self.overview_calls: list[dict] = []
+        self.intraday_calls: list[dict] = []
+
+    def should_delegate_execution(self) -> bool:
+        return self.delegate_execution
+
+    async def runtime_status(self, **kwargs):
+        self.runtime_calls.append(kwargs)
+        return {
+            'integration': {'mode': 'dispatch', 'enabled': True},
+            'runtime': {'status': 'ok', 'payload': {'ready': True}},
+        }
+
+    async def dispatch_next_open_plan(self, **kwargs):
+        self.dispatch_calls.append(kwargs)
+        return {
+            'summary': {'delegated_to_exec': True, 'submitted_count': 1},
+            'items': [{'plan_item_id': 8, 'symbol': '005930', 'execution_status': 'submitted'}],
+        }
+
+    async def list_signal_decider_exec_overview(self, **kwargs):
+        self.overview_calls.append(kwargs)
+        return {
+            'summary': {'remote_open_count': 1},
+            'items': [{'plan_item_id': 8, 'symbol': '005930', 'dispatch': {'status': 'accepted'}}],
+        }
+
+    async def list_intraday_exec_watch(self, **kwargs):
+        self.intraday_calls.append(kwargs)
+        return {
+            'summary': {'delegated_to_exec': True, 'items_total': 1},
+            'items': [{'plan_item_id': 12, 'symbol': '005930', 'remote_state': {'derived_status': 'open'}}],
+        }
+
+
 class TradingOrderRouteTests(unittest.TestCase):
     def setUp(self) -> None:
         self.app = FastAPI()
@@ -172,16 +212,19 @@ class TradingOrderRouteTests(unittest.TestCase):
         self.reconcile_service = FakeTradingOrderReconciliationService()
         self.next_open_service = FakeNextOpenExecutionService()
         self.intraday_auto_sell_service = FakeIntradayAutoSellService()
+        self.exec_integration_service = FakeSignalDeciderExecIntegrationService()
         self.original_service = routes_trading.trading_order_service
         self.original_monitoring_service = routes_trading.trading_order_monitoring_service
         self.original_reconcile_service = routes_trading.trading_order_reconciliation_service
         self.original_next_open_service = routes_trading.signal_decider_next_open_execution_service
         self.original_intraday_auto_sell_service = routes_trading.signal_decider_intraday_auto_sell_service
+        self.original_exec_integration_service = routes_trading.signal_decider_exec_integration_service
         routes_trading.trading_order_service = self.service
         routes_trading.trading_order_monitoring_service = self.monitoring_service
         routes_trading.trading_order_reconciliation_service = self.reconcile_service
         routes_trading.signal_decider_next_open_execution_service = self.next_open_service
         routes_trading.signal_decider_intraday_auto_sell_service = self.intraday_auto_sell_service
+        routes_trading.signal_decider_exec_integration_service = self.exec_integration_service
 
     def tearDown(self) -> None:
         routes_trading.trading_order_service = self.original_service
@@ -189,6 +232,7 @@ class TradingOrderRouteTests(unittest.TestCase):
         routes_trading.trading_order_reconciliation_service = self.original_reconcile_service
         routes_trading.signal_decider_next_open_execution_service = self.original_next_open_service
         routes_trading.signal_decider_intraday_auto_sell_service = self.original_intraday_auto_sell_service
+        routes_trading.signal_decider_exec_integration_service = self.original_exec_integration_service
 
     def test_buy_route_returns_created_payload(self) -> None:
         client = TestClient(self.app)
@@ -376,6 +420,46 @@ class TradingOrderRouteTests(unittest.TestCase):
         self.assertEqual(self.intraday_auto_sell_service.run_calls[0]['account_reference'], 'KIS:12345678-01')
         self.assertEqual(self.intraday_auto_sell_service.run_calls[0]['symbol'], '005930')
         self.assertTrue(self.intraday_auto_sell_service.run_calls[0]['force'])
+
+    def test_exec_routes_and_delegated_order_routes_use_exec_service(self) -> None:
+        self.exec_integration_service.delegate_execution = True
+        client = TestClient(self.app)
+
+        runtime_response = client.get('/trading/orders/exec/runtime')
+        overview_response = client.get(
+            '/trading/orders/exec/signal-decider',
+            params={'target_trade_date': '2026-04-30', 'symbol': '005930', 'refresh': 'true'},
+        )
+        next_open_response = client.post(
+            '/trading/orders/next-open-execution/run-if-due',
+            json={'target_trade_date': '2026-04-30', 'dry_run': False, 'force': True},
+        )
+        intraday_response = client.post(
+            '/trading/orders/intraday-auto-sell/run-if-due',
+            json={
+                'account_reference': 'KIS:12345678-01',
+                'symbol': '005930',
+                'dry_run': False,
+                'force': True,
+            },
+        )
+
+        self.assertEqual(runtime_response.status_code, 200)
+        self.assertTrue(runtime_response.json()['runtime']['payload']['ready'])
+        self.assertEqual(overview_response.status_code, 200)
+        self.assertEqual(overview_response.json()['summary']['remote_open_count'], 1)
+        self.assertEqual(next_open_response.status_code, 200)
+        self.assertTrue(next_open_response.json()['summary']['delegated_to_exec'])
+        self.assertEqual(intraday_response.status_code, 200)
+        self.assertTrue(intraday_response.json()['summary']['delegated_to_exec'])
+        self.assertEqual(self.exec_integration_service.dispatch_calls[0]['target_trade_date'].isoformat(), '2026-04-30')
+        self.assertTrue(self.exec_integration_service.dispatch_calls[0]['refresh_plan'])
+        self.assertTrue(self.exec_integration_service.dispatch_calls[0]['force'])
+        self.assertEqual(self.exec_integration_service.overview_calls[0]['symbol'], '005930')
+        self.assertTrue(self.exec_integration_service.overview_calls[0]['refresh'])
+        self.assertEqual(self.exec_integration_service.intraday_calls[0]['account_reference'], 'KIS:12345678-01')
+        self.assertEqual(self.exec_integration_service.intraday_calls[0]['symbol'], '005930')
+        self.assertTrue(self.exec_integration_service.intraday_calls[0]['refresh'])
 
 
 if __name__ == '__main__':
