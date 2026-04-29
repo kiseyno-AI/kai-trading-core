@@ -768,6 +768,9 @@ class SignalDeciderNextOpenExecutionService:
             'account_reference': target.account_reference,
             'account_label': target.label,
             'allocation_budget_krw': _decimal_to_text(target.budget_krw),
+            'target_price': snapshot.target_price,
+            'stop_loss_price': snapshot.stop_loss_price,
+            'suggested_holding_period': snapshot.suggested_holding_period,
             'signal_traceability': snapshot.traceability_payload if isinstance(snapshot.traceability_payload, dict) else {},
         }
         row.last_evaluated_at = now
@@ -920,6 +923,7 @@ class SignalDeciderNextOpenExecutionService:
         if row is None or quantity is None:
             raise ValueError(f'plan item {row_id} is missing or does not have a planned quantity')
         scope = parse_kis_account_reference(row.account_reference)
+        traceability = row.traceability_payload if isinstance(row.traceability_payload, dict) else {}
         strategy_context_payload = {
             'signal_decider_next_open': {
                 'plan_item_id': row.id,
@@ -932,6 +936,9 @@ class SignalDeciderNextOpenExecutionService:
                 'account_label': row.account_label,
                 'allocation_budget_krw': _decimal_to_text(_to_decimal(row.allocation_budget_krw)),
                 'estimated_reference_price': row.estimated_reference_price,
+                'target_price': traceability.get('target_price'),
+                'stop_loss_price': traceability.get('stop_loss_price'),
+                'suggested_holding_period': traceability.get('suggested_holding_period'),
                 'trigger': trigger,
             }
         }
