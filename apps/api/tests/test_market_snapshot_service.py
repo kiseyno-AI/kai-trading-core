@@ -104,19 +104,40 @@ class EmptyFXService:
 
 
 class MarketSnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
-    async def test_get_market_snapshot_aggregates_kis_and_fx_sources(self) -> None:
+    def setUp(self) -> None:
+        self.original_settings = {
+            'kis_use_mock': settings.kis_use_mock,
+            'market_snapshot_kis_use_real': settings.market_snapshot_kis_use_real,
+            'kis_app_key': settings.kis_app_key,
+            'kis_app_secret': settings.kis_app_secret,
+            'koreaexim_api_key': settings.koreaexim_api_key,
+        }
+        settings.kis_app_key = 'test-kis-key'
+        settings.kis_app_secret = 'test-kis-secret'
+        settings.koreaexim_api_key = 'test-koreaexim-key'
+
+    def tearDown(self) -> None:
+        for field_name, value in self.original_settings.items():
+            setattr(settings, field_name, value)
+
+    async def test_get_market_snapshot_uses_real_domain_override_when_global_kis_is_mock(self) -> None:
         original_kis_use_mock = settings.kis_use_mock
-        settings.kis_use_mock = False
+        original_market_snapshot_kis_use_real = settings.market_snapshot_kis_use_real
+        settings.kis_use_mock = True
+        settings.market_snapshot_kis_use_real = True
         client = FakeKISClient()
-        service = MarketSnapshotService(kis_api_client=client, koreaexim_service=FakeFXService())
+        service = MarketSnapshotService(real_domain_kis_api_client=client, koreaexim_service=FakeFXService())
         try:
             result = await service.get_market_snapshot()
         finally:
             settings.kis_use_mock = original_kis_use_mock
+            settings.market_snapshot_kis_use_real = original_market_snapshot_kis_use_real
 
         self.assertEqual(client.token_calls, 1)
         self.assertEqual(client.index_calls, ['0001', '1001'])
         self.assertEqual(client.flow_calls, [('KSP', '0001'), ('KSQ', '1001')])
+        self.assertEqual(service.runtime_status()['effective_kis_environment'], 'real')
+        self.assertTrue(service.runtime_status()['uses_real_domain_override'])
         self.assertEqual(result['markets']['kospi']['label'], 'KOSPI')
         self.assertEqual(result['markets']['kospi']['value'], 2642.07)
         self.assertEqual(result['markets']['kospi']['foreign_net_quantity'], -5290)
@@ -126,25 +147,33 @@ class MarketSnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['usd_krw']['effective_date'], '2026-04-28')
         self.assertTrue(result['usd_krw']['fallback_applied'])
 
-    async def test_get_market_snapshot_requires_real_kis_domain(self) -> None:
+    async def test_get_market_snapshot_requires_real_kis_domain_when_override_is_disabled(self) -> None:
         original_kis_use_mock = settings.kis_use_mock
+        original_market_snapshot_kis_use_real = settings.market_snapshot_kis_use_real
         settings.kis_use_mock = True
+        settings.market_snapshot_kis_use_real = False
         service = MarketSnapshotService(kis_api_client=FakeKISClient(), koreaexim_service=FakeFXService())
         try:
-            with self.assertRaises(MarketSnapshotConfigurationError):
+            with self.assertRaises(MarketSnapshotConfigurationError) as ctx:
                 await service.get_market_snapshot()
         finally:
             settings.kis_use_mock = original_kis_use_mock
+            settings.market_snapshot_kis_use_real = original_market_snapshot_kis_use_real
+
+        self.assertIn('MARKET_SNAPSHOT_KIS_USE_REAL', str(ctx.exception))
 
     async def test_get_market_snapshot_rejects_empty_fx_payload(self) -> None:
         original_kis_use_mock = settings.kis_use_mock
+        original_market_snapshot_kis_use_real = settings.market_snapshot_kis_use_real
         settings.kis_use_mock = False
+        settings.market_snapshot_kis_use_real = True
         service = MarketSnapshotService(kis_api_client=FakeKISClient(), koreaexim_service=EmptyFXService())
         try:
             with self.assertRaises(MarketSnapshotUpstreamError):
                 await service.get_market_snapshot()
         finally:
             settings.kis_use_mock = original_kis_use_mock
+            settings.market_snapshot_kis_use_real = original_market_snapshot_kis_use_real
 
 
 if __name__ == '__main__':

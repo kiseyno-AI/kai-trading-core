@@ -62,7 +62,7 @@ class FakeMarketSnapshotService:
 
 class UnavailableMarketSnapshotService:
     async def get_market_snapshot(self) -> dict:
-        raise MarketSnapshotConfigurationError('KIS market snapshot requires KIS_USE_MOCK=false')
+        raise MarketSnapshotConfigurationError('Enable MARKET_SNAPSHOT_KIS_USE_REAL or run with KIS_USE_MOCK=false.')
 
 
 class BrokenMarketSnapshotService:
@@ -98,7 +98,7 @@ class MarketRouteTests(unittest.TestCase):
         response = client.get('/market/snapshot')
 
         self.assertEqual(response.status_code, 503)
-        self.assertIn('KIS market snapshot', response.json()['detail'])
+        self.assertIn('MARKET_SNAPSHOT_KIS_USE_REAL', response.json()['detail'])
 
     def test_market_snapshot_route_maps_upstream_errors_to_502(self) -> None:
         routes_market.market_snapshot_service = BrokenMarketSnapshotService()

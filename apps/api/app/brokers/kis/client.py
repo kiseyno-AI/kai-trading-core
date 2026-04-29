@@ -74,20 +74,20 @@ def _safe_json(response: httpx.Response) -> dict[str, Any]:
 
 
 class KISClient:
-    _token_cache: dict[str, object] = {
-        'access_token': '',
-        'expires_at': datetime.min.replace(tzinfo=timezone.utc),
-        'token_type': 'Bearer',
-    }
-
-    def __init__(self) -> None:
-        self.base_url = settings.kis_mock_base_url if settings.kis_use_mock else settings.kis_base_url
+    def __init__(self, *, use_mock: bool | None = None) -> None:
+        self.use_mock = settings.kis_use_mock if use_mock is None else bool(use_mock)
+        self.base_url = settings.kis_mock_base_url if self.use_mock else settings.kis_base_url
+        self._token_cache: dict[str, object] = {
+            'access_token': '',
+            'expires_at': datetime.min.replace(tzinfo=timezone.utc),
+            'token_type': 'Bearer',
+        }
 
     def _environment(self) -> str:
-        return 'demo' if settings.kis_use_mock else 'real'
+        return 'demo' if self.use_mock else 'real'
 
     def websocket_url(self) -> str:
-        return settings.kis_realtime_mock_ws_url if settings.kis_use_mock else settings.kis_realtime_ws_url
+        return settings.kis_realtime_mock_ws_url if self.use_mock else settings.kis_realtime_ws_url
 
     def _get_cached_token(self) -> dict | None:
         now = datetime.now(timezone.utc)
@@ -164,7 +164,7 @@ class KISClient:
             'base_url': self.base_url,
             'websocket_url': self.websocket_url(),
             'environment': self._environment(),
-            'use_mock': settings.kis_use_mock,
+            'use_mock': self.use_mock,
             'app_key_configured': bool(settings.kis_app_key),
             'app_secret_configured': bool(settings.kis_app_secret),
             'hts_id_configured': bool(settings.kis_hts_id),

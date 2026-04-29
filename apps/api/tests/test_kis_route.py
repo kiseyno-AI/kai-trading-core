@@ -34,18 +34,37 @@ class FakeRealtimeOrderNoticeService:
         }
 
 
+class FakeMarketSnapshotService:
+    def runtime_status(self) -> dict:
+        return {
+            'ready': True,
+            'global_kis_environment': 'demo',
+            'effective_kis_environment': 'real',
+            'effective_kis_base_url': 'https://openapi.koreainvestment.com:9443',
+            'uses_real_domain_override': True,
+            'market_snapshot_kis_use_real': True,
+            'kis_app_key_configured': True,
+            'kis_app_secret_configured': True,
+            'koreaexim_api_key_configured': True,
+            'blocking_reasons': [],
+        }
+
+
 class KISRouteTests(unittest.TestCase):
     def setUp(self) -> None:
         self.app = FastAPI()
         self.app.include_router(routes_kis.router)
         self.original_client = routes_kis.kis_client
         self.original_realtime_service = routes_kis.kis_realtime_order_notice_service
+        self.original_market_snapshot_service = routes_kis.market_snapshot_service
         routes_kis.kis_client = FakeKISClient()
         routes_kis.kis_realtime_order_notice_service = FakeRealtimeOrderNoticeService()
+        routes_kis.market_snapshot_service = FakeMarketSnapshotService()
 
     def tearDown(self) -> None:
         routes_kis.kis_client = self.original_client
         routes_kis.kis_realtime_order_notice_service = self.original_realtime_service
+        routes_kis.market_snapshot_service = self.original_market_snapshot_service
 
     def test_health_route_includes_realtime_order_notice_snapshot(self) -> None:
         client = TestClient(self.app)
@@ -56,6 +75,8 @@ class KISRouteTests(unittest.TestCase):
         self.assertEqual(payload['environment'], 'demo')
         self.assertEqual(payload['realtime_order_notices']['status'], 'subscribed')
         self.assertEqual(payload['realtime_order_notices']['metrics']['notices_ingested'], 3)
+        self.assertTrue(payload['market_snapshot_runtime']['ready'])
+        self.assertEqual(payload['market_snapshot_runtime']['effective_kis_environment'], 'real')
 
 
 if __name__ == '__main__':
