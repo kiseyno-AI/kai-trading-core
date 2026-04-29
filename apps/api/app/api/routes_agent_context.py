@@ -32,6 +32,7 @@ from app.agent_context.retry_service import (
 )
 from app.agent_context.status_service import agent_context_status_service
 from app.agent_context.runtime_state import RuntimeFeedbackRunState, runtime_feedback_state_store
+from app.orders.signal_decider_execution_outcomes import signal_decider_execution_outcome_service
 
 import threading
 import uuid
@@ -764,6 +765,41 @@ async def get_signal_decider_decision_detail(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f'Signal-decider decision detail read failed: {exc}') from exc
+
+
+@router.get('/signal-decider/execution-outcomes')
+async def list_signal_decider_execution_outcomes(
+    snapshot_id: int | None = Query(default=None),
+    market_date: date | None = Query(default=None),
+    market_date_from: date | None = Query(default=None),
+    market_date_to: date | None = Query(default=None),
+    symbol: str | None = Query(default=None),
+    account_reference: str | None = Query(default=None),
+    policy_version: str | None = Query(default=None),
+    lifecycle_status: str | None = Query(default=None),
+    exit_reason: str | None = Query(default=None),
+    refresh: bool = Query(default=False),
+    limit: int = Query(default=50, ge=1, le=200),
+) -> dict:
+    try:
+        return await run_in_threadpool(
+            signal_decider_execution_outcome_service.list_outcomes,
+            snapshot_id=snapshot_id,
+            market_date=market_date,
+            market_date_from=market_date_from,
+            market_date_to=market_date_to,
+            symbol=symbol,
+            account_reference=account_reference,
+            policy_version=policy_version,
+            lifecycle_status=lifecycle_status,
+            exit_reason=exit_reason,
+            refresh=refresh,
+            limit=limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'Signal-decider execution outcome read failed: {exc}') from exc
 
 
 @router.get('/signal-decider/diagnostics/summary')

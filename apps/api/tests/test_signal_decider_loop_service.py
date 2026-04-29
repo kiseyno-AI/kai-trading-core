@@ -825,6 +825,54 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
         self.assertEqual(result['item']['outcomes'][0]['horizon_days'], 5)
         self.assertEqual(result['item']['evaluations'][0]['horizon_days'], 5)
 
+    def test_get_decision_detail_includes_actual_execution_outcomes_separately(self):
+        repository = FakeSignalDeciderLoopRepository(
+            [_feedback_row(feedback_id=41, snapshot_id=101, market_date='2026-04-23', symbol='005930', action='buy')]
+        )
+        service = SignalDeciderLoopService(repository=repository)
+
+        actual_execution_outcomes = [
+            {
+                'outcome_id': 7,
+                'decision_snapshot_id': 101,
+                'symbol': '005930',
+                'lifecycle_status': 'closed',
+                'exit_reason': 'target_hit',
+                'realized_pnl_krw': '20000.00',
+            }
+        ]
+        actual_execution_summary = {
+            'count': 1,
+            'closed_count': 1,
+            'open_count': 0,
+            'unresolved_count': 0,
+            'rejected_count': 0,
+            'lifecycle_status_counts': {'closed': 1},
+            'exit_reason_counts': {'target_hit': 1},
+            'total_closed_quantity': '5',
+            'total_open_quantity': '0',
+            'total_realized_pnl_krw': '20000.00',
+        }
+
+        with patch(
+            'app.agent_context.signal_decider_loop_service.signal_decider_execution_outcome_service.list_snapshot_outcomes',
+            return_value=actual_execution_outcomes,
+        ) as list_mock, patch(
+            'app.agent_context.signal_decider_loop_service.signal_decider_execution_outcome_service.build_summary',
+            return_value=actual_execution_summary,
+        ) as summary_mock:
+            result = service.get_decision_detail(
+                snapshot_id=101,
+                horizons=[5],
+                evaluation_version='signal_decider_eval_test',
+            )
+
+        list_mock.assert_called_once_with(decision_snapshot_ids=[101], refresh=True)
+        summary_mock.assert_called_once_with(items=actual_execution_outcomes)
+        self.assertEqual(result['summary']['actual_execution_outcome_count'], 1)
+        self.assertEqual(result['item']['actual_execution_summary'], actual_execution_summary)
+        self.assertEqual(result['item']['actual_execution_outcomes'], actual_execution_outcomes)
+
     def test_get_diagnostics_batches_outcomes_and_evaluations(self):
         repository = FakeSignalDeciderLoopRepository(
             [

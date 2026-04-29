@@ -26,6 +26,7 @@ from app.orders.next_open_execution import (
     ELIGIBILITY_ELIGIBLE,
     EXECUTION_WINDOW_NEXT_OPEN,
 )
+from app.orders.signal_decider_execution_outcomes import signal_decider_execution_outcome_service
 from app.orders.service import (
     TradingOrderPendingSubmissionError,
     TradingOrderRejectedError,
@@ -694,6 +695,7 @@ class SignalDeciderIntradayAutoSellService:
                 traceability_payload=traceability_payload,
                 latest_attempt=latest_attempt,
             )
+            signal_decider_execution_outcome_service.sync_entry_plan_item(entry_plan_item_id=source.row.id)
             items.append(self._serialize_row(self._load_watch_row_by_id(row_id=row_id)))
 
         return items
@@ -1315,7 +1317,14 @@ class SignalDeciderIntradayAutoSellService:
                 },
             }
             row.last_evaluated_at = now
+            linked_entry_plan_item_id = _normalize_int(
+                ((row.traceability_payload or {}).get('linked_next_open_plan_item_id'))
+            )
             session.flush()
+        if linked_entry_plan_item_id is not None:
+            signal_decider_execution_outcome_service.sync_entry_plan_item(
+                entry_plan_item_id=linked_entry_plan_item_id
+            )
         serialized = self._serialize_row(self._load_watch_row_by_id(row_id=row_id))
         serialized['idempotent_replay'] = False
         return serialized
@@ -1466,6 +1475,7 @@ class SignalDeciderIntradayAutoSellService:
     ) -> None:
         now = _utcnow()
         safe_payload = _json_safe(payload)
+        linked_entry_plan_item_id: int | None = None
         with session_scope() as session:
             row = session.get(SignalDeciderExecutionPlanItem, row_id)
             if row is None:
@@ -1483,11 +1493,18 @@ class SignalDeciderIntradayAutoSellService:
                 'attempts': attempts,
             }
             row.last_evaluated_at = now
+            linked_entry_plan_item_id = _normalize_int(
+                ((row.traceability_payload or {}).get('linked_next_open_plan_item_id'))
+            )
             if submitted:
                 row.submitted_at = row.submitted_at or _parse_datetime(request.get('submitted_at')) or _parse_datetime(
                     order.get('first_submitted_at')
                 ) or now
             session.flush()
+        if linked_entry_plan_item_id is not None:
+            signal_decider_execution_outcome_service.sync_entry_plan_item(
+                entry_plan_item_id=linked_entry_plan_item_id
+            )
 
     def _next_attempt_number(self, *, row: SignalDeciderExecutionPlanItem) -> int:
         submission_payload = row.submission_payload if isinstance(row.submission_payload, dict) else {}

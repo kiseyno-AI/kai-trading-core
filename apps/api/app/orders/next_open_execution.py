@@ -16,6 +16,7 @@ from app.db_models import SignalDeciderDecisionSnapshot, SignalDeciderExecutionP
 from app.market.clock import MarketState, get_market_state
 from app.market_data_store import load_daily_bars_for_symbol_range
 from app.orders.account_scope import parse_kis_account_reference
+from app.orders.signal_decider_execution_outcomes import signal_decider_execution_outcome_service
 from app.orders.service import (
     TradingOrderPendingSubmissionError,
     TradingOrderRejectedError,
@@ -296,6 +297,9 @@ class SignalDeciderNextOpenExecutionService:
 
             session.flush()
 
+        signal_decider_execution_outcome_service.sync_for_target_trade_date(
+            target_trade_date=resolved_target_date,
+        )
         rows = self._load_plan_rows(target_trade_date=resolved_target_date, account_reference=None)
         return {
             'request': {
@@ -912,6 +916,7 @@ class SignalDeciderNextOpenExecutionService:
                 'client_order_id': row.client_order_id,
             }
             session.flush()
+        signal_decider_execution_outcome_service.sync_entry_plan_item(entry_plan_item_id=row_id)
         row = self._load_plan_row(row_id=row_id)
         serialized = self._serialize_row(row)
         serialized['idempotent_replay'] = False
@@ -1037,6 +1042,7 @@ class SignalDeciderNextOpenExecutionService:
             if submitted:
                 row.submitted_at = row.submitted_at or now
             session.flush()
+        signal_decider_execution_outcome_service.sync_entry_plan_item(entry_plan_item_id=row_id)
 
     def _load_plan_row(self, *, row_id: int) -> SignalDeciderExecutionPlanItem:
         with session_scope() as session:

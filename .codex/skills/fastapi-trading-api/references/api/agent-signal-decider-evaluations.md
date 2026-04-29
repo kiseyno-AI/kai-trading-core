@@ -1,7 +1,7 @@
 # POST /agent-context/signal-decider/evaluations/compute
 
 ## Summary
-Computes or refreshes raw realized outcomes plus versioned grading rows for immutable stored `signal-decider` decision snapshots over a date range.
+Computes or refreshes raw synthetic realized outcomes plus versioned grading rows for immutable stored `signal-decider` decision snapshots over a date range.
 
 The same evaluation refresh now also runs in the default daily EOD stage catalog as `signal_decider_evaluations`, which revisits the recent decision window after new price bars arrive.
 
@@ -36,7 +36,7 @@ Content-Type: application/json
 # GET /agent-context/signal-decider/evaluations
 
 ## Summary
-Reads the persisted outcome-plus-grade bundle back per immutable stored `signal-decider` decision snapshot for one market date.
+Reads the persisted synthetic outcome-plus-grade bundle back per immutable stored `signal-decider` decision snapshot for one market date. Broker-executed fills and realized execution P&L remain queryable through `GET /agent-context/signal-decider/execution-outcomes`.
 
 ## Example request
 ```http

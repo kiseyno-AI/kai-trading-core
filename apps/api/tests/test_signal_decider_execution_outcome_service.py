@@ -1,0 +1,374 @@
+from datetime import date, datetime, timezone
+from decimal import Decimal
+import unittest
+from uuid import uuid4
+
+from sqlalchemy import delete, select
+
+from app.db import engine, session_scope
+from app.db_models import (
+    BrokerOrder,
+    BrokerOrderEvent,
+    OrderRequest,
+    SignalDeciderActualExecutionOutcome,
+    SignalDeciderDecisionSnapshot,
+    SignalDeciderExecutionPlanItem,
+)
+from app.orders.signal_decider_execution_outcomes import signal_decider_execution_outcome_service
+from app.orders.store import append_broker_order_event, upsert_broker_order, upsert_order_request
+
+
+class SignalDeciderExecutionOutcomeServiceTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        OrderRequest.__table__.create(bind=engine, checkfirst=True)
+        BrokerOrder.__table__.create(bind=engine, checkfirst=True)
+        BrokerOrderEvent.__table__.create(bind=engine, checkfirst=True)
+        SignalDeciderDecisionSnapshot.__table__.create(bind=engine, checkfirst=True)
+        SignalDeciderExecutionPlanItem.__table__.create(bind=engine, checkfirst=True)
+        SignalDeciderActualExecutionOutcome.__table__.create(bind=engine, checkfirst=True)
+
+    def setUp(self) -> None:
+        suffix = uuid4().hex[:8].upper()
+        self.account_reference = f'KIS:34{suffix[:6]}-01'
+        self.symbol = '005930'
+        self.market_date = date(2026, 4, 29)
+        self.target_trade_date = date(2026, 4, 30)
+        self.policy_version = f'signal_decider_policy_exec_{suffix.lower()}'
+
+    def tearDown(self) -> None:
+        with session_scope() as session:
+            session.execute(
+                delete(SignalDeciderActualExecutionOutcome).where(
+                    SignalDeciderActualExecutionOutcome.account_reference == self.account_reference
+                )
+            )
+            session.execute(
+                delete(SignalDeciderExecutionPlanItem).where(
+                    SignalDeciderExecutionPlanItem.account_reference == self.account_reference
+                )
+            )
+            session.execute(
+                delete(BrokerOrderEvent).where(
+                    BrokerOrderEvent.account_reference == self.account_reference
+                )
+            )
+            session.execute(
+                delete(BrokerOrder).where(
+                    BrokerOrder.account_reference == self.account_reference
+                )
+            )
+            session.execute(
+                delete(OrderRequest).where(
+                    OrderRequest.account_reference == self.account_reference
+                )
+            )
+            session.execute(
+                delete(SignalDeciderDecisionSnapshot).where(
+                    SignalDeciderDecisionSnapshot.policy_version == self.policy_version
+                )
+            )
+
+    def _seed_snapshot(self) -> int:
+        with session_scope() as session:
+            row = SignalDeciderDecisionSnapshot(
+                feedback_id=None,
+                market_date=self.market_date,
+                symbol=self.symbol,
+                agent_name='signal-decider',
+                agent_version='test-agent',
+                decision_run_id=f'run-{self.symbol}',
+                feedback_received_at=datetime(2026, 4, 29, 6, 0, tzinfo=timezone.utc),
+                policy_version=self.policy_version,
+                decision_action='buy',
+                preferred_action='buy',
+                next_day_open_action='buy',
+                entry_price_basis='next_open',
+                target_price=54000,
+                expected_return_pct=4.8,
+                stop_loss_price=47000,
+                suggested_holding_period='3-10 trading days',
+                confidence_score_10=7.2,
+                conviction_score_10=6.4,
+                thesis_summary='Execution test snapshot',
+                supporting_evidence_payload=['Breadth improved.'],
+                decision_risks_payload=['Leadership remained narrow.'],
+                invalidation_conditions_payload=['Close below support.'],
+                data_quality_warnings_payload=[],
+                specialist_disagreement_payload=[],
+                traceability_payload={'schema_version': 'signal_decider_trace_v2', 'gate_checks': {'missing_upstream_roles': []}},
+                input_feature_snapshot_payload={'technical': {'trend_state': 'uptrend'}},
+                request_payload={'signal_decider_policy': {'current_version': self.policy_version}},
+                response_payload={'next_day_open_action': 'buy'},
+                response_summary_payload={'policy_version': self.policy_version},
+            )
+            session.add(row)
+            session.flush()
+            return row.id
+
+    def _seed_order(
+        self,
+        *,
+        client_order_id: str,
+        side: str,
+        source: str,
+        quantity: str,
+        status: str,
+        average_fill_price: str | None = None,
+        filled_quantity: str = '0',
+        submitted_at: str,
+        last_fill_at: str | None = None,
+        strategy_context_payload: dict | None = None,
+        broker_order_id: str | None = None,
+    ) -> tuple[dict, dict]:
+        request_row = upsert_order_request(
+            {
+                'broker_name': 'kis',
+                'client_order_id': client_order_id,
+                'source': source,
+                'account_reference': self.account_reference,
+                'symbol': self.symbol,
+                'side': side,
+                'order_type': 'market',
+                'requested_quantity': quantity,
+                'requested_price': None,
+                'time_in_force': 'day',
+                'strategy_context_payload': strategy_context_payload,
+                'request_payload': {'seeded': True, 'side': side},
+                'validation_status': 'valid',
+                'submission_status': 'rejected' if status == 'rejected' else 'submitted',
+                'submitted_at': submitted_at,
+            }
+        )
+        filled_decimal = Decimal(filled_quantity)
+        requested_decimal = Decimal(quantity)
+        order_row = upsert_broker_order(
+            {
+                'order_request_id': request_row['id'],
+                'broker_name': 'kis',
+                'broker_order_id': broker_order_id or f'{client_order_id}-BROKER',
+                'client_order_id': client_order_id,
+                'account_reference': self.account_reference,
+                'symbol': self.symbol,
+                'side': side,
+                'order_type': 'market',
+                'requested_quantity': quantity,
+                'requested_price': None,
+                'accepted_quantity': quantity,
+                'accepted_price': None,
+                'filled_quantity': filled_quantity,
+                'remaining_quantity': str(max(requested_decimal - filled_decimal, Decimal('0'))),
+                'average_fill_price': average_fill_price,
+                'time_in_force': 'day',
+                'current_status': status,
+                'first_submitted_at': submitted_at,
+                'last_broker_update_at': last_fill_at or submitted_at,
+                'last_fill_at': last_fill_at,
+                'raw_latest_payload': {'seeded': True, 'status': status},
+                'snapshot_payload': {'status': status},
+            }
+        )
+        if filled_decimal > Decimal('0') and average_fill_price is not None and last_fill_at is not None:
+            append_broker_order_event(
+                {
+                    'broker_name': 'kis',
+                    'account_reference': self.account_reference,
+                    'client_order_id': client_order_id,
+                    'broker_order_id': order_row['broker_order_id'],
+                    'symbol': self.symbol,
+                    'event_type': 'fill' if status == 'filled' else 'partial_fill',
+                    'event_occurred_at': last_fill_at,
+                    'quantity_delta': filled_quantity,
+                    'cumulative_filled_quantity': filled_quantity,
+                    'remaining_quantity': str(max(requested_decimal - filled_decimal, Decimal('0'))),
+                    'fill_price': average_fill_price,
+                    'average_fill_price': average_fill_price,
+                    'resulting_status': status,
+                    'source': 'ws_notice',
+                    'event_dedup_key': f'fill:{client_order_id}:{filled_quantity}:{last_fill_at}',
+                    'raw_payload': {'seeded': True},
+                    'normalized_payload': {'status': status},
+                }
+            )
+        return request_row, order_row
+
+    def _seed_plan_item(
+        self,
+        *,
+        execution_window: str,
+        snapshot_id: int,
+        planned_side: str,
+        client_order_id: str | None,
+        order_request_id: int | None,
+        broker_order_row_id: int | None,
+        execution_status: str,
+        validation_payload: dict | None = None,
+        traceability_payload: dict | None = None,
+    ) -> int:
+        with session_scope() as session:
+            row = SignalDeciderExecutionPlanItem(
+                execution_window=execution_window,
+                decision_snapshot_id=snapshot_id,
+                order_request_id=order_request_id,
+                broker_order_row_id=broker_order_row_id,
+                broker_name='kis',
+                target_trade_date=self.target_trade_date,
+                source_market_date=self.market_date,
+                account_reference=self.account_reference,
+                account_label='Main',
+                symbol=self.symbol,
+                policy_version=self.policy_version,
+                planned_side=planned_side,
+                planned_order_type='market',
+                planned_time_in_force='day',
+                allocation_budget_krw=Decimal('250000'),
+                estimated_reference_price=50000,
+                planned_quantity=Decimal('5'),
+                estimated_notional_krw=Decimal('250000'),
+                eligibility_status='eligible',
+                execution_status=execution_status,
+                client_order_id=client_order_id,
+                validation_payload=validation_payload,
+                traceability_payload=traceability_payload or {},
+                submission_payload=None,
+                first_ready_at=datetime(2026, 4, 29, 23, 0, tzinfo=timezone.utc),
+                last_evaluated_at=datetime(2026, 4, 29, 23, 0, tzinfo=timezone.utc),
+                submitted_at=datetime(2026, 4, 30, 0, 1, tzinfo=timezone.utc) if order_request_id is not None else None,
+            )
+            session.add(row)
+            session.flush()
+            return row.id
+
+    def test_list_outcomes_refresh_persists_closed_target_hit_trade(self) -> None:
+        snapshot_id = self._seed_snapshot()
+        entry_client_order_id = 'SDNO-20260430-005930'
+        exit_client_order_id = 'SDIS-20260430-005930-TGT-A1'
+        entry_request, entry_order = self._seed_order(
+            client_order_id=entry_client_order_id,
+            side='buy',
+            source='signal_decider_next_open',
+            quantity='5',
+            status='filled',
+            filled_quantity='5',
+            average_fill_price='50000',
+            submitted_at='2026-04-30T00:01:00+00:00',
+            last_fill_at='2026-04-30T00:01:30+00:00',
+            strategy_context_payload={'signal_decider_next_open': {'decision_snapshot_id': snapshot_id}},
+        )
+        entry_plan_item_id = self._seed_plan_item(
+            execution_window='next_open',
+            snapshot_id=snapshot_id,
+            planned_side='buy',
+            client_order_id=entry_client_order_id,
+            order_request_id=entry_request['id'],
+            broker_order_row_id=entry_order['id'],
+            execution_status='submitted',
+            traceability_payload={'target_price': 54000, 'stop_loss_price': 47000},
+        )
+        exit_request, exit_order = self._seed_order(
+            client_order_id=exit_client_order_id,
+            side='sell',
+            source='signal_decider_auto_sell',
+            quantity='5',
+            status='filled',
+            filled_quantity='5',
+            average_fill_price='54000',
+            submitted_at='2026-04-30T03:00:00+00:00',
+            last_fill_at='2026-04-30T03:05:00+00:00',
+            strategy_context_payload={
+                'signal_decider_intraday_auto_sell': {
+                    'decision_snapshot_id': snapshot_id,
+                    'linked_next_open_plan_item_id': entry_plan_item_id,
+                    'trigger_rule': 'target_hit',
+                }
+            },
+        )
+        exit_plan_item_id = self._seed_plan_item(
+            execution_window='intraday_auto_sell',
+            snapshot_id=snapshot_id,
+            planned_side='sell',
+            client_order_id=exit_client_order_id,
+            order_request_id=exit_request['id'],
+            broker_order_row_id=exit_order['id'],
+            execution_status='submitted',
+            validation_payload={'trigger': {'rule': 'target_hit'}},
+            traceability_payload={'linked_next_open_plan_item_id': entry_plan_item_id},
+        )
+
+        payload = signal_decider_execution_outcome_service.list_outcomes(
+            snapshot_id=snapshot_id,
+            refresh=True,
+        )
+
+        self.assertEqual(payload['summary']['count'], 1)
+        self.assertEqual(payload['summary']['closed_count'], 1)
+        item = payload['items'][0]
+        self.assertEqual(item['entry_plan_item_id'], entry_plan_item_id)
+        self.assertEqual(item['exit_plan_item_id'], exit_plan_item_id)
+        self.assertEqual(item['lifecycle_status'], 'closed')
+        self.assertEqual(item['exit_reason'], 'target_hit')
+        self.assertEqual(item['entry_filled_quantity'], '5.00000000')
+        self.assertEqual(item['exit_filled_quantity'], '5.00000000')
+        self.assertEqual(item['closed_quantity'], '5.00000000')
+        self.assertEqual(item['open_quantity'], '0.00000000')
+        self.assertEqual(item['entry_average_fill_price'], 50000)
+        self.assertEqual(item['exit_average_fill_price'], 54000)
+        self.assertEqual(item['realized_pnl_krw'], '20000.00')
+        self.assertEqual(item['realized_return_pct'], 0.08)
+        self.assertEqual(item['entry_filled_at'], '2026-04-30T00:01:30+00:00')
+        self.assertEqual(item['exit_filled_at'], '2026-04-30T03:05:00+00:00')
+        self.assertEqual(item['diagnostics']['exit']['trigger_rule'], 'target_hit')
+
+        with session_scope() as session:
+            row = session.execute(
+                select(SignalDeciderActualExecutionOutcome).where(
+                    SignalDeciderActualExecutionOutcome.entry_plan_item_id == entry_plan_item_id
+                )
+            ).scalar_one()
+            self.assertEqual(row.exit_plan_item_id, exit_plan_item_id)
+            self.assertEqual(row.exit_reason, 'target_hit')
+
+    def test_list_outcomes_refresh_persists_rejected_entry_separately_from_synthetic_rows(self) -> None:
+        snapshot_id = self._seed_snapshot()
+        entry_client_order_id = 'SDNO-20260430-005930-REJECT'
+        entry_request, entry_order = self._seed_order(
+            client_order_id=entry_client_order_id,
+            side='buy',
+            source='signal_decider_next_open',
+            quantity='5',
+            status='rejected',
+            filled_quantity='0',
+            average_fill_price=None,
+            submitted_at='2026-04-30T00:01:00+00:00',
+            last_fill_at=None,
+            strategy_context_payload={'signal_decider_next_open': {'decision_snapshot_id': snapshot_id}},
+        )
+        entry_plan_item_id = self._seed_plan_item(
+            execution_window='next_open',
+            snapshot_id=snapshot_id,
+            planned_side='buy',
+            client_order_id=entry_client_order_id,
+            order_request_id=entry_request['id'],
+            broker_order_row_id=entry_order['id'],
+            execution_status='submit_failed',
+        )
+
+        payload = signal_decider_execution_outcome_service.list_outcomes(
+            snapshot_id=snapshot_id,
+            refresh=True,
+        )
+
+        self.assertEqual(payload['summary']['count'], 1)
+        self.assertEqual(payload['summary']['rejected_count'], 1)
+        item = payload['items'][0]
+        self.assertEqual(item['entry_plan_item_id'], entry_plan_item_id)
+        self.assertEqual(item['lifecycle_status'], 'entry_rejected')
+        self.assertEqual(item['exit_reason'], 'entry_rejected')
+        self.assertEqual(item['entry_filled_quantity'], '0.00000000')
+        self.assertEqual(item['exit_filled_quantity'], '0.00000000')
+        self.assertIsNone(item['realized_pnl_krw'])
+        self.assertEqual(item['diagnostics']['entry']['order_status'], 'rejected')
+
+
+if __name__ == '__main__':
+    unittest.main()

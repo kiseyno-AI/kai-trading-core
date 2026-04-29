@@ -1200,6 +1200,125 @@ class SignalDeciderExecutionPlanItem(Base, TimestampMixin):
     submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
 
 
+class SignalDeciderActualExecutionOutcome(Base, TimestampMixin):
+    __tablename__ = 'signal_decider_actual_execution_outcomes'
+    __table_args__ = (
+        UniqueConstraint(
+            'entry_plan_item_id',
+            name='uq_sdao_entry_plan',
+        ),
+        Index(
+            'ix_sdao_mkt_sym_status',
+            'market_date',
+            'symbol',
+            'lifecycle_status',
+        ),
+        Index(
+            'ix_sdao_acct_target_status',
+            'account_reference',
+            'target_trade_date',
+            'lifecycle_status',
+        ),
+        Index(
+            'ix_sdao_snapshot',
+            'decision_snapshot_id',
+        ),
+        Index(
+            'ix_sdao_symbol',
+            'symbol',
+        ),
+        Index(
+            'ix_sdao_policy',
+            'policy_version',
+        ),
+        Index(
+            'ix_sdao_lifecycle',
+            'lifecycle_status',
+        ),
+        Index(
+            'ix_sdao_exit_reason',
+            'exit_reason',
+        ),
+        Index(
+            'ix_sdao_exit_plan',
+            'exit_plan_item_id',
+        ),
+        Index(
+            'ix_sdao_entry_order_req',
+            'entry_order_request_id',
+        ),
+        Index(
+            'ix_sdao_entry_broker_order',
+            'entry_broker_order_row_id',
+        ),
+        Index(
+            'ix_sdao_exit_order_req',
+            'exit_order_request_id',
+        ),
+        Index(
+            'ix_sdao_exit_broker_order',
+            'exit_broker_order_row_id',
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    decision_snapshot_id: Mapped[int] = mapped_column(
+        ForeignKey('signal_decider_decision_snapshots.id', ondelete='CASCADE'),
+        nullable=False,
+    )
+    entry_plan_item_id: Mapped[int] = mapped_column(
+        ForeignKey('signal_decider_execution_plan_items.id', ondelete='CASCADE'),
+        nullable=False,
+    )
+    exit_plan_item_id: Mapped[int | None] = mapped_column(
+        ForeignKey('signal_decider_execution_plan_items.id', ondelete='SET NULL'),
+        nullable=True,
+    )
+    entry_order_request_id: Mapped[int | None] = mapped_column(
+        ForeignKey('order_requests.id', ondelete='SET NULL'),
+        nullable=True,
+    )
+    entry_broker_order_row_id: Mapped[int | None] = mapped_column(
+        ForeignKey('broker_orders.id', ondelete='SET NULL'),
+        nullable=True,
+    )
+    exit_order_request_id: Mapped[int | None] = mapped_column(
+        ForeignKey('order_requests.id', ondelete='SET NULL'),
+        nullable=True,
+    )
+    exit_broker_order_row_id: Mapped[int | None] = mapped_column(
+        ForeignKey('broker_orders.id', ondelete='SET NULL'),
+        nullable=True,
+    )
+    broker_name: Mapped[str] = mapped_column(String(32), nullable=False, default='kis')
+    market_date: Mapped[date] = mapped_column(Date, nullable=False)
+    source_market_date: Mapped[date] = mapped_column(Date, nullable=False)
+    target_trade_date: Mapped[date] = mapped_column(Date, nullable=False)
+    account_reference: Mapped[str] = mapped_column(String(128), nullable=False)
+    symbol: Mapped[str] = mapped_column(String(32), nullable=False)
+    policy_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    entry_side: Mapped[str] = mapped_column(String(16), nullable=False, default='buy')
+    exit_side: Mapped[str] = mapped_column(String(16), nullable=False, default='sell')
+    lifecycle_status: Mapped[str] = mapped_column(String(32), nullable=False, default='planned')
+    exit_reason: Mapped[str | None] = mapped_column(String(64))
+    entry_submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    entry_filled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    exit_submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    exit_filled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    entry_filled_quantity: Mapped[float | None] = mapped_column(Numeric(20, 8))
+    exit_filled_quantity: Mapped[float | None] = mapped_column(Numeric(20, 8))
+    closed_quantity: Mapped[float | None] = mapped_column(Numeric(20, 8))
+    open_quantity: Mapped[float | None] = mapped_column(Numeric(20, 8))
+    entry_average_fill_price: Mapped[float | None] = mapped_column(Numeric(20, 8))
+    exit_average_fill_price: Mapped[float | None] = mapped_column(Numeric(20, 8))
+    entry_notional_krw: Mapped[float | None] = mapped_column(Numeric(20, 2))
+    exit_notional_krw: Mapped[float | None] = mapped_column(Numeric(20, 2))
+    realized_pnl_krw: Mapped[float | None] = mapped_column(Numeric(20, 2))
+    realized_return_pct: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    diagnostics_payload: Mapped[dict | None] = mapped_column(JSON)
+    computed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
 class AgentContextFeedbackFailure(Base, TimestampMixin):
     __tablename__ = 'agent_context_feedback_failures'
     __table_args__ = (
