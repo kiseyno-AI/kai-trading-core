@@ -1,7 +1,7 @@
 # GET /trading/orders/intraday-auto-sell and POST /trading/orders/intraday-auto-sell/run-if-due
 
 ## Summary
-Inspect or execute the persisted intraday auto-sell watcher for positions linked to submitted signal-decider next-open buys. The watcher refreshes live account positions plus KIS quotes, compares them to persisted `target_price` and `stop_loss_price` thresholds, and submits market sell orders with duplicate suppression and cooldown-aware retry behavior.
+Inspect or execute the persisted intraday auto-sell watcher for positions linked to submitted signal-decider next-open buys. In the core-local path the watcher refreshes live account positions plus KIS quotes, compares them to persisted `target_price` and `stop_loss_price` thresholds, and submits market sell orders with duplicate suppression and cooldown-aware retry behavior. When `SIGNAL_DECIDER_EXEC_INTEGRATION_MODE=dispatch`, the same route becomes the delegated exec watch view that reads target/stop monitoring state back from `kai-trading-exec` instead of submitting live exits from core.
 
 ## Example request
 ```http
@@ -54,3 +54,5 @@ Content-Type: application/json
   ]
 }
 ```
+
+In exec dispatch mode, response items expose delegated `dispatch` and `remote_state` blocks instead of local KIS quote-trigger diagnostics, and `POST /trading/orders/intraday-auto-sell/run-if-due` refreshes that delegated read model instead of placing a duplicate live exit from core.

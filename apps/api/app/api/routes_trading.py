@@ -9,6 +9,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from app.orders.exec_integration import signal_decider_exec_integration_service
 from app.orders.intraday_auto_sell import signal_decider_intraday_auto_sell_service
 from app.orders.monitoring import trading_order_monitoring_service
 from app.orders.next_open_execution import signal_decider_next_open_execution_service
@@ -241,6 +242,37 @@ async def get_realtime_health() -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=f'Trading order realtime health read failed: {exc}') from exc
 
 
+@router.get('/exec/runtime')
+async def get_exec_runtime_status(
+    refresh: bool = Query(default=True),
+) -> dict[str, Any]:
+    try:
+        return await signal_decider_exec_integration_service.runtime_status(refresh=refresh)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'Exec runtime status read failed: {exc}') from exc
+
+
+@router.get('/exec/signal-decider')
+async def get_exec_signal_decider_overview(
+    target_trade_date: date | None = Query(default=None),
+    account_reference: str | None = Query(default=None, min_length=1, max_length=128),
+    symbol: str | None = Query(default=None, min_length=1, max_length=32),
+    refresh: bool = Query(default=False),
+) -> dict[str, Any]:
+    try:
+        return await signal_decider_exec_integration_service.list_signal_decider_exec_overview(
+            target_trade_date=target_trade_date,
+            account_reference=account_reference,
+            symbol=symbol,
+            refresh=refresh,
+            trigger='route_read',
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'Exec signal-decider overview read failed: {exc}') from exc
+
+
 @router.get('/next-open-execution')
 async def list_next_open_execution_plan(
     target_trade_date: date | None = Query(default=None),
@@ -263,6 +295,14 @@ async def list_next_open_execution_plan(
 @router.post('/next-open-execution/run-if-due')
 async def run_next_open_execution_if_due(payload: TradingNextOpenExecutionRunRequest) -> dict[str, Any]:
     try:
+        if signal_decider_exec_integration_service.should_delegate_execution():
+            return await signal_decider_exec_integration_service.dispatch_next_open_plan(
+                target_trade_date=payload.target_trade_date,
+                refresh_plan=True,
+                dry_run=payload.dry_run,
+                force=payload.force,
+                trigger='api',
+            )
         return await signal_decider_next_open_execution_service.run_market_open_execution_if_due(
             target_trade_date=payload.target_trade_date,
             dry_run=payload.dry_run,
@@ -283,6 +323,13 @@ async def list_intraday_auto_sell_watch(
     refresh: bool = Query(default=False),
 ) -> dict[str, Any]:
     try:
+        if signal_decider_exec_integration_service.should_delegate_execution():
+            return await signal_decider_exec_integration_service.list_intraday_exec_watch(
+                account_reference=account_reference,
+                symbol=symbol,
+                refresh=refresh,
+                trigger='route_read',
+            )
         return await signal_decider_intraday_auto_sell_service.list_watch_items(
             account_reference=account_reference,
             symbol=symbol,
@@ -297,6 +344,13 @@ async def list_intraday_auto_sell_watch(
 @router.post('/intraday-auto-sell/run-if-due')
 async def run_intraday_auto_sell_if_due(payload: TradingIntradayAutoSellRunRequest) -> dict[str, Any]:
     try:
+        if signal_decider_exec_integration_service.should_delegate_execution():
+            return await signal_decider_exec_integration_service.list_intraday_exec_watch(
+                account_reference=payload.account_reference,
+                symbol=payload.symbol,
+                refresh=True,
+                trigger='api',
+            )
         return await signal_decider_intraday_auto_sell_service.run_intraday_auto_sell_if_due(
             account_reference=payload.account_reference,
             symbol=payload.symbol,

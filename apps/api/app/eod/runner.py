@@ -8,6 +8,7 @@ from app.core.settings import settings
 from app.eod.auto_pykrx import auto_pykrx_eod_scheduler
 from app.eod.master import refresh_master_if_due
 from app.market.clock import get_market_state
+from app.orders.exec_integration import signal_decider_exec_integration_service
 from app.orders.intraday_auto_sell import signal_decider_intraday_auto_sell_service
 from app.orders.next_open_execution import signal_decider_next_open_execution_service
 from app.orders.reconciliation import trading_order_reconciliation_service
@@ -43,13 +44,26 @@ class EODBackgroundRunner:
                 if market.state == 'PREOPEN':
                     refresh_master_if_due()
                     signal_decider_next_open_execution_service.refresh_plan_if_due()
+                    if signal_decider_exec_integration_service.should_delegate_execution():
+                        await signal_decider_exec_integration_service.dispatch_next_open_plan(
+                            target_trade_date=market.server_time[:10],
+                            refresh_plan=False,
+                            trigger='preopen_exec_dispatch',
+                        )
                 elif market.state == 'OPEN':
-                    await signal_decider_next_open_execution_service.run_market_open_execution_if_due(
-                        trigger='market_open_scheduler'
-                    )
-                    await signal_decider_intraday_auto_sell_service.run_intraday_auto_sell_if_due(
-                        trigger='market_open_scheduler'
-                    )
+                    if signal_decider_exec_integration_service.should_delegate_execution():
+                        await signal_decider_exec_integration_service.list_signal_decider_exec_overview(
+                            target_trade_date=market.server_time[:10],
+                            refresh=True,
+                            trigger='market_open_scheduler',
+                        )
+                    else:
+                        await signal_decider_next_open_execution_service.run_market_open_execution_if_due(
+                            trigger='market_open_scheduler'
+                        )
+                        await signal_decider_intraday_auto_sell_service.run_intraday_auto_sell_if_due(
+                            trigger='market_open_scheduler'
+                        )
                 elif market.state == 'CLOSED':
                     await auto_pykrx_eod_scheduler.schedule_daily_pipeline_if_due()
                 await trading_order_reconciliation_service.run_periodic_if_due()

@@ -161,6 +161,52 @@ class InternalOpsTests(unittest.TestCase):
         self.assertEqual(run_execution.call_args.kwargs['trigger'], 'internal_ops_cli')
         self.assertEqual(run_execution.call_args.kwargs['force'], True)
 
+    def test_run_next_open_execution_if_due_delegates_to_exec_when_enabled(self) -> None:
+        with (
+            patch('app.internal.ops.bootstrap_runtime') as bootstrap_runtime,
+            patch('app.internal.ops.signal_decider_exec_integration_service.should_delegate_execution', return_value=True),
+            patch(
+                'app.internal.ops.signal_decider_exec_integration_service.dispatch_next_open_plan',
+                new=AsyncMock(return_value={'summary': {'delegated_to_exec': True, 'submitted_count': 1}}),
+            ) as dispatch_exec,
+        ):
+            result = ops.run_next_open_execution_if_due(
+                target_trade_date='2026-04-30',
+                dry_run=False,
+                force=True,
+            )
+
+        bootstrap_runtime.assert_called_once_with()
+        self.assertTrue(result['summary']['delegated_to_exec'])
+        self.assertEqual(dispatch_exec.call_args.kwargs['target_trade_date'], '2026-04-30')
+        self.assertTrue(dispatch_exec.call_args.kwargs['refresh_plan'])
+        self.assertEqual(dispatch_exec.call_args.kwargs['dry_run'], False)
+        self.assertEqual(dispatch_exec.call_args.kwargs['trigger'], 'internal_ops_cli')
+        self.assertEqual(dispatch_exec.call_args.kwargs['force'], True)
+
+    def test_run_intraday_auto_sell_if_due_delegates_to_exec_when_enabled(self) -> None:
+        with (
+            patch('app.internal.ops.bootstrap_runtime') as bootstrap_runtime,
+            patch('app.internal.ops.signal_decider_exec_integration_service.should_delegate_execution', return_value=True),
+            patch(
+                'app.internal.ops.signal_decider_exec_integration_service.list_intraday_exec_watch',
+                new=AsyncMock(return_value={'summary': {'delegated_to_exec': True, 'items_total': 1}}),
+            ) as delegated_watch,
+        ):
+            result = ops.run_intraday_auto_sell_if_due(
+                account_reference='KIS:12345678-01',
+                symbol='005930',
+                dry_run=False,
+                force=True,
+            )
+
+        bootstrap_runtime.assert_called_once_with()
+        self.assertTrue(result['summary']['delegated_to_exec'])
+        self.assertEqual(delegated_watch.call_args.kwargs['account_reference'], 'KIS:12345678-01')
+        self.assertEqual(delegated_watch.call_args.kwargs['symbol'], '005930')
+        self.assertTrue(delegated_watch.call_args.kwargs['refresh'])
+        self.assertEqual(delegated_watch.call_args.kwargs['trigger'], 'internal_ops_cli')
+
     def test_compute_trending_ranks_uses_direct_store_call(self) -> None:
         with (
             patch('app.internal.ops.bootstrap_runtime') as bootstrap_runtime,

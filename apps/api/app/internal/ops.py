@@ -32,6 +32,7 @@ from app.market_data_store import (
     load_tracked_symbols,
     persist_market_status_snapshot,
 )
+from app.orders.exec_integration import signal_decider_exec_integration_service
 from app.orders.intraday_auto_sell import signal_decider_intraday_auto_sell_service
 from app.orders.next_open_execution import signal_decider_next_open_execution_service
 from app.orders.reconciliation import trading_order_reconciliation_service
@@ -524,6 +525,16 @@ def run_next_open_execution_if_due(
     force: bool = False,
 ) -> dict[str, Any]:
     bootstrap_runtime()
+    if signal_decider_exec_integration_service.should_delegate_execution():
+        return asyncio.run(
+            signal_decider_exec_integration_service.dispatch_next_open_plan(
+                target_trade_date=target_trade_date,
+                refresh_plan=True,
+                dry_run=dry_run,
+                force=force,
+                trigger='internal_ops_cli',
+            )
+        )
     return asyncio.run(
         signal_decider_next_open_execution_service.run_market_open_execution_if_due(
             target_trade_date=target_trade_date,
@@ -542,6 +553,15 @@ def run_intraday_auto_sell_if_due(
     force: bool = False,
 ) -> dict[str, Any]:
     bootstrap_runtime()
+    if signal_decider_exec_integration_service.should_delegate_execution():
+        return asyncio.run(
+            signal_decider_exec_integration_service.list_intraday_exec_watch(
+                account_reference=account_reference,
+                symbol=symbol,
+                refresh=True,
+                trigger='internal_ops_cli',
+            )
+        )
     return asyncio.run(
         signal_decider_intraday_auto_sell_service.run_intraday_auto_sell_if_due(
             account_reference=account_reference,

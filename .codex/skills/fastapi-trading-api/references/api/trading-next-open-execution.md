@@ -1,7 +1,7 @@
 # GET /trading/orders/next-open-execution and POST /trading/orders/next-open-execution/run-if-due
 
 ## Summary
-Inspect or execute the persisted next-open buy plan derived from the latest previous-trading-day `signal_decider_decision_snapshots`. The planner maps decisions to configured KIS accounts, stores blocked-vs-eligible validation results durably, and the submit hook reuses the existing trading-order persistence flow with dry-run and duplicate-submit protection.
+Inspect or execute the persisted next-open buy plan derived from the latest previous-trading-day `signal_decider_decision_snapshots`. The planner maps decisions to configured KIS accounts, stores blocked-vs-eligible validation results durably, and the submit hook either reuses the existing trading-order persistence flow or, when `SIGNAL_DECIDER_EXEC_INTEGRATION_MODE=dispatch`, translates eligible rows into normalized exec plan items and dispatches them to `kai-trading-exec`.
 
 ## Example request
 ```http
@@ -63,3 +63,5 @@ Content-Type: application/json
   ]
 }
 ```
+
+When exec dispatch mode is enabled, the same plan rows stay visible through this route and the delegated linkage or audit state is stored under `submission.exec_dispatch` for each item, including the remote `plan_id`, remote item ids, last dispatch attempt, and latest matched readback snapshot.
