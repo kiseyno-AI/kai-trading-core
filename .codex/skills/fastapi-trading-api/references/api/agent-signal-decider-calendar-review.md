@@ -70,7 +70,7 @@ GET /agent-context/signal-decider/calendar?month=2026-04&horizons=1&horizons=3&h
 # GET /agent-context/signal-decider/calendar/{market_date}
 
 ## Summary
-Selected-date replay review for all `signal-decider` decisions emitted on one market date. Each item keeps the original decision fields, adds D+1 or D+3 or D+5 replay summaries, and exposes a stable rule-based review insight with path interpretation for UI rendering.
+Selected-date replay review for all `signal-decider` decisions emitted on one market date. Each item keeps the original decision fields, adds D+1 or D+3 or D+5 replay summaries, and exposes a stable rule-based review insight plus a canonical structured `review.narrative` object for localization-friendly rendering.
 
 ## Example request
 ```http
@@ -109,10 +109,27 @@ GET /agent-context/signal-decider/calendar/2026-04-20?horizons=1&horizons=3&hori
         "status": "complete",
         "insight": {
           "code": "buy_should_have_taken",
+          "priority": "low",
           "label": "Buy held up",
           "label_key": "signal_decider.review.buy_should_have_taken"
         },
-        "narrative": "The buy setup held up on the 5-day replay window. Target was touched and the stop-loss was never touched.",
+        "narrative": {
+          "version": "signal_decider_replay_review_v1",
+          "insight_code": "buy_should_have_taken",
+          "insight_priority": "low",
+          "headline": "Buy held up on replay.",
+          "headline_key": "signal_decider.review.headline.buy_should_have_taken",
+          "supporting_reasons": [
+            {
+              "code": "target_hit_without_stop",
+              "message": "Target was touched and the stop-loss was never touched inside the review window.",
+              "message_key": "signal_decider.review.reason.target_hit_without_stop"
+            }
+          ],
+          "counterfactual_summary": null,
+          "summary_text": "Buy held up on replay. Target was touched and the stop-loss was never touched inside the review window."
+        },
+        "narrative_text": "Buy held up on replay. Target was touched and the stop-loss was never touched inside the review window.",
         "path_analysis": {
           "path_marker": "target_hit",
           "first_trigger": "target_hit",
@@ -159,6 +176,8 @@ GET /agent-context/signal-decider/calendar/2026-04-20/snapshots/84?horizons=1&ho
     "symbol": "005930",
     "review_status": "complete",
     "insight_code": "buy_should_have_taken",
+    "insight_priority": "low",
+    "headline": "Buy held up on replay.",
     "primary_path_marker": "target_hit"
   },
   "item": {
@@ -167,8 +186,26 @@ GET /agent-context/signal-decider/calendar/2026-04-20/snapshots/84?horizons=1&ho
     "review": {
       "status": "complete",
       "insight": {
-        "code": "buy_should_have_taken"
+        "code": "buy_should_have_taken",
+        "priority": "low"
       },
+      "narrative": {
+        "version": "signal_decider_replay_review_v1",
+        "insight_code": "buy_should_have_taken",
+        "insight_priority": "low",
+        "headline": "Buy held up on replay.",
+        "headline_key": "signal_decider.review.headline.buy_should_have_taken",
+        "supporting_reasons": [
+          {
+            "code": "target_hit_without_stop",
+            "message": "Target was touched and the stop-loss was never touched inside the review window.",
+            "message_key": "signal_decider.review.reason.target_hit_without_stop"
+          }
+        ],
+        "counterfactual_summary": null,
+        "summary_text": "Buy held up on replay. Target was touched and the stop-loss was never touched inside the review window."
+      },
+      "narrative_text": "Buy held up on replay. Target was touched and the stop-loss was never touched inside the review window.",
       "path_analysis": {
         "path_marker": "target_hit",
         "checkpoints": {

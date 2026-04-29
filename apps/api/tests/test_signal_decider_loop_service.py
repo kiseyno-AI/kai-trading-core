@@ -1075,9 +1075,22 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
         items_by_symbol = {item['symbol']: item for item in result['items']}
         self.assertEqual(result['summary']['evaluation_coverage']['status'], 'complete')
         self.assertEqual(items_by_symbol['005930']['review']['insight']['code'], 'buy_should_have_taken')
+        self.assertEqual(items_by_symbol['005930']['review']['insight']['priority'], 'low')
         self.assertEqual(items_by_symbol['005930']['review']['path_analysis']['path_marker'], 'target_hit')
+        self.assertEqual(
+            items_by_symbol['005930']['review']['narrative']['supporting_reasons'][0]['code'],
+            'target_hit_without_stop',
+        )
+        self.assertEqual(
+            items_by_symbol['005930']['review']['narrative_text'],
+            items_by_symbol['005930']['review']['narrative']['summary_text'],
+        )
         self.assertEqual(items_by_symbol['000660']['review']['insight']['code'], 'wait_missed_opportunity')
         self.assertEqual(items_by_symbol['000660']['review']['path_analysis']['path_marker'], 'target_hit')
+        self.assertEqual(
+            items_by_symbol['000660']['review']['narrative']['counterfactual_summary']['action'],
+            'buy',
+        )
         self.assertEqual(items_by_symbol['035420']['review']['insight']['code'], 'reject_correct')
         self.assertEqual(items_by_symbol['035420']['review']['path_analysis']['path_marker'], 'stop_hit')
 
@@ -1126,8 +1139,14 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
         )
 
         self.assertEqual(result['summary']['insight_code'], 'ambiguous_target_stop_collision')
+        self.assertEqual(result['summary']['insight_priority'], 'high')
+        self.assertEqual(result['summary']['headline'], 'Replay path is operationally ambiguous.')
         self.assertEqual(result['item']['review']['path_analysis']['path_marker'], 'collision')
         self.assertEqual(result['item']['review']['insight']['code'], 'ambiguous_target_stop_collision')
+        self.assertEqual(
+            result['item']['review']['narrative']['supporting_reasons'][0]['code'],
+            'target_stop_collision_same_session',
+        )
         self.assertEqual(result['item']['observed_price_path'][0]['trade_date'], '2026-04-21')
         self.assertEqual(
             result['item']['review']['path_analysis']['checkpoints']['first_target_hit_trade_date'],
@@ -1137,6 +1156,214 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
             result['item']['review']['path_analysis']['checkpoints']['first_stop_loss_hit_trade_date'],
             '2026-04-21',
         )
+
+    def test_get_review_detail_structures_stop_before_target_buy_narrative(self):
+        repository = FakeSignalDeciderLoopRepository(
+            [
+                _feedback_row(
+                    feedback_id=1,
+                    snapshot_id=101,
+                    market_date='2026-04-20',
+                    symbol='005930',
+                    action='buy',
+                    target_price=110,
+                    stop_loss_price=95,
+                )
+            ]
+        )
+        service = SignalDeciderLoopService(repository=repository)
+
+        bars = [
+            {'trade_date': '2026-04-20', 'open_price': 99, 'high_price': 100, 'low_price': 98, 'close_price': 99, 'volume': 1000},
+            {'trade_date': '2026-04-21', 'open_price': 100, 'high_price': 103, 'low_price': 94, 'close_price': 97, 'volume': 1000},
+            {'trade_date': '2026-04-22', 'open_price': 97, 'high_price': 111, 'low_price': 96, 'close_price': 109, 'volume': 1000},
+            {'trade_date': '2026-04-23', 'open_price': 109, 'high_price': 112, 'low_price': 107, 'close_price': 111, 'volume': 1000},
+            {'trade_date': '2026-04-24', 'open_price': 111, 'high_price': 113, 'low_price': 109, 'close_price': 112, 'volume': 1000},
+            {'trade_date': '2026-04-25', 'open_price': 112, 'high_price': 114, 'low_price': 110, 'close_price': 113, 'volume': 1000},
+        ]
+
+        with patch(
+            'app.agent_context.signal_decider_loop_service.load_daily_bars_for_symbol_range',
+            return_value=bars,
+        ):
+            service.compute_evaluations(
+                market_date_from='2026-04-20',
+                market_date_to='2026-04-20',
+                horizons=[5],
+                evaluation_version='signal_decider_eval_test',
+            )
+
+        result = service.get_review_detail(
+            market_date='2026-04-20',
+            snapshot_id=101,
+            horizons=[5],
+            primary_horizon_days=5,
+            evaluation_version='signal_decider_eval_test',
+        )
+
+        self.assertEqual(result['item']['review']['insight']['code'], 'buy_stopped_out')
+        self.assertEqual(result['item']['review']['insight']['priority'], 'high')
+        self.assertEqual(result['item']['review']['path_analysis']['path_marker'], 'stop_hit')
+        self.assertEqual(result['item']['review']['path_analysis']['trigger_sequence'], 'stop_before_target')
+        self.assertEqual(
+            result['item']['review']['narrative']['supporting_reasons'][0]['code'],
+            'stop_hit_before_target',
+        )
+        self.assertEqual(
+            result['item']['review']['narrative']['headline'],
+            'Buy would have stopped out first.',
+        )
+
+    def test_get_review_detail_structures_no_threshold_positive_close_wait_narrative(self):
+        repository = FakeSignalDeciderLoopRepository(
+            [
+                _feedback_row(
+                    feedback_id=1,
+                    snapshot_id=101,
+                    market_date='2026-04-20',
+                    symbol='000660',
+                    action='wait',
+                    target_price=60,
+                    stop_loss_price=45,
+                )
+            ]
+        )
+        service = SignalDeciderLoopService(repository=repository)
+
+        bars = [
+            {'trade_date': '2026-04-20', 'open_price': 49, 'high_price': 50, 'low_price': 48, 'close_price': 49, 'volume': 900},
+            {'trade_date': '2026-04-21', 'open_price': 50, 'high_price': 52, 'low_price': 49, 'close_price': 51, 'volume': 900},
+            {'trade_date': '2026-04-22', 'open_price': 51, 'high_price': 53, 'low_price': 50, 'close_price': 52, 'volume': 900},
+            {'trade_date': '2026-04-23', 'open_price': 52, 'high_price': 53, 'low_price': 51, 'close_price': 52, 'volume': 900},
+            {'trade_date': '2026-04-24', 'open_price': 52, 'high_price': 54, 'low_price': 51, 'close_price': 53, 'volume': 900},
+            {'trade_date': '2026-04-25', 'open_price': 53, 'high_price': 54, 'low_price': 52, 'close_price': 53, 'volume': 900},
+        ]
+
+        with patch(
+            'app.agent_context.signal_decider_loop_service.load_daily_bars_for_symbol_range',
+            return_value=bars,
+        ):
+            service.compute_evaluations(
+                market_date_from='2026-04-20',
+                market_date_to='2026-04-20',
+                horizons=[5],
+                evaluation_version='signal_decider_eval_test',
+            )
+
+        result = service.get_review_detail(
+            market_date='2026-04-20',
+            snapshot_id=101,
+            horizons=[5],
+            primary_horizon_days=5,
+            evaluation_version='signal_decider_eval_test',
+        )
+
+        self.assertEqual(result['item']['review']['insight']['code'], 'wait_missed_opportunity')
+        self.assertEqual(result['item']['review']['path_analysis']['path_marker'], 'neither')
+        self.assertEqual(
+            result['item']['review']['narrative']['supporting_reasons'][0]['code'],
+            'no_threshold_hit_positive_close',
+        )
+        self.assertEqual(
+            result['item']['review']['narrative']['counterfactual_summary']['action'],
+            'buy',
+        )
+
+    def test_get_review_detail_structures_no_threshold_negative_close_buy_narrative(self):
+        repository = FakeSignalDeciderLoopRepository(
+            [
+                _feedback_row(
+                    feedback_id=1,
+                    snapshot_id=101,
+                    market_date='2026-04-20',
+                    symbol='005930',
+                    action='buy',
+                    target_price=120,
+                    stop_loss_price=80,
+                )
+            ]
+        )
+        service = SignalDeciderLoopService(repository=repository)
+
+        bars = [
+            {'trade_date': '2026-04-20', 'open_price': 99, 'high_price': 100, 'low_price': 98, 'close_price': 99, 'volume': 1000},
+            {'trade_date': '2026-04-21', 'open_price': 100, 'high_price': 102, 'low_price': 98, 'close_price': 99, 'volume': 1000},
+            {'trade_date': '2026-04-22', 'open_price': 99, 'high_price': 101, 'low_price': 98, 'close_price': 98, 'volume': 1000},
+            {'trade_date': '2026-04-23', 'open_price': 98, 'high_price': 100, 'low_price': 97, 'close_price': 98, 'volume': 1000},
+            {'trade_date': '2026-04-24', 'open_price': 98, 'high_price': 99, 'low_price': 97, 'close_price': 97, 'volume': 1000},
+            {'trade_date': '2026-04-25', 'open_price': 97, 'high_price': 98, 'low_price': 97, 'close_price': 97, 'volume': 1000},
+        ]
+
+        with patch(
+            'app.agent_context.signal_decider_loop_service.load_daily_bars_for_symbol_range',
+            return_value=bars,
+        ):
+            service.compute_evaluations(
+                market_date_from='2026-04-20',
+                market_date_to='2026-04-20',
+                horizons=[5],
+                evaluation_version='signal_decider_eval_test',
+            )
+
+        result = service.get_review_detail(
+            market_date='2026-04-20',
+            snapshot_id=101,
+            horizons=[5],
+            primary_horizon_days=5,
+            evaluation_version='signal_decider_eval_test',
+        )
+
+        self.assertEqual(result['item']['review']['insight']['code'], 'buy_no_edge')
+        self.assertEqual(result['item']['review']['path_analysis']['path_marker'], 'neither')
+        self.assertEqual(
+            result['item']['review']['narrative']['supporting_reasons'][0]['code'],
+            'no_threshold_hit_negative_close',
+        )
+        self.assertIsNone(result['item']['review']['narrative']['counterfactual_summary'])
+
+    def test_get_review_date_returns_pending_structured_narrative_for_incomplete_replay(self):
+        repository = FakeSignalDeciderLoopRepository(
+            [
+                _feedback_row(
+                    feedback_id=1,
+                    snapshot_id=101,
+                    market_date='2026-04-29',
+                    symbol='051910',
+                    action='buy',
+                    target_price=210,
+                    stop_loss_price=190,
+                )
+            ]
+        )
+        service = SignalDeciderLoopService(repository=repository)
+
+        bars = [
+            {'trade_date': '2026-04-29', 'open_price': 200, 'high_price': 201, 'low_price': 198, 'close_price': 200, 'volume': 700},
+            {'trade_date': '2026-04-30', 'open_price': 201, 'high_price': 204, 'low_price': 199, 'close_price': 203, 'volume': 700},
+        ]
+
+        with patch(
+            'app.agent_context.signal_decider_loop_service.load_daily_bars_for_symbol_range',
+            return_value=bars,
+        ):
+            service.compute_evaluations(
+                market_date_from='2026-04-29',
+                market_date_to='2026-04-29',
+                horizons=[5],
+                evaluation_version='signal_decider_eval_test',
+            )
+
+        result = service.get_review_date(
+            market_date='2026-04-29',
+            horizons=[5],
+            primary_horizon_days=5,
+            evaluation_version='signal_decider_eval_test',
+        )
+
+        item = result['items'][0]
+        self.assertEqual(item['review']['status'], 'pending')
+        self.assertEqual(item['review']['insight']['code'], 'evaluation_pending')
+        self.assertEqual(item['review']['narrative']['supporting_reasons'][0]['code'], 'pending_horizon_data')
 
     def test_get_diagnostics_batches_outcomes_and_evaluations(self):
         repository = FakeSignalDeciderLoopRepository(

@@ -325,7 +325,23 @@ class FakeSignalDeciderLoopService:
                     'symbol': '005930',
                     'review': {
                         'status': 'complete',
-                        'insight': {'code': 'buy_should_have_taken'},
+                        'insight': {'code': 'buy_should_have_taken', 'priority': 'low'},
+                        'narrative': {
+                            'insight_code': 'buy_should_have_taken',
+                            'insight_priority': 'low',
+                            'headline': 'Buy held up on replay.',
+                            'headline_key': 'signal_decider.review.headline.buy_should_have_taken',
+                            'supporting_reasons': [
+                                {
+                                    'code': 'target_hit_without_stop',
+                                    'message': 'Target was touched and the stop-loss was never touched inside the review window.',
+                                    'message_key': 'signal_decider.review.reason.target_hit_without_stop',
+                                }
+                            ],
+                            'counterfactual_summary': None,
+                            'summary_text': 'Buy held up on replay. Target was touched and the stop-loss was never touched inside the review window.',
+                        },
+                        'narrative_text': 'Buy held up on replay. Target was touched and the stop-loss was never touched inside the review window.',
                         'path_analysis': {'path_marker': 'target_hit'},
                     },
                 }
@@ -347,6 +363,8 @@ class FakeSignalDeciderLoopService:
             'summary': {
                 'review_status': 'complete',
                 'insight_code': 'buy_should_have_taken',
+                'insight_priority': 'low',
+                'headline': 'Buy held up on replay.',
                 'primary_path_marker': 'target_hit',
             },
             'item': {
@@ -354,7 +372,23 @@ class FakeSignalDeciderLoopService:
                 'symbol': '005930',
                 'review': {
                     'status': 'complete',
-                    'insight': {'code': 'buy_should_have_taken'},
+                    'insight': {'code': 'buy_should_have_taken', 'priority': 'low'},
+                    'narrative': {
+                        'insight_code': 'buy_should_have_taken',
+                        'insight_priority': 'low',
+                        'headline': 'Buy held up on replay.',
+                        'headline_key': 'signal_decider.review.headline.buy_should_have_taken',
+                        'supporting_reasons': [
+                            {
+                                'code': 'target_hit_without_stop',
+                                'message': 'Target was touched and the stop-loss was never touched inside the review window.',
+                                'message_key': 'signal_decider.review.reason.target_hit_without_stop',
+                            }
+                        ],
+                        'counterfactual_summary': None,
+                        'summary_text': 'Buy held up on replay. Target was touched and the stop-loss was never touched inside the review window.',
+                    },
+                    'narrative_text': 'Buy held up on replay. Target was touched and the stop-loss was never touched inside the review window.',
                     'path_analysis': {'path_marker': 'target_hit'},
                 },
                 'observed_price_path': [{'trade_date': '2026-04-24'}],
@@ -1014,6 +1048,7 @@ class AgentContextRouteTests(unittest.TestCase):
         self.assertEqual(fake_service.review_date_args['primary_horizon_days'], 5)
         self.assertEqual(fake_service.review_date_args['evaluation_version'], 'signal_decider_eval_v1')
         self.assertEqual(response.json()['items'][0]['review']['insight']['code'], 'buy_should_have_taken')
+        self.assertEqual(response.json()['items'][0]['review']['narrative']['headline'], 'Buy held up on replay.')
 
     def test_signal_decider_review_detail_route_calls_service(self):
         fake_service = FakeSignalDeciderLoopService()
@@ -1039,6 +1074,7 @@ class AgentContextRouteTests(unittest.TestCase):
         self.assertEqual(fake_service.review_detail_args['horizons'], [1, 5])
         self.assertEqual(fake_service.review_detail_args['primary_horizon_days'], 5)
         self.assertEqual(fake_service.review_detail_args['evaluation_version'], 'signal_decider_eval_v1')
+        self.assertEqual(response.json()['summary']['insight_priority'], 'low')
         self.assertEqual(response.json()['item']['observed_price_path'][0]['trade_date'], '2026-04-24')
 
     def test_signal_decider_execution_outcomes_route_calls_service(self):
