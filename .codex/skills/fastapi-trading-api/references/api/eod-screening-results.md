@@ -19,6 +19,7 @@ Supported `family` values:
 - `low_risk`
 - `beta`
 - `advanced_value`
+- `unified_value`
 - `composite`
 
 Use the family-specific routes when the client needs the full payload block or a single-symbol detail shape.

@@ -15,6 +15,7 @@ from app.db_models import (
     DailyMarketRiskFilterResult,
     DailyMomentumFactorResult,
     DailyPiotroskiFilterResult,
+    DailyUnifiedValueFactorResult,
     DailyValueFactorResult,
     Symbol,
 )
@@ -25,6 +26,7 @@ from app.signals.low_risk_factor import LOW_RISK_FEATURE_VERSION
 from app.signals.market_risk_filter import MARKET_RISK_FILTER_SOURCE
 from app.signals.momentum_factor import MOMENTUM_FACTOR_VERSION
 from app.signals.piotroski_filter import FILTER_SOURCE as PIOTROSKI_FILTER_SOURCE
+from app.signals.unified_value_factor import UNIFIED_VALUE_FACTOR_VERSION
 from app.signals.value_factor import VALUE_FACTOR_VERSION
 
 
@@ -344,6 +346,61 @@ SCREENING_FAMILY_DEFINITIONS: dict[str, ScreeningFamilyDefinition] = {
                 _count_when(
                     DailyAdvancedValueFactorResult.advanced_value_classification == 'insufficient_components'
                 ),
+            ),
+        ),
+    ),
+    'unified_value': ScreeningFamilyDefinition(
+        family='unified_value',
+        feature_version=UNIFIED_VALUE_FACTOR_VERSION,
+        detail_route='/eod/unified-value-factors',
+        model=DailyUnifiedValueFactorResult,
+        item_fields=(
+            ScreeningField('per', DailyUnifiedValueFactorResult.per, _round_float),
+            ScreeningField('pbr', DailyUnifiedValueFactorResult.pbr, _round_float),
+            ScreeningField('dividend_yield', DailyUnifiedValueFactorResult.dividend_yield, _round_float),
+            ScreeningField('fcf_yield', DailyUnifiedValueFactorResult.fcf_yield, _round_float),
+            ScreeningField('ev_to_ebitda', DailyUnifiedValueFactorResult.ev_to_ebitda, _round_float),
+            ScreeningField('components_used', DailyUnifiedValueFactorResult.components_used, _as_int),
+            ScreeningField('unified_value_rank', DailyUnifiedValueFactorResult.unified_value_rank, _as_int),
+            ScreeningField('unified_value_score', DailyUnifiedValueFactorResult.unified_value_score, _round_float),
+            ScreeningField(
+                'unified_value_percentile',
+                DailyUnifiedValueFactorResult.unified_value_percentile,
+                _round_float,
+            ),
+            ScreeningField('unified_value_status', DailyUnifiedValueFactorResult.unified_value_status),
+            ScreeningField('captured_at', DailyUnifiedValueFactorResult.captured_at, _as_iso_datetime),
+        ),
+        order_by=(
+            DailyUnifiedValueFactorResult.unified_value_rank.asc().nullslast(),
+            DailyUnifiedValueFactorResult.unified_value_score.desc().nullslast(),
+            Symbol.symbol.asc(),
+        ),
+        summary_fields=(
+            ScreeningMetric('entries', func.count(DailyUnifiedValueFactorResult.id)),
+            ScreeningMetric(
+                'scored_count',
+                _count_when(DailyUnifiedValueFactorResult.unified_value_status == 'scored'),
+            ),
+            ScreeningMetric(
+                'invalid_per_count',
+                _count_when(DailyUnifiedValueFactorResult.unified_value_status == 'invalid_per'),
+            ),
+            ScreeningMetric(
+                'missing_metric_count',
+                _count_when(DailyUnifiedValueFactorResult.unified_value_status == 'missing_metric'),
+            ),
+            ScreeningMetric(
+                'insufficient_components_count',
+                _count_when(DailyUnifiedValueFactorResult.unified_value_status == 'insufficient_components'),
+            ),
+            ScreeningMetric(
+                'insufficient_fundamentals_count',
+                _count_when(DailyUnifiedValueFactorResult.unified_value_status == 'insufficient_fundamentals'),
+            ),
+            ScreeningMetric(
+                'missing_market_date_bar_count',
+                _count_when(DailyUnifiedValueFactorResult.unified_value_status == 'missing_market_date_bar'),
             ),
         ),
     ),
