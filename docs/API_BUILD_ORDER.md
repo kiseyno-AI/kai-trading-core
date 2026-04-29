@@ -31,13 +31,14 @@
 28. Daily value factor compute/read routes
 29. Daily beta factor compute/read routes
 30. Daily advanced value factor compute/read routes
-31. Daily composite factor compute/read routes
-32. Signal-decider evaluation, diagnostics, and policy-candidate routes
-33. Internal trading order control, inquiry, and reconciliation routes
-34. Signal-decider next-open execution planning and market-open submit routes
-35. Signal-decider intraday auto-sell diagnostics and runtime submit routes
-36. Signal-decider actual execution outcome reporting routes
-37. Signal-decider replay review calendar routes
+31. Daily unified value factor compute/read routes
+32. Daily composite factor compute/read routes
+33. Signal-decider evaluation, diagnostics, and policy-candidate routes
+34. Internal trading order control, inquiry, and reconciliation routes
+35. Signal-decider next-open execution planning and market-open submit routes
+36. Signal-decider intraday auto-sell diagnostics and runtime submit routes
+37. Signal-decider actual execution outcome reporting routes
+38. Signal-decider replay review calendar routes
 
 ## Current routes
 - `POST /broker/kis/token`
@@ -123,6 +124,8 @@
 - `GET /eod/beta-factors?market_date=YYYY-MM-DD&symbol=005930`
 - `POST /eod/advanced-value-factors/compute?market_date=YYYY-MM-DD&symbols=005930,000660&source=advanced_value_v1`
 - `GET /eod/advanced-value-factors?market_date=YYYY-MM-DD&symbol=005930`
+- `POST /eod/unified-value-factors/compute?market_date=YYYY-MM-DD&symbols=005930,000660&source=unified_value_v1`
+- `GET /eod/unified-value-factors?market_date=YYYY-MM-DD&symbol=005930`
 - `POST /eod/composite-factors/compute?market_date=YYYY-MM-DD&symbols=005930,000660&source=composite_v1`
 - `GET /eod/composite-factors?market_date=YYYY-MM-DD&symbol=005930`
 - `GET /eod/screening-results?family=composite&market_date=YYYY-MM-DD&limit=100&offset=0`
@@ -385,7 +388,7 @@
 - `GET /eod/screening-results` is the compact dashboard-facing screening read across persisted factor and filter result families.
 - The existing family-specific inspect routes are still the canonical detail reads, but they hydrate full rows and return `factor_payload` or `filter_payload` JSON blocks. For interactive screening lists, the avoidable bottleneck was overfetch plus Python-side row shaping rather than missing canonical storage.
 - The screening route keeps the existing result tables, resolves the latest available `market_date` when omitted, computes summary counts in SQL, projects only list-needed columns, and pages collection reads with a default `limit=100`.
-- Supported `family` values are `market_risk_filter`, `piotroski_filter`, `momentum`, `value`, `low_risk`, `beta`, `advanced_value`, and `composite`.
+- Supported `family` values are `market_risk_filter`, `piotroski_filter`, `momentum`, `value`, `low_risk`, `beta`, `advanced_value`, `unified_value`, and `composite`.
 - Use the family-specific routes such as `GET /eod/composite-factors` or `GET /eod/market-risk-filters` when the client needs the full stored payload block or single-symbol inspection semantics.
 
 ## Daily momentum factor notes
@@ -452,6 +455,17 @@
 - Negative free cash flow remains a valid but unattractive `fcf_yield` input. Non-positive EBITDA and non-positive enterprise value are treated as explicit invalid EV/EBITDA cases rather than ranked values.
 - Auditability is explicit in `factor_payload`: the stored row keeps the selected annual snapshot metadata, matched DART input rows/highlights, component status flags, methodology assumptions, and the raw numerator/denominator pieces used to derive the final metrics.
 - For shell-driven operations, use `python3.11 -m app.internal.ops eod-advanced-value-factors-compute --market-date YYYY-MM-DD` from `apps/api`.
+
+## Unified value factor notes
+- `daily_unified_value_factor_results` is the DB-backed unified valuation layer keyed by `symbol_id + market_date`, persisted separately from both `daily_value_factor_results` and `daily_advanced_value_factor_results`.
+- `POST /eod/unified-value-factors/compute` rebuilds persisted rows from stored `daily_price_bars` plus the latest stored annual DART fundamentals snapshot on or before the requested `market_date`; it does not call live quote, broker, or execution paths during the request.
+- `GET /eod/unified-value-factors` is the persisted read API for that table. When `symbol` is provided, the route returns a single `item`; without `symbol`, it returns ordered `items` for the requested date.
+- `unified_value_v1` ranks five valuation components cross-sectionally over the full market-date universe: lower `per`, lower `pbr`, higher `dividend_yield`, higher `fcf_yield`, and lower `ev_to_ebitda`.
+- The final `unified_value_score` is the equal-weight mean of the five component percentiles and is only stored when all five component percentiles are available. `PER <= 0` is explicitly excluded from PER scoring, and those rows persist with `per_status=invalid_non_positive`, `components_used`, and `unified_value_status=invalid_per` rather than being dropped.
+- Rows missing a same-day bar, missing the annual fundamentals snapshot, or missing any required advanced-value ingredient still persist with auditable per-component statuses, per-component ranks or percentiles where available, and a non-scored `unified_value_status`.
+- The explicit top-level status taxonomy is `scored`, `invalid_per`, `missing_metric`, `insufficient_components`, `missing_market_date_bar`, and `insufficient_fundamentals`.
+- The pipeline stage is separate from both filtering and composite scoring. `GET /eod/pipeline/stages` exposes it as `unified_value_factors`, and `GET /eod/screening-results?family=unified_value` is the compact dashboard-facing read layer for its stored results.
+- For shell-driven operations, use `python3.11 -m app.internal.ops eod-unified-value-factors-compute --market-date YYYY-MM-DD` from `apps/api`.
 
 ## Composite factor notes
 - `daily_composite_factor_results` is the persisted integrated ranking layer keyed by `symbol_id + market_date`, built on top of the stored momentum, value v1, advanced value, low-risk, and beta slices.

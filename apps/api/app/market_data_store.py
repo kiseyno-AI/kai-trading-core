@@ -27,6 +27,7 @@ from app.db_models import (
     DailySignalFeature,
     DailyTechnicalSnapshot,
     DailyTrendingRank,
+    DailyUnifiedValueFactorResult,
     DailyValueFactorResult,
     EODCollectionRun,
     FavoriteSymbol,
@@ -2744,6 +2745,161 @@ def load_daily_advanced_value_factor_results(
                 'advanced_value_components_used': item.advanced_value_components_used,
                 'advanced_value_classification': item.advanced_value_classification,
                 'is_advanced_value_eligible': item.is_advanced_value_eligible,
+                'factor_payload': item.factor_payload,
+                'captured_at': item.captured_at.isoformat() if item.captured_at else None,
+            }
+            for item, symbol, name_ko, market in rows
+        ]
+
+
+def upsert_daily_unified_value_factor_result(result: dict) -> None:
+    refreshed_at = datetime.utcnow()
+    with session_scope() as session:
+        symbol = _get_symbol(session, result['symbol'])
+        if symbol is None:
+            symbol = Symbol(
+                symbol=result['symbol'],
+                market=result.get('market', 'KRX'),
+                name_ko=result.get('name_ko') or result['symbol'],
+                instrument_type='equity',
+                source=result.get('source', 'unified_value_v1'),
+                is_active=True,
+                last_refreshed_at=refreshed_at,
+            )
+            session.add(symbol)
+            session.flush()
+
+        values = {
+            'symbol_id': symbol.id,
+            'market_date': _normalize_trade_date(result['market_date']),
+            'source': result.get('source', 'unified_value_v1'),
+            'per': result.get('per'),
+            'pbr': result.get('pbr'),
+            'dividend_yield': result.get('dividend_yield'),
+            'fcf_yield': result.get('fcf_yield'),
+            'ev_to_ebitda': result.get('ev_to_ebitda'),
+            'per_status': result.get('per_status', 'missing'),
+            'pbr_status': result.get('pbr_status', 'missing'),
+            'dividend_yield_status': result.get('dividend_yield_status', 'missing'),
+            'fcf_yield_status': result.get('fcf_yield_status', 'missing_metric'),
+            'ev_to_ebitda_status': result.get('ev_to_ebitda_status', 'missing_metric'),
+            'per_rank': result.get('per_rank'),
+            'pbr_rank': result.get('pbr_rank'),
+            'dividend_yield_rank': result.get('dividend_yield_rank'),
+            'fcf_yield_rank': result.get('fcf_yield_rank'),
+            'ev_to_ebitda_rank': result.get('ev_to_ebitda_rank'),
+            'per_percentile': result.get('per_percentile'),
+            'pbr_percentile': result.get('pbr_percentile'),
+            'dividend_yield_percentile': result.get('dividend_yield_percentile'),
+            'fcf_yield_percentile': result.get('fcf_yield_percentile'),
+            'ev_to_ebitda_percentile': result.get('ev_to_ebitda_percentile'),
+            'unified_value_score': result.get('unified_value_score'),
+            'unified_value_rank': result.get('unified_value_rank'),
+            'unified_value_percentile': result.get('unified_value_percentile'),
+            'components_used': int(result.get('components_used') or 0),
+            'unified_value_status': result.get('unified_value_status', 'insufficient_components'),
+            'factor_payload': result['factor_payload'],
+            'captured_at': refreshed_at,
+            'updated_at': refreshed_at,
+        }
+        statement = pg_insert(DailyUnifiedValueFactorResult).values(values)
+        session.execute(
+            statement.on_conflict_do_update(
+                constraint='uq_daily_unified_value_factor_results_symbol_market_date',
+                set_={
+                    'source': statement.excluded.source,
+                    'per': statement.excluded.per,
+                    'pbr': statement.excluded.pbr,
+                    'dividend_yield': statement.excluded.dividend_yield,
+                    'fcf_yield': statement.excluded.fcf_yield,
+                    'ev_to_ebitda': statement.excluded.ev_to_ebitda,
+                    'per_status': statement.excluded.per_status,
+                    'pbr_status': statement.excluded.pbr_status,
+                    'dividend_yield_status': statement.excluded.dividend_yield_status,
+                    'fcf_yield_status': statement.excluded.fcf_yield_status,
+                    'ev_to_ebitda_status': statement.excluded.ev_to_ebitda_status,
+                    'per_rank': statement.excluded.per_rank,
+                    'pbr_rank': statement.excluded.pbr_rank,
+                    'dividend_yield_rank': statement.excluded.dividend_yield_rank,
+                    'fcf_yield_rank': statement.excluded.fcf_yield_rank,
+                    'ev_to_ebitda_rank': statement.excluded.ev_to_ebitda_rank,
+                    'per_percentile': statement.excluded.per_percentile,
+                    'pbr_percentile': statement.excluded.pbr_percentile,
+                    'dividend_yield_percentile': statement.excluded.dividend_yield_percentile,
+                    'fcf_yield_percentile': statement.excluded.fcf_yield_percentile,
+                    'ev_to_ebitda_percentile': statement.excluded.ev_to_ebitda_percentile,
+                    'unified_value_score': statement.excluded.unified_value_score,
+                    'unified_value_rank': statement.excluded.unified_value_rank,
+                    'unified_value_percentile': statement.excluded.unified_value_percentile,
+                    'components_used': statement.excluded.components_used,
+                    'unified_value_status': statement.excluded.unified_value_status,
+                    'factor_payload': statement.excluded.factor_payload,
+                    'captured_at': statement.excluded.captured_at,
+                    'updated_at': refreshed_at,
+                },
+            )
+        )
+
+
+def load_daily_unified_value_factor_results(
+    *,
+    market_date: str | date,
+    symbols: list[str] | None = None,
+    status: str | None = None,
+    limit: int | None = None,
+) -> list[dict]:
+    with session_scope() as session:
+        stmt = (
+            select(DailyUnifiedValueFactorResult, Symbol.symbol, Symbol.name_ko, Symbol.market)
+            .join(Symbol, Symbol.id == DailyUnifiedValueFactorResult.symbol_id)
+            .where(DailyUnifiedValueFactorResult.market_date == _normalize_trade_date(market_date))
+            .order_by(
+                DailyUnifiedValueFactorResult.unified_value_rank.asc().nullslast(),
+                DailyUnifiedValueFactorResult.unified_value_score.desc().nullslast(),
+                Symbol.symbol.asc(),
+            )
+        )
+        if limit is not None:
+            stmt = stmt.limit(limit)
+        if symbols:
+            stmt = stmt.where(Symbol.symbol.in_(symbols))
+        if status is not None:
+            stmt = stmt.where(DailyUnifiedValueFactorResult.unified_value_status == status)
+
+        rows = session.execute(stmt).all()
+        return [
+            {
+                'symbol': symbol,
+                'name_ko': name_ko,
+                'market': market,
+                'market_date': item.market_date.isoformat(),
+                'source': item.source,
+                'feature_version': item.source,
+                'per': _round_float(item.per, 6),
+                'pbr': _round_float(item.pbr, 6),
+                'dividend_yield': _round_float(item.dividend_yield, 6),
+                'fcf_yield': _round_float(item.fcf_yield, 6),
+                'ev_to_ebitda': _round_float(item.ev_to_ebitda, 6),
+                'per_status': item.per_status,
+                'pbr_status': item.pbr_status,
+                'dividend_yield_status': item.dividend_yield_status,
+                'fcf_yield_status': item.fcf_yield_status,
+                'ev_to_ebitda_status': item.ev_to_ebitda_status,
+                'per_rank': item.per_rank,
+                'pbr_rank': item.pbr_rank,
+                'dividend_yield_rank': item.dividend_yield_rank,
+                'fcf_yield_rank': item.fcf_yield_rank,
+                'ev_to_ebitda_rank': item.ev_to_ebitda_rank,
+                'per_percentile': _round_float(item.per_percentile, 6),
+                'pbr_percentile': _round_float(item.pbr_percentile, 6),
+                'dividend_yield_percentile': _round_float(item.dividend_yield_percentile, 6),
+                'fcf_yield_percentile': _round_float(item.fcf_yield_percentile, 6),
+                'ev_to_ebitda_percentile': _round_float(item.ev_to_ebitda_percentile, 6),
+                'unified_value_score': _round_float(item.unified_value_score, 6),
+                'unified_value_rank': item.unified_value_rank,
+                'unified_value_percentile': _round_float(item.unified_value_percentile, 6),
+                'components_used': item.components_used,
+                'unified_value_status': item.unified_value_status,
                 'factor_payload': item.factor_payload,
                 'captured_at': item.captured_at.isoformat() if item.captured_at else None,
             }

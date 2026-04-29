@@ -765,6 +765,57 @@ class DailyAdvancedValueFactorResult(Base, TimestampMixin):
     captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
+class DailyUnifiedValueFactorResult(Base, TimestampMixin):
+    __tablename__ = 'daily_unified_value_factor_results'
+    __table_args__ = (
+        UniqueConstraint(
+            'symbol_id',
+            'market_date',
+            name='uq_daily_unified_value_factor_results_symbol_market_date',
+        ),
+        Index('ix_daily_unified_value_factor_results_market_rank', 'market_date', 'unified_value_rank'),
+        Index('ix_daily_unified_value_factor_results_market_score', 'market_date', 'unified_value_score'),
+        Index('ix_daily_unified_value_factor_results_market_status', 'market_date', 'unified_value_status'),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol_id: Mapped[int] = mapped_column(ForeignKey('symbols.id', ondelete='CASCADE'), nullable=False, index=True)
+    market_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default='unified_value_v1')
+    per: Mapped[float | None] = mapped_column(Numeric(18, 6))
+    pbr: Mapped[float | None] = mapped_column(Numeric(18, 6))
+    dividend_yield: Mapped[float | None] = mapped_column(Numeric(18, 6))
+    fcf_yield: Mapped[float | None] = mapped_column(Numeric(18, 6))
+    ev_to_ebitda: Mapped[float | None] = mapped_column(Numeric(18, 6))
+    per_status: Mapped[str] = mapped_column(String(48), nullable=False, default='missing', index=True)
+    pbr_status: Mapped[str] = mapped_column(String(48), nullable=False, default='missing', index=True)
+    dividend_yield_status: Mapped[str] = mapped_column(String(48), nullable=False, default='missing', index=True)
+    fcf_yield_status: Mapped[str] = mapped_column(String(48), nullable=False, default='missing_metric', index=True)
+    ev_to_ebitda_status: Mapped[str] = mapped_column(String(48), nullable=False, default='missing_metric', index=True)
+    per_rank: Mapped[int | None] = mapped_column(Integer, index=True)
+    pbr_rank: Mapped[int | None] = mapped_column(Integer, index=True)
+    dividend_yield_rank: Mapped[int | None] = mapped_column(Integer, index=True)
+    fcf_yield_rank: Mapped[int | None] = mapped_column(Integer, index=True)
+    ev_to_ebitda_rank: Mapped[int | None] = mapped_column(Integer, index=True)
+    per_percentile: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    pbr_percentile: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    dividend_yield_percentile: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    fcf_yield_percentile: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    ev_to_ebitda_percentile: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    unified_value_score: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    unified_value_rank: Mapped[int | None] = mapped_column(Integer, index=True)
+    unified_value_percentile: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    components_used: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    unified_value_status: Mapped[str] = mapped_column(
+        String(48),
+        nullable=False,
+        default='insufficient_components',
+        index=True,
+    )
+    factor_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
 class DailyCompositeFactorResult(Base, TimestampMixin):
     __tablename__ = 'daily_composite_factor_results'
     __table_args__ = (

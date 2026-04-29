@@ -7,6 +7,7 @@ from app.db import engine, session_scope
 from app.db_models import (
     DailyCompositeFactorResult,
     DailyMarketRiskFilterResult,
+    DailyUnifiedValueFactorResult,
     Symbol,
 )
 from app.eod.screening_results import screening_result_read_service
@@ -18,6 +19,7 @@ class ScreeningResultReadServiceIntegrationTests(unittest.TestCase):
         Symbol.__table__.create(bind=engine, checkfirst=True)
         DailyCompositeFactorResult.__table__.create(bind=engine, checkfirst=True)
         DailyMarketRiskFilterResult.__table__.create(bind=engine, checkfirst=True)
+        DailyUnifiedValueFactorResult.__table__.create(bind=engine, checkfirst=True)
 
     def setUp(self) -> None:
         self.symbols = ['236001', '236002', '236003']
@@ -39,6 +41,11 @@ class ScreeningResultReadServiceIntegrationTests(unittest.TestCase):
                 session.execute(
                     delete(DailyMarketRiskFilterResult).where(
                         DailyMarketRiskFilterResult.symbol_id.in_(symbol_ids)
+                    )
+                )
+                session.execute(
+                    delete(DailyUnifiedValueFactorResult).where(
+                        DailyUnifiedValueFactorResult.symbol_id.in_(symbol_ids)
                     )
                 )
             session.execute(delete(Symbol).where(Symbol.symbol.in_(self.symbols)))
@@ -100,6 +107,25 @@ class ScreeningResultReadServiceIntegrationTests(unittest.TestCase):
     def test_read_rejects_unknown_family(self) -> None:
         with self.assertRaisesRegex(ValueError, 'family must be one of'):
             screening_result_read_service.read(family='unknown', market_date='2026-04-24')
+
+    def test_read_returns_compact_unified_value_screening_rows(self) -> None:
+        result = screening_result_read_service.read(
+            family='unified_value',
+            market_date='2026-04-24',
+            limit=50,
+            offset=0,
+        )
+
+        self.assertEqual(result['family'], 'unified_value')
+        self.assertEqual(result['detail_route'], '/eod/unified-value-factors')
+        self.assertEqual(result['feature_version'], 'unified_value_v1')
+        self.assertEqual(result['summary']['entries'], 2)
+        self.assertEqual(result['summary']['scored_count'], 1)
+        self.assertEqual(result['summary']['invalid_per_count'], 1)
+        self.assertEqual(result['pagination']['total'], 2)
+        self.assertEqual(result['items'][0]['symbol'], '236001')
+        self.assertEqual(result['items'][0]['unified_value_status'], 'scored')
+        self.assertNotIn('factor_payload', result['items'][0])
 
     def _seed_rows(self) -> None:
         with session_scope() as session:
@@ -263,6 +289,70 @@ class ScreeningResultReadServiceIntegrationTests(unittest.TestCase):
                         is_dishonest_disclosure=False,
                         is_trade_halted=False,
                         filter_payload={'reasons': ['investment_caution']},
+                        captured_at=captured_at,
+                    ),
+                    DailyUnifiedValueFactorResult(
+                        symbol_id=symbol_id_by_symbol['236001'],
+                        market_date=date(2026, 4, 24),
+                        source='unified_value_v1',
+                        per=6.1,
+                        pbr=0.7,
+                        dividend_yield=0.04,
+                        fcf_yield=0.09,
+                        ev_to_ebitda=4.8,
+                        per_status='available',
+                        pbr_status='available',
+                        dividend_yield_status='available',
+                        fcf_yield_status='available',
+                        ev_to_ebitda_status='available',
+                        per_rank=1,
+                        pbr_rank=1,
+                        dividend_yield_rank=1,
+                        fcf_yield_rank=1,
+                        ev_to_ebitda_rank=1,
+                        per_percentile=1.0,
+                        pbr_percentile=1.0,
+                        dividend_yield_percentile=1.0,
+                        fcf_yield_percentile=1.0,
+                        ev_to_ebitda_percentile=1.0,
+                        unified_value_score=1.0,
+                        unified_value_rank=1,
+                        unified_value_percentile=1.0,
+                        components_used=5,
+                        unified_value_status='scored',
+                        factor_payload={'note': 'payload should stay off compact screening rows'},
+                        captured_at=captured_at,
+                    ),
+                    DailyUnifiedValueFactorResult(
+                        symbol_id=symbol_id_by_symbol['236002'],
+                        market_date=date(2026, 4, 24),
+                        source='unified_value_v1',
+                        per=-1.2,
+                        pbr=0.9,
+                        dividend_yield=0.03,
+                        fcf_yield=0.06,
+                        ev_to_ebitda=6.2,
+                        per_status='invalid_non_positive',
+                        pbr_status='available',
+                        dividend_yield_status='available',
+                        fcf_yield_status='available',
+                        ev_to_ebitda_status='available',
+                        per_rank=None,
+                        pbr_rank=2,
+                        dividend_yield_rank=2,
+                        fcf_yield_rank=2,
+                        ev_to_ebitda_rank=2,
+                        per_percentile=None,
+                        pbr_percentile=0.0,
+                        dividend_yield_percentile=0.0,
+                        fcf_yield_percentile=0.0,
+                        ev_to_ebitda_percentile=0.0,
+                        unified_value_score=None,
+                        unified_value_rank=None,
+                        unified_value_percentile=None,
+                        components_used=4,
+                        unified_value_status='invalid_per',
+                        factor_payload={'note': 'payload should stay off compact screening rows'},
                         captured_at=captured_at,
                     ),
                 ]

@@ -53,6 +53,10 @@ from app.signals.market_risk_snapshot import (
 )
 from app.signals.momentum_factor import daily_momentum_factor_service
 from app.signals.piotroski_filter import daily_piotroski_filter_service
+from app.signals.unified_value_factor import (
+    UNIFIED_VALUE_FACTOR_SOURCE,
+    daily_unified_value_factor_service,
+)
 from app.signals.value_factor import VALUE_FACTOR_SOURCE, daily_value_factor_service
 from app.scanner.state import scanner_state
 from app.signals.daily_signal_features import daily_signal_feature_service
@@ -336,6 +340,16 @@ def compute_advanced_value_factors(*, market_date: str, symbols: str | None = No
         market_date=market_date,
         symbols=parsed_symbols,
         source=ADVANCED_VALUE_FACTOR_SOURCE,
+    )
+
+
+def compute_unified_value_factors(*, market_date: str, symbols: str | None = None) -> dict[str, Any]:
+    bootstrap_runtime()
+    parsed_symbols = [item.strip() for item in symbols.split(',') if item.strip()] if symbols else None
+    return daily_unified_value_factor_service.rebuild_for_market_date(
+        market_date=market_date,
+        symbols=parsed_symbols,
+        source=UNIFIED_VALUE_FACTOR_SOURCE,
     )
 
 
@@ -665,6 +679,13 @@ def _build_parser() -> argparse.ArgumentParser:
     advanced_value_parser.add_argument('--market-date', required=True)
     advanced_value_parser.add_argument('--symbols')
 
+    unified_value_parser = subparsers.add_parser(
+        'eod-unified-value-factors-compute',
+        help='Compute unified value factor rows directly',
+    )
+    unified_value_parser.add_argument('--market-date', required=True)
+    unified_value_parser.add_argument('--symbols')
+
     composite_parser = subparsers.add_parser(
         'eod-composite-factors-compute',
         help='Compute integrated composite factor rows directly',
@@ -852,6 +873,8 @@ def main(argv: Iterable[str] | None = None) -> int:
         payload = compute_value_factors(market_date=args.market_date, symbols=args.symbols)
     elif args.command == 'eod-advanced-value-factors-compute':
         payload = compute_advanced_value_factors(market_date=args.market_date, symbols=args.symbols)
+    elif args.command == 'eod-unified-value-factors-compute':
+        payload = compute_unified_value_factors(market_date=args.market_date, symbols=args.symbols)
     elif args.command == 'eod-composite-factors-compute':
         payload = compute_composite_factors(market_date=args.market_date, symbols=args.symbols)
     elif args.command == 'eod-trending-ranks-compute':

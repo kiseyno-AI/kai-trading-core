@@ -94,6 +94,7 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         )
         self.assertIn('fundamentals_daily_refresh', payload['default_daily_stage_order'])
         self.assertIn('signal_decider', payload['default_daily_stage_order'])
+        self.assertIn('unified_value_factors', payload['stage_order'])
         agent_feedback_stage = next(
             stage
             for stage in payload['stages']
@@ -102,6 +103,15 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         self.assertEqual(
             agent_feedback_stage['depends_on'],
             ['market_risk_filter', 'piotroski_filter'],
+        )
+        unified_value_stage = next(
+            stage
+            for stage in payload['stages']
+            if stage['id'] == 'unified_value_factors'
+        )
+        self.assertEqual(
+            unified_value_stage['depends_on'],
+            ['price_collection', 'fundamentals_daily_refresh'],
         )
 
     def test_run_reorders_requested_subset_and_splits_feedback_stages(self) -> None:
@@ -183,6 +193,33 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         )
 
         self.assertEqual(status, 'partial')
+
+    def test_execute_stage_routes_unified_value_factor_stage_to_service(self) -> None:
+        service = DailyPipelineStageService()
+
+        with patch(
+            'app.eod.daily_pipeline_stages.daily_unified_value_factor_service.rebuild_for_market_date',
+            return_value={'results_persisted': 2},
+        ) as compute_unified_value:
+            result = service._execute_stage(
+                stage_id='unified_value_factors',
+                market_date='2026-04-24',
+                symbols=['005930', '000660'],
+                markets=None,
+                force=False,
+                fs_div='CFS',
+                symbol_limit=None,
+                symbol_offset=0,
+                capture_limit=500,
+                retry_cycles=None,
+                feedback_max_cycles=3,
+                feedback_outer_batch_size=20,
+                reuse_existing_feedback=True,
+            )
+
+        self.assertEqual(result, {'results_persisted': 2})
+        self.assertEqual(compute_unified_value.call_args.kwargs['market_date'], '2026-04-24')
+        self.assertEqual(compute_unified_value.call_args.kwargs['symbols'], ['005930', '000660'])
 
 
 if __name__ == '__main__':
