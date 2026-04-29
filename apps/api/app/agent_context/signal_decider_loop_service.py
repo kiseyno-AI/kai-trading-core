@@ -22,6 +22,7 @@ from app.db_models import (
     SignalDeciderRealizedOutcome,
 )
 from app.market_data_store import load_daily_bars_for_symbol_range
+from app.orders.signal_decider_execution_outcomes import signal_decider_execution_outcome_service
 
 DEFAULT_SIGNAL_DECIDER_POLICY_VERSION = 'signal_decider_policy_v1'
 DEFAULT_SIGNAL_DECIDER_EVALUATION_VERSION = 'signal_decider_eval_v1'
@@ -1878,6 +1879,7 @@ class SignalDeciderLoopService:
             rows=[row],
             horizons=normalized_horizons,
             evaluation_version=resolved_evaluation_version,
+            refresh_actual_execution_outcomes=True,
         )[0]
         return {
             'request': {
@@ -1888,6 +1890,7 @@ class SignalDeciderLoopService:
             'summary': {
                 'evaluated_count': len(detail_item['evaluations']),
                 'outcome_count': len(detail_item['outcomes']),
+                'actual_execution_outcome_count': len(detail_item['actual_execution_outcomes']),
             },
             'item': detail_item,
         }
@@ -1915,6 +1918,7 @@ class SignalDeciderLoopService:
             rows=rows,
             horizons=None,
             evaluation_version=resolved_evaluation_version,
+            refresh_actual_execution_outcomes=True,
         )
         return {
             'request': {
@@ -1926,6 +1930,7 @@ class SignalDeciderLoopService:
             'summary': {
                 'count': len(items),
                 'evaluated_count': sum(1 for item in items if item['evaluations']),
+                'actual_execution_outcome_count': sum(len(item['actual_execution_outcomes']) for item in items),
             },
             'items': items,
         }
@@ -2492,6 +2497,7 @@ class SignalDeciderLoopService:
         rows: Sequence[SignalDeciderDecisionSnapshot],
         horizons: Sequence[int] | None,
         evaluation_version: str,
+        refresh_actual_execution_outcomes: bool = False,
     ) -> list[dict[str, Any]]:
         snapshot_ids = [row.id for row in rows]
         if not snapshot_ids:
@@ -2509,6 +2515,12 @@ class SignalDeciderLoopService:
                 evaluation_version=evaluation_version,
             )
         )
+        actual_execution_by_snapshot = self._group_execution_outcomes_by_snapshot_id(
+            signal_decider_execution_outcome_service.list_snapshot_outcomes(
+                decision_snapshot_ids=snapshot_ids,
+                refresh=refresh_actual_execution_outcomes,
+            )
+        )
         return [
             self._build_decision_detail_item(
                 row=row,
@@ -2516,6 +2528,7 @@ class SignalDeciderLoopService:
                 evaluation_version=evaluation_version,
                 outcomes=outcomes_by_snapshot.get(row.id, []),
                 evaluations=evaluations_by_snapshot.get(row.id, []),
+                actual_execution_outcomes=actual_execution_by_snapshot.get(row.id, []),
             )
             for row in rows
         ]
@@ -2528,6 +2541,7 @@ class SignalDeciderLoopService:
         evaluation_version: str,
         outcomes: Sequence[dict[str, Any]] | None = None,
         evaluations: Sequence[dict[str, Any]] | None = None,
+        actual_execution_outcomes: Sequence[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         resolved_outcomes = list(outcomes) if outcomes is not None else self.repository.list_realized_outcomes(
             decision_snapshot_ids=[row.id],
@@ -2540,6 +2554,14 @@ class SignalDeciderLoopService:
                 decision_snapshot_ids=[row.id],
                 horizons=horizons,
                 evaluation_version=evaluation_version,
+            )
+        )
+        resolved_actual_execution_outcomes = (
+            list(actual_execution_outcomes)
+            if actual_execution_outcomes is not None
+            else signal_decider_execution_outcome_service.list_snapshot_outcomes(
+                decision_snapshot_ids=[row.id],
+                refresh=False,
             )
         )
         decision = self._build_decision_snapshot(row)
@@ -2561,6 +2583,10 @@ class SignalDeciderLoopService:
             'upstream_traceability': request_payload.get('upstream_traceability'),
             'outcomes': resolved_outcomes,
             'evaluations': resolved_evaluations,
+            'actual_execution_summary': signal_decider_execution_outcome_service.build_summary(
+                items=resolved_actual_execution_outcomes,
+            ),
+            'actual_execution_outcomes': resolved_actual_execution_outcomes,
         }
 
     def _decision_matches_evaluation_filters(
@@ -3585,6 +3611,25 @@ class SignalDeciderLoopService:
             grouped.setdefault(snapshot_id, []).append(row)
         for items in grouped.values():
             items.sort(key=lambda item: int(item.get('horizon_days') or 0))
+        return grouped
+
+    def _group_execution_outcomes_by_snapshot_id(
+        self,
+        rows: Sequence[dict[str, Any]],
+    ) -> dict[int, list[dict[str, Any]]]:
+        grouped: dict[int, list[dict[str, Any]]] = {}
+        for row in rows:
+            snapshot_id = int(row['decision_snapshot_id'])
+            grouped.setdefault(snapshot_id, []).append(row)
+        for items in grouped.values():
+            items.sort(
+                key=lambda item: (
+                    str(item.get('target_trade_date') or ''),
+                    str(item.get('account_reference') or ''),
+                    str(item.get('symbol') or ''),
+                    int(item.get('outcome_id') or 0),
+                )
+            )
         return grouped
 
     def _resolve_evaluation_profile(self, evaluation_version: str) -> SignalDeciderEvaluationProfile:

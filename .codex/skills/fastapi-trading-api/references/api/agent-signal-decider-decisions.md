@@ -75,7 +75,7 @@ GET /agent-context/signal-decider/decisions?market_date_from=2026-04-20&market_d
 # GET /agent-context/signal-decider/decisions/{snapshot_id}
 
 ## Summary
-Reads one immutable `signal-decider` decision snapshot by `snapshot_id`, including the stable explanation block, frozen request/response payloads, upstream references, realized outcomes, and versioned evaluations in one place.
+Reads one immutable `signal-decider` decision snapshot by `snapshot_id`, including the stable explanation block, frozen request/response payloads, upstream references, synthetic realized outcomes, separate actual execution outcomes, and versioned evaluations in one place.
 
 ## Example request
 ```http
@@ -111,6 +111,26 @@ GET /agent-context/signal-decider/decisions/84?horizons=1&horizons=5&evaluation_
         "close_return_pct": 0.041
       }
     ],
+    "actual_execution_summary": {
+      "count": 1,
+      "closed_count": 1,
+      "total_realized_pnl_krw": "20000.00"
+    },
+    "actual_execution_outcomes": [
+      {
+        "outcome_id": 7,
+        "entry_plan_item_id": 301,
+        "exit_plan_item_id": 417,
+        "lifecycle_status": "closed",
+        "exit_reason": "target_hit",
+        "entry_filled_quantity": "5.00000000",
+        "exit_filled_quantity": "5.00000000",
+        "entry_average_fill_price": 50000,
+        "exit_average_fill_price": 54000,
+        "realized_pnl_krw": "20000.00",
+        "realized_return_pct": 0.08
+      }
+    ],
     "evaluations": [
       {
         "horizon_days": 5,
@@ -126,7 +146,7 @@ GET /agent-context/signal-decider/decisions/84?horizons=1&horizons=5&evaluation_
 # GET /agent-context/signal-decider/diagnostics
 
 ## Summary
-Reads the deeper immutable `signal-decider` trace bundle for one market date or symbol slice, including frozen request/response payloads, upstream summaries, realized outcomes, and versioned evaluation rows for audit or missed-opportunity review.
+Reads the deeper immutable `signal-decider` trace bundle for one market date or symbol slice, including frozen request/response payloads, upstream summaries, synthetic realized outcomes, separate actual execution outcomes, and versioned evaluation rows for audit or missed-opportunity review.
 
 ## Example request
 ```http
@@ -156,6 +176,19 @@ GET /agent-context/signal-decider/diagnostics?market_date=2026-04-23&symbol=0059
           "horizon_days": 5,
           "outcome_status": "complete",
           "close_return_pct": 0.041
+        }
+      ],
+      "actual_execution_summary": {
+        "count": 1,
+        "closed_count": 1,
+        "total_realized_pnl_krw": "20000.00"
+      },
+      "actual_execution_outcomes": [
+        {
+          "outcome_id": 7,
+          "lifecycle_status": "closed",
+          "exit_reason": "target_hit",
+          "realized_pnl_krw": "20000.00"
         }
       ],
       "evaluations": [

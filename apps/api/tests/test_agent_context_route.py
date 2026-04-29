@@ -406,6 +406,40 @@ class FakeSignalDeciderLoopService:
         }
 
 
+class FakeSignalDeciderExecutionOutcomeService:
+    def __init__(self):
+        self.list_args = None
+
+    def list_outcomes(self, **kwargs):
+        self.list_args = kwargs
+        return {
+            'request': {
+                'snapshot_id': kwargs['snapshot_id'],
+                'market_date': kwargs['market_date'].isoformat() if kwargs['market_date'] is not None else None,
+                'market_date_from': kwargs['market_date_from'].isoformat() if kwargs['market_date_from'] is not None else None,
+                'market_date_to': kwargs['market_date_to'].isoformat() if kwargs['market_date_to'] is not None else None,
+                'symbol': kwargs['symbol'],
+                'account_reference': kwargs['account_reference'],
+                'policy_version': kwargs['policy_version'],
+                'lifecycle_status': kwargs['lifecycle_status'],
+                'exit_reason': kwargs['exit_reason'],
+                'refresh': kwargs['refresh'],
+                'limit': kwargs['limit'],
+            },
+            'summary': {'count': 1, 'closed_count': 1},
+            'items': [
+                {
+                    'outcome_id': 7,
+                    'decision_snapshot_id': kwargs['snapshot_id'] or 84,
+                    'symbol': kwargs['symbol'] or '005930',
+                    'account_reference': kwargs['account_reference'] or 'KIS:12345678-01',
+                    'lifecycle_status': 'closed',
+                    'exit_reason': 'target_hit',
+                }
+            ],
+        }
+
+
 class AgentContextRouteTests(unittest.TestCase):
     def setUp(self):
         self.app = FastAPI()
@@ -836,6 +870,43 @@ class AgentContextRouteTests(unittest.TestCase):
         self.assertEqual(fake_service.detail_args['horizons'], [1, 5])
         self.assertEqual(fake_service.detail_args['evaluation_version'], 'signal_decider_eval_v1')
         self.assertEqual(response.json()['item']['snapshot_id'], 84)
+
+    def test_signal_decider_execution_outcomes_route_calls_service(self):
+        fake_service = FakeSignalDeciderExecutionOutcomeService()
+        original_service = routes_agent_context.signal_decider_execution_outcome_service
+        routes_agent_context.signal_decider_execution_outcome_service = fake_service
+        try:
+            client = TestClient(self.app)
+            response = client.get(
+                '/agent-context/signal-decider/execution-outcomes',
+                params=[
+                    ('snapshot_id', '84'),
+                    ('market_date_from', '2026-04-20'),
+                    ('market_date_to', '2026-04-23'),
+                    ('symbol', '005930'),
+                    ('account_reference', 'KIS:12345678-01'),
+                    ('policy_version', 'signal_decider_policy_v1'),
+                    ('lifecycle_status', 'closed'),
+                    ('exit_reason', 'target_hit'),
+                    ('refresh', 'true'),
+                    ('limit', '25'),
+                ],
+            )
+        finally:
+            routes_agent_context.signal_decider_execution_outcome_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(fake_service.list_args['snapshot_id'], 84)
+        self.assertEqual(fake_service.list_args['market_date_from'], date.fromisoformat('2026-04-20'))
+        self.assertEqual(fake_service.list_args['market_date_to'], date.fromisoformat('2026-04-23'))
+        self.assertEqual(fake_service.list_args['symbol'], '005930')
+        self.assertEqual(fake_service.list_args['account_reference'], 'KIS:12345678-01')
+        self.assertEqual(fake_service.list_args['policy_version'], 'signal_decider_policy_v1')
+        self.assertEqual(fake_service.list_args['lifecycle_status'], 'closed')
+        self.assertEqual(fake_service.list_args['exit_reason'], 'target_hit')
+        self.assertTrue(fake_service.list_args['refresh'])
+        self.assertEqual(fake_service.list_args['limit'], 25)
+        self.assertEqual(response.json()['items'][0]['lifecycle_status'], 'closed')
 
     def test_signal_decider_diagnostics_summary_route_calls_service(self):
         fake_service = FakeSignalDeciderLoopService()
