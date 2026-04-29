@@ -1,0 +1,193 @@
+# GET /agent-context/signal-decider/calendar
+
+## Summary
+Month-level replay review calendar over immutable `signal-decider` decision snapshots. The response groups decisions by market date, reports buy or wait or reject counts, highlights primary-horizon evaluation coverage, and keeps replay scorecards separate from actual execution outcomes.
+
+## Example request
+```http
+GET /agent-context/signal-decider/calendar?month=2026-04&horizons=1&horizons=3&horizons=5&primary_horizon_days=5&evaluation_version=signal_decider_eval_v1
+```
+
+## Example response
+```json
+{
+  "request": {
+    "month": "2026-04",
+    "market_date_from": "2026-04-01",
+    "market_date_to": "2026-04-30",
+    "horizons": [1, 3, 5],
+    "primary_horizon_days": 5,
+    "evaluation_version": "signal_decider_eval_v1"
+  },
+  "read_model": {
+    "name": "signal_decider_replay_review",
+    "version": "signal_decider_replay_review_v1",
+    "separate_from_actual_execution_outcomes": true,
+    "actual_execution_outcomes_endpoint": "/agent-context/signal-decider/execution-outcomes"
+  },
+  "taxonomy": {
+    "version": "signal_decider_replay_review_v1"
+  },
+  "summary": {
+    "day_count": 2,
+    "decision_count": 4,
+    "evaluation_coverage": {
+      "status": "partial",
+      "complete_count": 3,
+      "pending_count": 1
+    },
+    "scorecard": {
+      "target_hit_count": 2,
+      "stop_hit_count": 1,
+      "collision_count": 0,
+      "neither_count": 0,
+      "pending_count": 1
+    }
+  },
+  "items": [
+    {
+      "market_date": "2026-04-20",
+      "decision_count": 3,
+      "decision_actions": {
+        "buy": 1,
+        "reject": 1,
+        "wait": 1
+      },
+      "evaluation_coverage": {
+        "status": "complete"
+      },
+      "scorecard": {
+        "target_hit_count": 2,
+        "stop_hit_count": 1,
+        "pending_count": 0
+      }
+    }
+  ]
+}
+```
+
+
+# GET /agent-context/signal-decider/calendar/{market_date}
+
+## Summary
+Selected-date replay review for all `signal-decider` decisions emitted on one market date. Each item keeps the original decision fields, adds D+1 or D+3 or D+5 replay summaries, and exposes a stable rule-based review insight with path interpretation for UI rendering.
+
+## Example request
+```http
+GET /agent-context/signal-decider/calendar/2026-04-20?horizons=1&horizons=3&horizons=5&primary_horizon_days=5&evaluation_version=signal_decider_eval_v1
+```
+
+## Example response
+```json
+{
+  "summary": {
+    "count": 3,
+    "review_status_counts": {
+      "complete": 3
+    },
+    "insight_counts": {
+      "buy_should_have_taken": 1,
+      "wait_missed_opportunity": 1,
+      "reject_correct": 1
+    },
+    "evaluation_coverage": {
+      "primary_horizon_days": 5,
+      "status": "complete"
+    }
+  },
+  "items": [
+    {
+      "snapshot_id": 84,
+      "symbol": "005930",
+      "decision": {
+        "action": "buy",
+        "target_price": 105,
+        "stop_loss_price": 96
+      },
+      "summary": "Breakout quality stayed constructive.",
+      "review": {
+        "status": "complete",
+        "insight": {
+          "code": "buy_should_have_taken",
+          "label": "Buy held up",
+          "label_key": "signal_decider.review.buy_should_have_taken"
+        },
+        "narrative": "The buy setup held up on the 5-day replay window. Target was touched and the stop-loss was never touched.",
+        "path_analysis": {
+          "path_marker": "target_hit",
+          "first_trigger": "target_hit",
+          "trigger_sequence": "target_only"
+        },
+        "horizons": [
+          {
+            "horizon_days": 1,
+            "grade_label": "good_buy",
+            "path_analysis": {
+              "path_marker": "target_hit"
+            }
+          },
+          {
+            "horizon_days": 5,
+            "grade_label": "good_buy",
+            "path_analysis": {
+              "path_marker": "target_hit"
+            }
+          }
+        ]
+      }
+    }
+  ]
+}
+```
+
+
+# GET /agent-context/signal-decider/calendar/{market_date}/snapshots/{snapshot_id}
+
+## Summary
+Replay-only drilldown for one immutable decision snapshot on the selected date. It returns the replay insight, the primary-horizon trigger checkpoints, and the observed price path used by the synthetic review model. Actual fills and broker P&L stay on `GET /agent-context/signal-decider/execution-outcomes`.
+
+## Example request
+```http
+GET /agent-context/signal-decider/calendar/2026-04-20/snapshots/84?horizons=1&horizons=5&primary_horizon_days=5&evaluation_version=signal_decider_eval_v1
+```
+
+## Example response
+```json
+{
+  "summary": {
+    "market_date": "2026-04-20",
+    "symbol": "005930",
+    "review_status": "complete",
+    "insight_code": "buy_should_have_taken",
+    "primary_path_marker": "target_hit"
+  },
+  "item": {
+    "snapshot_id": 84,
+    "symbol": "005930",
+    "review": {
+      "status": "complete",
+      "insight": {
+        "code": "buy_should_have_taken"
+      },
+      "path_analysis": {
+        "path_marker": "target_hit",
+        "checkpoints": {
+          "entry_trade_date": "2026-04-21",
+          "exit_trade_date": "2026-04-25",
+          "first_target_hit_trade_date": "2026-04-21",
+          "first_stop_loss_hit_trade_date": null
+        }
+      }
+    },
+    "observed_price_path": [
+      {
+        "trade_date": "2026-04-21",
+        "open_price": 100,
+        "high_price": 106,
+        "low_price": 99,
+        "close_price": 104
+      }
+    ]
+  }
+}
+```
