@@ -50,6 +50,23 @@ class FakeMarketSnapshotService:
         }
 
 
+class FakePortfolioSummaryService:
+    def runtime_status(self) -> dict:
+        return {
+            'ready': True,
+            'app_env': 'production',
+            'kis_environment': 'real',
+            'kis_base_url': 'https://openapi.koreainvestment.com:9443',
+            'kis_use_mock': False,
+            'kis_app_key_configured': True,
+            'kis_app_secret_configured': True,
+            'portfolio_account_references_configured': True,
+            'portfolio_account_references_valid': True,
+            'configured_account_count': 2,
+            'blocking_reasons': [],
+        }
+
+
 class KISRouteTests(unittest.TestCase):
     def setUp(self) -> None:
         self.app = FastAPI()
@@ -57,14 +74,17 @@ class KISRouteTests(unittest.TestCase):
         self.original_client = routes_kis.kis_client
         self.original_realtime_service = routes_kis.kis_realtime_order_notice_service
         self.original_market_snapshot_service = routes_kis.market_snapshot_service
+        self.original_portfolio_summary_service = routes_kis.portfolio_summary_service
         routes_kis.kis_client = FakeKISClient()
         routes_kis.kis_realtime_order_notice_service = FakeRealtimeOrderNoticeService()
         routes_kis.market_snapshot_service = FakeMarketSnapshotService()
+        routes_kis.portfolio_summary_service = FakePortfolioSummaryService()
 
     def tearDown(self) -> None:
         routes_kis.kis_client = self.original_client
         routes_kis.kis_realtime_order_notice_service = self.original_realtime_service
         routes_kis.market_snapshot_service = self.original_market_snapshot_service
+        routes_kis.portfolio_summary_service = self.original_portfolio_summary_service
 
     def test_health_route_includes_realtime_order_notice_snapshot(self) -> None:
         client = TestClient(self.app)
@@ -77,6 +97,9 @@ class KISRouteTests(unittest.TestCase):
         self.assertEqual(payload['realtime_order_notices']['metrics']['notices_ingested'], 3)
         self.assertTrue(payload['market_snapshot_runtime']['ready'])
         self.assertEqual(payload['market_snapshot_runtime']['effective_kis_environment'], 'real')
+        self.assertTrue(payload['portfolio_summary_runtime']['ready'])
+        self.assertEqual(payload['portfolio_summary_runtime']['configured_account_count'], 2)
+        self.assertEqual(payload['portfolio_summary_runtime']['kis_environment'], 'real')
 
 
 if __name__ == '__main__':

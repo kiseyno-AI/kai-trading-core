@@ -15,6 +15,7 @@ from sqlalchemy.engine.url import make_url
 from app.core.settings import settings
 from app.db import DATABASE_URL, engine, get_alembic_config
 from app.market.snapshot import market_snapshot_service
+from app.orders.portfolio_summary_service import portfolio_summary_service
 
 OK_STATUS = 'ok'
 WARN_STATUS = 'warn'
@@ -31,7 +32,27 @@ def _market_snapshot_runtime_actions(runtime_status: dict[str, Any]) -> list[str
         actions.append('Set KIS_APP_KEY and KIS_APP_SECRET in apps/api/.env before deploying market snapshot.')
     if not runtime_status.get('koreaexim_api_key_configured'):
         actions.append('Set KOREAEXIM_API_KEY in apps/api/.env before deploying market snapshot.')
-    actions.append('After restart, run the deploy smoke check against /health, /eod/freshness, and /market/snapshot.')
+    actions.append(
+        'After restart, run the deploy smoke check against /health, /eod/freshness, /market/snapshot, and /portfolio/summary.'
+    )
+    return actions
+
+
+def _portfolio_summary_runtime_actions(runtime_status: dict[str, Any]) -> list[str]:
+    actions: list[str] = []
+    if not runtime_status.get('portfolio_account_references_configured'):
+        actions.append(
+            'Set PORTFOLIO_ACCOUNT_REFERENCES in apps/api/.env to one or more Label=KIS:<account_number>-<product_code> entries.'
+        )
+    elif not runtime_status.get('portfolio_account_references_valid'):
+        actions.append(
+            'Fix PORTFOLIO_ACCOUNT_REFERENCES so each entry uses KIS:<account_number>-<product_code> or Label=KIS:<account_number>-<product_code>.'
+        )
+    if not runtime_status.get('kis_app_key_configured') or not runtime_status.get('kis_app_secret_configured'):
+        actions.append('Set KIS_APP_KEY and KIS_APP_SECRET in apps/api/.env before deploying portfolio summary.')
+    if runtime_status.get('app_env', '').lower() == 'production' and runtime_status.get('kis_use_mock'):
+        actions.append('Set KIS_USE_MOCK=false in production so portfolio summary uses live KIS account inquiries.')
+    actions.append('After restart, verify GET /portfolio/summary returns sync.status other than not_configured.')
     return actions
 
 
@@ -93,6 +114,7 @@ def _load_revision_catalog() -> tuple[tuple[str, ...], list[dict[str, Any]]]:
 def _build_preflight_report(*, require_head: bool) -> dict[str, Any]:
     redacted_database_url = _redacted_database_url()
     market_snapshot_runtime = market_snapshot_service.runtime_status()
+    portfolio_summary_runtime = portfolio_summary_service.runtime_status()
 
     try:
         head_revisions, revision_catalog = _load_revision_catalog()
@@ -127,6 +149,7 @@ def _build_preflight_report(*, require_head: bool) -> dict[str, Any]:
             ],
             'runtime_checks': {
                 'market_snapshot': market_snapshot_runtime,
+                'portfolio_summary': portfolio_summary_runtime,
             },
         }
 
@@ -140,7 +163,7 @@ def _build_preflight_report(*, require_head: bool) -> dict[str, Any]:
     status = OK_STATUS
     summary = 'Database is already at the Alembic head revision.'
     recommended_actions = [
-        'After restart, run the deploy smoke check against /health, /eod/freshness, and /market/snapshot.',
+        'After restart, run the deploy smoke check against /health, /eod/freshness, /market/snapshot, and /portfolio/summary.',
     ]
 
     if len(head_revisions) != 1:
@@ -200,7 +223,7 @@ def _build_preflight_report(*, require_head: bool) -> dict[str, Any]:
                 summary = 'Database is not at the Alembic head revision.'
                 recommended_actions = [
                     'Run alembic upgrade head before restart, then rerun this preflight with --require-head.',
-                    'After restart, run the deploy smoke check against /health, /eod/freshness, and /market/snapshot.',
+                    'After restart, run the deploy smoke check against /health, /eod/freshness, /market/snapshot, and /portfolio/summary.',
                 ]
             else:
                 status = WARN_STATUS
@@ -210,7 +233,7 @@ def _build_preflight_report(*, require_head: bool) -> dict[str, Any]:
                 recommended_actions = [
                     'If DB_AUTO_UPGRADE=true, startup may continue and let Alembic apply the pending revisions.',
                     'For a gated deploy, prefer alembic upgrade head before restart, then rerun this preflight with --require-head.',
-                    'After restart, run the deploy smoke check against /health, /eod/freshness, and /market/snapshot.',
+                    'After restart, run the deploy smoke check against /health, /eod/freshness, /market/snapshot, and /portfolio/summary.',
                 ]
 
     if not market_snapshot_runtime['ready']:
@@ -218,6 +241,11 @@ def _build_preflight_report(*, require_head: bool) -> dict[str, Any]:
             status = FAIL_STATUS
             summary = 'Market snapshot runtime is not ready for deploy.'
         recommended_actions.extend(_market_snapshot_runtime_actions(market_snapshot_runtime))
+    if not portfolio_summary_runtime['ready']:
+        if status != FAIL_STATUS:
+            status = FAIL_STATUS
+            summary = 'Portfolio summary runtime is not ready for deploy.'
+        recommended_actions.extend(_portfolio_summary_runtime_actions(portfolio_summary_runtime))
 
     return {
         'status': status,
@@ -248,6 +276,7 @@ def _build_preflight_report(*, require_head: bool) -> dict[str, Any]:
         'recommended_actions': list(dict.fromkeys(recommended_actions)),
         'runtime_checks': {
             'market_snapshot': market_snapshot_runtime,
+            'portfolio_summary': portfolio_summary_runtime,
         },
     }
 
@@ -291,6 +320,17 @@ def _render_preflight_text(report: dict[str, Any]) -> str:
         )
         for reason in market_snapshot.get('blocking_reasons') or []:
             lines.append(f"- market_snapshot: {reason}")
+    portfolio_summary = runtime_checks.get('portfolio_summary')
+    if isinstance(portfolio_summary, dict):
+        lines.append(
+            'Portfolio summary runtime: '
+            + ('ready' if portfolio_summary.get('ready') else 'blocked')
+            + f" (kis_environment={portfolio_summary.get('kis_environment')}, "
+            + f"configured_account_count={portfolio_summary.get('configured_account_count')}, "
+            + f"kis_use_mock={portfolio_summary.get('kis_use_mock')})"
+        )
+        for reason in portfolio_summary.get('blocking_reasons') or []:
+            lines.append(f"- portfolio_summary: {reason}")
 
     if report['database'].get('error'):
         lines.append(f"Database error: {report['database']['error']}")
@@ -335,6 +375,7 @@ def collect_deploy_smoke_check(
             ('health', '/health'),
             ('eod_freshness', '/eod/freshness'),
             ('market_snapshot', '/market/snapshot'),
+            ('portfolio_summary', '/portfolio/summary'),
         ):
             try:
                 response = client.get(path)
@@ -382,6 +423,23 @@ def collect_deploy_smoke_check(
                     'kosdaq_value': kosdaq.get('value'),
                     'detail': payload.get('detail'),
                 }
+            elif name == 'portfolio_summary':
+                sync = payload.get('sync') if isinstance(payload.get('sync'), dict) else {}
+                accounts = payload.get('accounts') if isinstance(payload.get('accounts'), list) else []
+                sync_status = str(sync.get('status') or '').strip()
+                ok = (
+                    response.status_code == 200
+                    and sync_status in {'synced', 'stale', 'unavailable'}
+                    and len(accounts) > 0
+                )
+                checks[name] = {
+                    'ok': ok,
+                    'path': path,
+                    'status_code': response.status_code,
+                    'sync_status': sync_status,
+                    'accounts_count': len(accounts),
+                    'detail': sync.get('message'),
+                }
             else:
                 today = payload.get('today') if isinstance(payload.get('today'), dict) else {}
                 latest = payload.get('latest') if isinstance(payload.get('latest'), dict) else {}
@@ -423,6 +481,9 @@ def _render_smoke_check_text(report: dict[str, Any]) -> str:
             detail_parts.append(f"usd_krw_rate={check.get('usd_krw_rate')}")
             detail_parts.append(f"kospi_value={check.get('kospi_value')}")
             detail_parts.append(f"kosdaq_value={check.get('kosdaq_value')}")
+        elif name == 'portfolio_summary':
+            detail_parts.append(f"sync_status={check.get('sync_status')}")
+            detail_parts.append(f"accounts_count={check.get('accounts_count')}")
         else:
             detail_parts.append(f"today_trade_date={check.get('today_trade_date')}")
             detail_parts.append(f"latest_trade_date={check.get('latest_trade_date')}")

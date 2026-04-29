@@ -167,7 +167,9 @@
 ## Trading account inquiry notes
 - `GET /portfolio/summary` is the aggregate portfolio read for the dashboard and portfolio cards. It resolves the deployment-configured account list from `PORTFOLIO_ACCOUNT_REFERENCES`, reuses the KIS-backed account-summary and positions inquiries per account, and returns the web `PortfolioSummaryDto`-style shape with `accounts`, `holdings`, `allocation`, `recentActivity`, `sync`, and `notices`.
 - `PORTFOLIO_ACCOUNT_REFERENCES` accepts a comma-separated list of `KIS:<account_number>-<product_code>` entries, with optional labels in `Label=KIS:...` form. When the setting is missing or invalid, `GET /portfolio/summary` returns `200` with `sync.status=not_configured` and explanatory notices instead of an ambiguous empty success.
+- Production portfolio aggregation also requires `KIS_APP_KEY`, `KIS_APP_SECRET`, and `KIS_USE_MOCK=false`. In `APP_ENV=production`, the route and deploy preflight now treat mock-KIS portfolio wiring as a configuration error instead of waiting for a later upstream failure.
 - The portfolio summary route keeps sync state explicit: fully successful account reads report `sync.status=synced`, mixed-success reads report `sync.status=stale`, total upstream failure reports `sync.status=unavailable`, and deployment/account configuration problems report `sync.status=not_configured`.
+- `GET /broker/kis/health` now exposes `portfolio_summary_runtime`, deploy preflight reports `runtime_checks.portfolio_summary`, and deploy smoke-check fails if `/portfolio/summary` is still `not_configured` after restart.
 - `GET /trading/accounts/{account_reference}/summary` is the normalized KIS-backed cash and valuation snapshot for one KIS account reference. It combines `inquire-balance` and `inquire-account-balance` so UI cards can read cash and valuation fields without mapping KIS names client-side.
 - `GET /trading/accounts/{account_reference}/positions` is the normalized holdings view. It defaults to active positions only, supports optional `symbol` filtering for pre-trade “already holding this?” checks, and exposes quantity, sellable quantity, pricing, market value, PnL, and derived weight per row.
 - `GET /trading/accounts/{account_reference}/buying-power` is the pre-trade orderability read. Clients should call it before order submission with the intended `symbol`, `price`, and `order_type` so Core asks KIS directly for buyable quantity and amount instead of estimating from cached cash.
@@ -179,6 +181,7 @@
 - Realtime notices append durable rows into `broker_order_events` with `source=ws_notice`, preserve the raw decrypted field payload, and patch the current `broker_orders` snapshot when the notice advances the known order state.
 - Duplicate notices are deduplicated through a stable websocket event fingerprint. Older notices can still be persisted for audit, but they do not regress a newer `broker_orders` snapshot.
 - `GET /broker/kis/health` now includes a `realtime_order_notices` block with connection status, last message timing, reconnect attempts, subscription or auth lifecycle state, last fatal vs recoverable error, and ingest counters.
+- `GET /broker/kis/health` also includes `market_snapshot_runtime` and `portfolio_summary_runtime` so operators can confirm route-specific readiness without triggering the full downstream payloads.
 
 ## EOD freshness read-layer notes
 - Canonical semantics live in `docs/EOD_STATUS_SEMANTICS_CONTRACT.md`.

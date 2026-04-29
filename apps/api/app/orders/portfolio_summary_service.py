@@ -77,6 +77,36 @@ class ConfiguredPortfolioAccount:
     account_product_code: str
 
 
+@dataclass(frozen=True)
+class PortfolioSummaryRuntimeStatus:
+    ready: bool
+    app_env: str
+    kis_environment: str
+    kis_base_url: str
+    kis_use_mock: bool
+    kis_app_key_configured: bool
+    kis_app_secret_configured: bool
+    portfolio_account_references_configured: bool
+    portfolio_account_references_valid: bool
+    configured_account_count: int
+    blocking_reasons: tuple[str, ...]
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            'ready': self.ready,
+            'app_env': self.app_env,
+            'kis_environment': self.kis_environment,
+            'kis_base_url': self.kis_base_url,
+            'kis_use_mock': self.kis_use_mock,
+            'kis_app_key_configured': self.kis_app_key_configured,
+            'kis_app_secret_configured': self.kis_app_secret_configured,
+            'portfolio_account_references_configured': self.portfolio_account_references_configured,
+            'portfolio_account_references_valid': self.portfolio_account_references_valid,
+            'configured_account_count': self.configured_account_count,
+            'blocking_reasons': list(self.blocking_reasons),
+        }
+
+
 class PortfolioSummaryService:
     def __init__(
         self,
@@ -89,16 +119,20 @@ class PortfolioSummaryService:
         self.order_service = order_service or trading_order_service
         self.portfolio_account_references = portfolio_account_references
 
+    def runtime_status(self) -> dict[str, Any]:
+        return self._runtime_status().to_payload()
+
     async def get_portfolio_summary(self) -> dict[str, Any]:
         as_of = _utc_now().isoformat()
-        configured_accounts, config_error = self._resolve_accounts()
-        if config_error is not None:
+        runtime_status = self._runtime_status()
+        if not runtime_status.ready:
             return self._build_unavailable_summary(
                 as_of=as_of,
                 status='not_configured',
-                source='portfolio_account_references',
-                message=config_error,
+                source='portfolio_summary_runtime',
+                message=self._configuration_message(runtime_status),
             )
+        configured_accounts, _ = self._resolve_accounts()
 
         results = await asyncio.gather(
             *(self._build_account_payload(account, as_of=as_of) for account in configured_accounts)
@@ -251,11 +285,53 @@ class PortfolioSummaryService:
             'upstream_error_type': payload.get('upstream_error_type') or type(exc).__name__,
         }
 
-    def _resolve_accounts(self) -> tuple[list[ConfiguredPortfolioAccount], str | None]:
+    def _runtime_status(self) -> PortfolioSummaryRuntimeStatus:
+        configured_accounts, config_error = self._resolve_accounts()
+        entries = self._configured_account_entries()
+        blocking_reasons: list[str] = []
+        if config_error is not None:
+            blocking_reasons.append(config_error)
+        if not settings.kis_app_key:
+            blocking_reasons.append('KIS_APP_KEY must be configured for portfolio summary account inquiries.')
+        if not settings.kis_app_secret:
+            blocking_reasons.append('KIS_APP_SECRET must be configured for portfolio summary account inquiries.')
+
+        normalized_app_env = str(settings.app_env or '').strip()
+        if normalized_app_env.lower() == 'production' and settings.kis_use_mock:
+            blocking_reasons.append(
+                'KIS_USE_MOCK must be false in production so portfolio summary uses live KIS account inquiries.'
+            )
+
+        return PortfolioSummaryRuntimeStatus(
+            ready=not blocking_reasons,
+            app_env=normalized_app_env,
+            kis_environment='demo' if settings.kis_use_mock else 'real',
+            kis_base_url=settings.kis_mock_base_url if settings.kis_use_mock else settings.kis_base_url,
+            kis_use_mock=settings.kis_use_mock,
+            kis_app_key_configured=bool(settings.kis_app_key),
+            kis_app_secret_configured=bool(settings.kis_app_secret),
+            portfolio_account_references_configured=bool(entries),
+            portfolio_account_references_valid=config_error is None,
+            configured_account_count=len(configured_accounts),
+            blocking_reasons=tuple(blocking_reasons),
+        )
+
+    def _configuration_message(self, runtime_status: PortfolioSummaryRuntimeStatus) -> str:
+        reasons = list(runtime_status.blocking_reasons)
+        if not reasons:
+            return 'Portfolio summary runtime is not ready.'
+        if len(reasons) == 1:
+            return reasons[0]
+        return 'Portfolio summary runtime is not ready: ' + '; '.join(reasons)
+
+    def _configured_account_entries(self) -> list[str]:
         raw_value = self.portfolio_account_references
         if raw_value is None:
             raw_value = settings.portfolio_account_references
-        entries = [entry.strip() for entry in str(raw_value or '').split(',') if entry.strip()]
+        return [entry.strip() for entry in str(raw_value or '').split(',') if entry.strip()]
+
+    def _resolve_accounts(self) -> tuple[list[ConfiguredPortfolioAccount], str | None]:
+        entries = self._configured_account_entries()
         if not entries:
             return [], (
                 'No portfolio accounts are configured. Set PORTFOLIO_ACCOUNT_REFERENCES to one or more '

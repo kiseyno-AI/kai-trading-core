@@ -1,5 +1,6 @@
 import unittest
 
+from app.core.settings import settings
 from app.orders.account_inquiry_service import TradingAccountInquiryUpstreamError
 from app.orders.portfolio_summary_service import PortfolioSummaryService
 
@@ -46,6 +47,20 @@ class PortfolioSummaryServiceTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.inquiry_service = FakePortfolioInquiryService()
         self.order_service = FakePortfolioOrderService()
+        self.original_settings = {
+            'app_env': settings.app_env,
+            'kis_app_key': settings.kis_app_key,
+            'kis_app_secret': settings.kis_app_secret,
+            'kis_use_mock': settings.kis_use_mock,
+        }
+        settings.app_env = 'development'
+        settings.kis_app_key = 'test-kis-key'
+        settings.kis_app_secret = 'test-kis-secret'
+        settings.kis_use_mock = True
+
+    def tearDown(self) -> None:
+        for field_name, value in self.original_settings.items():
+            setattr(settings, field_name, value)
 
     async def test_portfolio_summary_normalizes_synced_account_payload(self) -> None:
         account_reference = 'KIS:12345678-01'
@@ -136,6 +151,39 @@ class PortfolioSummaryServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['sync']['status'], 'not_configured')
         self.assertEqual(result['accounts'], [])
         self.assertIn('PORTFOLIO_ACCOUNT_REFERENCES', result['notices'][0])
+
+    async def test_missing_kis_credentials_return_not_configured_before_upstream_calls(self) -> None:
+        settings.kis_app_key = ''
+        settings.kis_app_secret = ''
+        service = PortfolioSummaryService(
+            account_inquiry_service=self.inquiry_service,
+            order_service=self.order_service,
+            portfolio_account_references='Main=KIS:12345678-01',
+        )
+
+        result = await service.get_portfolio_summary()
+
+        self.assertEqual(result['sync']['status'], 'not_configured')
+        self.assertEqual(self.inquiry_service.summary_calls, [])
+        self.assertEqual(self.inquiry_service.positions_calls, [])
+        self.assertIn('KIS_APP_KEY', result['sync']['message'])
+        self.assertIn('KIS_APP_SECRET', result['sync']['message'])
+
+    def test_runtime_status_reports_production_mock_environment_as_not_ready(self) -> None:
+        settings.app_env = 'production'
+        settings.kis_use_mock = True
+        service = PortfolioSummaryService(
+            account_inquiry_service=self.inquiry_service,
+            order_service=self.order_service,
+            portfolio_account_references='Main=KIS:12345678-01',
+        )
+
+        result = service.runtime_status()
+
+        self.assertFalse(result['ready'])
+        self.assertEqual(result['kis_environment'], 'demo')
+        self.assertEqual(result['configured_account_count'], 1)
+        self.assertIn('KIS_USE_MOCK must be false in production', result['blocking_reasons'][0])
 
     async def test_partial_account_failures_mark_summary_stale_without_collapsing_to_not_configured(self) -> None:
         main_account = 'KIS:12345678-01'

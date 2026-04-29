@@ -67,3 +67,9 @@ GET /portfolio/summary
   ]
 }
 ```
+
+## Notes
+- `PORTFOLIO_ACCOUNT_REFERENCES` accepts `KIS:<account_number>-<product_code>` entries, with optional `Label=...` prefixes.
+- Production portfolio aggregation also requires `KIS_APP_KEY`, `KIS_APP_SECRET`, and `KIS_USE_MOCK=false`.
+- When the deployment is still missing portfolio configuration, the route returns `200` with `sync.status = "not_configured"` and explicit notices instead of pretending the portfolio is empty.
+- `GET /broker/kis/health` exposes `portfolio_summary_runtime` so operators can confirm readiness before relying on the full payload.
