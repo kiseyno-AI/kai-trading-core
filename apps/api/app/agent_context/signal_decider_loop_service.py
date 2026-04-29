@@ -67,6 +67,7 @@ SIGNAL_DECIDER_REPLAY_INSIGHT_TAXONOMY: dict[str, dict[str, Any]] = {
         'code': 'evaluation_pending',
         'label': 'Replay pending',
         'label_key': 'signal_decider.review.evaluation_pending',
+        'priority': 'medium',
         'decision_actions': list(SIGNAL_DECIDER_ACTIONS),
         'description': 'The requested replay horizon is not fully evaluated yet.',
         'outcome_tone': 'pending',
@@ -75,6 +76,7 @@ SIGNAL_DECIDER_REPLAY_INSIGHT_TAXONOMY: dict[str, dict[str, Any]] = {
         'code': 'buy_should_have_taken',
         'label': 'Buy held up',
         'label_key': 'signal_decider.review.buy_should_have_taken',
+        'priority': 'low',
         'decision_actions': ['buy'],
         'description': 'The buy decision kept a constructive replay path on the requested horizon.',
         'outcome_tone': 'positive',
@@ -83,6 +85,7 @@ SIGNAL_DECIDER_REPLAY_INSIGHT_TAXONOMY: dict[str, dict[str, Any]] = {
         'code': 'buy_stopped_out',
         'label': 'Buy stopped out',
         'label_key': 'signal_decider.review.buy_stopped_out',
+        'priority': 'high',
         'decision_actions': ['buy'],
         'description': 'The replay path would have touched the stop before resolving favorably.',
         'outcome_tone': 'negative',
@@ -91,6 +94,7 @@ SIGNAL_DECIDER_REPLAY_INSIGHT_TAXONOMY: dict[str, dict[str, Any]] = {
         'code': 'buy_no_edge',
         'label': 'Buy had no edge',
         'label_key': 'signal_decider.review.buy_no_edge',
+        'priority': 'medium',
         'decision_actions': ['buy'],
         'description': 'The buy decision finished without a convincing positive edge on the replay window.',
         'outcome_tone': 'negative',
@@ -99,6 +103,7 @@ SIGNAL_DECIDER_REPLAY_INSIGHT_TAXONOMY: dict[str, dict[str, Any]] = {
         'code': 'wait_correct',
         'label': 'Wait was correct',
         'label_key': 'signal_decider.review.wait_correct',
+        'priority': 'low',
         'decision_actions': ['wait'],
         'description': 'The replay path did not justify entering on the requested horizon.',
         'outcome_tone': 'positive',
@@ -107,6 +112,7 @@ SIGNAL_DECIDER_REPLAY_INSIGHT_TAXONOMY: dict[str, dict[str, Any]] = {
         'code': 'wait_missed_opportunity',
         'label': 'Wait missed opportunity',
         'label_key': 'signal_decider.review.wait_missed_opportunity',
+        'priority': 'high',
         'decision_actions': ['wait'],
         'description': 'The replay path later justified a buy, so waiting was too conservative.',
         'outcome_tone': 'negative',
@@ -115,6 +121,7 @@ SIGNAL_DECIDER_REPLAY_INSIGHT_TAXONOMY: dict[str, dict[str, Any]] = {
         'code': 'reject_correct',
         'label': 'Reject was correct',
         'label_key': 'signal_decider.review.reject_correct',
+        'priority': 'low',
         'decision_actions': ['reject'],
         'description': 'The rejected setup did not earn a later buy on the requested horizon.',
         'outcome_tone': 'positive',
@@ -123,6 +130,7 @@ SIGNAL_DECIDER_REPLAY_INSIGHT_TAXONOMY: dict[str, dict[str, Any]] = {
         'code': 'reject_too_conservative',
         'label': 'Reject was too conservative',
         'label_key': 'signal_decider.review.reject_too_conservative',
+        'priority': 'high',
         'decision_actions': ['reject'],
         'description': 'The rejected setup later showed a buyable replay path.',
         'outcome_tone': 'negative',
@@ -131,6 +139,7 @@ SIGNAL_DECIDER_REPLAY_INSIGHT_TAXONOMY: dict[str, dict[str, Any]] = {
         'code': 'ambiguous_target_stop_collision',
         'label': 'Ambiguous target/stop collision',
         'label_key': 'signal_decider.review.ambiguous_target_stop_collision',
+        'priority': 'high',
         'decision_actions': list(SIGNAL_DECIDER_ACTIONS),
         'description': 'Target and stop were both touchable on the same replay session, so the path is ambiguous.',
         'outcome_tone': 'ambiguous',
@@ -2152,6 +2161,8 @@ class SignalDeciderLoopService:
                 'symbol': detail_item['symbol'],
                 'review_status': detail_item['review']['status'],
                 'insight_code': detail_item['review']['insight']['code'],
+                'insight_priority': detail_item['review']['narrative']['insight_priority'],
+                'headline': detail_item['review']['narrative']['headline'],
                 'primary_path_marker': detail_item['review']['path_analysis']['path_marker'],
             },
             'item': detail_item,
@@ -3390,6 +3401,26 @@ class SignalDeciderLoopService:
             'version': SIGNAL_DECIDER_REPLAY_REVIEW_VERSION,
             'default_horizons': list(DEFAULT_SIGNAL_DECIDER_REVIEW_HORIZONS),
             'default_primary_horizon_days': DEFAULT_SIGNAL_DECIDER_REVIEW_PRIMARY_HORIZON,
+            'priority_levels': [
+                {
+                    'code': 'high',
+                    'label': 'High',
+                    'label_key': 'signal_decider.review.priority.high',
+                    'description': 'Needs prominent review because the replay was negative or ambiguous.',
+                },
+                {
+                    'code': 'medium',
+                    'label': 'Medium',
+                    'label_key': 'signal_decider.review.priority.medium',
+                    'description': 'Useful review signal, but not the most urgent replay outcome.',
+                },
+                {
+                    'code': 'low',
+                    'label': 'Low',
+                    'label_key': 'signal_decider.review.priority.low',
+                    'description': 'Replay mostly confirmed the original call.',
+                },
+            ],
             'insights': [dict(SIGNAL_DECIDER_REPLAY_INSIGHT_TAXONOMY[key]) for key in SIGNAL_DECIDER_REPLAY_INSIGHT_TAXONOMY],
             'path_markers': [
                 {
@@ -3567,12 +3598,14 @@ class SignalDeciderLoopService:
             'evaluation_version': evaluation_version,
             'insight': {
                 'code': insight['code'],
+                'priority': insight['priority'],
                 'label': insight['label'],
                 'label_key': insight['label_key'],
                 'description': insight['description'],
                 'outcome_tone': insight['outcome_tone'],
             },
             'narrative': insight['narrative'],
+            'narrative_text': insight['narrative']['summary_text'],
             'path_analysis': primary_horizon['path_analysis'],
             'rule_evaluation': insight['rule_basis'],
             'horizons': horizon_items,
@@ -3956,6 +3989,8 @@ class SignalDeciderLoopService:
         template = dict(SIGNAL_DECIDER_REPLAY_INSIGHT_TAXONOMY[code])
         narrative = self._build_review_narrative(
             code=code,
+            decision_action=normalized_decision_action,
+            evaluation=evaluation,
             path_analysis=path_analysis,
             primary_horizon_days=primary_horizon_days,
         )
@@ -3974,6 +4009,11 @@ class SignalDeciderLoopService:
                 'trigger_sequence': trigger_sequence,
                 'thresholds_configured': thresholds_configured,
                 'review_rule': code,
+                'generated_reason_codes': [
+                    str(reason.get('code'))
+                    for reason in list(narrative.get('supporting_reasons') or [])
+                    if reason.get('code')
+                ],
             },
         }
 
@@ -3981,51 +4021,228 @@ class SignalDeciderLoopService:
         self,
         *,
         code: str,
+        decision_action: str,
+        evaluation: dict[str, Any] | None,
         path_analysis: dict[str, Any],
         primary_horizon_days: int,
-    ) -> str:
-        path_explanation = str(path_analysis.get('path_explanation') or '').strip()
-        if code == 'evaluation_pending':
-            return f'The {primary_horizon_days}-day replay window is still pending, so the review insight is not final.'
-        if code == 'ambiguous_target_stop_collision':
-            return (
-                f'The {primary_horizon_days}-day replay window produced a same-session target/stop collision. '
-                f'{path_explanation}'
-            )
-        if code == 'buy_should_have_taken':
-            return (
-                f'The buy setup held up on the {primary_horizon_days}-day replay window. '
-                f'{path_explanation}'
-            )
-        if code == 'buy_stopped_out':
-            return (
-                f'The buy setup would have been stopped before resolving cleanly on the '
-                f'{primary_horizon_days}-day replay window. {path_explanation}'
-            )
-        if code == 'buy_no_edge':
-            return (
-                f'The buy setup never produced a convincing positive edge on the '
-                f'{primary_horizon_days}-day replay window. {path_explanation}'
-            )
-        if code == 'wait_correct':
-            return (
-                f'Waiting was defensible on the {primary_horizon_days}-day replay window. '
-                f'{path_explanation}'
-            )
-        if code == 'wait_missed_opportunity':
-            return (
-                f'The wait call was too conservative on the {primary_horizon_days}-day replay window. '
-                f'{path_explanation}'
-            )
-        if code == 'reject_correct':
-            return (
-                f'The reject call avoided a weak or adverse setup on the '
-                f'{primary_horizon_days}-day replay window. {path_explanation}'
-            )
-        return (
-            f'The reject call looks too conservative on the {primary_horizon_days}-day replay window. '
-            f'{path_explanation}'
+    ) -> dict[str, Any]:
+        headline = self._build_review_headline(
+            code=code,
+            primary_horizon_days=primary_horizon_days,
         )
+        supporting_reasons = self._build_review_supporting_reasons(
+            code=code,
+            evaluation=evaluation,
+            path_analysis=path_analysis,
+            primary_horizon_days=primary_horizon_days,
+        )
+        counterfactual_summary = self._build_review_counterfactual_summary(
+            decision_action=decision_action,
+            evaluation=evaluation,
+            primary_horizon_days=primary_horizon_days,
+        )
+        summary_parts = [headline]
+        if supporting_reasons:
+            summary_parts.append(' '.join(str(reason.get('message') or '').strip() for reason in supporting_reasons))
+        if counterfactual_summary:
+            summary_parts.append(str(counterfactual_summary.get('summary') or '').strip())
+        summary_text = ' '.join(part for part in summary_parts if part).strip()
+        return {
+            'version': SIGNAL_DECIDER_REPLAY_REVIEW_VERSION,
+            'insight_code': code,
+            'insight_priority': str(SIGNAL_DECIDER_REPLAY_INSIGHT_TAXONOMY[code]['priority']),
+            'headline': headline,
+            'headline_key': f'signal_decider.review.headline.{code}',
+            'supporting_reasons': supporting_reasons,
+            'counterfactual_summary': counterfactual_summary,
+            'summary_text': summary_text,
+        }
+
+    def _build_review_headline(
+        self,
+        *,
+        code: str,
+        primary_horizon_days: int,
+    ) -> str:
+        if code == 'evaluation_pending':
+            return f'Replay review is pending for the {primary_horizon_days}-day window.'
+        if code == 'ambiguous_target_stop_collision':
+            return 'Replay path is operationally ambiguous.'
+        if code == 'buy_should_have_taken':
+            return 'Buy held up on replay.'
+        if code == 'buy_stopped_out':
+            return 'Buy would have stopped out first.'
+        if code == 'buy_no_edge':
+            return 'Buy failed to show enough edge.'
+        if code == 'wait_correct':
+            return 'Wait was justified on replay.'
+        if code == 'wait_missed_opportunity':
+            return 'Wait missed a buyable move.'
+        if code == 'reject_correct':
+            return 'Reject avoided a weak setup.'
+        return 'Reject was too conservative on replay.'
+
+    def _build_review_supporting_reasons(
+        self,
+        *,
+        code: str,
+        evaluation: dict[str, Any] | None,
+        path_analysis: dict[str, Any],
+        primary_horizon_days: int,
+    ) -> list[dict[str, Any]]:
+        reasons: list[dict[str, Any]] = []
+        path_marker = str(path_analysis.get('path_marker') or 'pending')
+        trigger_sequence = str(path_analysis.get('trigger_sequence') or 'pending')
+        thresholds_configured = bool(path_analysis.get('thresholds_configured'))
+        returns = _maybe_dict(path_analysis.get('returns'))
+        close_return_pct = _to_float(returns.get('close_return_pct'))
+        evaluation_status = str((evaluation or {}).get('evaluation_status') or 'missing')
+        evaluation_diagnostics = _maybe_dict((evaluation or {}).get('diagnostics'))
+        severe_drawdown_before_target = bool(evaluation_diagnostics.get('severe_drawdown_before_target'))
+
+        if evaluation_status != 'graded' or path_marker == 'pending':
+            reasons.append(
+                self._review_reason(
+                    code='pending_horizon_data',
+                    message=(
+                        f'The requested {primary_horizon_days}-day replay window is not fully observed yet, '
+                        'so the review remains provisional.'
+                    ),
+                )
+            )
+            return reasons
+
+        if path_marker == 'collision':
+            reasons.append(
+                self._review_reason(
+                    code='target_stop_collision_same_session',
+                    message='Target and stop were both touchable on the same observed session.',
+                )
+            )
+        elif path_marker == 'target_hit':
+            if trigger_sequence == 'target_before_stop':
+                reasons.append(
+                    self._review_reason(
+                        code='target_hit_before_stop',
+                        message='Target was touched before the stop-loss on the observed path.',
+                    )
+                )
+            elif trigger_sequence == 'target_only':
+                reasons.append(
+                    self._review_reason(
+                        code='target_hit_without_stop',
+                        message='Target was touched and the stop-loss was never touched inside the review window.',
+                    )
+                )
+            else:
+                reasons.append(
+                    self._review_reason(
+                        code='target_hit_path',
+                        message='Target was touched inside the replay window.',
+                    )
+                )
+        elif path_marker == 'stop_hit':
+            if trigger_sequence == 'stop_before_target':
+                reasons.append(
+                    self._review_reason(
+                        code='stop_hit_before_target',
+                        message='Stop-loss was touched before the target on the observed path.',
+                    )
+                )
+            elif trigger_sequence == 'stop_only':
+                reasons.append(
+                    self._review_reason(
+                        code='stop_hit_without_target',
+                        message='Stop-loss was touched and the target was never touched inside the review window.',
+                    )
+                )
+            else:
+                reasons.append(
+                    self._review_reason(
+                        code='stop_hit_path',
+                        message='Stop-loss was touched inside the replay window.',
+                    )
+                )
+        elif thresholds_configured:
+            if close_return_pct is not None and close_return_pct > 0:
+                reasons.append(
+                    self._review_reason(
+                        code='no_threshold_hit_positive_close',
+                        message='Neither threshold was hit, but the replay window still ended above the entry.',
+                    )
+                )
+            elif close_return_pct is not None and close_return_pct < 0:
+                reasons.append(
+                    self._review_reason(
+                        code='no_threshold_hit_negative_close',
+                        message='Neither threshold was hit, but the replay window still ended below the entry.',
+                    )
+                )
+            else:
+                reasons.append(
+                    self._review_reason(
+                        code='no_threshold_hit_flat_close',
+                        message='Neither threshold was hit and the replay window ended roughly flat versus the entry.',
+                    )
+                )
+        else:
+            reasons.append(
+                self._review_reason(
+                    code='thresholds_not_fully_configured',
+                    message='Target and stop thresholds were not both configured, so the replay falls back to return-based grading.',
+                )
+            )
+
+        if severe_drawdown_before_target and code == 'buy_stopped_out':
+            reasons.append(
+                self._review_reason(
+                    code='severe_drawdown_before_target',
+                    message='Drawdown breached the severe-loss guardrail before any clean target resolution.',
+                )
+            )
+        return reasons
+
+    def _build_review_counterfactual_summary(
+        self,
+        *,
+        decision_action: str,
+        evaluation: dict[str, Any] | None,
+        primary_horizon_days: int,
+    ) -> dict[str, Any] | None:
+        raw_counterfactual_action = _normalize_optional_text(
+            str((evaluation or {}).get('counterfactual_action'))
+            if (evaluation or {}).get('counterfactual_action') is not None
+            else None
+        )
+        if raw_counterfactual_action is None:
+            return None
+        counterfactual_action = _normalize_action(raw_counterfactual_action)
+        missed_opportunity = bool((evaluation or {}).get('missed_opportunity'))
+        if not missed_opportunity or counterfactual_action == decision_action:
+            return None
+        if counterfactual_action == 'buy':
+            summary = f'A counterfactual buy would have looked justified on the {primary_horizon_days}-day replay window.'
+        elif counterfactual_action == 'wait':
+            summary = f'A counterfactual wait would have looked safer on the {primary_horizon_days}-day replay window.'
+        else:
+            summary = f'A counterfactual reject would have looked safer on the {primary_horizon_days}-day replay window.'
+        return {
+            'action': counterfactual_action,
+            'summary': summary,
+            'summary_key': f'signal_decider.review.counterfactual.{counterfactual_action}',
+        }
+
+    def _review_reason(
+        self,
+        *,
+        code: str,
+        message: str,
+    ) -> dict[str, str]:
+        return {
+            'code': code,
+            'message': message,
+            'message_key': f'signal_decider.review.reason.{code}',
+        }
 
     def _load_future_price_bars(
         self,
