@@ -976,6 +976,19 @@ class AgentContextRouteTests(unittest.TestCase):
         self.assertEqual(response.json()['summary']['day_count'], 1)
         self.assertEqual(response.json()['items'][0]['scorecard']['target_hit_count'], 1)
 
+    def test_signal_decider_review_calendar_route_maps_zero_primary_horizon_to_400(self):
+        client = TestClient(self.app)
+        response = client.get(
+            '/agent-context/signal-decider/calendar',
+            params=[
+                ('month', '2026-04'),
+                ('primary_horizon_days', '0'),
+            ],
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()['detail'], 'primary_horizon_days must be drawn from [1, 3, 5, 10]')
+
     def test_signal_decider_review_date_route_calls_service(self):
         fake_service = FakeSignalDeciderLoopService()
         original_service = routes_agent_context.signal_decider_loop_service

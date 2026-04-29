@@ -244,7 +244,9 @@ def _resolve_review_horizons(
     *,
     primary_horizon_days: int | None = None,
 ) -> tuple[list[int], int]:
-    normalized_primary = int(primary_horizon_days or DEFAULT_SIGNAL_DECIDER_REVIEW_PRIMARY_HORIZON)
+    normalized_primary = (
+        DEFAULT_SIGNAL_DECIDER_REVIEW_PRIMARY_HORIZON if primary_horizon_days is None else int(primary_horizon_days)
+    )
     if normalized_primary not in SIGNAL_DECIDER_EVALUATION_HORIZONS:
         raise ValueError(
             f'primary_horizon_days must be drawn from {list(SIGNAL_DECIDER_EVALUATION_HORIZONS)}'

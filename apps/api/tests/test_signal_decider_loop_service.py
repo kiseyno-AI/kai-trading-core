@@ -981,6 +981,18 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
         self.assertEqual(day_items['2026-04-29']['evaluation_coverage']['status'], 'pending')
         self.assertEqual(day_items['2026-04-29']['scorecard']['pending_count'], 1)
 
+    def test_get_review_calendar_rejects_zero_primary_horizon(self):
+        repository = FakeSignalDeciderLoopRepository([])
+        service = SignalDeciderLoopService(repository=repository)
+
+        with self.assertRaisesRegex(
+            ValueError,
+            r'primary_horizon_days must be drawn from \[1, 3, 5, 10\]',
+        ):
+            service.get_review_calendar(month='2026-04', primary_horizon_days=0)
+
+        self.assertEqual(repository.list_decision_snapshots_calls, [])
+
     def test_get_review_date_returns_replay_summaries_with_stable_insights(self):
         repository = FakeSignalDeciderLoopRepository(
             [
