@@ -72,6 +72,7 @@ from app.agent_context.run_state_service import agent_context_feedback_run_state
 from app.agent_context.response_contract import build_contract_prompt_suffix, normalize_agent_response
 from app.agent_context.reuse_service import agent_context_reuse_service
 from app.agent_context.session_cleanup_service import SessionCleanupTarget, agent_feedback_session_cleanup_service
+from app.agent_context.signal_decider_market_context import signal_decider_market_context_builder
 from app.agent_context.signal_decider_loop_service import signal_decider_loop_service
 from app.core.settings import settings
 from app.db import session_scope
@@ -1433,6 +1434,7 @@ class AgentFeedbackOrchestrator:
         item: dict[str, Any],
         market_date: date,
         request_run_id: str,
+        market_context: dict[str, Any] | None,
         upstream_summaries: dict[str, dict[str, Any]],
         upstream_traceability: dict[str, dict[str, Any]],
         signal_decider_policy: dict[str, Any] | None = None,
@@ -1441,6 +1443,7 @@ class AgentFeedbackOrchestrator:
             item=item,
             market_date=market_date,
             request_run_id=request_run_id,
+            market_context=market_context,
             upstream_summaries=upstream_summaries,
             upstream_traceability=upstream_traceability,
             signal_decider_agent_name=SIGNAL_DECIDER_AGENT_NAME,
@@ -1463,6 +1466,7 @@ class AgentFeedbackOrchestrator:
     ) -> list[dict[str, Any]]:
         buffered_lookup = {}
         active_signal_decider_policy = None
+        market_context = None
         if role == SIGNAL_DECIDER_AGENT_NAME:
             snapshot = runtime_feedback_state_store.get_run(market_date, run_id=request_run_id) or RuntimeFeedbackRunState(
                 run_id=request_run_id,
@@ -1524,11 +1528,14 @@ class AgentFeedbackOrchestrator:
                     dependency_policy=dependency_context['dependency_policy'],
                 )
                 continue
+            if market_context is None:
+                market_context = signal_decider_market_context_builder.build(market_date=market_date)
             dispatch_items.append(
                 self._build_signal_decider_payload(
                     item=item,
                     market_date=market_date,
                     request_run_id=request_run_id,
+                    market_context=market_context,
                     upstream_summaries=upstream_summaries,
                     upstream_traceability=upstream_traceability,
                     signal_decider_policy=active_signal_decider_policy,

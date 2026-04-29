@@ -646,6 +646,7 @@ def build_signal_decider_payload(
     item: dict[str, Any],
     market_date: date,
     request_run_id: str,
+    market_context: dict[str, Any] | None,
     upstream_summaries: dict[str, dict[str, Any]],
     upstream_traceability: dict[str, dict[str, Any]],
     signal_decider_agent_name: str,
@@ -665,6 +666,7 @@ def build_signal_decider_payload(
         'market_date': market_date.isoformat(),
         'symbol_day_context': symbol_day_context,
         'scores': jsonable_encoder(score_context),
+        'market_context': jsonable_encoder(market_context or {}),
         'upstream_summaries': jsonable_encoder(upstream_summaries),
         'upstream_traceability': jsonable_encoder(upstream_traceability),
         'decision_support_constraints': {
