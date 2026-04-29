@@ -521,6 +521,75 @@ def extract_json_object(text: str | None) -> str | None:
     return None
 
 
+def repair_json_tail(text: str | None) -> str | None:
+    if not text:
+        return None
+    normalized = text.strip()
+    if not normalized:
+        return None
+    try:
+        json.loads(normalized)
+        return normalized
+    except json.JSONDecodeError as exc:
+        tail_threshold = max(len(normalized) - 64, int(len(normalized) * 0.9))
+        if exc.pos < tail_threshold:
+            return None
+
+    repaired_chars: list[str] = []
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+    altered = False
+
+    for char in normalized:
+        if in_string:
+            repaired_chars.append(char)
+            if escaped:
+                escaped = False
+            elif char == '\\':
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+            repaired_chars.append(char)
+            continue
+
+        if char == '{':
+            stack.append('}')
+            repaired_chars.append(char)
+            continue
+        if char == '[':
+            stack.append(']')
+            repaired_chars.append(char)
+            continue
+        if char in {'}', ']'}:
+            if stack and char == stack[-1]:
+                stack.pop()
+                repaired_chars.append(char)
+                continue
+            altered = True
+            continue
+
+        repaired_chars.append(char)
+
+    if stack:
+        altered = True
+        repaired_chars.extend(reversed(stack))
+
+    if not altered:
+        return None
+
+    candidate = ''.join(repaired_chars)
+    try:
+        json.loads(candidate)
+    except json.JSONDecodeError:
+        return None
+    return candidate
+
+
 def build_upstream_feedback_bundle(
     *,
     symbol: str,
