@@ -34,6 +34,7 @@ from app.agent_context.orchestrator_helpers import (
     correlate_decoded_batch_response as _correlate_decoded_batch_response,
     extract_json_object as _extract_json_object,
     extract_response_mismatch_flags as _extract_response_mismatch_flags,
+    repair_json_tail as _repair_json_tail,
     failure_log_fields as _failure_log_fields,
     feedback_row_lookup as _feedback_row_lookup,
     feedback_session_key as _feedback_session_key,
@@ -248,11 +249,20 @@ class OpenClawAgentClient:
     def _decode_candidate_json(candidate_text: str | None) -> tuple[dict[str, Any] | None, str | None]:
         normalized_text = _extract_json_object(candidate_text)
         if not normalized_text:
-            return None, 'json_object_not_found'
+            repaired_raw_text = _repair_json_tail(candidate_text)
+            if not repaired_raw_text:
+                return None, 'json_object_not_found'
+            normalized_text = repaired_raw_text
         try:
             candidate_decoded = json.loads(normalized_text)
         except json.JSONDecodeError:
-            return None, 'json_decode_error'
+            repaired_text = _repair_json_tail(normalized_text)
+            if not repaired_text:
+                return None, 'json_decode_error'
+            try:
+                candidate_decoded = json.loads(repaired_text)
+            except json.JSONDecodeError:
+                return None, 'json_decode_error'
         if isinstance(candidate_decoded, list):
             return {'items': candidate_decoded}, None
         if isinstance(candidate_decoded, dict):
@@ -576,6 +586,7 @@ class OpenClawAgentClient:
                 "- Every signal-decider item must include explicit target_price and stop_loss_price values; do not leave them unspecified unless the payload makes a justified level impossible, and in that rare case explain the limitation in data_quality_warnings.\n"
                 "- If context is weak, missing, conflicting, or truncated, emit a complete conservative wait or reject item instead of prose, placeholders, omissions, or malformed JSON.\n"
                 "- Self-check before final answer: JSON parses; top-level object has items; item count matches assigned symbols; assigned symbols are exact and unique; no assigned symbol is missing; no unexpected symbol appears; required feedback fields exist.\n"
+                "- Immediately before sending, validate the final raw JSON text again and fix any extra or missing closing braces/brackets so the response begins with {, ends with }, and parses successfully with no trailing prose.\n"
             )
 
         if spec.role == SIGNAL_DECIDER_AGENT_NAME:
@@ -658,6 +669,7 @@ class OpenClawAgentClient:
             "Do not output tool_code, python, print(...), json.dumps(...), markdown fences, code blocks, intent tags, analysis, reasoning, or explanatory prose.\n"
             "Do not prepend labels like [intent:...], do not wrap JSON in tags, and do not add any text before or after the JSON.\n"
             "Do not restate the request, do not describe what you will do, and do not explain the schema. Output the final JSON only.\n"
+            "Immediately before sending, re-check the final JSON formatting one last time. If any closing brace/bracket count is wrong, fix it before answering.\n"
             "Your final answer must be a raw JSON object only, beginning with { and ending with }.\n"
             f"{build_contract_prompt_suffix(role=spec.role)}\n"
             f"JSON example:\n{json.dumps(example, ensure_ascii=False)}\n\n"
@@ -679,6 +691,7 @@ class OpenClawAgentClient:
                 "item.symbol must exactly match an assigned symbol string.\n"
                 f"{signal_decider_batch_rules}"
                 "No tool_code, no print(json.dumps(...)), no markdown fences, no intent tags, no prose, no request restatement, raw JSON object only.\n"
+                "Immediately before sending, re-check the final JSON formatting one last time and fix any extra or missing closing braces/brackets.\n"
                 "All operator-facing natural-language fields inside the JSON must be written in Korean.\n"
                 "For signal-decider outputs, provide explicit target_price and stop_loss_price levels for each symbol whenever possible; if a level is genuinely not supportable, keep the key and explain the limitation in data_quality_warnings.\n"
                 f"{build_contract_prompt_suffix(role=spec.role)}\n"

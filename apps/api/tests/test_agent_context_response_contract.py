@@ -14,6 +14,7 @@ class AgentContextResponseContractTests(unittest.TestCase):
         self.assertIn('wait or reject', suffix)
         self.assertIn('self-check', suffix)
         self.assertIn('JSON is parseable', suffix)
+        self.assertIn('Immediately before sending, validate the final raw JSON text again', suffix)
         self.assertIn('Operator-facing free-text fields must be written in Korean', suffix)
         self.assertIn(
             'Do not translate or localize machine-readable enum fields such as preferred_action, next_day_open_action, or entry_price_basis.',

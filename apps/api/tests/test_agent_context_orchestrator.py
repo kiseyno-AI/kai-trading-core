@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 from app.agent_context import orchestrator as orchestrator_module
 from app.agent_context.orchestrator import AgentFeedbackOrchestrator, OpenClawAgentClient
-from app.agent_context.orchestrator_helpers import correlate_decoded_batch_response
+from app.agent_context.orchestrator_helpers import correlate_decoded_batch_response, repair_json_tail
 from app.agent_context.runtime_state import RuntimeFeedbackRunState, RuntimeFeedbackStateStore
 
 
@@ -41,6 +41,28 @@ def _batch_result(symbol: str) -> dict:
         'completed_at': '2026-04-14T01:01:00+00:00',
         'session_ref': {'session_key': 'feedback/eod-summarizer/slot-01'},
     }
+
+
+class RepairJsonTailTests(unittest.TestCase):
+    def test_repair_json_tail_drops_extra_closing_brace_before_items_close(self):
+        malformed = '{"items":[{"symbol":"014190","feedback":{"summary":"ok","details":{},"improvement_notes":[]}}}]}'
+        repaired = repair_json_tail(malformed)
+        self.assertIsNotNone(repaired)
+        parsed = json.loads(repaired)
+        self.assertEqual(parsed['items'][0]['symbol'], '014190')
+
+    def test_decode_candidate_json_recovers_tail_mismatch(self):
+        malformed = '{"items":[{"symbol":"014190","feedback":{"role":"signal-decider","summary":"ok","confidence":0.6,"risk_flags":[],"details":{},"improvement_notes":[]}}}]}'
+        client = OpenClawAgentClient()
+        decoded, failure = client._decode_candidate_json(malformed)
+        self.assertIsNone(failure)
+        self.assertIsNotNone(decoded)
+        self.assertEqual(decoded['items'][0]['symbol'], '014190')
+
+    def test_repair_json_tail_does_not_hide_mid_object_syntax_errors(self):
+        malformed = '{"items":[{"symbol":"014190" "feedback":{}}]}'
+        repaired = repair_json_tail(malformed)
+        self.assertIsNone(repaired)
 
 
 class FakeFuture:
@@ -514,10 +536,12 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertIn('Every item.symbol is mandatory and must exactly match one assigned symbol string', message)
         self.assertIn('Every feedback.symbol and feedback.traceability.symbol is mandatory', message)
         self.assertIn('Self-check before final answer', message)
+        self.assertIn('Immediately before sending, validate the final raw JSON text again', message)
         self.assertIn('no assigned symbol is missing', message)
         self.assertIn('Assigned symbols (exact authoritative strings): ["005930"]', one_symbol_message)
         self.assertIn('output exactly 1 item(s)', one_symbol_message)
         self.assertIn('One-symbol requests still require the same batch envelope with exactly one item', one_symbol_message)
+        self.assertIn('Immediately before sending, re-check the final JSON formatting one last time', one_symbol_message)
 
     def test_signal_decider_prompt_trim_final_fallback_uses_one_item_rules(self):
         fake_settings = SimpleNamespace(

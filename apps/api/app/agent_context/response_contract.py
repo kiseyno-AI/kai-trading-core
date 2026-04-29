@@ -251,7 +251,8 @@ def build_contract_prompt_suffix(*, role: str | None = None) -> str:
             'risk_flags, and improvement_notes must be arrays of short Korean strings. '
             'details must be an object with structured decision-support fields and traceability. '
             'If evidence is missing, weak, conflicting, or truncated, still return a complete structured conservative feedback object with wait or reject, null unsupported numeric fields, and explicit risk/data-quality warnings. '
-            'Before finalizing, self-check that the JSON is parseable, all required keys are present, role and agent_name are correct, symbol and traceability.symbol exactly match the assigned symbol, operator-facing free-text fields are in Korean, and arrays are arrays of strings.'
+            'Before finalizing, self-check that the JSON is parseable, all required keys are present, role and agent_name are correct, symbol and traceability.symbol exactly match the assigned symbol, operator-facing free-text fields are in Korean, and arrays are arrays of strings. '
+            'Immediately before sending, validate the final raw JSON text again and correct any extra or missing closing braces/brackets so it begins with {, ends with }, and parses successfully.'
         )
     return (
         'Return JSON only. Do not wrap in markdown. '
