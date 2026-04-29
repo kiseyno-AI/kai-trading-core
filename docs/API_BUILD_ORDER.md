@@ -40,6 +40,7 @@
 37. Signal-decider intraday auto-sell diagnostics and runtime submit routes
 38. Signal-decider actual execution outcome reporting routes
 39. Signal-decider replay review calendar routes
+40. Core-owned exec runtime dashboard read APIs
 
 ## Current routes
 - `POST /broker/kis/token`
@@ -60,6 +61,10 @@
 - `GET /trading/orders/realtime-health`
 - `GET /trading/orders/exec/runtime?refresh=true`
 - `GET /trading/orders/exec/signal-decider?target_trade_date=YYYY-MM-DD&account_reference=KIS:12345678-01&symbol=005930&refresh=false`
+- `GET /execution/runtime/status?refresh=true`
+- `GET /execution/runtime/monitored-symbols?market_date=YYYY-MM-DD&refresh=true`
+- `GET /execution/runtime/daily-board?market_date=YYYY-MM-DD&refresh=true`
+- `GET /execution/runtime/symbols/005930?market_date=YYYY-MM-DD&refresh=true`
 - `GET /trading/orders/next-open-execution?target_trade_date=YYYY-MM-DD&refresh=false`
 - `POST /trading/orders/next-open-execution/run-if-due`
 - `GET /trading/orders/intraday-auto-sell?account_reference=KIS:12345678-01&symbol=005930&refresh=false`
@@ -206,6 +211,10 @@
 - `GET /trading/orders/exec/runtime` is the explicit operator read for exec readiness. It surfaces `disabled`, `not_configured`, `unavailable`, and `contract_error` states directly so operators can tell configuration failure apart from transient runtime failure.
 - `GET /trading/orders/exec/signal-decider` is the core-owned aggregated read model over persisted next-open plan rows plus exec runtime/order/execution/position readback. `refresh=true` calls the exec northbound APIs, persists the latest matched readback snapshot onto the durable next-open plan rows, and returns planned-vs-actual operator items without requiring web clients to query exec directly.
 - In dispatch mode the background runner pre-dispatches eligible next-open plans to exec during `PREOPEN`, then refreshes the core-owned exec read model during `OPEN` instead of submitting local next-open or intraday auto-sell orders from core. This avoids duplicate live actions while preserving explicit operator visibility in core.
+- `GET /execution/runtime/status` is the dashboard-facing runtime summary over exec. It reshapes the current exec runtime payload into concise UI states such as `ready`, `degraded`, `offline`, `paused`, and `kill_switched`, while keeping pause or kill-switch and liveness issues explicit instead of leaking transport failures as opaque 500s.
+- `GET /execution/runtime/monitored-symbols` is the symbol-level monitored-watch view for dashboard cards. It groups the same-day core-owned exec board by symbol and exposes normalized monitoring states such as `watching_fill`, `watching_target_stop`, `reconciling`, and `idle`.
+- `GET /execution/runtime/daily-board` is the same-day execution board for the web/dashboard. It combines persisted core planning rows with exec readback truth and normalizes each row into `planned`, `accepted`, `scheduled`, `submitted`, `partial`, `filled`, `cancelled`, or `failed`.
+- `GET /execution/runtime/symbols/{symbol}` is the per-symbol execution detail read for dashboard/operator pages. It preserves the normalized board status, adds account-scoped dispatch/readback detail and planning context, and keeps degraded or offline exec runtime state explicit without requiring the web to call exec directly.
 
 ## Trading account inquiry notes
 - `GET /portfolio/summary` is the aggregate portfolio read for the dashboard and portfolio cards. It resolves the deployment-configured account list from `PORTFOLIO_ACCOUNT_REFERENCES`, reuses the KIS-backed account-summary and positions inquiries per account, and returns the web `PortfolioSummaryDto`-style shape with `accounts`, `holdings`, `allocation`, `recentActivity`, `sync`, and `notices`.

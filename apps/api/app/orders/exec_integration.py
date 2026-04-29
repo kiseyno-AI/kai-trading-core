@@ -25,6 +25,7 @@ from app.orders.next_open_execution import (
     EXECUTION_WINDOW_NEXT_OPEN,
     signal_decider_next_open_execution_service,
 )
+from app.repositories.symbol_repository import load_symbols
 
 INTEGRATION_MODE_DISABLED = 'disabled'
 INTEGRATION_MODE_OBSERVE = 'observe'
@@ -71,6 +72,30 @@ REMOTE_ACTIVE_STATUSES = {
     'working',
 }
 REMOTE_FAILED_STATUSES = {'canceled', 'cancelled', 'failed', 'rejected'}
+REMOTE_SCHEDULED_STATUSES = {'accepted', 'created', 'pending', 'queued'}
+REMOTE_SUBMITTED_STATUSES = {'open', 'running', 'submitted', 'working'}
+REMOTE_PARTIAL_STATUSES = {'partial', 'partial_fill', 'partially_filled'}
+REMOTE_CANCELLED_STATUSES = {'canceled', 'cancelled'}
+
+UI_RUNTIME_STATUS_READY = 'ready'
+UI_RUNTIME_STATUS_DEGRADED = 'degraded'
+UI_RUNTIME_STATUS_OFFLINE = 'offline'
+UI_RUNTIME_STATUS_PAUSED = 'paused'
+UI_RUNTIME_STATUS_KILL_SWITCHED = 'kill_switched'
+
+UI_BOARD_STATUS_PLANNED = 'planned'
+UI_BOARD_STATUS_ACCEPTED = 'accepted'
+UI_BOARD_STATUS_SCHEDULED = 'scheduled'
+UI_BOARD_STATUS_SUBMITTED = 'submitted'
+UI_BOARD_STATUS_PARTIAL = 'partial'
+UI_BOARD_STATUS_FILLED = 'filled'
+UI_BOARD_STATUS_CANCELLED = 'cancelled'
+UI_BOARD_STATUS_FAILED = 'failed'
+
+UI_MONITORING_STATE_WATCHING_TARGET_STOP = 'watching_target_stop'
+UI_MONITORING_STATE_WATCHING_FILL = 'watching_fill'
+UI_MONITORING_STATE_RECONCILING = 'reconciling'
+UI_MONITORING_STATE_IDLE = 'idle'
 
 
 def _utcnow() -> datetime:
@@ -198,6 +223,56 @@ def _fingerprint_exec_plan(payload: dict[str, Any]) -> str:
 def _normalize_status(value: Any) -> str | None:
     normalized = _normalize_optional_text(value, lowercase=True)
     return normalized.replace(' ', '_') if normalized else None
+
+
+def _coalesce_text(*values: Any, lowercase: bool = False) -> str | None:
+    for value in values:
+        normalized = _normalize_optional_text(value, lowercase=lowercase)
+        if normalized:
+            return normalized
+    return None
+
+
+def _normalize_bool(value: Any) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {'1', 'true', 'yes', 'y', 'on'}:
+        return True
+    if normalized in {'0', 'false', 'no', 'n', 'off'}:
+        return False
+    return None
+
+
+def _parse_iso_datetime(value: Any) -> datetime | None:
+    text = _normalize_optional_text(value)
+    if not text:
+        return None
+    normalized = text[:-1] + '+00:00' if text.endswith('Z') else text
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _latest_iso_timestamp(values: Iterable[Any]) -> str | None:
+    latest: datetime | None = None
+    for value in values:
+        parsed = _parse_iso_datetime(value)
+        if parsed is None:
+            continue
+        if latest is None or parsed > latest:
+            latest = parsed
+    return latest.isoformat() if latest is not None else None
+
+
+def _serialize_issue(code: str, message: str, *, retryable: bool = False, status_code: int | None = None) -> dict[str, Any]:
+    return _serialize_error(code=code, message=message, retryable=retryable, status_code=status_code)
 
 
 class SignalDeciderExecClientError(RuntimeError):
@@ -741,6 +816,169 @@ class SignalDeciderExecIntegrationService:
             'integration': overview['integration'],
             'runtime': overview['runtime'],
             'summary': summary,
+            'items': items,
+        }
+
+    async def dashboard_runtime_status(self, *, refresh: bool = True) -> dict[str, Any]:
+        runtime_result = await self.runtime_status(refresh=refresh)
+        return self._build_dashboard_runtime_status(
+            integration=runtime_result['integration'],
+            runtime=runtime_result['runtime'],
+        )
+
+    async def get_runtime_daily_board(
+        self,
+        *,
+        market_date: str | date | None = None,
+        refresh: bool = True,
+        trigger: str = 'manual',
+    ) -> dict[str, Any]:
+        resolved_market_date = _normalize_date(market_date)
+        overview = await self._load_dashboard_overview(
+            target_trade_date=resolved_market_date,
+            account_reference=None,
+            symbol=None,
+            refresh=refresh,
+            trigger=trigger,
+        )
+        symbol_metadata_map = self._load_symbol_metadata_map(item.get('symbol') for item in overview['items'])
+        runtime = self._build_dashboard_runtime_status(
+            integration=overview['integration'],
+            runtime=overview['runtime'],
+        )
+        items = [
+            self._build_runtime_board_item(
+                item=item,
+                symbol_metadata_map=symbol_metadata_map,
+                runtime_status=runtime['status'],
+            )
+            for item in overview['items']
+        ]
+        return {
+            'request': {
+                'market_date': resolved_market_date.isoformat(),
+                'refresh': refresh,
+            },
+            'runtime': runtime,
+            'market_date': resolved_market_date.isoformat(),
+            'summary': self._build_runtime_daily_board_summary(items=items),
+            'items': items,
+        }
+
+    async def list_runtime_monitored_symbols(
+        self,
+        *,
+        market_date: str | date | None = None,
+        refresh: bool = True,
+        trigger: str = 'manual',
+    ) -> dict[str, Any]:
+        board = await self.get_runtime_daily_board(
+            market_date=market_date,
+            refresh=refresh,
+            trigger=trigger,
+        )
+        grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for item in board['items']:
+            symbol = _normalize_optional_text(item.get('symbol'))
+            if symbol:
+                grouped[symbol].append(item)
+
+        items = [
+            self._build_runtime_monitored_symbol_item(
+                symbol=symbol,
+                items=grouped_items,
+                runtime_status=board['runtime']['status'],
+            )
+            for symbol, grouped_items in sorted(grouped.items())
+            if self._should_include_monitored_symbol_group(grouped_items)
+        ]
+        return {
+            'request': {
+                'market_date': board['market_date'],
+                'refresh': refresh,
+            },
+            'runtime': board['runtime'],
+            'market_date': board['market_date'],
+            'summary': self._build_runtime_monitored_summary(items=items),
+            'items': items,
+        }
+
+    async def get_runtime_symbol_detail(
+        self,
+        *,
+        market_date: str | date | None = None,
+        symbol: str,
+        refresh: bool = True,
+        trigger: str = 'manual',
+    ) -> dict[str, Any]:
+        resolved_market_date = _normalize_date(market_date)
+        resolved_symbol = _normalize_optional_text(symbol)
+        if not resolved_symbol:
+            raise ValueError('symbol is required')
+        overview = await self._load_dashboard_overview(
+            target_trade_date=resolved_market_date,
+            account_reference=None,
+            symbol=resolved_symbol,
+            refresh=refresh,
+            trigger=trigger,
+        )
+        symbol_metadata_map = self._load_symbol_metadata_map([resolved_symbol])
+        runtime = self._build_dashboard_runtime_status(
+            integration=overview['integration'],
+            runtime=overview['runtime'],
+        )
+        items = [
+            self._build_runtime_symbol_detail_item(
+                item=item,
+                symbol_metadata_map=symbol_metadata_map,
+                runtime_status=runtime['status'],
+            )
+            for item in overview['items']
+        ]
+        metadata = symbol_metadata_map.get(
+            resolved_symbol,
+            {
+                'name': resolved_symbol,
+                'market': None,
+            },
+        )
+        return {
+            'request': {
+                'market_date': resolved_market_date.isoformat(),
+                'symbol': resolved_symbol,
+                'refresh': refresh,
+            },
+            'runtime': runtime,
+            'market_date': resolved_market_date.isoformat(),
+            'symbol': resolved_symbol,
+            'name': metadata['name'],
+            'market': metadata['market'],
+            'planning': {
+                'decision_source': 'signal-decider',
+                'decision_snapshot_ids': sorted(
+                    {
+                        int(item.get('decision_snapshot_id'))
+                        for item in items
+                        if item.get('decision_snapshot_id') is not None
+                    }
+                ),
+                'policy_versions': sorted(
+                    {
+                        str(item.get('policy_version'))
+                        for item in items
+                        if _normalize_optional_text(item.get('policy_version'))
+                    }
+                ),
+                'account_references': sorted(
+                    {
+                        str(item.get('account_reference'))
+                        for item in items
+                        if _normalize_optional_text(item.get('account_reference'))
+                    }
+                ),
+            },
+            'monitoring': self._build_runtime_symbol_monitoring(items=items, runtime_status=runtime['status']),
+            'summary': self._build_runtime_symbol_detail_summary(items=items),
             'items': items,
         }
 
@@ -1580,6 +1818,641 @@ class SignalDeciderExecIntegrationService:
             'traceability': item.get('traceability'),
             'validation': item.get('validation'),
         }
+
+    async def _load_dashboard_overview(
+        self,
+        *,
+        target_trade_date: date,
+        account_reference: str | None,
+        symbol: str | None,
+        refresh: bool,
+        trigger: str,
+    ) -> dict[str, Any]:
+        overview = await self.list_signal_decider_exec_overview(
+            target_trade_date=target_trade_date,
+            account_reference=account_reference,
+            symbol=symbol,
+            refresh=refresh,
+            trigger=trigger,
+        )
+        if refresh:
+            return overview
+        live_runtime = await self.runtime_status(refresh=True)
+        return {
+            **overview,
+            'integration': live_runtime['integration'],
+            'runtime': live_runtime['runtime'],
+        }
+
+    def _build_dashboard_runtime_status(
+        self,
+        *,
+        integration: dict[str, Any],
+        runtime: dict[str, Any],
+    ) -> dict[str, Any]:
+        payload = runtime.get('payload') if isinstance(runtime.get('payload'), dict) else {}
+        safety = payload.get('safety') if isinstance(payload.get('safety'), dict) else {}
+        counts = payload.get('counts') if isinstance(payload.get('counts'), dict) else {}
+        readiness = payload.get('readiness') if isinstance(payload.get('readiness'), dict) else {}
+        monitoring = payload.get('monitoring') if isinstance(payload.get('monitoring'), dict) else {}
+
+        paused = _normalize_bool(
+            _coalesce_text(
+                safety.get('paused'),
+                payload.get('paused'),
+                _extract_field(payload, 'runtime', 'paused'),
+            )
+        )
+        paused = bool(paused) if paused is not None else False
+
+        kill_switch_enabled = _normalize_bool(
+            _coalesce_text(
+                safety.get('kill_switch_enabled'),
+                payload.get('kill_switch_enabled'),
+                payload.get('kill_switched'),
+                _extract_field(payload, 'runtime', 'kill_switch_enabled'),
+            )
+        )
+        kill_switch_enabled = bool(kill_switch_enabled) if kill_switch_enabled is not None else False
+
+        automation_enabled = _normalize_bool(
+            _coalesce_text(
+                safety.get('automation_enabled'),
+                payload.get('automation_enabled'),
+                _extract_field(payload, 'runtime', 'automation_enabled'),
+            )
+        )
+        if automation_enabled is None:
+            automation_enabled = not paused and not kill_switch_enabled and bool(integration.get('enabled'))
+
+        ready = _normalize_bool(payload.get('ready'))
+        if ready is None:
+            ready = runtime.get('status') == REMOTE_FETCH_STATUS_OK and not kill_switch_enabled and not paused
+
+        monitoring_alive = _normalize_bool(
+            _coalesce_text(
+                monitoring.get('alive'),
+                monitoring.get('running'),
+                monitoring.get('ready'),
+                payload.get('monitoring_alive'),
+                _extract_field(payload, 'health', 'monitoring_alive'),
+            )
+        )
+        if monitoring_alive is None:
+            monitoring_alive = bool(ready and runtime.get('status') == REMOTE_FETCH_STATUS_OK)
+
+        last_heartbeat_at = _coalesce_text(
+            monitoring.get('last_heartbeat_at'),
+            monitoring.get('last_seen_at'),
+            payload.get('last_heartbeat_at'),
+            payload.get('monitoring_last_heartbeat_at'),
+            _extract_field(payload, 'health', 'last_heartbeat_at'),
+        )
+
+        open_order_count = self._coerce_integer(
+            counts.get('open_orders'),
+            payload.get('open_order_count'),
+            payload.get('open_orders'),
+        )
+        active_execution_job_count = self._coerce_integer(
+            counts.get('active_execution_jobs'),
+            payload.get('active_execution_job_count'),
+            payload.get('active_jobs'),
+        )
+
+        issues = list(integration.get('issues') or [])
+        runtime_error = runtime.get('error')
+        if isinstance(runtime_error, dict):
+            issues.append(runtime_error)
+        for reason in readiness.get('reasons') or []:
+            if isinstance(reason, dict):
+                issues.append(
+                    _serialize_issue(
+                        _normalize_optional_text(reason.get('code'), lowercase=True) or 'readiness_reason',
+                        _normalize_optional_text(reason.get('message')) or json.dumps(reason, sort_keys=True),
+                    )
+                )
+                continue
+            reason_text = _normalize_optional_text(reason)
+            if reason_text:
+                issues.append(_serialize_issue('readiness_reason', reason_text))
+
+        runtime_status = _normalize_optional_text(runtime.get('status'), lowercase=True)
+        exec_connected = runtime_status == REMOTE_FETCH_STATUS_OK
+
+        if kill_switch_enabled:
+            status = UI_RUNTIME_STATUS_KILL_SWITCHED
+        elif paused:
+            status = UI_RUNTIME_STATUS_PAUSED
+        elif runtime_status in {REMOTE_FETCH_STATUS_DISABLED, REMOTE_FETCH_STATUS_NOT_CONFIGURED, REMOTE_FETCH_STATUS_UNAVAILABLE}:
+            status = UI_RUNTIME_STATUS_OFFLINE
+        elif runtime_status == REMOTE_FETCH_STATUS_CONTRACT_ERROR:
+            status = UI_RUNTIME_STATUS_DEGRADED
+        elif exec_connected and ready and monitoring_alive and not issues:
+            status = UI_RUNTIME_STATUS_READY
+        elif exec_connected:
+            status = UI_RUNTIME_STATUS_DEGRADED
+        else:
+            status = UI_RUNTIME_STATUS_OFFLINE
+
+        return {
+            'status': status,
+            'mode': _coalesce_text(payload.get('mode'), integration.get('runtime_mode')) or 'mock',
+            'exec_connected': exec_connected,
+            'automation_enabled': bool(automation_enabled),
+            'paused': paused,
+            'kill_switch_enabled': kill_switch_enabled,
+            'monitoring_alive': bool(monitoring_alive),
+            'last_heartbeat_at': last_heartbeat_at,
+            'open_order_count': open_order_count,
+            'active_execution_job_count': active_execution_job_count,
+            'issues': issues,
+            'core_integration_mode': integration.get('mode'),
+            'delegate_execution': bool(integration.get('delegate_execution')),
+        }
+
+    def _build_runtime_board_item(
+        self,
+        *,
+        item: dict[str, Any],
+        symbol_metadata_map: dict[str, dict[str, Any]],
+        runtime_status: str,
+    ) -> dict[str, Any]:
+        symbol = _normalize_optional_text(item.get('symbol')) or 'UNKNOWN'
+        metadata = symbol_metadata_map.get(symbol, {'name': symbol, 'market': None})
+        remote_state = item.get('remote_state') if isinstance(item.get('remote_state'), dict) else {}
+        orders = remote_state.get('orders') if isinstance(remote_state.get('orders'), list) else []
+        executions = remote_state.get('executions') if isinstance(remote_state.get('executions'), list) else []
+        positions = remote_state.get('positions') if isinstance(remote_state.get('positions'), list) else []
+
+        planned_quantity = _safe_decimal(item.get('planned_quantity'))
+        entry_filled_quantity = _safe_decimal(remote_state.get('entry_filled_quantity'))
+        if entry_filled_quantity is None:
+            entry_filled_quantity = self._sum_execution_quantity(executions=executions, side='buy')
+        exit_filled_quantity = _safe_decimal(remote_state.get('exit_filled_quantity'))
+        if exit_filled_quantity is None:
+            exit_filled_quantity = self._sum_execution_quantity(executions=executions, side='sell')
+        open_quantity = _safe_decimal(remote_state.get('open_quantity'))
+        if open_quantity is None:
+            open_quantity = max(Decimal('0'), entry_filled_quantity - exit_filled_quantity)
+
+        order_statuses = self._collect_order_statuses(orders=orders)
+        status = self._normalize_board_item_status(
+            item=item,
+            order_statuses=order_statuses,
+            planned_quantity=planned_quantity,
+            entry_filled_quantity=entry_filled_quantity,
+            exit_filled_quantity=exit_filled_quantity,
+            open_quantity=open_quantity,
+        )
+        planned_intents = self._collect_planned_intents(item=item)
+        monitoring_state = self._resolve_monitoring_state(
+            status=status,
+            open_quantity=open_quantity,
+            planned_intents=planned_intents,
+            runtime_status=runtime_status,
+            has_execution_plan=bool(_normalize_optional_text((item.get('dispatch') or {}).get('plan_id'))),
+        )
+        return {
+            'plan_item_id': item.get('plan_item_id'),
+            'account_reference': item.get('account_reference'),
+            'account_label': item.get('account_label'),
+            'symbol': symbol,
+            'name': metadata['name'],
+            'market': metadata['market'],
+            'intent': EXEC_INTENT_NEXT_OPEN_BUY,
+            'status': status,
+            'monitoring_state': monitoring_state,
+            'position_side': 'long' if open_quantity > Decimal('0') or planned_quantity is not None else None,
+            'planned_intents': planned_intents,
+            'planned_quantity': _to_json_number(planned_quantity),
+            'filled_quantity': _to_json_number(entry_filled_quantity),
+            'open_quantity': _to_json_number(open_quantity),
+            'planned_price': item.get('estimated_reference_price'),
+            'avg_fill_price': self._resolve_average_fill_price(executions=executions, positions=positions),
+            'decision_source': 'signal-decider',
+            'decision_snapshot_id': item.get('decision_snapshot_id'),
+            'policy_version': item.get('policy_version'),
+            'execution_plan_id': _normalize_optional_text((item.get('dispatch') or {}).get('plan_id')),
+            'broker_order_id': self._resolve_broker_order_id(orders=orders, executions=executions),
+            'last_updated_at': self._resolve_last_updated_at(
+                item=item,
+                orders=orders,
+                executions=executions,
+                positions=positions,
+            ),
+            'failure_reason': self._resolve_failure_reason(item=item, order_statuses=order_statuses, status=status),
+            'target_price': item.get('target_price'),
+            'stop_loss_price': item.get('stop_loss_price'),
+            'target_trade_date': item.get('target_trade_date'),
+            'source_market_date': item.get('source_market_date'),
+        }
+
+    def _build_runtime_daily_board_summary(self, *, items: Sequence[dict[str, Any]]) -> dict[str, Any]:
+        counts = {
+            UI_BOARD_STATUS_PLANNED: 0,
+            UI_BOARD_STATUS_ACCEPTED: 0,
+            UI_BOARD_STATUS_SCHEDULED: 0,
+            UI_BOARD_STATUS_SUBMITTED: 0,
+            UI_BOARD_STATUS_PARTIAL: 0,
+            UI_BOARD_STATUS_FILLED: 0,
+            UI_BOARD_STATUS_CANCELLED: 0,
+            UI_BOARD_STATUS_FAILED: 0,
+        }
+        for item in items:
+            status = _normalize_optional_text(item.get('status'), lowercase=True)
+            if status in counts:
+                counts[status] += 1
+        return {
+            'items_total': len(items),
+            **counts,
+        }
+
+    def _build_runtime_monitored_symbol_item(
+        self,
+        *,
+        symbol: str,
+        items: Sequence[dict[str, Any]],
+        runtime_status: str,
+    ) -> dict[str, Any]:
+        first = items[0]
+        monitoring = self._build_runtime_symbol_monitoring(items=items, runtime_status=runtime_status)
+        return {
+            'symbol': symbol,
+            'name': first.get('name') or symbol,
+            'market': first.get('market'),
+            'monitoring_state': monitoring['state'],
+            'position_side': monitoring['position_side'],
+            'planned_intents': monitoring['planned_intents'],
+            'last_event_at': monitoring['last_event_at'],
+            'account_references': sorted(
+                {
+                    str(item.get('account_reference'))
+                    for item in items
+                    if _normalize_optional_text(item.get('account_reference'))
+                }
+            ),
+            'status_counts': dict(
+                sorted(
+                    Counter(
+                        _normalize_optional_text(item.get('status'), lowercase=True) or 'unknown'
+                        for item in items
+                    ).items()
+                )
+            ),
+        }
+
+    def _should_include_monitored_symbol_group(self, items: Sequence[dict[str, Any]]) -> bool:
+        for item in items:
+            if _normalize_optional_text(item.get('monitoring_state'), lowercase=True) != UI_MONITORING_STATE_IDLE:
+                return True
+            if _normalize_optional_text(item.get('status'), lowercase=True) in {
+                UI_BOARD_STATUS_ACCEPTED,
+                UI_BOARD_STATUS_SCHEDULED,
+                UI_BOARD_STATUS_SUBMITTED,
+                UI_BOARD_STATUS_PARTIAL,
+                UI_BOARD_STATUS_FILLED,
+            }:
+                return True
+        return False
+
+    def _build_runtime_monitored_summary(self, *, items: Sequence[dict[str, Any]]) -> dict[str, Any]:
+        state_counts = Counter(
+            _normalize_optional_text(item.get('monitoring_state'), lowercase=True) or 'unknown'
+            for item in items
+        )
+        return {
+            'items_total': len(items),
+            'watching_target_stop': state_counts.get(UI_MONITORING_STATE_WATCHING_TARGET_STOP, 0),
+            'watching_fill': state_counts.get(UI_MONITORING_STATE_WATCHING_FILL, 0),
+            'reconciling': state_counts.get(UI_MONITORING_STATE_RECONCILING, 0),
+            'idle': state_counts.get(UI_MONITORING_STATE_IDLE, 0),
+            'monitoring_state_counts': dict(sorted(state_counts.items())),
+        }
+
+    def _build_runtime_symbol_detail_item(
+        self,
+        *,
+        item: dict[str, Any],
+        symbol_metadata_map: dict[str, dict[str, Any]],
+        runtime_status: str,
+    ) -> dict[str, Any]:
+        board_item = self._build_runtime_board_item(
+            item=item,
+            symbol_metadata_map=symbol_metadata_map,
+            runtime_status=runtime_status,
+        )
+        remote_state = item.get('remote_state') if isinstance(item.get('remote_state'), dict) else {}
+        return {
+            **board_item,
+            'dispatch': item.get('dispatch'),
+            'remote_state': {
+                'derived_status': remote_state.get('derived_status'),
+                'last_synced_at': remote_state.get('last_synced_at'),
+                'endpoint_statuses': remote_state.get('endpoint_statuses') or {},
+            },
+            'orders': remote_state.get('orders') or [],
+            'executions': remote_state.get('executions') or [],
+            'positions': remote_state.get('positions') or [],
+            'validation': item.get('validation'),
+            'traceability': item.get('traceability'),
+        }
+
+    def _build_runtime_symbol_detail_summary(self, *, items: Sequence[dict[str, Any]]) -> dict[str, Any]:
+        status_counts = Counter(
+            _normalize_optional_text(item.get('status'), lowercase=True) or 'unknown'
+            for item in items
+        )
+        planned_quantity_total = sum(
+            ((_safe_decimal(item.get('planned_quantity')) or Decimal('0')) for item in items),
+            start=Decimal('0'),
+        )
+        filled_quantity_total = sum(
+            ((_safe_decimal(item.get('filled_quantity')) or Decimal('0')) for item in items),
+            start=Decimal('0'),
+        )
+        open_quantity_total = sum(
+            ((_safe_decimal(item.get('open_quantity')) or Decimal('0')) for item in items),
+            start=Decimal('0'),
+        )
+        return {
+            'items_total': len(items),
+            'account_count': len(
+                {
+                    str(item.get('account_reference'))
+                    for item in items
+                    if _normalize_optional_text(item.get('account_reference'))
+                }
+            ),
+            'status_counts': dict(sorted(status_counts.items())),
+            'planned_quantity_total': _to_json_number(planned_quantity_total),
+            'filled_quantity_total': _to_json_number(filled_quantity_total),
+            'open_quantity_total': _to_json_number(open_quantity_total),
+            'last_updated_at': _latest_iso_timestamp(item.get('last_updated_at') for item in items),
+        }
+
+    def _build_runtime_symbol_monitoring(self, *, items: Sequence[dict[str, Any]], runtime_status: str) -> dict[str, Any]:
+        if not items:
+            return {
+                'state': UI_MONITORING_STATE_IDLE,
+                'position_side': None,
+                'planned_intents': [],
+                'last_event_at': None,
+            }
+        states = [
+            _normalize_optional_text(item.get('monitoring_state'), lowercase=True) or UI_MONITORING_STATE_IDLE
+            for item in items
+        ]
+        priority = {
+            UI_MONITORING_STATE_RECONCILING: 4,
+            UI_MONITORING_STATE_WATCHING_TARGET_STOP: 3,
+            UI_MONITORING_STATE_WATCHING_FILL: 2,
+            UI_MONITORING_STATE_IDLE: 1,
+        }
+        state = max(states, key=lambda value: priority.get(value, 0))
+        return {
+            'state': state,
+            'position_side': 'long'
+            if any((_safe_decimal(item.get('open_quantity')) or Decimal('0')) > Decimal('0') for item in items)
+            else None,
+            'planned_intents': sorted(
+                {
+                    str(intent)
+                    for item in items
+                    for intent in (item.get('planned_intents') or [])
+                    if _normalize_optional_text(intent)
+                }
+            ),
+            'last_event_at': _latest_iso_timestamp(item.get('last_updated_at') for item in items),
+            'runtime_status': runtime_status,
+        }
+
+    @staticmethod
+    def _load_symbol_metadata_map(symbols: Iterable[Any]) -> dict[str, dict[str, Any]]:
+        normalized_symbols = sorted(
+            {
+                normalized
+                for value in symbols
+                if (normalized := _normalize_optional_text(value))
+            }
+        )
+        if not normalized_symbols:
+            return {}
+        rows = load_symbols(symbols=normalized_symbols, limit=max(len(normalized_symbols), 1))
+        return {
+            row['symbol']: {
+                'name': row.get('name_ko') or row['symbol'],
+                'market': row.get('market'),
+            }
+            for row in rows
+        }
+
+    @staticmethod
+    def _coerce_integer(*values: Any) -> int:
+        for value in values:
+            decimal_value = _safe_decimal(value)
+            if decimal_value is None:
+                continue
+            return int(decimal_value)
+        return 0
+
+    @staticmethod
+    def _sum_execution_quantity(*, executions: Sequence[dict[str, Any]], side: str) -> Decimal:
+        total = Decimal('0')
+        for execution in executions:
+            execution_side = _normalize_status(execution.get('side'))
+            if execution_side != side:
+                continue
+            total += _safe_decimal(execution.get('quantity') or execution.get('filled_quantity')) or Decimal('0')
+        return total
+
+    @staticmethod
+    def _collect_order_statuses(*, orders: Sequence[dict[str, Any]]) -> set[str]:
+        statuses: set[str] = set()
+        for order in orders:
+            status = _normalize_status(order.get('status') or order.get('current_status') or order.get('broker_status'))
+            if status:
+                statuses.add(status)
+        return statuses
+
+    def _normalize_board_item_status(
+        self,
+        *,
+        item: dict[str, Any],
+        order_statuses: set[str],
+        planned_quantity: Decimal | None,
+        entry_filled_quantity: Decimal,
+        exit_filled_quantity: Decimal,
+        open_quantity: Decimal,
+    ) -> str:
+        eligibility_status = _normalize_optional_text(item.get('eligibility_status'), lowercase=True)
+        execution_status = _normalize_optional_text(item.get('execution_status'), lowercase=True)
+        dispatch_status = _normalize_optional_text((item.get('dispatch') or {}).get('status'), lowercase=True)
+        remote_state = item.get('remote_state') if isinstance(item.get('remote_state'), dict) else {}
+        derived_status = _normalize_optional_text(remote_state.get('derived_status'), lowercase=True)
+
+        if eligibility_status == ELIGIBILITY_BLOCKED:
+            return UI_BOARD_STATUS_FAILED
+        if execution_status == EXECUTION_STATUS_SUBMIT_FAILED or dispatch_status in {
+            EXEC_DISPATCH_STATUS_FAILED,
+            EXEC_DISPATCH_STATUS_NOT_CONFIGURED,
+            EXEC_DISPATCH_STATUS_CONTRACT_ERROR,
+            EXEC_DISPATCH_STATUS_UNAVAILABLE,
+        }:
+            return UI_BOARD_STATUS_FAILED
+        if order_statuses & REMOTE_FAILED_STATUSES or derived_status == 'failed':
+            return UI_BOARD_STATUS_FAILED
+        if order_statuses & REMOTE_CANCELLED_STATUSES and entry_filled_quantity <= Decimal('0'):
+            return UI_BOARD_STATUS_CANCELLED
+        if order_statuses & REMOTE_PARTIAL_STATUSES:
+            return UI_BOARD_STATUS_PARTIAL
+        if planned_quantity is not None and entry_filled_quantity > Decimal('0') and entry_filled_quantity < planned_quantity:
+            return UI_BOARD_STATUS_PARTIAL
+        if exit_filled_quantity > Decimal('0') and open_quantity > Decimal('0'):
+            return UI_BOARD_STATUS_PARTIAL
+        if entry_filled_quantity > Decimal('0'):
+            return UI_BOARD_STATUS_FILLED
+        if order_statuses & REMOTE_SUBMITTED_STATUSES:
+            return UI_BOARD_STATUS_SUBMITTED
+        if order_statuses & REMOTE_SCHEDULED_STATUSES:
+            return UI_BOARD_STATUS_SCHEDULED
+        if dispatch_status in {EXEC_DISPATCH_STATUS_ACCEPTED, EXEC_DISPATCH_STATUS_PARTIAL}:
+            return UI_BOARD_STATUS_ACCEPTED
+        return UI_BOARD_STATUS_PLANNED
+
+    def _resolve_monitoring_state(
+        self,
+        *,
+        status: str,
+        open_quantity: Decimal,
+        planned_intents: Sequence[str],
+        runtime_status: str,
+        has_execution_plan: bool,
+    ) -> str:
+        if runtime_status in {UI_RUNTIME_STATUS_DEGRADED, UI_RUNTIME_STATUS_OFFLINE} and has_execution_plan:
+            return UI_MONITORING_STATE_RECONCILING
+        if open_quantity > Decimal('0') and planned_intents:
+            return UI_MONITORING_STATE_WATCHING_TARGET_STOP
+        if status in {
+            UI_BOARD_STATUS_ACCEPTED,
+            UI_BOARD_STATUS_SCHEDULED,
+            UI_BOARD_STATUS_SUBMITTED,
+            UI_BOARD_STATUS_PARTIAL,
+        }:
+            return UI_MONITORING_STATE_WATCHING_FILL
+        return UI_MONITORING_STATE_IDLE
+
+    @staticmethod
+    def _collect_planned_intents(*, item: dict[str, Any]) -> list[str]:
+        dispatch = item.get('dispatch') if isinstance(item.get('dispatch'), dict) else {}
+        intents = []
+        for link in dispatch.get('item_links') or []:
+            intent = _normalize_optional_text(link.get('intent'), lowercase=True)
+            if intent and intent != EXEC_INTENT_NEXT_OPEN_BUY:
+                intents.append(intent)
+        return sorted(dict.fromkeys(intents))
+
+    @staticmethod
+    def _resolve_average_fill_price(*, executions: Sequence[dict[str, Any]], positions: Sequence[dict[str, Any]]) -> int | float | None:
+        total_quantity = Decimal('0')
+        total_notional = Decimal('0')
+        for execution in executions:
+            if _normalize_status(execution.get('side')) == 'sell':
+                continue
+            quantity = _safe_decimal(execution.get('quantity') or execution.get('filled_quantity'))
+            price = _safe_decimal(
+                execution.get('average_fill_price')
+                or execution.get('fill_price')
+                or execution.get('price')
+            )
+            if quantity is None or quantity <= Decimal('0') or price is None or price <= Decimal('0'):
+                continue
+            total_quantity += quantity
+            total_notional += quantity * price
+        if total_quantity > Decimal('0'):
+            return _to_json_number(total_notional / total_quantity)
+        if positions:
+            return _to_json_number(_safe_decimal(positions[0].get('average_price')))
+        return None
+
+    @staticmethod
+    def _resolve_broker_order_id(*, orders: Sequence[dict[str, Any]], executions: Sequence[dict[str, Any]]) -> str | None:
+        for order in orders:
+            resolved = _coalesce_text(order.get('broker_order_id'), order.get('id'), order.get('order_id'))
+            if resolved:
+                return resolved
+        for execution in executions:
+            resolved = _coalesce_text(execution.get('broker_order_id'), execution.get('order_id'))
+            if resolved:
+                return resolved
+        return None
+
+    def _resolve_last_updated_at(
+        self,
+        *,
+        item: dict[str, Any],
+        orders: Sequence[dict[str, Any]],
+        executions: Sequence[dict[str, Any]],
+        positions: Sequence[dict[str, Any]],
+    ) -> str | None:
+        values: list[Any] = [
+            item.get('submitted_at'),
+            item.get('last_evaluated_at'),
+            item.get('first_ready_at'),
+            (item.get('dispatch') or {}).get('last_attempt_at'),
+            (item.get('dispatch') or {}).get('last_success_at'),
+            (item.get('remote_state') or {}).get('last_synced_at'),
+        ]
+        for payload in orders:
+            values.extend(
+                [
+                    payload.get('updated_at'),
+                    payload.get('last_event_at'),
+                    payload.get('submitted_at'),
+                    payload.get('created_at'),
+                ]
+            )
+        for payload in executions:
+            values.extend(
+                [
+                    payload.get('executed_at'),
+                    payload.get('filled_at'),
+                    payload.get('created_at'),
+                    payload.get('updated_at'),
+                ]
+            )
+        for payload in positions:
+            values.extend(
+                [
+                    payload.get('updated_at'),
+                    payload.get('as_of'),
+                    payload.get('captured_at'),
+                ]
+            )
+        return _latest_iso_timestamp(values)
+
+    def _resolve_failure_reason(self, *, item: dict[str, Any], order_statuses: set[str], status: str) -> str | None:
+        validation = item.get('validation') if isinstance(item.get('validation'), dict) else {}
+        blocking_reasons = validation.get('blocking_reasons') if isinstance(validation.get('blocking_reasons'), list) else []
+        if status == UI_BOARD_STATUS_FAILED and blocking_reasons:
+            first_reason = blocking_reasons[0]
+            if isinstance(first_reason, dict):
+                return _normalize_optional_text(first_reason.get('message'))
+            return _normalize_optional_text(first_reason)
+
+        dispatch = item.get('dispatch') if isinstance(item.get('dispatch'), dict) else {}
+        last_error = dispatch.get('last_error') if isinstance(dispatch.get('last_error'), dict) else {}
+        if status == UI_BOARD_STATUS_FAILED and last_error:
+            return _normalize_optional_text(last_error.get('message')) or _normalize_optional_text(last_error.get('code'))
+
+        if status == UI_BOARD_STATUS_CANCELLED:
+            return 'Execution was cancelled before entry fill completed.'
+        if status == UI_BOARD_STATUS_FAILED and order_statuses:
+            if 'rejected' in order_statuses:
+                return 'Exec rejected the order.'
+            if 'failed' in order_statuses:
+                return 'Exec reported a failed order lifecycle.'
+        return None
 
     @staticmethod
     def _client_error_status(exc: SignalDeciderExecClientError) -> str:
