@@ -233,7 +233,9 @@
 - KOSPI/KOSDAQ snapshot uses KIS `국내업종 현재지수` at `/uapi/domestic-stock/v1/quotations/inquire-index-price` with TR `FHPUP02100000`, because it returns current level, delta, breadth, and trading activity in a single response. The historical `/uapi/domestic-stock/v1/quotations/inquire-daily-indexchartprice` API remains better suited to chart views than the card summary.
 - Foreign/institutional flow uses KIS `시장별 투자자매매동향(시세)` at `/uapi/domestic-stock/v1/quotations/inquire-investor-time-by-market` with TR `FHPTJ04030000`, because it returns market-level intraday participant flow for KOSPI/KOSDAQ directly. Per-symbol and top-list investor APIs were intentionally not used for this card payload.
 - USD/KRW is normalized through the existing Korea Exim service path, so the snapshot keeps the Korea Exim `effective_date` and fallback-date semantics instead of duplicating FX lookup logic.
-- The selected KIS index and investor-flow APIs are real-domain only; when `KIS_USE_MOCK=true`, the route returns `503` rather than silently fabricating snapshot data.
+- The selected KIS index and investor-flow APIs are real-domain only. The route therefore resolves KIS requests against the real domain by default via `MARKET_SNAPSHOT_KIS_USE_REAL=true`, even when the wider process still has `KIS_USE_MOCK=true` for other flows.
+- Required runtime secrets are `KIS_APP_KEY`, `KIS_APP_SECRET`, and `KOREAEXIM_API_KEY`.
+- Deploy preflight reports `runtime_checks.market_snapshot`, `GET /broker/kis/health` exposes `market_snapshot_runtime`, and deploy smoke-check now fails if `/market/snapshot` does not return a usable payload.
 
 ## Realtime trending notes
 - `GET /scanner/realtime-trending` is the user-facing realtime trending read API backed by KIS ranking sources only.

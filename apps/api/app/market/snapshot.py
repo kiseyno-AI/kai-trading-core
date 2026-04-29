@@ -30,6 +30,34 @@ class MarketSnapshotTarget:
     investor_sector_code: str
 
 
+@dataclass(frozen=True)
+class MarketSnapshotRuntimeStatus:
+    ready: bool
+    global_kis_environment: str
+    effective_kis_environment: str
+    effective_kis_base_url: str
+    uses_real_domain_override: bool
+    market_snapshot_kis_use_real: bool
+    kis_app_key_configured: bool
+    kis_app_secret_configured: bool
+    koreaexim_api_key_configured: bool
+    blocking_reasons: tuple[str, ...]
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            'ready': self.ready,
+            'global_kis_environment': self.global_kis_environment,
+            'effective_kis_environment': self.effective_kis_environment,
+            'effective_kis_base_url': self.effective_kis_base_url,
+            'uses_real_domain_override': self.uses_real_domain_override,
+            'market_snapshot_kis_use_real': self.market_snapshot_kis_use_real,
+            'kis_app_key_configured': self.kis_app_key_configured,
+            'kis_app_secret_configured': self.kis_app_secret_configured,
+            'koreaexim_api_key_configured': self.koreaexim_api_key_configured,
+            'blocking_reasons': list(self.blocking_reasons),
+        }
+
+
 # Official KIS choices for the market-condition card:
 # - "국내업종 현재지수" (`inquire-index-price`, TR `FHPUP02100000`) returns the
 #   current KOSPI/KOSDAQ level, change, breadth, and trading activity in one call.
@@ -102,21 +130,81 @@ class MarketSnapshotService:
         *,
         kis_api_client: KISClient | None = None,
         koreaexim_service: KoreaEximService | None = None,
+        real_domain_kis_api_client: KISClient | None = None,
     ) -> None:
+        self._uses_default_kis_client = kis_api_client is None
         self.kis_api_client = kis_api_client or kis_client
         self.koreaexim_service = koreaexim_service or fx_service
+        self.real_domain_kis_api_client = real_domain_kis_api_client
+
+    def runtime_status(self) -> dict[str, Any]:
+        return self._runtime_status().to_payload()
+
+    def _runtime_status(self) -> MarketSnapshotRuntimeStatus:
+        global_kis_environment = 'demo' if settings.kis_use_mock else 'real'
+        uses_real_domain_override = bool(settings.kis_use_mock and settings.market_snapshot_kis_use_real)
+        effective_kis_environment = 'real' if settings.market_snapshot_kis_use_real else global_kis_environment
+        effective_kis_base_url = (
+            settings.kis_base_url if effective_kis_environment == 'real' else settings.kis_mock_base_url
+        )
+
+        blocking_reasons: list[str] = []
+        if effective_kis_environment != 'real':
+            blocking_reasons.append(
+                'Market snapshot requires real-domain KIS access because the selected index and investor-flow APIs '
+                'are real-domain only. Enable MARKET_SNAPSHOT_KIS_USE_REAL or run with KIS_USE_MOCK=false.'
+            )
+        if not settings.kis_app_key:
+            blocking_reasons.append('KIS_APP_KEY must be configured for market snapshot.')
+        if not settings.kis_app_secret:
+            blocking_reasons.append('KIS_APP_SECRET must be configured for market snapshot.')
+        if not settings.koreaexim_api_key:
+            blocking_reasons.append('KOREAEXIM_API_KEY must be configured for market snapshot USD/KRW data.')
+
+        return MarketSnapshotRuntimeStatus(
+            ready=not blocking_reasons,
+            global_kis_environment=global_kis_environment,
+            effective_kis_environment=effective_kis_environment,
+            effective_kis_base_url=effective_kis_base_url,
+            uses_real_domain_override=uses_real_domain_override,
+            market_snapshot_kis_use_real=settings.market_snapshot_kis_use_real,
+            kis_app_key_configured=bool(settings.kis_app_key),
+            kis_app_secret_configured=bool(settings.kis_app_secret),
+            koreaexim_api_key_configured=bool(settings.koreaexim_api_key),
+            blocking_reasons=tuple(blocking_reasons),
+        )
+
+    def _configuration_error(self) -> MarketSnapshotConfigurationError:
+        status = self._runtime_status()
+        if not status.blocking_reasons:
+            return MarketSnapshotConfigurationError('Market snapshot runtime is not ready.')
+        if len(status.blocking_reasons) == 1:
+            return MarketSnapshotConfigurationError(status.blocking_reasons[0])
+        return MarketSnapshotConfigurationError(
+            'Market snapshot runtime is not ready: ' + '; '.join(status.blocking_reasons)
+        )
+
+    def _effective_kis_client(self) -> KISClient:
+        if not self._uses_default_kis_client:
+            return self.kis_api_client
+        if settings.market_snapshot_kis_use_real and settings.kis_use_mock:
+            if self.real_domain_kis_api_client is None:
+                self.real_domain_kis_api_client = KISClient(use_mock=False)
+            return self.real_domain_kis_api_client
+        return self.kis_api_client
 
     async def get_market_snapshot(self) -> dict[str, Any]:
-        if settings.kis_use_mock:
-            raise MarketSnapshotConfigurationError(
-                'KIS market snapshot requires KIS_USE_MOCK=false because the selected index and investor-flow APIs are real-domain only'
-            )
+        status = self._runtime_status()
+        if not status.ready:
+            raise self._configuration_error()
+
+        kis_api_client = self._effective_kis_client()
 
         # Prime the shared token cache once before fanning out multiple KIS reads.
-        await self.kis_api_client.issue_access_token()
+        await kis_api_client.issue_access_token()
 
         market_rows, usd_krw_payload = await asyncio.gather(
-            asyncio.gather(*(self._fetch_market_row(target) for target in MARKET_SNAPSHOT_TARGETS)),
+            asyncio.gather(*(self._fetch_market_row(kis_api_client, target) for target in MARKET_SNAPSHOT_TARGETS)),
             self.koreaexim_service.get_exchange_rates(currency='USD'),
         )
 
@@ -129,10 +217,10 @@ class MarketSnapshotService:
             'usd_krw': self._build_usd_krw_snapshot(usd_krw_payload),
         }
 
-    async def _fetch_market_row(self, target: MarketSnapshotTarget) -> dict[str, Any]:
+    async def _fetch_market_row(self, kis_api_client: KISClient, target: MarketSnapshotTarget) -> dict[str, Any]:
         index_payload, flow_payload = await asyncio.gather(
-            self.kis_api_client.fetch_market_index_price(index_code=target.index_code),
-            self.kis_api_client.fetch_investor_time_by_market(
+            kis_api_client.fetch_market_index_price(index_code=target.index_code),
+            kis_api_client.fetch_investor_time_by_market(
                 market_code=target.investor_market_code,
                 sector_code=target.investor_sector_code,
             ),

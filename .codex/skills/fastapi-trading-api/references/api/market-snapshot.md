@@ -6,6 +6,11 @@ Returns a compact market-condition payload for the dashboard card, aggregating:
 - market-level foreign/institutional flow from KIS
 - USD/KRW from the existing Korea Exim service
 
+Runtime requirements:
+- KIS reads resolve to the real domain by default through `MARKET_SNAPSHOT_KIS_USE_REAL=true`, because the selected KIS index and investor-flow APIs are real-domain only
+- required secrets: `KIS_APP_KEY`, `KIS_APP_SECRET`, `KOREAEXIM_API_KEY`
+- `GET /broker/kis/health` exposes `market_snapshot_runtime` for readiness/debugging
+
 ## Example request
 ```http
 GET /market/snapshot

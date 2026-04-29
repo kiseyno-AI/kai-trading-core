@@ -14,10 +14,25 @@ from sqlalchemy.engine.url import make_url
 
 from app.core.settings import settings
 from app.db import DATABASE_URL, engine, get_alembic_config
+from app.market.snapshot import market_snapshot_service
 
 OK_STATUS = 'ok'
 WARN_STATUS = 'warn'
 FAIL_STATUS = 'fail'
+
+
+def _market_snapshot_runtime_actions(runtime_status: dict[str, Any]) -> list[str]:
+    actions: list[str] = []
+    if runtime_status.get('effective_kis_environment') != 'real':
+        actions.append(
+            'Enable MARKET_SNAPSHOT_KIS_USE_REAL=true or run with KIS_USE_MOCK=false so /market/snapshot uses the real KIS domain.'
+        )
+    if not runtime_status.get('kis_app_key_configured') or not runtime_status.get('kis_app_secret_configured'):
+        actions.append('Set KIS_APP_KEY and KIS_APP_SECRET in apps/api/.env before deploying market snapshot.')
+    if not runtime_status.get('koreaexim_api_key_configured'):
+        actions.append('Set KOREAEXIM_API_KEY in apps/api/.env before deploying market snapshot.')
+    actions.append('After restart, run the deploy smoke check against /health, /eod/freshness, and /market/snapshot.')
+    return actions
 
 
 def _redacted_database_url() -> str:
@@ -77,6 +92,7 @@ def _load_revision_catalog() -> tuple[tuple[str, ...], list[dict[str, Any]]]:
 
 def _build_preflight_report(*, require_head: bool) -> dict[str, Any]:
     redacted_database_url = _redacted_database_url()
+    market_snapshot_runtime = market_snapshot_service.runtime_status()
 
     try:
         head_revisions, revision_catalog = _load_revision_catalog()
@@ -109,6 +125,9 @@ def _build_preflight_report(*, require_head: bool) -> dict[str, Any]:
             'recommended_actions': [
                 'Verify the configured database is reachable from apps/api and rerun the preflight.',
             ],
+            'runtime_checks': {
+                'market_snapshot': market_snapshot_runtime,
+            },
         }
 
     revision_ids = [item['revision'] for item in revision_catalog]
@@ -121,7 +140,7 @@ def _build_preflight_report(*, require_head: bool) -> dict[str, Any]:
     status = OK_STATUS
     summary = 'Database is already at the Alembic head revision.'
     recommended_actions = [
-        'After restart, run the deploy smoke check against /health and /eod/freshness.',
+        'After restart, run the deploy smoke check against /health, /eod/freshness, and /market/snapshot.',
     ]
 
     if len(head_revisions) != 1:
@@ -181,7 +200,7 @@ def _build_preflight_report(*, require_head: bool) -> dict[str, Any]:
                 summary = 'Database is not at the Alembic head revision.'
                 recommended_actions = [
                     'Run alembic upgrade head before restart, then rerun this preflight with --require-head.',
-                    'After restart, run the deploy smoke check against /health and /eod/freshness.',
+                    'After restart, run the deploy smoke check against /health, /eod/freshness, and /market/snapshot.',
                 ]
             else:
                 status = WARN_STATUS
@@ -191,8 +210,14 @@ def _build_preflight_report(*, require_head: bool) -> dict[str, Any]:
                 recommended_actions = [
                     'If DB_AUTO_UPGRADE=true, startup may continue and let Alembic apply the pending revisions.',
                     'For a gated deploy, prefer alembic upgrade head before restart, then rerun this preflight with --require-head.',
-                    'After restart, run the deploy smoke check against /health and /eod/freshness.',
+                    'After restart, run the deploy smoke check against /health, /eod/freshness, and /market/snapshot.',
                 ]
+
+    if not market_snapshot_runtime['ready']:
+        if status != FAIL_STATUS:
+            status = FAIL_STATUS
+            summary = 'Market snapshot runtime is not ready for deploy.'
+        recommended_actions.extend(_market_snapshot_runtime_actions(market_snapshot_runtime))
 
     return {
         'status': status,
@@ -220,7 +245,10 @@ def _build_preflight_report(*, require_head: bool) -> dict[str, Any]:
             ),
             'findings': drift_findings,
         },
-        'recommended_actions': recommended_actions,
+        'recommended_actions': list(dict.fromkeys(recommended_actions)),
+        'runtime_checks': {
+            'market_snapshot': market_snapshot_runtime,
+        },
     }
 
 
@@ -251,6 +279,18 @@ def _render_preflight_text(report: dict[str, Any]) -> str:
         for finding in report['drift']['findings']:
             tables = ', '.join(finding['tables'])
             lines.append(f"- {finding['revision']} ({finding['migration']}): live table(s) already present -> {tables}")
+
+    runtime_checks = report.get('runtime_checks') or {}
+    market_snapshot = runtime_checks.get('market_snapshot')
+    if isinstance(market_snapshot, dict):
+        lines.append(
+            'Market snapshot runtime: '
+            + ('ready' if market_snapshot.get('ready') else 'blocked')
+            + f" (effective_kis_environment={market_snapshot.get('effective_kis_environment')}, "
+            + f"uses_real_domain_override={market_snapshot.get('uses_real_domain_override')})"
+        )
+        for reason in market_snapshot.get('blocking_reasons') or []:
+            lines.append(f"- market_snapshot: {reason}")
 
     if report['database'].get('error'):
         lines.append(f"Database error: {report['database']['error']}")
@@ -291,7 +331,11 @@ def collect_deploy_smoke_check(
         headers=headers,
         transport=transport,
     ) as client:
-        for name, path in (('health', '/health'), ('eod_freshness', '/eod/freshness')):
+        for name, path in (
+            ('health', '/health'),
+            ('eod_freshness', '/eod/freshness'),
+            ('market_snapshot', '/market/snapshot'),
+        ):
             try:
                 response = client.get(path)
                 payload = response.json()
@@ -315,6 +359,28 @@ def collect_deploy_smoke_check(
                     'status_code': response.status_code,
                     'app_status': app_status,
                     'database_connected': database_connected,
+                }
+            elif name == 'market_snapshot':
+                markets = payload.get('markets') if isinstance(payload.get('markets'), dict) else {}
+                kospi = markets.get('kospi') if isinstance(markets.get('kospi'), dict) else {}
+                kosdaq = markets.get('kosdaq') if isinstance(markets.get('kosdaq'), dict) else {}
+                usd_krw = payload.get('usd_krw') if isinstance(payload.get('usd_krw'), dict) else {}
+                ok = (
+                    response.status_code == 200
+                    and bool(payload.get('as_of'))
+                    and usd_krw.get('rate') is not None
+                    and kospi.get('value') is not None
+                    and kosdaq.get('value') is not None
+                )
+                checks[name] = {
+                    'ok': ok,
+                    'path': path,
+                    'status_code': response.status_code,
+                    'as_of': payload.get('as_of'),
+                    'usd_krw_rate': usd_krw.get('rate'),
+                    'kospi_value': kospi.get('value'),
+                    'kosdaq_value': kosdaq.get('value'),
+                    'detail': payload.get('detail'),
                 }
             else:
                 today = payload.get('today') if isinstance(payload.get('today'), dict) else {}
@@ -352,9 +418,16 @@ def _render_smoke_check_text(report: dict[str, Any]) -> str:
         if name == 'health':
             detail_parts.append(f"app_status={check.get('app_status')}")
             detail_parts.append(f"database_connected={check.get('database_connected')}")
+        elif name == 'market_snapshot':
+            detail_parts.append(f"as_of={check.get('as_of')}")
+            detail_parts.append(f"usd_krw_rate={check.get('usd_krw_rate')}")
+            detail_parts.append(f"kospi_value={check.get('kospi_value')}")
+            detail_parts.append(f"kosdaq_value={check.get('kosdaq_value')}")
         else:
             detail_parts.append(f"today_trade_date={check.get('today_trade_date')}")
             detail_parts.append(f"latest_trade_date={check.get('latest_trade_date')}")
+        if check.get('detail'):
+            detail_parts.append(f"detail={check['detail']}")
         if check.get('error'):
             detail_parts.append(f"error={check['error']}")
         lines.append(f"- {name}: {'ok' if check['ok'] else 'fail'} ({', '.join(detail_parts)})")
@@ -381,7 +454,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     smoke_parser = subparsers.add_parser(
         'smoke-check',
-        help='Hit /health and /eod/freshness after restart and fail if the service does not look healthy.',
+        help='Hit /health, /eod/freshness, and /market/snapshot after restart and fail if the service does not look healthy.',
     )
     smoke_parser.add_argument('--base-url', default='http://127.0.0.1:8000')
     smoke_parser.add_argument('--timeout-seconds', type=float, default=10.0)

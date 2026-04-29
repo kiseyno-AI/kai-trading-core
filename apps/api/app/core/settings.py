@@ -35,6 +35,7 @@ class Settings(BaseSettings):
     kis_base_url: str = 'https://openapi.koreainvestment.com:9443'
     kis_mock_base_url: str = 'https://openapivts.koreainvestment.com:29443'
     kis_use_mock: bool = True
+    market_snapshot_kis_use_real: bool = True
     kis_hts_id: str = ''
     kis_token_refresh_margin_seconds: int = 300
     kis_realtime_trending_cache_ttl_seconds: int = 20

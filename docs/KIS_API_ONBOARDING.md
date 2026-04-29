@@ -32,4 +32,5 @@
 ## Notes
 - Do not commit real secrets
 - Start with mock trading base URL first
+- `GET /market/snapshot` is the exception to the general mock-first guidance: it uses real-domain KIS market data by default because the selected index and investor-flow APIs do not exist on the mock domain. Keep `MARKET_SNAPSHOT_KIS_USE_REAL=true` and set `KOREAEXIM_API_KEY` alongside the KIS credentials when you need that route.
 - Add account, quote, balance, and order adapters after token flow is confirmed

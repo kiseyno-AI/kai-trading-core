@@ -99,8 +99,9 @@ Use these commands from `apps/api` when you want deploy-time schema checks to fa
 Notes:
 
 - The preflight is intentionally non-destructive. It does not mutate schema state.
+- The preflight now also reports whether `/market/snapshot` is runtime-ready before restart, including the resolved KIS environment and any missing required secrets.
 - The duplicate-table warning is heuristic by design: it flags live tables that overlap with still-pending unguarded `create_table(...)` revisions, which is the common `alembic_version` lag pattern behind repeated `DuplicateTable` deploy failures.
-- The smoke command automatically sends `Authorization: Bearer <token>` when `UPSTREAM_BEARER_TOKEN` is set in the current shell environment.
+- The smoke command now exercises `/market/snapshot` in addition to `/health` and `/eod/freshness`, and automatically sends `Authorization: Bearer <token>` when `UPSTREAM_BEARER_TOKEN` is set in the current shell environment.
 
 ## Duplicate-table drift recovery
 
@@ -286,6 +287,13 @@ Set this up under a long-running process manager (LaunchAgent, systemd, pm2, or 
 - `GET /fx/koreaexim/rates` currently targets the Korea Exim `AP01` daily exchange-rate slice only.
 - Optional query parameters: `search_date=YYYYMMDD`, `currency=USD`, and `fallback_days=0..10`.
 - `KOREAEXIM_FALLBACK_DAYS` controls how many prior days the service searches when the requested date is a weekend or holiday.
+
+## Market snapshot notes
+
+- `GET /market/snapshot` is a production-facing dashboard dependency and now resolves KIS reads against the real domain by default, even when the broader process still uses `KIS_USE_MOCK=true` for other flows.
+- Keep `MARKET_SNAPSHOT_KIS_USE_REAL=true` unless you intentionally want deploy preflight and smoke-check to fail the market snapshot path.
+- Required deploy-time secrets for the route are `KIS_APP_KEY`, `KIS_APP_SECRET`, and `KOREAEXIM_API_KEY`.
+- Use `GET /broker/kis/health` to inspect `market_snapshot_runtime` when deploy preflight or smoke-check reports a market snapshot readiness failure.
 
 ## ECOS notes
 
