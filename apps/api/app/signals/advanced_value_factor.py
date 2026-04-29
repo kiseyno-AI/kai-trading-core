@@ -272,6 +272,7 @@ def _serialize_highlight_row(row: DartFundamentalsHighlight) -> dict[str, Any]:
         'account_name': row.account_name,
         'current_amount': row.current_amount,
         'current_cumulative_amount': row.current_cumulative_amount,
+        'ratio_value': _round(float(row.ratio_value), 6) if row.ratio_value is not None else None,
         'currency': row.currency,
     }
 

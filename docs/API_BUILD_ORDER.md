@@ -32,13 +32,14 @@
 29. Daily beta factor compute/read routes
 30. Daily advanced value factor compute/read routes
 31. Daily unified value factor compute/read routes
-32. Daily composite factor compute/read routes
-33. Signal-decider evaluation, diagnostics, and policy-candidate routes
-34. Internal trading order control, inquiry, and reconciliation routes
-35. Signal-decider next-open execution planning and market-open submit routes
-36. Signal-decider intraday auto-sell diagnostics and runtime submit routes
-37. Signal-decider actual execution outcome reporting routes
-38. Signal-decider replay review calendar routes
+32. Daily quality factor compute/read routes
+33. Daily composite factor compute/read routes
+34. Signal-decider evaluation, diagnostics, and policy-candidate routes
+35. Internal trading order control, inquiry, and reconciliation routes
+36. Signal-decider next-open execution planning and market-open submit routes
+37. Signal-decider intraday auto-sell diagnostics and runtime submit routes
+38. Signal-decider actual execution outcome reporting routes
+39. Signal-decider replay review calendar routes
 
 ## Current routes
 - `POST /broker/kis/token`
@@ -126,6 +127,8 @@
 - `GET /eod/advanced-value-factors?market_date=YYYY-MM-DD&symbol=005930`
 - `POST /eod/unified-value-factors/compute?market_date=YYYY-MM-DD&symbols=005930,000660&source=unified_value_v1`
 - `GET /eod/unified-value-factors?market_date=YYYY-MM-DD&symbol=005930`
+- `POST /eod/quality-factors/compute?market_date=YYYY-MM-DD&symbols=005930,000660&source=quality_v1`
+- `GET /eod/quality-factors?market_date=YYYY-MM-DD&symbol=005930`
 - `POST /eod/composite-factors/compute?market_date=YYYY-MM-DD&symbols=005930,000660&source=composite_v1`
 - `GET /eod/composite-factors?market_date=YYYY-MM-DD&symbol=005930`
 - `GET /eod/screening-results?family=composite&market_date=YYYY-MM-DD&limit=100&offset=0`
@@ -466,6 +469,17 @@
 - The explicit top-level status taxonomy is `scored`, `invalid_per`, `missing_metric`, `insufficient_components`, `missing_market_date_bar`, and `insufficient_fundamentals`.
 - The pipeline stage is separate from both filtering and composite scoring. `GET /eod/pipeline/stages` exposes it as `unified_value_factors`, and `GET /eod/screening-results?family=unified_value` is the compact dashboard-facing read layer for its stored results.
 - For shell-driven operations, use `python3.11 -m app.internal.ops eod-unified-value-factors-compute --market-date YYYY-MM-DD` from `apps/api`.
+
+## Quality factor notes
+- `daily_quality_factor_results` is the DB-backed practical quality layer keyed by `symbol_id + market_date`, persisted separately from Piotroski filtering and from any later richer quality models.
+- `POST /eod/quality-factors/compute` rebuilds persisted rows from stored `daily_price_bars` plus the latest stored annual DART fundamentals snapshot on or before the requested `market_date`; it does not call live quote, broker, or execution paths during the request.
+- `GET /eod/quality-factors` is the persisted read API for that table. When `symbol` is provided, the route returns a single `item`; without `symbol`, it returns ordered `items` for the requested date.
+- `quality_v1` ranks six practical stored-data components cross-sectionally over the full market-date universe: higher `roe`, higher `roa`, higher `gross_profit_to_assets`, higher `operating_cash_flow_to_net_income`, lower `debt_ratio`, and lower `accruals_ratio`.
+- `gross_profit_to_assets` intentionally uses the currently feasible stored proxy `gross_margin * asset_turnover`, and `accruals_ratio` is explicitly `(net_income - operating_cash_flow) / total_assets`.
+- The final `quality_score` is the equal-weight mean of whichever component percentiles are available for that symbol on that `market_date`. `components_possible` is fixed at the six practical v1 components, `components_used` records how many percentile inputs were actually used, and `is_quality_score_complete=true` only when all six components were available and used.
+- Partial scoring is explicit rather than silent. Rows with at least one valid component persist as either `quality_status=scored_complete` or `quality_status=scored_partial`. Rows with zero usable components still persist with auditable per-component statuses plus a non-scored top-level `quality_status`.
+- The current top-level status taxonomy is `scored_complete`, `scored_partial`, `missing_metric`, `invalid_equity`, `invalid_assets`, `invalid_net_income`, `insufficient_components`, `insufficient_fundamentals`, and `missing_market_date_bar`.
+- The pipeline stage is separate from filtering and composite scoring. `GET /eod/pipeline/stages` exposes it as `quality_factors`, and the shell-driven path is `python3.11 -m app.internal.ops eod-quality-factors-compute --market-date YYYY-MM-DD` from `apps/api`.
 
 ## Composite factor notes
 - `daily_composite_factor_results` is the persisted integrated ranking layer keyed by `symbol_id + market_date`, built on top of the stored momentum, value v1, advanced value, low-risk, and beta slices.

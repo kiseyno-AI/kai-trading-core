@@ -24,6 +24,7 @@ from app.db_models import (
     DailyPiotroskiFilterResult,
     DailyPriceBar,
     DailyPriceContext,
+    DailyQualityFactorResult,
     DailySignalFeature,
     DailyTechnicalSnapshot,
     DailyTrendingRank,
@@ -2900,6 +2901,189 @@ def load_daily_unified_value_factor_results(
                 'unified_value_percentile': _round_float(item.unified_value_percentile, 6),
                 'components_used': item.components_used,
                 'unified_value_status': item.unified_value_status,
+                'factor_payload': item.factor_payload,
+                'captured_at': item.captured_at.isoformat() if item.captured_at else None,
+            }
+            for item, symbol, name_ko, market in rows
+        ]
+
+
+def upsert_daily_quality_factor_result(result: dict) -> None:
+    refreshed_at = datetime.utcnow()
+    with session_scope() as session:
+        symbol = _get_symbol(session, result['symbol'])
+        if symbol is None:
+            symbol = Symbol(
+                symbol=result['symbol'],
+                market=result.get('market', 'KRX'),
+                name_ko=result.get('name_ko') or result['symbol'],
+                instrument_type='equity',
+                source=result.get('source', 'quality_v1'),
+                is_active=True,
+                last_refreshed_at=refreshed_at,
+            )
+            session.add(symbol)
+            session.flush()
+
+        values = {
+            'symbol_id': symbol.id,
+            'market_date': _normalize_trade_date(result['market_date']),
+            'source': result.get('source', 'quality_v1'),
+            'roe': result.get('roe'),
+            'roa': result.get('roa'),
+            'gross_profit_to_assets': result.get('gross_profit_to_assets'),
+            'operating_cash_flow_to_net_income': result.get('operating_cash_flow_to_net_income'),
+            'debt_ratio': result.get('debt_ratio'),
+            'accruals_ratio': result.get('accruals_ratio'),
+            'roe_status': result.get('roe_status', 'missing_metric'),
+            'roa_status': result.get('roa_status', 'missing_metric'),
+            'gross_profit_to_assets_status': result.get('gross_profit_to_assets_status', 'missing_metric'),
+            'operating_cash_flow_to_net_income_status': result.get(
+                'operating_cash_flow_to_net_income_status',
+                'missing_metric',
+            ),
+            'debt_ratio_status': result.get('debt_ratio_status', 'missing_metric'),
+            'accruals_ratio_status': result.get('accruals_ratio_status', 'missing_metric'),
+            'roe_rank': result.get('roe_rank'),
+            'roa_rank': result.get('roa_rank'),
+            'gross_profit_to_assets_rank': result.get('gross_profit_to_assets_rank'),
+            'operating_cash_flow_to_net_income_rank': result.get('operating_cash_flow_to_net_income_rank'),
+            'debt_ratio_rank': result.get('debt_ratio_rank'),
+            'accruals_ratio_rank': result.get('accruals_ratio_rank'),
+            'roe_percentile': result.get('roe_percentile'),
+            'roa_percentile': result.get('roa_percentile'),
+            'gross_profit_to_assets_percentile': result.get('gross_profit_to_assets_percentile'),
+            'operating_cash_flow_to_net_income_percentile': result.get(
+                'operating_cash_flow_to_net_income_percentile'
+            ),
+            'debt_ratio_percentile': result.get('debt_ratio_percentile'),
+            'accruals_ratio_percentile': result.get('accruals_ratio_percentile'),
+            'quality_score': result.get('quality_score'),
+            'quality_rank': result.get('quality_rank'),
+            'quality_percentile': result.get('quality_percentile'),
+            'components_possible': int(result.get('components_possible') or 0),
+            'components_used': int(result.get('components_used') or 0),
+            'is_quality_score_complete': bool(result.get('is_quality_score_complete')),
+            'quality_status': result.get('quality_status', 'insufficient_components'),
+            'factor_payload': result['factor_payload'],
+            'captured_at': refreshed_at,
+            'updated_at': refreshed_at,
+        }
+        statement = pg_insert(DailyQualityFactorResult).values(values)
+        session.execute(
+            statement.on_conflict_do_update(
+                constraint='uq_daily_quality_factor_results_symbol_market_date',
+                set_={
+                    'source': statement.excluded.source,
+                    'roe': statement.excluded.roe,
+                    'roa': statement.excluded.roa,
+                    'gross_profit_to_assets': statement.excluded.gross_profit_to_assets,
+                    'operating_cash_flow_to_net_income': statement.excluded.operating_cash_flow_to_net_income,
+                    'debt_ratio': statement.excluded.debt_ratio,
+                    'accruals_ratio': statement.excluded.accruals_ratio,
+                    'roe_status': statement.excluded.roe_status,
+                    'roa_status': statement.excluded.roa_status,
+                    'gross_profit_to_assets_status': statement.excluded.gross_profit_to_assets_status,
+                    'operating_cash_flow_to_net_income_status': statement.excluded.operating_cash_flow_to_net_income_status,
+                    'debt_ratio_status': statement.excluded.debt_ratio_status,
+                    'accruals_ratio_status': statement.excluded.accruals_ratio_status,
+                    'roe_rank': statement.excluded.roe_rank,
+                    'roa_rank': statement.excluded.roa_rank,
+                    'gross_profit_to_assets_rank': statement.excluded.gross_profit_to_assets_rank,
+                    'operating_cash_flow_to_net_income_rank': statement.excluded.operating_cash_flow_to_net_income_rank,
+                    'debt_ratio_rank': statement.excluded.debt_ratio_rank,
+                    'accruals_ratio_rank': statement.excluded.accruals_ratio_rank,
+                    'roe_percentile': statement.excluded.roe_percentile,
+                    'roa_percentile': statement.excluded.roa_percentile,
+                    'gross_profit_to_assets_percentile': statement.excluded.gross_profit_to_assets_percentile,
+                    'operating_cash_flow_to_net_income_percentile': statement.excluded.operating_cash_flow_to_net_income_percentile,
+                    'debt_ratio_percentile': statement.excluded.debt_ratio_percentile,
+                    'accruals_ratio_percentile': statement.excluded.accruals_ratio_percentile,
+                    'quality_score': statement.excluded.quality_score,
+                    'quality_rank': statement.excluded.quality_rank,
+                    'quality_percentile': statement.excluded.quality_percentile,
+                    'components_possible': statement.excluded.components_possible,
+                    'components_used': statement.excluded.components_used,
+                    'is_quality_score_complete': statement.excluded.is_quality_score_complete,
+                    'quality_status': statement.excluded.quality_status,
+                    'factor_payload': statement.excluded.factor_payload,
+                    'captured_at': statement.excluded.captured_at,
+                    'updated_at': refreshed_at,
+                },
+            )
+        )
+
+
+def load_daily_quality_factor_results(
+    *,
+    market_date: str | date,
+    symbols: list[str] | None = None,
+    status: str | None = None,
+    limit: int | None = None,
+) -> list[dict]:
+    with session_scope() as session:
+        stmt = (
+            select(DailyQualityFactorResult, Symbol.symbol, Symbol.name_ko, Symbol.market)
+            .join(Symbol, Symbol.id == DailyQualityFactorResult.symbol_id)
+            .where(DailyQualityFactorResult.market_date == _normalize_trade_date(market_date))
+            .order_by(
+                DailyQualityFactorResult.quality_rank.asc().nullslast(),
+                DailyQualityFactorResult.quality_score.desc().nullslast(),
+                DailyQualityFactorResult.is_quality_score_complete.desc(),
+                DailyQualityFactorResult.components_used.desc(),
+                Symbol.symbol.asc(),
+            )
+        )
+        if limit is not None:
+            stmt = stmt.limit(limit)
+        if symbols:
+            stmt = stmt.where(Symbol.symbol.in_(symbols))
+        if status is not None:
+            stmt = stmt.where(DailyQualityFactorResult.quality_status == status)
+
+        rows = session.execute(stmt).all()
+        return [
+            {
+                'symbol': symbol,
+                'name_ko': name_ko,
+                'market': market,
+                'market_date': item.market_date.isoformat(),
+                'source': item.source,
+                'feature_version': item.source,
+                'roe': _round_float(item.roe, 6),
+                'roa': _round_float(item.roa, 6),
+                'gross_profit_to_assets': _round_float(item.gross_profit_to_assets, 6),
+                'operating_cash_flow_to_net_income': _round_float(item.operating_cash_flow_to_net_income, 6),
+                'debt_ratio': _round_float(item.debt_ratio, 6),
+                'accruals_ratio': _round_float(item.accruals_ratio, 6),
+                'roe_status': item.roe_status,
+                'roa_status': item.roa_status,
+                'gross_profit_to_assets_status': item.gross_profit_to_assets_status,
+                'operating_cash_flow_to_net_income_status': item.operating_cash_flow_to_net_income_status,
+                'debt_ratio_status': item.debt_ratio_status,
+                'accruals_ratio_status': item.accruals_ratio_status,
+                'roe_rank': item.roe_rank,
+                'roa_rank': item.roa_rank,
+                'gross_profit_to_assets_rank': item.gross_profit_to_assets_rank,
+                'operating_cash_flow_to_net_income_rank': item.operating_cash_flow_to_net_income_rank,
+                'debt_ratio_rank': item.debt_ratio_rank,
+                'accruals_ratio_rank': item.accruals_ratio_rank,
+                'roe_percentile': _round_float(item.roe_percentile, 6),
+                'roa_percentile': _round_float(item.roa_percentile, 6),
+                'gross_profit_to_assets_percentile': _round_float(item.gross_profit_to_assets_percentile, 6),
+                'operating_cash_flow_to_net_income_percentile': _round_float(
+                    item.operating_cash_flow_to_net_income_percentile,
+                    6,
+                ),
+                'debt_ratio_percentile': _round_float(item.debt_ratio_percentile, 6),
+                'accruals_ratio_percentile': _round_float(item.accruals_ratio_percentile, 6),
+                'quality_score': _round_float(item.quality_score, 6),
+                'quality_rank': item.quality_rank,
+                'quality_percentile': _round_float(item.quality_percentile, 6),
+                'components_possible': item.components_possible,
+                'components_used': item.components_used,
+                'is_quality_score_complete': item.is_quality_score_complete,
+                'quality_status': item.quality_status,
                 'factor_payload': item.factor_payload,
                 'captured_at': item.captured_at.isoformat() if item.captured_at else None,
             }

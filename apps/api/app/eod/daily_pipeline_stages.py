@@ -37,6 +37,7 @@ from app.signals.market_risk_snapshot import (
 )
 from app.signals.momentum_factor import daily_momentum_factor_service
 from app.signals.piotroski_filter import daily_piotroski_filter_service
+from app.signals.quality_factor import QUALITY_FACTOR_SOURCE, daily_quality_factor_service
 from app.signals.unified_value_factor import (
     UNIFIED_VALUE_FACTOR_SOURCE,
     daily_unified_value_factor_service,
@@ -58,6 +59,7 @@ FACTOR_STAGE_ORDER: tuple[str, ...] = (
     'beta_factors',
     'advanced_value_factors',
     'unified_value_factors',
+    'quality_factors',
     'composite_factors',
 )
 DAILY_STAGE_ORDER: tuple[str, ...] = (
@@ -300,6 +302,16 @@ STAGE_DEFINITIONS: dict[str, DailyStageDefinition] = {
         supports_symbols=True,
         inspect_routes=('/eod/unified-value-factors', '/eod/screening-results'),
         output_tables=('daily_unified_value_factor_results',),
+    ),
+    'quality_factors': DailyStageDefinition(
+        id='quality_factors',
+        label='quality factor compute',
+        group='factors',
+        description='Rebuild persisted practical quality factor rows from stored price bars and annual fundamentals.',
+        depends_on=('price_collection', 'fundamentals_daily_refresh'),
+        supports_symbols=True,
+        inspect_routes=('/eod/quality-factors',),
+        output_tables=('daily_quality_factor_results',),
     ),
     'composite_factors': DailyStageDefinition(
         id='composite_factors',
@@ -569,6 +581,12 @@ class DailyPipelineStageService:
                 market_date=market_date,
                 symbols=symbols,
                 source=UNIFIED_VALUE_FACTOR_SOURCE,
+            )
+        if stage_id == 'quality_factors':
+            return daily_quality_factor_service.rebuild_for_market_date(
+                market_date=market_date,
+                symbols=symbols,
+                source=QUALITY_FACTOR_SOURCE,
             )
         if stage_id == 'composite_factors':
             return daily_composite_factor_service.rebuild_for_market_date(
