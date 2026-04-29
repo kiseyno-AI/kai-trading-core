@@ -30,6 +30,9 @@ DEFAULT_SIGNAL_DECIDER_POLICY_CREATED_BY = 'system:bootstrap'
 DEFAULT_SIGNAL_DECIDER_POLICY_ACTIVATION_MODE = 'manual_only'
 DEFAULT_POLICY_CANDIDATE_STATUS = 'generated'
 DEFAULT_SIGNAL_DECIDER_EVALUATION_LOOKBACK_DAYS = 30
+DEFAULT_SIGNAL_DECIDER_REVIEW_PRIMARY_HORIZON = 5
+DEFAULT_SIGNAL_DECIDER_REVIEW_HORIZONS: tuple[int, ...] = (1, 3, 5)
+SIGNAL_DECIDER_REPLAY_REVIEW_VERSION = 'signal_decider_replay_review_v1'
 SIGNAL_DECIDER_POLICY_STATUSES: tuple[str, ...] = ('draft', 'candidate', 'active', 'retired')
 SIGNAL_DECIDER_EVALUATION_HORIZONS: tuple[int, ...] = (1, 3, 5, 10)
 SIGNAL_DECIDER_ACTIONS: tuple[str, ...] = ('buy', 'wait', 'reject')
@@ -52,6 +55,87 @@ POLICY_VERSION_AUDIT_METADATA_KEYS: tuple[str, ...] = (
     'last_activation_note',
     'retired_by_activation_of',
 )
+SIGNAL_DECIDER_REPLAY_PATH_MARKERS: tuple[str, ...] = (
+    'pending',
+    'target_hit',
+    'stop_hit',
+    'collision',
+    'neither',
+)
+SIGNAL_DECIDER_REPLAY_INSIGHT_TAXONOMY: dict[str, dict[str, Any]] = {
+    'evaluation_pending': {
+        'code': 'evaluation_pending',
+        'label': 'Replay pending',
+        'label_key': 'signal_decider.review.evaluation_pending',
+        'decision_actions': list(SIGNAL_DECIDER_ACTIONS),
+        'description': 'The requested replay horizon is not fully evaluated yet.',
+        'outcome_tone': 'pending',
+    },
+    'buy_should_have_taken': {
+        'code': 'buy_should_have_taken',
+        'label': 'Buy held up',
+        'label_key': 'signal_decider.review.buy_should_have_taken',
+        'decision_actions': ['buy'],
+        'description': 'The buy decision kept a constructive replay path on the requested horizon.',
+        'outcome_tone': 'positive',
+    },
+    'buy_stopped_out': {
+        'code': 'buy_stopped_out',
+        'label': 'Buy stopped out',
+        'label_key': 'signal_decider.review.buy_stopped_out',
+        'decision_actions': ['buy'],
+        'description': 'The replay path would have touched the stop before resolving favorably.',
+        'outcome_tone': 'negative',
+    },
+    'buy_no_edge': {
+        'code': 'buy_no_edge',
+        'label': 'Buy had no edge',
+        'label_key': 'signal_decider.review.buy_no_edge',
+        'decision_actions': ['buy'],
+        'description': 'The buy decision finished without a convincing positive edge on the replay window.',
+        'outcome_tone': 'negative',
+    },
+    'wait_correct': {
+        'code': 'wait_correct',
+        'label': 'Wait was correct',
+        'label_key': 'signal_decider.review.wait_correct',
+        'decision_actions': ['wait'],
+        'description': 'The replay path did not justify entering on the requested horizon.',
+        'outcome_tone': 'positive',
+    },
+    'wait_missed_opportunity': {
+        'code': 'wait_missed_opportunity',
+        'label': 'Wait missed opportunity',
+        'label_key': 'signal_decider.review.wait_missed_opportunity',
+        'decision_actions': ['wait'],
+        'description': 'The replay path later justified a buy, so waiting was too conservative.',
+        'outcome_tone': 'negative',
+    },
+    'reject_correct': {
+        'code': 'reject_correct',
+        'label': 'Reject was correct',
+        'label_key': 'signal_decider.review.reject_correct',
+        'decision_actions': ['reject'],
+        'description': 'The rejected setup did not earn a later buy on the requested horizon.',
+        'outcome_tone': 'positive',
+    },
+    'reject_too_conservative': {
+        'code': 'reject_too_conservative',
+        'label': 'Reject was too conservative',
+        'label_key': 'signal_decider.review.reject_too_conservative',
+        'decision_actions': ['reject'],
+        'description': 'The rejected setup later showed a buyable replay path.',
+        'outcome_tone': 'negative',
+    },
+    'ambiguous_target_stop_collision': {
+        'code': 'ambiguous_target_stop_collision',
+        'label': 'Ambiguous target/stop collision',
+        'label_key': 'signal_decider.review.ambiguous_target_stop_collision',
+        'decision_actions': list(SIGNAL_DECIDER_ACTIONS),
+        'description': 'Target and stop were both touchable on the same replay session, so the path is ambiguous.',
+        'outcome_tone': 'ambiguous',
+    },
+}
 
 
 @dataclass(frozen=True)
@@ -153,6 +237,44 @@ def _normalize_horizons(horizons: Sequence[int] | None) -> list[int]:
             f'horizons must be drawn from {list(SIGNAL_DECIDER_EVALUATION_HORIZONS)}; got {invalid}'
         )
     return normalized
+
+
+def _resolve_review_horizons(
+    horizons: Sequence[int] | None,
+    *,
+    primary_horizon_days: int | None = None,
+) -> tuple[list[int], int]:
+    normalized_primary = (
+        DEFAULT_SIGNAL_DECIDER_REVIEW_PRIMARY_HORIZON if primary_horizon_days is None else int(primary_horizon_days)
+    )
+    if normalized_primary not in SIGNAL_DECIDER_EVALUATION_HORIZONS:
+        raise ValueError(
+            f'primary_horizon_days must be drawn from {list(SIGNAL_DECIDER_EVALUATION_HORIZONS)}'
+        )
+    normalized_horizons = (
+        list(DEFAULT_SIGNAL_DECIDER_REVIEW_HORIZONS)
+        if not horizons
+        else _normalize_horizons(horizons)
+    )
+    if normalized_primary not in normalized_horizons:
+        normalized_horizons = sorted({*normalized_horizons, normalized_primary})
+    return normalized_horizons, normalized_primary
+
+
+def _resolve_calendar_month_window(month: str) -> tuple[str, date, date]:
+    normalized = str(month or '').strip()
+    if len(normalized) != 7 or normalized[4] != '-':
+        raise ValueError('month must use YYYY-MM format')
+    try:
+        start_date = date.fromisoformat(f'{normalized}-01')
+    except ValueError as exc:
+        raise ValueError('month must use YYYY-MM format') from exc
+    if start_date.month == 12:
+        next_month = date(start_date.year + 1, 1, 1)
+    else:
+        next_month = date(start_date.year, start_date.month + 1, 1)
+    end_date = next_month - timedelta(days=1)
+    return normalized, start_date, end_date
 
 
 def _resolve_market_date_window(
@@ -1895,6 +2017,146 @@ class SignalDeciderLoopService:
             'item': detail_item,
         }
 
+    def get_review_calendar(
+        self,
+        *,
+        month: str,
+        horizons: Sequence[int] | None = None,
+        primary_horizon_days: int = DEFAULT_SIGNAL_DECIDER_REVIEW_PRIMARY_HORIZON,
+        evaluation_version: str | None = None,
+    ) -> dict[str, Any]:
+        normalized_month, market_date_from, market_date_to = _resolve_calendar_month_window(month)
+        resolved_horizons, resolved_primary_horizon = _resolve_review_horizons(
+            horizons,
+            primary_horizon_days=primary_horizon_days,
+        )
+        resolved_evaluation_version = (
+            _normalize_optional_text(evaluation_version, default=DEFAULT_SIGNAL_DECIDER_EVALUATION_VERSION)
+            or DEFAULT_SIGNAL_DECIDER_EVALUATION_VERSION
+        )
+        rows = self.repository.list_decision_snapshots(
+            market_date_from=market_date_from,
+            market_date_to=market_date_to,
+        )
+        items, summary = self._build_calendar_summary_items(
+            rows=rows,
+            horizons=resolved_horizons,
+            primary_horizon_days=resolved_primary_horizon,
+            evaluation_version=resolved_evaluation_version,
+        )
+        return {
+            'request': {
+                'month': normalized_month,
+                'market_date_from': market_date_from.isoformat(),
+                'market_date_to': market_date_to.isoformat(),
+                'horizons': resolved_horizons,
+                'primary_horizon_days': resolved_primary_horizon,
+                'evaluation_version': resolved_evaluation_version,
+            },
+            'read_model': self._build_replay_read_model_descriptor(),
+            'taxonomy': self._build_replay_review_taxonomy(),
+            'summary': summary,
+            'items': items,
+        }
+
+    def get_review_date(
+        self,
+        *,
+        market_date: str | date,
+        horizons: Sequence[int] | None = None,
+        primary_horizon_days: int = DEFAULT_SIGNAL_DECIDER_REVIEW_PRIMARY_HORIZON,
+        evaluation_version: str | None = None,
+    ) -> dict[str, Any]:
+        normalized_market_date = _normalize_market_date(market_date)
+        resolved_horizons, resolved_primary_horizon = _resolve_review_horizons(
+            horizons,
+            primary_horizon_days=primary_horizon_days,
+        )
+        resolved_evaluation_version = (
+            _normalize_optional_text(evaluation_version, default=DEFAULT_SIGNAL_DECIDER_EVALUATION_VERSION)
+            or DEFAULT_SIGNAL_DECIDER_EVALUATION_VERSION
+        )
+        rows = self.repository.list_decision_snapshots(market_date=normalized_market_date)
+        items = self._build_review_items(
+            rows=rows,
+            horizons=resolved_horizons,
+            primary_horizon_days=resolved_primary_horizon,
+            evaluation_version=resolved_evaluation_version,
+            include_detail_payloads=False,
+        )
+        return {
+            'request': {
+                'market_date': normalized_market_date.isoformat(),
+                'horizons': resolved_horizons,
+                'primary_horizon_days': resolved_primary_horizon,
+                'evaluation_version': resolved_evaluation_version,
+            },
+            'read_model': self._build_replay_read_model_descriptor(),
+            'taxonomy': self._build_replay_review_taxonomy(),
+            'summary': self._build_review_items_summary(
+                items=items,
+                horizons=resolved_horizons,
+                primary_horizon_days=resolved_primary_horizon,
+                evaluation_version=resolved_evaluation_version,
+            ),
+            'items': items,
+        }
+
+    def get_review_detail(
+        self,
+        *,
+        market_date: str | date,
+        snapshot_id: int,
+        horizons: Sequence[int] | None = None,
+        primary_horizon_days: int = DEFAULT_SIGNAL_DECIDER_REVIEW_PRIMARY_HORIZON,
+        evaluation_version: str | None = None,
+    ) -> dict[str, Any]:
+        normalized_market_date = _normalize_market_date(market_date)
+        normalized_snapshot_id = int(snapshot_id)
+        resolved_horizons, resolved_primary_horizon = _resolve_review_horizons(
+            horizons,
+            primary_horizon_days=primary_horizon_days,
+        )
+        resolved_evaluation_version = (
+            _normalize_optional_text(evaluation_version, default=DEFAULT_SIGNAL_DECIDER_EVALUATION_VERSION)
+            or DEFAULT_SIGNAL_DECIDER_EVALUATION_VERSION
+        )
+        row = self.repository.get_decision_snapshot(snapshot_id=normalized_snapshot_id)
+        if row is None:
+            raise ValueError(f'signal-decider decision snapshot {normalized_snapshot_id} was not found')
+        if row.market_date != normalized_market_date:
+            raise ValueError(
+                f'signal-decider decision snapshot {normalized_snapshot_id} does not belong to market date '
+                f'{normalized_market_date.isoformat()}'
+            )
+        items = self._build_review_items(
+            rows=[row],
+            horizons=resolved_horizons,
+            primary_horizon_days=resolved_primary_horizon,
+            evaluation_version=resolved_evaluation_version,
+            include_detail_payloads=True,
+        )
+        detail_item = items[0]
+        return {
+            'request': {
+                'market_date': normalized_market_date.isoformat(),
+                'snapshot_id': normalized_snapshot_id,
+                'horizons': resolved_horizons,
+                'primary_horizon_days': resolved_primary_horizon,
+                'evaluation_version': resolved_evaluation_version,
+            },
+            'read_model': self._build_replay_read_model_descriptor(),
+            'taxonomy': self._build_replay_review_taxonomy(),
+            'summary': {
+                'market_date': normalized_market_date.isoformat(),
+                'symbol': detail_item['symbol'],
+                'review_status': detail_item['review']['status'],
+                'insight_code': detail_item['review']['insight']['code'],
+                'primary_path_marker': detail_item['review']['path_analysis']['path_marker'],
+            },
+            'item': detail_item,
+        }
+
     def get_diagnostics(
         self,
         *,
@@ -3109,6 +3371,661 @@ class SignalDeciderLoopService:
             'received_at': row.feedback_received_at.isoformat() if row.feedback_received_at else None,
             'created_at': row.created_at.isoformat() if row.created_at else None,
         }
+
+    def _build_replay_read_model_descriptor(self) -> dict[str, Any]:
+        return {
+            'name': 'signal_decider_replay_review',
+            'version': SIGNAL_DECIDER_REPLAY_REVIEW_VERSION,
+            'source_tables': [
+                'signal_decider_decision_snapshots',
+                'signal_decider_realized_outcomes',
+                'signal_decider_evaluations',
+            ],
+            'separate_from_actual_execution_outcomes': True,
+            'actual_execution_outcomes_endpoint': '/agent-context/signal-decider/execution-outcomes',
+        }
+
+    def _build_replay_review_taxonomy(self) -> dict[str, Any]:
+        return {
+            'version': SIGNAL_DECIDER_REPLAY_REVIEW_VERSION,
+            'default_horizons': list(DEFAULT_SIGNAL_DECIDER_REVIEW_HORIZONS),
+            'default_primary_horizon_days': DEFAULT_SIGNAL_DECIDER_REVIEW_PRIMARY_HORIZON,
+            'insights': [dict(SIGNAL_DECIDER_REPLAY_INSIGHT_TAXONOMY[key]) for key in SIGNAL_DECIDER_REPLAY_INSIGHT_TAXONOMY],
+            'path_markers': [
+                {
+                    'code': 'pending',
+                    'label': 'Pending',
+                    'label_key': 'signal_decider.review.path.pending',
+                    'description': 'Replay coverage is incomplete for the requested horizon.',
+                },
+                {
+                    'code': 'target_hit',
+                    'label': 'Target hit',
+                    'label_key': 'signal_decider.review.path.target_hit',
+                    'description': 'The replay path touched the configured target before the review window ended.',
+                },
+                {
+                    'code': 'stop_hit',
+                    'label': 'Stop hit',
+                    'label_key': 'signal_decider.review.path.stop_hit',
+                    'description': 'The replay path touched the configured stop before the review window ended.',
+                },
+                {
+                    'code': 'collision',
+                    'label': 'Collision',
+                    'label_key': 'signal_decider.review.path.collision',
+                    'description': 'Target and stop were both touchable on the same observed session.',
+                },
+                {
+                    'code': 'neither',
+                    'label': 'Neither',
+                    'label_key': 'signal_decider.review.path.neither',
+                    'description': 'Neither target nor stop was touched inside the replay window.',
+                },
+            ],
+        }
+
+    def _build_calendar_summary_items(
+        self,
+        *,
+        rows: Sequence[SignalDeciderDecisionSnapshot],
+        horizons: Sequence[int],
+        primary_horizon_days: int,
+        evaluation_version: str,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        review_items = self._build_review_items(
+            rows=rows,
+            horizons=horizons,
+            primary_horizon_days=primary_horizon_days,
+            evaluation_version=evaluation_version,
+            include_detail_payloads=False,
+        )
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for item in review_items:
+            grouped.setdefault(str(item['market_date']), []).append(item)
+        items: list[dict[str, Any]] = []
+        for market_date in sorted(grouped):
+            day_items = grouped[market_date]
+            day_summary = self._build_review_items_summary(
+                items=day_items,
+                horizons=horizons,
+                primary_horizon_days=primary_horizon_days,
+                evaluation_version=evaluation_version,
+            )
+            items.append(
+                {
+                    'market_date': market_date,
+                    'decision_count': day_summary['count'],
+                    'symbol_count': day_summary['symbol_count'],
+                    'decision_actions': day_summary['decision_actions'],
+                    'review_status_counts': day_summary['review_status_counts'],
+                    'evaluation_coverage': day_summary['evaluation_coverage'],
+                    'scorecard': self._build_review_scorecard(day_items),
+                }
+            )
+        overall = self._build_review_items_summary(
+            items=review_items,
+            horizons=horizons,
+            primary_horizon_days=primary_horizon_days,
+            evaluation_version=evaluation_version,
+        )
+        return (
+            items,
+            {
+                'month': rows[0].market_date.strftime('%Y-%m') if rows else None,
+                'day_count': len(items),
+                'decision_count': overall['count'],
+                'symbol_count': overall['symbol_count'],
+                'decision_actions': overall['decision_actions'],
+                'review_status_counts': overall['review_status_counts'],
+                'evaluation_coverage': overall['evaluation_coverage'],
+                'scorecard': self._build_review_scorecard(review_items),
+            },
+        )
+
+    def _build_review_items(
+        self,
+        *,
+        rows: Sequence[SignalDeciderDecisionSnapshot],
+        horizons: Sequence[int],
+        primary_horizon_days: int,
+        evaluation_version: str,
+        include_detail_payloads: bool,
+    ) -> list[dict[str, Any]]:
+        snapshot_ids = [row.id for row in rows]
+        if not snapshot_ids:
+            return []
+        outcomes_by_snapshot = self._group_by_snapshot_id(
+            self.repository.list_realized_outcomes(
+                decision_snapshot_ids=snapshot_ids,
+                horizons=horizons,
+            )
+        )
+        evaluations_by_snapshot = self._group_by_snapshot_id(
+            self.repository.list_evaluations(
+                decision_snapshot_ids=snapshot_ids,
+                horizons=horizons,
+                evaluation_version=evaluation_version,
+            )
+        )
+        return [
+            self._build_review_item(
+                row=row,
+                outcomes=outcomes_by_snapshot.get(row.id, []),
+                evaluations=evaluations_by_snapshot.get(row.id, []),
+                horizons=horizons,
+                primary_horizon_days=primary_horizon_days,
+                evaluation_version=evaluation_version,
+                include_detail_payloads=include_detail_payloads,
+            )
+            for row in rows
+        ]
+
+    def _build_review_item(
+        self,
+        *,
+        row: SignalDeciderDecisionSnapshot,
+        outcomes: Sequence[dict[str, Any]],
+        evaluations: Sequence[dict[str, Any]],
+        horizons: Sequence[int],
+        primary_horizon_days: int,
+        evaluation_version: str,
+        include_detail_payloads: bool,
+    ) -> dict[str, Any]:
+        decision = self._build_decision_snapshot(row)
+        outcomes_by_horizon = {int(item.get('horizon_days') or 0): item for item in outcomes}
+        evaluations_by_horizon = {int(item.get('horizon_days') or 0): item for item in evaluations}
+        horizon_items = [
+            self._build_horizon_review_projection(
+                horizon_days=horizon_days,
+                outcome=outcomes_by_horizon.get(horizon_days),
+                evaluation=evaluations_by_horizon.get(horizon_days),
+            )
+            for horizon_days in horizons
+        ]
+        primary_horizon = next(
+            (
+                item
+                for item in horizon_items
+                if int(item.get('horizon_days') or 0) == int(primary_horizon_days)
+            ),
+            self._build_horizon_review_projection(
+                horizon_days=primary_horizon_days,
+                outcome=None,
+                evaluation=None,
+            ),
+        )
+        insight = self._build_review_insight(
+            decision_action=_maybe_dict(decision.get('decision')).get('action'),
+            evaluation=evaluations_by_horizon.get(primary_horizon_days),
+            path_analysis=_maybe_dict(primary_horizon.get('path_analysis')),
+            primary_horizon_days=primary_horizon_days,
+        )
+        review = {
+            'status': insight['review_status'],
+            'primary_horizon_days': primary_horizon_days,
+            'evaluation_version': evaluation_version,
+            'insight': {
+                'code': insight['code'],
+                'label': insight['label'],
+                'label_key': insight['label_key'],
+                'description': insight['description'],
+                'outcome_tone': insight['outcome_tone'],
+            },
+            'narrative': insight['narrative'],
+            'path_analysis': primary_horizon['path_analysis'],
+            'rule_evaluation': insight['rule_basis'],
+            'horizons': horizon_items,
+        }
+        item = {
+            'snapshot_id': decision['snapshot_id'],
+            'feedback_id': decision['feedback_id'],
+            'decision_run_id': decision['decision_run_id'],
+            'market_date': decision['market_date'],
+            'symbol': decision['symbol'],
+            'policy_version': decision['policy_version'],
+            'decision': decision['decision'],
+            'summary': decision['summary'],
+            'supporting_evidence': decision['supporting_evidence'],
+            'decision_risks': decision['decision_risks'],
+            'received_at': decision['received_at'],
+            'created_at': decision['created_at'],
+            'review': review,
+        }
+        if include_detail_payloads:
+            request_payload = _maybe_dict(row.request_payload)
+            response_payload = _maybe_dict(row.response_payload)
+            primary_outcome = outcomes_by_horizon.get(primary_horizon_days)
+            item.update(
+                {
+                    'invalidation_conditions': decision['invalidation_conditions'],
+                    'data_quality_warnings': decision['data_quality_warnings'],
+                    'specialist_disagreement': decision['specialist_disagreement'],
+                    'traceability': decision['traceability'],
+                    'feature_snapshot': decision['feature_snapshot'],
+                    'request_payload': request_payload,
+                    'response_payload': response_payload,
+                    'response_summary': _maybe_dict(row.response_summary_payload),
+                    'upstream_summaries': request_payload.get('upstream_summaries'),
+                    'upstream_traceability': request_payload.get('upstream_traceability'),
+                    'primary_outcome': primary_outcome,
+                    'primary_evaluation': evaluations_by_horizon.get(primary_horizon_days),
+                    'observed_price_path': (
+                        list(primary_outcome.get('price_path') or [])
+                        if isinstance(primary_outcome, dict)
+                        else []
+                    ),
+                    'outcomes': list(outcomes),
+                    'evaluations': list(evaluations),
+                }
+            )
+        return item
+
+    def _build_review_items_summary(
+        self,
+        *,
+        items: Sequence[dict[str, Any]],
+        horizons: Sequence[int],
+        primary_horizon_days: int,
+        evaluation_version: str,
+    ) -> dict[str, Any]:
+        decision_actions = Counter(
+            str(_maybe_dict(item.get('decision')).get('action') or '')
+            for item in items
+            if _maybe_dict(item.get('decision')).get('action')
+        )
+        review_status_counts = Counter(
+            str(_maybe_dict(item.get('review')).get('status') or '')
+            for item in items
+            if _maybe_dict(item.get('review')).get('status')
+        )
+        insight_counts = Counter(
+            str(_maybe_dict(_maybe_dict(item.get('review')).get('insight')).get('code') or '')
+            for item in items
+            if _maybe_dict(_maybe_dict(item.get('review')).get('insight')).get('code')
+        )
+        path_marker_counts = Counter(
+            str(_maybe_dict(_maybe_dict(item.get('review')).get('path_analysis')).get('path_marker') or '')
+            for item in items
+            if _maybe_dict(_maybe_dict(item.get('review')).get('path_analysis')).get('path_marker')
+        )
+        complete_count = sum(1 for item in items if _maybe_dict(item.get('review')).get('status') == 'complete')
+        total_count = len(items)
+        if total_count == 0:
+            coverage_status = 'empty'
+        elif complete_count == total_count:
+            coverage_status = 'complete'
+        elif complete_count == 0:
+            coverage_status = 'pending'
+        else:
+            coverage_status = 'partial'
+        horizon_coverage: list[dict[str, Any]] = []
+        for horizon_days in horizons:
+            horizon_rows = [
+                horizon
+                for item in items
+                for horizon in list(_maybe_dict(item.get('review')).get('horizons') or [])
+                if int(_maybe_dict(horizon).get('horizon_days') or 0) == int(horizon_days)
+            ]
+            graded_count = sum(1 for horizon in horizon_rows if horizon.get('evaluation_status') == 'graded')
+            pending_count = sum(1 for horizon in horizon_rows if horizon.get('evaluation_status') == 'pending')
+            missing_count = sum(1 for horizon in horizon_rows if horizon.get('evaluation_status') == 'missing')
+            horizon_coverage.append(
+                {
+                    'horizon_days': horizon_days,
+                    'graded_count': graded_count,
+                    'pending_count': pending_count,
+                    'missing_count': missing_count,
+                }
+            )
+        return {
+            'count': total_count,
+            'symbol_count': len({str(item.get('symbol')) for item in items if item.get('symbol')}),
+            'decision_actions': dict(sorted(decision_actions.items())),
+            'review_status_counts': dict(sorted(review_status_counts.items())),
+            'insight_counts': dict(sorted(insight_counts.items())),
+            'path_marker_counts': dict(sorted(path_marker_counts.items())),
+            'evaluation_coverage': {
+                'primary_horizon_days': primary_horizon_days,
+                'evaluation_version': evaluation_version,
+                'complete_count': complete_count,
+                'pending_count': total_count - complete_count,
+                'coverage_ratio': round(complete_count / total_count, 6) if total_count else None,
+                'status': coverage_status,
+            },
+            'horizon_coverage': horizon_coverage,
+        }
+
+    def _build_review_scorecard(self, items: Sequence[dict[str, Any]]) -> dict[str, Any]:
+        insight_counts = Counter(
+            str(_maybe_dict(_maybe_dict(item.get('review')).get('insight')).get('code') or '')
+            for item in items
+            if _maybe_dict(_maybe_dict(item.get('review')).get('insight')).get('code')
+        )
+        path_markers = Counter(
+            str(_maybe_dict(_maybe_dict(item.get('review')).get('path_analysis')).get('path_marker') or '')
+            for item in items
+            if _maybe_dict(_maybe_dict(item.get('review')).get('path_analysis')).get('path_marker')
+        )
+        return {
+            'target_hit_count': int(path_markers.get('target_hit', 0)),
+            'stop_hit_count': int(path_markers.get('stop_hit', 0)),
+            'collision_count': int(path_markers.get('collision', 0)),
+            'neither_count': int(path_markers.get('neither', 0)),
+            'pending_count': int(path_markers.get('pending', 0)),
+            'insight_counts': dict(sorted(insight_counts.items())),
+        }
+
+    def _build_horizon_review_projection(
+        self,
+        *,
+        horizon_days: int,
+        outcome: dict[str, Any] | None,
+        evaluation: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        path_analysis = self._build_path_analysis(
+            outcome=outcome,
+            horizon_days=horizon_days,
+        )
+        return {
+            'horizon_days': horizon_days,
+            'outcome_status': str((outcome or {}).get('outcome_status') or 'missing'),
+            'evaluation_status': str((evaluation or {}).get('evaluation_status') or 'missing'),
+            'grade_label': (evaluation or {}).get('grade_label'),
+            'grade_score': _to_float((evaluation or {}).get('grade_score')),
+            'missed_opportunity': (evaluation or {}).get('missed_opportunity'),
+            'counterfactual_action': (evaluation or {}).get('counterfactual_action'),
+            'entry_trade_date': (outcome or {}).get('entry_trade_date'),
+            'exit_trade_date': (outcome or {}).get('exit_trade_date'),
+            'close_return_pct': _to_float((outcome or {}).get('close_return_pct')),
+            'max_upside_return_pct': _to_float((outcome or {}).get('max_upside_return_pct')),
+            'max_drawdown_return_pct': _to_float((outcome or {}).get('max_drawdown_return_pct')),
+            'target_hit': bool((outcome or {}).get('target_hit')),
+            'stop_loss_hit': bool((outcome or {}).get('stop_loss_hit')),
+            'target_stop_collision': bool((outcome or {}).get('target_stop_collision')),
+            'path_analysis': path_analysis,
+        }
+
+    def _build_path_analysis(
+        self,
+        *,
+        outcome: dict[str, Any] | None,
+        horizon_days: int,
+    ) -> dict[str, Any]:
+        if not outcome:
+            return {
+                'horizon_days': horizon_days,
+                'path_marker': 'pending',
+                'first_trigger': None,
+                'trigger_sequence': 'pending',
+                'thresholds_configured': False,
+                'bars_observed': 0,
+                'checkpoints': {
+                    'entry_trade_date': None,
+                    'exit_trade_date': None,
+                    'best_exit_trade_date': None,
+                    'worst_drawdown_trade_date': None,
+                    'first_target_hit_trade_date': None,
+                    'first_stop_loss_hit_trade_date': None,
+                    'observed_trade_dates': [],
+                },
+                'returns': {
+                    'close_return_pct': None,
+                    'max_upside_return_pct': None,
+                    'max_drawdown_return_pct': None,
+                },
+                'target_price': None,
+                'stop_loss_price': None,
+                'path_explanation': 'Replay coverage is not available for this horizon yet.',
+            }
+        diagnostics = _maybe_dict(outcome.get('diagnostics'))
+        outcome_status = str(outcome.get('outcome_status') or '')
+        target_price = _to_int(outcome.get('target_price'))
+        stop_loss_price = _to_int(outcome.get('stop_loss_price'))
+        thresholds_configured = target_price is not None and stop_loss_price is not None
+        first_target_hit_trade_date = _normalize_optional_text(
+            str(diagnostics.get('first_target_hit_trade_date'))
+            if diagnostics.get('first_target_hit_trade_date') is not None
+            else None
+        )
+        first_stop_loss_hit_trade_date = _normalize_optional_text(
+            str(diagnostics.get('first_stop_loss_hit_trade_date'))
+            if diagnostics.get('first_stop_loss_hit_trade_date') is not None
+            else None
+        )
+        target_hit = bool(outcome.get('target_hit'))
+        stop_hit = bool(outcome.get('stop_loss_hit'))
+        target_stop_collision = bool(outcome.get('target_stop_collision'))
+        path_marker = 'pending'
+        first_trigger: str | None = None
+        trigger_sequence = 'pending'
+        if outcome_status == 'complete':
+            if target_stop_collision or (
+                first_target_hit_trade_date
+                and first_stop_loss_hit_trade_date
+                and first_target_hit_trade_date == first_stop_loss_hit_trade_date
+            ):
+                path_marker = 'collision'
+                first_trigger = 'collision'
+                trigger_sequence = 'collision'
+            elif target_hit and stop_hit:
+                if first_target_hit_trade_date and first_stop_loss_hit_trade_date:
+                    if first_target_hit_trade_date < first_stop_loss_hit_trade_date:
+                        path_marker = 'target_hit'
+                        first_trigger = 'target_hit'
+                        trigger_sequence = 'target_before_stop'
+                    else:
+                        path_marker = 'stop_hit'
+                        first_trigger = 'stop_loss_hit'
+                        trigger_sequence = 'stop_before_target'
+                elif first_target_hit_trade_date:
+                    path_marker = 'target_hit'
+                    first_trigger = 'target_hit'
+                    trigger_sequence = 'target_only'
+                elif first_stop_loss_hit_trade_date:
+                    path_marker = 'stop_hit'
+                    first_trigger = 'stop_loss_hit'
+                    trigger_sequence = 'stop_only'
+                else:
+                    path_marker = 'collision'
+                    first_trigger = 'collision'
+                    trigger_sequence = 'collision'
+            elif target_hit:
+                path_marker = 'target_hit'
+                first_trigger = 'target_hit'
+                trigger_sequence = 'target_only'
+            elif stop_hit:
+                path_marker = 'stop_hit'
+                first_trigger = 'stop_loss_hit'
+                trigger_sequence = 'stop_only'
+            else:
+                path_marker = 'neither'
+                trigger_sequence = 'none'
+        path_explanation = self._build_path_explanation(
+            path_marker=path_marker,
+            trigger_sequence=trigger_sequence,
+            thresholds_configured=thresholds_configured,
+            horizon_days=horizon_days,
+        )
+        return {
+            'horizon_days': horizon_days,
+            'path_marker': path_marker,
+            'first_trigger': first_trigger,
+            'trigger_sequence': trigger_sequence,
+            'thresholds_configured': thresholds_configured,
+            'bars_observed': int(outcome.get('bars_observed') or 0),
+            'checkpoints': {
+                'entry_trade_date': outcome.get('entry_trade_date'),
+                'exit_trade_date': outcome.get('exit_trade_date'),
+                'best_exit_trade_date': diagnostics.get('best_exit_trade_date'),
+                'worst_drawdown_trade_date': diagnostics.get('worst_drawdown_trade_date'),
+                'first_target_hit_trade_date': first_target_hit_trade_date,
+                'first_stop_loss_hit_trade_date': first_stop_loss_hit_trade_date,
+                'observed_trade_dates': list(diagnostics.get('observed_trade_dates') or []),
+            },
+            'returns': {
+                'close_return_pct': _to_float(outcome.get('close_return_pct')),
+                'max_upside_return_pct': _to_float(outcome.get('max_upside_return_pct')),
+                'max_drawdown_return_pct': _to_float(outcome.get('max_drawdown_return_pct')),
+            },
+            'target_price': target_price,
+            'stop_loss_price': stop_loss_price,
+            'path_explanation': path_explanation,
+        }
+
+    def _build_path_explanation(
+        self,
+        *,
+        path_marker: str,
+        trigger_sequence: str,
+        thresholds_configured: bool,
+        horizon_days: int,
+    ) -> str:
+        if path_marker == 'pending':
+            return f'The {horizon_days}-day replay window is not fully observed yet.'
+        if path_marker == 'collision':
+            return 'Target and stop were both touchable on the same observed session.'
+        if path_marker == 'target_hit':
+            if trigger_sequence == 'target_before_stop':
+                return 'Target was touched before the stop-loss.'
+            if trigger_sequence == 'target_only':
+                return 'Target was touched and the stop-loss was never touched.'
+            return 'Target was touched inside the replay window.'
+        if path_marker == 'stop_hit':
+            if trigger_sequence == 'stop_before_target':
+                return 'Stop-loss was touched before the target.'
+            if trigger_sequence == 'stop_only':
+                return 'Stop-loss was touched and the target was never touched.'
+            return 'Stop-loss was touched inside the replay window.'
+        if not thresholds_configured:
+            return 'Target/stop thresholds were not both configured for this decision.'
+        return 'Neither target nor stop was touched inside the replay window.'
+
+    def _build_review_insight(
+        self,
+        *,
+        decision_action: Any,
+        evaluation: dict[str, Any] | None,
+        path_analysis: dict[str, Any],
+        primary_horizon_days: int,
+    ) -> dict[str, Any]:
+        normalized_decision_action = _normalize_action(decision_action)
+        evaluation_status = str((evaluation or {}).get('evaluation_status') or '')
+        grade_label = str((evaluation or {}).get('grade_label') or '')
+        path_marker = str(path_analysis.get('path_marker') or 'pending')
+        trigger_sequence = str(path_analysis.get('trigger_sequence') or 'pending')
+        thresholds_configured = bool(path_analysis.get('thresholds_configured'))
+        evaluation_diagnostics = _maybe_dict((evaluation or {}).get('diagnostics'))
+        severe_drawdown_before_target = bool(evaluation_diagnostics.get('severe_drawdown_before_target'))
+        review_status = 'complete'
+        if evaluation_status != 'graded' or path_marker == 'pending':
+            code = 'evaluation_pending'
+            review_status = 'pending'
+        elif path_marker == 'collision':
+            code = 'ambiguous_target_stop_collision'
+        elif normalized_decision_action == 'buy':
+            if (
+                path_marker == 'stop_hit'
+                and trigger_sequence in {'stop_before_target', 'stop_only'}
+            ) or severe_drawdown_before_target:
+                code = 'buy_stopped_out'
+            elif grade_label == 'good_buy' or (thresholds_configured and path_marker == 'target_hit'):
+                code = 'buy_should_have_taken'
+            elif grade_label == 'bad_buy':
+                code = 'buy_no_edge'
+            else:
+                code = 'buy_no_edge'
+        elif normalized_decision_action == 'wait':
+            if thresholds_configured and path_marker == 'target_hit':
+                code = 'wait_missed_opportunity'
+            elif thresholds_configured and path_marker == 'stop_hit':
+                code = 'wait_correct'
+            elif grade_label == 'missed_opportunity_after_wait':
+                code = 'wait_missed_opportunity'
+            else:
+                code = 'wait_correct'
+        else:
+            if thresholds_configured and path_marker == 'target_hit':
+                code = 'reject_too_conservative'
+            elif thresholds_configured and path_marker == 'stop_hit':
+                code = 'reject_correct'
+            elif grade_label == 'missed_opportunity_after_reject':
+                code = 'reject_too_conservative'
+            else:
+                code = 'reject_correct'
+        template = dict(SIGNAL_DECIDER_REPLAY_INSIGHT_TAXONOMY[code])
+        narrative = self._build_review_narrative(
+            code=code,
+            path_analysis=path_analysis,
+            primary_horizon_days=primary_horizon_days,
+        )
+        return {
+            **template,
+            'review_status': review_status,
+            'narrative': narrative,
+            'rule_basis': {
+                'decision_action': normalized_decision_action,
+                'evaluation_status': evaluation_status or 'missing',
+                'grade_label': grade_label or None,
+                'grade_score': _to_float((evaluation or {}).get('grade_score')),
+                'missed_opportunity': (evaluation or {}).get('missed_opportunity'),
+                'counterfactual_action': (evaluation or {}).get('counterfactual_action'),
+                'path_marker': path_marker,
+                'trigger_sequence': trigger_sequence,
+                'thresholds_configured': thresholds_configured,
+                'review_rule': code,
+            },
+        }
+
+    def _build_review_narrative(
+        self,
+        *,
+        code: str,
+        path_analysis: dict[str, Any],
+        primary_horizon_days: int,
+    ) -> str:
+        path_explanation = str(path_analysis.get('path_explanation') or '').strip()
+        if code == 'evaluation_pending':
+            return f'The {primary_horizon_days}-day replay window is still pending, so the review insight is not final.'
+        if code == 'ambiguous_target_stop_collision':
+            return (
+                f'The {primary_horizon_days}-day replay window produced a same-session target/stop collision. '
+                f'{path_explanation}'
+            )
+        if code == 'buy_should_have_taken':
+            return (
+                f'The buy setup held up on the {primary_horizon_days}-day replay window. '
+                f'{path_explanation}'
+            )
+        if code == 'buy_stopped_out':
+            return (
+                f'The buy setup would have been stopped before resolving cleanly on the '
+                f'{primary_horizon_days}-day replay window. {path_explanation}'
+            )
+        if code == 'buy_no_edge':
+            return (
+                f'The buy setup never produced a convincing positive edge on the '
+                f'{primary_horizon_days}-day replay window. {path_explanation}'
+            )
+        if code == 'wait_correct':
+            return (
+                f'Waiting was defensible on the {primary_horizon_days}-day replay window. '
+                f'{path_explanation}'
+            )
+        if code == 'wait_missed_opportunity':
+            return (
+                f'The wait call was too conservative on the {primary_horizon_days}-day replay window. '
+                f'{path_explanation}'
+            )
+        if code == 'reject_correct':
+            return (
+                f'The reject call avoided a weak or adverse setup on the '
+                f'{primary_horizon_days}-day replay window. {path_explanation}'
+            )
+        return (
+            f'The reject call looks too conservative on the {primary_horizon_days}-day replay window. '
+            f'{path_explanation}'
+        )
 
     def _load_future_price_bars(
         self,

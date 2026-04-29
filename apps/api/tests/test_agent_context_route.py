@@ -239,6 +239,9 @@ class FakeSignalDeciderLoopService:
     def __init__(self):
         self.decision_args = None
         self.detail_args = None
+        self.calendar_args = None
+        self.review_date_args = None
+        self.review_detail_args = None
         self.diagnostics_args = None
         self.aggregate_diagnostics_args = None
         self.compute_args = None
@@ -281,6 +284,81 @@ class FakeSignalDeciderLoopService:
             'request': {'snapshot_id': kwargs['snapshot_id']},
             'summary': {'evaluated_count': 1},
             'item': {'snapshot_id': kwargs['snapshot_id'], 'evaluation_summary': {'evaluated': True}},
+        }
+
+    def get_review_calendar(self, **kwargs):
+        self.calendar_args = kwargs
+        return {
+            'request': {
+                'month': kwargs['month'],
+                'horizons': kwargs['horizons'],
+                'primary_horizon_days': kwargs['primary_horizon_days'],
+                'evaluation_version': kwargs['evaluation_version'],
+            },
+            'read_model': {'name': 'signal_decider_replay_review'},
+            'taxonomy': {'version': 'signal_decider_replay_review_v1'},
+            'summary': {'day_count': 1, 'decision_count': 2},
+            'items': [
+                {
+                    'market_date': '2026-04-23',
+                    'decision_count': 2,
+                    'scorecard': {'target_hit_count': 1},
+                }
+            ],
+        }
+
+    def get_review_date(self, **kwargs):
+        self.review_date_args = kwargs
+        return {
+            'request': {
+                'market_date': kwargs['market_date'].isoformat(),
+                'horizons': kwargs['horizons'],
+                'primary_horizon_days': kwargs['primary_horizon_days'],
+                'evaluation_version': kwargs['evaluation_version'],
+            },
+            'read_model': {'name': 'signal_decider_replay_review'},
+            'taxonomy': {'version': 'signal_decider_replay_review_v1'},
+            'summary': {'count': 1, 'evaluation_coverage': {'status': 'complete'}},
+            'items': [
+                {
+                    'snapshot_id': 84,
+                    'symbol': '005930',
+                    'review': {
+                        'status': 'complete',
+                        'insight': {'code': 'buy_should_have_taken'},
+                        'path_analysis': {'path_marker': 'target_hit'},
+                    },
+                }
+            ],
+        }
+
+    def get_review_detail(self, **kwargs):
+        self.review_detail_args = kwargs
+        return {
+            'request': {
+                'market_date': kwargs['market_date'].isoformat(),
+                'snapshot_id': kwargs['snapshot_id'],
+                'horizons': kwargs['horizons'],
+                'primary_horizon_days': kwargs['primary_horizon_days'],
+                'evaluation_version': kwargs['evaluation_version'],
+            },
+            'read_model': {'name': 'signal_decider_replay_review'},
+            'taxonomy': {'version': 'signal_decider_replay_review_v1'},
+            'summary': {
+                'review_status': 'complete',
+                'insight_code': 'buy_should_have_taken',
+                'primary_path_marker': 'target_hit',
+            },
+            'item': {
+                'snapshot_id': kwargs['snapshot_id'],
+                'symbol': '005930',
+                'review': {
+                    'status': 'complete',
+                    'insight': {'code': 'buy_should_have_taken'},
+                    'path_analysis': {'path_marker': 'target_hit'},
+                },
+                'observed_price_path': [{'trade_date': '2026-04-24'}],
+            },
         }
 
     def get_diagnostics(self, **kwargs):
@@ -870,6 +948,98 @@ class AgentContextRouteTests(unittest.TestCase):
         self.assertEqual(fake_service.detail_args['horizons'], [1, 5])
         self.assertEqual(fake_service.detail_args['evaluation_version'], 'signal_decider_eval_v1')
         self.assertEqual(response.json()['item']['snapshot_id'], 84)
+
+    def test_signal_decider_review_calendar_route_calls_service(self):
+        fake_service = FakeSignalDeciderLoopService()
+        original_service = routes_agent_context.signal_decider_loop_service
+        routes_agent_context.signal_decider_loop_service = fake_service
+        try:
+            client = TestClient(self.app)
+            response = client.get(
+                '/agent-context/signal-decider/calendar',
+                params=[
+                    ('month', '2026-04'),
+                    ('horizons', '1'),
+                    ('horizons', '5'),
+                    ('primary_horizon_days', '5'),
+                    ('evaluation_version', 'signal_decider_eval_v1'),
+                ],
+            )
+        finally:
+            routes_agent_context.signal_decider_loop_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(fake_service.calendar_args['month'], '2026-04')
+        self.assertEqual(fake_service.calendar_args['horizons'], [1, 5])
+        self.assertEqual(fake_service.calendar_args['primary_horizon_days'], 5)
+        self.assertEqual(fake_service.calendar_args['evaluation_version'], 'signal_decider_eval_v1')
+        self.assertEqual(response.json()['summary']['day_count'], 1)
+        self.assertEqual(response.json()['items'][0]['scorecard']['target_hit_count'], 1)
+
+    def test_signal_decider_review_calendar_route_maps_zero_primary_horizon_to_400(self):
+        client = TestClient(self.app)
+        response = client.get(
+            '/agent-context/signal-decider/calendar',
+            params=[
+                ('month', '2026-04'),
+                ('primary_horizon_days', '0'),
+            ],
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()['detail'], 'primary_horizon_days must be drawn from [1, 3, 5, 10]')
+
+    def test_signal_decider_review_date_route_calls_service(self):
+        fake_service = FakeSignalDeciderLoopService()
+        original_service = routes_agent_context.signal_decider_loop_service
+        routes_agent_context.signal_decider_loop_service = fake_service
+        try:
+            client = TestClient(self.app)
+            response = client.get(
+                '/agent-context/signal-decider/calendar/2026-04-23',
+                params=[
+                    ('horizons', '1'),
+                    ('horizons', '3'),
+                    ('horizons', '5'),
+                    ('primary_horizon_days', '5'),
+                    ('evaluation_version', 'signal_decider_eval_v1'),
+                ],
+            )
+        finally:
+            routes_agent_context.signal_decider_loop_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(fake_service.review_date_args['market_date'], date.fromisoformat('2026-04-23'))
+        self.assertEqual(fake_service.review_date_args['horizons'], [1, 3, 5])
+        self.assertEqual(fake_service.review_date_args['primary_horizon_days'], 5)
+        self.assertEqual(fake_service.review_date_args['evaluation_version'], 'signal_decider_eval_v1')
+        self.assertEqual(response.json()['items'][0]['review']['insight']['code'], 'buy_should_have_taken')
+
+    def test_signal_decider_review_detail_route_calls_service(self):
+        fake_service = FakeSignalDeciderLoopService()
+        original_service = routes_agent_context.signal_decider_loop_service
+        routes_agent_context.signal_decider_loop_service = fake_service
+        try:
+            client = TestClient(self.app)
+            response = client.get(
+                '/agent-context/signal-decider/calendar/2026-04-23/snapshots/84',
+                params=[
+                    ('horizons', '1'),
+                    ('horizons', '5'),
+                    ('primary_horizon_days', '5'),
+                    ('evaluation_version', 'signal_decider_eval_v1'),
+                ],
+            )
+        finally:
+            routes_agent_context.signal_decider_loop_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(fake_service.review_detail_args['market_date'], date.fromisoformat('2026-04-23'))
+        self.assertEqual(fake_service.review_detail_args['snapshot_id'], 84)
+        self.assertEqual(fake_service.review_detail_args['horizons'], [1, 5])
+        self.assertEqual(fake_service.review_detail_args['primary_horizon_days'], 5)
+        self.assertEqual(fake_service.review_detail_args['evaluation_version'], 'signal_decider_eval_v1')
+        self.assertEqual(response.json()['item']['observed_price_path'][0]['trade_date'], '2026-04-24')
 
     def test_signal_decider_execution_outcomes_route_calls_service(self):
         fake_service = FakeSignalDeciderExecutionOutcomeService()

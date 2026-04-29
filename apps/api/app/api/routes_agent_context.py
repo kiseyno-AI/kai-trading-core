@@ -767,6 +767,73 @@ async def get_signal_decider_decision_detail(
         raise HTTPException(status_code=500, detail=f'Signal-decider decision detail read failed: {exc}') from exc
 
 
+@router.get('/signal-decider/calendar')
+async def get_signal_decider_review_calendar(
+    month: str = Query(...),
+    horizons: list[int] | None = Query(default=None),
+    primary_horizon_days: int = Query(default=5),
+    evaluation_version: str | None = Query(default=None),
+) -> dict:
+    try:
+        return await run_in_threadpool(
+            signal_decider_loop_service.get_review_calendar,
+            month=month,
+            horizons=horizons,
+            primary_horizon_days=primary_horizon_days,
+            evaluation_version=evaluation_version,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'Signal-decider replay calendar read failed: {exc}') from exc
+
+
+@router.get('/signal-decider/calendar/{market_date}')
+async def get_signal_decider_review_date(
+    market_date: date,
+    horizons: list[int] | None = Query(default=None),
+    primary_horizon_days: int = Query(default=5),
+    evaluation_version: str | None = Query(default=None),
+) -> dict:
+    try:
+        return await run_in_threadpool(
+            signal_decider_loop_service.get_review_date,
+            market_date=market_date,
+            horizons=horizons,
+            primary_horizon_days=primary_horizon_days,
+            evaluation_version=evaluation_version,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'Signal-decider replay date review failed: {exc}') from exc
+
+
+@router.get('/signal-decider/calendar/{market_date}/snapshots/{snapshot_id}')
+async def get_signal_decider_review_detail(
+    market_date: date,
+    snapshot_id: int,
+    horizons: list[int] | None = Query(default=None),
+    primary_horizon_days: int = Query(default=5),
+    evaluation_version: str | None = Query(default=None),
+) -> dict:
+    try:
+        return await run_in_threadpool(
+            signal_decider_loop_service.get_review_detail,
+            market_date=market_date,
+            snapshot_id=snapshot_id,
+            horizons=horizons,
+            primary_horizon_days=primary_horizon_days,
+            evaluation_version=evaluation_version,
+        )
+    except ValueError as exc:
+        if 'was not found' in str(exc) or 'does not belong' in str(exc):
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'Signal-decider replay detail read failed: {exc}') from exc
+
+
 @router.get('/signal-decider/execution-outcomes')
 async def list_signal_decider_execution_outcomes(
     snapshot_id: int | None = Query(default=None),
