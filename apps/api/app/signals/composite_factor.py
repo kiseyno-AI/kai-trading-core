@@ -14,6 +14,7 @@ from app.market_data_store import (
     load_symbols,
     upsert_daily_composite_factor_result,
 )
+from app.signals.momentum_factor import enrich_momentum_audit_fields
 
 COMPOSITE_FACTOR_VERSION = 'composite_v1'
 COMPOSITE_FACTOR_SOURCE = COMPOSITE_FACTOR_VERSION
@@ -494,19 +495,16 @@ class DailyCompositeFactorService:
     @staticmethod
     def _build_momentum_snapshot(row: dict[str, Any] | None) -> dict[str, Any]:
         definition = FACTOR_DEFINITION_BY_FAMILY['momentum']
-        score = _round(row.get('momentum_percentile')) if row is not None else None
+        enriched_row = enrich_momentum_audit_fields(row) if row is not None else {}
+        score = _round(enriched_row.get('momentum_percentile')) if row is not None else None
         if row is None:
             status = 'missing_factor_row'
-        elif score is None and row.get('has_sufficient_history') is False:
+        elif score is None and enriched_row.get('has_sufficient_history') is False:
             status = 'insufficient_history'
         elif score is None:
             status = 'missing_percentile'
-        elif row.get('is_recent_overheated'):
-            status = 'overheated'
-        elif row.get('is_momentum_eligible'):
-            status = 'eligible'
         else:
-            status = 'scored'
+            status = enriched_row.get('momentum_eligibility_status') or 'scored'
         return {
             'input_name': definition.input_name,
             'source_table': definition.source_table,
@@ -514,14 +512,18 @@ class DailyCompositeFactorService:
             'score': score,
             'available': score is not None,
             'status': status,
-            'source_feature_version': (row or {}).get('feature_version') or (row or {}).get('source'),
-            'rank': (row or {}).get('momentum_rank'),
-            'percentile': (row or {}).get('momentum_percentile'),
+            'source_feature_version': enriched_row.get('feature_version') or enriched_row.get('source'),
+            'rank': enriched_row.get('momentum_rank'),
+            'percentile': enriched_row.get('momentum_percentile'),
             'classification': None,
-            'is_eligible': (row or {}).get('is_momentum_eligible'),
+            'is_eligible': enriched_row.get('is_momentum_eligible'),
             'gate_flags': {
-                'is_recent_overheated': (row or {}).get('is_recent_overheated'),
-                'has_sufficient_history': (row or {}).get('has_sufficient_history'),
+                'is_recent_overheated': enriched_row.get('is_recent_overheated'),
+                'has_sufficient_history': enriched_row.get('has_sufficient_history'),
+                'is_price_above_ma120': enriched_row.get('is_price_above_ma120'),
+                'is_ma60_above_ma120': enriched_row.get('is_ma60_above_ma120'),
+                'passes_momentum_top_percentile': enriched_row.get('passes_momentum_top_percentile'),
+                'momentum_percentile_threshold': enriched_row.get('momentum_percentile_threshold'),
             },
         }
 
@@ -749,6 +751,12 @@ class DailyCompositeFactorService:
             'gates': {
                 'has_required_inputs': item['has_required_inputs'],
                 'is_recent_overheated': factor_snapshot['momentum']['gate_flags'].get('is_recent_overheated'),
+                'passes_momentum_top_percentile': factor_snapshot['momentum']['gate_flags'].get(
+                    'passes_momentum_top_percentile'
+                ),
+                'momentum_percentile_threshold': factor_snapshot['momentum']['gate_flags'].get(
+                    'momentum_percentile_threshold'
+                ),
                 'passes_liquidity_floor': factor_snapshot['low_risk']['gate_flags'].get('passes_liquidity_floor'),
                 'is_hard_excluded': item['is_hard_excluded'],
                 'hard_exclusion_reasons': item['_hard_exclusion_reasons'],
@@ -763,6 +771,7 @@ class DailyCompositeFactorService:
                     },
                 },
                 'informational_only_rules': {
+                    'momentum_eligibility_status': factor_snapshot['momentum']['status'],
                     'value_status': factor_snapshot['value_v1']['status'],
                     'advanced_value_classification': factor_snapshot['advanced_value']['classification'],
                     'low_beta_classification': factor_snapshot['beta']['classification'],
@@ -809,6 +818,13 @@ class DailyCompositeFactorService:
             'has_valuation_input': item['_has_valuation_input'],
             'requires_any_of_factors': sorted(COMPOSITE_REQUIRED_VALUATION_FACTORS),
             'is_recent_overheated': item['_factor_snapshot']['momentum']['gate_flags'].get('is_recent_overheated'),
+            'passes_momentum_top_percentile': item['_factor_snapshot']['momentum']['gate_flags'].get(
+                'passes_momentum_top_percentile'
+            ),
+            'momentum_percentile_threshold': item['_factor_snapshot']['momentum']['gate_flags'].get(
+                'momentum_percentile_threshold'
+            ),
+            'momentum_eligibility_status': item['_factor_snapshot']['momentum']['status'],
             'passes_liquidity_floor': item['_factor_snapshot']['low_risk']['gate_flags'].get('passes_liquidity_floor'),
             'is_hard_excluded': item['is_hard_excluded'],
             'hard_exclusion_reasons': item['_hard_exclusion_reasons'],

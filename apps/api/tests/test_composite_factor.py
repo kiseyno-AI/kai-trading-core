@@ -33,10 +33,24 @@ def _momentum_row(
     *,
     percentile: float | None,
     rank: int | None = None,
-    eligible: bool = True,
+    eligible: bool | None = None,
     overheated: bool = False,
     has_sufficient_history: bool = True,
+    top_percentile_threshold: float = 0.80,
+    passes_top_percentile: bool | None = None,
+    is_price_above_ma120: bool = True,
+    is_ma60_above_ma120: bool = True,
 ) -> dict:
+    if passes_top_percentile is None:
+        passes_top_percentile = bool(percentile is not None and percentile >= top_percentile_threshold)
+    if eligible is None:
+        eligible = bool(
+            has_sufficient_history
+            and is_price_above_ma120
+            and is_ma60_above_ma120
+            and passes_top_percentile
+            and not overheated
+        )
     return {
         'symbol': symbol,
         'market_date': market_date.isoformat(),
@@ -44,9 +58,13 @@ def _momentum_row(
         'feature_version': 'price_momentum_v1',
         'momentum_rank': rank,
         'momentum_percentile': percentile,
+        'momentum_percentile_threshold': top_percentile_threshold,
+        'passes_momentum_top_percentile': passes_top_percentile,
         'is_momentum_eligible': eligible,
         'is_recent_overheated': overheated,
         'has_sufficient_history': has_sufficient_history,
+        'is_price_above_ma120': is_price_above_ma120,
+        'is_ma60_above_ma120': is_ma60_above_ma120,
     }
 
 
@@ -207,6 +225,8 @@ class DailyCompositeFactorServiceTests(unittest.TestCase):
         self.assertAlmostEqual(middle['composite_score'], 0.545, places=6)
         self.assertEqual(middle['composite_rank'], 2)
         self.assertEqual(middle['composite_classification'], 'watchlist')
+        self.assertFalse(middle['gates']['passes_momentum_top_percentile'])
+        self.assertEqual(middle['gates']['momentum_eligibility_status'], 'below_top_percentile_cutoff')
 
         self.assertAlmostEqual(worst['composite_score'], 0.185, places=6)
         self.assertEqual(worst['composite_rank'], 3)

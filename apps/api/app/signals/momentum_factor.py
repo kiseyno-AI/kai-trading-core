@@ -130,11 +130,127 @@ def _sort_rows(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
         items,
         key=lambda item: (
             not bool(item.get('is_momentum_eligible')),
+            not bool(item.get('passes_momentum_top_percentile')),
             item.get('momentum_rank') is None,
             item.get('momentum_rank') if item.get('momentum_rank') is not None else 999999,
             item['symbol'],
         ),
     )
+
+
+MOMENTUM_ELIGIBILITY_STATUS_ELIGIBLE = 'eligible'
+MOMENTUM_ELIGIBILITY_STATUS_INSUFFICIENT_HISTORY = 'insufficient_history'
+MOMENTUM_ELIGIBILITY_STATUS_TREND_NOT_CONFIRMED = 'trend_not_confirmed'
+MOMENTUM_ELIGIBILITY_STATUS_BELOW_TOP_PERCENTILE_CUTOFF = 'below_top_percentile_cutoff'
+MOMENTUM_ELIGIBILITY_STATUS_RECENTLY_OVERHEATED = 'recently_overheated'
+
+
+def _momentum_eligibility_failed_requirements(
+    *,
+    has_sufficient_history: bool,
+    is_price_above_ma120: bool,
+    is_ma60_above_ma120: bool,
+    passes_momentum_top_percentile: bool,
+    is_recent_overheated: bool,
+) -> list[str]:
+    failed_requirements: list[str] = []
+    if not has_sufficient_history:
+        failed_requirements.append('has_sufficient_history')
+    if not is_price_above_ma120:
+        failed_requirements.append('is_price_above_ma120')
+    if not is_ma60_above_ma120:
+        failed_requirements.append('is_ma60_above_ma120')
+    if not passes_momentum_top_percentile:
+        failed_requirements.append('passes_momentum_top_percentile')
+    if is_recent_overheated:
+        failed_requirements.append('not_recently_overheated')
+    return failed_requirements
+
+
+def _momentum_eligibility_status(
+    *,
+    has_sufficient_history: bool,
+    is_price_above_ma120: bool,
+    is_ma60_above_ma120: bool,
+    passes_momentum_top_percentile: bool,
+    is_recent_overheated: bool,
+) -> str:
+    if not has_sufficient_history:
+        return MOMENTUM_ELIGIBILITY_STATUS_INSUFFICIENT_HISTORY
+    if not is_price_above_ma120 or not is_ma60_above_ma120:
+        return MOMENTUM_ELIGIBILITY_STATUS_TREND_NOT_CONFIRMED
+    if not passes_momentum_top_percentile:
+        return MOMENTUM_ELIGIBILITY_STATUS_BELOW_TOP_PERCENTILE_CUTOFF
+    if is_recent_overheated:
+        return MOMENTUM_ELIGIBILITY_STATUS_RECENTLY_OVERHEATED
+    return MOMENTUM_ELIGIBILITY_STATUS_ELIGIBLE
+
+
+@dataclass(frozen=True, slots=True)
+class MomentumEligibilityRule:
+    top_percentile_threshold: float = 0.80
+    rule_version: str = 'momentum_top_percentile_v1'
+    rule_name: str = 'trend_confirmed_top_percentile_and_not_recently_overheated'
+    comparison: str = '>='
+
+    def passes_momentum_top_percentile(self, momentum_percentile: float | None) -> bool:
+        if momentum_percentile is None:
+            return False
+        return momentum_percentile >= self.top_percentile_threshold
+
+    def evaluate(
+        self,
+        *,
+        has_sufficient_history: bool,
+        is_price_above_ma120: bool,
+        is_ma60_above_ma120: bool,
+        momentum_percentile: float | None,
+        is_recent_overheated: bool,
+    ) -> dict[str, Any]:
+        passes_top_percentile = self.passes_momentum_top_percentile(momentum_percentile)
+        failed_requirements = _momentum_eligibility_failed_requirements(
+            has_sufficient_history=has_sufficient_history,
+            is_price_above_ma120=is_price_above_ma120,
+            is_ma60_above_ma120=is_ma60_above_ma120,
+            passes_momentum_top_percentile=passes_top_percentile,
+            is_recent_overheated=is_recent_overheated,
+        )
+        status = _momentum_eligibility_status(
+            has_sufficient_history=has_sufficient_history,
+            is_price_above_ma120=is_price_above_ma120,
+            is_ma60_above_ma120=is_ma60_above_ma120,
+            passes_momentum_top_percentile=passes_top_percentile,
+            is_recent_overheated=is_recent_overheated,
+        )
+        return {
+            'passes_trend_confirmation': bool(is_price_above_ma120 and is_ma60_above_ma120),
+            'passes_momentum_top_percentile': passes_top_percentile,
+            'momentum_percentile_threshold': _round(self.top_percentile_threshold),
+            'momentum_eligibility_status': status,
+            'failed_requirements': failed_requirements,
+            'is_momentum_eligible': status == MOMENTUM_ELIGIBILITY_STATUS_ELIGIBLE,
+        }
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            'rule_version': self.rule_version,
+            'rule_name': self.rule_name,
+            'requires': [
+                'has_sufficient_history',
+                'is_price_above_ma120',
+                'is_ma60_above_ma120',
+                'passes_momentum_top_percentile',
+                'not is_recent_overheated',
+            ],
+            'percentile_gate': {
+                'field': 'momentum_percentile',
+                'comparison': self.comparison,
+                'threshold': _round(self.top_percentile_threshold),
+                'threshold_units': '0_to_1_percentile',
+                'higher_percentile_is_better': True,
+                'top_fraction': _round(1.0 - float(self.top_percentile_threshold)),
+            },
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -232,14 +348,67 @@ class MomentumOverheatRule:
         }
 
 
-def _with_overheat_audit_fields(item: dict[str, Any]) -> dict[str, Any]:
+def resolve_momentum_eligibility_status(item: dict[str, Any] | None) -> str | None:
+    if item is None:
+        return None
+
     payload = item.get('factor_payload') or {}
+    eligibility = payload.get('eligibility') or {}
+    explicit_status = item.get('momentum_eligibility_status') or eligibility.get('momentum_eligibility_status')
+    if explicit_status:
+        return explicit_status
+
+    threshold = item.get('momentum_percentile_threshold')
+    if threshold is None:
+        ranking = payload.get('ranking') or {}
+        threshold = ranking.get('momentum_percentile_threshold')
+    if threshold is None:
+        eligibility_rule = payload.get('eligibility_rule') or {}
+        percentile_gate = eligibility_rule.get('percentile_gate') or {}
+        threshold = percentile_gate.get('threshold')
+    if threshold is None:
+        threshold = MomentumEligibilityRule().top_percentile_threshold
+
+    passes_top_percentile = item.get('passes_momentum_top_percentile')
+    if passes_top_percentile is None and 'passes_momentum_top_percentile' in eligibility:
+        passes_top_percentile = eligibility.get('passes_momentum_top_percentile')
+    if passes_top_percentile is None:
+        percentile = item.get('momentum_percentile')
+        passes_top_percentile = bool(percentile is not None and percentile >= float(threshold))
+
+    return _momentum_eligibility_status(
+        has_sufficient_history=bool(item.get('has_sufficient_history')),
+        is_price_above_ma120=bool(item.get('is_price_above_ma120')),
+        is_ma60_above_ma120=bool(item.get('is_ma60_above_ma120')),
+        passes_momentum_top_percentile=bool(passes_top_percentile),
+        is_recent_overheated=bool(item.get('is_recent_overheated')),
+    )
+
+
+def enrich_momentum_audit_fields(item: dict[str, Any]) -> dict[str, Any]:
+    payload = item.get('factor_payload') or {}
+    ranking = payload.get('ranking') or {}
+    eligibility = payload.get('eligibility') or {}
+    eligibility_rule = payload.get('eligibility_rule') or {}
+    percentile_gate = eligibility_rule.get('percentile_gate') or {}
     returns = payload.get('returns') or {}
     volatility = payload.get('volatility') or {}
     overheat = payload.get('overheat') or {}
     overheat_rule = payload.get('overheat_rule') or {}
 
     enriched = dict(item)
+    enriched.setdefault(
+        'momentum_percentile_threshold',
+        ranking.get('momentum_percentile_threshold')
+        if 'momentum_percentile_threshold' in ranking
+        else percentile_gate.get('threshold'),
+    )
+    enriched.setdefault(
+        'passes_momentum_top_percentile',
+        eligibility.get('passes_momentum_top_percentile')
+        if 'passes_momentum_top_percentile' in eligibility
+        else ranking.get('passes_momentum_top_percentile'),
+    )
     enriched.setdefault('return_5d_rank', returns.get('return_5d_rank'))
     enriched.setdefault('return_5d_percentile', returns.get('return_5d_percentile'))
     enriched.setdefault('return_5d_ranked_universe_size', returns.get('return_5d_ranked_universe_size'))
@@ -263,6 +432,9 @@ def _with_overheat_audit_fields(item: dict[str, Any]) -> dict[str, Any]:
     )
     enriched.setdefault('is_recent_overheated', overheat.get('is_recent_overheated'))
     enriched.setdefault('overheat_rule_version', overheat_rule.get('rule_version'))
+    enriched.setdefault('passes_trend_confirmation', eligibility.get('passes_trend_confirmation'))
+    enriched.setdefault('eligibility_failed_requirements', eligibility.get('failed_requirements'))
+    enriched.setdefault('momentum_eligibility_status', resolve_momentum_eligibility_status(enriched))
     return enriched
 
 
@@ -271,9 +443,11 @@ def build_daily_momentum_factor_rows(
     market_date: str | date,
     price_histories: dict[str, Sequence[dict[str, Any]]],
     overheat_rule: MomentumOverheatRule | None = None,
+    eligibility_rule: MomentumEligibilityRule | None = None,
 ) -> list[dict[str, Any]]:
     normalized_market_date = _normalize_market_date(market_date)
     selected_overheat_rule = overheat_rule or MomentumOverheatRule()
+    selected_eligibility_rule = eligibility_rule or MomentumEligibilityRule()
     rows: list[dict[str, Any]] = []
 
     for symbol in sorted(price_histories):
@@ -334,7 +508,11 @@ def build_daily_momentum_factor_rows(
             'is_recent_overheated': False,
             'momentum_rank': None,
             'momentum_percentile': None,
+            'momentum_percentile_threshold': _round(selected_eligibility_rule.top_percentile_threshold),
+            'passes_momentum_top_percentile': False,
             'is_momentum_eligible': False,
+            'momentum_eligibility_status': MOMENTUM_ELIGIBILITY_STATUS_INSUFFICIENT_HISTORY,
+            'eligibility_failed_requirements': [],
             'factor_payload': {
                 'feature_version': MOMENTUM_FACTOR_VERSION,
                 'symbol': symbol,
@@ -394,15 +572,7 @@ def build_daily_momentum_factor_rows(
                     'passes_minimum_absolute_return': False,
                     'is_recent_overheated': False,
                 },
-                'eligibility_rule': {
-                    'rule_name': 'trend_confirmed_and_not_recently_overheated',
-                    'requires': [
-                        'has_sufficient_history',
-                        'is_price_above_ma120',
-                        'is_ma60_above_ma120',
-                        'not is_recent_overheated',
-                    ],
-                },
+                'eligibility_rule': selected_eligibility_rule.to_payload(),
                 'insufficient_history_reason': (
                     None
                     if has_sufficient_history
@@ -414,6 +584,8 @@ def build_daily_momentum_factor_rows(
                     'method': 'momentum_12_1_desc_symbol_asc_tiebreak',
                     'momentum_rank': None,
                     'momentum_percentile': None,
+                    'momentum_percentile_threshold': _round(selected_eligibility_rule.top_percentile_threshold),
+                    'passes_momentum_top_percentile': False,
                 },
             },
         }
@@ -465,18 +637,13 @@ def build_daily_momentum_factor_rows(
     for index, row in enumerate(ranked_rows, start=1):
         row['momentum_rank'] = index
         row['momentum_percentile'] = _percentile_from_rank(index, ranked_universe_size)
-        row['is_momentum_eligible'] = bool(
-            row['has_sufficient_history']
-            and row['is_price_above_ma120']
-            and row['is_ma60_above_ma120']
-            and not row['is_recent_overheated']
-        )
         row['factor_payload']['ranking'].update(
             {
                 'ranked_universe_size': ranked_universe_size,
                 'total_universe_size': total_universe_size,
                 'momentum_rank': row['momentum_rank'],
                 'momentum_percentile': row['momentum_percentile'],
+                'momentum_percentile_threshold': _round(selected_eligibility_rule.top_percentile_threshold),
             }
         )
 
@@ -486,26 +653,50 @@ def build_daily_momentum_factor_rows(
                 {
                     'ranked_universe_size': ranked_universe_size,
                     'total_universe_size': total_universe_size,
+                    'momentum_percentile_threshold': _round(selected_eligibility_rule.top_percentile_threshold),
                 }
             )
+        eligibility = selected_eligibility_rule.evaluate(
+            has_sufficient_history=row['has_sufficient_history'],
+            is_price_above_ma120=row['is_price_above_ma120'],
+            is_ma60_above_ma120=row['is_ma60_above_ma120'],
+            momentum_percentile=row['momentum_percentile'],
+            is_recent_overheated=row['is_recent_overheated'],
+        )
+        row['passes_momentum_top_percentile'] = eligibility['passes_momentum_top_percentile']
+        row['is_momentum_eligible'] = eligibility['is_momentum_eligible']
+        row['momentum_eligibility_status'] = eligibility['momentum_eligibility_status']
+        row['eligibility_failed_requirements'] = list(eligibility['failed_requirements'])
+        row['factor_payload']['ranking']['passes_momentum_top_percentile'] = row['passes_momentum_top_percentile']
         row['factor_payload']['eligibility'] = {
             'is_momentum_eligible': row['is_momentum_eligible'],
+            'momentum_eligibility_status': row['momentum_eligibility_status'],
             'has_sufficient_history': row['has_sufficient_history'],
+            'passes_trend_confirmation': eligibility['passes_trend_confirmation'],
             'is_price_above_ma120': row['is_price_above_ma120'],
             'is_ma60_above_ma120': row['is_ma60_above_ma120'],
+            'momentum_percentile_threshold': eligibility['momentum_percentile_threshold'],
+            'passes_momentum_top_percentile': row['passes_momentum_top_percentile'],
             'has_sufficient_cross_sectional_context': row['has_sufficient_cross_sectional_context'],
             'is_return_5d_extreme': row['is_return_5d_extreme'],
             'is_volatility_adjusted_overheated': row['is_volatility_adjusted_overheated'],
             'passes_minimum_absolute_return': row['passes_minimum_absolute_return'],
             'is_recent_overheated': row['is_recent_overheated'],
+            'failed_requirements': row['eligibility_failed_requirements'],
         }
 
     return _sort_rows(rows)
 
 
 class DailyMomentumFactorService:
-    def __init__(self, *, overheat_rule: MomentumOverheatRule | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        overheat_rule: MomentumOverheatRule | None = None,
+        eligibility_rule: MomentumEligibilityRule | None = None,
+    ) -> None:
         self.overheat_rule = overheat_rule or MomentumOverheatRule()
+        self.eligibility_rule = eligibility_rule or MomentumEligibilityRule()
         self.history_window = MOMENTUM_HISTORY_WINDOW
 
     def evaluate_symbol(
@@ -545,11 +736,12 @@ class DailyMomentumFactorService:
             market_date=normalized_market_date,
             price_histories=valid_histories,
             overheat_rule=self.overheat_rule,
+            eligibility_rule=self.eligibility_rule,
         )
         row = next(item for item in rows if item['symbol'] == normalized_symbol)
         if persist:
             upsert_daily_momentum_factor_result(row)
-        return _with_overheat_audit_fields(row)
+        return enrich_momentum_audit_fields(row)
 
     def rebuild_for_market_date(
         self,
@@ -564,9 +756,12 @@ class DailyMomentumFactorService:
                 'market_date': normalized_market_date,
                 'source': MOMENTUM_FACTOR_SOURCE,
                 'feature_version': MOMENTUM_FACTOR_VERSION,
+                'eligibility_rule_version': self.eligibility_rule.rule_version,
+                'momentum_percentile_threshold': _round(self.eligibility_rule.top_percentile_threshold),
                 'requested_symbols': 0,
                 'symbols_evaluated': 0,
                 'ranked_symbols': 0,
+                'top_percentile_symbols': 0,
                 'eligible_symbols': 0,
                 'results_persisted': 0,
                 'results_failed': 0,
@@ -590,6 +785,7 @@ class DailyMomentumFactorService:
             market_date=normalized_market_date,
             price_histories=valid_histories,
             overheat_rule=self.overheat_rule,
+            eligibility_rule=self.eligibility_rule,
         )
 
         persisted_items: list[dict[str, Any]] = []
@@ -606,14 +802,17 @@ class DailyMomentumFactorService:
             'market_date': normalized_market_date,
             'source': MOMENTUM_FACTOR_SOURCE,
             'feature_version': MOMENTUM_FACTOR_VERSION,
+            'eligibility_rule_version': self.eligibility_rule.rule_version,
+            'momentum_percentile_threshold': _round(self.eligibility_rule.top_percentile_threshold),
             'requested_symbols': len(target_symbols),
             'symbols_evaluated': len(rows),
             'ranked_symbols': sum(1 for row in rows if row.get('momentum_rank') is not None),
+            'top_percentile_symbols': sum(1 for row in rows if row.get('passes_momentum_top_percentile')),
             'eligible_symbols': sum(1 for row in rows if row.get('is_momentum_eligible')),
             'results_persisted': len(persisted_items),
             'results_failed': len(combined_failed_symbols),
             'failed_symbols': combined_failed_symbols[:50],
-            'items': [_with_overheat_audit_fields(item) for item in persisted_items],
+            'items': [enrich_momentum_audit_fields(item) for item in persisted_items],
         }
 
     def inspect(
@@ -626,7 +825,7 @@ class DailyMomentumFactorService:
         normalized_market_date = date.fromisoformat(_normalize_market_date(market_date))
         requested_symbols = _normalize_symbols(symbols)
         items = [
-            _with_overheat_audit_fields(item)
+            enrich_momentum_audit_fields(item)
             for item in load_daily_momentum_factor_results(
                 market_date=normalized_market_date,
                 symbols=requested_symbols,
@@ -638,12 +837,15 @@ class DailyMomentumFactorService:
         return {
             'market_date': normalized_market_date.isoformat(),
             'feature_version': MOMENTUM_FACTOR_VERSION,
+            'eligibility_rule_version': self.eligibility_rule.rule_version,
+            'momentum_percentile_threshold': _round(self.eligibility_rule.top_percentile_threshold),
             'summary': {
                 'entries': len(items),
                 'requested_symbols': requested_symbols or [],
                 'matched_symbols': matched_symbols,
                 'missing_symbols': [symbol for symbol in (requested_symbols or []) if symbol not in matched_symbol_set],
                 'ranked_symbols': sum(1 for item in items if item.get('momentum_rank') is not None),
+                'top_percentile_symbols': sum(1 for item in items if item.get('passes_momentum_top_percentile')),
                 'eligible_symbols': sum(1 for item in items if item.get('is_momentum_eligible')),
             },
             'items': items,

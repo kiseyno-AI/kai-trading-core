@@ -10,7 +10,18 @@ from app.db_models import (
     DailyUnifiedValueFactorResult,
     Symbol,
 )
-from app.eod.screening_results import screening_result_read_service
+from app.eod.screening_results import SCREENING_FAMILY_DEFINITIONS, screening_result_read_service
+
+
+class MomentumScreeningDefinitionTests(unittest.TestCase):
+    def test_momentum_screening_definition_exposes_cutoff_and_trend_fields(self) -> None:
+        keys = [field.key for field in SCREENING_FAMILY_DEFINITIONS['momentum'].item_fields]
+
+        self.assertIn('momentum_percentile_threshold', keys)
+        self.assertIn('passes_momentum_top_percentile', keys)
+        self.assertIn('momentum_eligibility_status', keys)
+        self.assertIn('is_price_above_ma120', keys)
+        self.assertIn('is_ma60_above_ma120', keys)
 
 
 class ScreeningResultReadServiceIntegrationTests(unittest.TestCase):

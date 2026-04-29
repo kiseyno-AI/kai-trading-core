@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 from app.signals.momentum_factor import (
     DailyMomentumFactorService,
+    MomentumEligibilityRule,
     build_daily_momentum_factor_rows,
 )
 
@@ -25,6 +26,10 @@ def _build_series_with_trailing_returns(
         raise ValueError('trailing_returns must fit inside the 252-day return history window')
     daily_returns = ([baseline_return] * (252 - len(trailing_returns))) + list(trailing_returns)
     return _build_close_series(initial_close, daily_returns)
+
+
+def _build_rankable_momentum_series(daily_return: float) -> list[float]:
+    return _build_close_series(100.0, ([daily_return] * 231) + ([0.0] * 21))
 
 
 def _build_bars(closes: list[float], *, start_date: date = date(2025, 1, 1)) -> list[dict]:
@@ -218,6 +223,52 @@ class DailyMomentumFactorBuilderTests(unittest.TestCase):
         self.assertEqual(by_symbol['035420']['momentum_rank'], 3)
         self.assertEqual(by_symbol['035420']['momentum_percentile'], 0.0)
 
+    def test_build_rows_requires_top_percentile_cutoff_for_eligibility(self) -> None:
+        rows = build_daily_momentum_factor_rows(
+            market_date='2025-09-10',
+            price_histories={
+                '005930': _build_bars(_build_rankable_momentum_series(0.0035)),
+                '000660': _build_bars(_build_rankable_momentum_series(0.0030)),
+                '035420': _build_bars(_build_rankable_momentum_series(0.0025)),
+                '051910': _build_bars(_build_rankable_momentum_series(0.0020)),
+                '068270': _build_bars(_build_rankable_momentum_series(0.0015)),
+            },
+        )
+
+        by_symbol = {row['symbol']: row for row in rows}
+        self.assertTrue(by_symbol['005930']['passes_momentum_top_percentile'])
+        self.assertTrue(by_symbol['005930']['is_momentum_eligible'])
+        self.assertEqual(by_symbol['005930']['momentum_eligibility_status'], 'eligible')
+
+        self.assertEqual(by_symbol['000660']['momentum_percentile'], 0.75)
+        self.assertEqual(by_symbol['000660']['momentum_percentile_threshold'], 0.8)
+        self.assertFalse(by_symbol['000660']['passes_momentum_top_percentile'])
+        self.assertFalse(by_symbol['000660']['is_momentum_eligible'])
+        self.assertEqual(by_symbol['000660']['momentum_eligibility_status'], 'below_top_percentile_cutoff')
+        self.assertIn(
+            'passes_momentum_top_percentile',
+            by_symbol['000660']['factor_payload']['eligibility']['failed_requirements'],
+        )
+
+    def test_build_rows_allows_configurable_top_percentile_cutoff(self) -> None:
+        rows = build_daily_momentum_factor_rows(
+            market_date='2025-09-10',
+            price_histories={
+                '005930': _build_bars(_build_rankable_momentum_series(0.0035)),
+                '000660': _build_bars(_build_rankable_momentum_series(0.0030)),
+                '035420': _build_bars(_build_rankable_momentum_series(0.0025)),
+                '051910': _build_bars(_build_rankable_momentum_series(0.0020)),
+                '068270': _build_bars(_build_rankable_momentum_series(0.0015)),
+            },
+            eligibility_rule=MomentumEligibilityRule(top_percentile_threshold=0.75),
+        )
+
+        by_symbol = {row['symbol']: row for row in rows}
+        self.assertEqual(by_symbol['000660']['momentum_percentile_threshold'], 0.75)
+        self.assertTrue(by_symbol['000660']['passes_momentum_top_percentile'])
+        self.assertTrue(by_symbol['000660']['is_momentum_eligible'])
+        self.assertEqual(by_symbol['000660']['momentum_eligibility_status'], 'eligible')
+
 
 class DailyMomentumFactorServiceTests(unittest.TestCase):
     def test_rebuild_for_market_date_persists_rows_for_selected_universe(self) -> None:
@@ -243,6 +294,7 @@ class DailyMomentumFactorServiceTests(unittest.TestCase):
         self.assertEqual(result['requested_symbols'], 2)
         self.assertEqual(result['symbols_evaluated'], 2)
         self.assertEqual(result['ranked_symbols'], 2)
+        self.assertEqual(result['top_percentile_symbols'], 1)
         self.assertEqual(result['results_persisted'], 2)
         self.assertEqual(result['results_failed'], 0)
         self.assertEqual(upsert.call_count, 2)
@@ -279,9 +331,20 @@ class DailyMomentumFactorServiceTests(unittest.TestCase):
                 'market_date': '2025-09-10',
                 'return_5d': 0.134337,
                 'momentum_rank': 1,
+                'momentum_percentile': 0.83,
                 'is_momentum_eligible': False,
                 'is_recent_overheated': True,
                 'factor_payload': {
+                    'ranking': {
+                        'momentum_percentile_threshold': 0.8,
+                        'passes_momentum_top_percentile': True,
+                    },
+                    'eligibility': {
+                        'passes_trend_confirmation': True,
+                        'passes_momentum_top_percentile': True,
+                        'momentum_eligibility_status': 'recently_overheated',
+                        'failed_requirements': ['not_recently_overheated'],
+                    },
                     'returns': {
                         'return_5d_rank': 1,
                         'return_5d_percentile': 1.0,
@@ -317,8 +380,12 @@ class DailyMomentumFactorServiceTests(unittest.TestCase):
         self.assertEqual(result['summary']['entries'], 1)
         self.assertEqual(result['summary']['matched_symbols'], ['005930'])
         self.assertEqual(result['summary']['missing_symbols'], ['000660'])
+        self.assertEqual(result['summary']['top_percentile_symbols'], 1)
         self.assertEqual(result['summary']['eligible_symbols'], 0)
         item = result['items'][0]
+        self.assertEqual(item['momentum_percentile_threshold'], 0.8)
+        self.assertTrue(item['passes_momentum_top_percentile'])
+        self.assertEqual(item['momentum_eligibility_status'], 'recently_overheated')
         self.assertEqual(item['return_5d_rank'], 1)
         self.assertEqual(item['return_5d_percentile'], 1.0)
         self.assertEqual(item['return_5d_ranked_universe_size'], 75)

@@ -937,6 +937,11 @@ class DailyMomentumFactorResult(Base, TimestampMixin):
         ),
         Index('ix_daily_momentum_factor_results_market_rank', 'market_date', 'momentum_rank'),
         Index('ix_daily_momentum_factor_results_market_percentile', 'market_date', 'momentum_percentile'),
+        Index(
+            'ix_daily_momentum_factor_results_market_top_percentile',
+            'market_date',
+            'passes_momentum_top_percentile',
+        ),
         Index('ix_daily_momentum_factor_results_market_eligible', 'market_date', 'is_momentum_eligible'),
     )
 
@@ -955,6 +960,8 @@ class DailyMomentumFactorResult(Base, TimestampMixin):
     is_recent_overheated: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     momentum_rank: Mapped[int | None] = mapped_column(Integer, index=True)
     momentum_percentile: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    momentum_percentile_threshold: Mapped[float] = mapped_column(Numeric(12, 6), nullable=False, default=0.80)
+    passes_momentum_top_percentile: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     is_momentum_eligible: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     factor_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
     captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
