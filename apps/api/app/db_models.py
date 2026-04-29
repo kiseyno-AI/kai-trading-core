@@ -1124,6 +1124,81 @@ class SignalDeciderPolicyCandidate(Base, TimestampMixin):
     activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
 
 
+class SignalDeciderExecutionPlanItem(Base, TimestampMixin):
+    __tablename__ = 'signal_decider_execution_plan_items'
+    __table_args__ = (
+        UniqueConstraint(
+            'execution_window',
+            'target_trade_date',
+            'account_reference',
+            'symbol',
+            name='uq_signal_decider_execution_plan_items_scope',
+        ),
+        Index(
+            'ix_signal_decider_execution_plan_items_target_status',
+            'target_trade_date',
+            'eligibility_status',
+            'execution_status',
+        ),
+        Index(
+            'ix_signal_decider_execution_plan_items_target_account',
+            'target_trade_date',
+            'account_reference',
+        ),
+        Index(
+            'ix_signal_decider_execution_plan_items_snapshot',
+            'decision_snapshot_id',
+        ),
+        Index(
+            'ix_signal_decider_execution_plan_items_order_request',
+            'order_request_id',
+        ),
+        Index(
+            'ix_signal_decider_execution_plan_items_broker_order',
+            'broker_order_row_id',
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    execution_window: Mapped[str] = mapped_column(String(32), nullable=False, default='next_open', index=True)
+    decision_snapshot_id: Mapped[int] = mapped_column(
+        ForeignKey('signal_decider_decision_snapshots.id', ondelete='CASCADE'),
+        nullable=False,
+        index=True,
+    )
+    order_request_id: Mapped[int | None] = mapped_column(
+        ForeignKey('order_requests.id', ondelete='SET NULL'),
+        nullable=True,
+    )
+    broker_order_row_id: Mapped[int | None] = mapped_column(
+        ForeignKey('broker_orders.id', ondelete='SET NULL'),
+        nullable=True,
+    )
+    broker_name: Mapped[str] = mapped_column(String(32), nullable=False, default='kis')
+    target_trade_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    source_market_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    account_reference: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    account_label: Mapped[str | None] = mapped_column(String(64))
+    symbol: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    policy_version: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    planned_side: Mapped[str] = mapped_column(String(16), nullable=False, default='buy')
+    planned_order_type: Mapped[str] = mapped_column(String(32), nullable=False, default='market')
+    planned_time_in_force: Mapped[str] = mapped_column(String(32), nullable=False, default='day')
+    allocation_budget_krw: Mapped[float] = mapped_column(Numeric(20, 2), nullable=False)
+    estimated_reference_price: Mapped[int | None] = mapped_column(BigInteger)
+    planned_quantity: Mapped[float | None] = mapped_column(Numeric(20, 8))
+    estimated_notional_krw: Mapped[float | None] = mapped_column(Numeric(20, 2))
+    eligibility_status: Mapped[str] = mapped_column(String(32), nullable=False, default='blocked', index=True)
+    execution_status: Mapped[str] = mapped_column(String(32), nullable=False, default='planned', index=True)
+    client_order_id: Mapped[str | None] = mapped_column(String(128), index=True)
+    validation_payload: Mapped[dict | None] = mapped_column(JSON)
+    traceability_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    submission_payload: Mapped[dict | None] = mapped_column(JSON)
+    first_ready_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_evaluated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+
+
 class AgentContextFeedbackFailure(Base, TimestampMixin):
     __tablename__ = 'agent_context_feedback_failures'
     __table_args__ = (

@@ -52,6 +52,15 @@ class Settings(BaseSettings):
     kis_order_reconcile_recent_days: int = 3
     kis_order_reconcile_batch_limit: int = 100
     portfolio_account_references: str = ''
+    signal_decider_next_open_enabled: bool = False
+    signal_decider_next_open_dry_run: bool = True
+    signal_decider_next_open_account_targets: str = ''
+    signal_decider_next_open_min_confidence_score_10: float = 6.0
+    signal_decider_next_open_min_expected_return_pct: float = 0.0
+    signal_decider_next_open_require_active_policy: bool = True
+    signal_decider_next_open_block_on_data_warnings: bool = True
+    signal_decider_next_open_block_on_specialist_disagreement: bool = True
+    signal_decider_next_open_require_target_and_stop: bool = True
 
     bok_ecos_api_key: str = Field(
         default='',

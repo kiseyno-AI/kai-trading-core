@@ -32,6 +32,7 @@ from app.market_data_store import (
     load_tracked_symbols,
     persist_market_status_snapshot,
 )
+from app.orders.next_open_execution import signal_decider_next_open_execution_service
 from app.orders.reconciliation import trading_order_reconciliation_service
 from app.quotes.service import QuoteService
 from app.signals.advanced_value_factor import (
@@ -490,6 +491,23 @@ def reconcile_trading_orders(
     )
 
 
+def run_next_open_execution_if_due(
+    *,
+    target_trade_date: str | None = None,
+    dry_run: bool | None = None,
+    force: bool = False,
+) -> dict[str, Any]:
+    bootstrap_runtime()
+    return asyncio.run(
+        signal_decider_next_open_execution_service.run_market_open_execution_if_due(
+            target_trade_date=target_trade_date,
+            dry_run=dry_run,
+            force=force,
+            trigger='internal_ops_cli',
+        )
+    )
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description='Internal kai-trading-core operations without self-HTTP.')
     subparsers = parser.add_subparsers(dest='command', required=True)
@@ -696,6 +714,14 @@ def _build_parser() -> argparse.ArgumentParser:
     trading_reconcile_parser.add_argument('--symbol')
     trading_reconcile_parser.add_argument('--limit', type=int)
     trading_reconcile_parser.add_argument('--reason')
+
+    next_open_execution_parser = subparsers.add_parser(
+        'trading-next-open-execution-run-if-due',
+        help='Refresh and execute the signal-decider next-open buy plan directly',
+    )
+    next_open_execution_parser.add_argument('--target-trade-date')
+    next_open_execution_parser.add_argument('--dry-run', choices=('true', 'false'))
+    next_open_execution_parser.add_argument('--force', action='store_true')
     return parser
 
 
@@ -842,6 +868,12 @@ def main(argv: Iterable[str] | None = None) -> int:
             symbol=args.symbol,
             limit=args.limit,
             reason=args.reason,
+        )
+    elif args.command == 'trading-next-open-execution-run-if-due':
+        payload = run_next_open_execution_if_due(
+            target_trade_date=args.target_trade_date,
+            dry_run=None if args.dry_run is None else args.dry_run == 'true',
+            force=args.force,
         )
     else:
         parser.error(f'Unsupported command: {args.command}')

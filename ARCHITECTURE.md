@@ -16,6 +16,7 @@
 - **`app/api/routes_*.py`** — HTTP routers (KIS, macro, FX, scanner, market, quotes, symbols, EOD).
 - **`app/dart/`** — DART company snapshot logic plus incremental disclosure-event sync, fundamentals capture, and DART persistence/repository code.
 - **`app/brokers/kis/`** — KIS client/provider/schemas.
+- **`app/orders/next_open_execution.py`** — persisted next-open execution planner that derives signal-decider buy candidates, applies account/allocation safety gates, and submits through the durable order flow at market open.
 - **`app/integrations/`** — BOK, FX (Korea Exim), etc.
 - **`app/fx/`** — Korea Exim FX service-level normalization, filtering, and date fallback behavior.
 - **`app/quotes/`**, **`app/market/`**, **`app/scanner/`**, **`app/eod/`**, **`app/signals/`** — domain services and background behavior, including pykrx-based historical EOD backfill and daily KIS ranking signal features.

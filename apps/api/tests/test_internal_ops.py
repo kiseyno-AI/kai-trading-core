@@ -115,6 +115,27 @@ class InternalOpsTests(unittest.TestCase):
         self.assertEqual(run_daily.call_args.kwargs['trigger'], 'internal_ops_cli')
         self.assertEqual(run_daily.call_args.kwargs['force'], True)
 
+    def test_run_next_open_execution_if_due_uses_direct_service_call(self) -> None:
+        with (
+            patch('app.internal.ops.bootstrap_runtime') as bootstrap_runtime,
+            patch(
+                'app.internal.ops.signal_decider_next_open_execution_service.run_market_open_execution_if_due',
+                new=AsyncMock(return_value={'summary': {'triggered': True, 'selected_count': 1}}),
+            ) as run_execution,
+        ):
+            result = ops.run_next_open_execution_if_due(
+                target_trade_date='2026-04-30',
+                dry_run=False,
+                force=True,
+            )
+
+        bootstrap_runtime.assert_called_once_with()
+        self.assertEqual(result['summary']['selected_count'], 1)
+        self.assertEqual(run_execution.call_args.kwargs['target_trade_date'], '2026-04-30')
+        self.assertEqual(run_execution.call_args.kwargs['dry_run'], False)
+        self.assertEqual(run_execution.call_args.kwargs['trigger'], 'internal_ops_cli')
+        self.assertEqual(run_execution.call_args.kwargs['force'], True)
+
     def test_compute_trending_ranks_uses_direct_store_call(self) -> None:
         with (
             patch('app.internal.ops.bootstrap_runtime') as bootstrap_runtime,
