@@ -104,6 +104,18 @@ COMPOSITE_CLASSIFICATION_ORDER = case(
     (DailyCompositeFactorResult.composite_classification == 'hard_excluded', 3),
     else_=4,
 )
+MOMENTUM_ELIGIBILITY_STATUS = case(
+    (DailyMomentumFactorResult.has_sufficient_history.is_(False), 'insufficient_history'),
+    (
+        DailyMomentumFactorResult.is_price_above_ma120.is_(False)
+        | DailyMomentumFactorResult.is_ma60_above_ma120.is_(False),
+        'trend_not_confirmed',
+    ),
+    (DailyMomentumFactorResult.passes_momentum_top_percentile.is_(False), 'below_top_percentile_cutoff'),
+    (DailyMomentumFactorResult.is_recent_overheated.is_(True), 'recently_overheated'),
+    (DailyMomentumFactorResult.is_momentum_eligible.is_(True), 'eligible'),
+    else_='ineligible',
+)
 
 SCREENING_FAMILY_DEFINITIONS: dict[str, ScreeningFamilyDefinition] = {
     'market_risk_filter': ScreeningFamilyDefinition(
@@ -170,20 +182,37 @@ SCREENING_FAMILY_DEFINITIONS: dict[str, ScreeningFamilyDefinition] = {
             ScreeningField('close_price', DailyMomentumFactorResult.close_price, _as_int),
             ScreeningField('momentum_rank', DailyMomentumFactorResult.momentum_rank, _as_int),
             ScreeningField('momentum_percentile', DailyMomentumFactorResult.momentum_percentile, _round_float),
+            ScreeningField(
+                'momentum_percentile_threshold',
+                DailyMomentumFactorResult.momentum_percentile_threshold,
+                _round_float,
+            ),
+            ScreeningField(
+                'passes_momentum_top_percentile',
+                DailyMomentumFactorResult.passes_momentum_top_percentile,
+            ),
+            ScreeningField('momentum_eligibility_status', MOMENTUM_ELIGIBILITY_STATUS),
             ScreeningField('return_5d', DailyMomentumFactorResult.return_5d, _round_float),
             ScreeningField('has_sufficient_history', DailyMomentumFactorResult.has_sufficient_history),
+            ScreeningField('is_price_above_ma120', DailyMomentumFactorResult.is_price_above_ma120),
+            ScreeningField('is_ma60_above_ma120', DailyMomentumFactorResult.is_ma60_above_ma120),
             ScreeningField('is_recent_overheated', DailyMomentumFactorResult.is_recent_overheated),
             ScreeningField('is_momentum_eligible', DailyMomentumFactorResult.is_momentum_eligible),
             ScreeningField('captured_at', DailyMomentumFactorResult.captured_at, _as_iso_datetime),
         ),
         order_by=(
             DailyMomentumFactorResult.is_momentum_eligible.desc(),
+            DailyMomentumFactorResult.passes_momentum_top_percentile.desc(),
             DailyMomentumFactorResult.momentum_rank.asc().nullslast(),
             Symbol.symbol.asc(),
         ),
         summary_fields=(
             ScreeningMetric('entries', func.count(DailyMomentumFactorResult.id)),
             ScreeningMetric('ranked_symbols', _count_when(DailyMomentumFactorResult.momentum_rank.is_not(None))),
+            ScreeningMetric(
+                'top_percentile_symbols',
+                _count_when(DailyMomentumFactorResult.passes_momentum_top_percentile.is_(True)),
+            ),
             ScreeningMetric('eligible_symbols', _count_when(DailyMomentumFactorResult.is_momentum_eligible.is_(True))),
             ScreeningMetric('overheated_count', _count_when(DailyMomentumFactorResult.is_recent_overheated.is_(True))),
             ScreeningMetric(

@@ -1951,6 +1951,8 @@ def upsert_daily_momentum_factor_result(result: dict) -> None:
             'is_recent_overheated': bool(result.get('is_recent_overheated')),
             'momentum_rank': result.get('momentum_rank'),
             'momentum_percentile': result.get('momentum_percentile'),
+            'momentum_percentile_threshold': result.get('momentum_percentile_threshold'),
+            'passes_momentum_top_percentile': bool(result.get('passes_momentum_top_percentile')),
             'is_momentum_eligible': bool(result.get('is_momentum_eligible')),
             'factor_payload': result['factor_payload'],
             'captured_at': refreshed_at,
@@ -1973,6 +1975,8 @@ def upsert_daily_momentum_factor_result(result: dict) -> None:
                     'is_recent_overheated': statement.excluded.is_recent_overheated,
                     'momentum_rank': statement.excluded.momentum_rank,
                     'momentum_percentile': statement.excluded.momentum_percentile,
+                    'momentum_percentile_threshold': statement.excluded.momentum_percentile_threshold,
+                    'passes_momentum_top_percentile': statement.excluded.passes_momentum_top_percentile,
                     'is_momentum_eligible': statement.excluded.is_momentum_eligible,
                     'factor_payload': statement.excluded.factor_payload,
                     'captured_at': statement.excluded.captured_at,
@@ -1996,6 +2000,7 @@ def load_daily_momentum_factor_results(
             .where(DailyMomentumFactorResult.market_date == _normalize_trade_date(market_date))
             .order_by(
                 DailyMomentumFactorResult.is_momentum_eligible.desc(),
+                DailyMomentumFactorResult.passes_momentum_top_percentile.desc(),
                 DailyMomentumFactorResult.momentum_rank.asc().nullslast(),
                 Symbol.symbol.asc(),
             )
@@ -2024,6 +2029,8 @@ def load_daily_momentum_factor_results(
                 'is_recent_overheated': item.is_recent_overheated,
                 'momentum_rank': item.momentum_rank,
                 'momentum_percentile': _round_float(item.momentum_percentile, 6),
+                'momentum_percentile_threshold': _round_float(item.momentum_percentile_threshold, 6),
+                'passes_momentum_top_percentile': item.passes_momentum_top_percentile,
                 'is_momentum_eligible': item.is_momentum_eligible,
                 'factor_payload': item.factor_payload,
                 'captured_at': item.captured_at.isoformat() if item.captured_at else None,

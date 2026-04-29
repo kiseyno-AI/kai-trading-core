@@ -24,6 +24,8 @@ Supported `family` values:
 
 Use the family-specific routes when the client needs the full payload block or a single-symbol detail shape.
 
+For `family=momentum`, compact rows now surface the explicit 12-1 eligibility gates directly: `momentum_percentile_threshold`, `passes_momentum_top_percentile`, `momentum_eligibility_status`, `is_price_above_ma120`, `is_ma60_above_ma120`, `is_recent_overheated`, and `is_momentum_eligible`.
+
 ## Query parameters
 - `family` (required): screening family identifier.
 - `market_date` (optional): ISO trade date. When omitted, the route uses the latest available persisted date for that family.

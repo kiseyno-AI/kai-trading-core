@@ -3,7 +3,7 @@
 ## Summary
 Computes or reads persisted price-based momentum factor rows built from stored `daily_price_bars`.
 
-The v1 slice stores 12-1 momentum using exact stored trading-bar offsets (`close[t-21] / close[t-252] - 1`), 60-day and 120-day moving averages, trend-confirmation flags, and a `momentum_overheat_v2` exclusion rule that combines cross-sectional 5-day return percentile, a volatility-adjusted 5-day shock metric, and a minimum absolute 5-day return gate. Compute and read responses expose the overheat audit fields directly and also preserve the full rule metadata inside `factor_payload`.
+The v1 slice stores 12-1 momentum using exact stored trading-bar offsets (`close[t-21] / close[t-252] - 1`), 60-day and 120-day moving averages, an explicit top-percentile eligibility gate (default top 20% / `momentum_percentile >= 0.80`), and a `momentum_overheat_v2` exclusion rule that combines cross-sectional 5-day return percentile, a volatility-adjusted 5-day shock metric, and a minimum absolute 5-day return gate. Compute and read responses expose the percentile cutoff, its pass/fail result, the primary eligibility status, and the overheat audit fields directly, while preserving the full rule metadata inside `factor_payload`.
 
 ## Example compute request
 ```http
@@ -20,12 +20,15 @@ GET /eod/momentum-factors?market_date=2026-04-23&symbols=005930,000660
 {
   "market_date": "2026-04-23",
   "feature_version": "price_momentum_v1",
+  "eligibility_rule_version": "momentum_top_percentile_v1",
+  "momentum_percentile_threshold": 0.8,
   "summary": {
     "entries": 2,
     "requested_symbols": ["005930", "000660"],
     "matched_symbols": ["005930", "000660"],
     "missing_symbols": [],
     "ranked_symbols": 2,
+    "top_percentile_symbols": 1,
     "eligible_symbols": 1
   },
   "items": [
@@ -50,8 +53,21 @@ GET /eod/momentum-factors?market_date=2026-04-23&symbols=005930,000660
       "overheat_rule_version": "momentum_overheat_v2",
       "momentum_rank": 142,
       "momentum_percentile": 0.96,
+      "momentum_percentile_threshold": 0.8,
+      "passes_momentum_top_percentile": true,
+      "momentum_eligibility_status": "recently_overheated",
       "is_momentum_eligible": false,
       "factor_payload": {
+        "eligibility_rule": {
+          "rule_version": "momentum_top_percentile_v1"
+        },
+        "ranking": {
+          "passes_momentum_top_percentile": true
+        },
+        "eligibility": {
+          "momentum_eligibility_status": "recently_overheated",
+          "failed_requirements": ["not_recently_overheated"]
+        },
         "overheat_rule": {
           "rule_version": "momentum_overheat_v2"
         },

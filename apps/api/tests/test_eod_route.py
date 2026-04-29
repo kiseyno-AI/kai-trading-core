@@ -361,7 +361,14 @@ class FakeMomentumFactorService:
             'market_date': kwargs['market_date'],
             'results_persisted': 2,
             'results_failed': 0,
-            'items': [{'symbol': '005930', 'momentum_rank': 1}],
+            'items': [
+                {
+                    'symbol': '005930',
+                    'momentum_rank': 1,
+                    'momentum_percentile_threshold': 0.8,
+                    'passes_momentum_top_percentile': True,
+                }
+            ],
         }
 
     def inspect(self, **kwargs):
@@ -369,7 +376,16 @@ class FakeMomentumFactorService:
         return {
             'market_date': kwargs['market_date'],
             'summary': {'entries': 1, 'eligible_symbols': 1},
-            'items': [{'symbol': '005930', 'momentum_rank': 1, 'is_momentum_eligible': True}],
+            'items': [
+                {
+                    'symbol': '005930',
+                    'momentum_rank': 1,
+                    'is_momentum_eligible': True,
+                    'momentum_percentile_threshold': 0.8,
+                    'passes_momentum_top_percentile': True,
+                    'momentum_eligibility_status': 'eligible',
+                }
+            ],
         }
 
 
@@ -1463,6 +1479,7 @@ class EODRouteTests(unittest.TestCase):
         self.assertEqual(fake_service.inspect_args['limit'], 5)
         self.assertEqual(response.json()['summary']['eligible_symbols'], 1)
         self.assertEqual(response.json()['items'][0]['momentum_rank'], 1)
+        self.assertTrue(response.json()['items'][0]['passes_momentum_top_percentile'])
 
     def test_compute_value_factors_route_calls_service(self):
         fake_service = FakeValueFactorService()
