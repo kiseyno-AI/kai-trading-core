@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from typing import Any, Callable, Sequence
 
+import exchange_calendars as xcals
+import pandas as pd
 from sqlalchemy import select
 
 from app.agent_context.signal_decider_loop_service import signal_decider_loop_service
@@ -32,6 +34,7 @@ EXECUTION_STATUS_DRY_RUN = 'dry_run'
 EXECUTION_STATUS_SUBMITTED = 'submitted'
 EXECUTION_STATUS_SUBMIT_FAILED = 'submit_failed'
 ORDER_SOURCE = 'signal_decider_next_open'
+KRX_EXCHANGE_CALENDAR = xcals.get_calendar('XKRX')
 
 
 def _utcnow() -> datetime:
@@ -96,10 +99,10 @@ def _normalize_text_list(value: Any) -> list[str]:
 
 
 def _previous_trading_day(value: date) -> date:
-    candidate = value - timedelta(days=1)
-    while candidate.weekday() >= 5:
-        candidate -= timedelta(days=1)
-    return candidate
+    session_label = pd.Timestamp(value.isoformat())
+    if KRX_EXCHANGE_CALENDAR.is_session(session_label):
+        return KRX_EXCHANGE_CALENDAR.previous_session(session_label).date()
+    return KRX_EXCHANGE_CALENDAR.date_to_session(session_label, direction='previous').date()
 
 
 def _reason(code: str, message: str) -> dict[str, str]:
@@ -253,10 +256,13 @@ class SignalDeciderNextOpenExecutionService:
                         session.add(row)
                         attached_existing[(target.account_reference, snapshot.symbol)] = row
 
-                    policy_context = policy_cache.setdefault(
-                        snapshot.policy_version,
-                        signal_decider_loop_service.get_policy_prompt_context(policy_version=snapshot.policy_version),
-                    )
+                    if row.execution_status == EXECUTION_STATUS_SUBMITTED:
+                        continue
+                    if snapshot.policy_version not in policy_cache:
+                        policy_cache[snapshot.policy_version] = signal_decider_loop_service.get_policy_prompt_context(
+                            policy_version=snapshot.policy_version
+                        )
+                    policy_context = policy_cache[snapshot.policy_version]
                     validation, computed = self._build_validation_payload(
                         snapshot=snapshot,
                         target=target,

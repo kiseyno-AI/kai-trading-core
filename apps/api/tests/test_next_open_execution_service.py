@@ -23,6 +23,7 @@ from app.orders.next_open_execution import (
     ELIGIBILITY_BLOCKED,
     ELIGIBILITY_ELIGIBLE,
     SignalDeciderNextOpenExecutionService,
+    _previous_trading_day,
 )
 from app.orders.store import upsert_broker_order, upsert_order_request
 
@@ -239,6 +240,9 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
+    def test_previous_trading_day_uses_exchange_calendar(self) -> None:
+        self.assertEqual(_previous_trading_day(date(2026, 1, 2)), date(2025, 12, 30))
+
     def test_refresh_plan_items_persists_eligible_and_blocked_buy_candidates(self) -> None:
         eligible_snapshot_id = self._seed_snapshot(symbol='005930')
         blocked_snapshot_id = self._seed_snapshot(
@@ -272,6 +276,27 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             'data_quality_warnings_present',
         )
         self.assertNotIn('035420', items_by_symbol)
+
+    def test_refresh_plan_items_reuses_cached_policy_context_by_policy_version(self) -> None:
+        self._seed_snapshot(symbol='005930')
+        self._seed_snapshot(symbol='000660')
+        service = self._service(state='PREOPEN', server_time='2026-04-30T08:40:00+09:00')
+
+        def fake_bars(symbol: str, **_kwargs):
+            if symbol == '005930':
+                return [{'trade_date': '2026-04-29', 'close_price': 50000}]
+            if symbol == '000660':
+                return [{'trade_date': '2026-04-29', 'close_price': 250000}]
+            return []
+
+        with patch(
+            'app.orders.next_open_execution.signal_decider_loop_service.get_policy_prompt_context',
+            return_value={'status': 'active', 'activation_mode': 'manual_only'},
+        ) as get_policy_prompt_context:
+            with patch('app.orders.next_open_execution.load_daily_bars_for_symbol_range', side_effect=fake_bars):
+                service.refresh_plan_items(target_trade_date=self.target_trade_date, trigger='test')
+
+        get_policy_prompt_context.assert_called_once_with(policy_version=self.policy_version)
 
     async def test_run_market_open_execution_submits_and_prevents_duplicate_replays(self) -> None:
         self._seed_snapshot(symbol='005930')
@@ -327,3 +352,37 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(fake_order_service.calls), 0)
         self.assertEqual(result['items'][0]['execution_status'], EXECUTION_STATUS_DRY_RUN)
         self.assertEqual(result['items'][0]['submission']['mode'], 'dry_run')
+
+    async def test_refresh_plan_items_does_not_mutate_submitted_rows(self) -> None:
+        original_snapshot_id = self._seed_snapshot(symbol='005930')
+        fake_order_service = FakeOrderService()
+        service = self._service(order_service=fake_order_service)
+
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[{'trade_date': '2026-04-29', 'close_price': 50000}],
+        ):
+            service.refresh_plan_items(target_trade_date=self.target_trade_date, trigger='test')
+            first_result = await service.run_market_open_execution_if_due(
+                target_trade_date=self.target_trade_date,
+                trigger='test',
+            )
+
+        submitted_item = first_result['items'][0]
+        replacement_snapshot_id = self._seed_snapshot(symbol='005930')
+        self.assertNotEqual(replacement_snapshot_id, original_snapshot_id)
+
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[{'trade_date': '2026-04-29', 'close_price': 51000}],
+        ):
+            refreshed = service.refresh_plan_items(target_trade_date=self.target_trade_date, trigger='test_refresh')
+
+        refreshed_item = next(item for item in refreshed['items'] if item['symbol'] == '005930')
+        self.assertEqual(refreshed_item['execution_status'], EXECUTION_STATUS_SUBMITTED)
+        self.assertEqual(refreshed_item['decision_snapshot_id'], submitted_item['decision_snapshot_id'])
+        self.assertEqual(refreshed_item['traceability'], submitted_item['traceability'])
+        self.assertEqual(refreshed_item['validation'], submitted_item['validation'])
+        self.assertEqual(refreshed_item['estimated_reference_price'], submitted_item['estimated_reference_price'])
+        self.assertEqual(refreshed_item['planned_quantity'], submitted_item['planned_quantity'])
+        self.assertEqual(refreshed_item['submitted_at'], submitted_item['submitted_at'])
