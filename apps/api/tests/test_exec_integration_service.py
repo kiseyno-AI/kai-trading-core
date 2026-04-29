@@ -438,6 +438,14 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result['exec_connected'])
         self.assertEqual(result['issues'][0]['code'], 'unavailable')
 
+    async def test_dashboard_runtime_status_refresh_false_keeps_ready_config_healthy(self) -> None:
+        result = await self.service.dashboard_runtime_status(refresh=False)
+
+        self.assertEqual(result['status'], 'degraded')
+        self.assertTrue(result['exec_connected'])
+        self.assertFalse(result['monitoring_alive'])
+        self.assertEqual(self.client.runtime_calls, 0)
+
     async def test_runtime_dashboard_views_merge_core_plan_and_exec_truth(self) -> None:
         dispatch_result = await self.service.dispatch_next_open_plan(
             target_trade_date=self.target_trade_date,
@@ -529,6 +537,63 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(detail['monitoring']['state'], 'watching_target_stop')
         self.assertEqual(detail['items'][0]['status'], 'filled')
         self.assertEqual(detail['items'][0]['remote_state']['derived_status'], 'open')
+
+    async def test_runtime_dashboard_views_classify_cancelled_orders_before_failed(self) -> None:
+        dispatch_result = await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=False,
+            dry_run=False,
+            force=True,
+            trigger='test',
+        )
+        plan_id = dispatch_result['dispatch']['groups'][0]['plan_id']
+        self.client.runtime_response = {
+            'mode': 'mock',
+            'ready': True,
+            'safety': {
+                'paused': False,
+                'kill_switch_enabled': False,
+                'automation_enabled': True,
+            },
+            'monitoring': {
+                'alive': True,
+            },
+        }
+        self.client.plan_response = {'items': [{'external_plan_id': plan_id, 'status': 'accepted'}]}
+        self.client.execution_response = {'items': []}
+        self.client.position_response = {'items': []}
+
+        for remote_status in ('cancelled', 'canceled'):
+            with self.subTest(remote_status=remote_status):
+                self.client.order_response = {
+                    'items': [
+                        {
+                            'id': 'order-1',
+                            'execution_plan_item_id': 'exec-item-1',
+                            'symbol': self.symbol,
+                            'status': remote_status,
+                            'updated_at': '2026-04-30T00:05:00+00:00',
+                        }
+                    ]
+                }
+
+                board = await self.service.get_runtime_daily_board(
+                    market_date=self.target_trade_date,
+                    refresh=True,
+                    trigger='test',
+                )
+                detail = await self.service.get_runtime_symbol_detail(
+                    market_date=self.target_trade_date,
+                    symbol=self.symbol,
+                    refresh=True,
+                    trigger='test',
+                )
+
+                self.assertEqual(board['summary']['cancelled'], 1)
+                self.assertEqual(board['summary']['failed'], 0)
+                self.assertEqual(board['items'][0]['status'], 'cancelled')
+                self.assertEqual(detail['items'][0]['status'], 'cancelled')
+                self.assertEqual(detail['items'][0]['remote_state']['derived_status'], 'cancelled')
 
 
 if __name__ == '__main__':

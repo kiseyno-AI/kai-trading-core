@@ -76,6 +76,7 @@ REMOTE_SCHEDULED_STATUSES = {'accepted', 'created', 'pending', 'queued'}
 REMOTE_SUBMITTED_STATUSES = {'open', 'running', 'submitted', 'working'}
 REMOTE_PARTIAL_STATUSES = {'partial', 'partial_fill', 'partially_filled'}
 REMOTE_CANCELLED_STATUSES = {'canceled', 'cancelled'}
+REMOTE_TERMINAL_FAILURE_STATUSES = REMOTE_FAILED_STATUSES - REMOTE_CANCELLED_STATUSES
 
 UI_RUNTIME_STATUS_READY = 'ready'
 UI_RUNTIME_STATUS_DEGRADED = 'degraded'
@@ -1716,6 +1717,7 @@ class SignalDeciderExecIntegrationService:
             for link in item_links
             if _normalize_status(link.get('remote_status'))
         }
+        status_set = item_statuses.union(set(order_status_counts.keys()))
         derived_status = EXEC_DISPATCH_STATUS_ACCEPTED
         if sell_quantity > 0 and (position_quantity <= 0 or (buy_quantity > 0 and sell_quantity >= buy_quantity)):
             derived_status = 'closed'
@@ -1723,7 +1725,9 @@ class SignalDeciderExecIntegrationService:
             derived_status = 'open'
         elif any(status in REMOTE_ACTIVE_STATUSES for status in order_status_counts):
             derived_status = 'working'
-        elif any(status in REMOTE_FAILED_STATUSES for status in item_statuses.union(set(order_status_counts.keys()))):
+        elif any(status in REMOTE_CANCELLED_STATUSES for status in status_set):
+            derived_status = UI_BOARD_STATUS_CANCELLED
+        elif any(status in REMOTE_TERMINAL_FAILURE_STATUSES for status in status_set):
             derived_status = 'failed'
 
         open_quantity = max(position_quantity, buy_quantity - sell_quantity)
@@ -1938,7 +1942,7 @@ class SignalDeciderExecIntegrationService:
                 issues.append(_serialize_issue('readiness_reason', reason_text))
 
         runtime_status = _normalize_optional_text(runtime.get('status'), lowercase=True)
-        exec_connected = runtime_status == REMOTE_FETCH_STATUS_OK
+        exec_connected = runtime_status in {REMOTE_FETCH_STATUS_OK, UI_RUNTIME_STATUS_READY}
 
         if kill_switch_enabled:
             status = UI_RUNTIME_STATUS_KILL_SWITCHED
@@ -2290,6 +2294,7 @@ class SignalDeciderExecIntegrationService:
         dispatch_status = _normalize_optional_text((item.get('dispatch') or {}).get('status'), lowercase=True)
         remote_state = item.get('remote_state') if isinstance(item.get('remote_state'), dict) else {}
         derived_status = _normalize_optional_text(remote_state.get('derived_status'), lowercase=True)
+        failed_order_statuses = order_statuses & REMOTE_TERMINAL_FAILURE_STATUSES
 
         if eligibility_status == ELIGIBILITY_BLOCKED:
             return UI_BOARD_STATUS_FAILED
@@ -2300,10 +2305,12 @@ class SignalDeciderExecIntegrationService:
             EXEC_DISPATCH_STATUS_UNAVAILABLE,
         }:
             return UI_BOARD_STATUS_FAILED
-        if order_statuses & REMOTE_FAILED_STATUSES or derived_status == 'failed':
-            return UI_BOARD_STATUS_FAILED
-        if order_statuses & REMOTE_CANCELLED_STATUSES and entry_filled_quantity <= Decimal('0'):
+        if (order_statuses & REMOTE_CANCELLED_STATUSES or derived_status == UI_BOARD_STATUS_CANCELLED) and (
+            entry_filled_quantity <= Decimal('0')
+        ):
             return UI_BOARD_STATUS_CANCELLED
+        if failed_order_statuses or derived_status == 'failed':
+            return UI_BOARD_STATUS_FAILED
         if order_statuses & REMOTE_PARTIAL_STATUSES:
             return UI_BOARD_STATUS_PARTIAL
         if planned_quantity is not None and entry_filled_quantity > Decimal('0') and entry_filled_quantity < planned_quantity:
