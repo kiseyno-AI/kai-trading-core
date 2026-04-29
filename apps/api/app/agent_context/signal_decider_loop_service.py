@@ -161,6 +161,45 @@ class SignalDeciderEvaluationProfile:
     buy_severe_drawdown_multiplier: float = 1.5
 
 
+@dataclass(frozen=True)
+class SignalDeciderDecisionSnapshotRecord:
+    id: int
+    feedback_id: int | None
+    market_date: date
+    symbol: str
+    agent_name: str
+    agent_version: str | None
+    decision_run_id: str | None
+    feedback_received_at: datetime | None
+    policy_version: str
+    decision_action: str
+    preferred_action: str
+    next_day_open_action: str
+    entry_price_basis: str
+    target_price: int | None
+    expected_return_pct: Decimal | float | None
+    stop_loss_price: int | None
+    suggested_holding_period: str | None
+    confidence_score_10: Decimal | float | None
+    conviction_score_10: Decimal | float | None
+    thesis_summary: str
+    supporting_evidence_payload: list | dict
+    decision_risks_payload: list | dict
+    invalidation_conditions_payload: list | dict
+    data_quality_warnings_payload: list | dict
+    specialist_disagreement_payload: list | dict
+    traceability_payload: dict
+    input_feature_snapshot_payload: dict
+    request_payload: dict
+    response_payload: dict
+    response_summary_payload: dict
+    created_at: datetime | None
+    updated_at: datetime | None
+
+
+SignalDeciderDecisionSnapshotRow = SignalDeciderDecisionSnapshot | SignalDeciderDecisionSnapshotRecord
+
+
 HORIZON_THRESHOLDS: dict[int, HorizonThreshold] = {
     1: HorizonThreshold(good_return_pct=0.010, opportunity_return_pct=0.015, loss_return_pct=0.010),
     3: HorizonThreshold(good_return_pct=0.020, opportunity_return_pct=0.025, loss_return_pct=0.020),
@@ -739,6 +778,45 @@ def _serialize_outcome_row(row: SignalDeciderRealizedOutcome) -> dict[str, Any]:
     }
 
 
+def _serialize_decision_snapshot_row(
+    row: SignalDeciderDecisionSnapshot,
+) -> SignalDeciderDecisionSnapshotRecord:
+    return SignalDeciderDecisionSnapshotRecord(
+        id=row.id,
+        feedback_id=row.feedback_id,
+        market_date=row.market_date,
+        symbol=row.symbol,
+        agent_name=row.agent_name,
+        agent_version=row.agent_version,
+        decision_run_id=row.decision_run_id,
+        feedback_received_at=row.feedback_received_at,
+        policy_version=row.policy_version,
+        decision_action=row.decision_action,
+        preferred_action=row.preferred_action,
+        next_day_open_action=row.next_day_open_action,
+        entry_price_basis=row.entry_price_basis,
+        target_price=row.target_price,
+        expected_return_pct=row.expected_return_pct,
+        stop_loss_price=row.stop_loss_price,
+        suggested_holding_period=row.suggested_holding_period,
+        confidence_score_10=row.confidence_score_10,
+        conviction_score_10=row.conviction_score_10,
+        thesis_summary=row.thesis_summary,
+        supporting_evidence_payload=row.supporting_evidence_payload,
+        decision_risks_payload=row.decision_risks_payload,
+        invalidation_conditions_payload=row.invalidation_conditions_payload,
+        data_quality_warnings_payload=row.data_quality_warnings_payload,
+        specialist_disagreement_payload=row.specialist_disagreement_payload,
+        traceability_payload=row.traceability_payload,
+        input_feature_snapshot_payload=row.input_feature_snapshot_payload,
+        request_payload=row.request_payload,
+        response_payload=row.response_payload,
+        response_summary_payload=row.response_summary_payload,
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+    )
+
+
 def _serialize_evaluation_row(row: SignalDeciderEvaluation) -> dict[str, Any]:
     return {
         'id': row.id,
@@ -833,7 +911,7 @@ class SignalDeciderLoopRepository:
         policy_versions: Sequence[str] | None = None,
         limit: int | None = None,
         offset: int = 0,
-    ) -> list[SignalDeciderDecisionSnapshot]:
+    ) -> list[SignalDeciderDecisionSnapshotRecord]:
         normalized_symbols = _normalize_symbols(symbols)
         normalized_actions = [_normalize_optional_action_filter(value) for value in decision_actions or []]
         normalized_actions = [value for value in normalized_actions if value]
@@ -870,15 +948,19 @@ class SignalDeciderLoopRepository:
                 stmt = stmt.offset(offset)
             if limit is not None:
                 stmt = stmt.limit(limit)
-            return session.execute(stmt).scalars().all()
+            rows = session.execute(stmt).scalars().all()
+            return [_serialize_decision_snapshot_row(row) for row in rows]
 
-    def get_decision_snapshot(self, *, snapshot_id: int) -> SignalDeciderDecisionSnapshot | None:
+    def get_decision_snapshot(self, *, snapshot_id: int) -> SignalDeciderDecisionSnapshotRecord | None:
         with session_scope() as session:
             stmt = select(SignalDeciderDecisionSnapshot).where(
                 SignalDeciderDecisionSnapshot.id == int(snapshot_id),
                 SignalDeciderDecisionSnapshot.agent_name == SIGNAL_DECIDER_AGENT_NAME,
             )
-            return session.execute(stmt).scalar_one_or_none()
+            row = session.execute(stmt).scalar_one_or_none()
+            if row is None:
+                return None
+            return _serialize_decision_snapshot_row(row)
 
     def list_realized_outcomes(
         self,
@@ -2767,7 +2849,7 @@ class SignalDeciderLoopService:
     def _build_decision_detail_items(
         self,
         *,
-        rows: Sequence[SignalDeciderDecisionSnapshot],
+        rows: Sequence[SignalDeciderDecisionSnapshotRow],
         horizons: Sequence[int] | None,
         evaluation_version: str,
         refresh_actual_execution_outcomes: bool = False,
@@ -2809,7 +2891,7 @@ class SignalDeciderLoopService:
     def _build_decision_detail_item(
         self,
         *,
-        row: SignalDeciderDecisionSnapshot,
+        row: SignalDeciderDecisionSnapshotRow,
         horizons: Sequence[int] | None,
         evaluation_version: str,
         outcomes: Sequence[dict[str, Any]] | None = None,
@@ -2964,7 +3046,7 @@ class SignalDeciderLoopService:
     def _build_aggregate_summary(
         self,
         *,
-        rows: Sequence[SignalDeciderDecisionSnapshot],
+        rows: Sequence[SignalDeciderDecisionSnapshotRow],
         evaluations: Sequence[dict[str, Any]],
     ) -> dict[str, Any]:
         verdict_counts: Counter[str] = Counter(
@@ -3053,7 +3135,7 @@ class SignalDeciderLoopService:
     def _build_contributor_report(
         self,
         *,
-        rows: Sequence[SignalDeciderDecisionSnapshot],
+        rows: Sequence[SignalDeciderDecisionSnapshotRow],
         evaluations_by_snapshot: dict[int, list[dict[str, Any]]],
         limit: int,
     ) -> dict[str, Any]:
@@ -3151,7 +3233,7 @@ class SignalDeciderLoopService:
         *,
         buckets: dict[tuple[str, str], dict[str, Any]],
         tokens: Sequence[tuple[str, str]],
-        row: SignalDeciderDecisionSnapshot,
+        row: SignalDeciderDecisionSnapshotRow,
         evaluation: dict[str, Any],
     ) -> None:
         for key, value in tokens:
@@ -3314,7 +3396,7 @@ class SignalDeciderLoopService:
             return None
         return round(total / count, 6)
 
-    def _build_decision_snapshot(self, row: SignalDeciderDecisionSnapshot) -> dict[str, Any]:
+    def _build_decision_snapshot(self, row: SignalDeciderDecisionSnapshotRow) -> dict[str, Any]:
         summary_payload = _maybe_dict(row.response_summary_payload)
         feedback_payload = _maybe_dict(row.response_payload)
         request_payload = _maybe_dict(row.request_payload)
@@ -3459,7 +3541,7 @@ class SignalDeciderLoopService:
     def _build_calendar_summary_items(
         self,
         *,
-        rows: Sequence[SignalDeciderDecisionSnapshot],
+        rows: Sequence[SignalDeciderDecisionSnapshotRow],
         horizons: Sequence[int],
         primary_horizon_days: int,
         evaluation_version: str,
@@ -3517,7 +3599,7 @@ class SignalDeciderLoopService:
     def _build_review_items(
         self,
         *,
-        rows: Sequence[SignalDeciderDecisionSnapshot],
+        rows: Sequence[SignalDeciderDecisionSnapshotRow],
         horizons: Sequence[int],
         primary_horizon_days: int,
         evaluation_version: str,
@@ -3555,7 +3637,7 @@ class SignalDeciderLoopService:
     def _build_review_item(
         self,
         *,
-        row: SignalDeciderDecisionSnapshot,
+        row: SignalDeciderDecisionSnapshotRow,
         outcomes: Sequence[dict[str, Any]],
         evaluations: Sequence[dict[str, Any]],
         horizons: Sequence[int],
@@ -4266,7 +4348,7 @@ class SignalDeciderLoopService:
     def _build_realized_outcome_item(
         self,
         *,
-        snapshot_row: SignalDeciderDecisionSnapshot,
+        snapshot_row: SignalDeciderDecisionSnapshotRow,
         decision: dict[str, Any],
         future_bars: list[dict[str, Any]],
         horizon_days: int,
@@ -4409,7 +4491,7 @@ class SignalDeciderLoopService:
     def _build_evaluation_item(
         self,
         *,
-        snapshot_row: SignalDeciderDecisionSnapshot,
+        snapshot_row: SignalDeciderDecisionSnapshotRow,
         decision: dict[str, Any],
         outcome: dict[str, Any],
         horizon_days: int,
