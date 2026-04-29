@@ -429,7 +429,42 @@ class SignalDeciderExecIntegrationService:
         integration = self.integration_status()
         resolved_target_date = _normalize_date(target_trade_date)
         resolved_account_reference = _normalize_optional_text(account_reference)
-        resolved_dry_run = bool(dry_run) if dry_run is not None else False
+        resolved_dry_run = settings.signal_decider_next_open_dry_run if dry_run is None else dry_run
+
+        if not force and not settings.signal_decider_next_open_enabled and not resolved_dry_run:
+            plan_view = signal_decider_next_open_execution_service.list_plan_items(
+                target_trade_date=resolved_target_date,
+                account_reference=resolved_account_reference,
+                refresh=False,
+            )
+            return {
+                'request': {
+                    'target_trade_date': resolved_target_date.isoformat(),
+                    'account_reference': resolved_account_reference,
+                    'refresh_plan': refresh_plan,
+                    'dry_run': resolved_dry_run,
+                    'force': force,
+                    'trigger': trigger,
+                },
+                'integration': integration,
+                'dispatch': {
+                    'groups': [],
+                    'preview_plans': [],
+                },
+                'summary': {
+                    **(plan_view.get('summary') or {}),
+                    'delegated_to_exec': True,
+                    'triggered': False,
+                    'reason': 'execution_disabled',
+                    'dispatch_mode': integration['mode'],
+                    'translated_item_count': 0,
+                    'dispatched_group_count': 0,
+                    'failed_group_count': 0,
+                    'skipped_group_count': 0,
+                    'preview_group_count': 0,
+                },
+                'items': plan_view.get('items') or [],
+            }
 
         if refresh_plan:
             signal_decider_next_open_execution_service.refresh_plan_items(
@@ -1142,6 +1177,7 @@ class SignalDeciderExecIntegrationService:
             if not plan_id:
                 continue
             symbols = sorted({row.symbol for row in group_rows if row.symbol})
+            group_account_reference = _normalize_optional_text(group_rows[0].account_reference) if group_rows else None
             plans_result = await self._fetch_remote_endpoint(
                 lambda: self.client.list_execution_plans(external_plan_id=plan_id)
             )
@@ -1154,6 +1190,13 @@ class SignalDeciderExecIntegrationService:
             positions_result = await self._fetch_remote_endpoint(
                 lambda: self.client.list_positions(symbols=symbols)
             )
+            positions_result = {
+                **positions_result,
+                'items': self._filter_remote_positions_for_account(
+                    positions=positions_result['items'],
+                    account_reference=group_account_reference,
+                ),
+            }
             self._persist_group_readback(
                 rows=group_rows,
                 trigger=trigger,
@@ -1338,6 +1381,44 @@ class SignalDeciderExecIntegrationService:
             if symbol and symbol == row.symbol:
                 matched.append(execution)
         return matched
+
+    @staticmethod
+    def _extract_remote_account_reference(payload: dict[str, Any]) -> str | None:
+        for candidate in (
+            payload.get('account_reference'),
+            payload.get('accountReference'),
+            _extract_field(payload, 'account', 'account_reference'),
+            _extract_field(payload, 'account', 'accountReference'),
+            _extract_field(payload, 'account', 'reference'),
+            _extract_field(payload, 'metadata', 'account_reference'),
+            _extract_field(payload, 'metadata', 'accountReference'),
+            _extract_field(payload, 'risk_context', 'account_reference'),
+            _extract_field(payload, 'riskContext', 'accountReference'),
+        ):
+            normalized = _normalize_optional_text(candidate)
+            if normalized:
+                return normalized
+        return None
+
+    @classmethod
+    def _filter_remote_positions_for_account(
+        cls,
+        *,
+        positions: Sequence[dict[str, Any]],
+        account_reference: str | None,
+    ) -> list[dict[str, Any]]:
+        resolved_account_reference = _normalize_optional_text(account_reference)
+        normalized_positions = list(positions)
+        if not resolved_account_reference:
+            return normalized_positions
+        scoped_accounts = [cls._extract_remote_account_reference(item) for item in normalized_positions]
+        if not any(account is not None for account in scoped_accounts):
+            return normalized_positions
+        return [
+            item
+            for item, position_account_reference in zip(normalized_positions, scoped_accounts)
+            if position_account_reference == resolved_account_reference
+        ]
 
     @staticmethod
     def _match_remote_positions(

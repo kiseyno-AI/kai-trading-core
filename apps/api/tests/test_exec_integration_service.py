@@ -1,5 +1,6 @@
 from datetime import date, datetime, timezone
 import unittest
+from unittest.mock import patch
 from uuid import uuid4
 
 from sqlalchemy import delete
@@ -97,12 +98,16 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             'signal_decider_exec_dispatch_source': settings.signal_decider_exec_dispatch_source,
             'signal_decider_exec_runtime_mode': settings.signal_decider_exec_runtime_mode,
             'signal_decider_exec_request_timeout_seconds': settings.signal_decider_exec_request_timeout_seconds,
+            'signal_decider_next_open_enabled': settings.signal_decider_next_open_enabled,
+            'signal_decider_next_open_dry_run': settings.signal_decider_next_open_dry_run,
         }
         settings.signal_decider_exec_integration_mode = 'dispatch'
         settings.signal_decider_exec_base_url = 'http://exec.test'
         settings.signal_decider_exec_dispatch_source = 'kai-trading-core'
         settings.signal_decider_exec_runtime_mode = 'mock'
         settings.signal_decider_exec_request_timeout_seconds = 5.0
+        settings.signal_decider_next_open_enabled = True
+        settings.signal_decider_next_open_dry_run = False
         self.client = FakeExecClient()
         self.service = SignalDeciderExecIntegrationService(client=self.client)
         self.snapshot_id = self._seed_snapshot()
@@ -236,6 +241,38 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(exec_dispatch['dispatch_status'], 'accepted')
             self.assertEqual(len(exec_dispatch['item_links']), 3)
 
+    async def test_dispatch_next_open_plan_uses_next_open_dry_run_default(self) -> None:
+        settings.signal_decider_next_open_enabled = False
+        settings.signal_decider_next_open_dry_run = True
+
+        result = await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=False,
+            trigger='test',
+        )
+
+        self.assertTrue(result['request']['dry_run'])
+        self.assertEqual(result['summary']['preview_group_count'], 1)
+        self.assertEqual(result['dispatch']['groups'][0]['dispatch_status'], 'preview')
+        self.assertEqual(len(self.client.post_calls), 0)
+
+    async def test_dispatch_next_open_plan_respects_execution_enabled_gate(self) -> None:
+        settings.signal_decider_next_open_enabled = False
+        settings.signal_decider_next_open_dry_run = False
+
+        with patch('app.orders.exec_integration.signal_decider_next_open_execution_service.refresh_plan_items') as refresh_plan:
+            result = await self.service.dispatch_next_open_plan(
+                target_trade_date=self.target_trade_date,
+                refresh_plan=True,
+                trigger='test',
+            )
+
+        refresh_plan.assert_not_called()
+        self.assertFalse(result['request']['dry_run'])
+        self.assertEqual(result['summary']['reason'], 'execution_disabled')
+        self.assertFalse(result['summary']['triggered'])
+        self.assertEqual(len(self.client.post_calls), 0)
+
     async def test_exec_overview_refresh_persists_remote_readback(self) -> None:
         dispatch_result = await self.service.dispatch_next_open_plan(
             target_trade_date=self.target_trade_date,
@@ -289,6 +326,45 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             readback = row.submission_payload['exec_dispatch']['readback']
             self.assertEqual(readback['orders']['count'], 1)
             self.assertEqual(readback['derived_state']['derived_status'], 'open')
+
+    async def test_exec_overview_refresh_filters_positions_to_current_account(self) -> None:
+        dispatch_result = await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=False,
+            dry_run=False,
+            force=True,
+            trigger='test',
+        )
+        plan_id = dispatch_result['dispatch']['groups'][0]['plan_id']
+        self.client.plan_response = {'items': [{'external_plan_id': plan_id, 'status': 'accepted'}]}
+        self.client.order_response = {'items': []}
+        self.client.execution_response = {'items': []}
+        self.client.position_response = {
+            'items': [
+                {
+                    'account_reference': 'KIS:00000000-01',
+                    'symbol': self.symbol,
+                    'quantity': '5',
+                    'average_price': '50000',
+                }
+            ]
+        }
+
+        overview = await self.service.list_signal_decider_exec_overview(
+            target_trade_date=self.target_trade_date,
+            account_reference=self.account_reference,
+            symbol=self.symbol,
+            refresh=True,
+            trigger='test',
+        )
+
+        self.assertEqual(overview['items'][0]['remote_state']['derived_status'], 'accepted')
+        self.assertEqual(overview['items'][0]['remote_state']['positions'], [])
+
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            readback = row.submission_payload['exec_dispatch']['readback']
+            self.assertEqual(readback['positions']['count'], 0)
 
 
 if __name__ == '__main__':
