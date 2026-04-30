@@ -23,12 +23,16 @@ def is_abortlike_error(error: Any) -> bool:
     return any(marker in text for marker in ABORTLIKE_ERROR_MARKERS)
 
 
+FEEDBACK_SESSION_KEY_PREFIX = 'feedback'
+FRESH_FEEDBACK_SESSION_KEY_PREFIX = 'feedback-fresh'
+
+
 def feedback_session_key(*, agent_name: str, slot: int) -> str:
-    return f"feedback/{agent_name}/slot-{slot:02d}"
+    return f"{FEEDBACK_SESSION_KEY_PREFIX}/{agent_name}/slot-{slot:02d}"
 
 
 def fresh_feedback_session_key(*, agent_name: str, request_run_id: str, slot: int) -> str:
-    return f"feedback/{agent_name}/{request_run_id}/slot-{slot:02d}/{uuid.uuid4().hex[:10]}"
+    return f"{FRESH_FEEDBACK_SESSION_KEY_PREFIX}/{agent_name}/{request_run_id}/slot-{slot:02d}/{uuid.uuid4().hex[:10]}"
 
 
 def subagent_test_session_key(*, agent_name: str, request_run_id: str, symbol: str) -> str:

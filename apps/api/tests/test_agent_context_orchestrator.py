@@ -547,6 +547,25 @@ def _patch_feedback_eligibility(*symbols: str):
 
 
 class AgentFeedbackOrchestratorTests(unittest.TestCase):
+    def test_openclaw_client_uses_default_timeout_when_configured_timeout_is_non_positive(self):
+        fake_settings = SimpleNamespace(
+            openclaw_base_url='https://openclaw.example',
+            openclaw_gateway_token='gateway-token',
+            openclaw_agent_timeout_seconds=0,
+            openclaw_agent_max_retries=0,
+            openclaw_agent_retry_backoff_seconds=0,
+            openclaw_agent_max_prompt_chars=0,
+        )
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            client = OpenClawAgentClient()
+
+        self.assertEqual(
+            client.timeout_seconds,
+            orchestrator_module.DEFAULT_OPENCLAW_AGENT_TIMEOUT_SECONDS,
+        )
+        self.assertEqual(client.http_timeout_seconds, client.timeout_seconds)
+
     def test_signal_decider_batch_message_requires_exact_symbol_batch_envelope(self):
         fake_settings = SimpleNamespace(
             openclaw_base_url='https://openclaw.example',
@@ -1020,8 +1039,13 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertIn('raw_response', decider_row['summary'])
         self.assertEqual(decider_row['context']['market_context']['status'], 'ready')
         self.assertEqual(decider_row['context']['market_context']['flows']['foreign']['value'], 746146)
+        eod_call = next(call for call in client.calls if call['spec'].role == 'eod-summarizer')
+        self.assertEqual(eod_call['batch_items'][0]['session_reuse_mode'], 'fresh_per_batch')
+        self.assertTrue(eod_call['batch_items'][0]['session_key'].startswith('agent:eod-summarizer:feedback-fresh/eod-summarizer/'))
+        self.assertIn(result['request']['request_run_id'], eod_call['batch_items'][0]['session_key'])
         decider_call = next(call for call in client.calls if call['spec'].role == 'signal-decider')
         self.assertEqual(decider_call['batch_items'][0]['session_reuse_mode'], 'fresh_per_batch')
+        self.assertTrue(decider_call['batch_items'][0]['session_key'].startswith('agent:signal-decider:feedback-fresh/signal-decider/'))
         self.assertIn(result['request']['request_run_id'], decider_call['batch_items'][0]['session_key'])
         self.assertEqual(market_context_builder.calls, ['2026-04-14'])
         self.assertEqual(result['summary']['completed'], 4)
@@ -1088,7 +1112,7 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertEqual(cleanup_target.symbol, '005930')
         self.assertEqual(cleanup_target.run_id, result['request']['request_run_id'])
         self.assertIn(result['request']['request_run_id'], cleanup_target.session_key)
-        self.assertIn('feedback/signal-decider/', cleanup_target.session_key)
+        self.assertIn('feedback-fresh/signal-decider/', cleanup_target.session_key)
 
     def test_build_upstream_feedback_bundle_does_not_reuse_same_day_persisted_summary_when_role_requires_redispatch(self):
         upstream_summaries, upstream_traceability, missing_roles = AgentFeedbackOrchestrator._build_upstream_feedback_bundle(
@@ -1375,7 +1399,8 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertEqual(len(failure_service.recorded), 1)
         recorded = failure_service.recorded[0]
         self.assertEqual(recorded['failure_kind'], 'session_history_missing_or_empty')
-        self.assertEqual(recorded['summary']['session_key'], 'agent:eod-summarizer:feedback/eod-summarizer/slot-01')
+        self.assertTrue(recorded['summary']['session_key'].startswith('agent:eod-summarizer:feedback-fresh/eod-summarizer/'))
+        self.assertIn('/slot-01/', recorded['summary']['session_key'])
         self.assertEqual(recorded['summary']['session_id'], 'session-traj-1')
         self.assertEqual(recorded['summary']['response_id'], 'resp-decider-traj-1')
         self.assertTrue(str(recorded['summary']['request_marker']).startswith('batch-request::'))

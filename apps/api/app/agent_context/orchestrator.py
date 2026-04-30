@@ -148,11 +148,17 @@ def _split_requested_symbols_by_agent_feedback_eligibility(
     return eligible_symbols, skipped_symbols
 
 
+DEFAULT_OPENCLAW_AGENT_TIMEOUT_SECONDS = 120.0
+
+
 class OpenClawAgentClient:
     def __init__(self) -> None:
         self.base_url = settings.openclaw_base_url.rstrip('/')
         self.gateway_token = settings.openclaw_gateway_token
-        self.timeout_seconds = settings.openclaw_agent_timeout_seconds if settings.openclaw_agent_timeout_seconds > 0 else None
+        configured_timeout = float(settings.openclaw_agent_timeout_seconds or 0)
+        self.timeout_seconds = (
+            configured_timeout if configured_timeout > 0 else DEFAULT_OPENCLAW_AGENT_TIMEOUT_SECONDS
+        )
         self.http_timeout_seconds = self.timeout_seconds
         self.max_retries = max(0, settings.openclaw_agent_max_retries)
         self.retry_backoff_seconds = max(0, settings.openclaw_agent_retry_backoff_seconds)
@@ -2643,11 +2649,8 @@ class AgentFeedbackOrchestrator:
                     queue: list[tuple[int, list[dict[str, Any]]]] = []
                     for batch_index, batch in enumerate(indexed_batches):
                         slot = (batch_index % role_parallelism) + 1
-                        session_reuse_mode = 'slot_reused'
-                        stable_session_key = f"agent:{spec.agent_name}:{_feedback_session_key(agent_name=spec.agent_name, slot=slot)}"
-                        if role == SIGNAL_DECIDER_AGENT_NAME:
-                            session_reuse_mode = 'fresh_per_batch'
-                            stable_session_key = f"agent:{spec.agent_name}:{_fresh_feedback_session_key(agent_name=spec.agent_name, request_run_id=request_run_id, slot=slot)}"
+                        session_reuse_mode = 'fresh_per_batch'
+                        stable_session_key = f"agent:{spec.agent_name}:{_fresh_feedback_session_key(agent_name=spec.agent_name, request_run_id=request_run_id, slot=slot)}"
                         dispatch_id = f'{request_run_id}:{role}:slot-{slot}:batch-{batch_index + 1}'
                         batch_with_session = [
                             {
