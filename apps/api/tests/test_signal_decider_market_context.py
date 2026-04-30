@@ -39,8 +39,8 @@ def _snapshot_payload(
                 'advancers': 702,
                 'unchanged': 81,
                 'decliners': 198,
-                'foreign_net_value': 148656,
-                'institution_net_value': 55532,
+                'foreign_net_value': -1455933000000,
+                'institution_net_value': 283792000000,
             },
             'kosdaq': {
                 'label': 'KOSDAQ',
@@ -50,8 +50,8 @@ def _snapshot_payload(
                 'advancers': 901,
                 'unchanged': 92,
                 'decliners': 501,
-                'foreign_net_value': 597490,
-                'institution_net_value': None if missing_institutional else 150685,
+                'foreign_net_value': -211205000000,
+                'institution_net_value': None if missing_institutional else -304502000000,
             },
         },
         'usd_krw': {
@@ -78,8 +78,10 @@ class SignalDeciderMarketContextBuilderTests(unittest.TestCase):
         self.assertEqual(result['indices']['kospi']['level'], 2642.07)
         self.assertEqual(result['indices']['kosdaq']['change_rate'], 0.54)
         self.assertEqual(result['fx']['usdkrw']['value'], 1444.5)
-        self.assertEqual(result['flows']['foreign']['value'], 746146)
-        self.assertEqual(result['flows']['institutional']['value'], 206217)
+        self.assertEqual(result['flows']['foreign']['value'], -1667138000000)
+        self.assertEqual(result['flows']['foreign']['unit'], 'krw')
+        self.assertEqual(result['flows']['institutional']['value'], -20710000000)
+        self.assertEqual(result['flows']['institutional']['unit'], 'krw')
         self.assertEqual(result['missing_fields'], [])
         self.assertIsNone(result['stale_reason'])
         self.assertIn('KOSPI +0.45%', result['summary']['line'])

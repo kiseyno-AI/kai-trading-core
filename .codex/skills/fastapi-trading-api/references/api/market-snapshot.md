@@ -22,6 +22,8 @@ Degradation behavior:
 - when a prior USD/KRW fetch succeeded, Core reuses the latest durable USD/KRW snapshot from `current_fx_rate_snapshots` and marks the FX leg stale instead of failing the whole snapshot
 - when no cached USD/KRW value exists, the snapshot becomes partial and `missing_fields` includes the missing FX fields
 - `freshness` reports the current cache cadence, last refresh attempt/success timestamps, next due time, and whether the last refresh was `success`, `degraded`, or `error`
+- `trading_value` keeps KIS `acml_tr_pbmn` semantics and is paired with `trading_value_unit: "million_krw"`
+- `foreign_net_value` and `institution_net_value` are normalized from KIS `*_tr_pbmn` fields into raw KRW and are paired with `investor_flow_value_unit: "krw"`
 
 ## Example request
 ```http
@@ -47,13 +49,15 @@ GET /market/snapshot
       "low": 2634.29,
       "volume": 305715,
       "trading_value": 4736153,
+      "trading_value_unit": "million_krw",
       "advancers": 512,
       "unchanged": 94,
       "decliners": 330,
       "foreign_net_quantity": -5290,
-      "foreign_net_value": 148656,
+      "foreign_net_value": -1455933000000,
       "institution_net_quantity": 720,
-      "institution_net_value": -55532
+      "institution_net_value": 283792000000,
+      "investor_flow_value_unit": "krw"
     },
     "kosdaq": {
       "label": "KOSDAQ",
@@ -66,13 +70,15 @@ GET /market/snapshot
       "low": 854.72,
       "volume": 1312496,
       "trading_value": 11507962,
+      "trading_value_unit": "million_krw",
       "advancers": 828,
       "unchanged": 94,
       "decliners": 716,
       "foreign_net_quantity": -18565,
-      "foreign_net_value": -597490,
+      "foreign_net_value": -211205000000,
       "institution_net_quantity": -4738,
-      "institution_net_value": -150685
+      "institution_net_value": -304502000000,
+      "investor_flow_value_unit": "krw"
     }
   },
   "usd_krw": {

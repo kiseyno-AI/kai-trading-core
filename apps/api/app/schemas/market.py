@@ -34,14 +34,31 @@ class MarketSnapshotMarket(BaseModel):
     high: float | None = None
     low: float | None = None
     volume: int | None = None
-    trading_value: int | None = None
+    trading_value: int | None = Field(
+        default=None,
+        description='Cumulative trading value from KIS `acml_tr_pbmn`, expressed in million KRW.',
+    )
+    trading_value_unit: Literal['million_krw'] = Field(
+        default='million_krw',
+        description='Unit for `trading_value`.',
+    )
     advancers: int | None = None
     unchanged: int | None = None
     decliners: int | None = None
     foreign_net_quantity: int | None = None
-    foreign_net_value: int | None = None
+    foreign_net_value: int | None = Field(
+        default=None,
+        description='Foreign net trading value in KRW, normalized from KIS `frgn_ntby_tr_pbmn`.',
+    )
     institution_net_quantity: int | None = None
-    institution_net_value: int | None = None
+    institution_net_value: int | None = Field(
+        default=None,
+        description='Institutional net trading value in KRW, normalized from KIS `orgn_ntby_tr_pbmn`.',
+    )
+    investor_flow_value_unit: Literal['krw'] = Field(
+        default='krw',
+        description='Unit for `foreign_net_value` and `institution_net_value`.',
+    )
 
 
 class MarketSnapshotFX(BaseModel):

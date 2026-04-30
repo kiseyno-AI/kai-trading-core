@@ -26,13 +26,15 @@ class FakeMarketSnapshotService:
                     'low': 2634.29,
                     'volume': 305715,
                     'trading_value': 4736153,
+                    'trading_value_unit': 'million_krw',
                     'advancers': 512,
                     'unchanged': 94,
                     'decliners': 330,
                     'foreign_net_quantity': -5290,
-                    'foreign_net_value': 148656,
+                    'foreign_net_value': -1455933000000,
                     'institution_net_quantity': 720,
-                    'institution_net_value': -55532,
+                    'institution_net_value': 283792000000,
+                    'investor_flow_value_unit': 'krw',
                 },
                 'kosdaq': {
                     'label': 'KOSDAQ',
@@ -45,13 +47,15 @@ class FakeMarketSnapshotService:
                     'low': 854.72,
                     'volume': 1312496,
                     'trading_value': 11507962,
+                    'trading_value_unit': 'million_krw',
                     'advancers': 828,
                     'unchanged': 94,
                     'decliners': 716,
                     'foreign_net_quantity': -18565,
-                    'foreign_net_value': -597490,
+                    'foreign_net_value': -211205000000,
                     'institution_net_quantity': -4738,
-                    'institution_net_value': -150685,
+                    'institution_net_value': -304502000000,
+                    'investor_flow_value_unit': 'krw',
                 },
             },
             'usd_krw': {
@@ -140,6 +144,9 @@ class MarketRouteTests(unittest.TestCase):
         payload = response.json()
         self.assertEqual(payload['markets']['kospi']['label'], 'KOSPI')
         self.assertEqual(payload['markets']['kosdaq']['foreign_net_quantity'], -18565)
+        self.assertEqual(payload['markets']['kospi']['trading_value_unit'], 'million_krw')
+        self.assertEqual(payload['markets']['kospi']['investor_flow_value_unit'], 'krw')
+        self.assertEqual(payload['markets']['kosdaq']['institution_net_value'], -304502000000)
         self.assertEqual(payload['status'], 'ready')
         self.assertEqual(payload['usd_krw']['pair'], 'USD/KRW')
         self.assertTrue(payload['freshness']['served_from_cache'])

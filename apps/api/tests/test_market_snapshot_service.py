@@ -63,9 +63,9 @@ class FakeKISClient:
                 'output': [
                     {
                         'frgn_ntby_qty': '-5290',
-                        'frgn_ntby_tr_pbmn': '148656',
+                        'frgn_ntby_tr_pbmn': '-1455933',
                         'orgn_ntby_qty': '720',
-                        'orgn_ntby_tr_pbmn': '-55532',
+                        'orgn_ntby_tr_pbmn': '283792',
                     }
                 ]
             }
@@ -73,9 +73,9 @@ class FakeKISClient:
             'output': [
                 {
                     'frgn_ntby_qty': '-18565',
-                    'frgn_ntby_tr_pbmn': '-597490',
+                    'frgn_ntby_tr_pbmn': '-211205',
                     'orgn_ntby_qty': '-4738',
-                    'orgn_ntby_tr_pbmn': '-150685',
+                    'orgn_ntby_tr_pbmn': '-304502',
                 }
             ]
         }
@@ -270,6 +270,12 @@ class MarketSnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(fx_service.calls), 1)
         self.assertEqual(first_read['status'], 'ready')
         self.assertEqual(first_read['markets']['kospi']['value'], 2642.07)
+        self.assertEqual(first_read['markets']['kospi']['trading_value_unit'], 'million_krw')
+        self.assertEqual(first_read['markets']['kospi']['foreign_net_value'], -1_455_933_000_000)
+        self.assertEqual(first_read['markets']['kospi']['institution_net_value'], 283_792_000_000)
+        self.assertEqual(first_read['markets']['kospi']['investor_flow_value_unit'], 'krw')
+        self.assertEqual(first_read['markets']['kosdaq']['foreign_net_value'], -211_205_000_000)
+        self.assertEqual(first_read['markets']['kosdaq']['institution_net_value'], -304_502_000_000)
         self.assertEqual(first_read['usd_krw']['source'], 'live')
         self.assertTrue(first_read['freshness']['served_from_cache'])
         self.assertEqual(first_read['freshness']['last_refresh_status'], 'success')

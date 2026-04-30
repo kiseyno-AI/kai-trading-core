@@ -265,11 +265,11 @@ class SignalDeciderMarketContextBuilder:
                 institutional_values.append(institutional_value)
 
         if len(foreign_values) == len(EXPECTED_INDEX_KEYS) and not missing_foreign:
-            flows['foreign'] = {'value': sum(foreign_values), 'unit': 'KIS_NET_VALUE_RAW'}
+            flows['foreign'] = {'value': sum(foreign_values), 'unit': 'krw'}
         else:
             _append_missing_field(missing_fields, 'flows.foreign')
         if len(institutional_values) == len(EXPECTED_INDEX_KEYS) and not missing_institutional:
-            flows['institutional'] = {'value': sum(institutional_values), 'unit': 'KIS_NET_VALUE_RAW'}
+            flows['institutional'] = {'value': sum(institutional_values), 'unit': 'krw'}
         else:
             _append_missing_field(missing_fields, 'flows.institutional')
         return flows

@@ -41,6 +41,11 @@ class MarketSnapshotUnavailableError(RuntimeError):
 
 logger = logging.getLogger(__name__)
 SEOUL_TZ = ZoneInfo('Asia/Seoul')
+# KIS exposes market-level value fields as `*_tr_pbmn`; for the dashboard contract we keep the
+# index trading value in that original million-KRW scale, but normalize investor-flow values to KRW.
+KIS_TRADING_VALUE_UNIT = 'million_krw'
+KRW_UNIT = 'krw'
+KIS_TR_PBMN_TO_KRW_MULTIPLIER = 1_000_000
 
 
 @dataclass(frozen=True)
@@ -129,6 +134,13 @@ def _parse_int(value: Any, *, field_name: str) -> int | None:
             return int(float(text))
         except ValueError as exc:
             raise MarketSnapshotUpstreamError(f'KIS returned a non-integer {field_name}: {value!r}') from exc
+
+
+def _parse_tr_pbmn_as_krw(value: Any, *, field_name: str) -> int | None:
+    parsed_value = _parse_int(value, field_name=field_name)
+    if parsed_value is None:
+        return None
+    return parsed_value * KIS_TR_PBMN_TO_KRW_MULTIPLIER
 
 
 def _require_mapping(value: Any, *, field_name: str) -> Mapping[str, Any]:
@@ -429,16 +441,21 @@ class MarketSnapshotService:
             'low': _parse_float(index_output.get('bstp_nmix_lwpr'), field_name='bstp_nmix_lwpr'),
             'volume': _parse_int(index_output.get('acml_vol'), field_name='acml_vol'),
             'trading_value': _parse_int(index_output.get('acml_tr_pbmn'), field_name='acml_tr_pbmn'),
+            'trading_value_unit': KIS_TRADING_VALUE_UNIT,
             'advancers': _parse_int(index_output.get('ascn_issu_cnt'), field_name='ascn_issu_cnt'),
             'unchanged': _parse_int(index_output.get('stnr_issu_cnt'), field_name='stnr_issu_cnt'),
             'decliners': _parse_int(index_output.get('down_issu_cnt'), field_name='down_issu_cnt'),
             'foreign_net_quantity': _parse_int(flow_output.get('frgn_ntby_qty'), field_name='frgn_ntby_qty'),
-            'foreign_net_value': _parse_int(flow_output.get('frgn_ntby_tr_pbmn'), field_name='frgn_ntby_tr_pbmn'),
+            'foreign_net_value': _parse_tr_pbmn_as_krw(
+                flow_output.get('frgn_ntby_tr_pbmn'),
+                field_name='frgn_ntby_tr_pbmn',
+            ),
             'institution_net_quantity': _parse_int(flow_output.get('orgn_ntby_qty'), field_name='orgn_ntby_qty'),
-            'institution_net_value': _parse_int(
+            'institution_net_value': _parse_tr_pbmn_as_krw(
                 flow_output.get('orgn_ntby_tr_pbmn'),
                 field_name='orgn_ntby_tr_pbmn',
             ),
+            'investor_flow_value_unit': KRW_UNIT,
         }
 
     def _extract_flow_output(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:

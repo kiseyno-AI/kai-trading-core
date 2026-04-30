@@ -98,10 +98,13 @@ Authorization: Bearer <token>
       "value": 2642.07,
       "change": 2.78,
       "change_percent": 0.11,
+      "trading_value": 4736153,
+      "trading_value_unit": "million_krw",
       "foreign_net_quantity": -5290,
-      "foreign_net_value": 148656,
+      "foreign_net_value": -1455933000000,
       "institution_net_quantity": 720,
-      "institution_net_value": -55532
+      "institution_net_value": 283792000000,
+      "investor_flow_value_unit": "krw"
     },
     "kosdaq": {
       "label": "KOSDAQ",
@@ -109,10 +112,13 @@ Authorization: Bearer <token>
       "value": 857.6,
       "change": -1.61,
       "change_percent": -0.19,
+      "trading_value": 11507962,
+      "trading_value_unit": "million_krw",
       "foreign_net_quantity": -18565,
-      "foreign_net_value": -597490,
+      "foreign_net_value": -211205000000,
       "institution_net_quantity": -4738,
-      "institution_net_value": -150685
+      "institution_net_value": -304502000000,
+      "investor_flow_value_unit": "krw"
     }
   },
   "usd_krw": {
@@ -128,6 +134,8 @@ Authorization: Bearer <token>
 - This route is intentionally compact and card-oriented rather than chart-oriented.
 - KOSPI/KOSDAQ index data comes from KIS `inquire-index-price`.
 - Market-level investor flow comes from KIS `inquire-investor-time-by-market`.
+- `trading_value` preserves KIS `acml_tr_pbmn` scale and is expressed in million KRW; see `trading_value_unit`.
+- `foreign_net_value` and `institution_net_value` are normalized from KIS `*_tr_pbmn` fields into raw KRW; see `investor_flow_value_unit`.
 - USD/KRW comes from the existing Korea Exim integration, including its fallback-date behavior, and Core persists the latest usable USD/KRW row so refresh-time fallback survives process restarts.
 - The selected KIS endpoints are real-domain only, so this route resolves KIS requests against the real domain by default via `MARKET_SNAPSHOT_KIS_USE_REAL=true`.
 - Required secrets are `KIS_APP_KEY`, `KIS_APP_SECRET`, and `KOREAEXIM_API_KEY`.
