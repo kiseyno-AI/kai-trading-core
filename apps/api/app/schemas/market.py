@@ -56,6 +56,16 @@ class MarketSnapshotFX(BaseModel):
     captured_at: datetime | None = None
 
 
+class MarketSnapshotFreshness(BaseModel):
+    served_from_cache: bool = True
+    refresh_interval_seconds: int
+    last_refresh_attempted_at: datetime | None = None
+    last_refresh_succeeded_at: datetime | None = None
+    next_refresh_due_at: datetime | None = None
+    last_refresh_status: Literal['never', 'success', 'degraded', 'error', 'unknown'] = 'never'
+    last_refresh_error: str | None = None
+
+
 class MarketSnapshotResponse(BaseModel):
     as_of: datetime
     status: Literal['ready', 'partial', 'stale'] = 'ready'
@@ -63,3 +73,4 @@ class MarketSnapshotResponse(BaseModel):
     stale_reason: str | None = None
     markets: dict[str, MarketSnapshotMarket]
     usd_krw: MarketSnapshotFX
+    freshness: MarketSnapshotFreshness

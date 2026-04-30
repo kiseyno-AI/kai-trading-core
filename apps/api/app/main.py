@@ -34,6 +34,7 @@ from app.core.audit_logging import (
 from app.core.settings import settings
 from app.db import check_database, init_database
 from app.eod.runner import background_runner
+from app.market.snapshot import market_snapshot_service
 from app.market_data_store import load_tracked_symbols
 from app.orders.reconciliation import trading_order_reconciliation_service
 from app.orders.kis_realtime_order_notices import kis_realtime_order_notice_service
@@ -56,6 +57,10 @@ async def lifespan(_: FastAPI):
         await trading_order_reconciliation_service.run_startup_reconcile()
     except Exception as exc:
         logger.exception('Trading order startup reconcile failed: %s', exc)
+    try:
+        await market_snapshot_service.refresh_market_snapshot_if_due(trigger='startup')
+    except Exception as exc:
+        logger.warning('Market snapshot startup refresh failed; serving cache when available: %s', exc)
     await background_runner.start()
     try:
         yield

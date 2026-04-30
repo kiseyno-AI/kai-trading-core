@@ -8,6 +8,7 @@ from app.core.settings import settings
 from app.eod.auto_pykrx import auto_pykrx_eod_scheduler
 from app.eod.master import refresh_master_if_due
 from app.market.clock import get_market_state
+from app.market.snapshot import market_snapshot_service
 from app.orders.exec_integration import signal_decider_exec_integration_service
 from app.orders.intraday_auto_sell import signal_decider_intraday_auto_sell_service
 from app.orders.next_open_execution import signal_decider_next_open_execution_service
@@ -67,6 +68,9 @@ class EODBackgroundRunner:
                 elif market.state == 'CLOSED':
                     await auto_pykrx_eod_scheduler.schedule_daily_pipeline_if_due()
                 await trading_order_reconciliation_service.run_periodic_if_due()
+                await market_snapshot_service.refresh_market_snapshot_if_due(
+                    trigger=f'background_runner:{market.state.lower()}'
+                )
             except Exception as exc:
                 logger.exception('Background runner loop failed: %s', exc)
             await asyncio.sleep(self.interval_seconds)

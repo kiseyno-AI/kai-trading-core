@@ -75,6 +75,8 @@ What it does:
 
 ## Current runtime expectations
 - Core server should stay up 24/7.
+- The API startup path tries to prime the persisted `/market/snapshot` cache once, and the background runner refreshes it on the configured cadence (`MARKET_SNAPSHOT_REFRESH_INTERVAL_SECONDS`, default 3600s).
+- `GET /market/snapshot` serves the persisted snapshot read model instead of making live upstream calls per dashboard request.
 - Pre-market master refresh uses the KIS master zip files.
 - A background runner checks market state every 60 seconds while the API process is alive.
 - During `PREOPEN`, it refreshes the daily master if needed.
