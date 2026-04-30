@@ -64,6 +64,11 @@ class AgentContextProgressService:
                     runtime_summary=runtime_summary,
                     run_snapshot=resolved_run,
                 )
+                result_payload = self._build_result_from_summary(
+                    market_date=normalized_market_date,
+                    summary=summary_payload,
+                    expected_agents=expected_agent_names,
+                )
             else:
                 summary_payload = runtime_summary
                 if resolved_run is not None:
@@ -175,17 +180,79 @@ class AgentContextProgressService:
         )
         current_role_progress = runtime_role_progress.get(current_role)
         if current_role and isinstance(role_progress.get(current_role), dict):
-            updated_role_progress = dict(role_progress[current_role])
-            updated_role_progress['status'] = (
-                current_role_progress.get('status')
-                if isinstance(current_role_progress, dict) and current_role_progress.get('status') is not None
-                else 'running'
+            updated_role_progress = self._merge_live_retry_current_role_progress(
+                persisted_role_progress=role_progress[current_role],
+                runtime_role_progress=current_role_progress,
             )
-            if isinstance(current_role_progress, dict) and current_role_progress.get('boundary_status') is not None:
-                updated_role_progress['boundary_status'] = current_role_progress['boundary_status']
             role_progress = {**role_progress, current_role: updated_role_progress}
             merged['role_progress'] = role_progress
         return merged
+
+    @staticmethod
+    def _merge_live_retry_current_role_progress(
+        *,
+        persisted_role_progress: dict[str, Any],
+        runtime_role_progress: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        merged_role_progress = dict(persisted_role_progress)
+        runtime_progress = runtime_role_progress if isinstance(runtime_role_progress, dict) else {}
+
+        total_symbols = max(
+            int(merged_role_progress.get('total_symbols') or 0),
+            int(runtime_progress.get('total_symbols') or 0),
+        )
+        completed_symbols = max(
+            int(merged_role_progress.get('completed_symbols') or 0),
+            int(runtime_progress.get('completed_symbols') or 0),
+        )
+        failed_items = max(
+            int(merged_role_progress.get('failed_items') or 0),
+            int(runtime_progress.get('failed_items') or 0),
+        )
+        terminal_symbols = max(
+            int(runtime_progress.get('terminal_symbols') or 0),
+            completed_symbols + failed_items,
+        )
+        in_progress_symbols = max(int(runtime_progress.get('in_progress_symbols') or 0), 0)
+        processed_symbols = min(
+            total_symbols,
+            max(
+                int(merged_role_progress.get('processed_symbols') or 0),
+                int(runtime_progress.get('processed_symbols') or 0),
+                terminal_symbols + in_progress_symbols,
+            ),
+        )
+        pending_symbols = max(0, total_symbols - processed_symbols)
+        progress_ratio = (processed_symbols / total_symbols) if total_symbols else 0.0
+
+        for key in (
+            'reused_symbols',
+            'retry_pending_symbols',
+            'first_pass_completed_symbols',
+            'first_pass_failed_symbols',
+            'retry_queued_symbols',
+            'retry_attempted_symbols',
+        ):
+            if key in runtime_progress:
+                merged_role_progress[key] = runtime_progress[key]
+
+        merged_role_progress.update(
+            {
+                'status': runtime_progress.get('status') or 'running',
+                'total_symbols': total_symbols,
+                'processed_symbols': processed_symbols,
+                'completed_symbols': completed_symbols,
+                'in_progress_symbols': in_progress_symbols,
+                'pending_symbols': pending_symbols,
+                'failed_items': failed_items,
+                'terminal_symbols': terminal_symbols,
+                'progress_ratio': round(progress_ratio, 6),
+                'progress_percent': round(progress_ratio * 100, 2),
+            }
+        )
+        if runtime_progress.get('boundary_status') is not None:
+            merged_role_progress['boundary_status'] = runtime_progress['boundary_status']
+        return merged_role_progress
 
     @staticmethod
     def _normalize_summary_progress_fields(summary: dict[str, Any]) -> dict[str, Any]:
