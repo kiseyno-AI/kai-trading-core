@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import copy
+import logging
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -14,6 +16,8 @@ from app.orders.account_inquiry_service import (
 )
 from app.orders.account_scope import parse_kis_account_reference
 from app.orders.service import trading_order_service
+
+logger = logging.getLogger(__name__)
 
 
 def _utc_now() -> datetime:
@@ -107,6 +111,18 @@ class PortfolioSummaryRuntimeStatus:
         }
 
 
+@dataclass(slots=True)
+class PortfolioSummaryCacheRecord:
+    payload: dict[str, Any]
+    as_of: str | None
+    cached_at: datetime
+    last_refresh_attempted_at: datetime | None
+    last_refresh_succeeded_at: datetime | None
+    last_refresh_status: str
+    last_refresh_error: str | None
+    refresh_trigger: str | None
+
+
 class PortfolioSummaryService:
     def __init__(
         self,
@@ -114,24 +130,131 @@ class PortfolioSummaryService:
         account_inquiry_service: Any | None = None,
         order_service: Any | None = None,
         portfolio_account_references: str | None = None,
+        cache_ttl_seconds: int | None = None,
     ) -> None:
         self.account_inquiry_service = account_inquiry_service or trading_account_inquiry_service
         self.order_service = order_service or trading_order_service
         self.portfolio_account_references = portfolio_account_references
+        configured_ttl = (
+            settings.portfolio_summary_cache_ttl_seconds
+            if cache_ttl_seconds is None
+            else cache_ttl_seconds
+        )
+        self.cache_ttl_seconds = max(int(configured_ttl), 0)
+        self._cache: PortfolioSummaryCacheRecord | None = None
+        self._refresh_lock = asyncio.Lock()
+        self._refresh_task: asyncio.Task | None = None
 
     def runtime_status(self) -> dict[str, Any]:
-        return self._runtime_status().to_payload()
+        payload = self._runtime_status().to_payload()
+        payload['cache'] = self._build_cache_status_payload(self._cache)
+        return payload
 
-    async def get_portfolio_summary(self) -> dict[str, Any]:
-        as_of = _utc_now().isoformat()
+    async def get_portfolio_summary(
+        self,
+        *,
+        refresh: bool = False,
+        trigger: str = 'route_read',
+    ) -> dict[str, Any]:
+        if refresh:
+            return await self.refresh_portfolio_summary_if_due(trigger=f'{trigger}:refresh', force=True)
+
+        cache_record = self._cache
+        if cache_record is None:
+            return await self.refresh_portfolio_summary_if_due(trigger=trigger, force=True)
+        if self._refresh_is_due(cache_record):
+            self._ensure_background_refresh(trigger=f'{trigger}:stale_cache')
+        return self._decorate_cached_payload(cache_record, served_from_cache=True)
+
+    async def refresh_portfolio_summary_if_due(
+        self,
+        *,
+        trigger: str,
+        force: bool = False,
+    ) -> dict[str, Any]:
+        async with self._refresh_lock:
+            cache_record = self._cache
+            if cache_record is not None and not force and not self._refresh_is_due(cache_record):
+                return self._decorate_cached_payload(cache_record, served_from_cache=True)
+            return await self._refresh_portfolio_summary(cache_record=cache_record, trigger=trigger)
+
+    def _ensure_background_refresh(self, *, trigger: str) -> None:
+        if self._refresh_task is not None and not self._refresh_task.done():
+            return
+        self._refresh_task = asyncio.create_task(
+            self.refresh_portfolio_summary_if_due(trigger=trigger, force=False),
+            name='portfolio-summary-refresh',
+        )
+        self._refresh_task.add_done_callback(self._finalize_refresh_task)
+
+    def _finalize_refresh_task(self, task: asyncio.Task) -> None:
+        if self._refresh_task is task:
+            self._refresh_task = None
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.warning('Portfolio summary background refresh failed: %s', exc)
+
+    async def _refresh_portfolio_summary(
+        self,
+        *,
+        cache_record: PortfolioSummaryCacheRecord | None,
+        trigger: str,
+    ) -> dict[str, Any]:
+        attempted_at = _utc_now()
         runtime_status = self._runtime_status()
         if not runtime_status.ready:
+            message = self._configuration_message(runtime_status)
+            if cache_record is not None:
+                cached = self._store_refresh_failure(
+                    cache_record=cache_record,
+                    attempted_at=attempted_at,
+                    error=message,
+                    trigger=trigger,
+                )
+                return self._decorate_cached_payload(cached, served_from_cache=True)
             return self._build_unavailable_summary(
-                as_of=as_of,
+                as_of=attempted_at.isoformat(),
                 status='not_configured',
                 source='portfolio_summary_runtime',
-                message=self._configuration_message(runtime_status),
+                message=message,
+                freshness=self._build_uncached_freshness_payload(
+                    attempted_at=attempted_at,
+                    last_refresh_status='error',
+                    last_refresh_error=message,
+                ),
             )
+
+        try:
+            payload = await self._build_live_portfolio_summary()
+        except Exception as exc:
+            if cache_record is not None:
+                cached = self._store_refresh_failure(
+                    cache_record=cache_record,
+                    attempted_at=attempted_at,
+                    error=str(exc),
+                    trigger=trigger,
+                )
+                return self._decorate_cached_payload(cached, served_from_cache=True)
+            raise
+
+        refresh_status, refresh_error = self._classify_refresh_result(payload)
+        refreshed_record = PortfolioSummaryCacheRecord(
+            payload=copy.deepcopy(payload),
+            as_of=str(payload.get('asOf') or '') or None,
+            cached_at=attempted_at,
+            last_refresh_attempted_at=attempted_at,
+            last_refresh_succeeded_at=attempted_at,
+            last_refresh_status=refresh_status,
+            last_refresh_error=refresh_error,
+            refresh_trigger=trigger,
+        )
+        self._cache = refreshed_record
+        return self._decorate_cached_payload(refreshed_record, served_from_cache=False)
+
+    async def _build_live_portfolio_summary(self) -> dict[str, Any]:
+        as_of = _utc_now().isoformat()
         configured_accounts, _ = self._resolve_accounts()
 
         results = await asyncio.gather(
@@ -180,6 +303,37 @@ class PortfolioSummaryService:
             'accounts': accounts,
             'notices': notices,
         }
+
+    def _classify_refresh_result(self, payload: dict[str, Any]) -> tuple[str, str | None]:
+        sync = payload.get('sync') if isinstance(payload.get('sync'), dict) else {}
+        sync_status = str(sync.get('status') or '').strip()
+        sync_message = str(sync.get('message') or '').strip() or None
+        if sync_status == 'synced':
+            return 'success', None
+        if sync_status in {'stale', 'unavailable', 'not_configured'}:
+            return 'degraded', sync_message
+        return 'error', sync_message or 'Portfolio summary refresh did not produce a usable snapshot.'
+
+    def _store_refresh_failure(
+        self,
+        *,
+        cache_record: PortfolioSummaryCacheRecord,
+        attempted_at: datetime,
+        error: str,
+        trigger: str,
+    ) -> PortfolioSummaryCacheRecord:
+        updated = PortfolioSummaryCacheRecord(
+            payload=copy.deepcopy(cache_record.payload),
+            as_of=cache_record.as_of,
+            cached_at=cache_record.cached_at,
+            last_refresh_attempted_at=attempted_at,
+            last_refresh_succeeded_at=cache_record.last_refresh_succeeded_at,
+            last_refresh_status='error',
+            last_refresh_error=error,
+            refresh_trigger=trigger,
+        )
+        self._cache = updated
+        return updated
 
     async def _build_account_payload(
         self,
@@ -463,8 +617,9 @@ class PortfolioSummaryService:
         status: str,
         source: str,
         message: str,
+        freshness: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        return {
+        payload = {
             'asOf': as_of,
             'source': 'kis_portfolio_summary_v1',
             'sync': {
@@ -476,6 +631,169 @@ class PortfolioSummaryService:
             'accounts': [],
             'notices': [message],
         }
+        if freshness is not None:
+            payload['freshness'] = freshness
+        return payload
+
+    def _decorate_cached_payload(
+        self,
+        cache_record: PortfolioSummaryCacheRecord,
+        *,
+        served_from_cache: bool,
+    ) -> dict[str, Any]:
+        payload = copy.deepcopy(cache_record.payload)
+        freshness = self._build_freshness_payload(cache_record, served_from_cache=served_from_cache)
+        payload['freshness'] = freshness
+
+        sync = payload.get('sync') if isinstance(payload.get('sync'), dict) else {}
+        notices = payload.get('notices') if isinstance(payload.get('notices'), list) else []
+        stale_notice: str | None = None
+        if freshness['staleReason'] == 'refresh_due':
+            stale_notice = 'Portfolio summary is serving cached data while a refresh runs in background.'
+        elif freshness['staleReason'] == 'refresh_failed':
+            stale_notice = 'Portfolio summary is serving cached data because the last refresh failed.'
+
+        if stale_notice is not None:
+            if sync.get('status') == 'synced':
+                sync['status'] = 'stale'
+            sync['message'] = self._merge_messages(sync.get('message'), stale_notice)
+            notices = self._prepend_notice(notices, stale_notice)
+
+        payload['sync'] = sync
+        payload['notices'] = notices
+        return payload
+
+    def _build_cache_status_payload(
+        self,
+        cache_record: PortfolioSummaryCacheRecord | None,
+    ) -> dict[str, Any]:
+        stale_reason = self._stale_reason(cache_record)
+        return {
+            'available': True,
+            'has_snapshot': cache_record is not None,
+            'as_of': cache_record.as_of if cache_record is not None else None,
+            'cached_at': self._format_datetime(cache_record.cached_at if cache_record is not None else None),
+            'cache_age_seconds': self._cache_age_seconds(cache_record),
+            'is_stale': stale_reason is not None,
+            'stale_reason': stale_reason,
+            'refresh_in_flight': self._has_refresh_in_flight(),
+            'last_refresh_attempted_at': (
+                self._format_datetime(cache_record.last_refresh_attempted_at) if cache_record is not None else None
+            ),
+            'last_refresh_succeeded_at': (
+                self._format_datetime(cache_record.last_refresh_succeeded_at) if cache_record is not None else None
+            ),
+            'next_refresh_due_at': self._format_datetime(self._next_refresh_due_at(cache_record)),
+            'last_refresh_status': cache_record.last_refresh_status if cache_record is not None else 'never',
+            'last_refresh_error': cache_record.last_refresh_error if cache_record is not None else None,
+            'refresh_interval_seconds': self.cache_ttl_seconds,
+        }
+
+    def _build_freshness_payload(
+        self,
+        cache_record: PortfolioSummaryCacheRecord,
+        *,
+        served_from_cache: bool,
+    ) -> dict[str, Any]:
+        stale_reason = self._stale_reason(cache_record)
+        return {
+            'servedFromCache': served_from_cache,
+            'hasCachedSnapshot': True,
+            'cachedAt': self._format_datetime(cache_record.cached_at),
+            'cacheAgeSeconds': self._cache_age_seconds(cache_record),
+            'isStale': stale_reason is not None,
+            'staleReason': stale_reason,
+            'refreshInFlight': self._has_refresh_in_flight(),
+            'refreshIntervalSeconds': self.cache_ttl_seconds,
+            'lastRefreshAttemptedAt': self._format_datetime(cache_record.last_refresh_attempted_at),
+            'lastRefreshSucceededAt': self._format_datetime(cache_record.last_refresh_succeeded_at),
+            'nextRefreshDueAt': self._format_datetime(self._next_refresh_due_at(cache_record)),
+            'lastRefreshStatus': cache_record.last_refresh_status,
+            'lastRefreshError': cache_record.last_refresh_error,
+        }
+
+    def _build_uncached_freshness_payload(
+        self,
+        *,
+        attempted_at: datetime,
+        last_refresh_status: str,
+        last_refresh_error: str | None,
+    ) -> dict[str, Any]:
+        return {
+            'servedFromCache': False,
+            'hasCachedSnapshot': False,
+            'cachedAt': None,
+            'cacheAgeSeconds': None,
+            'isStale': False,
+            'staleReason': None,
+            'refreshInFlight': self._has_refresh_in_flight(),
+            'refreshIntervalSeconds': self.cache_ttl_seconds,
+            'lastRefreshAttemptedAt': self._format_datetime(attempted_at),
+            'lastRefreshSucceededAt': None,
+            'nextRefreshDueAt': None,
+            'lastRefreshStatus': last_refresh_status,
+            'lastRefreshError': last_refresh_error,
+        }
+
+    def _stale_reason(self, cache_record: PortfolioSummaryCacheRecord | None) -> str | None:
+        if cache_record is None:
+            return None
+        if cache_record.last_refresh_status == 'error':
+            return 'refresh_failed'
+        if self._refresh_is_due(cache_record):
+            return 'refresh_due'
+        return None
+
+    def _refresh_is_due(self, cache_record: PortfolioSummaryCacheRecord | None) -> bool:
+        if cache_record is None:
+            return True
+        if self.cache_ttl_seconds == 0:
+            return True
+        next_due_at = self._next_refresh_due_at(cache_record)
+        if next_due_at is None:
+            return True
+        return _utc_now() >= next_due_at
+
+    def _next_refresh_due_at(
+        self,
+        cache_record: PortfolioSummaryCacheRecord | None,
+    ) -> datetime | None:
+        if cache_record is None:
+            return None
+        reference = (
+            cache_record.last_refresh_attempted_at
+            or cache_record.last_refresh_succeeded_at
+            or cache_record.cached_at
+        )
+        return reference + timedelta(seconds=self.cache_ttl_seconds)
+
+    def _cache_age_seconds(self, cache_record: PortfolioSummaryCacheRecord | None) -> int | None:
+        if cache_record is None:
+            return None
+        age = _utc_now() - cache_record.cached_at
+        return max(int(age.total_seconds()), 0)
+
+    def _has_refresh_in_flight(self) -> bool:
+        return self._refresh_task is not None and not self._refresh_task.done()
+
+    def _format_datetime(self, value: datetime | None) -> str | None:
+        if value is None:
+            return None
+        return value.isoformat()
+
+    def _merge_messages(self, current: Any, new_message: str) -> str:
+        current_text = str(current or '').strip()
+        if not current_text:
+            return new_message
+        if new_message in current_text:
+            return current_text
+        return f'{current_text} {new_message}'
+
+    def _prepend_notice(self, notices: list[Any], notice: str) -> list[Any]:
+        normalized = [item for item in notices if isinstance(item, str) and item.strip()]
+        if notice in normalized:
+            return normalized
+        return [notice, *normalized]
 
 
 portfolio_summary_service = PortfolioSummaryService()

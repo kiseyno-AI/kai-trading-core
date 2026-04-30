@@ -70,7 +70,7 @@
 - `GET /trading/orders/intraday-auto-sell?account_reference=KIS:12345678-01&symbol=005930&refresh=false`
 - `POST /trading/orders/intraday-auto-sell/run-if-due`
 - `GET /trading/orders/{client_order_id}/timeline?account_reference=KIS:12345678-01&refresh=false`
-- `GET /portfolio/summary`
+- `GET /portfolio/summary?refresh=false`
 - `GET /trading/accounts/{account_reference}/summary`
 - `GET /trading/accounts/{account_reference}/positions?symbol=005930&include_zero=false`
 - `GET /trading/accounts/{account_reference}/buying-power?symbol=005930&price=57000&order_type=market`
@@ -229,9 +229,12 @@
 
 ## Trading account inquiry notes
 - `GET /portfolio/summary` is the aggregate portfolio read for the dashboard and portfolio cards. It resolves the deployment-configured account list from `PORTFOLIO_ACCOUNT_REFERENCES`, reuses the KIS-backed account-summary and positions inquiries per account, and returns the web `PortfolioSummaryDto`-style shape with `accounts`, `holdings`, `allocation`, `recentActivity`, `sync`, and `notices`.
+- The default `/portfolio/summary` read path is now a short-lived in-memory cache with stale-while-revalidate semantics. Fresh cache hits return immediately, stale cache hits return the last known summary plus honest freshness metadata, and `refresh=true` forces a live rebuild for manual sync paths.
 - `PORTFOLIO_ACCOUNT_REFERENCES` accepts a comma-separated list of `KIS:<account_number>-<product_code>` entries, with optional labels in `Label=KIS:...` form. When the setting is missing or invalid, `GET /portfolio/summary` returns `200` with `sync.status=not_configured` and explanatory notices instead of an ambiguous empty success.
 - Production portfolio aggregation also requires `KIS_APP_KEY`, `KIS_APP_SECRET`, and `KIS_USE_MOCK=false`. In `APP_ENV=production`, the route and deploy preflight now treat mock-KIS portfolio wiring as a configuration error instead of waiting for a later upstream failure.
 - The portfolio summary route keeps sync state explicit: fully successful account reads report `sync.status=synced`, mixed-success reads report `sync.status=stale`, total upstream failure reports `sync.status=unavailable`, and deployment/account configuration problems report `sync.status=not_configured`.
+- `/portfolio/summary` now also returns a `freshness` object with cache hit state, TTL, cache age, last refresh attempt/success timestamps, `lastRefreshStatus`, `lastRefreshError`, and whether a background refresh is currently in flight.
+- Startup primes the portfolio summary cache when runtime configuration is ready, and the shared background runner keeps refreshing it on the normal poll loop so dashboard reads do not sit on the live broker critical path.
 - `GET /broker/kis/health` now exposes `portfolio_summary_runtime`, deploy preflight reports `runtime_checks.portfolio_summary`, and deploy smoke-check fails if `/portfolio/summary` is still `not_configured` after restart.
 - `GET /trading/accounts/{account_reference}/summary` is the normalized KIS-backed cash and valuation snapshot for one KIS account reference. It combines `inquire-balance` and `inquire-account-balance` so UI cards can read cash and valuation fields without mapping KIS names client-side.
 - `GET /trading/accounts/{account_reference}/positions` is the normalized holdings view. It defaults to active positions only, supports optional `symbol` filtering for pre-trade “already holding this?” checks, and exposes quantity, sellable quantity, pricing, market value, PnL, and derived weight per row.

@@ -33,7 +33,13 @@ GET /broker/kis/health
     "portfolio_account_references_configured": true,
     "portfolio_account_references_valid": true,
     "configured_account_count": 2,
-    "blocking_reasons": []
+    "blocking_reasons": [],
+    "cache": {
+      "has_snapshot": true,
+      "is_stale": false,
+      "last_refresh_status": "success",
+      "refresh_interval_seconds": 60
+    }
   },
   "realtime_order_notices": {
     "enabled": true,
@@ -73,3 +79,4 @@ GET /broker/kis/health
 ## Notes
 - `market_snapshot_runtime` and `portfolio_summary_runtime` are route-specific readiness summaries for deploy and operator checks.
 - `portfolio_summary_runtime.ready=false` means `/portfolio/summary` is still blocked by config such as missing `PORTFOLIO_ACCOUNT_REFERENCES`, missing KIS secrets, or `KIS_USE_MOCK=true` in `APP_ENV=production`.
+- `portfolio_summary_runtime.cache` exposes whether Core currently has a cached portfolio snapshot, whether it is stale, and the last refresh status/error without forcing a live broker read.

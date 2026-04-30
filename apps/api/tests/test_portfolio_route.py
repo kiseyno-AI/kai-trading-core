@@ -8,17 +8,18 @@ from app.api import routes_portfolio
 
 class FakePortfolioSummaryService:
     def __init__(self) -> None:
-        self.calls = 0
+        self.calls: list[dict] = []
         self.exception: Exception | None = None
 
-    async def get_portfolio_summary(self):
-        self.calls += 1
+    async def get_portfolio_summary(self, *, refresh: bool = False, trigger: str = 'route_read'):
+        self.calls.append({'refresh': refresh, 'trigger': trigger})
         if self.exception is not None:
             raise self.exception
         return {
             'asOf': '2026-04-29T01:23:45+00:00',
             'source': 'kis_portfolio_summary_v1',
             'sync': {'status': 'synced'},
+            'freshness': {'servedFromCache': True},
             'accounts': [{'id': 'KIS:12345678-01', 'label': 'Main'}],
             'notices': [],
         }
@@ -43,7 +44,16 @@ class PortfolioRouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()['sync']['status'], 'synced')
         self.assertEqual(response.json()['accounts'][0]['label'], 'Main')
-        self.assertEqual(self.service.calls, 1)
+        self.assertEqual(self.service.calls, [{'refresh': False, 'trigger': 'route_read'}])
+
+    def test_summary_route_passes_refresh_flag(self) -> None:
+        client = TestClient(self.app)
+
+        response = client.get('/portfolio/summary?refresh=true')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['freshness']['servedFromCache'], True)
+        self.assertEqual(self.service.calls, [{'refresh': True, 'trigger': 'route_read'}])
 
     def test_summary_route_maps_unexpected_errors_to_500(self) -> None:
         client = TestClient(self.app)
