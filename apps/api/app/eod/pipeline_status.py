@@ -4,8 +4,22 @@ from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from typing import Any, Callable
 
+from sqlalchemy import func, select
+
 from app.core.settings import settings
+from app.db import session_scope
+from app.db_models import (
+    DailyAdvancedValueFactorResult,
+    DailyBetaFactorResult,
+    DailyCompositeFactorResult,
+    DailyLowRiskFactorResult,
+    DailyMomentumFactorResult,
+    DailyQualityFactorResult,
+    DailyUnifiedValueFactorResult,
+    DailyValueFactorResult,
+)
 from app.dart.fundamentals_capture_service import dart_fundamentals_capture_service
+from app.eod.daily_pipeline_stages import FACTOR_STAGE_ORDER, STAGE_DEFINITIONS
 from app.eod.pykrx_backfill import DEFAULT_MARKETS, PYKRX_BACKFILL_SERVICE
 from app.eod.pipeline_status_support import (
     PYKRX_STAGE_ORDER,
@@ -28,7 +42,22 @@ from app.market.clock import get_market_state
 from app.market_data_store import DAY_BASED_TRENDING_PERIODS, count_live_symbols, load_eod_run_stage_counts
 from app.repositories.eod_run_repository import list_eod_collection_runs
 
-PIPELINE_STAGE_ORDER = PYKRX_STAGE_ORDER + ('fundamentals_daily_refresh',)
+DEFAULT_FACTOR_STAGE_ORDER = tuple(
+    stage_id
+    for stage_id in FACTOR_STAGE_ORDER
+    if STAGE_DEFINITIONS[stage_id].default_selected
+)
+PIPELINE_STAGE_ORDER = PYKRX_STAGE_ORDER + ('fundamentals_daily_refresh',) + DEFAULT_FACTOR_STAGE_ORDER
+FACTOR_STAGE_MODELS = {
+    'momentum_factors': DailyMomentumFactorResult,
+    'value_factors': DailyValueFactorResult,
+    'low_risk_factors': DailyLowRiskFactorResult,
+    'beta_factors': DailyBetaFactorResult,
+    'advanced_value_factors': DailyAdvancedValueFactorResult,
+    'unified_value_factors': DailyUnifiedValueFactorResult,
+    'quality_factors': DailyQualityFactorResult,
+    'composite_factors': DailyCompositeFactorResult,
+}
 
 
 def _utcnow_iso() -> str:
@@ -68,6 +97,37 @@ def _load_latest_fundamentals_refresh_run(*, market_date: str, fs_div: str) -> d
     return payload.get('latest_run')
 
 
+def _noop_factor_stage_counts_loader(*, market_date: str) -> dict[str, dict[str, Any]]:
+    return {}
+
+
+def _load_factor_stage_counts(*, market_date: str) -> dict[str, dict[str, Any]]:
+    normalized_market_date = date.fromisoformat(market_date)
+    counts: dict[str, dict[str, Any]] = {}
+    with session_scope() as session:
+        for stage_id, model in FACTOR_STAGE_MODELS.items():
+            persisted, updated_at = session.execute(
+                select(
+                    func.count(func.distinct(model.symbol_id)),
+                    func.max(model.captured_at),
+                )
+                .select_from(model)
+                .where(model.market_date == normalized_market_date)
+            ).one()
+            counts[stage_id] = {
+                'persisted': int(persisted or 0),
+                'updated_at': updated_at.isoformat() if updated_at else None,
+            }
+    return counts
+
+
+def _stage_label(stage_id: str) -> str:
+    if stage_id in STAGE_LABELS:
+        return STAGE_LABELS[stage_id]
+    definition = STAGE_DEFINITIONS.get(stage_id)
+    return definition.label if definition is not None else stage_id.replace('_', ' ')
+
+
 @dataclass
 class EODPipelineStatusService:
     market_state_loader: Callable = get_market_state
@@ -75,6 +135,7 @@ class EODPipelineStatusService:
     pykrx_stage_counts_loader: Callable = load_eod_run_stage_counts
     live_symbol_count_loader: Callable = count_live_symbols
     fundamentals_refresh_loader: Callable = _load_latest_fundamentals_refresh_run
+    factor_stage_counts_loader: Callable = _noop_factor_stage_counts_loader
 
     def read(
         self,
@@ -100,10 +161,21 @@ class EODPipelineStatusService:
             market_date=resolved_market_date,
             fs_div=resolved_fs_div,
         )
+        factor_stage_counts = self.factor_stage_counts_loader(market_date=resolved_market_date)
         stages = {
             **pykrx_stages,
             'fundamentals_daily_refresh': fundamentals_stage,
         }
+        price_stage = stages['price_collection']
+        for stage_id in DEFAULT_FACTOR_STAGE_ORDER:
+            stages[stage_id] = self._build_factor_stage(
+                stage_id=stage_id,
+                market_date=resolved_market_date,
+                price_stage=price_stage,
+                prior_stages=stages,
+                aggregate=dict(factor_stage_counts.get(stage_id) or {}),
+                live_symbols_total=live_symbols_total,
+            )
         return {
             'market_date': resolved_market_date,
             'generated_at': _utcnow_iso(),
@@ -469,6 +541,123 @@ class EODPipelineStatusService:
             },
         }
 
+    def _build_factor_stage(
+        self,
+        *,
+        stage_id: str,
+        market_date: str,
+        price_stage: dict[str, Any],
+        prior_stages: dict[str, dict[str, Any]],
+        aggregate: dict[str, Any],
+        live_symbols_total: int,
+    ) -> dict[str, Any]:
+        definition = STAGE_DEFINITIONS[stage_id]
+        label = definition.label
+        persisted = int(aggregate.get('persisted') or 0)
+        expected_total = self._resolve_factor_expected_total(
+            price_stage=price_stage,
+            live_symbols_total=live_symbols_total,
+            persisted=persisted,
+        )
+        blocking_stages = [
+            dependency
+            for dependency in definition.depends_on
+            if dependency in prior_stages and str(prior_stages[dependency].get('status') or 'pending') != 'completed'
+        ]
+        failed_blocking_stages = [
+            dependency
+            for dependency in blocking_stages
+            if str(prior_stages[dependency].get('status') or 'pending') == 'failed'
+        ]
+        status = 'pending'
+        if not blocking_stages:
+            if persisted > 0 and expected_total and persisted < expected_total:
+                status = 'partial'
+            elif persisted > 0:
+                status = 'completed'
+        counts = build_stage_counts(
+            total=max(expected_total, persisted),
+            succeeded=persisted,
+            failed=0,
+            processed=persisted,
+        )
+        return {
+            'task': stage_id,
+            'label': label,
+            'status': status,
+            'source_status': 'stored_rows_present' if persisted > 0 else None,
+            'market_date': market_date,
+            'started_at': None,
+            'updated_at': aggregate.get('updated_at'),
+            'completed_at': aggregate.get('updated_at') if status in {'completed', 'partial'} else None,
+            'processed': counts.processed,
+            'total': counts.total,
+            'succeeded': counts.succeeded,
+            'failed': counts.failed,
+            'remaining': counts.remaining,
+            'current_step': None,
+            'current_activity': self._build_factor_activity(
+                stage_id=stage_id,
+                status=status,
+                persisted=persisted,
+                expected_total=max(expected_total, persisted),
+                blocking_stages=blocking_stages,
+                failed_blocking_stages=failed_blocking_stages,
+            ),
+            'current_symbol': None,
+            'current_period': None,
+            'source_run_ids': {},
+            'details': {
+                'mode': 'derived_from_factor_rows',
+                'depends_on': list(definition.depends_on),
+                'blocking_stages': blocking_stages,
+                'failed_blocking_stages': failed_blocking_stages,
+                'rows_persisted': persisted,
+                'expected_rows': max(expected_total, persisted),
+                'no_rows_present': persisted == 0,
+                'output_tables': list(definition.output_tables),
+                'inspect_routes': list(definition.inspect_routes),
+                'default_selected': definition.default_selected,
+            },
+        }
+
+    @staticmethod
+    def _resolve_factor_expected_total(
+        *,
+        price_stage: dict[str, Any],
+        live_symbols_total: int,
+        persisted: int,
+    ) -> int:
+        expected_total = int(price_stage.get('succeeded') or 0)
+        if expected_total <= 0:
+            expected_total = int(price_stage.get('total') or 0)
+        if expected_total <= 0:
+            expected_total = int(live_symbols_total or 0)
+        return max(expected_total, persisted)
+
+    @staticmethod
+    def _build_factor_activity(
+        *,
+        stage_id: str,
+        status: str,
+        persisted: int,
+        expected_total: int,
+        blocking_stages: list[str],
+        failed_blocking_stages: list[str],
+    ) -> str:
+        label = _stage_label(stage_id)
+        if failed_blocking_stages:
+            failed_labels = ', '.join(_stage_label(item) for item in failed_blocking_stages)
+            return f'Blocked by failed {failed_labels}'
+        if blocking_stages:
+            blocking_labels = ', '.join(_stage_label(item) for item in blocking_stages)
+            return f'Waiting on {blocking_labels}'
+        if persisted > 0:
+            if status == 'partial' and expected_total > 0:
+                return f'Stored {persisted}/{expected_total} rows for {label}'
+            return _default_activity(label, status)
+        return _default_activity(label, status)
+
     @staticmethod
     def _resolve_overall_status(stages: dict[str, dict[str, Any]]) -> str:
         statuses = [str(item.get('status') or 'pending') for item in stages.values()]
@@ -483,4 +672,6 @@ class EODPipelineStatusService:
         return 'partial'
 
 
-eod_pipeline_status_service = EODPipelineStatusService()
+eod_pipeline_status_service = EODPipelineStatusService(
+    factor_stage_counts_loader=_load_factor_stage_counts,
+)

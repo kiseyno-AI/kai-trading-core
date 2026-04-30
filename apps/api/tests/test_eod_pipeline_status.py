@@ -1,7 +1,11 @@
 import unittest
 from unittest.mock import patch
 
-from app.eod.pipeline_status import EODPipelineStatusService, _load_latest_pipeline_pykrx_run
+from app.eod.pipeline_status import (
+    DEFAULT_FACTOR_STAGE_ORDER,
+    EODPipelineStatusService,
+    _load_latest_pipeline_pykrx_run,
+)
 
 
 class _FakeMarketState:
@@ -20,6 +24,16 @@ class _FakeBreakDayMarketState:
     is_open = False
     reason = 'holiday'
     server_time = '2026-04-14T12:15:00+09:00'
+
+
+def _full_factor_stage_counts(*, total: int, updated_at: str) -> dict[str, dict]:
+    return {
+        stage_id: {
+            'persisted': total,
+            'updated_at': updated_at,
+        }
+        for stage_id in DEFAULT_FACTOR_STAGE_ORDER
+    }
 
 
 class EODPipelineStatusServiceTests(unittest.TestCase):
@@ -101,6 +115,8 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
         self.assertEqual(result['stages']['price_collection']['total'], 3579)
         self.assertEqual(result['stages']['trending_ranks']['total'], 3)
         self.assertEqual(result['stages']['fundamentals_daily_refresh']['status'], 'pending')
+        self.assertEqual(result['stages']['momentum_factors']['status'], 'pending')
+        self.assertEqual(result['stages']['composite_factors']['status'], 'pending')
         self.assertEqual(
             result['stages']['fundamentals_daily_refresh']['details'],
             {'fs_div': 'CFS'},
@@ -366,7 +382,7 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
             'Marked failed after exceeding the stale running threshold before a daily refresh status read',
         )
 
-    def test_read_maps_completed_pipeline_stages_from_completed_run_and_aggregate_counts(self):
+    def test_read_marks_completed_core_pipeline_partial_when_factor_rows_are_missing(self):
         pykrx_run = {
             'id': 303,
             'market': 'KRX',
@@ -429,11 +445,255 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
 
         result = service.read()
 
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['stages']['fundamentals_daily_refresh']['status'], 'completed')
+        self.assertEqual(result['stages']['momentum_factors']['status'], 'pending')
+        self.assertEqual(result['stages']['value_factors']['status'], 'pending')
+        self.assertEqual(result['stages']['composite_factors']['status'], 'pending')
+        self.assertEqual(
+            result['stage_order'],
+            [
+                'price_collection',
+                'technical_snapshots',
+                'action_summaries',
+                'trending_ranks',
+                'fundamentals_daily_refresh',
+                'momentum_factors',
+                'value_factors',
+                'low_risk_factors',
+                'beta_factors',
+                'advanced_value_factors',
+                'unified_value_factors',
+                'quality_factors',
+                'composite_factors',
+            ],
+        )
+
+    def test_read_keeps_blocked_factor_stage_pending_when_stored_rows_exist_before_fundamentals(self):
+        pykrx_run = {
+            'id': 304,
+            'market': 'KRX',
+            'trade_date': '2026-04-21',
+            'source': 'pykrx',
+            'trigger': 'manual_daily_api',
+            'status': 'completed',
+            'symbols_total': 3,
+            'symbols_succeeded': 3,
+            'symbols_failed': 0,
+            'error_message': None,
+            'started_at': '2026-04-21T09:10:00+00:00',
+            'completed_at': '2026-04-21T10:00:00+00:00',
+            'run_metadata': {
+                'mode': 'daily_auto',
+                'latest_available_trade_date': '2026-04-21',
+                'markets': ['KOSPI', 'KOSDAQ'],
+            },
+        }
+        stage_counts = {
+            'price_collection': {'persisted': 3, 'updated_at': '2026-04-21T09:20:00+00:00'},
+            'technical_snapshots': {'persisted': 3, 'updated_at': '2026-04-21T09:35:00+00:00'},
+            'action_summaries': {'persisted': 3, 'updated_at': '2026-04-21T09:45:00+00:00'},
+            'trending_ranks': {'persisted': 9, 'periods_persisted': 3, 'updated_at': '2026-04-21T09:55:00+00:00'},
+        }
+        factor_stage_counts = {
+            'momentum_factors': {
+                'persisted': 2,
+                'updated_at': '2026-04-21T10:10:00+00:00',
+            },
+            'advanced_value_factors': {
+                'persisted': 3,
+                'updated_at': '2026-04-21T10:15:00+00:00',
+            },
+        }
+        service = EODPipelineStatusService(
+            market_state_loader=lambda: _FakeMarketState(),
+            pykrx_run_loader=lambda **_: pykrx_run,
+            pykrx_stage_counts_loader=lambda *_: stage_counts,
+            live_symbol_count_loader=lambda: 3579,
+            fundamentals_refresh_loader=lambda **_: None,
+            factor_stage_counts_loader=lambda **_: factor_stage_counts,
+        )
+
+        result = service.read()
+
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['stages']['momentum_factors']['status'], 'partial')
+        self.assertEqual(
+            result['stages']['momentum_factors']['current_activity'],
+            'Stored 2/3 rows for momentum factor compute',
+        )
+        self.assertEqual(result['stages']['advanced_value_factors']['status'], 'pending')
+        self.assertEqual(
+            result['stages']['advanced_value_factors']['current_activity'],
+            'Waiting on DART fundamentals daily refresh',
+        )
+        self.assertEqual(
+            result['stages']['advanced_value_factors']['details']['blocking_stages'],
+            ['fundamentals_daily_refresh'],
+        )
+        self.assertEqual(
+            result['stages']['advanced_value_factors']['source_status'],
+            'stored_rows_present',
+        )
+        self.assertIsNone(result['stages']['advanced_value_factors']['completed_at'])
+
+    def test_read_keeps_blocked_factor_stage_pending_when_dependency_failed(self):
+        pykrx_run = {
+            'id': 305,
+            'market': 'KRX',
+            'trade_date': '2026-04-21',
+            'source': 'pykrx',
+            'trigger': 'manual_daily_api',
+            'status': 'completed',
+            'symbols_total': 3,
+            'symbols_succeeded': 3,
+            'symbols_failed': 0,
+            'error_message': None,
+            'started_at': '2026-04-21T09:10:00+00:00',
+            'completed_at': '2026-04-21T10:00:00+00:00',
+            'run_metadata': {
+                'mode': 'daily_auto',
+                'latest_available_trade_date': '2026-04-21',
+                'markets': ['KOSPI', 'KOSDAQ'],
+            },
+        }
+        stage_counts = {
+            'price_collection': {'persisted': 3, 'updated_at': '2026-04-21T09:20:00+00:00'},
+            'technical_snapshots': {'persisted': 3, 'updated_at': '2026-04-21T09:35:00+00:00'},
+            'action_summaries': {'persisted': 3, 'updated_at': '2026-04-21T09:45:00+00:00'},
+            'trending_ranks': {'persisted': 9, 'periods_persisted': 3, 'updated_at': '2026-04-21T09:55:00+00:00'},
+        }
+        fundamentals_run = {
+            'id': 89,
+            'market_date': '2026-04-21',
+            'trigger': 'eod_pykrx_followup',
+            'status': 'failed',
+            'fs_div': 'CFS',
+            'force': False,
+            'symbol_limit': None,
+            'symbol_offset': 0,
+            'symbols_total': 3,
+            'symbols_checked': 3,
+            'symbols_missing': 1,
+            'symbols_stale': 1,
+            'symbols_fresh': 1,
+            'symbols_refreshed': 0,
+            'symbols_failed': 1,
+            'events_detected': 5,
+            'events_captured': 2,
+            'events_failed': 1,
+            'error_message': 'Fundamentals refresh failed',
+            'started_at': '2026-04-21T10:01:00+00:00',
+            'completed_at': '2026-04-21T10:05:00+00:00',
+            'run_metadata': {
+                'symbols_selected': 3,
+                'last_progress_at': '2026-04-21T10:05:00+00:00',
+            },
+        }
+        factor_stage_counts = {
+            'advanced_value_factors': {
+                'persisted': 3,
+                'updated_at': '2026-04-21T10:15:00+00:00',
+            },
+        }
+        service = EODPipelineStatusService(
+            market_state_loader=lambda: _FakeMarketState(),
+            pykrx_run_loader=lambda **_: pykrx_run,
+            pykrx_stage_counts_loader=lambda *_: stage_counts,
+            live_symbol_count_loader=lambda: 3579,
+            fundamentals_refresh_loader=lambda **_: fundamentals_run,
+            factor_stage_counts_loader=lambda **_: factor_stage_counts,
+        )
+
+        result = service.read()
+
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['stages']['fundamentals_daily_refresh']['status'], 'failed')
+        self.assertEqual(result['stages']['advanced_value_factors']['status'], 'pending')
+        self.assertEqual(
+            result['stages']['advanced_value_factors']['current_activity'],
+            'Blocked by failed DART fundamentals daily refresh',
+        )
+        self.assertEqual(
+            result['stages']['advanced_value_factors']['details']['failed_blocking_stages'],
+            ['fundamentals_daily_refresh'],
+        )
+        self.assertIsNone(result['stages']['advanced_value_factors']['completed_at'])
+
+    def test_read_maps_completed_pipeline_stages_from_completed_run_and_aggregate_counts(self):
+        pykrx_run = {
+            'id': 303,
+            'market': 'KRX',
+            'trade_date': '2026-04-21',
+            'source': 'pykrx',
+            'trigger': 'manual_daily_api',
+            'status': 'completed',
+            'symbols_total': 3,
+            'symbols_succeeded': 3,
+            'symbols_failed': 0,
+            'error_message': None,
+            'started_at': '2026-04-21T09:10:00+00:00',
+            'completed_at': '2026-04-21T10:00:00+00:00',
+            'run_metadata': {
+                'mode': 'daily_auto',
+                'latest_available_trade_date': '2026-04-21',
+                'markets': ['KOSPI', 'KOSDAQ'],
+            },
+        }
+        stage_counts = {
+            'price_collection': {'persisted': 3, 'updated_at': '2026-04-21T09:20:00+00:00'},
+            'technical_snapshots': {'persisted': 3, 'updated_at': '2026-04-21T09:35:00+00:00'},
+            'action_summaries': {'persisted': 3, 'updated_at': '2026-04-21T09:45:00+00:00'},
+            'trending_ranks': {'persisted': 9, 'periods_persisted': 3, 'updated_at': '2026-04-21T09:55:00+00:00'},
+        }
+        fundamentals_run = {
+            'id': 88,
+            'market_date': '2026-04-21',
+            'trigger': 'eod_pykrx_followup',
+            'status': 'completed',
+            'fs_div': 'CFS',
+            'force': False,
+            'symbol_limit': None,
+            'symbol_offset': 0,
+            'symbols_total': 3,
+            'symbols_checked': 3,
+            'symbols_missing': 0,
+            'symbols_stale': 0,
+            'symbols_fresh': 2,
+            'symbols_refreshed': 1,
+            'symbols_failed': 0,
+            'events_detected': 5,
+            'events_captured': 5,
+            'events_failed': 0,
+            'error_message': None,
+            'started_at': '2026-04-21T10:01:00+00:00',
+            'completed_at': '2026-04-21T10:05:00+00:00',
+            'run_metadata': {
+                'symbols_selected': 3,
+                'last_progress_at': '2026-04-21T10:05:00+00:00',
+            },
+        }
+        service = EODPipelineStatusService(
+            market_state_loader=lambda: _FakeMarketState(),
+            pykrx_run_loader=lambda **_: pykrx_run,
+            pykrx_stage_counts_loader=lambda *_: stage_counts,
+            live_symbol_count_loader=lambda: 3579,
+            fundamentals_refresh_loader=lambda **_: fundamentals_run,
+            factor_stage_counts_loader=lambda **_: _full_factor_stage_counts(
+                total=3,
+                updated_at='2026-04-21T10:15:00+00:00',
+            ),
+        )
+
+        result = service.read()
+
         self.assertEqual(result['status'], 'completed')
         self.assertEqual(result['stages']['price_collection']['status'], 'completed')
         self.assertEqual(result['stages']['technical_snapshots']['status'], 'completed')
         self.assertEqual(result['stages']['action_summaries']['status'], 'completed')
         self.assertEqual(result['stages']['trending_ranks']['status'], 'completed')
         self.assertEqual(result['stages']['fundamentals_daily_refresh']['status'], 'completed')
+        self.assertEqual(result['stages']['momentum_factors']['status'], 'completed')
+        self.assertEqual(result['stages']['composite_factors']['status'], 'completed')
         self.assertEqual(result['stages']['trending_ranks']['processed'], 3)
         self.assertEqual(result['stages']['fundamentals_daily_refresh']['succeeded'], 3)

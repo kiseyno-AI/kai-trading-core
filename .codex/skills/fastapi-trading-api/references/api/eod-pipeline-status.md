@@ -7,6 +7,8 @@ Canonical semantics for this route and `GET /eod/freshness` live in `docs/EOD_ST
 
 Unlike `GET /eod/freshness`, this route focuses on in-flight work. It reports the current stage status for pykrx daily price collection, technical snapshot compute, action summary compute, stored trending-rank rebuild, and the latest DART fundamentals daily refresh run for the requested `market_date`.
 
+The same payload now also reports the default-selected factor/scoring stages for that market date: `momentum_factors`, `value_factors`, `low_risk_factors`, `beta_factors`, `advanced_value_factors`, `unified_value_factors`, `quality_factors`, and `composite_factors`. Those stages are derived from stored result-row coverage, so a completed core EOD day with missing scoring rows stays `partial` instead of reading as a false completed success.
+
 The default `market_date` is the current Seoul calendar date from `server_time[:10]`. On weekends, holidays, or other break-days, callers must pass `market_date` explicitly if they want the previous trading day's pipeline view instead of the current calendar date.
 
 ## Example request
@@ -25,7 +27,15 @@ GET /eod/pipeline/status?market_date=2026-04-21&fs_div=CFS
     "technical_snapshots",
     "action_summaries",
     "trending_ranks",
-    "fundamentals_daily_refresh"
+    "fundamentals_daily_refresh",
+    "momentum_factors",
+    "value_factors",
+    "low_risk_factors",
+    "beta_factors",
+    "advanced_value_factors",
+    "unified_value_factors",
+    "quality_factors",
+    "composite_factors"
   ],
   "stages": {
     "price_collection": {
@@ -61,6 +71,18 @@ GET /eod/pipeline/status?market_date=2026-04-21&fs_div=CFS
         "sync_run_ids": [880, 881],
         "capture_run_id": 700,
         "capture_run_ids": [699, 700]
+      }
+    },
+    "momentum_factors": {
+      "status": "pending",
+      "processed": 0,
+      "total": 3579,
+      "failed": 0,
+      "current_activity": "Pending momentum factor compute",
+      "details": {
+        "rows_persisted": 0,
+        "expected_rows": 3579,
+        "default_selected": true
       }
     }
   }

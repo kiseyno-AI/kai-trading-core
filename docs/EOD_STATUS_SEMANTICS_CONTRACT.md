@@ -99,11 +99,25 @@ It freezes the behavior currently shipped on `main` so future web work, core ref
   `symbols_succeeded = symbols_fresh + symbols_refreshed`, and totals prefer `run_metadata.symbols_selected`.
 - Its activity text should prefer the current metadata-driven refresh stage while running, but once the refresh run is failed, the run `error_message` overrides the running-style activity text.
 
+### factor stages
+
+- The pipeline stage order continues after fundamentals with:
+  `momentum_factors`, `value_factors`, `low_risk_factors`, `beta_factors`, `advanced_value_factors`, `unified_value_factors`, `quality_factors`, and `composite_factors`.
+- Those stages are default-selected members of the daily process. A default daily run is not complete for a market date until their stored rows exist.
+- Factor-stage counts are derived from the persisted result tables for the requested `market_date`, not from dedicated run rows.
+- Factor-stage `total` is anchored to the same-market-date price-collection universe when available, so missing factor rows remain visible as incomplete daily scoring coverage instead of collapsing into a false completed state.
+- Factor stages can currently surface `pending`, `partial`, or `completed`.
+  They do not expose a live `running` state because the repo does not persist standalone run-progress rows for those factor families.
+- If a factor stage depends on fundamentals or earlier factor slices and those prerequisites are not yet completed, the factor stage stays `pending` and its activity text reports the blocking stages.
+- `advanced_value_factors`, `unified_value_factors`, and `quality_factors` depend on both same-day price collection and same-day DART fundamentals refresh.
+- `composite_factors` depends on the component slices `momentum_factors`, `value_factors`, `low_risk_factors`, `beta_factors`, and `advanced_value_factors`.
+
 ### overall status
 
 - Overall pipeline `status` is `running` if any stage is `running`.
 - Overall pipeline `status` is `pending` only when every stage is `pending`.
 - Overall pipeline `status` is `completed` only when every stage is `completed`.
+- On a same-day run where pykrx and fundamentals are complete but one or more default-selected factor stages still have no stored rows, overall status must stay `partial`.
 - Overall pipeline `status` is `failed` only when at least one stage is `failed` and no stage is `completed` or `partial`.
 - All other mixed states resolve to `partial`.
 

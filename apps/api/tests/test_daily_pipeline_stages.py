@@ -93,6 +93,8 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             ],
         )
         self.assertIn('fundamentals_daily_refresh', payload['default_daily_stage_order'])
+        self.assertIn('momentum_factors', payload['default_daily_stage_order'])
+        self.assertIn('composite_factors', payload['default_daily_stage_order'])
         self.assertIn('signal_decider', payload['default_daily_stage_order'])
         self.assertIn('unified_value_factors', payload['stage_order'])
         self.assertIn('quality_factors', payload['stage_order'])
@@ -123,6 +125,31 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             quality_stage['depends_on'],
             ['price_collection', 'fundamentals_daily_refresh'],
         )
+        advanced_value_stage = next(
+            stage
+            for stage in payload['stages']
+            if stage['id'] == 'advanced_value_factors'
+        )
+        self.assertEqual(
+            advanced_value_stage['depends_on'],
+            ['price_collection', 'fundamentals_daily_refresh'],
+        )
+        composite_stage = next(
+            stage
+            for stage in payload['stages']
+            if stage['id'] == 'composite_factors'
+        )
+        self.assertEqual(
+            composite_stage['depends_on'],
+            [
+                'momentum_factors',
+                'value_factors',
+                'low_risk_factors',
+                'beta_factors',
+                'advanced_value_factors',
+            ],
+        )
+        self.assertTrue(composite_stage['default_selected'])
 
     def test_run_reorders_requested_subset_and_splits_feedback_stages(self) -> None:
         pykrx_runner = _FakePykrxStageRunner()
@@ -167,6 +194,55 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         self.assertEqual(evaluation_service.calls[0]['as_of_market_date'], '2026-04-14')
         self.assertEqual(evaluation_service.calls[0]['symbols'], ['005930', '000660'])
         self.assertGreaterEqual(execute_stage.call_count, 3)
+
+    def test_run_uses_default_daily_stage_order_including_factor_stages(self) -> None:
+        pykrx_runner = _FakePykrxStageRunner()
+        service = DailyPipelineStageService(pykrx_service=pykrx_runner)
+
+        with (
+            patch.object(service, '_normalize_market_date', return_value='2026-04-14'),
+            patch.object(service, '_execute_stage', side_effect=lambda stage_id, **_: {'stage_id': stage_id}) as execute_stage,
+        ):
+            result = service.run(market_date='2026-04-14')
+
+        self.assertEqual(
+            result['resolved_stages'],
+            service.describe()['default_daily_stage_order'],
+        )
+        self.assertEqual(
+            pykrx_runner.calls[0]['stages'],
+            [
+                'price_collection',
+                'technical_snapshots',
+                'action_summaries',
+                'trending_ranks',
+                'signal_features',
+                'market_risk_filter',
+            ],
+        )
+        executed_stage_ids = [call.args[0] for call in execute_stage.call_args_list]
+        self.assertEqual(
+            executed_stage_ids[:4],
+            [
+                'master_refresh',
+                'pykrx_universe_refresh',
+                'fundamentals_daily_refresh',
+                'piotroski_filter',
+            ],
+        )
+        self.assertEqual(
+            executed_stage_ids[4:12],
+            [
+                'momentum_factors',
+                'value_factors',
+                'low_risk_factors',
+                'beta_factors',
+                'advanced_value_factors',
+                'unified_value_factors',
+                'quality_factors',
+                'composite_factors',
+            ],
+        )
 
     def test_run_rejects_unknown_stage(self) -> None:
         service = DailyPipelineStageService()

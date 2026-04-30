@@ -267,13 +267,15 @@
 - It stays separate from `GET /eod/freshness`: freshness answers whether the stored data is available, while pipeline status answers which stage is running now and what work is currently in progress.
 - Its default `market_date` is also the current Seoul calendar date from `server_time[:10]`; weekends, holidays, and other break-days do not auto-resolve to the previous trading date unless the caller passes `market_date` explicitly.
 - The pykrx stage breakdown reuses the existing `eod_collection_runs` row plus downstream rows linked by `eod_run_id`, and records lightweight per-stage progress in `eod_collection_runs.run_metadata`.
-- The current pykrx pipeline stages are `price_collection`, `technical_snapshots`, `action_summaries`, and `trending_ranks`. The same payload also reports the latest DART `fundamentals_daily_refresh` run for the requested `market_date` and `fs_div`.
+- The current pipeline payload reports `price_collection`, `technical_snapshots`, `action_summaries`, `trending_ranks`, `fundamentals_daily_refresh`, and the default-selected factor stages `momentum_factors`, `value_factors`, `low_risk_factors`, `beta_factors`, `advanced_value_factors`, `unified_value_factors`, `quality_factors`, and `composite_factors`.
 - While a pykrx run is `running`, the inferred current stage is authoritative for live display: that stage remains `running`, later pykrx stages stay `pending` until they actually start, and stale `stage_progress.status=running` entries must be downgraded once the owning run is no longer running.
+- Factor stages are derived from same-day stored result-row coverage instead of dedicated run rows. A default-selected factor stage with no stored rows for the requested market date remains `pending`, so the overall pipeline must stay `partial` until those rows exist.
 - Stage payloads include normalized status, timestamps, processed or total or failed counts where available, current step or activity text, and linked source run IDs so operators can correlate the live run with existing inspect routes.
 
 ## EOD pipeline stage orchestration notes
 - `GET /eod/pipeline/stages` is the operator-facing stage catalog for the explicit daily pipeline orchestrator.
 - The catalog exposes the canonical stage order, the default daily run sequence, per-stage dependency metadata, supported inputs, inspect routes, and output-table hints.
+- The default daily run now includes the factor/scoring sequence after DART fundamentals and Piotroski: `momentum_factors`, `value_factors`, `low_risk_factors`, `beta_factors`, `advanced_value_factors`, `unified_value_factors`, `quality_factors`, and `composite_factors`.
 - `POST /eod/pipeline/run` executes an explicit stage subset in canonical order while reusing the underlying stage operations rather than duplicating orchestration logic.
 - Requested stages are reordered to the canonical sequence before execution. The response preserves both `requested_stages` and `resolved_stages` so operators can audit what was asked for versus what ran.
 - The route does not silently inject missing dependencies. Callers can inspect `depends_on` from the catalog and choose whether they want a narrow rerun or a wider prerequisite-inclusive slice.
@@ -432,7 +434,7 @@
 - Cross-sectional `momentum_rank` and `momentum_percentile` are computed only across symbols in the selected compute universe that have non-null 12-1 momentum. Higher momentum receives a lower rank number and a higher percentile.
 - `is_momentum_eligible` now explicitly requires the stored trend checks, the default top-20% percentile gate (`momentum_percentile >= 0.80` unless a different rule instance is used), and the existing recent-overheat exclusion. The persisted payload includes the eligibility rule metadata, the primary `momentum_eligibility_status`, and the list of failed requirements for auditability.
 - The default 5-day overheat exclusion is `momentum_overheat_v2`: a symbol is marked overheated only when its 5-day return is cross-sectionally extreme, its volatility-adjusted 5-day acceleration exceeds the configured shock threshold, and the raw 5-day return clears a minimum absolute move. The persisted payload records the percentile threshold, the volatility-adjusted formula, the minimum-universe guardrail, and the threshold values so later tuning remains auditable.
-- The current scope is intentionally manual or operator-triggered rather than part of the steady-state pykrx pipeline stages. For shell-driven operations, use `python3.11 -m app.internal.ops eod-momentum-factors-compute --market-date YYYY-MM-DD` from `apps/api`.
+- The default daily pipeline now runs `momentum_factors` after same-day price collection completes. For manual reruns, use `python3.11 -m app.internal.ops eod-momentum-factors-compute --market-date YYYY-MM-DD` from `apps/api`.
 
 ## Daily value factor notes
 - `daily_value_factor_results` is the DB-backed value-factor layer keyed by `symbol_id + market_date`.
@@ -498,6 +500,7 @@
 - The final `unified_value_score` is the equal-weight mean of the five component percentiles and is only stored when all five component percentiles are available. `PER <= 0` is explicitly excluded from PER scoring, and those rows persist with `per_status=invalid_non_positive`, `components_used`, and `unified_value_status=invalid_per` rather than being dropped.
 - Rows missing a same-day bar, missing the annual fundamentals snapshot, or missing any required advanced-value ingredient still persist with auditable per-component statuses, per-component ranks or percentiles where available, and a non-scored `unified_value_status`.
 - The explicit top-level status taxonomy is `scored`, `invalid_per`, `missing_metric`, `insufficient_components`, `missing_market_date_bar`, and `insufficient_fundamentals`.
+- The default daily pipeline now runs `unified_value_factors` after same-day price collection and DART fundamentals refresh complete.
 - The pipeline stage is separate from both filtering and composite scoring. `GET /eod/pipeline/stages` exposes it as `unified_value_factors`, and `GET /eod/screening-results?family=unified_value` is the compact dashboard-facing read layer for its stored results.
 - For shell-driven operations, use `python3.11 -m app.internal.ops eod-unified-value-factors-compute --market-date YYYY-MM-DD` from `apps/api`.
 
@@ -510,6 +513,7 @@
 - The final `quality_score` is the equal-weight mean of whichever component percentiles are available for that symbol on that `market_date`. `components_possible` is fixed at the six practical v1 components, `components_used` records how many percentile inputs were actually used, and `is_quality_score_complete=true` only when all six components were available and used.
 - Partial scoring is explicit rather than silent. Rows with at least one valid component persist as either `quality_status=scored_complete` or `quality_status=scored_partial`. Rows with zero usable components still persist with auditable per-component statuses plus a non-scored top-level `quality_status`.
 - The current top-level status taxonomy is `scored_complete`, `scored_partial`, `missing_metric`, `invalid_equity`, `invalid_assets`, `invalid_net_income`, `insufficient_components`, `insufficient_fundamentals`, and `missing_market_date_bar`.
+- The default daily pipeline now runs `quality_factors` after same-day price collection and DART fundamentals refresh complete.
 - The pipeline stage is separate from filtering and composite scoring. `GET /eod/pipeline/stages` exposes it as `quality_factors`, and the shell-driven path is `python3.11 -m app.internal.ops eod-quality-factors-compute --market-date YYYY-MM-DD` from `apps/api`.
 
 ## Composite factor notes
@@ -521,6 +525,7 @@
 - Missing-input behavior is explicit: the composite layer renormalizes weights across available inputs only when the row has at least three valid factors, at least one valuation-family input (`value_v1` or `advanced_value`), and at least `0.60` of total base-weight coverage. Otherwise it persists `composite_score=null` with `composite_classification=insufficient_inputs`.
 - Hard exclusions are explicit and auditable: `momentum_recent_overheat` excludes symbols whose stored momentum row is flagged `is_recent_overheated=true`, and `low_risk_liquidity_floor` excludes symbols whose stored low-risk row fails `passes_liquidity_floor`.
 - Hard exclusions do not erase the integrated score. Rows can still store `composite_score`, `composite_rank`, and `composite_percentile` while `is_composite_eligible=false` and `composite_classification=hard_excluded` so operators can inspect both score quality and exclusion cause.
+- The default daily pipeline now runs `composite_factors` after the momentum, value, low-risk, beta, and advanced-value stages finish for the same market date.
 - `factor_payload` keeps the input basis, base and applied weights, per-factor contributions, gate metadata, and the summary rank fields so downstream consumers can explain why a symbol landed where it did.
 - For shell-driven operations, use `python3.11 -m app.internal.ops eod-composite-factors-compute --market-date YYYY-MM-DD` from `apps/api`.
 
