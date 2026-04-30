@@ -11,6 +11,9 @@ class FakeMarketSnapshotService:
     async def get_market_snapshot(self) -> dict:
         return {
             'as_of': '2026-04-29T10:05:12+09:00',
+            'status': 'ready',
+            'missing_fields': [],
+            'stale_reason': None,
             'markets': {
                 'kospi': {
                     'label': 'KOSPI',
@@ -56,6 +59,36 @@ class FakeMarketSnapshotService:
                 'rate': 1444.5,
                 'effective_date': '2026-04-28',
                 'fallback_applied': True,
+                'status': 'stale',
+                'source': 'live',
+                'stale_reason': 'koreaexim_date_fallback_applied',
+                'detail': 'Korea Exim date fallback applied',
+                'captured_at': '2026-04-29T10:05:12+09:00',
+            },
+        }
+
+
+class PartialMarketSnapshotService:
+    async def get_market_snapshot(self) -> dict:
+        return {
+            'as_of': '2026-04-30T13:15:00+09:00',
+            'status': 'partial',
+            'missing_fields': ['usd_krw.rate'],
+            'stale_reason': 'koreaexim_quota_exhausted',
+            'markets': {
+                'kospi': {'label': 'KOSPI', 'index_code': '0001', 'value': 2642.07},
+                'kosdaq': {'label': 'KOSDAQ', 'index_code': '1001', 'value': 857.6},
+            },
+            'usd_krw': {
+                'pair': 'USD/KRW',
+                'rate': None,
+                'effective_date': None,
+                'fallback_applied': False,
+                'status': 'missing',
+                'source': 'unavailable',
+                'stale_reason': 'koreaexim_quota_exhausted',
+                'detail': 'Korea Exim returned result=4',
+                'captured_at': None,
             },
         }
 
@@ -89,7 +122,23 @@ class MarketRouteTests(unittest.TestCase):
         payload = response.json()
         self.assertEqual(payload['markets']['kospi']['label'], 'KOSPI')
         self.assertEqual(payload['markets']['kosdaq']['foreign_net_quantity'], -18565)
+        self.assertEqual(payload['status'], 'ready')
         self.assertEqual(payload['usd_krw']['pair'], 'USD/KRW')
+
+    def test_market_snapshot_route_returns_partial_payload_when_fx_is_missing(self) -> None:
+        routes_market.market_snapshot_service = PartialMarketSnapshotService()
+
+        client = TestClient(self.app)
+        response = client.get('/market/snapshot')
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload['status'], 'partial')
+        self.assertEqual(payload['stale_reason'], 'koreaexim_quota_exhausted')
+        self.assertIn('usd_krw.rate', payload['missing_fields'])
+        self.assertEqual(payload['markets']['kospi']['value'], 2642.07)
+        self.assertEqual(payload['usd_krw']['status'], 'missing')
+        self.assertEqual(payload['usd_krw']['source'], 'unavailable')
 
     def test_market_snapshot_route_maps_configuration_errors_to_503(self) -> None:
         routes_market.market_snapshot_service = UnavailableMarketSnapshotService()

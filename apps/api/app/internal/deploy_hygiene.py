@@ -406,10 +406,10 @@ def collect_deploy_smoke_check(
                 kospi = markets.get('kospi') if isinstance(markets.get('kospi'), dict) else {}
                 kosdaq = markets.get('kosdaq') if isinstance(markets.get('kosdaq'), dict) else {}
                 usd_krw = payload.get('usd_krw') if isinstance(payload.get('usd_krw'), dict) else {}
+                missing_fields = payload.get('missing_fields') if isinstance(payload.get('missing_fields'), list) else []
                 ok = (
                     response.status_code == 200
                     and bool(payload.get('as_of'))
-                    and usd_krw.get('rate') is not None
                     and kospi.get('value') is not None
                     and kosdaq.get('value') is not None
                 )
@@ -418,9 +418,12 @@ def collect_deploy_smoke_check(
                     'path': path,
                     'status_code': response.status_code,
                     'as_of': payload.get('as_of'),
+                    'snapshot_status': payload.get('status'),
                     'usd_krw_rate': usd_krw.get('rate'),
                     'kospi_value': kospi.get('value'),
                     'kosdaq_value': kosdaq.get('value'),
+                    'missing_fields': missing_fields,
+                    'stale_reason': payload.get('stale_reason'),
                     'detail': payload.get('detail'),
                 }
             elif name == 'portfolio_summary':
@@ -478,9 +481,14 @@ def _render_smoke_check_text(report: dict[str, Any]) -> str:
             detail_parts.append(f"database_connected={check.get('database_connected')}")
         elif name == 'market_snapshot':
             detail_parts.append(f"as_of={check.get('as_of')}")
+            detail_parts.append(f"snapshot_status={check.get('snapshot_status')}")
             detail_parts.append(f"usd_krw_rate={check.get('usd_krw_rate')}")
             detail_parts.append(f"kospi_value={check.get('kospi_value')}")
             detail_parts.append(f"kosdaq_value={check.get('kosdaq_value')}")
+            if check.get('missing_fields'):
+                detail_parts.append(f"missing_fields={check.get('missing_fields')}")
+            if check.get('stale_reason'):
+                detail_parts.append(f"stale_reason={check.get('stale_reason')}")
         elif name == 'portfolio_summary':
             detail_parts.append(f"sync_status={check.get('sync_status')}")
             detail_parts.append(f"accounts_count={check.get('accounts_count')}")

@@ -151,8 +151,12 @@ class SignalDeciderMarketContextBuilder:
         elif as_of.date().isoformat() != market_date_text:
             stale_reasons.append(f'as_of_date={as_of.date().isoformat()}')
         usd_krw = fx.get('usdkrw') if isinstance(fx.get('usdkrw'), dict) else None
-        if isinstance(usd_krw, dict) and usd_krw.get('fallback_applied'):
-            stale_reasons.append('usdkrw_fallback_applied')
+        if isinstance(usd_krw, dict):
+            fx_stale_reason = str(usd_krw.get('stale_reason') or '').strip()
+            if fx_stale_reason:
+                stale_reasons.append(fx_stale_reason)
+            elif usd_krw.get('fallback_applied'):
+                stale_reasons.append('usdkrw_fallback_applied')
 
         status = 'ready'
         if not indices and not usd_krw:
@@ -216,12 +220,18 @@ class SignalDeciderMarketContextBuilder:
             return {}
         if effective_date is None:
             _append_missing_field(missing_fields, 'fx.usdkrw.effective_date')
+        captured_at = _normalize_datetime(payload.get('captured_at'))
 
         return {
             'usdkrw': {
                 'value': value,
                 'effective_date': str(effective_date) if effective_date is not None else None,
                 'fallback_applied': bool(payload.get('fallback_applied')),
+                'status': str(payload.get('status') or 'ready'),
+                'source': str(payload.get('source') or 'live'),
+                'stale_reason': payload.get('stale_reason'),
+                'detail': payload.get('detail'),
+                'captured_at': captured_at.isoformat() if captured_at is not None else None,
             }
         }
 
