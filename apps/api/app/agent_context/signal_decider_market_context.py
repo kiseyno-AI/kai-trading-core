@@ -6,7 +6,7 @@ import logging
 import threading
 from typing import Any
 
-from app.market.snapshot import market_snapshot_service
+from app.market.snapshot import market_snapshot_service, normalize_market_snapshot_payload
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +118,7 @@ class SignalDeciderMarketContextBuilder:
         return self._build_payload(snapshot=snapshot, market_date=market_date)
 
     def _build_payload(self, *, snapshot: dict[str, Any], market_date: date) -> dict[str, Any]:
+        snapshot = normalize_market_snapshot_payload(snapshot)
         market_date_text = market_date.isoformat()
         missing_fields: list[str] = []
         snapshot_markets = snapshot.get('markets') if isinstance(snapshot.get('markets'), dict) else {}

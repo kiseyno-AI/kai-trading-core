@@ -46,6 +46,7 @@ SEOUL_TZ = ZoneInfo('Asia/Seoul')
 KIS_TRADING_VALUE_UNIT = 'million_krw'
 KRW_UNIT = 'krw'
 KIS_TR_PBMN_TO_KRW_MULTIPLIER = 1_000_000
+LEGACY_INVESTOR_FLOW_UNITS = frozenset({KIS_TRADING_VALUE_UNIT, 'kis_net_value_raw'})
 
 
 @dataclass(frozen=True)
@@ -172,6 +173,52 @@ def _normalize_iso_datetime(value: Any) -> datetime | None:
         return datetime.fromisoformat(normalized)
     except ValueError:
         return None
+
+
+def _normalize_market_snapshot_market_row(payload: Mapping[str, Any]) -> dict[str, Any]:
+    row = deepcopy(dict(payload))
+    has_trading_value_unit = str(payload.get('trading_value_unit') or '').strip() != ''
+    flow_unit = str(payload.get('investor_flow_value_unit') or '').strip().lower()
+
+    if not has_trading_value_unit:
+        row['trading_value_unit'] = KIS_TRADING_VALUE_UNIT
+
+    # Cached rows written before the investor-flow migration stored `*_tr_pbmn` values directly
+    # and omitted both unit markers. Normalize those rows on read so stale cache consumers keep
+    # seeing KRW-scale values until the next successful refresh rewrites the payload.
+    if flow_unit in LEGACY_INVESTOR_FLOW_UNITS or (not flow_unit and not has_trading_value_unit):
+        row['foreign_net_value'] = _parse_tr_pbmn_as_krw(
+            payload.get('foreign_net_value'),
+            field_name='foreign_net_value',
+        )
+        row['institution_net_value'] = _parse_tr_pbmn_as_krw(
+            payload.get('institution_net_value'),
+            field_name='institution_net_value',
+        )
+        row['investor_flow_value_unit'] = KRW_UNIT
+        return row
+
+    if not flow_unit or flow_unit == KRW_UNIT:
+        row['investor_flow_value_unit'] = KRW_UNIT
+        return row
+
+    row['foreign_net_value'] = None
+    row['institution_net_value'] = None
+    row['investor_flow_value_unit'] = KRW_UNIT
+    return row
+
+
+def normalize_market_snapshot_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    normalized_payload = deepcopy(dict(payload))
+    markets = normalized_payload.get('markets')
+    if not isinstance(markets, Mapping):
+        return normalized_payload
+
+    normalized_payload['markets'] = {
+        key: _normalize_market_snapshot_market_row(row) if isinstance(row, Mapping) else deepcopy(row)
+        for key, row in markets.items()
+    }
+    return normalized_payload
 
 
 class MarketSnapshotService:
@@ -710,7 +757,7 @@ class MarketSnapshotService:
     ) -> dict[str, Any] | None:
         if not isinstance(cached_payload, dict):
             return None
-        payload = deepcopy(cached_payload)
+        payload = normalize_market_snapshot_payload(cached_payload)
         payload['status'] = 'stale'
         payload['stale_reason'] = stale_reason
         missing_fields = payload.get('missing_fields')
@@ -726,7 +773,7 @@ class MarketSnapshotService:
     ) -> dict[str, Any] | None:
         if cache_record is None or not isinstance(cache_record.payload, dict):
             return None
-        payload = deepcopy(cache_record.payload)
+        payload = normalize_market_snapshot_payload(cache_record.payload)
         payload['freshness'] = self._build_freshness_payload(cache_record)
         return payload
 

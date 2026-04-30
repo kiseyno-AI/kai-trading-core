@@ -282,6 +282,102 @@ class MarketSnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first_read['as_of'], second_read['as_of'])
         self.assertEqual(len(fx_service.calls), 1)
 
+    async def test_get_market_snapshot_normalizes_legacy_cached_investor_flow_values(self) -> None:
+        settings.kis_use_mock = False
+        settings.market_snapshot_kis_use_real = True
+        client = FakeKISClient()
+        fx_service = FakeFXService()
+        cache_store = InMemoryCacheStore()
+        cached_at = datetime.fromisoformat('2026-04-29T10:05:12+09:00')
+        cache_store.record = MarketSnapshotCacheRecord(
+            payload={
+                'as_of': cached_at.isoformat(),
+                'status': 'ready',
+                'missing_fields': [],
+                'stale_reason': None,
+                'markets': {
+                    'kospi': {
+                        'label': 'KOSPI',
+                        'index_code': '0001',
+                        'value': 2642.07,
+                        'change': 2.78,
+                        'change_percent': 0.11,
+                        'open': 2651.63,
+                        'high': 2653.87,
+                        'low': 2634.29,
+                        'volume': 305715,
+                        'trading_value': 4736153,
+                        'advancers': 512,
+                        'unchanged': 94,
+                        'decliners': 330,
+                        'foreign_net_quantity': -5290,
+                        'foreign_net_value': -1455933,
+                        'institution_net_quantity': 720,
+                        'institution_net_value': 283792,
+                    },
+                    'kosdaq': {
+                        'label': 'KOSDAQ',
+                        'index_code': '1001',
+                        'value': 857.60,
+                        'change': -1.61,
+                        'change_percent': -0.19,
+                        'open': 863.69,
+                        'high': 864.24,
+                        'low': 854.72,
+                        'volume': 1312496,
+                        'trading_value': 11507962,
+                        'advancers': 828,
+                        'unchanged': 94,
+                        'decliners': 716,
+                        'foreign_net_quantity': -18565,
+                        'foreign_net_value': -211205,
+                        'institution_net_quantity': -4738,
+                        'institution_net_value': -304502,
+                    },
+                },
+                'usd_krw': {
+                    'pair': 'USD/KRW',
+                    'rate': 1444.5,
+                    'effective_date': '2026-04-29',
+                    'fallback_applied': False,
+                    'status': 'ready',
+                    'source': 'live',
+                    'stale_reason': None,
+                    'detail': None,
+                    'captured_at': cached_at.isoformat(),
+                },
+            },
+            snapshot_status='ready',
+            stale_reason=None,
+            as_of=cached_at,
+            last_refresh_attempted_at=cached_at,
+            last_refresh_succeeded_at=cached_at,
+            last_refresh_status='success',
+            last_refresh_error=None,
+            refresh_trigger='seed_cache',
+            created_at=cached_at,
+            updated_at=cached_at,
+        )
+        service = MarketSnapshotService(
+            kis_api_client=client,
+            koreaexim_service=fx_service,
+            cache_store=cache_store,
+            fx_snapshot_store_instance=self.fx_snapshot_store,
+        )
+
+        result = await service.get_market_snapshot()
+
+        self.assertEqual(client.token_calls, 0)
+        self.assertEqual(len(fx_service.calls), 0)
+        self.assertEqual(result['markets']['kospi']['trading_value_unit'], 'million_krw')
+        self.assertEqual(result['markets']['kospi']['foreign_net_value'], -1_455_933_000_000)
+        self.assertEqual(result['markets']['kospi']['institution_net_value'], 283_792_000_000)
+        self.assertEqual(result['markets']['kospi']['investor_flow_value_unit'], 'krw')
+        self.assertEqual(result['markets']['kosdaq']['foreign_net_value'], -211_205_000_000)
+        self.assertEqual(result['markets']['kosdaq']['institution_net_value'], -304_502_000_000)
+        self.assertEqual(result['markets']['kosdaq']['investor_flow_value_unit'], 'krw')
+        self.assertTrue(result['freshness']['served_from_cache'])
+
     async def test_get_market_snapshot_requires_real_kis_domain_when_override_is_disabled_without_cache(self) -> None:
         settings.kis_use_mock = True
         settings.market_snapshot_kis_use_real = False
