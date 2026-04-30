@@ -6,6 +6,10 @@ import json
 from pathlib import Path
 from typing import Any, Iterable
 
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).resolve().parents[2] / '.env', override=False)
+
 from app.agent_context.derived_contexts import derived_context_backfill_service
 from app.agent_context.orchestrator import agent_feedback_orchestrator
 from app.agent_context.retry_service import EXPECTED_ROLES, FeedbackRetryCycleConfig, agent_feedback_retry_service

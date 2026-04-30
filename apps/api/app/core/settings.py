@@ -111,7 +111,7 @@ class Settings(BaseSettings):
     openclaw_agent_timeout_seconds: float = 0.0
     openclaw_agent_max_retries: int = 2
     openclaw_agent_retry_backoff_seconds: float = 2.0
-    openclaw_agent_parallel_subtasks: int = 10
+    openclaw_agent_parallel_subtasks: int = 5
     openclaw_agent_symbol_chunk_size: int = 1
     openclaw_agent_max_prompt_chars: int = 0
     openclaw_feedback_trigger_after_fundamentals_refresh: bool = False
