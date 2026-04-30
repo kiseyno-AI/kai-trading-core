@@ -1,8 +1,9 @@
 import unittest
 from copy import deepcopy
-from datetime import datetime
+from datetime import date, datetime
 
 from app.core.settings import settings
+from app.fx.snapshot_store import FXRateSnapshotRecord
 from app.integrations.fx.client import KoreaEximAPIError
 from app.market.snapshot import (
     MarketSnapshotConfigurationError,
@@ -120,6 +121,19 @@ def _parse_datetime(value) -> datetime | None:
     return None
 
 
+def _parse_date(value) -> date:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip()
+        if len(normalized) == 8 and normalized.isdigit():
+            return date.fromisoformat(f'{normalized[:4]}-{normalized[4:6]}-{normalized[6:8]}')
+        return date.fromisoformat(normalized)
+    raise ValueError(f'Unsupported test date value: {value!r}')
+
+
 class InMemoryCacheStore:
     def __init__(self) -> None:
         self.record: MarketSnapshotCacheRecord | None = None
@@ -155,6 +169,64 @@ class InMemoryCacheStore:
         return deepcopy(self.record)
 
 
+class InMemoryFXSnapshotStore:
+    def __init__(self) -> None:
+        self.record: FXRateSnapshotRecord | None = None
+        self.saved_records: list[FXRateSnapshotRecord] = []
+
+    def load_latest_usable(
+        self,
+        *,
+        provider: str,
+        currency_pair: str,
+    ) -> FXRateSnapshotRecord | None:
+        if self.record is None:
+            return None
+        if self.record.provider != provider or self.record.currency_pair != currency_pair:
+            return None
+        return deepcopy(self.record)
+
+    def upsert_snapshot(
+        self,
+        *,
+        provider: str,
+        currency_pair: str,
+        base_currency: str,
+        quote_currency: str,
+        exchange_rate: float,
+        requested_date: date | str,
+        effective_date: date | str,
+        fallback_applied: bool,
+        snapshot_status: str,
+        stale_reason: str | None,
+        detail: str | None,
+        payload: dict | None,
+        captured_at: datetime | str,
+    ) -> FXRateSnapshotRecord:
+        captured_dt = _parse_datetime(captured_at)
+        assert captured_dt is not None
+        created_at = self.record.created_at if self.record is not None else captured_dt
+        self.record = FXRateSnapshotRecord(
+            provider=provider,
+            currency_pair=currency_pair,
+            base_currency=base_currency,
+            quote_currency=quote_currency,
+            exchange_rate=float(exchange_rate),
+            requested_date=_parse_date(requested_date),
+            effective_date=_parse_date(effective_date),
+            fallback_applied=fallback_applied,
+            snapshot_status=snapshot_status,
+            stale_reason=stale_reason,
+            detail=detail,
+            payload=deepcopy(payload) if isinstance(payload, dict) else None,
+            captured_at=captured_dt,
+            created_at=created_at,
+            updated_at=captured_dt,
+        )
+        self.saved_records.append(deepcopy(self.record))
+        return deepcopy(self.record)
+
+
 class MarketSnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.original_settings = {
@@ -167,6 +239,7 @@ class MarketSnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
         settings.kis_app_key = 'test-kis-key'
         settings.kis_app_secret = 'test-kis-secret'
         settings.koreaexim_api_key = 'test-koreaexim-key'
+        self.fx_snapshot_store = InMemoryFXSnapshotStore()
 
     def tearDown(self) -> None:
         for field_name, value in self.original_settings.items():
@@ -182,6 +255,7 @@ class MarketSnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
             kis_api_client=client,
             koreaexim_service=fx_service,
             cache_store=cache_store,
+            fx_snapshot_store_instance=self.fx_snapshot_store,
             refresh_interval_seconds=3600,
         )
 
@@ -209,6 +283,7 @@ class MarketSnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
             kis_api_client=FakeKISClient(),
             koreaexim_service=FakeFXService(),
             cache_store=InMemoryCacheStore(),
+            fx_snapshot_store_instance=self.fx_snapshot_store,
         )
 
         with self.assertRaises(MarketSnapshotConfigurationError) as ctx:
@@ -224,6 +299,7 @@ class MarketSnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
             kis_api_client=FakeKISClient(),
             koreaexim_service=fx_service,
             cache_store=InMemoryCacheStore(),
+            fx_snapshot_store_instance=self.fx_snapshot_store,
         )
 
         result = await service.refresh_market_snapshot_if_due(trigger='test_partial', force=True)
@@ -261,6 +337,7 @@ class MarketSnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
             kis_api_client=FakeKISClient(),
             koreaexim_service=fx_service,
             cache_store=InMemoryCacheStore(),
+            fx_snapshot_store_instance=self.fx_snapshot_store,
             refresh_interval_seconds=0,
         )
 
@@ -280,6 +357,42 @@ class MarketSnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(throttled_result['usd_krw']['source'], 'cache')
         self.assertEqual(throttled_result['usd_krw']['stale_reason'], 'koreaexim_quota_exhausted')
         self.assertEqual(len(fx_service.calls), 2)
+
+    async def test_refresh_uses_persisted_fx_fallback_after_restart_when_live_fx_is_unavailable(self) -> None:
+        settings.kis_use_mock = False
+        settings.market_snapshot_kis_use_real = True
+        durable_fx_store = InMemoryFXSnapshotStore()
+
+        seed_service = MarketSnapshotService(
+            kis_api_client=FakeKISClient(),
+            koreaexim_service=FakeFXService(),
+            cache_store=InMemoryCacheStore(),
+            fx_snapshot_store_instance=durable_fx_store,
+        )
+        seeded = await seed_service.refresh_market_snapshot_if_due(trigger='seed_snapshot', force=True)
+
+        failing_fx_service = SequencedFXService([KoreaEximAPIError('Korea Exim returned result=4')])
+        restarted_service = MarketSnapshotService(
+            kis_api_client=FakeKISClient(),
+            koreaexim_service=failing_fx_service,
+            cache_store=InMemoryCacheStore(),
+            fx_snapshot_store_instance=durable_fx_store,
+        )
+        recovered = await restarted_service.refresh_market_snapshot_if_due(trigger='restart_refresh', force=True)
+
+        self.assertIsNotNone(seeded)
+        self.assertEqual(len(durable_fx_store.saved_records), 1)
+        self.assertIsNotNone(recovered)
+        self.assertEqual(recovered['status'], 'stale')
+        self.assertEqual(recovered['stale_reason'], 'koreaexim_quota_exhausted')
+        self.assertEqual(recovered['usd_krw']['status'], 'stale')
+        self.assertEqual(recovered['usd_krw']['source'], 'cache')
+        self.assertEqual(recovered['usd_krw']['rate'], 1444.5)
+        self.assertEqual(recovered['usd_krw']['effective_date'], '2026-04-29')
+        self.assertEqual(recovered['usd_krw']['captured_at'], seeded['usd_krw']['captured_at'])
+        self.assertEqual(recovered['missing_fields'], [])
+        self.assertEqual(recovered['freshness']['last_refresh_status'], 'degraded')
+        self.assertEqual(len(failing_fx_service.calls), 1)
 
 
 if __name__ == '__main__':

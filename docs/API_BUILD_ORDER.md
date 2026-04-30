@@ -179,7 +179,8 @@
 - `GET /market/snapshot` keeps the KIS-derived index and investor-flow legs available when the Korea Exim USD/KRW leg is stale or unavailable.
 - The response now includes top-level `status`, `missing_fields`, and `stale_reason` fields so consumers can distinguish `ready`, `stale`, and `partial` snapshots without collapsing the whole card.
 - The response now also includes a top-level `freshness` object with `served_from_cache`, refresh cadence, last-attempt and last-success timestamps, next due time, and `last_refresh_status` / `last_refresh_error` metadata for honest stale labeling.
-- `usd_krw` now exposes `status`, `source`, `stale_reason`, `detail`, and `captured_at`. Korea Exim `result=4` reuses the last successful persisted USD/KRW snapshot when available (`status=stale`, `source=cache`) and otherwise returns a partial snapshot with `usd_krw.status=missing`.
+- Core now persists the latest usable Korea Exim FX row in `current_fx_rate_snapshots`, keyed by `provider + currency_pair`, so USD/KRW fallback survives process restarts independently of the broader market snapshot cache payload.
+- `usd_krw` now exposes `status`, `source`, `stale_reason`, `detail`, and `captured_at`. Korea Exim `result=4` reuses the latest durable USD/KRW snapshot when available (`status=stale`, `source=cache`) and otherwise returns a partial snapshot with `usd_krw.status=missing`.
 - Korea Exim quota exhaustion is now sticky for the same search date within the persisted refresh state: once a refresh records `result=4`, later due refreshes reuse cached or missing USD/KRW state for that date instead of retrying Korea Exim immediately.
 
 ## Trading order adapter notes

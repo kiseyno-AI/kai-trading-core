@@ -19,7 +19,7 @@ Degradation behavior:
 - if Korea Exim returns `result=4` or another USD/KRW-only failure during a background refresh, the endpoint still returns `200` with preserved KIS market rows
 - top-level `status`, `missing_fields`, and `stale_reason` describe whether the snapshot is `ready`, `stale`, or `partial`
 - `usd_krw.status` is `ready`, `stale`, or `missing`; `usd_krw.source` is `live`, `cache`, or `unavailable`
-- when a prior USD/KRW fetch succeeded, the service reuses that cached value and marks the FX leg stale instead of failing the whole snapshot
+- when a prior USD/KRW fetch succeeded, Core reuses the latest durable USD/KRW snapshot from `current_fx_rate_snapshots` and marks the FX leg stale instead of failing the whole snapshot
 - when no cached USD/KRW value exists, the snapshot becomes partial and `missing_fields` includes the missing FX fields
 - `freshness` reports the current cache cadence, last refresh attempt/success timestamps, next due time, and whether the last refresh was `success`, `degraded`, or `error`
 
