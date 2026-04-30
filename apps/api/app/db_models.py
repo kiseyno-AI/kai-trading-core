@@ -149,6 +149,28 @@ class CurrentMarketSnapshotCache(Base, TimestampMixin):
     refresh_trigger: Mapped[str | None] = mapped_column(String(64))
 
 
+class CurrentFXRateSnapshot(Base, TimestampMixin):
+    __tablename__ = 'current_fx_rate_snapshots'
+    __table_args__ = (
+        UniqueConstraint('provider', 'currency_pair', name='uq_current_fx_rate_snapshots_provider_pair'),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    currency_pair: Mapped[str] = mapped_column(String(32), nullable=False)
+    base_currency: Mapped[str] = mapped_column(String(16), nullable=False)
+    quote_currency: Mapped[str] = mapped_column(String(16), nullable=False)
+    exchange_rate: Mapped[float] = mapped_column(Numeric(20, 6), nullable=False)
+    requested_date: Mapped[date] = mapped_column(Date, nullable=False)
+    effective_date: Mapped[date] = mapped_column(Date, nullable=False)
+    fallback_applied: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    snapshot_status: Mapped[str] = mapped_column(String(32), nullable=False, default='ready')
+    stale_reason: Mapped[str | None] = mapped_column(String(64))
+    detail: Mapped[str | None] = mapped_column(Text)
+    payload: Mapped[dict | None] = mapped_column(JSON)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class EODCollectionRun(Base):
     __tablename__ = 'eod_collection_runs'
 

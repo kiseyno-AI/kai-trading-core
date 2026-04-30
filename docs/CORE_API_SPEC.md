@@ -128,7 +128,7 @@ Authorization: Bearer <token>
 - This route is intentionally compact and card-oriented rather than chart-oriented.
 - KOSPI/KOSDAQ index data comes from KIS `inquire-index-price`.
 - Market-level investor flow comes from KIS `inquire-investor-time-by-market`.
-- USD/KRW comes from the existing Korea Exim integration, including its fallback-date behavior.
+- USD/KRW comes from the existing Korea Exim integration, including its fallback-date behavior, and Core persists the latest usable USD/KRW row so refresh-time fallback survives process restarts.
 - The selected KIS endpoints are real-domain only, so this route resolves KIS requests against the real domain by default via `MARKET_SNAPSHOT_KIS_USE_REAL=true`.
 - Required secrets are `KIS_APP_KEY`, `KIS_APP_SECRET`, and `KOREAEXIM_API_KEY`.
 - Runtime readiness is exposed through `GET /broker/kis/health` as `market_snapshot_runtime`, and deploy smoke-check now includes this route.

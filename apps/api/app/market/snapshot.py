@@ -12,6 +12,12 @@ from zoneinfo import ZoneInfo
 from app.brokers.kis.client import KISClient, KISClientError
 from app.brokers.kis.provider import kis_client
 from app.core.settings import settings
+from app.fx.snapshot_store import (
+    KOREAEXIM_PROVIDER,
+    USD_KRW_PAIR,
+    FXRateSnapshotStore,
+    fx_snapshot_store,
+)
 from app.fx.service import KoreaEximRateNotFoundError, KoreaEximService, fx_service
 from app.integrations.fx.client import KoreaEximAPIError
 from app.market.snapshot_store import (
@@ -164,6 +170,7 @@ class MarketSnapshotService:
         koreaexim_service: KoreaEximService | None = None,
         real_domain_kis_api_client: KISClient | None = None,
         cache_store: MarketSnapshotCacheStore | None = None,
+        fx_snapshot_store_instance: FXRateSnapshotStore | None = None,
         refresh_interval_seconds: int | None = None,
     ) -> None:
         self._uses_default_kis_client = kis_api_client is None
@@ -171,6 +178,7 @@ class MarketSnapshotService:
         self.koreaexim_service = koreaexim_service or fx_service
         self.real_domain_kis_api_client = real_domain_kis_api_client
         self.cache_store = cache_store or market_snapshot_cache_store
+        self.fx_snapshot_store = fx_snapshot_store_instance or fx_snapshot_store
         configured_interval = (
             settings.market_snapshot_refresh_interval_seconds
             if refresh_interval_seconds is None
@@ -448,7 +456,7 @@ class MarketSnapshotService:
     ) -> dict[str, Any]:
         requested_date = self._requested_fx_search_date(now=refreshed_at)
         quota_detail = self._quota_exhaustion_detail(cache_record=cache_record, search_date=requested_date)
-        cached_snapshot = self._cached_usd_krw_snapshot(cache_record)
+        cached_snapshot = self._latest_usable_usd_krw_snapshot(cache_record)
         if quota_detail is not None:
             logger.warning(
                 'Skipping Korea Exim USD/KRW fetch for %s because quota exhaustion is already recorded: %s',
@@ -466,11 +474,13 @@ class MarketSnapshotService:
                 search_date=requested_date,
                 currency='USD',
             )
-            return self._build_usd_krw_snapshot(
+            snapshot = self._build_usd_krw_snapshot(
                 payload,
                 source='live',
                 captured_at=refreshed_at.isoformat(),
             )
+            self._persist_latest_usd_krw_snapshot(payload=payload, snapshot=snapshot)
+            return snapshot
         except KoreaEximAPIError as exc:
             detail = str(exc)
             stale_reason = self._classify_fx_stale_reason(detail)
@@ -514,6 +524,34 @@ class MarketSnapshotService:
             return None
         return detail
 
+    def _latest_usable_usd_krw_snapshot(
+        self,
+        cache_record: MarketSnapshotCacheRecord | None,
+    ) -> dict[str, Any] | None:
+        candidates: list[dict[str, Any]] = []
+        persisted_snapshot = self._persisted_usd_krw_snapshot()
+        if persisted_snapshot is not None and persisted_snapshot.get('rate') is not None:
+            candidates.append(persisted_snapshot)
+        cached_snapshot = self._cached_usd_krw_snapshot(cache_record)
+        if cached_snapshot is not None and cached_snapshot.get('rate') is not None:
+            candidates.append(cached_snapshot)
+        if not candidates:
+            return None
+        return max(candidates, key=self._snapshot_recency)
+
+    def _persisted_usd_krw_snapshot(self) -> dict[str, Any] | None:
+        try:
+            record = self.fx_snapshot_store.load_latest_usable(
+                provider=KOREAEXIM_PROVIDER,
+                currency_pair=USD_KRW_PAIR,
+            )
+        except Exception as exc:
+            logger.warning('Failed to load persisted USD/KRW snapshot fallback: %s', exc)
+            return None
+        if record is None:
+            return None
+        return record.to_market_snapshot_payload()
+
     def _cached_usd_krw_snapshot(
         self,
         cache_record: MarketSnapshotCacheRecord | None,
@@ -524,6 +562,37 @@ class MarketSnapshotService:
         if not isinstance(cached_snapshot, Mapping):
             return None
         return deepcopy(dict(cached_snapshot))
+
+    def _persist_latest_usd_krw_snapshot(
+        self,
+        *,
+        payload: Mapping[str, Any],
+        snapshot: Mapping[str, Any],
+    ) -> None:
+        rate = snapshot.get('rate')
+        effective_date = payload.get('effective_date')
+        requested_date = payload.get('requested_date')
+        captured_at = snapshot.get('captured_at')
+        if rate is None or effective_date in (None, '') or requested_date in (None, '') or captured_at in (None, ''):
+            return
+        try:
+            self.fx_snapshot_store.upsert_snapshot(
+                provider=str(payload.get('provider') or KOREAEXIM_PROVIDER),
+                currency_pair=USD_KRW_PAIR,
+                base_currency='USD',
+                quote_currency='KRW',
+                exchange_rate=float(rate),
+                requested_date=str(requested_date),
+                effective_date=str(effective_date),
+                fallback_applied=bool(snapshot.get('fallback_applied')),
+                snapshot_status=str(snapshot.get('status') or 'ready'),
+                stale_reason=str(snapshot.get('stale_reason')) if snapshot.get('stale_reason') else None,
+                detail=str(snapshot.get('detail')) if snapshot.get('detail') else None,
+                payload=deepcopy(dict(payload)),
+                captured_at=str(captured_at),
+            )
+        except Exception as exc:
+            logger.warning('Failed to persist durable USD/KRW snapshot: %s', exc)
 
     def _build_usd_krw_snapshot(
         self,
@@ -683,6 +752,14 @@ class MarketSnapshotService:
         if value is None:
             return None
         return value.isoformat()
+
+    def _snapshot_recency(self, snapshot: Mapping[str, Any]) -> datetime:
+        captured_at = _normalize_iso_datetime(snapshot.get('captured_at'))
+        if captured_at is None:
+            return datetime.min.replace(tzinfo=SEOUL_TZ)
+        if captured_at.tzinfo is None:
+            return captured_at.replace(tzinfo=SEOUL_TZ)
+        return captured_at
 
     def _refresh_is_due(self, cache_record: MarketSnapshotCacheRecord | None) -> bool:
         if cache_record is None:
