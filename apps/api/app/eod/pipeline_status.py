@@ -570,10 +570,11 @@ class EODPipelineStatusService:
             if str(prior_stages[dependency].get('status') or 'pending') == 'failed'
         ]
         status = 'pending'
-        if persisted > 0 and expected_total and persisted < expected_total:
-            status = 'partial'
-        elif persisted > 0:
-            status = 'completed'
+        if not blocking_stages:
+            if persisted > 0 and expected_total and persisted < expected_total:
+                status = 'partial'
+            elif persisted > 0:
+                status = 'completed'
         counts = build_stage_counts(
             total=max(expected_total, persisted),
             succeeded=persisted,
@@ -645,16 +646,16 @@ class EODPipelineStatusService:
         failed_blocking_stages: list[str],
     ) -> str:
         label = _stage_label(stage_id)
-        if persisted > 0:
-            if status == 'partial' and expected_total > 0:
-                return f'Stored {persisted}/{expected_total} rows for {label}'
-            return _default_activity(label, status)
         if failed_blocking_stages:
             failed_labels = ', '.join(_stage_label(item) for item in failed_blocking_stages)
             return f'Blocked by failed {failed_labels}'
         if blocking_stages:
             blocking_labels = ', '.join(_stage_label(item) for item in blocking_stages)
             return f'Waiting on {blocking_labels}'
+        if persisted > 0:
+            if status == 'partial' and expected_total > 0:
+                return f'Stored {persisted}/{expected_total} rows for {label}'
+            return _default_activity(label, status)
         return _default_activity(label, status)
 
     @staticmethod
