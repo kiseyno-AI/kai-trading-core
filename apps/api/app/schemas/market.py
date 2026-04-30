@@ -1,6 +1,7 @@
 from datetime import datetime
+from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class QuoteRequest(BaseModel):
@@ -48,9 +49,17 @@ class MarketSnapshotFX(BaseModel):
     rate: float | None = None
     effective_date: str | None = None
     fallback_applied: bool
+    status: Literal['ready', 'stale', 'missing'] = 'ready'
+    source: Literal['live', 'cache', 'unavailable'] = 'live'
+    stale_reason: str | None = None
+    detail: str | None = None
+    captured_at: datetime | None = None
 
 
 class MarketSnapshotResponse(BaseModel):
     as_of: datetime
+    status: Literal['ready', 'partial', 'stale'] = 'ready'
+    missing_fields: list[str] = Field(default_factory=list)
+    stale_reason: str | None = None
     markets: dict[str, MarketSnapshotMarket]
     usd_krw: MarketSnapshotFX

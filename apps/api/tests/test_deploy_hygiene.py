@@ -348,6 +348,72 @@ class DeployHygieneTests(unittest.TestCase):
         self.assertTrue(report['checks']['market_snapshot']['ok'])
         self.assertTrue(report['checks']['portfolio_summary']['ok'])
 
+    def test_collect_deploy_smoke_check_accepts_partial_market_snapshot_when_kis_data_is_present(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == '/health':
+                return httpx.Response(
+                    200,
+                    json={'status': 'ok', 'database': {'connected': True}},
+                    request=request,
+                )
+            if request.url.path == '/eod/freshness':
+                return httpx.Response(
+                    200,
+                    json={
+                        'today': {'trade_date': '2026-04-30'},
+                        'latest': {'trade_date': '2026-04-29', 'updated_at': '2026-04-30T00:00:00+09:00'},
+                    },
+                    request=request,
+                )
+            if request.url.path == '/market/snapshot':
+                return httpx.Response(
+                    200,
+                    json={
+                        'as_of': '2026-04-30T13:15:00+09:00',
+                        'status': 'partial',
+                        'missing_fields': ['usd_krw.rate', 'usd_krw.effective_date'],
+                        'stale_reason': 'koreaexim_quota_exhausted',
+                        'markets': {
+                            'kospi': {'value': 2642.07},
+                            'kosdaq': {'value': 857.6},
+                        },
+                        'usd_krw': {
+                            'rate': None,
+                            'status': 'missing',
+                            'source': 'unavailable',
+                            'stale_reason': 'koreaexim_quota_exhausted',
+                        },
+                    },
+                    request=request,
+                )
+            if request.url.path == '/portfolio/summary':
+                return httpx.Response(
+                    200,
+                    json={
+                        'sync': {
+                            'status': 'synced',
+                            'message': None,
+                        },
+                        'accounts': [{'id': 'KIS:12345678-01'}],
+                    },
+                    request=request,
+                )
+            raise AssertionError(f'unexpected path: {request.url.path}')
+
+        report, exit_code = deploy_hygiene.collect_deploy_smoke_check(
+            base_url='http://testserver',
+            transport=httpx.MockTransport(handler),
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(report['checks']['market_snapshot']['snapshot_status'], 'partial')
+        self.assertTrue(report['checks']['market_snapshot']['ok'])
+        self.assertEqual(report['checks']['market_snapshot']['stale_reason'], 'koreaexim_quota_exhausted')
+        self.assertEqual(
+            report['checks']['market_snapshot']['missing_fields'],
+            ['usd_krw.rate', 'usd_krw.effective_date'],
+        )
+
     def test_collect_deploy_smoke_check_fails_when_health_is_degraded(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
             if request.url.path == '/health':

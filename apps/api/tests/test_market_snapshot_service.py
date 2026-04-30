@@ -1,10 +1,10 @@
 import unittest
 
 from app.core.settings import settings
+from app.integrations.fx.client import KoreaEximAPIError
 from app.market.snapshot import (
     MarketSnapshotConfigurationError,
     MarketSnapshotService,
-    MarketSnapshotUpstreamError,
 )
 
 
@@ -82,25 +82,27 @@ class FakeFXService:
         return {
             'provider': 'koreaexim',
             'requested_date': '20260429',
-            'effective_date': '20260428',
-            'fallback_applied': True,
+            'effective_date': '20260429',
+            'fallback_applied': False,
             'currency': kwargs.get('currency'),
             'count': 1,
             'items': [{'currency_code': 'USD', 'exchange_rate': 1444.5}],
         }
 
 
-class EmptyFXService:
+class SequencedFXService:
+    def __init__(self, responses: list[dict | Exception]) -> None:
+        self.responses = list(responses)
+        self.calls: list[dict] = []
+
     async def get_exchange_rates(self, **kwargs):
-        return {
-            'provider': 'koreaexim',
-            'requested_date': '20260429',
-            'effective_date': '20260429',
-            'fallback_applied': False,
-            'currency': kwargs.get('currency'),
-            'count': 0,
-            'items': [],
-        }
+        self.calls.append(dict(kwargs))
+        if not self.responses:
+            raise AssertionError('No more fake FX responses are configured')
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
 
 
 class MarketSnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
@@ -142,10 +144,17 @@ class MarketSnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['markets']['kospi']['value'], 2642.07)
         self.assertEqual(result['markets']['kospi']['foreign_net_quantity'], -5290)
         self.assertEqual(result['markets']['kosdaq']['institution_net_value'], -150685)
+        self.assertEqual(result['status'], 'ready')
+        self.assertEqual(result['missing_fields'], [])
+        self.assertIsNone(result['stale_reason'])
         self.assertEqual(result['usd_krw']['pair'], 'USD/KRW')
         self.assertEqual(result['usd_krw']['rate'], 1444.5)
-        self.assertEqual(result['usd_krw']['effective_date'], '2026-04-28')
-        self.assertTrue(result['usd_krw']['fallback_applied'])
+        self.assertEqual(result['usd_krw']['effective_date'], '2026-04-29')
+        self.assertFalse(result['usd_krw']['fallback_applied'])
+        self.assertEqual(result['usd_krw']['status'], 'ready')
+        self.assertEqual(result['usd_krw']['source'], 'live')
+        self.assertIsNone(result['usd_krw']['stale_reason'])
+        self.assertIsNotNone(result['usd_krw']['captured_at'])
 
     async def test_get_market_snapshot_requires_real_kis_domain_when_override_is_disabled(self) -> None:
         original_kis_use_mock = settings.kis_use_mock
@@ -162,18 +171,68 @@ class MarketSnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn('MARKET_SNAPSHOT_KIS_USE_REAL', str(ctx.exception))
 
-    async def test_get_market_snapshot_rejects_empty_fx_payload(self) -> None:
+    async def test_get_market_snapshot_returns_partial_when_fx_quota_is_exhausted_without_cache(self) -> None:
         original_kis_use_mock = settings.kis_use_mock
         original_market_snapshot_kis_use_real = settings.market_snapshot_kis_use_real
         settings.kis_use_mock = False
         settings.market_snapshot_kis_use_real = True
-        service = MarketSnapshotService(kis_api_client=FakeKISClient(), koreaexim_service=EmptyFXService())
+        fx_service = SequencedFXService([KoreaEximAPIError('Korea Exim returned result=4')])
+        service = MarketSnapshotService(kis_api_client=FakeKISClient(), koreaexim_service=fx_service)
         try:
-            with self.assertRaises(MarketSnapshotUpstreamError):
-                await service.get_market_snapshot()
+            result = await service.get_market_snapshot()
         finally:
             settings.kis_use_mock = original_kis_use_mock
             settings.market_snapshot_kis_use_real = original_market_snapshot_kis_use_real
+
+        self.assertEqual(result['status'], 'partial')
+        self.assertIn('usd_krw.rate', result['missing_fields'])
+        self.assertEqual(result['stale_reason'], 'koreaexim_quota_exhausted')
+        self.assertEqual(result['usd_krw']['status'], 'missing')
+        self.assertEqual(result['usd_krw']['source'], 'unavailable')
+        self.assertIsNone(result['usd_krw']['rate'])
+        self.assertEqual(result['usd_krw']['stale_reason'], 'koreaexim_quota_exhausted')
+        self.assertIn('result=4', result['usd_krw']['detail'])
+        self.assertEqual(len(fx_service.calls), 1)
+
+    async def test_get_market_snapshot_uses_cached_fx_after_quota_exhaustion_and_throttles_retries(self) -> None:
+        original_kis_use_mock = settings.kis_use_mock
+        original_market_snapshot_kis_use_real = settings.market_snapshot_kis_use_real
+        settings.kis_use_mock = False
+        settings.market_snapshot_kis_use_real = True
+        fx_service = SequencedFXService(
+            [
+                {
+                    'provider': 'koreaexim',
+                    'requested_date': '20260429',
+                    'effective_date': '20260429',
+                    'fallback_applied': False,
+                    'currency': 'USD',
+                    'count': 1,
+                    'items': [{'currency_code': 'USD', 'exchange_rate': 1444.5}],
+                },
+                KoreaEximAPIError('Korea Exim returned result=4'),
+            ]
+        )
+        service = MarketSnapshotService(kis_api_client=FakeKISClient(), koreaexim_service=fx_service)
+        try:
+            ready_result = await service.get_market_snapshot()
+            stale_result = await service.get_market_snapshot()
+            throttled_result = await service.get_market_snapshot()
+        finally:
+            settings.kis_use_mock = original_kis_use_mock
+            settings.market_snapshot_kis_use_real = original_market_snapshot_kis_use_real
+
+        self.assertEqual(ready_result['status'], 'ready')
+        self.assertEqual(stale_result['status'], 'stale')
+        self.assertEqual(stale_result['stale_reason'], 'koreaexim_quota_exhausted')
+        self.assertEqual(stale_result['usd_krw']['status'], 'stale')
+        self.assertEqual(stale_result['usd_krw']['source'], 'cache')
+        self.assertEqual(stale_result['usd_krw']['rate'], 1444.5)
+        self.assertIn('result=4', stale_result['usd_krw']['detail'])
+        self.assertEqual(throttled_result['status'], 'stale')
+        self.assertEqual(throttled_result['usd_krw']['source'], 'cache')
+        self.assertEqual(throttled_result['usd_krw']['stale_reason'], 'koreaexim_quota_exhausted')
+        self.assertEqual(len(fx_service.calls), 2)
 
 
 if __name__ == '__main__':

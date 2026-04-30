@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import threading
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
@@ -10,7 +12,8 @@ from zoneinfo import ZoneInfo
 from app.brokers.kis.client import KISClient
 from app.brokers.kis.provider import kis_client
 from app.core.settings import settings
-from app.fx.service import KoreaEximService, fx_service
+from app.fx.service import KoreaEximRateNotFoundError, KoreaEximService, fx_service
+from app.integrations.fx.client import KoreaEximAPIError
 
 
 class MarketSnapshotConfigurationError(RuntimeError):
@@ -19,6 +22,10 @@ class MarketSnapshotConfigurationError(RuntimeError):
 
 class MarketSnapshotUpstreamError(RuntimeError):
     pass
+
+
+logger = logging.getLogger(__name__)
+SEOUL_TZ = ZoneInfo('Asia/Seoul')
 
 
 @dataclass(frozen=True)
@@ -136,6 +143,10 @@ class MarketSnapshotService:
         self.kis_api_client = kis_api_client or kis_client
         self.koreaexim_service = koreaexim_service or fx_service
         self.real_domain_kis_api_client = real_domain_kis_api_client
+        self._fx_state_lock = threading.Lock()
+        self._cached_usd_krw_snapshot: dict[str, Any] | None = None
+        self._fx_quota_exhausted_search_date: str | None = None
+        self._fx_quota_exhausted_detail: str | None = None
 
     def runtime_status(self) -> dict[str, Any]:
         return self._runtime_status().to_payload()
@@ -193,6 +204,38 @@ class MarketSnapshotService:
             return self.real_domain_kis_api_client
         return self.kis_api_client
 
+    def _now(self) -> datetime:
+        return datetime.now(SEOUL_TZ)
+
+    def _requested_fx_search_date(self) -> str:
+        return self._now().strftime('%Y%m%d')
+
+    def _load_cached_usd_krw_snapshot(self) -> dict[str, Any] | None:
+        with self._fx_state_lock:
+            if self._cached_usd_krw_snapshot is None:
+                return None
+            return dict(self._cached_usd_krw_snapshot)
+
+    def _store_cached_usd_krw_snapshot(self, snapshot: Mapping[str, Any]) -> None:
+        with self._fx_state_lock:
+            self._cached_usd_krw_snapshot = dict(snapshot)
+
+    def _quota_exhaustion_detail(self, *, search_date: str) -> str | None:
+        with self._fx_state_lock:
+            if self._fx_quota_exhausted_search_date == search_date:
+                return self._fx_quota_exhausted_detail or f'Korea Exim quota already exhausted for {search_date}'
+        return None
+
+    def _record_quota_exhaustion(self, *, search_date: str, detail: str) -> None:
+        with self._fx_state_lock:
+            self._fx_quota_exhausted_search_date = search_date
+            self._fx_quota_exhausted_detail = detail
+
+    def _clear_quota_exhaustion(self) -> None:
+        with self._fx_state_lock:
+            self._fx_quota_exhausted_search_date = None
+            self._fx_quota_exhausted_detail = None
+
     async def get_market_snapshot(self) -> dict[str, Any]:
         status = self._runtime_status()
         if not status.ready:
@@ -203,19 +246,28 @@ class MarketSnapshotService:
         # Prime the shared token cache once before fanning out multiple KIS reads.
         await kis_api_client.issue_access_token()
 
-        market_rows, usd_krw_payload = await asyncio.gather(
-            asyncio.gather(*(self._fetch_market_row(kis_api_client, target) for target in MARKET_SNAPSHOT_TARGETS)),
-            self.koreaexim_service.get_exchange_rates(currency='USD'),
+        market_rows_task = asyncio.gather(
+            *(self._fetch_market_row(kis_api_client, target) for target in MARKET_SNAPSHOT_TARGETS)
         )
+        usd_krw_task = asyncio.create_task(self._fetch_usd_krw_snapshot())
 
-        return {
-            'as_of': datetime.now(ZoneInfo('Asia/Seoul')),
+        try:
+            market_rows = await market_rows_task
+            usd_krw_snapshot = await usd_krw_task
+        except Exception:
+            usd_krw_task.cancel()
+            raise
+
+        response = {
+            'as_of': self._now(),
             'markets': {
                 target.key: row
                 for target, row in zip(MARKET_SNAPSHOT_TARGETS, market_rows, strict=True)
             },
-            'usd_krw': self._build_usd_krw_snapshot(usd_krw_payload),
+            'usd_krw': usd_krw_snapshot,
         }
+        response.update(self._build_snapshot_metadata(usd_krw_snapshot=usd_krw_snapshot))
+        return response
 
     async def _fetch_market_row(self, kis_api_client: KISClient, target: MarketSnapshotTarget) -> dict[str, Any]:
         index_payload, flow_payload = await asyncio.gather(
@@ -262,7 +314,62 @@ class MarketSnapshotService:
         first_row = rows[0]
         return _require_mapping(first_row, field_name='output[0]')
 
-    def _build_usd_krw_snapshot(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+    async def _fetch_usd_krw_snapshot(self) -> dict[str, Any]:
+        requested_date = self._requested_fx_search_date()
+        quota_detail = self._quota_exhaustion_detail(search_date=requested_date)
+        if quota_detail is not None:
+            logger.warning(
+                'Skipping Korea Exim USD/KRW fetch for %s because quota exhaustion is already recorded: %s',
+                requested_date,
+                quota_detail,
+            )
+            return self._build_cached_or_missing_usd_krw_snapshot(
+                stale_reason='koreaexim_quota_exhausted',
+                detail=quota_detail,
+            )
+
+        try:
+            payload = await self.koreaexim_service.get_exchange_rates(
+                search_date=requested_date,
+                currency='USD',
+            )
+            snapshot = self._build_usd_krw_snapshot(payload, source='live', captured_at=self._now())
+        except KoreaEximAPIError as exc:
+            detail = str(exc)
+            stale_reason = self._classify_fx_stale_reason(detail)
+            if stale_reason == 'koreaexim_quota_exhausted':
+                self._record_quota_exhaustion(search_date=requested_date, detail=detail)
+            logger.warning('Market snapshot FX degraded: %s', detail)
+            return self._build_cached_or_missing_usd_krw_snapshot(
+                stale_reason=stale_reason,
+                detail=detail,
+            )
+        except KoreaEximRateNotFoundError as exc:
+            detail = str(exc)
+            logger.warning('Market snapshot FX missing: %s', detail)
+            return self._build_cached_or_missing_usd_krw_snapshot(
+                stale_reason='koreaexim_rate_not_found',
+                detail=detail,
+            )
+        except MarketSnapshotUpstreamError as exc:
+            detail = str(exc)
+            logger.warning('Market snapshot FX payload invalid: %s', detail)
+            return self._build_cached_or_missing_usd_krw_snapshot(
+                stale_reason='koreaexim_payload_invalid',
+                detail=detail,
+            )
+
+        self._clear_quota_exhaustion()
+        self._store_cached_usd_krw_snapshot(snapshot)
+        return snapshot
+
+    def _build_usd_krw_snapshot(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        source: str,
+        captured_at: datetime,
+    ) -> dict[str, Any]:
         items = payload.get('items')
         if not isinstance(items, list) or not items:
             raise MarketSnapshotUpstreamError('Korea Exim USD payload did not include any items')
@@ -270,12 +377,72 @@ class MarketSnapshotService:
         if not isinstance(first_row, Mapping):
             raise MarketSnapshotUpstreamError('Korea Exim USD payload returned a malformed rate row')
 
+        fallback_applied = bool(payload.get('fallback_applied'))
+        stale_reason = 'koreaexim_date_fallback_applied' if fallback_applied else None
+        detail = 'Korea Exim date fallback applied' if fallback_applied else None
+
         return {
             'pair': 'USD/KRW',
             'rate': first_row.get('exchange_rate'),
             'effective_date': _normalize_compact_date(payload.get('effective_date')),
-            'fallback_applied': bool(payload.get('fallback_applied')),
+            'fallback_applied': fallback_applied,
+            'status': 'stale' if fallback_applied else 'ready',
+            'source': source,
+            'stale_reason': stale_reason,
+            'detail': detail,
+            'captured_at': captured_at,
         }
+
+    def _build_cached_or_missing_usd_krw_snapshot(
+        self,
+        *,
+        stale_reason: str,
+        detail: str,
+    ) -> dict[str, Any]:
+        cached_snapshot = self._load_cached_usd_krw_snapshot()
+        if cached_snapshot is not None and cached_snapshot.get('rate') is not None:
+            cached_snapshot['status'] = 'stale'
+            cached_snapshot['source'] = 'cache'
+            cached_snapshot['stale_reason'] = stale_reason
+            cached_snapshot['detail'] = detail
+            return cached_snapshot
+
+        return {
+            'pair': 'USD/KRW',
+            'rate': None,
+            'effective_date': None,
+            'fallback_applied': False,
+            'status': 'missing',
+            'source': 'unavailable',
+            'stale_reason': stale_reason,
+            'detail': detail,
+            'captured_at': None,
+        }
+
+    def _build_snapshot_metadata(self, *, usd_krw_snapshot: Mapping[str, Any]) -> dict[str, Any]:
+        missing_fields: list[str] = []
+        if usd_krw_snapshot.get('rate') is None:
+            missing_fields.append('usd_krw.rate')
+        if usd_krw_snapshot.get('effective_date') is None:
+            missing_fields.append('usd_krw.effective_date')
+
+        if missing_fields:
+            status = 'partial'
+        elif usd_krw_snapshot.get('status') == 'stale':
+            status = 'stale'
+        else:
+            status = 'ready'
+
+        return {
+            'status': status,
+            'missing_fields': missing_fields,
+            'stale_reason': usd_krw_snapshot.get('stale_reason'),
+        }
+
+    def _classify_fx_stale_reason(self, detail: str) -> str:
+        if 'result=4' in detail:
+            return 'koreaexim_quota_exhausted'
+        return 'koreaexim_upstream_error'
 
 
 market_snapshot_service = MarketSnapshotService()

@@ -173,6 +173,11 @@
 - `POST /agent-context/signal-decider/policy-candidates/generate`
 - `GET /agent-context/signal-decider/policy-candidates?status=generated&evaluation_version=signal_decider_eval_v1`
 
+## Market snapshot notes
+- `GET /market/snapshot` keeps the KIS-derived index and investor-flow legs available when the Korea Exim USD/KRW leg is stale or unavailable.
+- The response now includes top-level `status`, `missing_fields`, and `stale_reason` fields so consumers can distinguish `ready`, `stale`, and `partial` snapshots without collapsing the whole card.
+- `usd_krw` now exposes `status`, `source`, `stale_reason`, `detail`, and `captured_at`. Korea Exim `result=4` reuses the last successful in-memory USD/KRW snapshot when available (`status=stale`, `source=cache`) and otherwise returns a partial snapshot with `usd_krw.status=missing`.
+
 ## Trading order adapter notes
 - `POST /trading/orders/buy` and `POST /trading/orders/sell` are the internal order-control submit routes for the first KIS domestic cash adapter.
 - `POST /trading/orders/{client_order_id}/cancel` and `POST /trading/orders/{client_order_id}/amend` are account-scoped control routes. They require `account_reference` in `KIS:<account_number>-<product_code>` format so the service can reconcile and control the correct broker account without exposing credentials.

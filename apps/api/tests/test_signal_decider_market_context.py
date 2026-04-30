@@ -17,9 +17,19 @@ class ErrorSnapshotService:
         raise RuntimeError('snapshot unavailable')
 
 
-def _snapshot_payload(*, fallback_applied: bool = False, missing_institutional: bool = False) -> dict:
+def _snapshot_payload(
+    *,
+    fallback_applied: bool = False,
+    missing_institutional: bool = False,
+    fx_status: str = 'ready',
+    fx_stale_reason: str | None = None,
+    fx_source: str = 'live',
+) -> dict:
     return {
         'as_of': datetime.fromisoformat('2026-04-29T10:05:12+09:00'),
+        'status': 'ready',
+        'missing_fields': [],
+        'stale_reason': None,
         'markets': {
             'kospi': {
                 'label': 'KOSPI',
@@ -48,6 +58,11 @@ def _snapshot_payload(*, fallback_applied: bool = False, missing_institutional: 
             'rate': 1444.5,
             'effective_date': '2026-04-29',
             'fallback_applied': fallback_applied,
+            'status': fx_status,
+            'source': fx_source,
+            'stale_reason': fx_stale_reason,
+            'detail': None,
+            'captured_at': '2026-04-29T10:05:12+09:00',
         },
     }
 
@@ -93,6 +108,25 @@ class SignalDeciderMarketContextBuilderTests(unittest.TestCase):
         self.assertEqual(result['status'], 'stale')
         self.assertEqual(result['stale_reason'], 'usdkrw_fallback_applied')
         self.assertTrue(result['fx']['usdkrw']['fallback_applied'])
+
+    def test_build_returns_stale_when_snapshot_marks_fx_as_cached_stale(self) -> None:
+        builder = SignalDeciderMarketContextBuilder(
+            snapshot_service=FakeSnapshotService(
+                _snapshot_payload(
+                    fallback_applied=False,
+                    fx_status='stale',
+                    fx_stale_reason='koreaexim_quota_exhausted',
+                    fx_source='cache',
+                )
+            )
+        )
+
+        result = builder.build(market_date=date(2026, 4, 29))
+
+        self.assertEqual(result['status'], 'stale')
+        self.assertEqual(result['stale_reason'], 'koreaexim_quota_exhausted')
+        self.assertEqual(result['fx']['usdkrw']['source'], 'cache')
+        self.assertEqual(result['fx']['usdkrw']['status'], 'stale')
 
     def test_build_returns_unavailable_when_snapshot_fetch_fails(self) -> None:
         builder = SignalDeciderMarketContextBuilder(snapshot_service=ErrorSnapshotService())
