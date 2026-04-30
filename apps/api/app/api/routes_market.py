@@ -9,6 +9,7 @@ from app.market_data_store import persist_market_status_snapshot
 from app.market.clock import get_market_state
 from app.market.snapshot import (
     MarketSnapshotConfigurationError,
+    MarketSnapshotUnavailableError,
     MarketSnapshotUpstreamError,
     market_snapshot_service,
 )
@@ -32,7 +33,7 @@ async def market_status() -> dict:
 async def market_snapshot() -> dict:
     try:
         return await market_snapshot_service.get_market_snapshot()
-    except (MarketSnapshotConfigurationError, KISConfigurationError, KoreaEximConfigurationError) as exc:
+    except (MarketSnapshotConfigurationError, MarketSnapshotUnavailableError, KISConfigurationError, KoreaEximConfigurationError) as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except (MarketSnapshotUpstreamError, KISClientError, KoreaEximAPIError, KoreaEximRateNotFoundError) as exc:
         raise HTTPException(status_code=502, detail=f'Market snapshot upstream failed: {exc}') from exc

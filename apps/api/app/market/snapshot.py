@@ -2,18 +2,23 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import threading
 from collections.abc import Mapping
+from copy import deepcopy
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from app.brokers.kis.client import KISClient
+from app.brokers.kis.client import KISClient, KISClientError
 from app.brokers.kis.provider import kis_client
 from app.core.settings import settings
 from app.fx.service import KoreaEximRateNotFoundError, KoreaEximService, fx_service
 from app.integrations.fx.client import KoreaEximAPIError
+from app.market.snapshot_store import (
+    MarketSnapshotCacheRecord,
+    MarketSnapshotCacheStore,
+    market_snapshot_cache_store,
+)
 
 
 class MarketSnapshotConfigurationError(RuntimeError):
@@ -21,6 +26,10 @@ class MarketSnapshotConfigurationError(RuntimeError):
 
 
 class MarketSnapshotUpstreamError(RuntimeError):
+    pass
+
+
+class MarketSnapshotUnavailableError(RuntimeError):
     pass
 
 
@@ -131,6 +140,22 @@ def _normalize_compact_date(value: Any) -> str | None:
     return text
 
 
+def _normalize_iso_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    if not normalized:
+        return None
+    if normalized.endswith('Z'):
+        normalized = normalized[:-1] + '+00:00'
+    try:
+        return datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+
+
 class MarketSnapshotService:
     def __init__(
         self,
@@ -138,18 +163,40 @@ class MarketSnapshotService:
         kis_api_client: KISClient | None = None,
         koreaexim_service: KoreaEximService | None = None,
         real_domain_kis_api_client: KISClient | None = None,
+        cache_store: MarketSnapshotCacheStore | None = None,
+        refresh_interval_seconds: int | None = None,
     ) -> None:
         self._uses_default_kis_client = kis_api_client is None
         self.kis_api_client = kis_api_client or kis_client
         self.koreaexim_service = koreaexim_service or fx_service
         self.real_domain_kis_api_client = real_domain_kis_api_client
-        self._fx_state_lock = threading.Lock()
-        self._cached_usd_krw_snapshot: dict[str, Any] | None = None
-        self._fx_quota_exhausted_search_date: str | None = None
-        self._fx_quota_exhausted_detail: str | None = None
+        self.cache_store = cache_store or market_snapshot_cache_store
+        configured_interval = (
+            settings.market_snapshot_refresh_interval_seconds
+            if refresh_interval_seconds is None
+            else refresh_interval_seconds
+        )
+        self.refresh_interval_seconds = max(int(configured_interval), 0)
+        self._refresh_lock = asyncio.Lock()
 
     def runtime_status(self) -> dict[str, Any]:
-        return self._runtime_status().to_payload()
+        payload = self._runtime_status().to_payload()
+        try:
+            payload['cache'] = self._build_cache_status_payload(self.cache_store.load())
+        except Exception as exc:
+            payload['cache'] = {
+                'available': False,
+                'has_snapshot': False,
+                'snapshot_status': None,
+                'as_of': None,
+                'last_refresh_attempted_at': None,
+                'last_refresh_succeeded_at': None,
+                'next_refresh_due_at': None,
+                'last_refresh_status': 'unknown',
+                'last_refresh_error': str(exc),
+                'refresh_interval_seconds': self.refresh_interval_seconds,
+            }
+        return payload
 
     def _runtime_status(self) -> MarketSnapshotRuntimeStatus:
         global_kis_environment = 'demo' if settings.kis_use_mock else 'real'
@@ -207,40 +254,117 @@ class MarketSnapshotService:
     def _now(self) -> datetime:
         return datetime.now(SEOUL_TZ)
 
-    def _requested_fx_search_date(self) -> str:
-        return self._now().strftime('%Y%m%d')
-
-    def _load_cached_usd_krw_snapshot(self) -> dict[str, Any] | None:
-        with self._fx_state_lock:
-            if self._cached_usd_krw_snapshot is None:
-                return None
-            return dict(self._cached_usd_krw_snapshot)
-
-    def _store_cached_usd_krw_snapshot(self, snapshot: Mapping[str, Any]) -> None:
-        with self._fx_state_lock:
-            self._cached_usd_krw_snapshot = dict(snapshot)
-
-    def _quota_exhaustion_detail(self, *, search_date: str) -> str | None:
-        with self._fx_state_lock:
-            if self._fx_quota_exhausted_search_date == search_date:
-                return self._fx_quota_exhausted_detail or f'Korea Exim quota already exhausted for {search_date}'
-        return None
-
-    def _record_quota_exhaustion(self, *, search_date: str, detail: str) -> None:
-        with self._fx_state_lock:
-            self._fx_quota_exhausted_search_date = search_date
-            self._fx_quota_exhausted_detail = detail
-
-    def _clear_quota_exhaustion(self) -> None:
-        with self._fx_state_lock:
-            self._fx_quota_exhausted_search_date = None
-            self._fx_quota_exhausted_detail = None
+    def _requested_fx_search_date(self, *, now: datetime | None = None) -> str:
+        return (now or self._now()).strftime('%Y%m%d')
 
     async def get_market_snapshot(self) -> dict[str, Any]:
-        status = self._runtime_status()
-        if not status.ready:
+        try:
+            cache_record = self.cache_store.load()
+        except Exception as exc:
+            raise MarketSnapshotUnavailableError(f'Market snapshot cache unavailable: {exc}') from exc
+        payload = self._decorate_cached_payload(cache_record)
+        if payload is not None:
+            return payload
+
+        runtime_status = self._runtime_status()
+        if not runtime_status.ready:
             raise self._configuration_error()
 
+        if cache_record is not None and cache_record.last_refresh_error:
+            raise MarketSnapshotUnavailableError(
+                'Market snapshot cache is empty and the last refresh failed: '
+                + cache_record.last_refresh_error
+            )
+        raise MarketSnapshotUnavailableError(
+            'Market snapshot cache is empty. Wait for the background refresh to complete.'
+        )
+
+    async def refresh_market_snapshot_if_due(
+        self,
+        *,
+        trigger: str,
+        force: bool = False,
+    ) -> dict[str, Any] | None:
+        async with self._refresh_lock:
+            cache_record = self.cache_store.load()
+            if not force and not self._refresh_is_due(cache_record):
+                return self._decorate_cached_payload(cache_record)
+            return await self._refresh_market_snapshot(cache_record=cache_record, trigger=trigger)
+
+    async def _refresh_market_snapshot(
+        self,
+        *,
+        cache_record: MarketSnapshotCacheRecord | None,
+        trigger: str,
+    ) -> dict[str, Any] | None:
+        attempted_at = self._now()
+        cached_payload = cache_record.payload if cache_record is not None else None
+        last_successful_refresh_at = cache_record.last_refresh_succeeded_at if cache_record is not None else None
+        runtime_status = self._runtime_status()
+
+        if not runtime_status.ready:
+            error = str(self._configuration_error())
+            stale_payload = self._build_stale_payload_from_cache(
+                cached_payload,
+                stale_reason='market_snapshot_configuration_blocked',
+            )
+            stored_record = self.cache_store.save(
+                payload=stale_payload,
+                last_refresh_attempted_at=attempted_at,
+                last_refresh_succeeded_at=last_successful_refresh_at,
+                last_refresh_status='error',
+                last_refresh_error=error,
+                refresh_trigger=trigger,
+            )
+            if stale_payload is not None:
+                logger.warning('Market snapshot refresh blocked by configuration; serving cached snapshot: %s', error)
+                return self._decorate_cached_payload(stored_record)
+            raise self._configuration_error()
+
+        try:
+            snapshot = await self._build_live_snapshot(cache_record=cache_record, refreshed_at=attempted_at)
+        except Exception as exc:
+            stale_payload = self._build_stale_payload_from_cache(
+                cached_payload,
+                stale_reason=self._classify_refresh_failure_reason(exc),
+            )
+            stored_record = self.cache_store.save(
+                payload=stale_payload,
+                last_refresh_attempted_at=attempted_at,
+                last_refresh_succeeded_at=last_successful_refresh_at,
+                last_refresh_status='error',
+                last_refresh_error=str(exc),
+                refresh_trigger=trigger,
+            )
+            if stale_payload is not None:
+                logger.warning('Market snapshot refresh failed; serving stale cached snapshot: %s', exc)
+                return self._decorate_cached_payload(stored_record)
+            raise
+
+        refresh_status = 'success' if snapshot.get('status') == 'ready' else 'degraded'
+        refresh_error = None
+        if refresh_status == 'degraded':
+            usd_krw_snapshot = snapshot.get('usd_krw')
+            if isinstance(usd_krw_snapshot, Mapping):
+                refresh_error = str(usd_krw_snapshot.get('detail') or snapshot.get('stale_reason') or 'snapshot degraded')
+            else:
+                refresh_error = str(snapshot.get('stale_reason') or 'snapshot degraded')
+        stored_record = self.cache_store.save(
+            payload=snapshot,
+            last_refresh_attempted_at=attempted_at,
+            last_refresh_succeeded_at=attempted_at,
+            last_refresh_status=refresh_status,
+            last_refresh_error=refresh_error,
+            refresh_trigger=trigger,
+        )
+        return self._decorate_cached_payload(stored_record)
+
+    async def _build_live_snapshot(
+        self,
+        *,
+        cache_record: MarketSnapshotCacheRecord | None,
+        refreshed_at: datetime,
+    ) -> dict[str, Any]:
         kis_api_client = self._effective_kis_client()
 
         # Prime the shared token cache once before fanning out multiple KIS reads.
@@ -249,7 +373,9 @@ class MarketSnapshotService:
         market_rows_task = asyncio.gather(
             *(self._fetch_market_row(kis_api_client, target) for target in MARKET_SNAPSHOT_TARGETS)
         )
-        usd_krw_task = asyncio.create_task(self._fetch_usd_krw_snapshot())
+        usd_krw_task = asyncio.create_task(
+            self._fetch_usd_krw_snapshot(cache_record=cache_record, refreshed_at=refreshed_at)
+        )
 
         try:
             market_rows = await market_rows_task
@@ -259,7 +385,7 @@ class MarketSnapshotService:
             raise
 
         response = {
-            'as_of': self._now(),
+            'as_of': refreshed_at.isoformat(),
             'markets': {
                 target.key: row
                 for target, row in zip(MARKET_SNAPSHOT_TARGETS, market_rows, strict=True)
@@ -314,9 +440,15 @@ class MarketSnapshotService:
         first_row = rows[0]
         return _require_mapping(first_row, field_name='output[0]')
 
-    async def _fetch_usd_krw_snapshot(self) -> dict[str, Any]:
-        requested_date = self._requested_fx_search_date()
-        quota_detail = self._quota_exhaustion_detail(search_date=requested_date)
+    async def _fetch_usd_krw_snapshot(
+        self,
+        *,
+        cache_record: MarketSnapshotCacheRecord | None,
+        refreshed_at: datetime,
+    ) -> dict[str, Any]:
+        requested_date = self._requested_fx_search_date(now=refreshed_at)
+        quota_detail = self._quota_exhaustion_detail(cache_record=cache_record, search_date=requested_date)
+        cached_snapshot = self._cached_usd_krw_snapshot(cache_record)
         if quota_detail is not None:
             logger.warning(
                 'Skipping Korea Exim USD/KRW fetch for %s because quota exhaustion is already recorded: %s',
@@ -324,6 +456,7 @@ class MarketSnapshotService:
                 quota_detail,
             )
             return self._build_cached_or_missing_usd_krw_snapshot(
+                cached_snapshot=cached_snapshot,
                 stale_reason='koreaexim_quota_exhausted',
                 detail=quota_detail,
             )
@@ -333,14 +466,17 @@ class MarketSnapshotService:
                 search_date=requested_date,
                 currency='USD',
             )
-            snapshot = self._build_usd_krw_snapshot(payload, source='live', captured_at=self._now())
+            return self._build_usd_krw_snapshot(
+                payload,
+                source='live',
+                captured_at=refreshed_at.isoformat(),
+            )
         except KoreaEximAPIError as exc:
             detail = str(exc)
             stale_reason = self._classify_fx_stale_reason(detail)
-            if stale_reason == 'koreaexim_quota_exhausted':
-                self._record_quota_exhaustion(search_date=requested_date, detail=detail)
             logger.warning('Market snapshot FX degraded: %s', detail)
             return self._build_cached_or_missing_usd_krw_snapshot(
+                cached_snapshot=cached_snapshot,
                 stale_reason=stale_reason,
                 detail=detail,
             )
@@ -348,6 +484,7 @@ class MarketSnapshotService:
             detail = str(exc)
             logger.warning('Market snapshot FX missing: %s', detail)
             return self._build_cached_or_missing_usd_krw_snapshot(
+                cached_snapshot=cached_snapshot,
                 stale_reason='koreaexim_rate_not_found',
                 detail=detail,
             )
@@ -355,20 +492,45 @@ class MarketSnapshotService:
             detail = str(exc)
             logger.warning('Market snapshot FX payload invalid: %s', detail)
             return self._build_cached_or_missing_usd_krw_snapshot(
+                cached_snapshot=cached_snapshot,
                 stale_reason='koreaexim_payload_invalid',
                 detail=detail,
             )
 
-        self._clear_quota_exhaustion()
-        self._store_cached_usd_krw_snapshot(snapshot)
-        return snapshot
+    def _quota_exhaustion_detail(
+        self,
+        *,
+        cache_record: MarketSnapshotCacheRecord | None,
+        search_date: str,
+    ) -> str | None:
+        if cache_record is None:
+            return None
+        detail = (cache_record.last_refresh_error or '').strip()
+        attempted_at = cache_record.last_refresh_attempted_at
+        if 'result=4' not in detail or attempted_at is None:
+            return None
+        attempted_search_date = attempted_at.astimezone(SEOUL_TZ).strftime('%Y%m%d')
+        if attempted_search_date != search_date:
+            return None
+        return detail
+
+    def _cached_usd_krw_snapshot(
+        self,
+        cache_record: MarketSnapshotCacheRecord | None,
+    ) -> dict[str, Any] | None:
+        if cache_record is None or not isinstance(cache_record.payload, dict):
+            return None
+        cached_snapshot = cache_record.payload.get('usd_krw')
+        if not isinstance(cached_snapshot, Mapping):
+            return None
+        return deepcopy(dict(cached_snapshot))
 
     def _build_usd_krw_snapshot(
         self,
         payload: Mapping[str, Any],
         *,
         source: str,
-        captured_at: datetime,
+        captured_at: str,
     ) -> dict[str, Any]:
         items = payload.get('items')
         if not isinstance(items, list) or not items:
@@ -396,16 +558,17 @@ class MarketSnapshotService:
     def _build_cached_or_missing_usd_krw_snapshot(
         self,
         *,
+        cached_snapshot: Mapping[str, Any] | None,
         stale_reason: str,
         detail: str,
     ) -> dict[str, Any]:
-        cached_snapshot = self._load_cached_usd_krw_snapshot()
         if cached_snapshot is not None and cached_snapshot.get('rate') is not None:
-            cached_snapshot['status'] = 'stale'
-            cached_snapshot['source'] = 'cache'
-            cached_snapshot['stale_reason'] = stale_reason
-            cached_snapshot['detail'] = detail
-            return cached_snapshot
+            payload = deepcopy(dict(cached_snapshot))
+            payload['status'] = 'stale'
+            payload['source'] = 'cache'
+            payload['stale_reason'] = stale_reason
+            payload['detail'] = detail
+            return payload
 
         return {
             'pair': 'USD/KRW',
@@ -443,6 +606,106 @@ class MarketSnapshotService:
         if 'result=4' in detail:
             return 'koreaexim_quota_exhausted'
         return 'koreaexim_upstream_error'
+
+    def _classify_refresh_failure_reason(self, exc: Exception) -> str:
+        if isinstance(exc, MarketSnapshotConfigurationError):
+            return 'market_snapshot_configuration_blocked'
+        if isinstance(exc, (KISClientError, MarketSnapshotUpstreamError)):
+            return 'market_snapshot_kis_upstream_error'
+        if isinstance(exc, (KoreaEximAPIError, KoreaEximRateNotFoundError)):
+            return 'market_snapshot_fx_upstream_error'
+        return 'market_snapshot_refresh_failed'
+
+    def _build_stale_payload_from_cache(
+        self,
+        cached_payload: dict[str, Any] | None,
+        *,
+        stale_reason: str,
+    ) -> dict[str, Any] | None:
+        if not isinstance(cached_payload, dict):
+            return None
+        payload = deepcopy(cached_payload)
+        payload['status'] = 'stale'
+        payload['stale_reason'] = stale_reason
+        missing_fields = payload.get('missing_fields')
+        if isinstance(missing_fields, list):
+            payload['missing_fields'] = list(missing_fields)
+        else:
+            payload['missing_fields'] = []
+        return payload
+
+    def _decorate_cached_payload(
+        self,
+        cache_record: MarketSnapshotCacheRecord | None,
+    ) -> dict[str, Any] | None:
+        if cache_record is None or not isinstance(cache_record.payload, dict):
+            return None
+        payload = deepcopy(cache_record.payload)
+        payload['freshness'] = self._build_freshness_payload(cache_record)
+        return payload
+
+    def _build_cache_status_payload(
+        self,
+        cache_record: MarketSnapshotCacheRecord | None,
+    ) -> dict[str, Any]:
+        return {
+            'available': True,
+            'has_snapshot': bool(cache_record and cache_record.payload),
+            'snapshot_status': cache_record.snapshot_status if cache_record is not None else None,
+            'as_of': self._format_datetime(cache_record.as_of) if cache_record is not None else None,
+            'last_refresh_attempted_at': (
+                self._format_datetime(cache_record.last_refresh_attempted_at) if cache_record is not None else None
+            ),
+            'last_refresh_succeeded_at': (
+                self._format_datetime(cache_record.last_refresh_succeeded_at) if cache_record is not None else None
+            ),
+            'next_refresh_due_at': self._format_datetime(self._next_refresh_due_at(cache_record)),
+            'last_refresh_status': cache_record.last_refresh_status if cache_record is not None else 'never',
+            'last_refresh_error': cache_record.last_refresh_error if cache_record is not None else None,
+            'refresh_interval_seconds': self.refresh_interval_seconds,
+        }
+
+    def _build_freshness_payload(
+        self,
+        cache_record: MarketSnapshotCacheRecord,
+    ) -> dict[str, Any]:
+        return {
+            'served_from_cache': True,
+            'refresh_interval_seconds': self.refresh_interval_seconds,
+            'last_refresh_attempted_at': self._format_datetime(cache_record.last_refresh_attempted_at),
+            'last_refresh_succeeded_at': self._format_datetime(cache_record.last_refresh_succeeded_at),
+            'next_refresh_due_at': self._format_datetime(self._next_refresh_due_at(cache_record)),
+            'last_refresh_status': cache_record.last_refresh_status,
+            'last_refresh_error': cache_record.last_refresh_error,
+        }
+
+    def _format_datetime(self, value: datetime | None) -> str | None:
+        if value is None:
+            return None
+        return value.isoformat()
+
+    def _refresh_is_due(self, cache_record: MarketSnapshotCacheRecord | None) -> bool:
+        if cache_record is None:
+            return True
+        if self.refresh_interval_seconds == 0:
+            return True
+        next_due_at = self._next_refresh_due_at(cache_record)
+        if next_due_at is None:
+            return True
+        return self._now() >= next_due_at
+
+    def _next_refresh_due_at(
+        self,
+        cache_record: MarketSnapshotCacheRecord | None,
+    ) -> datetime | None:
+        if cache_record is None:
+            return None
+        reference = cache_record.last_refresh_attempted_at or cache_record.last_refresh_succeeded_at or cache_record.as_of
+        if reference is None and isinstance(cache_record.payload, dict):
+            reference = _normalize_iso_datetime(cache_record.payload.get('as_of'))
+        if reference is None:
+            return None
+        return reference + timedelta(seconds=self.refresh_interval_seconds)
 
 
 market_snapshot_service = MarketSnapshotService()

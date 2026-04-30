@@ -174,9 +174,13 @@
 - `GET /agent-context/signal-decider/policy-candidates?status=generated&evaluation_version=signal_decider_eval_v1`
 
 ## Market snapshot notes
+- `GET /market/snapshot` is now a cache/read-model endpoint. Web reads return the latest persisted Core market snapshot instead of triggering live KIS or Korea Exim calls in the request path.
+- The background/runtime refresh cadence is explicit and configurable through `MARKET_SNAPSHOT_REFRESH_INTERVAL_SECONDS` (default `3600` seconds). Startup primes the cache when possible, and the background runner refreshes it when due.
 - `GET /market/snapshot` keeps the KIS-derived index and investor-flow legs available when the Korea Exim USD/KRW leg is stale or unavailable.
 - The response now includes top-level `status`, `missing_fields`, and `stale_reason` fields so consumers can distinguish `ready`, `stale`, and `partial` snapshots without collapsing the whole card.
-- `usd_krw` now exposes `status`, `source`, `stale_reason`, `detail`, and `captured_at`. Korea Exim `result=4` reuses the last successful in-memory USD/KRW snapshot when available (`status=stale`, `source=cache`) and otherwise returns a partial snapshot with `usd_krw.status=missing`.
+- The response now also includes a top-level `freshness` object with `served_from_cache`, refresh cadence, last-attempt and last-success timestamps, next due time, and `last_refresh_status` / `last_refresh_error` metadata for honest stale labeling.
+- `usd_krw` now exposes `status`, `source`, `stale_reason`, `detail`, and `captured_at`. Korea Exim `result=4` reuses the last successful persisted USD/KRW snapshot when available (`status=stale`, `source=cache`) and otherwise returns a partial snapshot with `usd_krw.status=missing`.
+- Korea Exim quota exhaustion is now sticky for the same search date within the persisted refresh state: once a refresh records `result=4`, later due refreshes reuse cached or missing USD/KRW state for that date instead of retrying Korea Exim immediately.
 
 ## Trading order adapter notes
 - `POST /trading/orders/buy` and `POST /trading/orders/sell` are the internal order-control submit routes for the first KIS domestic cash adapter.
