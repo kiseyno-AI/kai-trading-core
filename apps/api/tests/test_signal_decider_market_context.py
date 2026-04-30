@@ -20,12 +20,20 @@ class ErrorSnapshotService:
 def _snapshot_payload(
     *,
     fallback_applied: bool = False,
+    legacy_cached_flow_values: bool = False,
     missing_institutional: bool = False,
     fx_status: str = 'ready',
     fx_stale_reason: str | None = None,
     fx_source: str = 'live',
 ) -> dict:
-    return {
+    kospi_foreign_value = -1455933 if legacy_cached_flow_values else -1455933000000
+    kospi_institution_value = 283792 if legacy_cached_flow_values else 283792000000
+    kosdaq_foreign_value = -211205 if legacy_cached_flow_values else -211205000000
+    kosdaq_institution_value = None
+    if not missing_institutional:
+        kosdaq_institution_value = -304502 if legacy_cached_flow_values else -304502000000
+
+    payload = {
         'as_of': datetime.fromisoformat('2026-04-29T10:05:12+09:00'),
         'status': 'ready',
         'missing_fields': [],
@@ -33,25 +41,33 @@ def _snapshot_payload(
         'markets': {
             'kospi': {
                 'label': 'KOSPI',
+                'index_code': '0001',
                 'value': 2642.07,
                 'change': 11.78,
                 'change_percent': 0.45,
+                'trading_value': 4736153,
+                'trading_value_unit': 'million_krw',
                 'advancers': 702,
                 'unchanged': 81,
                 'decliners': 198,
-                'foreign_net_value': 148656,
-                'institution_net_value': 55532,
+                'foreign_net_value': kospi_foreign_value,
+                'institution_net_value': kospi_institution_value,
+                'investor_flow_value_unit': 'krw',
             },
             'kosdaq': {
                 'label': 'KOSDAQ',
+                'index_code': '1001',
                 'value': 857.60,
                 'change': 4.61,
                 'change_percent': 0.54,
+                'trading_value': 11507962,
+                'trading_value_unit': 'million_krw',
                 'advancers': 901,
                 'unchanged': 92,
                 'decliners': 501,
-                'foreign_net_value': 597490,
-                'institution_net_value': None if missing_institutional else 150685,
+                'foreign_net_value': kosdaq_foreign_value,
+                'institution_net_value': kosdaq_institution_value,
+                'investor_flow_value_unit': 'krw',
             },
         },
         'usd_krw': {
@@ -65,6 +81,11 @@ def _snapshot_payload(
             'captured_at': '2026-04-29T10:05:12+09:00',
         },
     }
+    if legacy_cached_flow_values:
+        for row in payload['markets'].values():
+            row.pop('trading_value_unit', None)
+            row.pop('investor_flow_value_unit', None)
+    return payload
 
 
 class SignalDeciderMarketContextBuilderTests(unittest.TestCase):
@@ -78,12 +99,28 @@ class SignalDeciderMarketContextBuilderTests(unittest.TestCase):
         self.assertEqual(result['indices']['kospi']['level'], 2642.07)
         self.assertEqual(result['indices']['kosdaq']['change_rate'], 0.54)
         self.assertEqual(result['fx']['usdkrw']['value'], 1444.5)
-        self.assertEqual(result['flows']['foreign']['value'], 746146)
-        self.assertEqual(result['flows']['institutional']['value'], 206217)
+        self.assertEqual(result['flows']['foreign']['value'], -1667138000000)
+        self.assertEqual(result['flows']['foreign']['unit'], 'krw')
+        self.assertEqual(result['flows']['institutional']['value'], -20710000000)
+        self.assertEqual(result['flows']['institutional']['unit'], 'krw')
         self.assertEqual(result['missing_fields'], [])
         self.assertIsNone(result['stale_reason'])
         self.assertIn('KOSPI +0.45%', result['summary']['line'])
         self.assertIn('KOSDAQ breadth 901/92/501', result['summary']['breadth_summary'])
+
+    def test_build_normalizes_legacy_cached_flow_values_before_labeling_krw(self) -> None:
+        builder = SignalDeciderMarketContextBuilder(
+            snapshot_service=FakeSnapshotService(_snapshot_payload(legacy_cached_flow_values=True))
+        )
+
+        result = builder.build(market_date=date(2026, 4, 29))
+
+        self.assertEqual(result['status'], 'ready')
+        self.assertEqual(result['flows']['foreign']['value'], -1667138000000)
+        self.assertEqual(result['flows']['foreign']['unit'], 'krw')
+        self.assertEqual(result['flows']['institutional']['value'], -20710000000)
+        self.assertEqual(result['flows']['institutional']['unit'], 'krw')
+        self.assertEqual(result['missing_fields'], [])
 
     def test_build_returns_partial_when_flow_inputs_are_missing(self) -> None:
         builder = SignalDeciderMarketContextBuilder(
