@@ -24,6 +24,7 @@ from app.agent_context.reuse_service import agent_context_reuse_service
 from app.agent_context.read_service import agent_context_read_service
 from app.agent_context.run_state_service import agent_context_feedback_run_state_service
 from app.agent_context.session_cleanup_service import agent_feedback_session_cleanup_service
+from app.agent_context.signal_decider_calendar_review_service import signal_decider_calendar_review_service
 from app.agent_context.signal_decider_loop_service import signal_decider_loop_service
 from app.agent_context.retry_service import (
     EXPECTED_ROLES,
@@ -776,7 +777,7 @@ async def get_signal_decider_review_calendar(
 ) -> dict:
     try:
         return await run_in_threadpool(
-            signal_decider_loop_service.get_review_calendar,
+            signal_decider_calendar_review_service.get_review_calendar,
             month=month,
             horizons=horizons,
             primary_horizon_days=primary_horizon_days,
@@ -788,6 +789,23 @@ async def get_signal_decider_review_calendar(
         raise HTTPException(status_code=500, detail=f'Signal-decider replay calendar read failed: {exc}') from exc
 
 
+@router.get('/signal-decider/calendar/maintenance')
+async def inspect_signal_decider_review_calendar_maintenance(
+    evaluation_version: str | None = Query(default=None),
+    limit: int = Query(default=10, ge=1, le=100),
+) -> dict:
+    try:
+        return await run_in_threadpool(
+            signal_decider_calendar_review_service.inspect_maintenance,
+            evaluation_version=evaluation_version,
+            limit=limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'Signal-decider calendar maintenance inspect failed: {exc}') from exc
+
+
 @router.get('/signal-decider/calendar/{market_date}')
 async def get_signal_decider_review_date(
     market_date: date,
@@ -797,7 +815,7 @@ async def get_signal_decider_review_date(
 ) -> dict:
     try:
         return await run_in_threadpool(
-            signal_decider_loop_service.get_review_date,
+            signal_decider_calendar_review_service.get_review_date,
             market_date=market_date,
             horizons=horizons,
             primary_horizon_days=primary_horizon_days,
@@ -819,7 +837,7 @@ async def get_signal_decider_review_detail(
 ) -> dict:
     try:
         return await run_in_threadpool(
-            signal_decider_loop_service.get_review_detail,
+            signal_decider_calendar_review_service.get_review_detail,
             market_date=market_date,
             snapshot_id=snapshot_id,
             horizons=horizons,

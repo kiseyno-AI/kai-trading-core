@@ -518,6 +518,151 @@ class FakeSignalDeciderLoopService:
         }
 
 
+class FakeSignalDeciderCalendarReviewService:
+    def __init__(self):
+        self.calendar_args = None
+        self.review_date_args = None
+        self.review_detail_args = None
+        self.maintenance_args = None
+
+    def get_review_calendar(self, **kwargs):
+        self.calendar_args = kwargs
+        return {
+            'request': {
+                'month': kwargs['month'],
+                'horizons': kwargs['horizons'],
+                'primary_horizon_days': kwargs['primary_horizon_days'],
+                'evaluation_version': kwargs['evaluation_version'],
+            },
+            'read_model': {
+                'name': 'signal_decider_replay_review',
+                'artifact_source': 'signal_decider_calendar_review_items',
+            },
+            'taxonomy': {'version': 'signal_decider_replay_review_v1'},
+            'summary': {'day_count': 1, 'decision_count': 2, 'calendar_status': 'reviewed'},
+            'items': [
+                {
+                    'market_date': '2026-04-23',
+                    'calendar_status': 'reviewed',
+                    'decision_count': 2,
+                    'scorecard': {'target_hit_count': 1},
+                }
+            ],
+        }
+
+    def inspect_maintenance(self, **kwargs):
+        self.maintenance_args = kwargs
+        return {
+            'request': kwargs,
+            'summary': {'count': 1, 'latest_status': 'completed'},
+            'items': [{'id': 7, 'status': 'completed'}],
+        }
+
+    def get_review_date(self, **kwargs):
+        self.review_date_args = kwargs
+        return {
+            'request': {
+                'market_date': kwargs['market_date'].isoformat(),
+                'horizons': kwargs['horizons'],
+                'primary_horizon_days': kwargs['primary_horizon_days'],
+                'evaluation_version': kwargs['evaluation_version'],
+            },
+            'read_model': {
+                'name': 'signal_decider_replay_review',
+                'artifact_source': 'signal_decider_calendar_review_items',
+            },
+            'taxonomy': {'version': 'signal_decider_replay_review_v1'},
+            'summary': {'count': 1, 'evaluation_coverage': {'status': 'complete'}},
+            'items': [
+                {
+                    'snapshot_id': 84,
+                    'symbol': '005930',
+                    'review': {
+                        'status': 'complete',
+                        'insight': {'code': 'buy_should_have_taken', 'priority': 'low'},
+                        'quality_verdict': 'buy_should_have_taken',
+                        'quality_reason': 'Target was touched and the stop-loss was never touched inside the review window.',
+                        'review_conclusion': 'Buy held up on replay.',
+                        'path_outcome': 'target_hit',
+                        'intraday_path_result': 'target_only',
+                        'narrative': {
+                            'insight_code': 'buy_should_have_taken',
+                            'insight_priority': 'low',
+                            'headline': 'Buy held up on replay.',
+                            'headline_key': 'signal_decider.review.headline.buy_should_have_taken',
+                            'supporting_reasons': [
+                                {
+                                    'code': 'target_hit_without_stop',
+                                    'message': 'Target was touched and the stop-loss was never touched inside the review window.',
+                                    'message_key': 'signal_decider.review.reason.target_hit_without_stop',
+                                }
+                            ],
+                            'counterfactual_summary': None,
+                            'summary_text': 'Buy held up on replay. Target was touched and the stop-loss was never touched inside the review window.',
+                        },
+                        'narrative_text': 'Buy held up on replay. Target was touched and the stop-loss was never touched inside the review window.',
+                        'path_analysis': {'path_marker': 'target_hit'},
+                    },
+                }
+            ],
+        }
+
+    def get_review_detail(self, **kwargs):
+        self.review_detail_args = kwargs
+        return {
+            'request': {
+                'market_date': kwargs['market_date'].isoformat(),
+                'snapshot_id': kwargs['snapshot_id'],
+                'horizons': kwargs['horizons'],
+                'primary_horizon_days': kwargs['primary_horizon_days'],
+                'evaluation_version': kwargs['evaluation_version'],
+            },
+            'read_model': {
+                'name': 'signal_decider_replay_review',
+                'artifact_source': 'signal_decider_calendar_review_items',
+            },
+            'taxonomy': {'version': 'signal_decider_replay_review_v1'},
+            'summary': {
+                'review_status': 'complete',
+                'insight_code': 'buy_should_have_taken',
+                'insight_priority': 'low',
+                'headline': 'Buy held up on replay.',
+                'primary_path_marker': 'target_hit',
+            },
+            'item': {
+                'snapshot_id': kwargs['snapshot_id'],
+                'symbol': '005930',
+                'review': {
+                    'status': 'complete',
+                    'insight': {'code': 'buy_should_have_taken', 'priority': 'low'},
+                    'quality_verdict': 'buy_should_have_taken',
+                    'quality_reason': 'Target was touched and the stop-loss was never touched inside the review window.',
+                    'review_conclusion': 'Buy held up on replay.',
+                    'path_outcome': 'target_hit',
+                    'intraday_path_result': 'target_only',
+                    'narrative': {
+                        'insight_code': 'buy_should_have_taken',
+                        'insight_priority': 'low',
+                        'headline': 'Buy held up on replay.',
+                        'headline_key': 'signal_decider.review.headline.buy_should_have_taken',
+                        'supporting_reasons': [
+                            {
+                                'code': 'target_hit_without_stop',
+                                'message': 'Target was touched and the stop-loss was never touched inside the review window.',
+                                'message_key': 'signal_decider.review.reason.target_hit_without_stop',
+                            }
+                        ],
+                        'counterfactual_summary': None,
+                        'summary_text': 'Buy held up on replay. Target was touched and the stop-loss was never touched inside the review window.',
+                    },
+                    'narrative_text': 'Buy held up on replay. Target was touched and the stop-loss was never touched inside the review window.',
+                    'path_analysis': {'path_marker': 'target_hit'},
+                },
+                'observed_price_path': [{'trade_date': '2026-04-24'}],
+            },
+        }
+
+
 class FakeSignalDeciderExecutionOutcomeService:
     def __init__(self):
         self.list_args = None
@@ -984,9 +1129,9 @@ class AgentContextRouteTests(unittest.TestCase):
         self.assertEqual(response.json()['item']['snapshot_id'], 84)
 
     def test_signal_decider_review_calendar_route_calls_service(self):
-        fake_service = FakeSignalDeciderLoopService()
-        original_service = routes_agent_context.signal_decider_loop_service
-        routes_agent_context.signal_decider_loop_service = fake_service
+        fake_service = FakeSignalDeciderCalendarReviewService()
+        original_service = routes_agent_context.signal_decider_calendar_review_service
+        routes_agent_context.signal_decider_calendar_review_service = fake_service
         try:
             client = TestClient(self.app)
             response = client.get(
@@ -1000,7 +1145,7 @@ class AgentContextRouteTests(unittest.TestCase):
                 ],
             )
         finally:
-            routes_agent_context.signal_decider_loop_service = original_service
+            routes_agent_context.signal_decider_calendar_review_service = original_service
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(fake_service.calendar_args['month'], '2026-04')
@@ -1008,6 +1153,7 @@ class AgentContextRouteTests(unittest.TestCase):
         self.assertEqual(fake_service.calendar_args['primary_horizon_days'], 5)
         self.assertEqual(fake_service.calendar_args['evaluation_version'], 'signal_decider_eval_v1')
         self.assertEqual(response.json()['summary']['day_count'], 1)
+        self.assertEqual(response.json()['items'][0]['calendar_status'], 'reviewed')
         self.assertEqual(response.json()['items'][0]['scorecard']['target_hit_count'], 1)
 
     def test_signal_decider_review_calendar_route_maps_zero_primary_horizon_to_400(self):
@@ -1023,10 +1169,28 @@ class AgentContextRouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.json()['detail'], 'primary_horizon_days must be drawn from [1, 3, 5, 10]')
 
+    def test_signal_decider_review_calendar_maintenance_route_calls_service(self):
+        fake_service = FakeSignalDeciderCalendarReviewService()
+        original_service = routes_agent_context.signal_decider_calendar_review_service
+        routes_agent_context.signal_decider_calendar_review_service = fake_service
+        try:
+            client = TestClient(self.app)
+            response = client.get(
+                '/agent-context/signal-decider/calendar/maintenance',
+                params={'evaluation_version': 'signal_decider_eval_v1', 'limit': '5'},
+            )
+        finally:
+            routes_agent_context.signal_decider_calendar_review_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(fake_service.maintenance_args, {'evaluation_version': 'signal_decider_eval_v1', 'limit': 5})
+        self.assertEqual(response.json()['summary']['latest_status'], 'completed')
+        self.assertEqual(response.json()['items'][0]['id'], 7)
+
     def test_signal_decider_review_date_route_calls_service(self):
-        fake_service = FakeSignalDeciderLoopService()
-        original_service = routes_agent_context.signal_decider_loop_service
-        routes_agent_context.signal_decider_loop_service = fake_service
+        fake_service = FakeSignalDeciderCalendarReviewService()
+        original_service = routes_agent_context.signal_decider_calendar_review_service
+        routes_agent_context.signal_decider_calendar_review_service = fake_service
         try:
             client = TestClient(self.app)
             response = client.get(
@@ -1040,7 +1204,7 @@ class AgentContextRouteTests(unittest.TestCase):
                 ],
             )
         finally:
-            routes_agent_context.signal_decider_loop_service = original_service
+            routes_agent_context.signal_decider_calendar_review_service = original_service
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(fake_service.review_date_args['market_date'], date.fromisoformat('2026-04-23'))
@@ -1048,12 +1212,13 @@ class AgentContextRouteTests(unittest.TestCase):
         self.assertEqual(fake_service.review_date_args['primary_horizon_days'], 5)
         self.assertEqual(fake_service.review_date_args['evaluation_version'], 'signal_decider_eval_v1')
         self.assertEqual(response.json()['items'][0]['review']['insight']['code'], 'buy_should_have_taken')
+        self.assertEqual(response.json()['items'][0]['review']['quality_verdict'], 'buy_should_have_taken')
         self.assertEqual(response.json()['items'][0]['review']['narrative']['headline'], 'Buy held up on replay.')
 
     def test_signal_decider_review_detail_route_calls_service(self):
-        fake_service = FakeSignalDeciderLoopService()
-        original_service = routes_agent_context.signal_decider_loop_service
-        routes_agent_context.signal_decider_loop_service = fake_service
+        fake_service = FakeSignalDeciderCalendarReviewService()
+        original_service = routes_agent_context.signal_decider_calendar_review_service
+        routes_agent_context.signal_decider_calendar_review_service = fake_service
         try:
             client = TestClient(self.app)
             response = client.get(
@@ -1066,7 +1231,7 @@ class AgentContextRouteTests(unittest.TestCase):
                 ],
             )
         finally:
-            routes_agent_context.signal_decider_loop_service = original_service
+            routes_agent_context.signal_decider_calendar_review_service = original_service
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(fake_service.review_detail_args['market_date'], date.fromisoformat('2026-04-23'))
@@ -1075,6 +1240,7 @@ class AgentContextRouteTests(unittest.TestCase):
         self.assertEqual(fake_service.review_detail_args['primary_horizon_days'], 5)
         self.assertEqual(fake_service.review_detail_args['evaluation_version'], 'signal_decider_eval_v1')
         self.assertEqual(response.json()['summary']['insight_priority'], 'low')
+        self.assertEqual(response.json()['item']['review']['path_outcome'], 'target_hit')
         self.assertEqual(response.json()['item']['observed_price_path'][0]['trade_date'], '2026-04-24')
 
     def test_signal_decider_execution_outcomes_route_calls_service(self):

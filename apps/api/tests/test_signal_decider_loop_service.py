@@ -1194,8 +1194,11 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
         self.assertEqual(result['summary']['scorecard']['target_hit_count'], 2)
         self.assertEqual(result['summary']['scorecard']['stop_hit_count'], 1)
         self.assertEqual(result['summary']['scorecard']['pending_count'], 1)
+        self.assertEqual(result['summary']['calendar_status'], 'partial')
         self.assertEqual(day_items['2026-04-20']['decision_count'], 3)
+        self.assertEqual(day_items['2026-04-20']['calendar_status'], 'reviewed')
         self.assertEqual(day_items['2026-04-20']['scorecard']['target_hit_count'], 2)
+        self.assertEqual(day_items['2026-04-29']['calendar_status'], 'stored')
         self.assertEqual(day_items['2026-04-29']['evaluation_coverage']['status'], 'pending')
         self.assertEqual(day_items['2026-04-29']['scorecard']['pending_count'], 1)
 
@@ -1294,6 +1297,10 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
         self.assertEqual(result['summary']['evaluation_coverage']['status'], 'complete')
         self.assertEqual(items_by_symbol['005930']['review']['insight']['code'], 'buy_should_have_taken')
         self.assertEqual(items_by_symbol['005930']['review']['insight']['priority'], 'low')
+        self.assertEqual(items_by_symbol['005930']['review']['quality_verdict'], 'buy_should_have_taken')
+        self.assertEqual(items_by_symbol['005930']['review']['review_conclusion'], 'Buy held up on replay.')
+        self.assertEqual(items_by_symbol['005930']['review']['path_outcome'], 'target_hit')
+        self.assertEqual(items_by_symbol['005930']['review']['intraday_path_result'], 'target_only')
         self.assertEqual(items_by_symbol['005930']['review']['path_analysis']['path_marker'], 'target_hit')
         self.assertEqual(
             items_by_symbol['005930']['review']['narrative']['supporting_reasons'][0]['code'],
@@ -1361,6 +1368,9 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
         self.assertEqual(result['summary']['headline'], 'Replay path is operationally ambiguous.')
         self.assertEqual(result['item']['review']['path_analysis']['path_marker'], 'collision')
         self.assertEqual(result['item']['review']['insight']['code'], 'ambiguous_target_stop_collision')
+        self.assertEqual(result['item']['review']['quality_verdict'], 'ambiguous_target_stop_collision')
+        self.assertEqual(result['item']['review']['path_outcome'], 'collision')
+        self.assertEqual(result['item']['review']['intraday_path_result'], 'collision')
         self.assertEqual(
             result['item']['review']['narrative']['supporting_reasons'][0]['code'],
             'target_stop_collision_same_session',

@@ -14,6 +14,7 @@ from app.agent_context.derived_contexts import derived_context_backfill_service
 from app.agent_context.orchestrator import agent_feedback_orchestrator
 from app.agent_context.retry_service import EXPECTED_ROLES, FeedbackRetryCycleConfig, agent_feedback_retry_service
 from app.agent_context.session_cleanup_service import agent_feedback_session_cleanup_service
+from app.agent_context.signal_decider_calendar_review_service import signal_decider_calendar_review_service
 from app.agent_context.signal_decider_loop_service import (
     DEFAULT_SIGNAL_DECIDER_EVALUATION_LOOKBACK_DAYS,
     signal_decider_loop_service,
@@ -259,6 +260,36 @@ def compute_signal_decider_evaluations(
         horizons=parsed_horizons,
         evaluation_version=evaluation_version,
         force_recompute=force_recompute,
+    )
+
+
+def refresh_signal_decider_calendar_reviews(
+    *,
+    market_date: str,
+    lookback_days: int = DEFAULT_SIGNAL_DECIDER_EVALUATION_LOOKBACK_DAYS,
+    symbols: str | None = None,
+    horizons: str | None = None,
+    primary_horizons: str | None = None,
+    evaluation_version: str | None = None,
+    force_recompute: bool = False,
+) -> dict[str, Any]:
+    bootstrap_runtime()
+    parsed_symbols = [item.strip() for item in symbols.split(',') if item.strip()] if symbols else None
+    parsed_horizons = [int(item.strip()) for item in horizons.split(',') if item.strip()] if horizons else None
+    parsed_primary_horizons = (
+        [int(item.strip()) for item in primary_horizons.split(',') if item.strip()]
+        if primary_horizons
+        else None
+    )
+    return signal_decider_calendar_review_service.refresh_recent_reviews(
+        as_of_market_date=market_date,
+        lookback_days=lookback_days,
+        symbols=parsed_symbols,
+        horizons=parsed_horizons,
+        primary_horizons=parsed_primary_horizons,
+        evaluation_version=evaluation_version,
+        force_recompute=force_recompute,
+        trigger='internal_ops_cli',
     )
 
 
@@ -768,6 +799,22 @@ def _build_parser() -> argparse.ArgumentParser:
     signal_decider_evaluations_parser.add_argument('--evaluation-version')
     signal_decider_evaluations_parser.add_argument('--force-recompute', action='store_true')
 
+    signal_decider_calendar_parser = subparsers.add_parser(
+        'agent-signal-decider-calendar-refresh',
+        help='Refresh the dedicated persisted calendar-review read model directly',
+    )
+    signal_decider_calendar_parser.add_argument('--market-date', required=True)
+    signal_decider_calendar_parser.add_argument(
+        '--lookback-days',
+        type=int,
+        default=DEFAULT_SIGNAL_DECIDER_EVALUATION_LOOKBACK_DAYS,
+    )
+    signal_decider_calendar_parser.add_argument('--symbols')
+    signal_decider_calendar_parser.add_argument('--horizons')
+    signal_decider_calendar_parser.add_argument('--primary-horizons')
+    signal_decider_calendar_parser.add_argument('--evaluation-version')
+    signal_decider_calendar_parser.add_argument('--force-recompute', action='store_true')
+
     feedback_smoke_parser = subparsers.add_parser(
         'agent-feedback-symbol-cleanup-smoke',
         help='Dispatch symbol feedback, store rows, attempt immediate session deletion, then retry failed deletions once',
@@ -938,6 +985,16 @@ def main(argv: Iterable[str] | None = None) -> int:
             lookback_days=args.lookback_days,
             symbols=args.symbols,
             horizons=args.horizons,
+            evaluation_version=args.evaluation_version,
+            force_recompute=args.force_recompute,
+        )
+    elif args.command == 'agent-signal-decider-calendar-refresh':
+        payload = refresh_signal_decider_calendar_reviews(
+            market_date=args.market_date,
+            lookback_days=args.lookback_days,
+            symbols=args.symbols,
+            horizons=args.horizons,
+            primary_horizons=args.primary_horizons,
             evaluation_version=args.evaluation_version,
             force_recompute=args.force_recompute,
         )

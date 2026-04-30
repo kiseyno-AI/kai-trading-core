@@ -3552,6 +3552,61 @@ class SignalDeciderLoopService:
             ],
         }
 
+    def build_replay_read_model_descriptor(self) -> dict[str, Any]:
+        return self._build_replay_read_model_descriptor()
+
+    def build_replay_review_taxonomy(self) -> dict[str, Any]:
+        return self._build_replay_review_taxonomy()
+
+    def build_review_items(
+        self,
+        *,
+        rows: Sequence[SignalDeciderDecisionSnapshotRow],
+        horizons: Sequence[int],
+        primary_horizon_days: int,
+        evaluation_version: str,
+        include_detail_payloads: bool,
+    ) -> list[dict[str, Any]]:
+        return self._build_review_items(
+            rows=rows,
+            horizons=horizons,
+            primary_horizon_days=primary_horizon_days,
+            evaluation_version=evaluation_version,
+            include_detail_payloads=include_detail_payloads,
+        )
+
+    def summarize_review_items(
+        self,
+        *,
+        items: Sequence[dict[str, Any]],
+        horizons: Sequence[int],
+        primary_horizon_days: int,
+        evaluation_version: str,
+    ) -> dict[str, Any]:
+        return self._build_review_items_summary(
+            items=items,
+            horizons=horizons,
+            primary_horizon_days=primary_horizon_days,
+            evaluation_version=evaluation_version,
+        )
+
+    def build_review_scorecard(self, items: Sequence[dict[str, Any]]) -> dict[str, Any]:
+        return self._build_review_scorecard(items)
+
+    def build_calendar_day_status(
+        self,
+        *,
+        decision_count: int,
+        reviewed_count: int,
+    ) -> str:
+        if decision_count <= 0:
+            return 'empty'
+        if reviewed_count >= decision_count:
+            return 'reviewed'
+        if reviewed_count > 0:
+            return 'partial'
+        return 'stored'
+
     def _build_calendar_summary_items(
         self,
         *,
@@ -3579,10 +3634,21 @@ class SignalDeciderLoopService:
                 primary_horizon_days=primary_horizon_days,
                 evaluation_version=evaluation_version,
             )
+            reviewed_count = int(_maybe_dict(day_summary.get('evaluation_coverage')).get('complete_count') or 0)
+            decision_count = int(day_summary.get('count') or 0)
             items.append(
                 {
                     'market_date': market_date,
-                    'decision_count': day_summary['count'],
+                    'calendar_status': self.build_calendar_day_status(
+                        decision_count=decision_count,
+                        reviewed_count=reviewed_count,
+                    ),
+                    'decision_count': decision_count,
+                    'stored_decision_count': decision_count,
+                    'reviewed_decision_count': reviewed_count,
+                    'pending_review_count': int(
+                        _maybe_dict(day_summary.get('evaluation_coverage')).get('pending_count') or 0
+                    ),
                     'symbol_count': day_summary['symbol_count'],
                     'decision_actions': day_summary['decision_actions'],
                     'review_status_counts': day_summary['review_status_counts'],
@@ -3596,12 +3662,23 @@ class SignalDeciderLoopService:
             primary_horizon_days=primary_horizon_days,
             evaluation_version=evaluation_version,
         )
+        reviewed_count = int(_maybe_dict(overall.get('evaluation_coverage')).get('complete_count') or 0)
+        decision_count = int(overall.get('count') or 0)
         return (
             items,
             {
                 'month': rows[0].market_date.strftime('%Y-%m') if rows else None,
                 'day_count': len(items),
-                'decision_count': overall['count'],
+                'calendar_status': self.build_calendar_day_status(
+                    decision_count=decision_count,
+                    reviewed_count=reviewed_count,
+                ),
+                'decision_count': decision_count,
+                'stored_decision_count': decision_count,
+                'reviewed_decision_count': reviewed_count,
+                'pending_review_count': int(
+                    _maybe_dict(overall.get('evaluation_coverage')).get('pending_count') or 0
+                ),
                 'symbol_count': overall['symbol_count'],
                 'decision_actions': overall['decision_actions'],
                 'review_status_counts': overall['review_status_counts'],
@@ -3688,6 +3765,10 @@ class SignalDeciderLoopService:
             path_analysis=_maybe_dict(primary_horizon.get('path_analysis')),
             primary_horizon_days=primary_horizon_days,
         )
+        narrative = _maybe_dict(insight.get('narrative'))
+        supporting_reasons = list(narrative.get('supporting_reasons') or [])
+        primary_reason = _maybe_dict(supporting_reasons[0]) if supporting_reasons else {}
+        path_analysis = _maybe_dict(primary_horizon.get('path_analysis'))
         review = {
             'status': insight['review_status'],
             'primary_horizon_days': primary_horizon_days,
@@ -3700,11 +3781,19 @@ class SignalDeciderLoopService:
                 'description': insight['description'],
                 'outcome_tone': insight['outcome_tone'],
             },
-            'narrative': insight['narrative'],
-            'narrative_text': insight['narrative']['summary_text'],
+            'narrative': narrative,
+            'narrative_text': narrative.get('summary_text'),
             'path_analysis': primary_horizon['path_analysis'],
             'rule_evaluation': insight['rule_basis'],
             'horizons': horizon_items,
+            'outcome_horizons': horizon_items,
+            'quality_verdict': insight['code'],
+            'quality_reason_code': primary_reason.get('code'),
+            'quality_reason': primary_reason.get('message'),
+            'review_conclusion': narrative.get('headline'),
+            'review_conclusion_text': narrative.get('summary_text'),
+            'path_outcome': path_analysis.get('path_marker'),
+            'intraday_path_result': path_analysis.get('trigger_sequence'),
         }
         item = {
             'snapshot_id': decision['snapshot_id'],
