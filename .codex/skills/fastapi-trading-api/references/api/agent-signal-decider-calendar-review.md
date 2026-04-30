@@ -1,7 +1,7 @@
 # GET /agent-context/signal-decider/calendar
 
 ## Summary
-Month-level replay review calendar over immutable `signal-decider` decision snapshots. The response groups decisions by market date, reports buy or wait or reject counts, highlights primary-horizon evaluation coverage, and keeps replay scorecards separate from actual execution outcomes.
+Month-level replay review calendar over the persisted `signal_decider_calendar_review_items` read model. The response groups decisions by market date, reports buy or wait or reject counts, highlights primary-horizon evaluation coverage, and keeps replay scorecards separate from actual execution outcomes.
 
 ## Example request
 ```http
@@ -22,6 +22,7 @@ GET /agent-context/signal-decider/calendar?month=2026-04&horizons=1&horizons=3&h
   "read_model": {
     "name": "signal_decider_replay_review",
     "version": "signal_decider_replay_review_v1",
+    "artifact_source": "signal_decider_calendar_review_items",
     "separate_from_actual_execution_outcomes": true,
     "actual_execution_outcomes_endpoint": "/agent-context/signal-decider/execution-outcomes"
   },
@@ -31,6 +32,10 @@ GET /agent-context/signal-decider/calendar?month=2026-04&horizons=1&horizons=3&h
   "summary": {
     "day_count": 2,
     "decision_count": 4,
+    "calendar_status": "partial",
+    "stored_decision_count": 4,
+    "reviewed_decision_count": 3,
+    "pending_review_count": 1,
     "evaluation_coverage": {
       "status": "partial",
       "complete_count": 3,
@@ -47,7 +52,11 @@ GET /agent-context/signal-decider/calendar?month=2026-04&horizons=1&horizons=3&h
   "items": [
     {
       "market_date": "2026-04-20",
+      "calendar_status": "reviewed",
       "decision_count": 3,
+      "stored_decision_count": 3,
+      "reviewed_decision_count": 3,
+      "pending_review_count": 0,
       "decision_actions": {
         "buy": 1,
         "reject": 1,
@@ -70,7 +79,7 @@ GET /agent-context/signal-decider/calendar?month=2026-04&horizons=1&horizons=3&h
 # GET /agent-context/signal-decider/calendar/{market_date}
 
 ## Summary
-Selected-date replay review for all `signal-decider` decisions emitted on one market date. Each item keeps the original decision fields, adds D+1 or D+3 or D+5 replay summaries, and exposes a stable rule-based review insight plus a canonical structured `review.narrative` object for localization-friendly rendering.
+Selected-date replay review for all `signal-decider` decisions emitted on one market date, read from the persisted calendar-review artifacts. Each item keeps the original decision fields, adds D+1 or D+3 or D+5 replay summaries, and exposes both the structured replay narrative and direct calendar-facing aliases such as `quality_verdict`, `quality_reason`, `review_conclusion`, `path_outcome`, and `intraday_path_result`.
 
 ## Example request
 ```http
@@ -107,6 +116,11 @@ GET /agent-context/signal-decider/calendar/2026-04-20?horizons=1&horizons=3&hori
       "summary": "Breakout quality stayed constructive.",
       "review": {
         "status": "complete",
+        "quality_verdict": "buy_should_have_taken",
+        "quality_reason": "Target was touched and the stop-loss was never touched inside the review window.",
+        "review_conclusion": "Buy held up on replay.",
+        "path_outcome": "target_hit",
+        "intraday_path_result": "target_only",
         "insight": {
           "code": "buy_should_have_taken",
           "priority": "low",
@@ -150,6 +164,22 @@ GET /agent-context/signal-decider/calendar/2026-04-20?horizons=1&horizons=3&hori
               "path_marker": "target_hit"
             }
           }
+        ],
+        "outcome_horizons": [
+          {
+            "horizon_days": 1,
+            "grade_label": "good_buy",
+            "path_analysis": {
+              "path_marker": "target_hit"
+            }
+          },
+          {
+            "horizon_days": 5,
+            "grade_label": "good_buy",
+            "path_analysis": {
+              "path_marker": "target_hit"
+            }
+          }
         ]
       }
     }
@@ -161,7 +191,7 @@ GET /agent-context/signal-decider/calendar/2026-04-20?horizons=1&horizons=3&hori
 # GET /agent-context/signal-decider/calendar/{market_date}/snapshots/{snapshot_id}
 
 ## Summary
-Replay-only drilldown for one immutable decision snapshot on the selected date. It returns the replay insight, the primary-horizon trigger checkpoints, and the observed price path used by the synthetic review model. Actual fills and broker P&L stay on `GET /agent-context/signal-decider/execution-outcomes`.
+Replay-only drilldown for one immutable decision snapshot on the selected date, backed by the persisted calendar-review detail payload. It returns the replay insight, the primary-horizon trigger checkpoints, and the observed price path used by the synthetic review model. Actual fills and broker P&L stay on `GET /agent-context/signal-decider/execution-outcomes`.
 
 ## Example request
 ```http
@@ -185,6 +215,11 @@ GET /agent-context/signal-decider/calendar/2026-04-20/snapshots/84?horizons=1&ho
     "symbol": "005930",
     "review": {
       "status": "complete",
+      "quality_verdict": "buy_should_have_taken",
+      "quality_reason": "Target was touched and the stop-loss was never touched inside the review window.",
+      "review_conclusion": "Buy held up on replay.",
+      "path_outcome": "target_hit",
+      "intraday_path_result": "target_only",
       "insight": {
         "code": "buy_should_have_taken",
         "priority": "low"
@@ -226,5 +261,49 @@ GET /agent-context/signal-decider/calendar/2026-04-20/snapshots/84?horizons=1&ho
       }
     ]
   }
+}
+```
+
+
+# GET /agent-context/signal-decider/calendar/maintenance
+
+## Summary
+Inspect the independent persisted calendar-review maintenance process. This route reports recent `agent-signal-decider-calendar-refresh` runs so operators can confirm the separate calendar artifact job is healthy without looking at the main daily pipeline.
+
+## Example request
+```http
+GET /agent-context/signal-decider/calendar/maintenance?evaluation_version=signal_decider_eval_v1&limit=5
+```
+
+## Example response
+```json
+{
+  "request": {
+    "evaluation_version": "signal_decider_eval_v1",
+    "limit": 5
+  },
+  "summary": {
+    "count": 1,
+    "latest_status": "completed",
+    "latest_completed_at": "2026-04-30T09:05:00+00:00"
+  },
+  "items": [
+    {
+      "id": 17,
+      "market_date_from": "2026-03-31",
+      "market_date_to": "2026-04-30",
+      "as_of_market_date": "2026-04-30",
+      "lookback_days": 30,
+      "evaluation_version": "signal_decider_eval_v1",
+      "horizons": [1, 3, 5, 10],
+      "primary_horizons": [1, 3, 5, 10],
+      "trigger": "internal_ops_cli",
+      "status": "completed",
+      "summary": {
+        "decision_count": 42,
+        "review_rows_upserted": 168
+      }
+    }
+  ]
 }
 ```

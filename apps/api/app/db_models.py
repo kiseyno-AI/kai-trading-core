@@ -1216,6 +1216,105 @@ class SignalDeciderEvaluation(Base, TimestampMixin):
     evaluated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
+class SignalDeciderCalendarReviewRun(Base, TimestampMixin):
+    __tablename__ = 'signal_decider_calendar_review_runs'
+    __table_args__ = (
+        Index(
+            'ix_signal_decider_calendar_review_runs_window_status_created',
+            'market_date_from',
+            'market_date_to',
+            'status',
+            'created_at',
+        ),
+        Index(
+            'ix_signal_decider_calendar_review_runs_asof_status_created',
+            'as_of_market_date',
+            'status',
+            'created_at',
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    market_date_from: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    market_date_to: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    as_of_market_date: Mapped[date | None] = mapped_column(Date, index=True)
+    lookback_days: Mapped[int | None] = mapped_column(Integer)
+    evaluation_version: Mapped[str] = mapped_column(String(64), nullable=False, default='signal_decider_eval_v1', index=True)
+    horizons_payload: Mapped[list | dict] = mapped_column(JSON, nullable=False)
+    primary_horizons_payload: Mapped[list | dict] = mapped_column(JSON, nullable=False)
+    symbols_payload: Mapped[list | dict | None] = mapped_column(JSON)
+    trigger: Mapped[str] = mapped_column(String(64), nullable=False, default='manual', index=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default='running', index=True)
+    force_recompute: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    summary_payload: Mapped[dict | None] = mapped_column(JSON)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+
+
+class SignalDeciderCalendarReviewItem(Base, TimestampMixin):
+    __tablename__ = 'signal_decider_calendar_review_items'
+    __table_args__ = (
+        UniqueConstraint(
+            'decision_snapshot_id',
+            'evaluation_version',
+            'primary_horizon_days',
+            name='uq_signal_decider_calendar_review_items_snapshot_version_primary',
+        ),
+        Index(
+            'ix_signal_decider_calendar_review_items_market_version_primary',
+            'market_date',
+            'evaluation_version',
+            'primary_horizon_days',
+        ),
+        Index(
+            'ix_signal_decider_calendar_review_items_symbol_market_primary',
+            'symbol',
+            'market_date',
+            'primary_horizon_days',
+        ),
+        Index(
+            'ix_signal_decider_calendar_review_items_status_market',
+            'review_status',
+            'market_date',
+        ),
+        Index(
+            'ix_signal_decider_calendar_review_items_insight_market',
+            'insight_code',
+            'market_date',
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    decision_snapshot_id: Mapped[int] = mapped_column(
+        ForeignKey('signal_decider_decision_snapshots.id', ondelete='CASCADE'),
+        nullable=False,
+        index=True,
+    )
+    review_run_id: Mapped[int | None] = mapped_column(
+        ForeignKey('signal_decider_calendar_review_runs.id', ondelete='SET NULL'),
+        index=True,
+    )
+    market_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    symbol: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    policy_version: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    decision_action: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    evaluation_version: Mapped[str] = mapped_column(String(64), nullable=False, default='signal_decider_eval_v1', index=True)
+    primary_horizon_days: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    review_status: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    insight_code: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    insight_priority: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    quality_verdict: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    quality_reason_code: Mapped[str | None] = mapped_column(String(64))
+    quality_reason_text: Mapped[str | None] = mapped_column(Text)
+    review_conclusion: Mapped[str] = mapped_column(Text, nullable=False)
+    review_summary_text: Mapped[str] = mapped_column(Text, nullable=False)
+    path_outcome: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    intraday_path_result: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    item_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    detail_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    refreshed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+
+
 class SignalDeciderPolicyVersion(Base, TimestampMixin):
     __tablename__ = 'signal_decider_policy_versions'
     __table_args__ = (

@@ -330,6 +330,35 @@ class InternalOpsTests(unittest.TestCase):
         self.assertEqual(compute_evaluations.call_args.kwargs['evaluation_version'], 'signal_decider_eval_v1')
         self.assertTrue(compute_evaluations.call_args.kwargs['force_recompute'])
 
+    def test_refresh_signal_decider_calendar_reviews_uses_dedicated_service_call(self) -> None:
+        with (
+            patch('app.internal.ops.bootstrap_runtime') as bootstrap_runtime,
+            patch(
+                'app.internal.ops.signal_decider_calendar_review_service.refresh_recent_reviews',
+                return_value={'summary': {'review_rows_upserted': 8}},
+            ) as refresh_reviews,
+        ):
+            result = ops.refresh_signal_decider_calendar_reviews(
+                market_date='2026-04-30',
+                lookback_days=14,
+                symbols='005930,000660',
+                horizons='1,5,10',
+                primary_horizons='3,5',
+                evaluation_version='signal_decider_eval_v1',
+                force_recompute=True,
+            )
+
+        bootstrap_runtime.assert_called_once_with()
+        self.assertEqual(result, {'summary': {'review_rows_upserted': 8}})
+        self.assertEqual(refresh_reviews.call_args.kwargs['as_of_market_date'], '2026-04-30')
+        self.assertEqual(refresh_reviews.call_args.kwargs['lookback_days'], 14)
+        self.assertEqual(refresh_reviews.call_args.kwargs['symbols'], ['005930', '000660'])
+        self.assertEqual(refresh_reviews.call_args.kwargs['horizons'], [1, 5, 10])
+        self.assertEqual(refresh_reviews.call_args.kwargs['primary_horizons'], [3, 5])
+        self.assertEqual(refresh_reviews.call_args.kwargs['evaluation_version'], 'signal_decider_eval_v1')
+        self.assertTrue(refresh_reviews.call_args.kwargs['force_recompute'])
+        self.assertEqual(refresh_reviews.call_args.kwargs['trigger'], 'internal_ops_cli')
+
     def test_run_agent_feedback_retry_cycles_passes_explicit_symbols_to_retry_service(self) -> None:
         with (
             patch('app.internal.ops.bootstrap_runtime') as bootstrap_runtime,
@@ -693,3 +722,30 @@ class InternalOpsTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(json.loads(stdout.getvalue()), {'summary': {'evaluations_upserted': 6}})
+
+    def test_cli_signal_decider_calendar_refresh_outputs_json(self) -> None:
+        stdout = io.StringIO()
+        with (
+            patch(
+                'app.internal.ops.refresh_signal_decider_calendar_reviews',
+                return_value={'summary': {'review_rows_upserted': 12}},
+            ),
+            redirect_stdout(stdout),
+        ):
+            exit_code = ops.main(
+                [
+                    'agent-signal-decider-calendar-refresh',
+                    '--market-date',
+                    '2026-04-30',
+                    '--symbols',
+                    '005930,000660',
+                    '--horizons',
+                    '1,5',
+                    '--primary-horizons',
+                    '3,5',
+                    '--force-recompute',
+                ]
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(json.loads(stdout.getvalue()), {'summary': {'review_rows_upserted': 12}})
