@@ -36,6 +36,7 @@ from app.db import check_database, init_database
 from app.eod.runner import background_runner
 from app.market.snapshot import market_snapshot_service
 from app.market_data_store import load_tracked_symbols
+from app.orders.portfolio_summary_service import portfolio_summary_service
 from app.orders.reconciliation import trading_order_reconciliation_service
 from app.orders.kis_realtime_order_notices import kis_realtime_order_notice_service
 from app.scanner.state import scanner_state
@@ -61,6 +62,10 @@ async def lifespan(_: FastAPI):
         await market_snapshot_service.refresh_market_snapshot_if_due(trigger='startup')
     except Exception as exc:
         logger.warning('Market snapshot startup refresh failed; serving cache when available: %s', exc)
+    try:
+        await portfolio_summary_service.refresh_portfolio_summary_if_due(trigger='startup', force=True)
+    except Exception as exc:
+        logger.warning('Portfolio summary startup refresh failed; serving cache when available: %s', exc)
     await background_runner.start()
     try:
         yield

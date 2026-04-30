@@ -12,6 +12,7 @@ from app.market.snapshot import market_snapshot_service
 from app.orders.exec_integration import signal_decider_exec_integration_service
 from app.orders.intraday_auto_sell import signal_decider_intraday_auto_sell_service
 from app.orders.next_open_execution import signal_decider_next_open_execution_service
+from app.orders.portfolio_summary_service import portfolio_summary_service
 from app.orders.reconciliation import trading_order_reconciliation_service
 
 logger = logging.getLogger(__name__)
@@ -69,6 +70,9 @@ class EODBackgroundRunner:
                     await auto_pykrx_eod_scheduler.schedule_daily_pipeline_if_due()
                 await trading_order_reconciliation_service.run_periodic_if_due()
                 await market_snapshot_service.refresh_market_snapshot_if_due(
+                    trigger=f'background_runner:{market.state.lower()}'
+                )
+                await portfolio_summary_service.refresh_portfolio_summary_if_due(
                     trigger=f'background_runner:{market.state.lower()}'
                 )
             except Exception as exc:

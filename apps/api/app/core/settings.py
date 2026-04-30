@@ -53,6 +53,7 @@ class Settings(BaseSettings):
     kis_order_reconcile_recent_days: int = 3
     kis_order_reconcile_batch_limit: int = 100
     portfolio_account_references: str = ''
+    portfolio_summary_cache_ttl_seconds: int = 60
     signal_decider_next_open_enabled: bool = False
     signal_decider_next_open_dry_run: bool = True
     signal_decider_next_open_account_targets: str = ''

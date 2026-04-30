@@ -228,7 +228,7 @@ Returns the aggregate portfolio payload used by the dashboard and portfolio page
 
 ### Example request
 ```http
-GET /portfolio/summary
+GET /portfolio/summary?refresh=false
 Authorization: Bearer <token>
 ```
 
@@ -238,10 +238,25 @@ Authorization: Bearer <token>
   "asOf": "2026-04-29T01:23:45+00:00",
   "source": "kis_portfolio_summary_v1",
   "sync": {
-    "status": "synced",
+    "status": "stale",
     "lastSyncedAt": "2026-04-29T01:23:45+00:00",
     "source": "kis_account_inquiry_v1",
-    "message": null
+    "message": "Portfolio summary is serving cached data while a refresh runs in background."
+  },
+  "freshness": {
+    "servedFromCache": true,
+    "hasCachedSnapshot": true,
+    "cachedAt": "2026-04-29T01:23:45+00:00",
+    "cacheAgeSeconds": 74,
+    "isStale": true,
+    "staleReason": "refresh_due",
+    "refreshInFlight": true,
+    "refreshIntervalSeconds": 60,
+    "lastRefreshAttemptedAt": "2026-04-29T01:24:59+00:00",
+    "lastRefreshSucceededAt": "2026-04-29T01:23:45+00:00",
+    "nextRefreshDueAt": "2026-04-29T01:24:45+00:00",
+    "lastRefreshStatus": "success",
+    "lastRefreshError": null
   },
   "accounts": [
     {
@@ -310,12 +325,14 @@ Authorization: Bearer <token>
 ### Notes
 - The route resolves its account scope from `PORTFOLIO_ACCOUNT_REFERENCES`, a comma-separated list of `KIS:<account_number>-<product_code>` values. Optional labels can be supplied as `Label=KIS:...`.
 - This is a portfolio-level aggregation layer over the account-specific KIS inquiry routes. It reuses the same KIS account-reference model as `/trading/accounts/{account_reference}/summary` and `/positions`.
+- The default `refresh=false` path is a short-lived cached read model with stale-while-revalidate semantics. `refresh=true` forces an immediate live rebuild for manual sync paths.
 - Production portfolio aggregation also requires `KIS_APP_KEY`, `KIS_APP_SECRET`, and `KIS_USE_MOCK=false`. In `APP_ENV=production`, mock-KIS portfolio wiring is treated as `not_configured`.
 - `sync.status` is the primary UX state. Current intended values are:
   - `synced` when every configured account summary and holdings read succeeds
   - `stale` when at least one account succeeds but one or more configured accounts fail
   - `unavailable` when no configured account can be read from KIS
   - `not_configured` when account resolution or KIS deployment configuration is missing or invalid
+- `freshness` exposes the cache hit state, cache TTL, cache age, last refresh attempt/success timestamps, `lastRefreshStatus`, `lastRefreshError`, and whether a background refresh is currently in flight.
 - On degraded accounts, missing sections may be omitted instead of returned as misleading empty arrays, while `notices` explains which account or subsection failed.
 - Percent fields in this route use whole-percent values for direct UI rendering, for example `4.0` means `4.00%`.
 - Runtime readiness is exposed through `GET /broker/kis/health` as `portfolio_summary_runtime`. Deploy preflight reports the same status under `runtime_checks.portfolio_summary`, and deploy smoke-check now expects `/portfolio/summary` to leave the `not_configured` state after restart.

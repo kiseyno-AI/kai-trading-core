@@ -1,4 +1,5 @@
 import unittest
+from datetime import timedelta
 
 from app.core.settings import settings
 from app.orders.account_inquiry_service import TradingAccountInquiryUpstreamError
@@ -52,36 +53,57 @@ class PortfolioSummaryServiceTests(unittest.IsolatedAsyncioTestCase):
             'kis_app_key': settings.kis_app_key,
             'kis_app_secret': settings.kis_app_secret,
             'kis_use_mock': settings.kis_use_mock,
+            'portfolio_summary_cache_ttl_seconds': settings.portfolio_summary_cache_ttl_seconds,
         }
         settings.app_env = 'development'
         settings.kis_app_key = 'test-kis-key'
         settings.kis_app_secret = 'test-kis-secret'
         settings.kis_use_mock = True
+        settings.portfolio_summary_cache_ttl_seconds = 60
 
     def tearDown(self) -> None:
         for field_name, value in self.original_settings.items():
             setattr(settings, field_name, value)
 
-    async def test_portfolio_summary_normalizes_synced_account_payload(self) -> None:
-        account_reference = 'KIS:12345678-01'
+    def _build_service(
+        self,
+        *,
+        portfolio_account_references: str = 'Main=KIS:12345678-01',
+        cache_ttl_seconds: int = 60,
+    ) -> PortfolioSummaryService:
+        return PortfolioSummaryService(
+            account_inquiry_service=self.inquiry_service,
+            order_service=self.order_service,
+            portfolio_account_references=portfolio_account_references,
+            cache_ttl_seconds=cache_ttl_seconds,
+        )
+
+    def _seed_synced_account(
+        self,
+        *,
+        account_reference: str = 'KIS:12345678-01',
+        as_of: str = '2026-04-29T01:23:45+00:00',
+        total_asset_value: int = 3072000,
+        market_value: int = 572000,
+    ) -> None:
         self.inquiry_service.summary_results[account_reference] = {
             'account_reference': account_reference,
-            'as_of': '2026-04-29T01:23:45+00:00',
+            'as_of': as_of,
             'cash': {
                 'settled_cash': 2500000,
                 'withdrawable_cash': 2400000,
                 'orderable_cash': 2500000,
             },
             'valuation': {
-                'securities_value': 572000,
-                'total_asset_value': 3072000,
+                'securities_value': market_value,
+                'total_asset_value': total_asset_value,
                 'pnl_amount': 22000,
                 'pnl_pct': 0.04,
             },
         }
         self.inquiry_service.positions_results[account_reference] = {
             'account_reference': account_reference,
-            'as_of': '2026-04-29T01:23:45+00:00',
+            'as_of': as_of,
             'items': [
                 {
                     'symbol': '005930',
@@ -89,7 +111,7 @@ class PortfolioSummaryServiceTests(unittest.IsolatedAsyncioTestCase):
                     'quantity': 10,
                     'average_price': 55000,
                     'last_price': 57200,
-                    'market_value': 572000,
+                    'market_value': market_value,
                     'pnl_amount': 22000,
                     'pnl_pct': 0.04,
                     'weight_pct': 0.1862,
@@ -114,16 +136,17 @@ class PortfolioSummaryServiceTests(unittest.IsolatedAsyncioTestCase):
             ],
         }
 
-        service = PortfolioSummaryService(
-            account_inquiry_service=self.inquiry_service,
-            order_service=self.order_service,
-            portfolio_account_references='Main=KIS:12345678-01',
-        )
+    async def test_portfolio_summary_normalizes_synced_account_payload_and_freshness(self) -> None:
+        self._seed_synced_account()
+        service = self._build_service()
 
         result = await service.get_portfolio_summary()
 
         self.assertEqual(result['sync']['status'], 'synced')
         self.assertEqual(result['source'], 'kis_portfolio_summary_v1')
+        self.assertEqual(result['freshness']['servedFromCache'], False)
+        self.assertEqual(result['freshness']['lastRefreshStatus'], 'success')
+        self.assertFalse(result['freshness']['isStale'])
         self.assertEqual(len(result['accounts']), 1)
         account = result['accounts'][0]
         self.assertEqual(account['label'], 'Main')
@@ -139,27 +162,94 @@ class PortfolioSummaryServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(account['recentActivity'][0]['status'], 'filled')
         self.assertEqual(result['notices'], [])
 
-    async def test_missing_portfolio_account_configuration_returns_not_configured_state(self) -> None:
-        service = PortfolioSummaryService(
-            account_inquiry_service=self.inquiry_service,
-            order_service=self.order_service,
-            portfolio_account_references='',
+    async def test_repeated_reads_use_cached_summary_until_ttl_expires(self) -> None:
+        self._seed_synced_account()
+        service = self._build_service(cache_ttl_seconds=60)
+
+        first = await service.get_portfolio_summary()
+        second = await service.get_portfolio_summary()
+
+        self.assertFalse(first['freshness']['servedFromCache'])
+        self.assertTrue(second['freshness']['servedFromCache'])
+        self.assertFalse(second['freshness']['isStale'])
+        self.assertEqual(len(self.inquiry_service.summary_calls), 1)
+        self.assertEqual(len(self.inquiry_service.positions_calls), 1)
+        self.assertEqual(len(self.order_service.list_calls), 1)
+
+    async def test_stale_cache_returns_cached_payload_and_revalidates_in_background(self) -> None:
+        account_reference = 'KIS:12345678-01'
+        self._seed_synced_account(account_reference=account_reference)
+        service = self._build_service(cache_ttl_seconds=60)
+
+        initial = await service.get_portfolio_summary()
+        self.assertEqual(initial['accounts'][0]['summary']['totalAssets']['amount'], 3072000)
+        assert service._cache is not None
+        service._cache.cached_at -= timedelta(minutes=5)
+        service._cache.last_refresh_attempted_at = service._cache.cached_at
+        service._cache.last_refresh_succeeded_at = service._cache.cached_at
+
+        self._seed_synced_account(
+            account_reference=account_reference,
+            as_of='2026-04-29T01:25:45+00:00',
+            total_asset_value=4072000,
+            market_value=1572000,
         )
+
+        stale = await service.get_portfolio_summary()
+
+        self.assertTrue(stale['freshness']['servedFromCache'])
+        self.assertTrue(stale['freshness']['isStale'])
+        self.assertEqual(stale['freshness']['staleReason'], 'refresh_due')
+        self.assertTrue(stale['freshness']['refreshInFlight'])
+        self.assertEqual(stale['sync']['status'], 'stale')
+        self.assertEqual(stale['accounts'][0]['summary']['totalAssets']['amount'], 3072000)
+
+        refresh_task = service._refresh_task
+        self.assertIsNotNone(refresh_task)
+        await refresh_task
+
+        refreshed = await service.get_portfolio_summary()
+        self.assertEqual(refreshed['sync']['status'], 'synced')
+        self.assertEqual(refreshed['accounts'][0]['summary']['totalAssets']['amount'], 4072000)
+        self.assertEqual(refreshed['accounts'][0]['holdings'][0]['marketValue']['amount'], 1572000)
+        self.assertEqual(len(self.inquiry_service.summary_calls), 2)
+        self.assertEqual(len(self.inquiry_service.positions_calls), 2)
+        self.assertEqual(len(self.order_service.list_calls), 2)
+
+    async def test_refresh_failure_with_existing_cache_returns_stale_cached_summary(self) -> None:
+        account_reference = 'KIS:12345678-01'
+        self._seed_synced_account(account_reference=account_reference)
+        service = self._build_service()
+
+        initial = await service.get_portfolio_summary()
+        self.assertEqual(initial['accounts'][0]['summary']['totalAssets']['amount'], 3072000)
+        self.inquiry_service.summary_exceptions[account_reference] = RuntimeError('upstream timeout')
+
+        result = await service.get_portfolio_summary(refresh=True)
+
+        self.assertTrue(result['freshness']['servedFromCache'])
+        self.assertTrue(result['freshness']['isStale'])
+        self.assertEqual(result['freshness']['staleReason'], 'refresh_failed')
+        self.assertEqual(result['freshness']['lastRefreshStatus'], 'error')
+        self.assertIn('upstream timeout', result['freshness']['lastRefreshError'])
+        self.assertEqual(result['sync']['status'], 'stale')
+        self.assertEqual(result['accounts'][0]['summary']['totalAssets']['amount'], 3072000)
+        self.assertEqual(len(self.inquiry_service.summary_calls), 2)
+
+    async def test_missing_portfolio_account_configuration_returns_not_configured_state(self) -> None:
+        service = self._build_service(portfolio_account_references='')
 
         result = await service.get_portfolio_summary()
 
         self.assertEqual(result['sync']['status'], 'not_configured')
         self.assertEqual(result['accounts'], [])
+        self.assertFalse(result['freshness']['hasCachedSnapshot'])
         self.assertIn('PORTFOLIO_ACCOUNT_REFERENCES', result['notices'][0])
 
     async def test_missing_kis_credentials_return_not_configured_before_upstream_calls(self) -> None:
         settings.kis_app_key = ''
         settings.kis_app_secret = ''
-        service = PortfolioSummaryService(
-            account_inquiry_service=self.inquiry_service,
-            order_service=self.order_service,
-            portfolio_account_references='Main=KIS:12345678-01',
-        )
+        service = self._build_service()
 
         result = await service.get_portfolio_summary()
 
@@ -168,37 +258,25 @@ class PortfolioSummaryServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.inquiry_service.positions_calls, [])
         self.assertIn('KIS_APP_KEY', result['sync']['message'])
         self.assertIn('KIS_APP_SECRET', result['sync']['message'])
+        self.assertEqual(result['freshness']['lastRefreshStatus'], 'error')
 
     def test_runtime_status_reports_production_mock_environment_as_not_ready(self) -> None:
         settings.app_env = 'production'
         settings.kis_use_mock = True
-        service = PortfolioSummaryService(
-            account_inquiry_service=self.inquiry_service,
-            order_service=self.order_service,
-            portfolio_account_references='Main=KIS:12345678-01',
-        )
+        service = self._build_service()
 
         result = service.runtime_status()
 
         self.assertFalse(result['ready'])
         self.assertEqual(result['kis_environment'], 'demo')
         self.assertEqual(result['configured_account_count'], 1)
+        self.assertFalse(result['cache']['has_snapshot'])
         self.assertIn('KIS_USE_MOCK must be false in production', result['blocking_reasons'][0])
 
     async def test_partial_account_failures_mark_summary_stale_without_collapsing_to_not_configured(self) -> None:
         main_account = 'KIS:12345678-01'
         isa_account = 'KIS:87654321-22'
-        self.inquiry_service.summary_results[main_account] = {
-            'account_reference': main_account,
-            'as_of': '2026-04-29T01:23:45+00:00',
-            'cash': {'settled_cash': 2500000, 'withdrawable_cash': 2400000, 'orderable_cash': 2500000},
-            'valuation': {'securities_value': 572000, 'total_asset_value': 3072000, 'pnl_amount': 22000, 'pnl_pct': 0.04},
-        }
-        self.inquiry_service.positions_results[main_account] = {
-            'account_reference': main_account,
-            'as_of': '2026-04-29T01:23:45+00:00',
-            'items': [{'symbol': '005930', 'quantity': 10, 'market_value': 572000, 'pnl_pct': 0.04, 'weight_pct': 0.1862}],
-        }
+        self._seed_synced_account(account_reference=main_account)
         configuration_error = TradingAccountInquiryUpstreamError(
             'KIS credentials must be configured',
             payload={'detail': 'KIS credentials must be configured', 'configured': False, 'retryable': False},
@@ -206,15 +284,15 @@ class PortfolioSummaryServiceTests(unittest.IsolatedAsyncioTestCase):
         self.inquiry_service.summary_exceptions[isa_account] = configuration_error
         self.inquiry_service.positions_exceptions[isa_account] = configuration_error
 
-        service = PortfolioSummaryService(
-            account_inquiry_service=self.inquiry_service,
-            order_service=self.order_service,
-            portfolio_account_references='Main=KIS:12345678-01,ISA=KIS:87654321-22',
+        service = self._build_service(
+            portfolio_account_references='Main=KIS:12345678-01,ISA=KIS:87654321-22'
         )
 
         result = await service.get_portfolio_summary()
 
         self.assertEqual(result['sync']['status'], 'stale')
+        self.assertEqual(result['freshness']['lastRefreshStatus'], 'degraded')
+        self.assertFalse(result['freshness']['isStale'])
         self.assertEqual(len(result['accounts']), 2)
         self.assertEqual(result['accounts'][0]['status'], 'synced')
         self.assertEqual(result['accounts'][1]['status'], 'unavailable')
@@ -229,16 +307,14 @@ class PortfolioSummaryServiceTests(unittest.IsolatedAsyncioTestCase):
         self.inquiry_service.summary_exceptions[account_reference] = configuration_error
         self.inquiry_service.positions_exceptions[account_reference] = configuration_error
 
-        service = PortfolioSummaryService(
-            account_inquiry_service=self.inquiry_service,
-            order_service=self.order_service,
-            portfolio_account_references='Main=KIS:12345678-01',
-        )
+        service = self._build_service()
 
         result = await service.get_portfolio_summary()
 
         self.assertEqual(result['sync']['status'], 'not_configured')
         self.assertEqual(result['accounts'][0]['status'], 'unavailable')
+        self.assertEqual(result['freshness']['lastRefreshStatus'], 'degraded')
+        self.assertFalse(result['freshness']['isStale'])
         self.assertIn('not configured', result['sync']['message'].lower())
 
 
