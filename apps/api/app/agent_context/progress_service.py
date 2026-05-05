@@ -80,6 +80,13 @@ class AgentContextProgressService:
                 )
         elif resolved_run is not None:
             if (
+                run_id is None
+                and not self._is_live_run_snapshot(resolved_run)
+                and self._is_persisted_summary_complete(persisted_progress['summary'])
+            ):
+                summary_payload = persisted_progress['summary']
+                result_payload = persisted_progress['result']
+            elif (
                 resolved_run_mode == DAILY_RETRY_CYCLE_MODE
                 and scope_resolved_from_run
                 and self._is_live_run_snapshot(resolved_run)
@@ -88,16 +95,21 @@ class AgentContextProgressService:
                     persisted_summary=persisted_progress['summary'],
                     run_snapshot=resolved_run,
                 )
+                result_payload = self._build_result_from_summary(
+                    market_date=normalized_market_date,
+                    summary=summary_payload,
+                    expected_agents=expected_agent_names,
+                )
             else:
                 summary_payload = self._build_summary_from_run_snapshot(
                     run_snapshot=resolved_run,
                     fallback_summary=persisted_progress['summary'],
                 )
-            result_payload = self._build_result_from_summary(
-                market_date=normalized_market_date,
-                summary=summary_payload,
-                expected_agents=expected_agent_names,
-            )
+                result_payload = self._build_result_from_summary(
+                    market_date=normalized_market_date,
+                    summary=summary_payload,
+                    expected_agents=expected_agent_names,
+                )
         summary_payload = self._normalize_summary_progress_fields(summary_payload)
 
         return {
@@ -289,6 +301,15 @@ class AgentContextProgressService:
         progress_summary = payload.get('progress_summary') if isinstance(payload.get('progress_summary'), dict) else {}
         run_status = str(progress_summary.get('run_status') or payload.get('run_status') or '').strip().lower()
         return run_status == 'running'
+
+    @staticmethod
+    def _is_persisted_summary_complete(summary: dict[str, Any]) -> bool:
+        return (
+            str(summary.get('run_status') or '').strip().lower() == 'completed'
+            and int(summary.get('expected_feedback_count') or 0) > 0
+            and int(summary.get('completed_feedback_count') or 0) >= int(summary.get('expected_feedback_count') or 0)
+            and int(summary.get('failed_items') or 0) == 0
+        )
 
     @staticmethod
     def _merge_live_retry_current_role_progress(
@@ -602,6 +623,8 @@ class AgentContextProgressService:
         )
 
         role_progress: dict[str, dict[str, Any]] = {}
+        completed_roles: list[str] = []
+        remaining_roles: list[str] = []
         for agent_name in expected_agents:
             completed_for_role = len(completed_by_role.get(agent_name, set()))
             failed_for_role = len(failed_by_role.get(agent_name, set()))
@@ -618,6 +641,10 @@ class AgentContextProgressService:
                     role_status = 'failed'
             elif processed_for_role > 0:
                 role_status = 'partial'
+            if role_status == 'completed':
+                completed_roles.append(agent_name)
+            else:
+                remaining_roles.append(agent_name)
             role_progress[agent_name] = {
                 'role': agent_name,
                 'status': role_status,
@@ -695,6 +722,8 @@ class AgentContextProgressService:
             'estimated_completion_at': estimated_completion_at,
             'eta_confidence': eta_confidence,
             'role_progress': role_progress,
+            'completed_roles': completed_roles,
+            'remaining_roles': remaining_roles,
         }
 
     @staticmethod

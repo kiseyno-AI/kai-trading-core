@@ -116,7 +116,7 @@ def upgrade() -> None:
                 'decision_snapshot_id',
                 'evaluation_version',
                 'primary_horizon_days',
-                name='uq_signal_decider_calendar_review_items_snapshot_version_primary',
+                name='uq_sd_cal_review_items_snapshot_eval_horizon',
             ),
         )
 

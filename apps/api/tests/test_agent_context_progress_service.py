@@ -897,6 +897,87 @@ class AgentContextProgressServiceTests(unittest.TestCase):
         self.assertEqual(result['result']['roles']['signal-decider']['error_count'], 1)
         self.assertEqual(find_latest_run.call_args.kwargs['request_modes'], ['daily_retry_cycle_role_sequenced'])
 
+    def test_feedback_progress_prefers_complete_persisted_counts_over_stale_durable_run_snapshot(self):
+        fake_session = FakeProgressSession()
+        fake_session.market_universe_symbols = ['005930', '000660']
+        fake_session.feedback_rows = [
+            SimpleNamespace(
+                symbol=symbol,
+                agent_name=agent_name,
+                run_id=f'{agent_name}-completed',
+                received_at=datetime(2026, 4, 14, 1, index, tzinfo=timezone.utc),
+                id=index,
+            )
+            for index, (symbol, agent_name) in enumerate(
+                [
+                    ('005930', 'eod-summarizer'),
+                    ('005930', 'technical-summarizer'),
+                    ('000660', 'eod-summarizer'),
+                    ('000660', 'technical-summarizer'),
+                ],
+                start=1,
+            )
+        ]
+        fake_session.failure_rows = [
+            SimpleNamespace(
+                symbol='005930',
+                agent_name='eod-summarizer',
+                run_id='stale-failed-run',
+                received_at=datetime(2026, 4, 13, 1, 0, tzinfo=timezone.utc),
+                id=100,
+            )
+        ]
+        stale_run_snapshot = {
+            'run_id': 'stale-failed-run',
+            'status': 'partial',
+            'symbols_total': 2,
+            'completed_count': 0,
+            'failed_count': 4,
+            'started_at': datetime(2026, 4, 13, 1, 0, tzinfo=timezone.utc),
+            'completed_at': datetime(2026, 4, 13, 1, 10, tzinfo=timezone.utc),
+            'request_payload': {
+                'mode': 'daily_retry_cycle_role_sequenced',
+                'symbols': ['005930', '000660'],
+                'requested_symbols': ['005930', '000660'],
+                'roles': ['eod-summarizer', 'technical-summarizer'],
+            },
+            'summary_payload': {
+                'progress_summary': {
+                    'run_id': 'stale-failed-run',
+                    'run_status': 'partial',
+                    'failed_items': 4,
+                    'completed_feedback_count': 0,
+                    'expected_feedback_count': 4,
+                }
+            },
+        }
+
+        @contextmanager
+        def fake_session_scope():
+            yield fake_session
+
+        with patch('app.agent_context.progress_service.session_scope', fake_session_scope):
+            with patch('app.agent_context.progress_service.runtime_feedback_state_store.get_run', return_value=None):
+                with patch(
+                    'app.agent_context.progress_service.agent_context_feedback_run_state_service.find_latest_run',
+                    return_value=stale_run_snapshot,
+                ):
+                    result = AgentContextProgressService().get_feedback_progress(
+                        market_date='2026-04-14',
+                        symbols=None,
+                        expected_agents=['eod-summarizer', 'technical-summarizer'],
+                    )
+
+        self.assertIsNone(result['summary']['run_id'])
+        self.assertEqual(result['summary']['run_status'], 'completed')
+        self.assertEqual(result['summary']['completed_feedback_count'], 4)
+        self.assertEqual(result['summary']['expected_feedback_count'], 4)
+        self.assertEqual(result['summary']['failed_items'], 0)
+        self.assertEqual(result['summary']['completed_roles'], ['eod-summarizer', 'technical-summarizer'])
+        self.assertEqual(result['summary']['remaining_roles'], [])
+        self.assertEqual(result['result']['roles']['eod-summarizer']['completed_count'], 2)
+        self.assertEqual(result['result']['roles']['technical-summarizer']['completed_count'], 2)
+
     def test_feedback_progress_prefers_run_scope_over_requested_symbols_when_run_was_filtered(self):
         fake_session = FakeProgressSession()
         run_snapshot = {

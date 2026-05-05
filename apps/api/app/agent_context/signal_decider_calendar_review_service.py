@@ -158,7 +158,7 @@ class SignalDeciderCalendarReviewRepository:
             stmt = insert(SignalDeciderCalendarReviewItem).values(list(items))
             excluded = stmt.excluded
             stmt = stmt.on_conflict_do_update(
-                constraint='uq_signal_decider_calendar_review_items_snapshot_version_primary',
+                constraint='uq_sd_cal_review_items_snapshot_eval_horizon',
                 set_={
                     'review_run_id': excluded.review_run_id,
                     'market_date': excluded.market_date,
