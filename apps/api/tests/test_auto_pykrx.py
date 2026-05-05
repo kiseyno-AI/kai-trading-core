@@ -528,6 +528,10 @@ class PykrxBackfillServiceTests(TestCase):
                 'app.eod.pykrx_backfill.dart_fundamentals_capture_service.run_daily_incremental_refresh',
                 return_value={'status': 'completed', 'trigger': 'eod_pykrx_followup'},
             ) as fundamentals_refresh,
+            patch(
+                'app.eod.pykrx_pipeline_runner._run_daily_factor_followup',
+                return_value={'triggered': True, 'status': 'completed', 'stages': {}},
+            ) as factor_followup,
             patch('app.eod.pykrx_backfill.complete_eod_collection_run'),
         ):
             result = service._run_market_data_pipeline(
@@ -548,6 +552,11 @@ class PykrxBackfillServiceTests(TestCase):
             market_date='2026-04-03',
             capture_limit=500,
             trigger='eod_pykrx_followup',
+        )
+        factor_followup.assert_called_once_with(market_date='2026-04-03')
+        self.assertEqual(
+            result['factor_scoring_followup'],
+            {'triggered': True, 'status': 'completed', 'stages': {}},
         )
 
     def test_run_collection_daily_auto_rebuilds_price_contexts_when_selected_stages_are_explicit(self) -> None:
@@ -690,6 +699,14 @@ class PykrxBackfillServiceTests(TestCase):
         self.assertEqual(result['status'], 'completed')
         self.assertEqual(
             result['fundamentals_followup'],
+            {
+                'triggered': False,
+                'reason': 'dart_api_key_not_configured',
+                'market_date': '2026-04-03',
+            },
+        )
+        self.assertEqual(
+            result['factor_scoring_followup'],
             {
                 'triggered': False,
                 'reason': 'dart_api_key_not_configured',

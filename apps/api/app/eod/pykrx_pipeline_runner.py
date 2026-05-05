@@ -24,6 +24,17 @@ PYKRX_DAILY_STAGE_ORDER: tuple[str, ...] = (
     'market_risk_filter',
 )
 
+FACTOR_FOLLOWUP_STAGE_ORDER: tuple[str, ...] = (
+    'momentum_factors',
+    'value_factors',
+    'low_risk_factors',
+    'beta_factors',
+    'advanced_value_factors',
+    'unified_value_factors',
+    'quality_factors',
+    'composite_factors',
+)
+
 
 @dataclass(frozen=True)
 class PykrxPipelineDependencies:
@@ -43,6 +54,81 @@ class PykrxPipelineDependencies:
     settings: Any
     normalize_yyyymmdd: Callable[..., str]
     update_run_stage_metadata: Callable[..., dict]
+
+
+def _run_daily_factor_followup(*, market_date: str) -> dict[str, Any]:
+    from app.signals.advanced_value_factor import ADVANCED_VALUE_FACTOR_SOURCE, daily_advanced_value_factor_service
+    from app.signals.beta_factor import BETA_FACTOR_SOURCE, daily_beta_factor_service
+    from app.signals.composite_factor import COMPOSITE_FACTOR_SOURCE, daily_composite_factor_service
+    from app.signals.low_risk_factor import LOW_RISK_SOURCE, daily_low_risk_factor_service
+    from app.signals.momentum_factor import daily_momentum_factor_service
+    from app.signals.quality_factor import QUALITY_FACTOR_SOURCE, daily_quality_factor_service
+    from app.signals.unified_value_factor import UNIFIED_VALUE_FACTOR_SOURCE, daily_unified_value_factor_service
+    from app.signals.value_factor import VALUE_FACTOR_SOURCE, daily_value_factor_service
+
+    stage_calls: dict[str, Callable[[], dict[str, Any]]] = {
+        'momentum_factors': lambda: daily_momentum_factor_service.rebuild_for_market_date(market_date=market_date),
+        'value_factors': lambda: daily_value_factor_service.rebuild_for_market_date(
+            market_date=market_date,
+            source=VALUE_FACTOR_SOURCE,
+        ),
+        'low_risk_factors': lambda: daily_low_risk_factor_service.rebuild_for_market_date(
+            market_date=market_date,
+            source=LOW_RISK_SOURCE,
+        ),
+        'beta_factors': lambda: daily_beta_factor_service.rebuild_for_market_date(
+            market_date=market_date,
+            source=BETA_FACTOR_SOURCE,
+        ),
+        'advanced_value_factors': lambda: daily_advanced_value_factor_service.rebuild_for_market_date(
+            market_date=market_date,
+            source=ADVANCED_VALUE_FACTOR_SOURCE,
+        ),
+        'unified_value_factors': lambda: daily_unified_value_factor_service.rebuild_for_market_date(
+            market_date=market_date,
+            source=UNIFIED_VALUE_FACTOR_SOURCE,
+        ),
+        'quality_factors': lambda: daily_quality_factor_service.rebuild_for_market_date(
+            market_date=market_date,
+            source=QUALITY_FACTOR_SOURCE,
+        ),
+        'composite_factors': lambda: daily_composite_factor_service.rebuild_for_market_date(
+            market_date=market_date,
+            source=COMPOSITE_FACTOR_SOURCE,
+        ),
+    }
+    stages: dict[str, dict[str, Any]] = {}
+    overall_status = 'completed'
+    for stage_id in FACTOR_FOLLOWUP_STAGE_ORDER:
+        try:
+            result = stage_calls[stage_id]()
+            failed = int(
+                result.get('results_failed')
+                or result.get('failed')
+                or result.get('symbols_failed')
+                or 0
+            )
+            stage_status = 'completed' if failed == 0 else 'partial'
+            if failed:
+                overall_status = 'partial'
+            stages[stage_id] = {
+                'status': stage_status,
+                'result': result,
+            }
+        except Exception as exc:  # pragma: no cover - defensive production guard
+            logger.exception('Daily factor follow-up failed for %s on %s', stage_id, market_date)
+            overall_status = 'partial'
+            stages[stage_id] = {
+                'status': 'failed',
+                'error_type': type(exc).__name__,
+                'error_message': str(exc),
+            }
+    return {
+        'triggered': True,
+        'market_date': market_date,
+        'status': overall_status,
+        'stages': stages,
+    }
 
 
 def run_market_data_pipeline(
@@ -749,8 +835,23 @@ def run_market_data_pipeline(
                 trigger='eod_pykrx_followup',
             )
         )
+        fundamentals_status = str(result['fundamentals_followup'].get('status') or '').strip().lower()
+        if fundamentals_status in {'completed', 'partial'}:
+            result['factor_scoring_followup'] = _run_daily_factor_followup(market_date=latest_trade_date)
+        else:
+            result['factor_scoring_followup'] = {
+                'triggered': False,
+                'reason': 'fundamentals_followup_incomplete',
+                'market_date': latest_trade_date,
+                'fundamentals_status': fundamentals_status or None,
+            }
     elif chain_fundamentals_followup and mode == 'daily_auto' and status in {'completed', 'completed_with_errors'}:
         result['fundamentals_followup'] = {
+            'triggered': False,
+            'reason': 'dart_api_key_not_configured',
+            'market_date': latest_trade_date,
+        }
+        result['factor_scoring_followup'] = {
             'triggered': False,
             'reason': 'dart_api_key_not_configured',
             'market_date': latest_trade_date,
