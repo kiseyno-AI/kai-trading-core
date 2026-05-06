@@ -1216,6 +1216,63 @@ class SignalDeciderEvaluation(Base, TimestampMixin):
     evaluated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
+class DeciderPostDecisionEvaluation(Base, TimestampMixin):
+    __tablename__ = 'decider_post_decision_evaluations'
+    __table_args__ = (
+        UniqueConstraint(
+            'feedback_id',
+            'window_days',
+            name='uq_decider_post_decision_evaluations_feedback_window',
+        ),
+        Index(
+            'ix_decider_post_decision_evaluations_market_agent_window',
+            'market_date',
+            'agent_name',
+            'window_days',
+        ),
+        Index(
+            'ix_decider_post_decision_evaluations_symbol_market',
+            'symbol',
+            'market_date',
+        ),
+        Index(
+            'ix_decider_post_decision_evaluations_label_market',
+            'outcome_label',
+            'market_date',
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    feedback_id: Mapped[int] = mapped_column(
+        ForeignKey('agent_context_feedback.id', ondelete='CASCADE'),
+        nullable=False,
+        index=True,
+    )
+    decision_snapshot_id: Mapped[int | None] = mapped_column(
+        ForeignKey('signal_decider_decision_snapshots.id', ondelete='SET NULL'),
+        nullable=True,
+        index=True,
+    )
+    agent_name: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    market_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    symbol: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    window_days: Mapped[int] = mapped_column(Integer, nullable=False, default=5, index=True)
+    decision_action: Mapped[str] = mapped_column(String(32), nullable=False, default='wait', index=True)
+    entry_trade_date: Mapped[date | None] = mapped_column(Date, index=True)
+    entry_price: Mapped[int | None] = mapped_column(BigInteger)
+    target_price: Mapped[int | None] = mapped_column(BigInteger)
+    stop_loss_price: Mapped[int | None] = mapped_column(BigInteger)
+    first_target_hit_trade_date: Mapped[date | None] = mapped_column(Date, index=True)
+    first_stop_hit_trade_date: Mapped[date | None] = mapped_column(Date, index=True)
+    mfe_pct: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    mae_pct: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    outcome_label: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    outcome_reason: Mapped[str] = mapped_column(Text, nullable=False)
+    data_quality_warnings_payload: Mapped[list] = mapped_column(JSON, nullable=False)
+    metadata_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    computed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
 class SignalDeciderCalendarReviewRun(Base, TimestampMixin):
     __tablename__ = 'signal_decider_calendar_review_runs'
     __table_args__ = (
