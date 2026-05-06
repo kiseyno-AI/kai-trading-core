@@ -142,6 +142,45 @@ def _annotate_feedback_attribution(
     }
 
 
+def coerce_decoded_batch_response(decoded: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Normalize common agent output-shape mistakes before symbol correlation.
+
+    Some agents occasionally return {"batch": {"items": [...]}} or put feedback
+    fields directly on each item instead of under item.feedback. Preserve the
+    response but coerce it into the canonical {"items": [{"symbol", "feedback"}]}
+    envelope so downstream role-specific normalizers can apply their usual
+    mismatch/risk-flag handling instead of failing the whole batch early.
+    """
+    if not isinstance(decoded, dict):
+        return decoded
+
+    working = decoded
+    batch = working.get('batch')
+    if isinstance(batch, dict) and isinstance(batch.get('items'), list):
+        working = {**batch, '_coerced_from_batch_key': True}
+
+    items = working.get('items')
+    if not isinstance(items, list):
+        return working
+
+    normalized_items: list[Any] = []
+    for item in items:
+        if not isinstance(item, dict):
+            normalized_items.append(item)
+            continue
+        if isinstance(item.get('feedback'), dict):
+            normalized_items.append(item)
+            continue
+        symbol = item.get('symbol')
+        feedback = {
+            key: value
+            for key, value in item.items()
+            if key not in {'feedback'}
+        }
+        normalized_items.append({'symbol': symbol, 'feedback': feedback, '_coerced_feedback_from_item': True})
+    return {**working, 'items': normalized_items}
+
+
 def correlate_decoded_batch_response(
     *,
     decoded: dict[str, Any] | None,
@@ -661,8 +700,70 @@ def build_signal_decider_payload(
     requested_at = datetime.now(timezone.utc).isoformat()
     symbol = str(item.get('symbol') or '')
     resolved_signal_decider_policy = jsonable_encoder(
-        signal_decider_policy or signal_decider_loop_service.get_active_policy_context()
+        signal_decider_policy
+        if signal_decider_policy is not None
+        else (
+            signal_decider_loop_service.get_active_policy_context()
+            if signal_decider_agent_name == 'signal-decider'
+            else {}
+        )
     )
+    required_feedback_fields = [
+        'role',
+        'agent_name',
+        'symbol',
+        'market_date',
+        'preferred_action',
+        'next_day_open_action',
+        'entry_price_basis',
+        'target_price',
+        'expected_return_pct',
+        'stop_loss_price',
+        'suggested_holding_period',
+        'confidence_score_10',
+        'conviction_score_10',
+        'thesis_summary',
+        'supporting_evidence',
+        'decision_risks',
+        'invalidation_conditions',
+        'data_quality_warnings',
+        'specialist_disagreement',
+        'traceability',
+        'summary',
+        'confidence',
+        'risk_flags',
+        'details',
+        'improvement_notes',
+    ]
+    if signal_decider_agent_name == 'short-term-decider':
+        required_feedback_fields = [
+            'role',
+            'agent_name',
+            'symbol',
+            'market_date',
+            'tactical_action',
+            'preferred_action',
+            'trigger_price',
+            'chase_limit_price',
+            'target_price',
+            'stop_loss_price',
+            'expected_holding_period',
+            'confidence_score_10',
+            'conviction_score_10',
+            'thesis_summary',
+            'trigger_conditions',
+            'supporting_evidence',
+            'tactical_risks',
+            'invalidation_conditions',
+            'data_quality_warnings',
+            'traceability',
+            'summary',
+            'confidence',
+            'risk_flags',
+            'details',
+            'improvement_notes',
+        ]
+
     return {
         'role': signal_decider_agent_name,
         'agent_name': signal_decider_agent_name,
@@ -696,33 +797,7 @@ def build_signal_decider_payload(
             'top_level_batch_shape': {'items': [{'symbol': symbol, 'feedback': {'symbol': symbol}}]},
             'single_symbol_batch_rule': 'Even one-symbol requests must return the batch envelope with exactly one item.',
             'failure_safe': 'If inputs are missing, weak, conflicting, or truncated, return a complete conservative wait or reject item with null unsupported numeric fields and explicit warnings.',
-            'required_feedback_fields': [
-                'role',
-                'agent_name',
-                'symbol',
-                'market_date',
-                'preferred_action',
-                'next_day_open_action',
-                'entry_price_basis',
-                'target_price',
-                'expected_return_pct',
-                'stop_loss_price',
-                'suggested_holding_period',
-                'confidence_score_10',
-                'conviction_score_10',
-                'thesis_summary',
-                'supporting_evidence',
-                'decision_risks',
-                'invalidation_conditions',
-                'data_quality_warnings',
-                'specialist_disagreement',
-                'traceability',
-                'summary',
-                'confidence',
-                'risk_flags',
-                'details',
-                'improvement_notes',
-            ],
+            'required_feedback_fields': required_feedback_fields,
             'self_check_before_final_output': [
                 'output_is_parseable_json_object',
                 'top_level_has_items_array',

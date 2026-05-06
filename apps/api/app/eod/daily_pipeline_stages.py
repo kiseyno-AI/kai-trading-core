@@ -6,7 +6,7 @@ from datetime import date
 from typing import Any, Sequence
 
 from app.agent_context.retry_service import FeedbackRetryCycleConfig, agent_feedback_retry_service
-from app.agent_context.roles import SIGNAL_DECIDER_AGENT_NAME, SUMMARIZER_AGENT_NAMES
+from app.agent_context.roles import DECISION_SUPPORT_AGENT_NAMES, SUMMARIZER_AGENT_NAMES
 from app.agent_context.signal_decider_loop_service import (
     DEFAULT_SIGNAL_DECIDER_EVALUATION_LOOKBACK_DAYS,
     signal_decider_loop_service,
@@ -352,9 +352,9 @@ STAGE_DEFINITIONS: dict[str, DailyStageDefinition] = {
     ),
     'signal_decider': DailyStageDefinition(
         id='signal_decider',
-        label='signal decider dispatch',
+        label='decision support decider dispatch',
         group='agent_feedback',
-        description='Run the persisted signal-decider stage over the same active-pre-filter intersection using stored summaries.',
+        description='Run the persisted decision-support decider stages over the same active-pre-filter intersection using stored summaries.',
         depends_on=('agent_feedback_summaries',),
         supports_symbols=True,
         supports_capture_limit=True,
@@ -613,7 +613,7 @@ class DailyPipelineStageService:
             roles = (
                 SUMMARIZER_AGENT_NAMES
                 if stage_id == 'agent_feedback_summaries'
-                else (SIGNAL_DECIDER_AGENT_NAME,)
+                else DECISION_SUPPORT_AGENT_NAMES
             )
             return self.feedback_retry_service.run_retry_cycles(
                 config=FeedbackRetryCycleConfig(

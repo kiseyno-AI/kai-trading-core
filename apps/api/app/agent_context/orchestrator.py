@@ -31,6 +31,7 @@ from app.agent_context.orchestrator_helpers import (
     build_response_storage_payload as _build_response_storage_payload,
     build_signal_decider_payload as _build_signal_decider_payload_helper,
     build_upstream_feedback_bundle as _build_upstream_feedback_bundle_helper,
+    coerce_decoded_batch_response as _coerce_decoded_batch_response,
     correlate_decoded_batch_response as _correlate_decoded_batch_response,
     extract_json_object as _extract_json_object,
     extract_response_mismatch_flags as _extract_response_mismatch_flags,
@@ -67,7 +68,7 @@ from app.agent_context.logging import (
 from app.agent_context.runtime_state import RuntimeFeedbackRunState, runtime_feedback_state_store
 from app.agent_context.payload_builder import agent_payload_builder
 from app.agent_context.read_service import agent_context_read_service
-from app.agent_context.roles import SIGNAL_DECIDER_AGENT_NAME, SUMMARIZER_AGENT_NAMES
+from app.agent_context.roles import DEFAULT_AGENT_NAMES, DECISION_SUPPORT_AGENT_NAMES, SHORT_TERM_DECIDER_AGENT_NAME, SIGNAL_DECIDER_AGENT_NAME, SUMMARIZER_AGENT_NAMES
 from app.agent_context.run_state_service import agent_context_feedback_run_state_service
 from app.agent_context.response_contract import build_contract_prompt_suffix, normalize_agent_response
 from app.agent_context.reuse_service import agent_context_reuse_service
@@ -120,6 +121,16 @@ DISPATCH_SPECS: tuple[AgentDispatchSpec, ...] = (
         role='fundamental-summarizer',
         agent_name='fundamental-summarizer',
         instruction='Summarize the latest fundamentals conservatively, emphasizing business quality, balance-sheet risks, cash-flow traits, anomalies, and data gaps.',
+    ),
+    AgentDispatchSpec(
+        role=SHORT_TERM_DECIDER_AGENT_NAME,
+        agent_name=SHORT_TERM_DECIDER_AGENT_NAME,
+        instruction=(
+            'Synthesize the specialist summaries, market context, flow context, momentum, volume, price-action, and data-quality inputs into short-term tactical decision support only, '
+            'classifying each symbol as scalp_buy_candidate, watch_for_trigger, avoid_chase, wait, or reject for a 1-2 trading day horizon. '
+            'Prioritize liquidity, fresh participation, clean trigger/invalidation levels, and chase-risk control. '
+            'Write all operator-facing feedback in Korean while staying JSON-only, and avoid execution logic, leverage, sizing, or fake precision.'
+        ),
     ),
     AgentDispatchSpec(
         role=SIGNAL_DECIDER_AGENT_NAME,
@@ -578,7 +589,7 @@ class OpenClawAgentClient:
         assigned_symbols_json = json.dumps(assigned_symbols, ensure_ascii=False)
 
         def _signal_decider_batch_rules(symbols: Sequence[str]) -> str:
-            if spec.role != SIGNAL_DECIDER_AGENT_NAME:
+            if spec.role not in DECISION_SUPPORT_AGENT_NAMES:
                 return ''
             symbols_json = json.dumps(list(symbols), ensure_ascii=False)
             symbol_count = len(symbols)
@@ -596,7 +607,45 @@ class OpenClawAgentClient:
                 "- Immediately before sending, validate the final raw JSON text again and fix any extra or missing closing braces/brackets so the response begins with {, ends with }, and parses successfully with no trailing prose.\n"
             )
 
-        if spec.role == SIGNAL_DECIDER_AGENT_NAME:
+        if spec.role == SHORT_TERM_DECIDER_AGENT_NAME:
+            example_feedback = {
+                'role': spec.role,
+                'agent_name': spec.agent_name,
+                'symbol': example_symbol,
+                'market_date': market_date.isoformat(),
+                'tactical_action': 'watch_for_trigger',
+                'trigger_price': 10300,
+                'chase_limit_price': 10500,
+                'target_price': 10900,
+                'stop_loss_price': 9900,
+                'expected_holding_period': '1-2 trading days',
+                'confidence_score_10': 6,
+                'conviction_score_10': 5,
+                'thesis_summary': 'brief short-term tactical thesis',
+                'trigger_conditions': ['example trigger condition'],
+                'supporting_evidence': ['example evidence'],
+                'tactical_risks': ['example chase or reversal risk'],
+                'invalidation_conditions': ['example invalidation'],
+                'data_quality_warnings': ['example warning'],
+                'traceability': {
+                    'agent_name': spec.agent_name,
+                    'symbol': example_symbol,
+                    'market_date': market_date.isoformat(),
+                },
+                'summary': 'brief short-term tactical thesis',
+                'confidence': 0.6,
+                'risk_flags': ['example_warning'],
+                'details': {
+                    'tactical_decision_support': {'decision_support_only': True},
+                    'traceability': {
+                        'agent_name': spec.agent_name,
+                        'symbol': example_symbol,
+                        'market_date': market_date.isoformat(),
+                    },
+                },
+                'improvement_notes': ['example note about missing intraday, order-book, or flow data'],
+            }
+        elif spec.role == SIGNAL_DECIDER_AGENT_NAME:
             example_feedback = {
                 'role': spec.role,
                 'agent_name': spec.agent_name,
@@ -670,7 +719,7 @@ class OpenClawAgentClient:
             "Prefer derived judgments over restating inputs; if a field is already in the payload, reference its implication instead of copying it.\n"
             "If some inputs are weak or missing, still return conservative structured feedback for that symbol instead of prose or placeholders.\n"
             "All operator-facing natural-language fields inside the JSON must be written in Korean.\n"
-            "For signal-decider outputs, provide explicit target_price and stop_loss_price levels for each symbol whenever possible; if a level is genuinely not supportable, keep the key and explain the limitation in data_quality_warnings.\n"
+            "For decision-support outputs, provide explicit target_price and stop_loss_price levels for each symbol whenever possible; short-term-decider must also provide trigger_price and chase_limit_price. If a level is genuinely not supportable, keep the key and explain the limitation in data_quality_warnings.\n"
             f"{signal_decider_batch_rules}"
             "Do not mention subagents, children, spawning, waiting, or internal orchestration.\n"
             "Do not output tool_code, python, print(...), json.dumps(...), markdown fences, code blocks, intent tags, analysis, reasoning, or explanatory prose.\n"
@@ -700,7 +749,7 @@ class OpenClawAgentClient:
                 "No tool_code, no print(json.dumps(...)), no markdown fences, no intent tags, no prose, no request restatement, raw JSON object only.\n"
                 "Immediately before sending, re-check the final JSON formatting one last time and fix any extra or missing closing braces/brackets.\n"
                 "All operator-facing natural-language fields inside the JSON must be written in Korean.\n"
-                "For signal-decider outputs, provide explicit target_price and stop_loss_price levels for each symbol whenever possible; if a level is genuinely not supportable, keep the key and explain the limitation in data_quality_warnings.\n"
+                "For decision-support outputs, provide explicit target_price and stop_loss_price levels for each symbol whenever possible; short-term-decider must also provide trigger_price and chase_limit_price. If a level is genuinely not supportable, keep the key and explain the limitation in data_quality_warnings.\n"
                 f"{build_contract_prompt_suffix(role=spec.role)}\n"
                 f"Market date: {market_date.isoformat()}\n"
                 f"Assigned batch payload:\n{json.dumps(list(prepared_items), ensure_ascii=False)}"
@@ -721,7 +770,7 @@ class OpenClawAgentClient:
             f"{_signal_decider_batch_rules(fallback_assigned_symbols)}"
             "No tool_code, no print(json.dumps(...)), no markdown fences, no intent tags, no prose, no request restatement, raw JSON object only.\n"
             "All operator-facing natural-language fields inside the JSON must be written in Korean.\n"
-            "For signal-decider outputs, provide explicit target_price and stop_loss_price levels for the assigned symbol whenever possible; if a level is genuinely not supportable, keep the key and explain the limitation in data_quality_warnings.\n"
+            "For decision-support outputs, provide explicit target_price and stop_loss_price levels for the assigned symbol whenever possible; short-term-decider must also provide trigger_price and chase_limit_price. If a level is genuinely not supportable, keep the key and explain the limitation in data_quality_warnings.\n"
             f"{build_contract_prompt_suffix(role=spec.role)}\n"
             f"Market date: {market_date.isoformat()}\n"
             f"Assigned batch payload:\n{json.dumps([fallback_item], ensure_ascii=False)}"
@@ -1235,6 +1284,7 @@ class OpenClawAgentClient:
                             'slot': slot,
                         },
                     )
+                decoded = _coerce_decoded_batch_response(decoded)
                 top_level_object_fallback = False
                 if isinstance(decoded, dict) and not isinstance(decoded.get('items'), list):
                     top_level_object_fallback = True
@@ -1444,6 +1494,7 @@ class AgentFeedbackOrchestrator:
         upstream_summaries: dict[str, dict[str, Any]],
         upstream_traceability: dict[str, dict[str, Any]],
         signal_decider_policy: dict[str, Any] | None = None,
+        agent_name: str = SIGNAL_DECIDER_AGENT_NAME,
     ) -> dict[str, Any]:
         payload = _build_signal_decider_payload_helper(
             item=item,
@@ -1452,7 +1503,7 @@ class AgentFeedbackOrchestrator:
             market_context=market_context,
             upstream_summaries=upstream_summaries,
             upstream_traceability=upstream_traceability,
-            signal_decider_agent_name=SIGNAL_DECIDER_AGENT_NAME,
+            signal_decider_agent_name=agent_name,
             signal_decider_policy=signal_decider_policy,
         )
         payload['orchestration']['required_upstream_roles'] = list(UPSTREAM_SUMMARY_ROLES)
@@ -1473,7 +1524,7 @@ class AgentFeedbackOrchestrator:
         buffered_lookup = {}
         active_signal_decider_policy = None
         market_context = None
-        if role == SIGNAL_DECIDER_AGENT_NAME:
+        if role in DECISION_SUPPORT_AGENT_NAMES:
             snapshot = runtime_feedback_state_store.get_run(market_date, run_id=request_run_id) or RuntimeFeedbackRunState(
                 run_id=request_run_id,
                 market_date=market_date,
@@ -1485,7 +1536,11 @@ class AgentFeedbackOrchestrator:
                 started_at=datetime.now(timezone.utc),
             )
             buffered_lookup = _feedback_row_lookup(snapshot.buffered_feedback_rows)
-            active_signal_decider_policy = signal_decider_loop_service.get_active_policy_context()
+            active_signal_decider_policy = (
+                signal_decider_loop_service.get_active_policy_context()
+                if role == SIGNAL_DECIDER_AGENT_NAME
+                else {}
+            )
 
         dispatch_items: list[dict[str, Any]] = []
         for item in symbol_context_items:
@@ -1493,7 +1548,7 @@ class AgentFeedbackOrchestrator:
             decision = reuse_decisions.get(symbol, {}).get(role)
             if decision is not None and not decision.should_dispatch:
                 continue
-            if role != SIGNAL_DECIDER_AGENT_NAME:
+            if role not in DECISION_SUPPORT_AGENT_NAMES:
                 dispatch_items.append({**item})
                 continue
 
@@ -1545,6 +1600,7 @@ class AgentFeedbackOrchestrator:
                     upstream_summaries=upstream_summaries,
                     upstream_traceability=upstream_traceability,
                     signal_decider_policy=active_signal_decider_policy,
+                    agent_name=role,
                 )
             )
         return dispatch_items
@@ -2187,12 +2243,12 @@ class AgentFeedbackOrchestrator:
         )
 
     def _select_specs(self, *, roles: Sequence[str] | None, available_roles: Sequence[str] | None = None) -> list[AgentDispatchSpec]:
-        requested = {role.strip() for role in roles} if roles else None
+        requested = {role.strip() for role in roles} if roles else set(DEFAULT_AGENT_NAMES)
         available = set(available_roles) if available_roles else None
         specs = [
             spec
             for spec in DISPATCH_SPECS
-            if (requested is None or spec.role in requested) and (available is None or spec.role in available)
+            if spec.role in requested and (available is None or spec.role in available)
         ]
         if not specs:
             raise ValueError('No matching agent feedback roles requested')
@@ -2522,7 +2578,7 @@ class AgentFeedbackOrchestrator:
                         roles=[spec.role for spec in specs],
                     )
                 upstream_reuse_decisions = {}
-                if any(spec.role == SIGNAL_DECIDER_AGENT_NAME for spec in specs):
+                if any(spec.role in DECISION_SUPPORT_AGENT_NAMES for spec in specs):
                     upstream_reuse_decisions = agent_context_reuse_service.build_latest_decisions(
                         market_date=normalized_market_date,
                         symbols=dispatch_symbols,

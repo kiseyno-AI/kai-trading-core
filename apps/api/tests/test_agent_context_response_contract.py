@@ -22,6 +22,99 @@ class AgentContextResponseContractTests(unittest.TestCase):
         )
         self.assertIn('next_day_open_action and preferred_action must be one of buy, wait, reject exactly as written.', suffix)
 
+    def test_short_term_decider_contract_and_normalizer_preserve_tactical_fields(self):
+        suffix = build_contract_prompt_suffix(role='short-term-decider')
+        self.assertIn('scalp_buy_candidate, watch_for_trigger, avoid_chase, wait, reject', suffix)
+        self.assertIn('trigger_price, chase_limit_price', suffix)
+        self.assertIn('agent_name should equal short-term-decider', suffix)
+
+        output_text = json.dumps(
+            {
+                'role': 'short-term-decider',
+                'agent_name': 'short-term-decider',
+                'symbol': '005930',
+                'market_date': '2026-05-06',
+                'tactical_action': 'avoid_chase',
+                'trigger_price': 81200,
+                'chase_limit_price': 82400,
+                'target_price': 84600,
+                'stop_loss_price': 79200,
+                'expected_holding_period': '1-2 trading days',
+                'confidence_score_10': 6,
+                'conviction_score_10': 5,
+                'thesis_summary': '단기 탄력은 있으나 추격 리스크가 큽니다.',
+                'trigger_conditions': ['81200원 재돌파와 거래량 동반'],
+                'supporting_evidence': ['수급 개선'],
+                'tactical_risks': ['갭 상승 시 손익비 악화'],
+                'invalidation_conditions': ['79200원 이탈'],
+                'data_quality_warnings': ['마켓 컨텍스트가 stale입니다.'],
+                'improvement_notes': ['실시간 호가 잔량이 있으면 판단이 개선됩니다.'],
+            }
+        )
+
+        result = normalize_agent_response(
+            role='short-term-decider',
+            output_text=output_text,
+            raw_response={'id': 'resp-short-1'},
+            market_date='2026-05-06',
+            symbol='005930',
+            agent_name='short-term-decider',
+        )
+
+        self.assertEqual(result['tactical_action'], 'avoid_chase')
+        self.assertEqual(result['preferred_action'], 'avoid_chase')
+        self.assertEqual(result['trigger_price'], 81200.0)
+        self.assertEqual(result['chase_limit_price'], 82400.0)
+        self.assertEqual(result['target_price'], 84600.0)
+        self.assertEqual(result['stop_loss_price'], 79200.0)
+        self.assertEqual(result['confidence'], 0.6)
+        self.assertEqual(result['traceability']['agent_name'], 'short-term-decider')
+        self.assertEqual(result['traceability']['symbol'], '005930')
+        self.assertIn('마켓 컨텍스트가 stale입니다.', result['risk_flags'])
+        self.assertEqual(
+            result['details']['tactical_decision_support']['trigger_conditions'],
+            ['81200원 재돌파와 거래량 동반'],
+        )
+
+    def test_short_term_decider_normalizer_extracts_batch_or_item_level_feedback(self):
+        output_text = json.dumps(
+            {
+                'batch': {
+                    'items': [
+                        {
+                            'symbol': '005930',
+                            'tactical_action': 'watch_for_trigger',
+                            'confidence': 'low',
+                            'thesis_summary': '저항대 근처라 확인이 필요합니다.',
+                            'data_quality_warnings': ['마켓 컨텍스트가 오래됐습니다.'],
+                            'risk_flags': ['stale_market_context'],
+                        }
+                    ]
+                }
+            }
+        )
+
+        result = normalize_agent_response(
+            role='short-term-decider',
+            output_text=output_text,
+            raw_response={'id': 'resp-short-batch'},
+            market_date='2026-05-06',
+            symbol='005930',
+            agent_name='short-term-decider',
+        )
+
+        self.assertEqual(result['role'], 'short-term-decider')
+        self.assertEqual(result['agent_name'], 'short-term-decider')
+        self.assertEqual(result['symbol'], '005930')
+        self.assertEqual(result['market_date'], '2026-05-06')
+        self.assertEqual(result['tactical_action'], 'watch_for_trigger')
+        self.assertEqual(result['preferred_action'], 'watch_for_trigger')
+        self.assertIsNone(result['confidence'])
+        self.assertIn('stale_market_context', result['risk_flags'])
+        self.assertIn('마켓 컨텍스트가 오래됐습니다.', result['risk_flags'])
+        self.assertEqual(result['traceability']['symbol'], '005930')
+        self.assertTrue(result['details']['tactical_decision_support']['decision_support_only'])
+
     def test_normalize_signal_decider_response_preserves_decision_support_fields_and_traceability(self):
         output_text = json.dumps(
             {

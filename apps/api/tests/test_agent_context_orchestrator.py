@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 from app.agent_context import orchestrator as orchestrator_module
 from app.agent_context.orchestrator import AgentFeedbackOrchestrator, OpenClawAgentClient
-from app.agent_context.orchestrator_helpers import correlate_decoded_batch_response, repair_json_tail
+from app.agent_context.orchestrator_helpers import coerce_decoded_batch_response, correlate_decoded_batch_response, repair_json_tail
 from app.agent_context.runtime_state import RuntimeFeedbackRunState, RuntimeFeedbackStateStore
 
 
@@ -44,6 +44,27 @@ def _batch_result(symbol: str) -> dict:
 
 
 class RepairJsonTailTests(unittest.TestCase):
+    def test_coerce_decoded_batch_response_unwraps_batch_and_item_level_feedback(self):
+        decoded = {
+            'batch': {
+                'items': [
+                    {
+                        'symbol': '005930',
+                        'tactical_action': 'watch_for_trigger',
+                        'summary': '확인 필요',
+                    }
+                ]
+            }
+        }
+
+        result = coerce_decoded_batch_response(decoded)
+
+        self.assertIn('items', result)
+        self.assertTrue(result['_coerced_from_batch_key'])
+        self.assertEqual(result['items'][0]['symbol'], '005930')
+        self.assertEqual(result['items'][0]['feedback']['tactical_action'], 'watch_for_trigger')
+        self.assertTrue(result['items'][0]['_coerced_feedback_from_item'])
+
     def test_repair_json_tail_drops_extra_closing_brace_before_items_close(self):
         malformed = '{"items":[{"symbol":"014190","feedback":{"summary":"ok","details":{},"improvement_notes":[]}}}]}'
         repaired = repair_json_tail(malformed)
@@ -273,6 +294,33 @@ class SignalDeciderBatchClient:
                     'risk_flags': [],
                     'details': {'fundamental_backdrop': {'quality': 'improving'}},
                     'improvement_notes': ['Add management guidance trend.'],
+                }
+                for item in batch_items
+            }
+        elif spec.role == 'short-term-decider':
+            self.decider_payloads.extend(batch_items)
+            feedback_by_symbol = {
+                item['symbol']: {
+                    'role': spec.role,
+                    'agent_name': spec.agent_name,
+                    'symbol': item['symbol'],
+                    'market_date': item['market_date'],
+                    'tactical_action': 'watch_for_trigger',
+                    'preferred_action': 'watch_for_trigger',
+                    'trigger_price': 87200,
+                    'chase_limit_price': 88500,
+                    'target_price': 91200,
+                    'stop_loss_price': 82900,
+                    'expected_holding_period': '1-2 trading days',
+                    'confidence_score_10': 6,
+                    'conviction_score_10': 5,
+                    'thesis_summary': '단기 탄력은 있으나 돌파 확인이 필요합니다.',
+                    'trigger_conditions': ['87200원 돌파와 거래량 동반'],
+                    'supporting_evidence': ['Breadth improved.', 'Support held above 80000.'],
+                    'tactical_risks': ['Leadership remains narrow.'],
+                    'invalidation_conditions': ['82900원 이탈'],
+                    'data_quality_warnings': ['Signal-feature coverage was partial.'],
+                    'improvement_notes': ['Add premarket gap context.'],
                 }
                 for item in batch_items
             }
@@ -999,10 +1047,13 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
 
         self.assertEqual(
             result['request']['roles'],
-            ['eod-summarizer', 'technical-summarizer', 'fundamental-summarizer', 'signal-decider'],
+            ['eod-summarizer', 'technical-summarizer', 'fundamental-summarizer', 'short-term-decider', 'signal-decider'],
         )
-        self.assertEqual(len(client.decider_payloads), 1)
-        decider_payload = client.decider_payloads[0]
+        self.assertEqual(len(client.decider_payloads), 2)
+        short_term_payload = next(payload for payload in client.decider_payloads if payload['role'] == 'short-term-decider')
+        self.assertEqual(short_term_payload['orchestration']['request_model'], 'openclaw/short-term-decider')
+        self.assertIn('trigger_price', short_term_payload['output_contract']['required_feedback_fields'])
+        decider_payload = next(payload for payload in client.decider_payloads if payload['role'] == 'signal-decider')
         self.assertEqual(decider_payload['upstream_summaries']['eod-summarizer']['details']['breadth_context']['market_bias'], 'constructive')
         self.assertEqual(
             decider_payload['upstream_summaries']['technical-summarizer']['details']['support_resistance']['support_levels'],
@@ -1047,6 +1098,62 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertEqual(decider_call['batch_items'][0]['session_reuse_mode'], 'fresh_per_batch')
         self.assertTrue(decider_call['batch_items'][0]['session_key'].startswith('agent:signal-decider:feedback-fresh/signal-decider/'))
         self.assertIn(result['request']['request_run_id'], decider_call['batch_items'][0]['session_key'])
+        self.assertEqual(market_context_builder.calls, ['2026-04-14', '2026-04-14'])
+        self.assertEqual(result['summary']['completed'], 5)
+
+    def test_requested_short_term_decider_builds_tactical_payload_from_upstream_summaries(self):
+        service = AgentFeedbackOrchestrator()
+        client = SignalDeciderBatchClient()
+        service.client = client
+        feedback_service = FakeFeedbackService()
+        cleanup_service = FakeSessionCleanupService()
+        fake_settings = SimpleNamespace(openclaw_agent_symbol_chunk_size=1, openclaw_agent_parallel_subtasks=2)
+        reuse_service = SimpleNamespace(build_latest_decisions=lambda **kwargs: {})
+        market_context_builder = FakeMarketContextBuilder(
+            {
+                'status': 'ready',
+                'market_date': '2026-04-14',
+                'summary': {'market_bias': 'risk_on'},
+                'flows': {'foreign': {'value': 746146}},
+                'missing_fields': [],
+            }
+        )
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            with patch.object(orchestrator_module, 'agent_context_read_service', DeciderReadyAgentContextReadService()):
+                with patch.object(orchestrator_module, 'agent_context_reuse_service', reuse_service):
+                    with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
+                        with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
+                            with patch.object(
+                                orchestrator_module,
+                                'signal_decider_market_context_builder',
+                                market_context_builder,
+                            ):
+                                with _patch_feedback_eligibility('005930'):
+                                    result = service.dispatch_for_symbols(
+                                        market_date='2026-04-14',
+                                        symbols=['005930'],
+                                        roles=['eod-summarizer', 'technical-summarizer', 'fundamental-summarizer', 'short-term-decider'],
+                                        reuse_existing=False,
+                                    )
+
+        self.assertEqual(
+            result['request']['roles'],
+            ['eod-summarizer', 'technical-summarizer', 'fundamental-summarizer', 'short-term-decider'],
+        )
+        short_term_payload = client.decider_payloads[0]
+        self.assertEqual(short_term_payload['role'], 'short-term-decider')
+        self.assertEqual(short_term_payload['agent_name'], 'short-term-decider')
+        self.assertEqual(short_term_payload['orchestration']['request_model'], 'openclaw/short-term-decider')
+        self.assertEqual(short_term_payload['market_context']['status'], 'ready')
+        self.assertIn('trigger_price', short_term_payload['output_contract']['required_feedback_fields'])
+        self.assertIn('chase_limit_price', short_term_payload['output_contract']['required_feedback_fields'])
+        self.assertNotIn('next_day_open_action', short_term_payload['output_contract']['required_feedback_fields'])
+        short_term_row = next(item for item in feedback_service.bulk_items if item['agent_name'] == 'short-term-decider')
+        self.assertEqual(short_term_row['feedback']['tactical_action'], 'watch_for_trigger')
+        self.assertEqual(short_term_row['feedback']['preferred_action'], 'watch_for_trigger')
+        self.assertEqual(short_term_row['feedback']['trigger_price'], 87200.0)
+        self.assertEqual(short_term_row['context']['market_context']['summary']['market_bias'], 'risk_on')
         self.assertEqual(market_context_builder.calls, ['2026-04-14'])
         self.assertEqual(result['summary']['completed'], 4)
 

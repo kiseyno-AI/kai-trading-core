@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import patch
 
-from app.agent_context.roles import SIGNAL_DECIDER_AGENT_NAME, SUMMARIZER_AGENT_NAMES
+from app.agent_context.roles import DECISION_SUPPORT_AGENT_NAMES, SUMMARIZER_AGENT_NAMES
 from app.eod.daily_pipeline_stages import DailyPipelineStageService
 
 
@@ -190,7 +190,7 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         self.assertEqual(pykrx_runner.calls[0]['stages'], ['price_collection', 'technical_snapshots'])
         self.assertEqual(pykrx_runner.calls[0]['symbols'], ['005930', '000660'])
         self.assertEqual(feedback_retry_service.calls[0]['config'].roles, SUMMARIZER_AGENT_NAMES)
-        self.assertEqual(feedback_retry_service.calls[1]['config'].roles, (SIGNAL_DECIDER_AGENT_NAME,))
+        self.assertEqual(feedback_retry_service.calls[1]['config'].roles, DECISION_SUPPORT_AGENT_NAMES)
         self.assertEqual(evaluation_service.calls[0]['as_of_market_date'], '2026-04-14')
         self.assertEqual(evaluation_service.calls[0]['symbols'], ['005930', '000660'])
         self.assertGreaterEqual(execute_stage.call_count, 3)
