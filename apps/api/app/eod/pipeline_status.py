@@ -172,9 +172,9 @@ class EODPipelineStatusService:
             fs_div=resolved_fs_div,
         )
         factor_stage_counts = self.factor_stage_counts_loader(market_date=resolved_market_date)
-        stored_price_rows = int(dict(pykrx_stage_counts.get('price_collection') or {}).get('persisted') or 0)
+        stored_price_rows = int(self.price_bar_count_loader(market_date=resolved_market_date) or 0)
         if stored_price_rows <= 0:
-            stored_price_rows = int(self.price_bar_count_loader(market_date=resolved_market_date) or 0)
+            stored_price_rows = int(dict(pykrx_stage_counts.get('price_collection') or {}).get('persisted') or 0)
         stages = {
             **pykrx_stages,
             'fundamentals_daily_refresh': fundamentals_stage,
