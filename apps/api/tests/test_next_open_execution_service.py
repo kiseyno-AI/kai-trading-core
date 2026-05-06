@@ -149,6 +149,12 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
             session.execute(
+                delete(SignalDeciderDecisionSnapshot).where(
+                    SignalDeciderDecisionSnapshot.agent_name == 'short-term-decider',
+                    SignalDeciderDecisionSnapshot.market_date == self.market_date,
+                )
+            )
+            session.execute(
                 delete(SignalDeciderPolicyVersion).where(
                     SignalDeciderPolicyVersion.policy_version == self.policy_version
                 )
@@ -226,6 +232,84 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             session.flush()
             return row.id
 
+    def _seed_short_term_snapshot(
+        self,
+        *,
+        symbol: str,
+        tactical_action: str = 'watch_for_trigger',
+        trigger_price: int | None = 50500,
+        chase_limit_price: int | None = 51500,
+        target_price: int | None = 54000,
+        stop_loss_price: int | None = 49000,
+        data_warnings: list[str] | None = None,
+    ) -> int:
+        generic_action = 'buy' if tactical_action in {'scalp_buy_candidate', 'watch_for_trigger'} else tactical_action
+        if generic_action not in {'buy', 'wait', 'reject'}:
+            generic_action = 'wait'
+        with session_scope() as session:
+            row = SignalDeciderDecisionSnapshot(
+                feedback_id=None,
+                market_date=self.market_date,
+                symbol=symbol,
+                agent_name='short-term-decider',
+                agent_version='test-agent',
+                decision_run_id=f'short-run-{symbol}',
+                feedback_received_at=datetime(2026, 4, 29, 6, 0, tzinfo=timezone.utc),
+                policy_version='short_term_decider_contract_v1',
+                decision_action=generic_action,
+                preferred_action=generic_action,
+                next_day_open_action=generic_action,
+                entry_price_basis='trigger_limit',
+                target_price=target_price,
+                expected_return_pct=None,
+                stop_loss_price=stop_loss_price,
+                suggested_holding_period='1-2 trading days',
+                confidence_score_10=7.1,
+                conviction_score_10=6.4,
+                thesis_summary=f'{symbol} short-term summary',
+                supporting_evidence_payload=['Momentum stayed constructive.'],
+                decision_risks_payload=['Opening range may stay volatile.'],
+                invalidation_conditions_payload=['Trigger reclaim failed.'],
+                data_quality_warnings_payload=data_warnings or [],
+                specialist_disagreement_payload=[],
+                traceability_payload={
+                    'schema_version': 'short_term_decider_trace_v1',
+                    'gate_checks': {
+                        'missing_upstream_roles': [],
+                        'decision_support_only': True,
+                        'allow_execution_logic': False,
+                    },
+                    'tactical_context': {
+                        'tactical_action': tactical_action,
+                        'trigger_price': trigger_price,
+                        'chase_limit_price': chase_limit_price,
+                    },
+                },
+                input_feature_snapshot_payload={'meta': {'source_agent_name': 'short-term-decider'}},
+                request_payload={'orchestration': {'required_upstream_roles': ['technical-summarizer']}},
+                response_payload={
+                    'role': 'short-term-decider',
+                    'agent_name': 'short-term-decider',
+                    'tactical_action': tactical_action,
+                    'preferred_action': tactical_action,
+                    'trigger_price': trigger_price,
+                    'chase_limit_price': chase_limit_price,
+                    'target_price': target_price,
+                    'stop_loss_price': stop_loss_price,
+                    'expected_holding_period': '1-2 trading days',
+                    'confidence_score_10': 7.1,
+                    'conviction_score_10': 6.4,
+                    'supporting_evidence': ['Momentum stayed constructive.'],
+                    'tactical_risks': ['Opening range may stay volatile.'],
+                    'invalidation_conditions': ['Trigger reclaim failed.'],
+                    'data_quality_warnings': data_warnings or [],
+                },
+                response_summary_payload={'model': 'openclaw/short-term-decider'},
+            )
+            session.add(row)
+            session.flush()
+            return row.id
+
     def _service(self, *, order_service=None, state='OPEN', server_time='2026-04-30T09:01:00+09:00'):
         return SignalDeciderNextOpenExecutionService(
             order_service=order_service,
@@ -297,6 +381,61 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
                 service.refresh_plan_items(target_trade_date=self.target_trade_date, trigger='test')
 
         get_policy_prompt_context.assert_called_once_with(policy_version=self.policy_version)
+
+    def test_refresh_plan_items_keeps_same_symbol_different_deciders_separate(self) -> None:
+        signal_snapshot_id = self._seed_snapshot(symbol='005930')
+        short_term_snapshot_id = self._seed_short_term_snapshot(symbol='005930')
+        service = self._service(state='PREOPEN', server_time='2026-04-30T08:40:00+09:00')
+
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[{'trade_date': '2026-04-29', 'close_price': 50000}],
+        ):
+            result = service.refresh_plan_items(target_trade_date=self.target_trade_date, trigger='test')
+
+        self.assertEqual(result['summary']['items_total'], 2)
+        self.assertEqual(result['summary']['decision_agent_counts']['short-term-decider'], 1)
+        self.assertEqual(result['summary']['decision_agent_counts']['signal-decider'], 1)
+        items = [item for item in result['items'] if item['symbol'] == '005930']
+        self.assertEqual(len(items), 2)
+        by_agent = {item['decision_agent_name']: item for item in items}
+        self.assertEqual(by_agent['signal-decider']['decision_snapshot_id'], signal_snapshot_id)
+        self.assertEqual(by_agent['signal-decider']['client_order_id'], 'SDNO-20260430-005930')
+        self.assertEqual(by_agent['short-term-decider']['decision_snapshot_id'], short_term_snapshot_id)
+        self.assertEqual(by_agent['short-term-decider']['client_order_id'], 'STDE-20260430-005930')
+        self.assertEqual(by_agent['short-term-decider']['eligibility_status'], ELIGIBILITY_ELIGIBLE)
+
+    def test_refresh_plan_items_skips_non_actionable_short_term_decisions(self) -> None:
+        self._seed_short_term_snapshot(symbol='035420', tactical_action='wait')
+        service = self._service(state='PREOPEN', server_time='2026-04-30T08:40:00+09:00')
+
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[{'trade_date': '2026-04-29', 'close_price': 50000}],
+        ):
+            result = service.refresh_plan_items(target_trade_date=self.target_trade_date, trigger='test')
+
+        self.assertNotIn('035420', {item['symbol'] for item in result['items']})
+
+    def test_refresh_plan_items_blocks_short_term_rows_missing_trigger_fields(self) -> None:
+        self._seed_short_term_snapshot(
+            symbol='000660',
+            tactical_action='watch_for_trigger',
+            trigger_price=None,
+            chase_limit_price=255000,
+        )
+        service = self._service(state='PREOPEN', server_time='2026-04-30T08:40:00+09:00')
+
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[{'trade_date': '2026-04-29', 'close_price': 250000}],
+        ):
+            result = service.refresh_plan_items(target_trade_date=self.target_trade_date, trigger='test')
+
+        item = next(item for item in result['items'] if item['symbol'] == '000660')
+        self.assertEqual(item['decision_agent_name'], 'short-term-decider')
+        self.assertEqual(item['eligibility_status'], ELIGIBILITY_BLOCKED)
+        self.assertEqual(item['validation']['blocking_reasons'][0]['code'], 'trigger_price_missing')
 
     async def test_run_market_open_execution_submits_and_prevents_duplicate_replays(self) -> None:
         self._seed_snapshot(symbol='005930')

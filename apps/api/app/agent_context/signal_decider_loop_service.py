@@ -11,7 +11,7 @@ from sqlalchemy import case, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import SQLAlchemyError
 
-from app.agent_context.roles import SIGNAL_DECIDER_AGENT_NAME
+from app.agent_context.roles import SHORT_TERM_DECIDER_AGENT_NAME, SIGNAL_DECIDER_AGENT_NAME
 from app.db import session_scope
 from app.db_models import (
     AgentContextFeedback,
@@ -25,6 +25,7 @@ from app.market_data_store import load_daily_bars_for_symbol_range
 from app.orders.signal_decider_execution_outcomes import signal_decider_execution_outcome_service
 
 DEFAULT_SIGNAL_DECIDER_POLICY_VERSION = 'signal_decider_policy_v1'
+DEFAULT_SHORT_TERM_DECIDER_POLICY_VERSION = 'short_term_decider_contract_v1'
 DEFAULT_SIGNAL_DECIDER_EVALUATION_VERSION = 'signal_decider_eval_v1'
 DEFAULT_SIGNAL_DECIDER_POLICY_CREATED_BY = 'system:bootstrap'
 DEFAULT_SIGNAL_DECIDER_POLICY_ACTIVATION_MODE = 'manual_only'
@@ -36,6 +37,17 @@ SIGNAL_DECIDER_REPLAY_REVIEW_VERSION = 'signal_decider_replay_review_v1'
 SIGNAL_DECIDER_POLICY_STATUSES: tuple[str, ...] = ('draft', 'candidate', 'active', 'retired')
 SIGNAL_DECIDER_EVALUATION_HORIZONS: tuple[int, ...] = (1, 3, 5, 10)
 SIGNAL_DECIDER_ACTIONS: tuple[str, ...] = ('buy', 'wait', 'reject')
+SHORT_TERM_DECIDER_ACTIONS: tuple[str, ...] = (
+    'scalp_buy_candidate',
+    'watch_for_trigger',
+    'avoid_chase',
+    'wait',
+    'reject',
+)
+SHORT_TERM_DECIDER_ACTIONABLE_ACTIONS: tuple[str, ...] = (
+    'scalp_buy_candidate',
+    'watch_for_trigger',
+)
 SIGNAL_DECIDER_GRADE_LABELS: tuple[str, ...] = (
     'good_buy',
     'bad_buy',
@@ -368,6 +380,22 @@ def _normalize_action(value: Any) -> str:
         normalized = value.strip().lower()
         if normalized in {'buy', 'wait', 'reject'}:
             return normalized
+    return 'wait'
+
+
+def _normalize_short_term_action(value: Any) -> str:
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in SHORT_TERM_DECIDER_ACTIONS:
+            return normalized
+    return 'wait'
+
+
+def _short_term_generic_action(tactical_action: str) -> str:
+    if tactical_action in SHORT_TERM_DECIDER_ACTIONABLE_ACTIONS:
+        return 'buy'
+    if tactical_action == 'reject':
+        return 'reject'
     return 'wait'
 
 
@@ -739,6 +767,157 @@ def build_signal_decider_traceability_snapshot(
             'stop_loss_price': _to_int(
                 feedback_payload.get('stop_loss_price') or decision_support.get('stop_loss_price')
             ),
+        },
+        'raw_traceability': raw_traceability,
+    }
+
+
+def build_short_term_decider_traceability_snapshot(
+    *,
+    agent_name: str,
+    agent_version: str | None,
+    feedback_id: int | None,
+    decision_run_id: str | None,
+    market_date: date,
+    symbol: str,
+    policy_version: str,
+    tactical_action: str,
+    thesis_summary: str,
+    summary_payload: dict[str, Any],
+    feedback_payload: dict[str, Any],
+    context_payload: dict[str, Any] | None,
+) -> dict[str, Any]:
+    context = _maybe_dict(context_payload)
+    raw_traceability = _maybe_dict(feedback_payload.get('traceability'))
+    tactical_support = _maybe_dict(_maybe_dict(feedback_payload.get('details')).get('tactical_decision_support'))
+    orchestration = _maybe_dict(context.get('orchestration'))
+    decision_support_constraints = _maybe_dict(context.get('decision_support_constraints'))
+    upstream_traceability = _maybe_dict(context.get('upstream_traceability'))
+    upstream_summaries = _maybe_dict(context.get('upstream_summaries'))
+    trigger_conditions = _normalize_text_list(
+        feedback_payload.get('trigger_conditions') or tactical_support.get('trigger_conditions')
+    )
+    supporting_evidence = _normalize_text_list(
+        feedback_payload.get('supporting_evidence') or tactical_support.get('supporting_evidence')
+    )
+    tactical_risks = _normalize_text_list(
+        feedback_payload.get('tactical_risks')
+        or tactical_support.get('tactical_risks')
+        or feedback_payload.get('decision_risks')
+    )
+    invalidation_conditions = _normalize_text_list(
+        feedback_payload.get('invalidation_conditions') or tactical_support.get('invalidation_conditions')
+    )
+    data_quality_warnings = _normalize_text_list(
+        feedback_payload.get('data_quality_warnings') or tactical_support.get('data_quality_warnings')
+    )
+    required_upstream_roles = [
+        str(role).strip()
+        for role in orchestration.get('required_upstream_roles', [])
+        if str(role).strip()
+    ]
+    if not required_upstream_roles:
+        required_upstream_roles = sorted(
+            {
+                *[str(role).strip() for role in upstream_traceability.keys() if str(role).strip()],
+                *[str(role).strip() for role in upstream_summaries.keys() if str(role).strip()],
+            }
+        )
+    available_upstream_roles = sorted(
+        {
+            *[str(role).strip() for role in upstream_traceability.keys() if str(role).strip()],
+            *[str(role).strip() for role in upstream_summaries.keys() if str(role).strip()],
+        }
+    )
+    traceability_symbol = _normalize_optional_text(
+        str(raw_traceability.get('symbol')) if raw_traceability.get('symbol') is not None else None
+    )
+    traceability_market_date = _normalize_optional_text(
+        str(raw_traceability.get('market_date')) if raw_traceability.get('market_date') is not None else None
+    )
+    traceability_agent_name = _normalize_optional_text(
+        str(raw_traceability.get('agent_name')) if raw_traceability.get('agent_name') is not None else None
+    )
+    upstream_references: dict[str, dict[str, Any]] = {}
+    for role in available_upstream_roles:
+        trace_info = _maybe_dict(upstream_traceability.get(role))
+        upstream_references[role] = {
+            'feedback_id': trace_info.get('feedback_id'),
+            'run_id': trace_info.get('run_id'),
+            'market_date': trace_info.get('market_date'),
+            'received_at': trace_info.get('received_at'),
+            'source': trace_info.get('source'),
+        }
+    return {
+        'schema_version': 'short_term_decider_trace_v1',
+        'agent': {
+            'agent_name': agent_name,
+            'agent_version': agent_version,
+            'model': summary_payload.get('model'),
+            'feedback_id': feedback_id,
+            'decision_run_id': decision_run_id,
+        },
+        'policy': {
+            'version': policy_version,
+            'activation_mode': 'external_contract',
+            'candidate_activation_required': False,
+        },
+        'orchestration': orchestration,
+        'upstream_references': upstream_references,
+        'gate_checks': {
+            'required_upstream_roles': required_upstream_roles,
+            'available_upstream_roles': available_upstream_roles,
+            'missing_upstream_roles': [
+                role for role in required_upstream_roles if role not in set(available_upstream_roles)
+            ],
+            'decision_support_only': bool(decision_support_constraints.get('decision_support_only')),
+            'allow_execution_logic': bool(decision_support_constraints.get('allow_execution_logic', False)),
+            'has_data_warnings': bool(data_quality_warnings),
+            'has_specialist_disagreement': False,
+            'traceability_symbol_matches': traceability_symbol in {None, symbol},
+            'traceability_market_date_matches': traceability_market_date in {None, market_date.isoformat()},
+            'traceability_agent_name_matches': traceability_agent_name in {None, agent_name},
+        },
+        'tactical_context': {
+            'tactical_action': tactical_action,
+            'trigger_price': _to_int(feedback_payload.get('trigger_price') or tactical_support.get('trigger_price')),
+            'chase_limit_price': _to_int(
+                feedback_payload.get('chase_limit_price') or tactical_support.get('chase_limit_price')
+            ),
+            'target_price': _to_int(feedback_payload.get('target_price') or tactical_support.get('target_price')),
+            'stop_loss_price': _to_int(
+                feedback_payload.get('stop_loss_price') or tactical_support.get('stop_loss_price')
+            ),
+            'expected_holding_period': _normalize_optional_text(
+                str(
+                    feedback_payload.get('expected_holding_period')
+                    or tactical_support.get('expected_holding_period')
+                )
+                if (
+                    feedback_payload.get('expected_holding_period') is not None
+                    or tactical_support.get('expected_holding_period') is not None
+                )
+                else None
+            ),
+            'trigger_conditions': trigger_conditions,
+        },
+        'final_action_rationale': {
+            'decision_action': tactical_action,
+            'summary': thesis_summary,
+            'confidence_score_10': _to_float(
+                feedback_payload.get('confidence_score_10') or tactical_support.get('confidence_score_10')
+            ),
+            'conviction_score_10': _to_float(
+                feedback_payload.get('conviction_score_10') or tactical_support.get('conviction_score_10')
+            ),
+            'target_price': _to_int(feedback_payload.get('target_price') or tactical_support.get('target_price')),
+            'stop_loss_price': _to_int(
+                feedback_payload.get('stop_loss_price') or tactical_support.get('stop_loss_price')
+            ),
+            'supporting_evidence': supporting_evidence,
+            'tactical_risks': tactical_risks,
+            'invalidation_conditions': invalidation_conditions,
+            'data_quality_warnings': data_quality_warnings,
         },
         'raw_traceability': raw_traceability,
     }
@@ -1872,105 +2051,197 @@ class SignalDeciderLoopService:
         context_payload: dict[str, Any] | None,
         received_at: str | datetime | None,
     ) -> dict[str, Any] | None:
-        if agent_name != SIGNAL_DECIDER_AGENT_NAME:
-            return None
-
-        normalized_market_date = _normalize_market_date(market_date)
-        response_payload = _maybe_dict(normalized_feedback_payload) or _maybe_dict(feedback_payload)
-        request_payload = dict(_maybe_dict(context_payload))
-        default_policy_context = self.get_policy_prompt_context(
-            policy_version=_maybe_dict(request_payload.get('signal_decider_policy')).get('current_version')
-        )
-        policy_version = _policy_version_from_payloads(
-            summary_payload=summary_payload,
-            feedback_payload=response_payload,
-            context_payload=request_payload,
-            default_policy_version=default_policy_context.get('current_version'),
-        )
-        request_payload.setdefault('signal_decider_policy', self.get_policy_prompt_context(policy_version=policy_version))
-        feature_snapshot = _maybe_dict(
-            _maybe_dict(request_payload.get('signal_decider_trace')).get('feature_snapshot')
-        )
-        if not feature_snapshot:
-            feature_snapshot = build_signal_decider_feature_snapshot(
-                symbol_day_context=_maybe_dict(request_payload.get('symbol_day_context')),
-                feedback_payload=response_payload,
-                score_context=(
-                    _maybe_dict(request_payload.get('scores'))
-                    or _maybe_dict(_maybe_dict(request_payload.get('symbol_day_context')).get('scores'))
-                ),
+        if agent_name == SIGNAL_DECIDER_AGENT_NAME:
+            normalized_market_date = _normalize_market_date(market_date)
+            response_payload = _maybe_dict(normalized_feedback_payload) or _maybe_dict(feedback_payload)
+            request_payload = dict(_maybe_dict(context_payload))
+            default_policy_context = self.get_policy_prompt_context(
+                policy_version=_maybe_dict(request_payload.get('signal_decider_policy')).get('current_version')
             )
-        decision_action = _normalize_action(
-            response_payload.get('next_day_open_action') or response_payload.get('preferred_action')
-        )
-        thesis_summary = str(
-            response_payload.get('thesis_summary')
-            or response_payload.get('summary')
-            or summary_payload.get('summary')
-            or ''
-        ).strip()
-        traceability_payload = _maybe_dict(request_payload.get('signal_decider_trace')).get('traceability')
-        if not isinstance(traceability_payload, dict) or not traceability_payload.get('schema_version'):
-            traceability_payload = build_signal_decider_traceability_snapshot(
-                agent_name=agent_name,
-                agent_version=agent_version,
-                feedback_id=feedback_id,
-                decision_run_id=run_id,
-                market_date=normalized_market_date,
-                symbol=symbol,
-                policy_version=policy_version,
-                decision_action=decision_action,
-                thesis_summary=thesis_summary,
+            policy_version = _policy_version_from_payloads(
                 summary_payload=summary_payload,
                 feedback_payload=response_payload,
                 context_payload=request_payload,
-                feature_snapshot=feature_snapshot,
+                default_policy_version=default_policy_context.get('current_version'),
             )
-        return {
-            'feedback_id': feedback_id,
-            'market_date': normalized_market_date,
-            'symbol': symbol,
-            'agent_name': agent_name,
-            'agent_version': agent_version,
-            'decision_run_id': run_id,
-            'feedback_received_at': _normalize_optional_datetime(received_at),
-            'policy_version': policy_version,
-            'decision_action': decision_action,
-            'preferred_action': _normalize_action(response_payload.get('preferred_action')),
-            'next_day_open_action': _normalize_action(response_payload.get('next_day_open_action')),
-            'entry_price_basis': _normalize_optional_text(
-                str(response_payload.get('entry_price_basis')) if response_payload.get('entry_price_basis') is not None else None,
-                default='next_open',
+            request_payload.setdefault('signal_decider_policy', self.get_policy_prompt_context(policy_version=policy_version))
+            feature_snapshot = _maybe_dict(
+                _maybe_dict(request_payload.get('signal_decider_trace')).get('feature_snapshot')
             )
-            or 'next_open',
-            'target_price': _to_int(response_payload.get('target_price')),
-            'expected_return_pct': _to_float(response_payload.get('expected_return_pct')),
-            'stop_loss_price': _to_int(response_payload.get('stop_loss_price')),
-            'suggested_holding_period': _normalize_optional_text(
-                str(response_payload.get('suggested_holding_period'))
-                if response_payload.get('suggested_holding_period') is not None
-                else None
-            ),
-            'confidence_score_10': _to_float(response_payload.get('confidence_score_10')),
-            'conviction_score_10': _to_float(response_payload.get('conviction_score_10')),
-            'thesis_summary': thesis_summary,
-            'supporting_evidence_payload': _normalize_text_list(response_payload.get('supporting_evidence')),
-            'decision_risks_payload': _normalize_text_list(response_payload.get('decision_risks')),
-            'invalidation_conditions_payload': _normalize_text_list(
-                response_payload.get('invalidation_conditions')
-            ),
-            'data_quality_warnings_payload': _normalize_text_list(
-                response_payload.get('data_quality_warnings')
-            ),
-            'specialist_disagreement_payload': _normalize_text_list(
-                response_payload.get('specialist_disagreement')
-            ),
-            'traceability_payload': traceability_payload,
-            'input_feature_snapshot_payload': feature_snapshot,
-            'request_payload': request_payload,
-            'response_payload': response_payload,
-            'response_summary_payload': _maybe_dict(summary_payload),
-        }
+            if not feature_snapshot:
+                feature_snapshot = build_signal_decider_feature_snapshot(
+                    symbol_day_context=_maybe_dict(request_payload.get('symbol_day_context')),
+                    feedback_payload=response_payload,
+                    score_context=(
+                        _maybe_dict(request_payload.get('scores'))
+                        or _maybe_dict(_maybe_dict(request_payload.get('symbol_day_context')).get('scores'))
+                    ),
+                )
+            decision_action = _normalize_action(
+                response_payload.get('next_day_open_action') or response_payload.get('preferred_action')
+            )
+            thesis_summary = str(
+                response_payload.get('thesis_summary')
+                or response_payload.get('summary')
+                or summary_payload.get('summary')
+                or ''
+            ).strip()
+            traceability_payload = _maybe_dict(request_payload.get('signal_decider_trace')).get('traceability')
+            if not isinstance(traceability_payload, dict) or not traceability_payload.get('schema_version'):
+                traceability_payload = build_signal_decider_traceability_snapshot(
+                    agent_name=agent_name,
+                    agent_version=agent_version,
+                    feedback_id=feedback_id,
+                    decision_run_id=run_id,
+                    market_date=normalized_market_date,
+                    symbol=symbol,
+                    policy_version=policy_version,
+                    decision_action=decision_action,
+                    thesis_summary=thesis_summary,
+                    summary_payload=summary_payload,
+                    feedback_payload=response_payload,
+                    context_payload=request_payload,
+                    feature_snapshot=feature_snapshot,
+                )
+            return {
+                'feedback_id': feedback_id,
+                'market_date': normalized_market_date,
+                'symbol': symbol,
+                'agent_name': agent_name,
+                'agent_version': agent_version,
+                'decision_run_id': run_id,
+                'feedback_received_at': _normalize_optional_datetime(received_at),
+                'policy_version': policy_version,
+                'decision_action': decision_action,
+                'preferred_action': _normalize_action(response_payload.get('preferred_action')),
+                'next_day_open_action': _normalize_action(response_payload.get('next_day_open_action')),
+                'entry_price_basis': _normalize_optional_text(
+                    str(response_payload.get('entry_price_basis'))
+                    if response_payload.get('entry_price_basis') is not None
+                    else None,
+                    default='next_open',
+                )
+                or 'next_open',
+                'target_price': _to_int(response_payload.get('target_price')),
+                'expected_return_pct': _to_float(response_payload.get('expected_return_pct')),
+                'stop_loss_price': _to_int(response_payload.get('stop_loss_price')),
+                'suggested_holding_period': _normalize_optional_text(
+                    str(response_payload.get('suggested_holding_period'))
+                    if response_payload.get('suggested_holding_period') is not None
+                    else None
+                ),
+                'confidence_score_10': _to_float(response_payload.get('confidence_score_10')),
+                'conviction_score_10': _to_float(response_payload.get('conviction_score_10')),
+                'thesis_summary': thesis_summary,
+                'supporting_evidence_payload': _normalize_text_list(response_payload.get('supporting_evidence')),
+                'decision_risks_payload': _normalize_text_list(response_payload.get('decision_risks')),
+                'invalidation_conditions_payload': _normalize_text_list(
+                    response_payload.get('invalidation_conditions')
+                ),
+                'data_quality_warnings_payload': _normalize_text_list(
+                    response_payload.get('data_quality_warnings')
+                ),
+                'specialist_disagreement_payload': _normalize_text_list(
+                    response_payload.get('specialist_disagreement')
+                ),
+                'traceability_payload': traceability_payload,
+                'input_feature_snapshot_payload': feature_snapshot,
+                'request_payload': request_payload,
+                'response_payload': response_payload,
+                'response_summary_payload': _maybe_dict(summary_payload),
+            }
+
+        if agent_name == SHORT_TERM_DECIDER_AGENT_NAME:
+            normalized_market_date = _normalize_market_date(market_date)
+            response_payload = _maybe_dict(normalized_feedback_payload) or _maybe_dict(feedback_payload)
+            request_payload = dict(_maybe_dict(context_payload))
+            tactical_action = _normalize_short_term_action(
+                response_payload.get('tactical_action') or response_payload.get('preferred_action')
+            )
+            generic_action = _short_term_generic_action(tactical_action)
+            policy_version = (
+                _normalize_optional_text(response_payload.get('policy_version'))
+                or _normalize_optional_text(summary_payload.get('policy_version'))
+                or DEFAULT_SHORT_TERM_DECIDER_POLICY_VERSION
+            )
+            thesis_summary = str(
+                response_payload.get('thesis_summary')
+                or response_payload.get('summary')
+                or summary_payload.get('summary')
+                or ''
+            ).strip()
+            traceability_payload = _maybe_dict(response_payload.get('traceability'))
+            if not isinstance(traceability_payload, dict) or not traceability_payload.get('schema_version'):
+                traceability_payload = build_short_term_decider_traceability_snapshot(
+                    agent_name=agent_name,
+                    agent_version=agent_version,
+                    feedback_id=feedback_id,
+                    decision_run_id=run_id,
+                    market_date=normalized_market_date,
+                    symbol=symbol,
+                    policy_version=policy_version,
+                    tactical_action=tactical_action,
+                    thesis_summary=thesis_summary,
+                    summary_payload=summary_payload,
+                    feedback_payload=response_payload,
+                    context_payload=request_payload,
+                )
+            feature_snapshot = {
+                'symbol_day_context': _maybe_dict(request_payload.get('symbol_day_context')),
+                'scores': _maybe_dict(request_payload.get('scores')),
+                'market_context': _maybe_dict(request_payload.get('market_context')),
+                'meta': {
+                    'source_agent_name': agent_name,
+                    'tactical_action': tactical_action,
+                    'has_trigger_price': response_payload.get('trigger_price') is not None,
+                    'has_chase_limit_price': response_payload.get('chase_limit_price') is not None,
+                    'has_target_price': response_payload.get('target_price') is not None,
+                    'has_stop_loss_price': response_payload.get('stop_loss_price') is not None,
+                },
+            }
+            return {
+                'feedback_id': feedback_id,
+                'market_date': normalized_market_date,
+                'symbol': symbol,
+                'agent_name': agent_name,
+                'agent_version': agent_version,
+                'decision_run_id': run_id,
+                'feedback_received_at': _normalize_optional_datetime(received_at),
+                'policy_version': policy_version,
+                'decision_action': generic_action,
+                'preferred_action': generic_action,
+                'next_day_open_action': generic_action,
+                'entry_price_basis': 'trigger_limit',
+                'target_price': _to_int(response_payload.get('target_price')),
+                'expected_return_pct': None,
+                'stop_loss_price': _to_int(response_payload.get('stop_loss_price')),
+                'suggested_holding_period': _normalize_optional_text(
+                    str(response_payload.get('expected_holding_period'))
+                    if response_payload.get('expected_holding_period') is not None
+                    else None
+                ),
+                'confidence_score_10': _to_float(response_payload.get('confidence_score_10')),
+                'conviction_score_10': _to_float(response_payload.get('conviction_score_10')),
+                'thesis_summary': thesis_summary,
+                'supporting_evidence_payload': _normalize_text_list(response_payload.get('supporting_evidence')),
+                'decision_risks_payload': _normalize_text_list(
+                    response_payload.get('tactical_risks') or response_payload.get('decision_risks')
+                ),
+                'invalidation_conditions_payload': _normalize_text_list(
+                    response_payload.get('invalidation_conditions')
+                ),
+                'data_quality_warnings_payload': _normalize_text_list(
+                    response_payload.get('data_quality_warnings')
+                ),
+                'specialist_disagreement_payload': [],
+                'traceability_payload': traceability_payload,
+                'input_feature_snapshot_payload': feature_snapshot,
+                'request_payload': request_payload,
+                'response_payload': response_payload,
+                'response_summary_payload': _maybe_dict(summary_payload),
+            }
+
+        return None
 
     def list_decisions(
         self,

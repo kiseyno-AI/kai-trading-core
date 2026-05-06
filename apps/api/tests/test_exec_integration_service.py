@@ -141,6 +141,12 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                     SignalDeciderDecisionSnapshot.policy_version == self.policy_version
                 )
             )
+            session.execute(
+                delete(SignalDeciderDecisionSnapshot).where(
+                    SignalDeciderDecisionSnapshot.agent_name == 'short-term-decider',
+                    SignalDeciderDecisionSnapshot.market_date == self.market_date,
+                )
+            )
             session.execute(delete(Symbol).where(Symbol.symbol == self.symbol))
 
     def _seed_snapshot(self) -> int:
@@ -180,6 +186,73 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             session.flush()
             return row.id
 
+    def _seed_short_term_snapshot(
+        self,
+        *,
+        tactical_action: str = 'watch_for_trigger',
+        trigger_price: int | None = 50500,
+        chase_limit_price: int | None = 51500,
+        target_price: int | None = 54000,
+        stop_loss_price: int | None = 49200,
+    ) -> int:
+        generic_action = 'buy' if tactical_action in {'scalp_buy_candidate', 'watch_for_trigger'} else tactical_action
+        if generic_action not in {'buy', 'wait', 'reject'}:
+            generic_action = 'wait'
+        with session_scope() as session:
+            row = SignalDeciderDecisionSnapshot(
+                feedback_id=None,
+                market_date=self.market_date,
+                symbol=self.symbol,
+                agent_name='short-term-decider',
+                agent_version='test-agent',
+                decision_run_id='short-run-1',
+                feedback_received_at=datetime(2026, 4, 29, 6, 0, tzinfo=timezone.utc),
+                policy_version='short_term_decider_contract_v1',
+                decision_action=generic_action,
+                preferred_action=generic_action,
+                next_day_open_action=generic_action,
+                entry_price_basis='trigger_limit',
+                target_price=target_price,
+                expected_return_pct=None,
+                stop_loss_price=stop_loss_price,
+                suggested_holding_period='1-2 trading days',
+                confidence_score_10=7.3,
+                conviction_score_10=6.5,
+                thesis_summary='Dispatch guarded short-term setup.',
+                supporting_evidence_payload=['Opening setup stayed constructive.'],
+                decision_risks_payload=['Gap risk remained elevated.'],
+                invalidation_conditions_payload=['Trigger reclaim failed.'],
+                data_quality_warnings_payload=[],
+                specialist_disagreement_payload=[],
+                traceability_payload={
+                    'schema_version': 'short_term_decider_trace_v1',
+                    'gate_checks': {
+                        'missing_upstream_roles': [],
+                        'decision_support_only': True,
+                        'allow_execution_logic': False,
+                    },
+                },
+                input_feature_snapshot_payload={'meta': {'source_agent_name': 'short-term-decider'}},
+                request_payload={},
+                response_payload={
+                    'role': 'short-term-decider',
+                    'agent_name': 'short-term-decider',
+                    'tactical_action': tactical_action,
+                    'preferred_action': tactical_action,
+                    'trigger_price': trigger_price,
+                    'chase_limit_price': chase_limit_price,
+                    'target_price': target_price,
+                    'stop_loss_price': stop_loss_price,
+                    'expected_holding_period': '1-2 trading days',
+                    'confidence_score_10': 7.3,
+                    'conviction_score_10': 6.5,
+                },
+                response_summary_payload={'model': 'openclaw/short-term-decider'},
+            )
+            session.add(row)
+            session.flush()
+            return row.id
+
     def _seed_symbol(self) -> None:
         with session_scope() as session:
             session.execute(delete(Symbol).where(Symbol.symbol == self.symbol))
@@ -200,6 +273,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         with session_scope() as session:
             row = SignalDeciderExecutionPlanItem(
                 execution_window='next_open',
+                decision_agent_name='signal-decider',
                 decision_snapshot_id=self.snapshot_id,
                 order_request_id=None,
                 broker_order_row_id=None,
@@ -234,6 +308,82 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                     'stop_loss_price': 47000,
                     'suggested_holding_period': '3-10 trading days',
                     'signal_traceability': {'gate_checks': {'missing_upstream_roles': []}},
+                },
+                submission_payload=None,
+                first_ready_at=datetime(2026, 4, 29, 23, 30, tzinfo=timezone.utc),
+                last_evaluated_at=datetime(2026, 4, 29, 23, 30, tzinfo=timezone.utc),
+                submitted_at=None,
+            )
+            session.add(row)
+            session.flush()
+            return row.id
+
+    def _seed_short_term_plan_item(
+        self,
+        *,
+        snapshot_id: int,
+        trigger_price: int | None = 50500,
+        chase_limit_price: int | None = 51500,
+        target_price: int | None = 54000,
+        stop_loss_price: int | None = 49200,
+    ) -> int:
+        with session_scope() as session:
+            row = SignalDeciderExecutionPlanItem(
+                execution_window='next_open',
+                decision_agent_name='short-term-decider',
+                decision_snapshot_id=snapshot_id,
+                order_request_id=None,
+                broker_order_row_id=None,
+                broker_name='kis',
+                target_trade_date=self.target_trade_date,
+                source_market_date=self.market_date,
+                account_reference=self.account_reference,
+                account_label='Main',
+                symbol=self.symbol,
+                policy_version='short_term_decider_contract_v1',
+                planned_side='buy',
+                planned_order_type='limit',
+                planned_time_in_force='day',
+                allocation_budget_krw='1500000',
+                estimated_reference_price=51500,
+                planned_quantity='29',
+                estimated_notional_krw='1493500',
+                eligibility_status='eligible',
+                execution_status='planned',
+                client_order_id='STDE-20260430-005930',
+                validation_payload={
+                    'blocking_reasons': [],
+                    'warnings': [],
+                    'decision_agent_name': 'short-term-decider',
+                    'short_term': {
+                        'tactical_action': 'watch_for_trigger',
+                        'trigger_price': trigger_price,
+                        'chase_limit_price': chase_limit_price,
+                        'target_price': target_price,
+                        'stop_loss_price': stop_loss_price,
+                        'expected_holding_period': '1-2 trading days',
+                    },
+                },
+                traceability_payload={
+                    'agent_name': 'short-term-decider',
+                    'decision_agent_name': 'short-term-decider',
+                    'decision_snapshot_id': snapshot_id,
+                    'source_feedback_id': None,
+                    'decision_run_id': 'short-run-1',
+                    'policy_version': 'short_term_decider_contract_v1',
+                    'target_trade_date': self.target_trade_date.isoformat(),
+                    'source_market_date': self.market_date.isoformat(),
+                    'account_reference': self.account_reference,
+                    'account_label': 'Main',
+                    'allocation_budget_krw': '1500000',
+                    'target_price': target_price,
+                    'stop_loss_price': stop_loss_price,
+                    'expected_holding_period': '1-2 trading days',
+                    'tactical_action': 'watch_for_trigger',
+                    'trigger_price': trigger_price,
+                    'chase_limit_price': chase_limit_price,
+                    'entry_execution_mode': 'pending_trigger_limit',
+                    'decision_traceability': {'schema_version': 'short_term_decider_trace_v1'},
                 },
                 submission_payload=None,
                 first_ready_at=datetime(2026, 4, 29, 23, 30, tzinfo=timezone.utc),
@@ -303,6 +453,85 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['summary']['reason'], 'execution_disabled')
         self.assertFalse(result['summary']['triggered'])
         self.assertEqual(len(self.client.post_calls), 0)
+
+    async def test_dispatch_next_open_plan_includes_short_term_groups_with_explicit_identity(self) -> None:
+        short_snapshot_id = self._seed_short_term_snapshot()
+        self._seed_short_term_plan_item(snapshot_id=short_snapshot_id)
+
+        result = await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=False,
+            dry_run=False,
+            force=True,
+            trigger='test',
+        )
+
+        self.assertEqual(len(self.client.post_calls), 2)
+        by_agent = {
+            payload['metadata']['decision_agent_name']: payload
+            for payload in self.client.post_calls
+        }
+        self.assertEqual(set(by_agent), {'signal-decider', 'short-term-decider'})
+        signal_payload = by_agent['signal-decider']
+        short_payload = by_agent['short-term-decider']
+        self.assertEqual(signal_payload['plan_id'], f'core-signal_decider-20260430-{self.account_reference.replace(":", "_").replace("-", "_")}')
+        self.assertEqual(short_payload['metadata']['decision_agent_name'], 'short-term-decider')
+        self.assertEqual(short_payload['strategy_run_id'], f'short-term-decider:2026-04-30:{self.account_reference.replace(":", "_").replace("-", "_")}')
+        short_entry = short_payload['items'][0]
+        self.assertEqual(short_entry['decision_agent_name'], 'short-term-decider')
+        self.assertEqual(short_entry['trigger_price'], 50500)
+        self.assertEqual(short_entry['limit_price'], 51500)
+        self.assertEqual(short_entry['risk_context']['agent_name'], 'short-term-decider')
+        self.assertEqual(short_entry['risk_context']['decision_agent_name'], 'short-term-decider')
+        self.assertEqual(short_entry['risk_context']['entry_execution_mode'], 'pending_trigger_limit')
+        self.assertIn('source_feedback_id', short_entry['risk_context'])
+        self.assertEqual(result['summary']['translated_item_count'], 6)
+        self.assertEqual(
+            {group['decision_agent_name'] for group in result['dispatch']['groups']},
+            {'signal-decider', 'short-term-decider'},
+        )
+
+    async def test_dispatch_next_open_plan_short_term_missing_target_stop_dispatches_entry_only(self) -> None:
+        short_snapshot_id = self._seed_short_term_snapshot(target_price=None, stop_loss_price=None)
+        self._seed_short_term_plan_item(
+            snapshot_id=short_snapshot_id,
+            target_price=None,
+            stop_loss_price=None,
+        )
+
+        await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=False,
+            dry_run=False,
+            force=True,
+            trigger='test',
+        )
+
+        short_payload = next(
+            payload for payload in self.client.post_calls if payload['metadata']['decision_agent_name'] == 'short-term-decider'
+        )
+        self.assertEqual(len(short_payload['items']), 1)
+        self.assertEqual(short_payload['items'][0]['trigger_price'], 50500)
+        self.assertEqual(short_payload['items'][0]['limit_price'], 51500)
+
+    async def test_exec_overview_includes_both_deciders_without_symbol_collision(self) -> None:
+        short_snapshot_id = self._seed_short_term_snapshot()
+        self._seed_short_term_plan_item(snapshot_id=short_snapshot_id)
+
+        overview = await self.service.list_signal_decider_exec_overview(
+            target_trade_date=self.target_trade_date,
+            symbol=self.symbol,
+            refresh=False,
+            trigger='test',
+        )
+
+        self.assertEqual(len(overview['items']), 2)
+        self.assertEqual(overview['summary']['decision_agent_counts']['short-term-decider'], 1)
+        self.assertEqual(overview['summary']['decision_agent_counts']['signal-decider'], 1)
+        self.assertEqual(
+            {item['decision_agent_name'] for item in overview['items']},
+            {'signal-decider', 'short-term-decider'},
+        )
 
     async def test_exec_overview_refresh_persists_remote_readback(self) -> None:
         dispatch_result = await self.service.dispatch_next_open_plan(

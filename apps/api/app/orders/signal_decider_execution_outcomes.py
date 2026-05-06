@@ -7,6 +7,7 @@ from typing import Any, Sequence
 
 from sqlalchemy import inspect, select
 
+from app.agent_context.roles import SIGNAL_DECIDER_AGENT_NAME
 from app.db import session_scope
 from app.db_models import (
     BrokerOrder,
@@ -226,6 +227,7 @@ class SignalDeciderExecutionOutcomeService:
                 .where(
                     SignalDeciderExecutionPlanItem.id.in_(normalized_ids),
                     SignalDeciderExecutionPlanItem.execution_window == EXECUTION_WINDOW_NEXT_OPEN,
+                    SignalDeciderExecutionPlanItem.decision_agent_name == SIGNAL_DECIDER_AGENT_NAME,
                 )
                 .order_by(
                     SignalDeciderExecutionPlanItem.target_trade_date.desc(),
@@ -455,7 +457,10 @@ class SignalDeciderExecutionOutcomeService:
                 return []
             stmt = (
                 select(SignalDeciderExecutionPlanItem)
-                .where(SignalDeciderExecutionPlanItem.execution_window == EXECUTION_WINDOW_NEXT_OPEN)
+                .where(
+                    SignalDeciderExecutionPlanItem.execution_window == EXECUTION_WINDOW_NEXT_OPEN,
+                    SignalDeciderExecutionPlanItem.decision_agent_name == SIGNAL_DECIDER_AGENT_NAME,
+                )
                 .order_by(
                     SignalDeciderExecutionPlanItem.target_trade_date.desc(),
                     SignalDeciderExecutionPlanItem.account_reference.asc(),

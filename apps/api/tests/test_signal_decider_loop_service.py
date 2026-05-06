@@ -663,6 +663,58 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
         self.assertEqual(snapshot_item['request_payload']['market_context']['status'], 'partial')
         self.assertEqual(snapshot_item['input_feature_snapshot_payload']['scores']['quality']['components_possible'], 6)
 
+    def test_prepare_snapshot_persistence_item_supports_short_term_decider(self):
+        service = SignalDeciderLoopService(repository=FakeSignalDeciderLoopRepository([]))
+        snapshot_item = service.prepare_snapshot_persistence_item(
+            feedback_id=12,
+            market_date='2026-04-23',
+            symbol='005930',
+            agent_name='short-term-decider',
+            agent_version='openclaw-v1',
+            run_id='short-run-12',
+            summary_payload={'model': 'openclaw/short-term-decider'},
+            feedback_payload={
+                'tactical_action': 'watch_for_trigger',
+                'preferred_action': 'watch_for_trigger',
+                'trigger_price': 81200,
+                'chase_limit_price': 82400,
+                'target_price': 84800,
+                'stop_loss_price': 79200,
+                'expected_holding_period': '1-2 trading days',
+                'confidence_score_10': 7.2,
+                'conviction_score_10': 6.4,
+                'thesis_summary': '돌파 확인 뒤 추격 범위를 제한한다.',
+                'supporting_evidence': ['거래대금이 재유입되고 있다.'],
+                'tactical_risks': ['개장 직후 변동성이 확대될 수 있다.'],
+                'invalidation_conditions': ['트리거 재돌파 실패 시 무효화한다.'],
+                'data_quality_warnings': [],
+                'traceability': {
+                    'agent_name': 'short-term-decider',
+                    'symbol': '005930',
+                    'market_date': '2026-04-23',
+                },
+            },
+            context_payload={
+                'decision_support_constraints': {
+                    'decision_support_only': True,
+                    'allow_execution_logic': False,
+                },
+                'orchestration': {'required_upstream_roles': ['technical-summarizer']},
+                'upstream_traceability': {
+                    'technical-summarizer': {'feedback_id': 8, 'run_id': 'upstream-8', 'source': 'persisted_feedback'}
+                },
+            },
+            received_at='2026-04-23T06:00:00+00:00',
+        )
+
+        self.assertEqual(snapshot_item['agent_name'], 'short-term-decider')
+        self.assertEqual(snapshot_item['policy_version'], 'short_term_decider_contract_v1')
+        self.assertEqual(snapshot_item['decision_action'], 'buy')
+        self.assertEqual(snapshot_item['entry_price_basis'], 'trigger_limit')
+        self.assertEqual(snapshot_item['traceability_payload']['schema_version'], 'short_term_decider_trace_v1')
+        self.assertEqual(snapshot_item['traceability_payload']['tactical_context']['trigger_price'], 81200)
+        self.assertEqual(snapshot_item['traceability_payload']['upstream_references']['technical-summarizer']['feedback_id'], 8)
+
     def test_list_decisions_preserves_multiple_snapshots_for_one_symbol_date(self):
         repository = FakeSignalDeciderLoopRepository(
             [

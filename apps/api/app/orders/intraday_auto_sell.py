@@ -11,6 +11,7 @@ import exchange_calendars as xcals
 import pandas as pd
 from sqlalchemy import select
 
+from app.agent_context.roles import SIGNAL_DECIDER_AGENT_NAME
 from app.core.settings import settings
 from app.db import session_scope
 from app.db_models import SignalDeciderDecisionSnapshot, SignalDeciderExecutionPlanItem
@@ -912,7 +913,10 @@ class SignalDeciderIntradayAutoSellService:
         with session_scope() as session:
             rows = session.execute(
                 select(SignalDeciderExecutionPlanItem)
-                .where(SignalDeciderExecutionPlanItem.execution_window == EXECUTION_WINDOW_NEXT_OPEN)
+                .where(
+                    SignalDeciderExecutionPlanItem.execution_window == EXECUTION_WINDOW_NEXT_OPEN,
+                    SignalDeciderExecutionPlanItem.decision_agent_name == SIGNAL_DECIDER_AGENT_NAME,
+                )
                 .order_by(
                     SignalDeciderExecutionPlanItem.target_trade_date.desc(),
                     SignalDeciderExecutionPlanItem.submitted_at.desc(),
@@ -955,6 +959,7 @@ class SignalDeciderIntradayAutoSellService:
                 select(SignalDeciderExecutionPlanItem)
                 .where(
                     SignalDeciderExecutionPlanItem.execution_window == EXECUTION_WINDOW_NEXT_OPEN,
+                    SignalDeciderExecutionPlanItem.decision_agent_name == SIGNAL_DECIDER_AGENT_NAME,
                     SignalDeciderExecutionPlanItem.account_reference == account_reference,
                     SignalDeciderExecutionPlanItem.symbol == symbol,
                     SignalDeciderExecutionPlanItem.planned_side == 'buy',
