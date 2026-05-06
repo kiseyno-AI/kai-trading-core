@@ -620,6 +620,191 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
         )
         self.assertIsNone(result['stages']['advanced_value_factors']['completed_at'])
 
+    def test_read_prefers_stored_price_bar_count_when_price_stage_metadata_is_stale(self):
+        pykrx_run = {
+            'id': 306,
+            'market': 'KRX',
+            'trade_date': '2026-05-06',
+            'source': 'pykrx',
+            'trigger': 'auto_close_scheduler',
+            'status': 'completed',
+            'symbols_total': 2811,
+            'symbols_succeeded': 2811,
+            'symbols_failed': 0,
+            'error_message': None,
+            'started_at': '2026-05-06T06:10:00+00:00',
+            'completed_at': '2026-05-06T07:00:00+00:00',
+            'run_metadata': {
+                'mode': 'daily_auto',
+                'latest_available_trade_date': '2026-05-06',
+                'markets': ['KOSPI', 'KOSDAQ'],
+            },
+        }
+        stage_counts = {
+            'price_collection': {'persisted': 2810, 'updated_at': '2026-05-06T06:20:00+00:00'},
+            'technical_snapshots': {'persisted': 2810, 'updated_at': '2026-05-06T06:35:00+00:00'},
+            'action_summaries': {'persisted': 2810, 'updated_at': '2026-05-06T06:45:00+00:00'},
+            'trending_ranks': {'persisted': 8430, 'periods_persisted': 3, 'updated_at': '2026-05-06T06:55:00+00:00'},
+        }
+        fundamentals_run = {
+            'id': 90,
+            'market_date': '2026-05-06',
+            'trigger': 'eod_pykrx_followup',
+            'status': 'completed',
+            'fs_div': 'CFS',
+            'force': False,
+            'symbol_limit': None,
+            'symbol_offset': 0,
+            'symbols_total': 2810,
+            'symbols_checked': 2810,
+            'symbols_missing': 0,
+            'symbols_stale': 0,
+            'symbols_fresh': 2750,
+            'symbols_refreshed': 60,
+            'symbols_failed': 0,
+            'events_detected': 5,
+            'events_captured': 5,
+            'events_failed': 0,
+            'error_message': None,
+            'started_at': '2026-05-06T07:01:00+00:00',
+            'completed_at': '2026-05-06T07:05:00+00:00',
+            'run_metadata': {
+                'symbols_selected': 2810,
+                'last_progress_at': '2026-05-06T07:05:00+00:00',
+            },
+        }
+        service = EODPipelineStatusService(
+            market_state_loader=lambda: _FakeMarketState(),
+            pykrx_run_loader=lambda **_: pykrx_run,
+            pykrx_stage_counts_loader=lambda *_: stage_counts,
+            live_symbol_count_loader=lambda: 3579,
+            fundamentals_refresh_loader=lambda **_: fundamentals_run,
+            factor_stage_counts_loader=lambda **_: _full_factor_stage_counts(
+                total=2810,
+                updated_at='2026-05-06T07:15:00+00:00',
+            ),
+            price_bar_count_loader=lambda **_: 2810,
+        )
+
+        result = service.read(market_date='2026-05-06')
+
+        self.assertEqual(result['stages']['momentum_factors']['status'], 'completed')
+        self.assertEqual(result['stages']['unified_value_factors']['status'], 'completed')
+        self.assertEqual(result['stages']['quality_factors']['status'], 'completed')
+        self.assertEqual(result['stages']['momentum_factors']['details']['expected_rows'], 2810)
+        self.assertEqual(
+            result['stages']['momentum_factors']['details']['expected_rows_source'],
+            'daily_price_bars',
+        )
+        self.assertEqual(
+            result['stages']['momentum_factors']['details']['price_bars_persisted'],
+            2810,
+        )
+        self.assertEqual(
+            result['stages']['momentum_factors']['details']['price_stage_expected_rows'],
+            2811,
+        )
+
+    def test_read_prefers_date_scoped_price_bars_over_limited_retry_run_counts_for_factor_progress(self):
+        pykrx_run = {
+            'id': 307,
+            'market': 'KRX',
+            'trade_date': '2026-05-06',
+            'source': 'pykrx',
+            'trigger': 'manual_daily_api',
+            'status': 'completed',
+            'symbols_total': 100,
+            'symbols_succeeded': 100,
+            'symbols_failed': 0,
+            'error_message': None,
+            'started_at': '2026-05-06T06:10:00+00:00',
+            'completed_at': '2026-05-06T07:00:00+00:00',
+            'run_metadata': {
+                'mode': 'daily_auto',
+                'latest_available_trade_date': '2026-05-06',
+                'requested_start_date': '20260506',
+                'requested_end_date': '20260506',
+                'limited_run': True,
+                'retry': {
+                    'retry_of_run_id': 300,
+                    'retry_cycle': 2,
+                    'symbol_count': 100,
+                },
+                'markets': ['KOSPI', 'KOSDAQ'],
+            },
+        }
+        stage_counts = {
+            'price_collection': {'persisted': 100, 'updated_at': '2026-05-06T06:20:00+00:00'},
+            'technical_snapshots': {'persisted': 100, 'updated_at': '2026-05-06T06:35:00+00:00'},
+            'action_summaries': {'persisted': 100, 'updated_at': '2026-05-06T06:45:00+00:00'},
+            'trending_ranks': {'persisted': 300, 'periods_persisted': 3, 'updated_at': '2026-05-06T06:55:00+00:00'},
+        }
+        fundamentals_run = {
+            'id': 91,
+            'market_date': '2026-05-06',
+            'trigger': 'eod_pykrx_followup',
+            'status': 'completed',
+            'fs_div': 'CFS',
+            'force': False,
+            'symbol_limit': None,
+            'symbol_offset': 0,
+            'symbols_total': 2810,
+            'symbols_checked': 2810,
+            'symbols_missing': 0,
+            'symbols_stale': 0,
+            'symbols_fresh': 2750,
+            'symbols_refreshed': 60,
+            'symbols_failed': 0,
+            'events_detected': 5,
+            'events_captured': 5,
+            'events_failed': 0,
+            'error_message': None,
+            'started_at': '2026-05-06T07:01:00+00:00',
+            'completed_at': '2026-05-06T07:05:00+00:00',
+            'run_metadata': {
+                'symbols_selected': 2810,
+                'last_progress_at': '2026-05-06T07:05:00+00:00',
+            },
+        }
+        factor_stage_counts = {
+            'momentum_factors': {
+                'persisted': 1000,
+                'updated_at': '2026-05-06T07:15:00+00:00',
+            },
+        }
+        service = EODPipelineStatusService(
+            market_state_loader=lambda: _FakeMarketState(),
+            pykrx_run_loader=lambda **_: pykrx_run,
+            pykrx_stage_counts_loader=lambda *_: stage_counts,
+            live_symbol_count_loader=lambda: 3579,
+            fundamentals_refresh_loader=lambda **_: fundamentals_run,
+            factor_stage_counts_loader=lambda **_: factor_stage_counts,
+            price_bar_count_loader=lambda **_: 2810,
+        )
+
+        result = service.read(market_date='2026-05-06')
+
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['stages']['momentum_factors']['status'], 'partial')
+        self.assertEqual(result['stages']['momentum_factors']['total'], 2810)
+        self.assertEqual(
+            result['stages']['momentum_factors']['current_activity'],
+            'Stored 1000/2810 rows for momentum factor compute',
+        )
+        self.assertEqual(result['stages']['momentum_factors']['details']['expected_rows'], 2810)
+        self.assertEqual(
+            result['stages']['momentum_factors']['details']['expected_rows_source'],
+            'daily_price_bars',
+        )
+        self.assertEqual(
+            result['stages']['momentum_factors']['details']['price_bars_persisted'],
+            2810,
+        )
+        self.assertEqual(
+            result['stages']['momentum_factors']['details']['price_stage_expected_rows'],
+            100,
+        )
+
     def test_read_maps_completed_pipeline_stages_from_completed_run_and_aggregate_counts(self):
         pykrx_run = {
             'id': 303,
