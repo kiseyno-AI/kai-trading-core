@@ -11,6 +11,7 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException, Query
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from app.agent_context.decider_evaluation_service import decider_post_decision_evaluation_service
 from app.agent_context.eod_summaries_service import agent_context_eod_summaries_service
 from app.agent_context.eligibility import (
     AGENT_FEEDBACK_ELIGIBILITY_FILTERS,
@@ -106,6 +107,23 @@ class AgentFeedbackCleanupRunRequest(BaseModel):
     model_config = ConfigDict(extra='forbid')
 
     limit: int = Field(default=100, ge=1, le=1000)
+
+
+class DeciderEvaluationComputeRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+    market_date_from: date
+    market_date_to: date
+    agent_names: list[str] | None = Field(default=None, min_length=1, max_length=20)
+    symbols: list[str] | None = Field(default=None, min_length=1, max_length=500)
+    window_days: int = Field(default=5, ge=1, le=30)
+    force_recompute: bool = False
+
+    @model_validator(mode='after')
+    def validate_window(self) -> 'DeciderEvaluationComputeRequest':
+        if self.market_date_from > self.market_date_to:
+            raise ValueError('market_date_from must be on or before market_date_to')
+        return self
 
 
 class SignalDeciderEvaluationComputeRequest(BaseModel):
@@ -710,6 +728,53 @@ async def list_agent_feedback(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f'Agent feedback read failed: {exc}') from exc
+
+
+@router.post('/decider/evaluations/compute')
+async def compute_decider_post_decision_evaluations(payload: DeciderEvaluationComputeRequest) -> dict:
+    try:
+        return await run_in_threadpool(
+            decider_post_decision_evaluation_service.compute_evaluations,
+            market_date_from=payload.market_date_from,
+            market_date_to=payload.market_date_to,
+            agent_names=payload.agent_names,
+            symbols=payload.symbols,
+            window_days=payload.window_days,
+            force_recompute=payload.force_recompute,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'Decider evaluation compute failed: {exc}') from exc
+
+
+@router.get('/decider/evaluations')
+async def list_decider_post_decision_evaluations(
+    market_date: date | None = Query(default=None),
+    market_date_from: date | None = Query(default=None),
+    market_date_to: date | None = Query(default=None),
+    agent_names: list[str] | None = Query(default=None),
+    symbols: list[str] | None = Query(default=None),
+    outcome_labels: list[str] | None = Query(default=None),
+    window_days: int = Query(default=5, ge=1, le=30),
+    limit: int = Query(default=50, ge=1, le=200),
+) -> dict:
+    try:
+        return await run_in_threadpool(
+            decider_post_decision_evaluation_service.list_evaluations,
+            market_date=market_date,
+            market_date_from=market_date_from,
+            market_date_to=market_date_to,
+            agent_names=agent_names,
+            symbols=symbols,
+            outcome_labels=outcome_labels,
+            window_days=window_days,
+            limit=limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'Decider evaluation read failed: {exc}') from exc
 
 
 @router.get('/signal-decider/decisions')

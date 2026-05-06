@@ -235,6 +235,60 @@ class FakeAgentContextProgressService:
         }
 
 
+class FakeDeciderEvaluationService:
+    def __init__(self):
+        self.compute_args = None
+        self.list_args = None
+
+    def compute_evaluations(self, **kwargs):
+        self.compute_args = kwargs
+        return {
+            'request': {
+                'market_date_from': kwargs['market_date_from'].isoformat(),
+                'market_date_to': kwargs['market_date_to'].isoformat(),
+                'agent_names': kwargs['agent_names'],
+                'symbols': kwargs['symbols'],
+                'window_days': kwargs['window_days'],
+                'force_recompute': kwargs['force_recompute'],
+            },
+            'summary': {'evaluations_upserted': 2},
+            'items': [
+                {
+                    'evaluation_id': 7,
+                    'source': {'feedback_id': 11, 'decision_snapshot_id': 84},
+                    'agent_name': 'signal-decider',
+                    'symbol': '005930',
+                    'outcome_label': 'target_hit_before_stop',
+                }
+            ],
+        }
+
+    def list_evaluations(self, **kwargs):
+        self.list_args = kwargs
+        return {
+            'request': {
+                'market_date': kwargs['market_date'].isoformat() if kwargs['market_date'] is not None else None,
+                'market_date_from': kwargs['market_date_from'].isoformat() if kwargs['market_date_from'] is not None else None,
+                'market_date_to': kwargs['market_date_to'].isoformat() if kwargs['market_date_to'] is not None else None,
+                'agent_names': kwargs['agent_names'],
+                'symbols': kwargs['symbols'],
+                'outcome_labels': kwargs['outcome_labels'],
+                'window_days': kwargs['window_days'],
+                'limit': kwargs['limit'],
+            },
+            'summary': {'count': 1},
+            'items': [
+                {
+                    'evaluation_id': 7,
+                    'source': {'feedback_id': 11, 'decision_snapshot_id': 84},
+                    'agent_name': 'signal-decider',
+                    'symbol': '005930',
+                    'outcome_label': 'target_hit_before_stop',
+                }
+            ],
+        }
+
+
 class FakeSignalDeciderLoopService:
     def __init__(self):
         self.decision_args = None
@@ -962,6 +1016,63 @@ class AgentContextRouteTests(unittest.TestCase):
         self.assertEqual(fake_service.list_args['agent_name'], 'openclaw')
         self.assertEqual(fake_service.list_args['limit'], 10)
         self.assertEqual(response.json()['items'][0]['symbol'], '005930')
+
+    def test_compute_decider_evaluations_route_calls_service(self):
+        fake_service = FakeDeciderEvaluationService()
+        original_service = routes_agent_context.decider_post_decision_evaluation_service
+        routes_agent_context.decider_post_decision_evaluation_service = fake_service
+        try:
+            client = TestClient(self.app)
+            response = client.post(
+                '/agent-context/decider/evaluations/compute',
+                json={
+                    'market_date_from': '2026-04-20',
+                    'market_date_to': '2026-04-23',
+                    'agent_names': ['signal-decider', 'short-term-decider'],
+                    'symbols': ['005930'],
+                    'window_days': 5,
+                },
+            )
+        finally:
+            routes_agent_context.decider_post_decision_evaluation_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(fake_service.compute_args['market_date_from'].isoformat(), '2026-04-20')
+        self.assertEqual(fake_service.compute_args['market_date_to'].isoformat(), '2026-04-23')
+        self.assertEqual(fake_service.compute_args['agent_names'], ['signal-decider', 'short-term-decider'])
+        self.assertEqual(fake_service.compute_args['symbols'], ['005930'])
+        self.assertEqual(fake_service.compute_args['window_days'], 5)
+        self.assertEqual(response.json()['summary']['evaluations_upserted'], 2)
+
+    def test_list_decider_evaluations_route_calls_service(self):
+        fake_service = FakeDeciderEvaluationService()
+        original_service = routes_agent_context.decider_post_decision_evaluation_service
+        routes_agent_context.decider_post_decision_evaluation_service = fake_service
+        try:
+            client = TestClient(self.app)
+            response = client.get(
+                '/agent-context/decider/evaluations',
+                params=[
+                    ('market_date', '2026-04-23'),
+                    ('agent_names', 'signal-decider'),
+                    ('agent_names', 'short-term-decider'),
+                    ('symbols', '005930'),
+                    ('outcome_labels', 'target_hit_before_stop'),
+                    ('window_days', '5'),
+                    ('limit', '25'),
+                ],
+            )
+        finally:
+            routes_agent_context.decider_post_decision_evaluation_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(fake_service.list_args['market_date'].isoformat(), '2026-04-23')
+        self.assertEqual(fake_service.list_args['agent_names'], ['signal-decider', 'short-term-decider'])
+        self.assertEqual(fake_service.list_args['symbols'], ['005930'])
+        self.assertEqual(fake_service.list_args['outcome_labels'], ['target_hit_before_stop'])
+        self.assertEqual(fake_service.list_args['window_days'], 5)
+        self.assertEqual(fake_service.list_args['limit'], 25)
+        self.assertEqual(response.json()['items'][0]['outcome_label'], 'target_hit_before_stop')
 
     def test_inspect_technical_summarizer_feedback_route_calls_service(self):
         fake_service = FakeAgentContextFeedbackService()
