@@ -34,10 +34,18 @@ GET /execution/runtime/monitored-symbols?market_date=2026-04-30&refresh=true
         "stop_sell",
         "target_sell"
       ],
+      "decision_agent_names": [
+        "short-term-decider",
+        "signal-decider"
+      ],
       "last_event_at": "2026-04-30T00:07:00+00:00",
       "account_references": [
         "KIS:12345678-01"
-      ]
+      ],
+      "status_counts": {
+        "filled": 1,
+        "submitted": 1
+      }
     }
   ]
 }

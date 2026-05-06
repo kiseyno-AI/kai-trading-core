@@ -1447,6 +1447,7 @@ class SignalDeciderExecutionPlanItem(Base, TimestampMixin):
             'target_trade_date',
             'account_reference',
             'symbol',
+            'decision_agent_name',
             name='uq_signal_decider_execution_plan_items_scope',
         ),
         Index(
@@ -1476,6 +1477,7 @@ class SignalDeciderExecutionPlanItem(Base, TimestampMixin):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     execution_window: Mapped[str] = mapped_column(String(32), nullable=False, default='next_open', index=True)
+    decision_agent_name: Mapped[str] = mapped_column(String(64), nullable=False, default='signal-decider', index=True)
     decision_snapshot_id: Mapped[int] = mapped_column(
         ForeignKey('signal_decider_decision_snapshots.id', ondelete='CASCADE'),
         nullable=False,

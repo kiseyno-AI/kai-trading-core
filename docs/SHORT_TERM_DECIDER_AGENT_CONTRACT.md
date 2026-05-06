@@ -13,6 +13,8 @@ Evaluate whether a symbol has a supportable 1-3 trading day tactical setup using
 
 The agent must not produce execution instructions, position sizing, leverage guidance, or brokerage/order logic.
 
+Downstream core planning may persist actionable rows and dispatch them to `kai-trading-exec` as decider-identified pending trigger-limit candidates, but that consumer behavior does not change the contract here: the model still produces only decision-support fields, never live order instructions.
+
 ## Allowed actions
 
 `tactical_action` and `preferred_action` must be exactly one of:

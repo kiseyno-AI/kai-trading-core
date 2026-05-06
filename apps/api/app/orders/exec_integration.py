@@ -11,6 +11,7 @@ from typing import Any, Iterable, Sequence
 import httpx
 from sqlalchemy import select
 
+from app.agent_context.roles import SHORT_TERM_DECIDER_AGENT_NAME, SIGNAL_DECIDER_AGENT_NAME
 from app.core.audit_logging import request_with_audit
 from app.core.settings import settings
 from app.db import session_scope
@@ -40,7 +41,7 @@ EXEC_SERVICE_NAME = 'kai-trading-exec'
 EXEC_INTENT_NEXT_OPEN_BUY = 'next_open_buy'
 EXEC_INTENT_TARGET_SELL = 'target_sell'
 EXEC_INTENT_STOP_SELL = 'stop_sell'
-EXEC_SOURCE_SCHEMA_VERSION = 'signal_decider_exec_plan_v1'
+EXEC_SOURCE_SCHEMA_VERSION = 'signal_decider_exec_plan_v2'
 
 EXEC_DISPATCH_STATUS_PREVIEW = 'preview'
 EXEC_DISPATCH_STATUS_ACCEPTED = 'accepted'
@@ -175,6 +176,11 @@ def _serialize_error(*, code: str, message: str, retryable: bool = False, status
 
 def _sanitize_key(value: str) -> str:
     return re.sub(r'[^A-Za-z0-9]+', '_', value).strip('_') or 'unknown'
+
+
+def _normalize_decision_agent_name(value: Any) -> str:
+    normalized = _normalize_optional_text(value, lowercase=True)
+    return normalized or SIGNAL_DECIDER_AGENT_NAME
 
 
 def _collect_items(payload: Any) -> list[dict[str, Any]]:
@@ -553,7 +559,7 @@ class SignalDeciderExecIntegrationService:
             account_reference=resolved_account_reference,
         )
         snapshots = self._load_snapshots(rows)
-        grouped = self._group_rows_by_account(rows)
+        grouped = self._group_rows_by_dispatch_scope(rows)
 
         group_results: list[dict[str, Any]] = []
         translated_item_count = 0
@@ -562,13 +568,14 @@ class SignalDeciderExecIntegrationService:
         skipped_group_count = 0
         preview_plans: list[dict[str, Any]] = []
 
-        for account_key, account_rows in grouped.items():
+        for (account_key, decision_agent_name), account_rows in grouped.items():
             eligible_rows = [row for row in account_rows if row.eligibility_status == ELIGIBILITY_ELIGIBLE]
             if not eligible_rows:
                 skipped_group_count += 1
                 group_results.append(
                     {
                         'account_reference': account_key,
+                        'decision_agent_name': decision_agent_name,
                         'dispatch_status': EXEC_DISPATCH_STATUS_SKIPPED,
                         'message': 'No eligible core plan rows were available for dispatch.',
                         'eligible_count': 0,
@@ -589,6 +596,7 @@ class SignalDeciderExecIntegrationService:
                 group_results.append(
                     {
                         'account_reference': account_key,
+                        'decision_agent_name': decision_agent_name,
                         'plan_id': plan_id,
                         'dispatch_status': EXEC_DISPATCH_STATUS_ALREADY_DISPATCHED,
                         'eligible_count': len(eligible_rows),
@@ -601,6 +609,7 @@ class SignalDeciderExecIntegrationService:
                 preview_plans.append(
                     {
                         'account_reference': account_key,
+                        'decision_agent_name': decision_agent_name,
                         'plan_id': plan_id,
                         'translated_item_count': len(plan_payload['items']),
                         'payload': plan_payload,
@@ -609,6 +618,7 @@ class SignalDeciderExecIntegrationService:
                 group_results.append(
                     {
                         'account_reference': account_key,
+                        'decision_agent_name': decision_agent_name,
                         'plan_id': plan_id,
                         'dispatch_status': EXEC_DISPATCH_STATUS_PREVIEW,
                         'eligible_count': len(eligible_rows),
@@ -634,6 +644,7 @@ class SignalDeciderExecIntegrationService:
                 group_results.append(
                     {
                         'account_reference': account_key,
+                        'decision_agent_name': decision_agent_name,
                         'plan_id': plan_id,
                         'dispatch_status': EXEC_DISPATCH_STATUS_NOT_CONFIGURED,
                         'eligible_count': len(eligible_rows),
@@ -664,6 +675,7 @@ class SignalDeciderExecIntegrationService:
                 group_results.append(
                     {
                         'account_reference': account_key,
+                        'decision_agent_name': decision_agent_name,
                         'plan_id': plan_id,
                         'dispatch_status': status,
                         'eligible_count': len(eligible_rows),
@@ -691,6 +703,7 @@ class SignalDeciderExecIntegrationService:
             group_results.append(
                 {
                     'account_reference': account_key,
+                    'decision_agent_name': decision_agent_name,
                     'plan_id': plan_id,
                     **persisted_group_result,
                 }
@@ -792,7 +805,11 @@ class SignalDeciderExecIntegrationService:
             refresh=refresh,
             trigger=trigger,
         )
-        items = [self._build_intraday_watch_item(item) for item in overview['items']]
+        items = [
+            self._build_intraday_watch_item(item)
+            for item in overview['items']
+            if _normalize_decision_agent_name(item.get('decision_agent_name')) == SIGNAL_DECIDER_AGENT_NAME
+        ]
         summary = {
             'delegated_to_exec': True,
             'items_total': len(items),
@@ -955,12 +972,39 @@ class SignalDeciderExecIntegrationService:
             'name': metadata['name'],
             'market': metadata['market'],
             'planning': {
-                'decision_source': 'signal-decider',
+                'decision_source': (
+                    next(iter(agent_names))
+                    if len(
+                        agent_names := {
+                            _normalize_decision_agent_name(item.get('decision_agent_name'))
+                            for item in items
+                            if _normalize_optional_text(item.get('decision_agent_name'))
+                        }
+                    )
+                    == 1
+                    else 'multiple'
+                ),
+                'decision_agent_names': sorted(agent_names),
                 'decision_snapshot_ids': sorted(
                     {
                         int(item.get('decision_snapshot_id'))
                         for item in items
                         if item.get('decision_snapshot_id') is not None
+                    }
+                ),
+                'decision_run_ids': sorted(
+                    {
+                        str((item.get('traceability') or {}).get('decision_run_id'))
+                        for item in items
+                        if _normalize_optional_text((item.get('traceability') or {}).get('decision_run_id'))
+                    }
+                ),
+                'source_feedback_ids': sorted(
+                    {
+                        int((item.get('traceability') or {}).get('source_feedback_id') or (item.get('traceability') or {}).get('feedback_id'))
+                        for item in items
+                        if (item.get('traceability') or {}).get('source_feedback_id') is not None
+                        or (item.get('traceability') or {}).get('feedback_id') is not None
                     }
                 ),
                 'policy_versions': sorted(
@@ -999,6 +1043,7 @@ class SignalDeciderExecIntegrationService:
                 )
                 .order_by(
                     SignalDeciderExecutionPlanItem.account_reference.asc(),
+                    SignalDeciderExecutionPlanItem.decision_agent_name.asc(),
                     SignalDeciderExecutionPlanItem.symbol.asc(),
                     SignalDeciderExecutionPlanItem.id.asc(),
                 )
@@ -1030,12 +1075,12 @@ class SignalDeciderExecIntegrationService:
             return snapshots
 
     @staticmethod
-    def _group_rows_by_account(
+    def _group_rows_by_dispatch_scope(
         rows: Sequence[SignalDeciderExecutionPlanItem],
-    ) -> dict[str, list[SignalDeciderExecutionPlanItem]]:
-        grouped: dict[str, list[SignalDeciderExecutionPlanItem]] = defaultdict(list)
+    ) -> dict[tuple[str, str], list[SignalDeciderExecutionPlanItem]]:
+        grouped: dict[tuple[str, str], list[SignalDeciderExecutionPlanItem]] = defaultdict(list)
         for row in rows:
-            grouped[row.account_reference].append(row)
+            grouped[(row.account_reference, _normalize_decision_agent_name(row.decision_agent_name))].append(row)
         return grouped
 
     def _build_exec_plan_payload(
@@ -1046,9 +1091,10 @@ class SignalDeciderExecIntegrationService:
         trigger: str,
     ) -> tuple[dict[str, Any], dict[int, list[dict[str, Any]]]]:
         first_row = rows[0]
+        decision_agent_name = _normalize_decision_agent_name(first_row.decision_agent_name)
         source_market_date = first_row.source_market_date.isoformat()
         plan_id = (
-            f'core-signal-decider-{first_row.target_trade_date.strftime("%Y%m%d")}-'
+            f'core-{_sanitize_key(decision_agent_name)}-{first_row.target_trade_date.strftime("%Y%m%d")}-'
             f'{_sanitize_key(first_row.account_reference)}'
         )
         runtime_mode = _normalize_optional_text(settings.signal_decider_exec_runtime_mode, lowercase=True) or 'mock'
@@ -1059,32 +1105,50 @@ class SignalDeciderExecIntegrationService:
 
         for row in rows:
             snapshot = snapshots.get(int(row.decision_snapshot_id))
+            row_decision_agent_name = _normalize_decision_agent_name(row.decision_agent_name)
             traceability = row.traceability_payload if isinstance(row.traceability_payload, dict) else {}
             validation = row.validation_payload if isinstance(row.validation_payload, dict) else {}
             quantity = _safe_decimal(row.planned_quantity)
             target_price = snapshot.target_price if snapshot is not None else traceability.get('target_price')
             stop_loss_price = snapshot.stop_loss_price if snapshot is not None else traceability.get('stop_loss_price')
+            trigger_price = traceability.get('trigger_price')
+            chase_limit_price = traceability.get('chase_limit_price')
+            entry_execution_mode = (
+                'pending_trigger_limit'
+                if row_decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
+                else 'next_open_market'
+            )
             core_entry_key = f'core-plan-{row.id}:{EXEC_INTENT_NEXT_OPEN_BUY}'
             common_risk_context = {
                 'schema_version': EXEC_SOURCE_SCHEMA_VERSION,
+                'agent_name': row_decision_agent_name,
+                'decision_agent_name': row_decision_agent_name,
                 'core_plan_item_id': row.id,
                 'core_client_order_id': row.client_order_id,
                 'core_execution_window': row.execution_window,
                 'account_reference': row.account_reference,
                 'account_label': row.account_label,
                 'target_trade_date': row.target_trade_date.isoformat(),
-                'source_market_date': source_market_date,
+                'source_market_date': row.source_market_date.isoformat(),
                 'policy_version': row.policy_version,
                 'decision_snapshot_id': row.decision_snapshot_id,
+                'source_feedback_id': traceability.get('source_feedback_id') or traceability.get('feedback_id'),
                 'decision_run_id': traceability.get('decision_run_id'),
                 'target_price': target_price,
                 'stop_loss_price': stop_loss_price,
                 'suggested_holding_period': traceability.get('suggested_holding_period'),
+                'expected_holding_period': traceability.get('expected_holding_period'),
+                'tactical_action': traceability.get('tactical_action'),
+                'trigger_price': trigger_price,
+                'chase_limit_price': chase_limit_price,
+                'entry_execution_mode': entry_execution_mode,
                 'validation': validation,
-                'traceability': traceability.get('signal_traceability') or {},
+                'traceability': traceability.get('decision_traceability') or traceability.get('signal_traceability') or {},
             }
             entry_item = {
                 'core_item_key': core_entry_key,
+                'agent_name': row_decision_agent_name,
+                'decision_agent_name': row_decision_agent_name,
                 'symbol': row.symbol,
                 'side': 'buy',
                 'intent': EXEC_INTENT_NEXT_OPEN_BUY,
@@ -1095,8 +1159,16 @@ class SignalDeciderExecIntegrationService:
                     'estimated_reference_price': row.estimated_reference_price,
                     'estimated_notional_krw': _decimal_to_text(_safe_decimal(row.estimated_notional_krw)),
                 },
-                'limit_price': None,
-                'trigger_price': None,
+                'limit_price': (
+                    _to_json_number(_safe_decimal(chase_limit_price))
+                    if row_decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
+                    else None
+                ),
+                'trigger_price': (
+                    _to_json_number(_safe_decimal(trigger_price))
+                    if row_decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
+                    else None
+                ),
                 'time_in_force': row.planned_time_in_force,
                 'risk_context': {
                     **common_risk_context,
@@ -1114,7 +1186,16 @@ class SignalDeciderExecIntegrationService:
                     'intent': EXEC_INTENT_NEXT_OPEN_BUY,
                     'side': 'buy',
                     'symbol': row.symbol,
-                    'trigger_price': None,
+                    'trigger_price': (
+                        _to_json_number(_safe_decimal(trigger_price))
+                        if row_decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
+                        else None
+                    ),
+                    'limit_price': (
+                        _to_json_number(_safe_decimal(chase_limit_price))
+                        if row_decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
+                        else None
+                    ),
                 }
             )
 
@@ -1123,6 +1204,8 @@ class SignalDeciderExecIntegrationService:
                 items.append(
                     {
                         'core_item_key': target_key,
+                        'agent_name': row_decision_agent_name,
+                        'decision_agent_name': row_decision_agent_name,
                         'symbol': row.symbol,
                         'side': 'sell',
                         'intent': EXEC_INTENT_TARGET_SELL,
@@ -1156,6 +1239,8 @@ class SignalDeciderExecIntegrationService:
                 items.append(
                     {
                         'core_item_key': stop_key,
+                        'agent_name': row_decision_agent_name,
+                        'decision_agent_name': row_decision_agent_name,
                         'symbol': row.symbol,
                         'side': 'sell',
                         'intent': EXEC_INTENT_STOP_SELL,
@@ -1189,11 +1274,15 @@ class SignalDeciderExecIntegrationService:
             'source': dispatch_source,
             'mode': runtime_mode,
             'market_date': first_row.target_trade_date.isoformat(),
-            'strategy_run_id': f'signal-decider:{first_row.target_trade_date.isoformat()}:{_sanitize_key(first_row.account_reference)}',
+            'strategy_run_id': (
+                f'{decision_agent_name}:{first_row.target_trade_date.isoformat()}:{_sanitize_key(first_row.account_reference)}'
+            ),
             'requested_at': requested_at,
             'items': items,
             'metadata': {
                 'schema_version': EXEC_SOURCE_SCHEMA_VERSION,
+                'agent_name': decision_agent_name,
+                'decision_agent_name': decision_agent_name,
                 'trigger': trigger,
                 'requested_at': requested_at,
                 'account_reference': first_row.account_reference,
@@ -1746,12 +1835,25 @@ class SignalDeciderExecIntegrationService:
         exec_dispatch = submission.get('exec_dispatch') if isinstance(submission.get('exec_dispatch'), dict) else {}
         readback = exec_dispatch.get('readback') if isinstance(exec_dispatch.get('readback'), dict) else {}
         traceability = item.get('traceability') if isinstance(item.get('traceability'), dict) else {}
+        decision_agent_name = _normalize_decision_agent_name(
+            item.get('decision_agent_name') or traceability.get('decision_agent_name') or traceability.get('agent_name')
+        )
         dispatch_status = _normalize_status(exec_dispatch.get('dispatch_status'))
         derived_state = readback.get('derived_state') if isinstance(readback.get('derived_state'), dict) else {}
         return {
             **item,
+            'agent_name': decision_agent_name,
+            'decision_agent_name': decision_agent_name,
             'target_price': traceability.get('target_price'),
             'stop_loss_price': traceability.get('stop_loss_price'),
+            'trigger_price': traceability.get('trigger_price'),
+            'chase_limit_price': traceability.get('chase_limit_price'),
+            'decision_run_id': traceability.get('decision_run_id'),
+            'source_feedback_id': traceability.get('source_feedback_id') or traceability.get('feedback_id'),
+            'tactical_action': traceability.get('tactical_action'),
+            'expected_holding_period': traceability.get('expected_holding_period')
+            or traceability.get('suggested_holding_period'),
+            'entry_execution_mode': traceability.get('entry_execution_mode'),
             'dispatch': {
                 'status': dispatch_status
                 or (
@@ -1791,6 +1893,14 @@ class SignalDeciderExecIntegrationService:
         )
         return {
             **plan_summary,
+            'decision_agent_counts': dict(
+                sorted(
+                    Counter(
+                        _normalize_decision_agent_name(item.get('decision_agent_name'))
+                        for item in items
+                    ).items()
+                )
+            ),
             'dispatch_status_counts': dict(sorted(dispatch_status_counts.items())),
             'remote_status_counts': dict(sorted(remote_status_counts.items())),
             'remote_open_count': sum(
@@ -1805,6 +1915,8 @@ class SignalDeciderExecIntegrationService:
         return {
             'plan_item_id': item.get('plan_item_id'),
             'execution_window': item.get('execution_window'),
+            'agent_name': item.get('decision_agent_name'),
+            'decision_agent_name': item.get('decision_agent_name'),
             'target_trade_date': item.get('target_trade_date'),
             'source_market_date': item.get('source_market_date'),
             'account_reference': item.get('account_reference'),
@@ -1983,6 +2095,7 @@ class SignalDeciderExecIntegrationService:
         runtime_status: str,
     ) -> dict[str, Any]:
         symbol = _normalize_optional_text(item.get('symbol')) or 'UNKNOWN'
+        decision_agent_name = _normalize_decision_agent_name(item.get('decision_agent_name'))
         metadata = symbol_metadata_map.get(symbol, {'name': symbol, 'market': None})
         remote_state = item.get('remote_state') if isinstance(item.get('remote_state'), dict) else {}
         orders = remote_state.get('orders') if isinstance(remote_state.get('orders'), list) else []
@@ -2024,6 +2137,8 @@ class SignalDeciderExecIntegrationService:
             'symbol': symbol,
             'name': metadata['name'],
             'market': metadata['market'],
+            'agent_name': decision_agent_name,
+            'decision_agent_name': decision_agent_name,
             'intent': EXEC_INTENT_NEXT_OPEN_BUY,
             'status': status,
             'monitoring_state': monitoring_state,
@@ -2034,8 +2149,10 @@ class SignalDeciderExecIntegrationService:
             'open_quantity': _to_json_number(open_quantity),
             'planned_price': item.get('estimated_reference_price'),
             'avg_fill_price': self._resolve_average_fill_price(executions=executions, positions=positions),
-            'decision_source': 'signal-decider',
+            'decision_source': decision_agent_name,
             'decision_snapshot_id': item.get('decision_snapshot_id'),
+            'source_feedback_id': item.get('source_feedback_id'),
+            'decision_run_id': item.get('decision_run_id'),
             'policy_version': item.get('policy_version'),
             'execution_plan_id': _normalize_optional_text((item.get('dispatch') or {}).get('plan_id')),
             'broker_order_id': self._resolve_broker_order_id(orders=orders, executions=executions),
@@ -2048,6 +2165,10 @@ class SignalDeciderExecIntegrationService:
             'failure_reason': self._resolve_failure_reason(item=item, order_statuses=order_statuses, status=status),
             'target_price': item.get('target_price'),
             'stop_loss_price': item.get('stop_loss_price'),
+            'trigger_price': item.get('trigger_price'),
+            'chase_limit_price': item.get('chase_limit_price'),
+            'expected_holding_period': item.get('expected_holding_period'),
+            'entry_execution_mode': item.get('entry_execution_mode'),
             'target_trade_date': item.get('target_trade_date'),
             'source_market_date': item.get('source_market_date'),
         }
@@ -2088,6 +2209,13 @@ class SignalDeciderExecIntegrationService:
             'monitoring_state': monitoring['state'],
             'position_side': monitoring['position_side'],
             'planned_intents': monitoring['planned_intents'],
+            'decision_agent_names': sorted(
+                {
+                    _normalize_decision_agent_name(item.get('decision_agent_name'))
+                    for item in items
+                    if _normalize_optional_text(item.get('decision_agent_name'))
+                }
+            ),
             'last_event_at': monitoring['last_event_at'],
             'account_references': sorted(
                 {
@@ -2187,6 +2315,14 @@ class SignalDeciderExecIntegrationService:
                     for item in items
                     if _normalize_optional_text(item.get('account_reference'))
                 }
+            ),
+            'decision_agent_counts': dict(
+                sorted(
+                    Counter(
+                        _normalize_decision_agent_name(item.get('decision_agent_name'))
+                        for item in items
+                    ).items()
+                )
             ),
             'status_counts': dict(sorted(status_counts.items())),
             'planned_quantity_total': _to_json_number(planned_quantity_total),
