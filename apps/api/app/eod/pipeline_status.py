@@ -39,7 +39,12 @@ from app.eod.run_stage_support import (
     select_preferred_eod_run,
 )
 from app.market.clock import get_market_state
-from app.market_data_store import DAY_BASED_TRENDING_PERIODS, count_live_symbols, load_eod_run_stage_counts
+from app.market_data_store import (
+    DAY_BASED_TRENDING_PERIODS,
+    count_daily_price_bars_for_date,
+    count_live_symbols,
+    load_eod_run_stage_counts,
+)
 from app.repositories.eod_run_repository import list_eod_collection_runs
 
 DEFAULT_FACTOR_STAGE_ORDER = tuple(
@@ -101,6 +106,10 @@ def _noop_factor_stage_counts_loader(*, market_date: str) -> dict[str, dict[str,
     return {}
 
 
+def _noop_price_bar_count_loader(*, market_date: str) -> int:
+    return 0
+
+
 def _load_factor_stage_counts(*, market_date: str) -> dict[str, dict[str, Any]]:
     normalized_market_date = date.fromisoformat(market_date)
     counts: dict[str, dict[str, Any]] = {}
@@ -136,6 +145,7 @@ class EODPipelineStatusService:
     live_symbol_count_loader: Callable = count_live_symbols
     fundamentals_refresh_loader: Callable = _load_latest_fundamentals_refresh_run
     factor_stage_counts_loader: Callable = _noop_factor_stage_counts_loader
+    price_bar_count_loader: Callable = _noop_price_bar_count_loader
 
     def read(
         self,
@@ -162,6 +172,9 @@ class EODPipelineStatusService:
             fs_div=resolved_fs_div,
         )
         factor_stage_counts = self.factor_stage_counts_loader(market_date=resolved_market_date)
+        stored_price_rows = int(dict(pykrx_stage_counts.get('price_collection') or {}).get('persisted') or 0)
+        if stored_price_rows <= 0:
+            stored_price_rows = int(self.price_bar_count_loader(market_date=resolved_market_date) or 0)
         stages = {
             **pykrx_stages,
             'fundamentals_daily_refresh': fundamentals_stage,
@@ -172,6 +185,7 @@ class EODPipelineStatusService:
                 stage_id=stage_id,
                 market_date=resolved_market_date,
                 price_stage=price_stage,
+                price_rows_persisted=stored_price_rows,
                 prior_stages=stages,
                 aggregate=dict(factor_stage_counts.get(stage_id) or {}),
                 live_symbols_total=live_symbols_total,
@@ -547,6 +561,7 @@ class EODPipelineStatusService:
         stage_id: str,
         market_date: str,
         price_stage: dict[str, Any],
+        price_rows_persisted: int,
         prior_stages: dict[str, dict[str, Any]],
         aggregate: dict[str, Any],
         live_symbols_total: int,
@@ -554,11 +569,13 @@ class EODPipelineStatusService:
         definition = STAGE_DEFINITIONS[stage_id]
         label = definition.label
         persisted = int(aggregate.get('persisted') or 0)
-        expected_total = self._resolve_factor_expected_total(
+        expected_total, expected_total_source = self._resolve_factor_expected_total(
             price_stage=price_stage,
+            price_rows_persisted=price_rows_persisted,
             live_symbols_total=live_symbols_total,
             persisted=persisted,
         )
+        price_stage_expected_total = self._resolve_price_stage_metadata_total(price_stage=price_stage)
         blocking_stages = [
             dependency
             for dependency in definition.depends_on
@@ -614,6 +631,9 @@ class EODPipelineStatusService:
                 'failed_blocking_stages': failed_blocking_stages,
                 'rows_persisted': persisted,
                 'expected_rows': max(expected_total, persisted),
+                'expected_rows_source': expected_total_source,
+                'price_bars_persisted': price_rows_persisted or None,
+                'price_stage_expected_rows': price_stage_expected_total or None,
                 'no_rows_present': persisted == 0,
                 'output_tables': list(definition.output_tables),
                 'inspect_routes': list(definition.inspect_routes),
@@ -625,15 +645,26 @@ class EODPipelineStatusService:
     def _resolve_factor_expected_total(
         *,
         price_stage: dict[str, Any],
+        price_rows_persisted: int,
         live_symbols_total: int,
         persisted: int,
-    ) -> int:
+    ) -> tuple[int, str]:
+        expected_total = int(price_rows_persisted or 0)
+        if expected_total > 0:
+            return max(expected_total, persisted), 'daily_price_bars'
+
+        expected_total = EODPipelineStatusService._resolve_price_stage_metadata_total(price_stage=price_stage)
+        if expected_total <= 0:
+            expected_total = int(live_symbols_total or 0)
+            return max(expected_total, persisted), 'live_symbol_count'
+        return max(expected_total, persisted), 'price_stage_metadata'
+
+    @staticmethod
+    def _resolve_price_stage_metadata_total(*, price_stage: dict[str, Any]) -> int:
         expected_total = int(price_stage.get('succeeded') or 0)
         if expected_total <= 0:
             expected_total = int(price_stage.get('total') or 0)
-        if expected_total <= 0:
-            expected_total = int(live_symbols_total or 0)
-        return max(expected_total, persisted)
+        return expected_total
 
     @staticmethod
     def _build_factor_activity(
@@ -674,4 +705,5 @@ class EODPipelineStatusService:
 
 eod_pipeline_status_service = EODPipelineStatusService(
     factor_stage_counts_loader=_load_factor_stage_counts,
+    price_bar_count_loader=lambda *, market_date: count_daily_price_bars_for_date(market_date),
 )
