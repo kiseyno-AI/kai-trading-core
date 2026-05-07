@@ -22,6 +22,9 @@ What it does:
 
 ## Health checks
 - `GET /health`
+- `GET /broker/kis/health`
+- `POST /broker/kis/intraday-snapshots/collect?symbols=005930`
+- `GET /broker/kis/intraday-snapshots?symbols=005930&limit=5`
 - `GET /portfolio/summary`
 - `GET /trading/orders/exec/runtime?refresh=true`
 - `GET /trading/orders/exec/signal-decider?target_trade_date=2026-04-30&refresh=true`
@@ -87,8 +90,9 @@ What it does:
 - During `OPEN`, if `SIGNAL_DECIDER_EXEC_INTEGRATION_MODE=disabled`, core submits or dry-runs eligible next-open execution-plan rows through the existing trading order service, using the `SIGNAL_DECIDER_NEXT_OPEN_*` safety settings and deterministic client-order ids for duplicate protection.
 - During `OPEN`, if `SIGNAL_DECIDER_EXEC_INTEGRATION_MODE=disabled`, core also evaluates linked next-open positions against persisted signal-decider target/stop thresholds and submits intraday auto-sell market orders when the live KIS quote crosses a configured exit rule.
 - During `OPEN`, if `SIGNAL_DECIDER_EXEC_INTEGRATION_MODE=dispatch`, core does not place those live signal-decider orders itself. Instead it refreshes the core-owned exec read model from the exec runtime APIs so operator and web views can read dispatch/runtime/order/execution state without double-submitting live actions from core.
+- KIS intraday execution-context snapshots are a separate credential-aware capture lane. They do not run inside the PyKRX/DART EOD jobs, and the manual/API collect path safely returns `status=disabled` when KIS credentials are unavailable or the feature toggle is off.
 - During `CLOSED`, after `EOD_AUTO_PYKRX_AFTER_CLOSE_MINUTES`, it schedules a thread-based pykrx daily EOD run if that trade date is available and not already completed.
-- Database persistence stores symbol master data, tracked symbols, quote cache/history, market status snapshots, the current market snapshot cache, durable Korea Exim FX snapshots for request-time USD/KRW fallback, EOD bars, EOD run records, persisted daily price contexts, daily PyKRX enrichment rows, daily technical/action snapshots, KIS daily signal features, KIS daily market-risk snapshots, persisted daily market-risk filter results, persisted daily momentum factor results, persisted daily low-risk factor results, persisted daily beta factor results, persisted daily advanced value factor results, persisted daily unified value factor results, persisted daily composite factor results, persisted daily market participation context, and stored day-based trending ranks.
+- Database persistence stores symbol master data, tracked symbols, quote cache/history, market status snapshots, the current market snapshot cache, durable Korea Exim FX snapshots for request-time USD/KRW fallback, EOD bars, EOD run records, persisted daily price contexts, daily PyKRX enrichment rows, daily technical/action snapshots, KIS daily signal features, KIS intraday snapshot history/current-cache rows, KIS daily market-risk snapshots, persisted daily market-risk filter results, persisted daily momentum factor results, persisted daily low-risk factor results, persisted daily beta factor results, persisted daily advanced value factor results, persisted daily unified value factor results, persisted daily composite factor results, persisted daily market participation context, and stored day-based trending ranks.
 
 ## Database bootstrap
 
@@ -196,7 +200,10 @@ Useful limited-scope runs:
 - API-triggered composite factor rerun: `curl -X POST "http://127.0.0.1:8000/eod/composite-factors/compute?market_date=2026-04-24"`
 - Persisted composite factor inspect: `curl "http://127.0.0.1:8000/eod/composite-factors?market_date=2026-04-24&symbol=005930"`
 - KIS ranking signal-feature collection: `python3.11 -m app.internal.ops kis-daily-signal-features-collect --market-date 2026-04-14`
+- KIS intraday execution-context snapshot collection: `python3.11 -m app.internal.ops kis-intraday-snapshots-collect --symbols 005930 --include-news true`
 - KIS market-risk snapshot collection: `python3.11 -m app.internal.ops eod-market-risk-snapshots-collect --market-date 2026-04-14`
+- API-triggered KIS intraday execution-context snapshot collection: `curl -X POST "http://127.0.0.1:8000/broker/kis/intraday-snapshots/collect?symbols=005930&max_news_items=5"`
+- API-triggered KIS intraday execution-context snapshot inspect: `curl "http://127.0.0.1:8000/broker/kis/intraday-snapshots?symbols=005930&limit=5"`
 - API-triggered KIS market-risk snapshot collection: `curl -X POST "http://127.0.0.1:8000/eod/market-risk-snapshots/collect?market_date=2026-04-14"`
 - API-triggered KIS market-risk filter compute: `curl -X POST "http://127.0.0.1:8000/eod/market-risk-filters/compute?market_date=2026-04-14"`
 - Recent derived-context backfill: `python3.11 -m app.internal.ops agent-derived-contexts-backfill-recent`
@@ -232,6 +239,7 @@ Internal ops commands from `apps/api`:
 - `python3.11 -m app.internal.ops agent-signal-decider-evaluations-compute --market-date 2026-04-30 --horizons 1,3,5,10`
 - `python3.11 -m app.internal.ops agent-signal-decider-calendar-refresh --market-date 2026-04-30 --lookback-days 30 --horizons 1,3,5,10 --primary-horizons 1,3,5,10`
 - `python3.11 -m app.internal.ops kis-daily-signal-features-collect --market-date 2026-04-14`
+- `python3.11 -m app.internal.ops kis-intraday-snapshots-collect --symbols 005930 --include-news true`
 - `python3.11 -m app.internal.ops agent-derived-contexts-backfill-recent`
 - `python3.11 -m app.internal.index_audit`
 

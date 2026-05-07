@@ -52,6 +52,11 @@ class Settings(BaseSettings):
     kis_order_reconcile_stale_after_minutes: int = 15
     kis_order_reconcile_recent_days: int = 3
     kis_order_reconcile_batch_limit: int = 100
+    kis_intraday_snapshot_enabled: bool = True
+    kis_intraday_snapshot_market_code: str = 'J'
+    kis_intraday_snapshot_max_ranking_pages: int = 2
+    kis_intraday_snapshot_news_pages: int = 2
+    kis_intraday_snapshot_news_limit: int = 5
     portfolio_account_references: str = ''
     portfolio_summary_cache_ttl_seconds: int = 60
     signal_decider_next_open_enabled: bool = False

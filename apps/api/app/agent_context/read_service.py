@@ -30,6 +30,7 @@ from app.dart.service import (
 from app.dart.store import DartSyncRepository, dart_sync_repository
 from app.eod.pykrx_enrichment import pykrx_enrichment_service
 from app.market_data_store import (
+    load_current_kis_intraday_snapshots,
     load_daily_advanced_value_factor_results,
     load_daily_action_summaries,
     load_daily_beta_factor_results,
@@ -1045,6 +1046,84 @@ def _build_signal_features_freshness_provenance(
     )
 
 
+def _build_intraday_execution_context(row: dict[str, Any] | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+
+    return {
+        'status': str(row.get('availability_status') or 'available'),
+        'market_state': row.get('market_state'),
+        'market_code': row.get('market_code'),
+        'source': row.get('source'),
+        'feature_version': row.get('feature_version'),
+        'as_of_market_date': row.get('as_of_market_date'),
+        'as_of_timestamp': row.get('as_of_timestamp'),
+        'coverage': row.get('coverage'),
+        'availability': row.get('availability'),
+        'freshness': row.get('freshness'),
+        'quote': row.get('quote'),
+        'orderbook': row.get('orderbook'),
+        'liquidity': row.get('liquidity'),
+        'investor_program_activity': row.get('investor_program_activity'),
+        'news_hints': row.get('news_hints'),
+    }
+
+
+def _build_intraday_execution_freshness_provenance(
+    *,
+    row: dict[str, Any] | None,
+    requested_market_date: date,
+) -> dict[str, Any]:
+    if row is None:
+        return _build_freshness_provenance(
+            requested_market_date=requested_market_date,
+            freshness_status=FRESHNESS_STATUS_MISSING,
+            provenance_status=PROVENANCE_STATUS_PROVIDER_SOURCED,
+            source_tables=('current_kis_intraday_snapshot_cache', 'kis_intraday_snapshots'),
+            source_provider='kis',
+            row_count=0,
+            reason='no_current_kis_intraday_snapshot_cache_row',
+        )
+
+    as_of_market_date = str(
+        row.get('as_of_market_date')
+        or ((row.get('freshness') or {}).get('market_date') if isinstance(row.get('freshness'), dict) else '')
+        or ''
+    ) or None
+    trade_date_relation = _trade_date_relation_to_request(
+        as_of_market_date=as_of_market_date,
+        requested_market_date=requested_market_date,
+    )
+    freshness_status = (
+        FRESHNESS_STATUS_FRESH
+        if trade_date_relation in {None, 'same_market_date'}
+        else FRESHNESS_STATUS_STALE
+    )
+    return _build_freshness_provenance(
+        requested_market_date=requested_market_date,
+        freshness_status=freshness_status,
+        provenance_status=PROVENANCE_STATUS_PROVIDER_SOURCED,
+        source_tables=('current_kis_intraday_snapshot_cache', 'kis_intraday_snapshots'),
+        source_provider=str(row.get('source') or 'kis'),
+        as_of_market_date=as_of_market_date,
+        as_of_timestamp=row.get('as_of_timestamp') or row.get('captured_at'),
+        latest_available_market_date=as_of_market_date,
+        latest_available_timestamp=row.get('captured_at'),
+        row_count=1,
+        trade_date_relation_to_request=trade_date_relation,
+        reason='intraday_snapshot_partial' if str(row.get('availability_status') or '') == 'partial' else None,
+        extra={
+            'availability_status': row.get('availability_status'),
+            'coverage_status': ((row.get('coverage') or {}).get('status') if isinstance(row.get('coverage'), dict) else None),
+            'available_intraday_blocks': (
+                ((row.get('coverage') or {}).get('available_blocks'))
+                if isinstance(row.get('coverage'), dict)
+                else None
+            ),
+        },
+    )
+
+
 def _build_fundamentals_freshness_provenance(
     *,
     fundamentals: dict[str, Any],
@@ -1287,6 +1366,27 @@ def _build_signal_feature_completeness(row: dict[str, Any] | None) -> dict[str, 
         'null_submetric_count': len(null_submetric_fields),
         'present_submetric_fields': present_submetric_fields,
         'present_submetric_count': len(present_submetric_fields),
+    }
+
+
+def _build_intraday_execution_completeness(row: dict[str, Any] | None) -> dict[str, Any]:
+    if row is None:
+        return {
+            'status': 'unavailable',
+            'reason': 'No persisted KIS intraday execution-context snapshot is available.',
+            'available_blocks': 0,
+            'partial_blocks': 0,
+            'total_blocks': 5,
+        }
+
+    coverage = row.get('coverage') if isinstance(row.get('coverage'), dict) else {}
+    block_statuses = dict(coverage.get('block_statuses') or {})
+    return {
+        'status': str(row.get('availability_status') or coverage.get('status') or 'available'),
+        'available_blocks': int(coverage.get('available_blocks') or 0),
+        'partial_blocks': int(coverage.get('partial_blocks') or 0),
+        'total_blocks': int(coverage.get('total_blocks') or 5),
+        'block_statuses': block_statuses,
     }
 
 
@@ -1642,6 +1742,10 @@ class AgentContextReadService:
             symbols=normalized_symbols,
             limit=max(len(normalized_symbols), 1000),
         )
+        intraday_execution_rows = load_current_kis_intraday_snapshots(
+            symbols=normalized_symbols,
+            limit=max(len(normalized_symbols), 1000),
+        )
         price_context_rows = load_daily_price_contexts(
             market_date=normalized_market_date,
             symbols=normalized_symbols,
@@ -1686,6 +1790,7 @@ class AgentContextReadService:
         beta_map = {item['symbol']: item for item in beta_rows}
         composite_map = {item['symbol']: item for item in composite_rows}
         quote_map = {item['symbol']: item for item in quote_rows}
+        intraday_execution_map = {item['symbol']: item for item in intraday_execution_rows}
         price_context_map = {item['symbol']: item['context_payload'] for item in price_context_rows}
         price_context_history_map = _group_price_context_history(
             price_context_history_rows,
@@ -1712,6 +1817,8 @@ class AgentContextReadService:
         for symbol in normalized_symbols:
             raw_quote_row = quote_map.get(symbol)
             quote_context = _build_quote_context(raw_quote_row, market_date=normalized_market_date)
+            intraday_execution_row = intraday_execution_map.get(symbol)
+            intraday_execution_context = _build_intraday_execution_context(intraday_execution_row)
             price_context = price_context_map.get(symbol)
             price_context_history = price_context_history_map.get(symbol, [])
             technical_snapshot = technical_map.get(symbol)
@@ -1801,6 +1908,7 @@ class AgentContextReadService:
                     for family, row in persisted_factor_rows.items()
                 },
                 'signal_features': _build_signal_feature_completeness(signal_features),
+                'intraday_execution_context': _build_intraday_execution_completeness(intraday_execution_row),
                 'market_relative_context': _build_market_relative_completeness(market_relative_context),
                 'sector_peer_mapping': _build_context_block_completeness(
                     sector_peer_context,
@@ -1846,6 +1954,10 @@ class AgentContextReadService:
             signal_features_provenance = _build_signal_features_freshness_provenance(
                 signal_features=signal_features,
                 latest_prior_row=(latest_prior_rows.get('signal_features') or {}).get(symbol),
+                requested_market_date=normalized_market_date,
+            )
+            intraday_execution_provenance = _build_intraday_execution_freshness_provenance(
+                row=intraday_execution_row,
                 requested_market_date=normalized_market_date,
             )
             fundamentals_provenance = _build_fundamentals_freshness_provenance(
@@ -1912,6 +2024,11 @@ class AgentContextReadService:
                 signal_features = {
                     **signal_features,
                     'freshness_provenance': signal_features_provenance,
+                }
+            if intraday_execution_context is not None:
+                intraday_execution_context = {
+                    **intraday_execution_context,
+                    'freshness_provenance': intraday_execution_provenance,
                 }
             if sector_peer_context is not None:
                 sector_peer_context = {
@@ -2001,6 +2118,7 @@ class AgentContextReadService:
                 'company': company_row is not None,
                 'quote_context': quote_context is not None,
                 'price_context': price_context is not None,
+                'intraday_execution_context': intraday_execution_context is not None,
                 'technical_snapshot': technical_snapshot is not None,
                 'action_summary': action_summary is not None,
                 'signal_features': signal_features is not None,
@@ -2029,6 +2147,7 @@ class AgentContextReadService:
                     'company': company,
                     'quote_context': quote_context,
                     'price_context': price_context,
+                    'intraday_execution_context': intraday_execution_context,
                     'price_context_history': price_context_history,
                     'technical_snapshot': technical_snapshot,
                     'action_summary': action_summary,
@@ -2051,6 +2170,7 @@ class AgentContextReadService:
                     'context_provenance': {
                         'quote_context': quote_context_provenance,
                         'price_context': price_context_provenance,
+                        'intraday_execution_context': intraday_execution_provenance,
                         'signal_features': signal_features_provenance,
                         'sector_peer_context': sector_peer_context_provenance,
                         'market_breadth_context': market_breadth_context_provenance,
@@ -2079,6 +2199,16 @@ class AgentContextReadService:
             for family, present_count in factor_row_counts.items()
         }
         signal_feature_present_count = sum(1 for item in items if item['signal_features'] is not None)
+        intraday_execution_available_count = sum(
+            1
+            for item in items
+            if str((item.get('intraday_execution_context') or {}).get('status') or 'unavailable') == 'available'
+        )
+        intraday_execution_partial_count = sum(
+            1
+            for item in items
+            if str((item.get('intraday_execution_context') or {}).get('status') or 'unavailable') == 'partial'
+        )
         market_relative_available_count = sum(
             1
             for item in items
@@ -2152,6 +2282,11 @@ class AgentContextReadService:
                     partial_label='sparse',
                 ),
             },
+            'intraday_execution_context': _build_symbol_block_coverage(
+                available_count=intraday_execution_available_count,
+                partial_count=intraday_execution_partial_count,
+                requested_count=requested_symbol_count,
+            ),
             'market_relative_context': {
                 'available_rows': market_relative_available_count,
                 'partial_rows': market_relative_partial_count,
@@ -2197,6 +2332,7 @@ class AgentContextReadService:
         for item in items:
             item['context_completeness']['requested_symbol_coverage'] = requested_symbol_coverage
             item['context_provenance']['signal_features']['requested_symbol_coverage'] = requested_symbol_coverage['signal_features']
+            item['context_provenance']['intraday_execution_context']['requested_symbol_coverage'] = requested_symbol_coverage['intraday_execution_context']
             item['context_provenance']['sector_peer_context']['requested_symbol_coverage'] = requested_symbol_coverage['sector_peer_mapping']
             item['context_provenance']['market_breadth_context']['requested_symbol_coverage'] = requested_symbol_coverage['market_breadth_context']
             item['context_provenance']['investor_flow_context']['requested_symbol_coverage'] = requested_symbol_coverage['investor_flow_context']
@@ -2219,6 +2355,7 @@ class AgentContextReadService:
                 'missing_symbols': missing_symbols,
                 'quote_context_count': sum(1 for item in items if item['quote_context'] is not None),
                 'price_context_count': sum(1 for item in items if item['price_context'] is not None),
+                'intraday_execution_context_count': sum(1 for item in items if item['intraday_execution_context'] is not None),
                 'technical_snapshot_count': sum(1 for item in items if item['technical_snapshot'] is not None),
                 'action_summary_count': sum(1 for item in items if item['action_summary'] is not None),
                 'signal_feature_count': sum(1 for item in items if item['signal_features'] is not None),

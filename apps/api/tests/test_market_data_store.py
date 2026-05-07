@@ -5,12 +5,21 @@ from sqlalchemy import delete, select
 from sqlalchemy.dialects import postgresql
 
 from app.db import engine, session_scope
-from app.db_models import DailyPriceBar, DailyPykrxEnrichmentRow, EODCollectionRun, Symbol
+from app.db_models import (
+    CurrentKISIntradaySnapshotCache,
+    DailyPriceBar,
+    DailyPykrxEnrichmentRow,
+    EODCollectionRun,
+    KISIntradaySnapshot,
+    Symbol,
+)
 from app.market_data_store import (
     _build_daily_market_relative_rows_query,
     load_daily_market_relative_contexts,
     load_daily_pykrx_enrichment_rows,
+    load_current_kis_intraday_snapshot,
     upsert_daily_pykrx_enrichment_rows,
+    persist_kis_intraday_snapshot,
 )
 
 
@@ -386,6 +395,62 @@ class PykrxEnrichmentStoreIntegrationTests(unittest.TestCase):
         self.assertEqual(valuation_row['name_ko'], 'Value Alpha')
         self.assertEqual(valuation_row['payload']['per'], 10.8)
         self.assertEqual(foreign_row['payload']['foreign_ownership_ratio_pct'], 33.1)
+
+
+class KISIntradaySnapshotStoreIntegrationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        Symbol.__table__.create(bind=engine, checkfirst=True)
+        KISIntradaySnapshot.__table__.create(bind=engine, checkfirst=True)
+        CurrentKISIntradaySnapshotCache.__table__.create(bind=engine, checkfirst=True)
+
+    def tearDown(self) -> None:
+        with session_scope() as session:
+            symbol_ids = list(session.execute(select(Symbol.id).where(Symbol.symbol.in_(['771001']))).scalars().all())
+            if symbol_ids:
+                session.execute(delete(KISIntradaySnapshot).where(KISIntradaySnapshot.symbol_id.in_(symbol_ids)))
+                session.execute(
+                    delete(CurrentKISIntradaySnapshotCache).where(
+                        CurrentKISIntradaySnapshotCache.symbol_id.in_(symbol_ids)
+                    )
+                )
+            session.execute(delete(Symbol).where(Symbol.symbol == '771001'))
+
+    def test_persist_and_load_current_kis_intraday_snapshot(self) -> None:
+        persist_kis_intraday_snapshot(
+            {
+                'symbol': '771001',
+                'name_ko': 'Intraday Alpha',
+                'market': 'KOSPI',
+                'market_code': 'J',
+                'source': 'kis_intraday_snapshot_v1',
+                'feature_version': 'kis_intraday_snapshot_v1',
+                'availability_status': 'partial',
+                'freshness_status': 'fresh',
+                'as_of_market_date': '2026-05-07',
+                'as_of_timestamp': '2026-05-07T10:15:30+09:00',
+                'snapshot_payload': {
+                    'symbol': '771001',
+                    'market_state': 'OPEN',
+                    'coverage': {'status': 'partial', 'available_blocks': 3, 'partial_blocks': 1, 'total_blocks': 5},
+                    'quote': {'price': 71550},
+                    'liquidity': {'volume_power_rank': 3},
+                },
+            }
+        )
+
+        row = load_current_kis_intraday_snapshot('771001')
+
+        assert row is not None
+        self.assertEqual(row['symbol'], '771001')
+        self.assertEqual(row['name_ko'], 'Intraday Alpha')
+        self.assertEqual(row['availability_status'], 'partial')
+        self.assertEqual(row['freshness_status'], 'fresh')
+        self.assertEqual(row['as_of_market_date'], '2026-05-07')
+        self.assertEqual(row['quote']['price'], 71550)
+        self.assertEqual(row['liquidity']['volume_power_rank'], 3)
+        self.assertIsNotNone(row['captured_at'])
+        self.assertIsNotNone(row['cached_at'])
 
 
 if __name__ == '__main__':

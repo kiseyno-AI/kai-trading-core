@@ -41,6 +41,16 @@ GET /broker/kis/health
       "refresh_interval_seconds": 60
     }
   },
+  "intraday_snapshot_runtime": {
+    "enabled": true,
+    "ready": true,
+    "credentials_configured": true,
+    "kis_use_mock": true,
+    "market_code": "J",
+    "max_ranking_pages": 2,
+    "news_limit": 5,
+    "blocking_reasons": []
+  },
   "realtime_order_notices": {
     "enabled": true,
     "configured": true,
@@ -78,5 +88,6 @@ GET /broker/kis/health
 
 ## Notes
 - `market_snapshot_runtime` and `portfolio_summary_runtime` are route-specific readiness summaries for deploy and operator checks.
+- `intraday_snapshot_runtime` is the readiness summary for the separate KIS intraday execution-context capture path. `ready=false` means Core will safely return `status=disabled` from the collect route instead of attempting live KIS calls.
 - `portfolio_summary_runtime.ready=false` means `/portfolio/summary` is still blocked by config such as missing `PORTFOLIO_ACCOUNT_REFERENCES`, missing KIS secrets, or `KIS_USE_MOCK=true` in `APP_ENV=production`.
 - `portfolio_summary_runtime.cache` exposes whether Core currently has a cached portfolio snapshot, whether it is stale, and the last refresh status/error without forcing a live broker read.

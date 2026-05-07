@@ -34,6 +34,7 @@ from app.eod.pykrx_enrichment import pykrx_enrichment_service
 from app.eod.state import job_state
 from app.eod.technical_snapshots import daily_technical_snapshot_service
 from app.market.clock import get_market_state
+from app.market.kis_intraday_snapshots import KIS_INTRADAY_SNAPSHOT_SOURCE, kis_intraday_snapshot_service
 from app.market_data_store import (
     compute_and_persist_daily_trending_ranks,
     load_tracked_symbols,
@@ -225,6 +226,29 @@ def collect_kis_daily_signal_features(
             max_pages=max_pages,
             overtime_volume_rank_sort_cls_code=overtime_volume_rank_sort_cls_code,
             overtime_fluctuation_div_cls_code=overtime_fluctuation_div_cls_code,
+        )
+    )
+
+
+def collect_kis_intraday_snapshots(
+    *,
+    symbols: str | None = None,
+    market_code: str | None = None,
+    source: str = KIS_INTRADAY_SNAPSHOT_SOURCE,
+    max_ranking_pages: int | None = None,
+    max_news_items: int | None = None,
+    include_news: bool = True,
+) -> dict[str, Any]:
+    bootstrap_runtime()
+    parsed_symbols = [item.strip() for item in symbols.split(',') if item.strip()] if symbols else None
+    return asyncio.run(
+        kis_intraday_snapshot_service.collect_snapshots(
+            symbols=parsed_symbols,
+            market_code=market_code,
+            source=source,
+            max_ranking_pages=max_ranking_pages,
+            max_news_items=max_news_items,
+            include_news=include_news,
         )
     )
 
@@ -769,6 +793,17 @@ def _build_parser() -> argparse.ArgumentParser:
     signal_features_parser.add_argument('--overtime-volume-rank-sort-cls-code', default='2')
     signal_features_parser.add_argument('--overtime-fluctuation-div-cls-code', default='2')
 
+    intraday_snapshot_parser = subparsers.add_parser(
+        'kis-intraday-snapshots-collect',
+        help='Collect current KIS intraday execution-context snapshots directly',
+    )
+    intraday_snapshot_parser.add_argument('--symbols')
+    intraday_snapshot_parser.add_argument('--market-code')
+    intraday_snapshot_parser.add_argument('--source', default=KIS_INTRADAY_SNAPSHOT_SOURCE)
+    intraday_snapshot_parser.add_argument('--max-ranking-pages', type=int)
+    intraday_snapshot_parser.add_argument('--max-news-items', type=int)
+    intraday_snapshot_parser.add_argument('--include-news', choices=('true', 'false'), default='true')
+
     piotroski_filter_parser = subparsers.add_parser(
         'eod-piotroski-filter-collect',
         help='Compute and persist daily Piotroski filter results directly',
@@ -1047,6 +1082,15 @@ def main(argv: Iterable[str] | None = None) -> int:
             max_pages=args.max_pages,
             overtime_volume_rank_sort_cls_code=args.overtime_volume_rank_sort_cls_code,
             overtime_fluctuation_div_cls_code=args.overtime_fluctuation_div_cls_code,
+        )
+    elif args.command == 'kis-intraday-snapshots-collect':
+        payload = collect_kis_intraday_snapshots(
+            symbols=args.symbols,
+            market_code=args.market_code,
+            source=args.source,
+            max_ranking_pages=args.max_ranking_pages,
+            max_news_items=args.max_news_items,
+            include_news=args.include_news == 'true',
         )
     elif args.command == 'eod-piotroski-filter-collect':
         payload = collect_daily_piotroski_filter_results(market_date=args.market_date)

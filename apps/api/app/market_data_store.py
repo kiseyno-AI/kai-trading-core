@@ -11,6 +11,7 @@ from sqlalchemy.orm import aliased
 
 from app.db import engine, session_scope
 from app.db_models import (
+    CurrentKISIntradaySnapshotCache,
     CurrentQuoteCache,
     DailyActionSummary,
     DailyAdvancedValueFactorResult,
@@ -33,6 +34,7 @@ from app.db_models import (
     DailyValueFactorResult,
     EODCollectionRun,
     FavoriteSymbol,
+    KISIntradaySnapshot,
     MarketStatusSnapshot,
     QuoteSnapshot,
     Symbol,
@@ -80,6 +82,12 @@ def _normalize_trade_date(value: str | date) -> date:
     if isinstance(value, date):
         return value
     return _parse_trade_date(value)
+
+
+def _normalize_optional_trade_date(value: str | date | None) -> date | None:
+    if value in (None, ''):
+        return None
+    return _normalize_trade_date(value)
 
 
 def _parse_datetime(value: str | None) -> datetime | None:
@@ -244,6 +252,145 @@ def load_current_quotes(
         return [
             _serialize_current_quote_cache_row(row, symbol=symbol)
             for row, symbol in rows
+        ]
+
+
+def persist_kis_intraday_snapshot(snapshot: dict) -> None:
+    refreshed_at = datetime.utcnow()
+    with session_scope() as session:
+        symbol = _get_symbol(session, snapshot['symbol'])
+        if symbol is None:
+            symbol = Symbol(
+                symbol=snapshot['symbol'],
+                market=snapshot.get('market') or 'KRX',
+                name_ko=snapshot.get('name_ko') or snapshot['symbol'],
+                instrument_type='equity',
+                source=snapshot.get('source', 'kis_intraday_snapshot_v1'),
+                is_active=True,
+                last_refreshed_at=refreshed_at,
+            )
+            session.add(symbol)
+            session.flush()
+        elif snapshot.get('name_ko') and symbol.name_ko == symbol.symbol:
+            symbol.name_ko = snapshot['name_ko']
+            symbol.last_refreshed_at = refreshed_at
+
+        values = {
+            'symbol_id': symbol.id,
+            'market_code': snapshot.get('market_code', 'J'),
+            'source': snapshot.get('source', 'kis_intraday_snapshot_v1'),
+            'feature_version': snapshot.get('feature_version', snapshot.get('source', 'kis_intraday_snapshot_v1')),
+            'availability_status': snapshot.get('availability_status', 'available'),
+            'freshness_status': snapshot.get('freshness_status', 'fresh'),
+            'as_of_market_date': _normalize_optional_trade_date(snapshot.get('as_of_market_date')),
+            'as_of_timestamp': _parse_datetime(snapshot.get('as_of_timestamp')),
+            'snapshot_payload': snapshot['snapshot_payload'],
+        }
+        session.add(KISIntradaySnapshot(**values))
+
+        current = session.execute(
+            select(CurrentKISIntradaySnapshotCache).where(CurrentKISIntradaySnapshotCache.symbol_id == symbol.id)
+        ).scalar_one_or_none()
+        if current is None:
+            session.add(
+                CurrentKISIntradaySnapshotCache(
+                    **values,
+                    captured_at=refreshed_at,
+                )
+            )
+            return
+
+        current.market_code = values['market_code']
+        current.source = values['source']
+        current.feature_version = values['feature_version']
+        current.availability_status = values['availability_status']
+        current.freshness_status = values['freshness_status']
+        current.as_of_market_date = values['as_of_market_date']
+        current.as_of_timestamp = values['as_of_timestamp']
+        current.snapshot_payload = values['snapshot_payload']
+        current.captured_at = refreshed_at
+
+
+def _serialize_current_kis_intraday_snapshot_cache_row(
+    row: CurrentKISIntradaySnapshotCache,
+    *,
+    symbol: str,
+    name_ko: str | None,
+    market: str | None,
+) -> dict:
+    payload = dict(row.snapshot_payload or {})
+    payload['symbol'] = symbol
+    payload['name_ko'] = payload.get('name_ko') or name_ko
+    payload['market'] = payload.get('market') or market
+    payload['market_code'] = payload.get('market_code') or row.market_code
+    payload['source'] = payload.get('source') or row.source
+    payload['feature_version'] = payload.get('feature_version') or row.feature_version
+    payload['availability_status'] = payload.get('availability_status') or row.availability_status
+    payload['freshness_status'] = payload.get('freshness_status') or row.freshness_status
+    payload['as_of_market_date'] = (
+        payload.get('as_of_market_date')
+        or row.as_of_market_date.isoformat()
+        if row.as_of_market_date
+        else payload.get('as_of_market_date')
+    )
+    payload['as_of_timestamp'] = (
+        payload.get('as_of_timestamp')
+        or row.as_of_timestamp.isoformat()
+        if row.as_of_timestamp
+        else payload.get('as_of_timestamp')
+    )
+    payload['captured_at'] = row.captured_at.isoformat() if row.captured_at else None
+    payload['cached_at'] = row.updated_at.isoformat() if row.updated_at else None
+    return payload
+
+
+def load_current_kis_intraday_snapshot(symbol: str) -> dict | None:
+    with session_scope() as session:
+        row = session.execute(
+            select(CurrentKISIntradaySnapshotCache, Symbol.symbol, Symbol.name_ko, Symbol.market)
+            .join(Symbol, Symbol.id == CurrentKISIntradaySnapshotCache.symbol_id)
+            .where(Symbol.symbol == symbol)
+        ).one_or_none()
+        if row is None:
+            return None
+        cache_row, resolved_symbol, name_ko, market = row
+        return _serialize_current_kis_intraday_snapshot_cache_row(
+            cache_row,
+            symbol=resolved_symbol,
+            name_ko=name_ko,
+            market=market,
+        )
+
+
+def load_current_kis_intraday_snapshots(
+    *,
+    symbols: list[str] | None = None,
+    limit: int = 100,
+) -> list[dict]:
+    with session_scope() as session:
+        stmt = (
+            select(
+                CurrentKISIntradaySnapshotCache,
+                Symbol.symbol,
+                Symbol.name_ko,
+                Symbol.market,
+            )
+            .join(Symbol, Symbol.id == CurrentKISIntradaySnapshotCache.symbol_id)
+            .order_by(Symbol.symbol.asc())
+            .limit(limit)
+        )
+        if symbols:
+            stmt = stmt.where(Symbol.symbol.in_(symbols))
+
+        rows = session.execute(stmt).all()
+        return [
+            _serialize_current_kis_intraday_snapshot_cache_row(
+                row,
+                symbol=symbol,
+                name_ko=name_ko,
+                market=market,
+            )
+            for row, symbol, name_ko, market in rows
         ]
 
 

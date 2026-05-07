@@ -116,6 +116,48 @@ class CurrentQuoteCache(Base):
     )
 
 
+class KISIntradaySnapshot(Base):
+    __tablename__ = 'kis_intraday_snapshots'
+    __table_args__ = (
+        Index('ix_kis_intraday_snapshots_availability_status', 'availability_status'),
+        Index('ix_kis_intraday_snapshots_as_of_market_date', 'as_of_market_date'),
+        Index('ix_kis_intraday_snapshots_symbol_captured_at', 'symbol_id', 'captured_at'),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol_id: Mapped[int] = mapped_column(ForeignKey('symbols.id', ondelete='CASCADE'), nullable=False, index=True)
+    market_code: Mapped[str] = mapped_column(String(8), nullable=False, default='J')
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default='kis_intraday_snapshot_v1')
+    feature_version: Mapped[str] = mapped_column(String(32), nullable=False, default='kis_intraday_snapshot_v1')
+    availability_status: Mapped[str] = mapped_column(String(16), nullable=False, default='available')
+    freshness_status: Mapped[str] = mapped_column(String(16), nullable=False, default='fresh')
+    as_of_market_date: Mapped[date | None] = mapped_column(Date)
+    as_of_timestamp: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    snapshot_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+
+
+class CurrentKISIntradaySnapshotCache(Base, TimestampMixin):
+    __tablename__ = 'current_kis_intraday_snapshot_cache'
+    __table_args__ = (
+        UniqueConstraint('symbol_id', name='uq_current_kis_intraday_snapshot_cache_symbol_id'),
+        Index('ix_current_kis_intraday_snapshot_cache_availability_status', 'availability_status'),
+        Index('ix_current_kis_intraday_snapshot_cache_as_of_market_date', 'as_of_market_date'),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol_id: Mapped[int] = mapped_column(ForeignKey('symbols.id', ondelete='CASCADE'), nullable=False, index=True)
+    market_code: Mapped[str] = mapped_column(String(8), nullable=False, default='J')
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default='kis_intraday_snapshot_v1')
+    feature_version: Mapped[str] = mapped_column(String(32), nullable=False, default='kis_intraday_snapshot_v1')
+    availability_status: Mapped[str] = mapped_column(String(16), nullable=False, default='available')
+    freshness_status: Mapped[str] = mapped_column(String(16), nullable=False, default='fresh')
+    as_of_market_date: Mapped[date | None] = mapped_column(Date)
+    as_of_timestamp: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    snapshot_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
 class MarketStatusSnapshot(Base):
     __tablename__ = 'market_status_snapshots'
 
