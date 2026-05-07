@@ -1,0 +1,261 @@
+{
+  "duplicate_focus": [
+    {
+      "id": 101,
+      "market_date": "2026-05-05",
+      "symbol": "005930",
+      "agent_name": "technical-summarizer",
+      "feedback_payload": {
+        "role": "technical-summarizer"
+      },
+      "normalized_feedback_payload": {
+        "role": "technical-summarizer"
+      },
+      "data_gaps_payload": {
+        "items": [
+          "Need factor score coverage.",
+          "Need factor score coverage."
+        ]
+      },
+      "improvement_notes_payload": [
+        "Need factor score coverage.",
+        "Need factor score coverage.",
+        "Need turnover and slippage evidence."
+      ],
+      "missing_data_categories_payload": null,
+      "context_payload": {
+        "symbol_day_context": {
+          "context_provenance": {
+            "factor_rows": {
+              "unified_value": {
+                "issue_types": [
+                  "available_but_old"
+                ],
+                "freshness_status": "available_but_old",
+                "provenance_status": "derived_from_provider_data",
+                "requested_symbol_coverage": {
+                  "present_rows": 2,
+                  "missing_rows": 0,
+                  "coverage_status": "complete"
+                }
+              }
+            },
+            "signal_features": {
+              "issue_types": [
+                "derived_or_fallback"
+              ],
+              "freshness_status": "fresh",
+              "provenance_status": "provider_plus_fallback",
+              "requested_symbol_coverage": {
+                "present_rows": 2,
+                "missing_rows": 0,
+                "coverage_status": "complete"
+              }
+            },
+            "quote_context": {
+              "issue_types": [
+                "stale"
+              ],
+              "freshness_status": "stale",
+              "provenance_status": "provider_sourced",
+              "requested_symbol_coverage": {
+                "available_rows": 1,
+                "partial_rows": 1,
+                "unavailable_rows": 0,
+                "coverage_status": "partial"
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "range_focus": [
+    {
+      "id": 201,
+      "market_date": "2026-05-05",
+      "symbol": "005930",
+      "agent_name": "technical-summarizer",
+      "feedback_payload": {
+        "role": "technical-summarizer"
+      },
+      "normalized_feedback_payload": {
+        "role": "technical-summarizer"
+      },
+      "data_gaps_payload": null,
+      "improvement_notes_payload": [
+        "Need factor score coverage.",
+        "Need momentum score context.",
+        "Need sector peer comparison."
+      ],
+      "missing_data_categories_payload": null,
+      "context_payload": {
+        "symbol_day_context": {
+          "context_provenance": {
+            "factor_rows": {
+              "unified_value": {
+                "issue_types": [
+                  "available_but_old"
+                ],
+                "freshness_status": "available_but_old",
+                "provenance_status": "derived_from_provider_data",
+                "requested_symbol_coverage": {
+                  "present_rows": 2,
+                  "missing_rows": 0,
+                  "coverage_status": "complete"
+                }
+              },
+              "momentum": {
+                "issue_types": [
+                  "available_but_old"
+                ],
+                "freshness_status": "available_but_old",
+                "provenance_status": "derived_from_provider_data",
+                "requested_symbol_coverage": {
+                  "present_rows": 2,
+                  "missing_rows": 0,
+                  "coverage_status": "complete"
+                }
+              }
+            },
+            "signal_features": {
+              "issue_types": [
+                "derived_or_fallback"
+              ],
+              "freshness_status": "fresh",
+              "provenance_status": "provider_plus_fallback",
+              "requested_symbol_coverage": {
+                "present_rows": 2,
+                "missing_rows": 0,
+                "coverage_status": "complete"
+              }
+            },
+            "market_breadth_context": {
+              "issue_types": [
+                "missing"
+              ],
+              "freshness_status": "missing",
+              "provenance_status": "derived_from_provider_data",
+              "requested_symbol_coverage": {
+                "available_rows": 1,
+                "partial_rows": 1,
+                "unavailable_rows": 0,
+                "coverage_status": "partial"
+              }
+            },
+            "sector_peer_context": {
+              "issue_types": [
+                "missing"
+              ],
+              "freshness_status": "missing",
+              "provenance_status": "provider_sourced",
+              "requested_symbol_coverage": {
+                "available_rows": 1,
+                "partial_rows": 1,
+                "unavailable_rows": 0,
+                "coverage_status": "partial"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": 202,
+      "market_date": "2026-05-06",
+      "symbol": "005930",
+      "agent_name": "technical-summarizer",
+      "feedback_payload": {
+        "role": "technical-summarizer"
+      },
+      "normalized_feedback_payload": {
+        "role": "technical-summarizer"
+      },
+      "data_gaps_payload": null,
+      "improvement_notes_payload": [
+        "Need factor score coverage."
+      ],
+      "missing_data_categories_payload": null,
+      "context_payload": {
+        "symbol_day_context": {
+          "context_provenance": {
+            "factor_rows": {
+              "unified_value": {
+                "issue_types": [
+                  "available_but_old"
+                ],
+                "freshness_status": "available_but_old",
+                "provenance_status": "derived_from_provider_data",
+                "requested_symbol_coverage": {
+                  "present_rows": 1,
+                  "missing_rows": 0,
+                  "coverage_status": "complete"
+                }
+              }
+            },
+            "signal_features": {
+              "issue_types": [
+                "derived_or_fallback"
+              ],
+              "freshness_status": "fresh",
+              "provenance_status": "provider_plus_fallback",
+              "requested_symbol_coverage": {
+                "present_rows": 1,
+                "missing_rows": 0,
+                "coverage_status": "complete"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": 203,
+      "market_date": "2026-05-06",
+      "symbol": "000660",
+      "agent_name": "signal-decider",
+      "feedback_payload": {
+        "role": "signal-decider"
+      },
+      "normalized_feedback_payload": {
+        "role": "signal-decider"
+      },
+      "data_gaps_payload": null,
+      "improvement_notes_payload": [
+        "Need turnover and slippage evidence."
+      ],
+      "missing_data_categories_payload": null,
+      "context_payload": {
+        "symbol_day_context": {
+          "context_provenance": {
+            "signal_features": {
+              "issue_types": [
+                "derived_or_fallback"
+              ],
+              "freshness_status": "fresh",
+              "provenance_status": "provider_plus_fallback",
+              "requested_symbol_coverage": {
+                "present_rows": 2,
+                "missing_rows": 0,
+                "coverage_status": "complete"
+              }
+            },
+            "quote_context": {
+              "issue_types": [
+                "stale"
+              ],
+              "freshness_status": "stale",
+              "provenance_status": "provider_sourced",
+              "requested_symbol_coverage": {
+                "available_rows": 1,
+                "partial_rows": 1,
+                "unavailable_rows": 0,
+                "coverage_status": "partial"
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

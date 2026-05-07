@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from datetime import date
 from typing import Any, Sequence
 
@@ -8,6 +9,7 @@ from sqlalchemy import select
 from app.agent_context.missing_data_taxonomy import (
     CATEGORY_DEFINITIONS_BY_KEY,
     build_missing_data_classification,
+    extract_missing_data_note_mentions,
     normalize_missing_data_category_filters,
 )
 from app.db import session_scope
@@ -84,6 +86,183 @@ def _feedback_role(row: dict[str, Any]) -> str:
         if isinstance(role, str) and role.strip():
             return role.strip().lower()
     return str(row.get('agent_name') or '').strip().lower()
+
+
+def _ratio(numerator: int, denominator: int) -> float:
+    if denominator <= 0:
+        return 0.0
+    return round(numerator / denominator, 4)
+
+
+def _trend_direction(delta: int) -> str:
+    if delta < 0:
+        return 'improving'
+    if delta > 0:
+        return 'worsening'
+    return 'flat'
+
+
+def _normalize_requested_symbol_coverage(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+
+    if 'present_rows' in value or 'missing_rows' in value:
+        present_rows = int(value.get('present_rows') or 0)
+        partial_rows = int(value.get('partial_rows') or 0)
+        unavailable_rows = int(value.get('missing_rows') or 0)
+    elif 'available_rows' in value or 'partial_rows' in value or 'unavailable_rows' in value:
+        present_rows = int(value.get('available_rows') or 0)
+        partial_rows = int(value.get('partial_rows') or 0)
+        unavailable_rows = int(value.get('unavailable_rows') or 0)
+    else:
+        return None
+
+    requested_symbol_count = present_rows + partial_rows + unavailable_rows
+    coverage_status = str(value.get('coverage_status') or '').strip().lower()
+    if not coverage_status:
+        if requested_symbol_count <= 0:
+            coverage_status = 'unknown'
+        elif unavailable_rows == 0 and partial_rows == 0:
+            coverage_status = 'complete'
+        elif present_rows > 0 or partial_rows > 0:
+            coverage_status = 'partial'
+        else:
+            coverage_status = 'missing'
+
+    return {
+        'requested_symbol_count': requested_symbol_count,
+        'present_rows': present_rows,
+        'partial_rows': partial_rows,
+        'unavailable_rows': unavailable_rows,
+        'coverage_ratio': _ratio(present_rows + partial_rows, requested_symbol_count),
+        'coverage_status': coverage_status,
+    }
+
+
+def _serialize_dimension_breakdown(
+    buckets: dict[str, dict[str, Any]],
+    *,
+    key_name: str,
+) -> list[dict[str, Any]]:
+    payload: list[dict[str, Any]] = []
+    for key, bucket in sorted(
+        buckets.items(),
+        key=lambda item: (-item[1]['matched_note_count'], -len(item[1]['feedback_row_keys']), item[0]),
+    ):
+        payload.append(
+            {
+                key_name: key,
+                'feedback_rows': len(bucket['feedback_row_keys']),
+                'matched_note_count': bucket['matched_note_count'],
+                'raw_note_mentions': bucket['raw_note_mentions'],
+                'duplicate_note_mentions': bucket['duplicate_note_mentions'],
+                'duplicate_note_rate': _ratio(bucket['duplicate_note_mentions'], bucket['raw_note_mentions']),
+                'categories': sorted(bucket['categories']),
+                'symbols': sorted(bucket['symbols']),
+                'agents': sorted(bucket['agents']),
+                'roles': sorted(bucket['roles']),
+                'context_issue_type_note_mentions': dict(sorted(bucket['context_issue_type_note_mentions'].items())),
+            }
+        )
+    return payload
+
+
+def _build_category_trend(
+    category_payload: dict[str, Any],
+    *,
+    before_market_date: str,
+    after_market_date: str,
+) -> dict[str, Any] | None:
+    if before_market_date == after_market_date:
+        return None
+
+    breakdown_by_date = {
+        item['market_date']: item
+        for item in category_payload.get('date_breakdown') or []
+    }
+    before = breakdown_by_date.get(
+        before_market_date,
+        {
+            'market_date': before_market_date,
+            'feedback_rows': 0,
+            'note_mentions': 0,
+        },
+    )
+    after = breakdown_by_date.get(
+        after_market_date,
+        {
+            'market_date': after_market_date,
+            'feedback_rows': 0,
+            'note_mentions': 0,
+        },
+    )
+    note_mentions_delta = int(after['note_mentions']) - int(before['note_mentions'])
+    feedback_rows_delta = int(after['feedback_rows']) - int(before['feedback_rows'])
+    return {
+        'before_market_date': before['market_date'],
+        'after_market_date': after['market_date'],
+        'before_note_mentions': before['note_mentions'],
+        'after_note_mentions': after['note_mentions'],
+        'note_mentions_delta': note_mentions_delta,
+        'before_feedback_rows': before['feedback_rows'],
+        'after_feedback_rows': after['feedback_rows'],
+        'feedback_rows_delta': feedback_rows_delta,
+        'direction': _trend_direction(note_mentions_delta),
+    }
+
+
+def _build_range_comparison(
+    *,
+    date_breakdown_payload: list[dict[str, Any]],
+    categories_payload: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    if len(date_breakdown_payload) < 2:
+        return None
+
+    before = date_breakdown_payload[0]
+    after = date_breakdown_payload[-1]
+    matched_note_delta = int(after['matched_note_count']) - int(before['matched_note_count'])
+    duplicate_note_rate_delta = round(
+        float(after['duplicate_note_rate']) - float(before['duplicate_note_rate']),
+        4,
+    )
+
+    category_changes: list[dict[str, Any]] = []
+    improving_count = 0
+    worsening_count = 0
+    flat_count = 0
+    for item in sorted(categories_payload, key=lambda category: category['category']):
+        trend = item.get('trend')
+        if trend is None:
+            continue
+        direction = trend['direction']
+        if direction == 'improving':
+            improving_count += 1
+        elif direction == 'worsening':
+            worsening_count += 1
+        else:
+            flat_count += 1
+        category_changes.append(
+            {
+                'category': item['category'],
+                'direction': direction,
+                'note_mentions_delta': trend['note_mentions_delta'],
+                'feedback_rows_delta': trend['feedback_rows_delta'],
+            }
+        )
+
+    return {
+        'before_market_date': before['market_date'],
+        'after_market_date': after['market_date'],
+        'day_count': len(date_breakdown_payload),
+        'matched_note_delta': matched_note_delta,
+        'duplicate_note_rate_delta': duplicate_note_rate_delta,
+        'direction': _trend_direction(matched_note_delta),
+        'categories_improving': improving_count,
+        'categories_worsening': worsening_count,
+        'categories_flat': flat_count,
+        'category_changes': category_changes,
+    }
 
 
 class AgentContextMissingDataReportRepository:
@@ -187,11 +366,18 @@ class AgentContextMissingDataReportService:
         matched_symbols: set[str] = set()
         category_aggregates: dict[str, dict[str, Any]] = {}
         date_breakdown: dict[str, dict[str, Any]] = {}
+        context_block_aggregates: dict[str, dict[str, Any]] = {}
+        symbol_breakdown: dict[str, dict[str, Any]] = {}
+        agent_breakdown: dict[str, dict[str, Any]] = {}
         feedback_rows_with_notes = 0
+        feedback_rows_with_duplicate_notes = 0
         feedback_rows_matched = 0
+        raw_note_mentions_total = 0
+        duplicate_note_mentions_total = 0
         unique_note_count = 0
         matched_note_count = 0
         unmatched_note_count = 0
+        matched_unclassified_note_mentions = 0
         uncategorized_examples: list[dict[str, Any]] = []
         persist_updates: list[dict[str, Any]] = []
 
@@ -210,6 +396,9 @@ class AgentContextMissingDataReportService:
                     'matched_row_keys': set(),
                     'symbols': set(),
                     'matched_symbols': set(),
+                    'raw_note_mentions': 0,
+                    'duplicate_note_mentions': 0,
+                    'feedback_rows_with_duplicate_notes': 0,
                     'unique_note_count': 0,
                     'matched_note_count': 0,
                     'category_counts': {},
@@ -218,6 +407,10 @@ class AgentContextMissingDataReportService:
             day_bucket['feedback_row_keys'].add(row_key)
             day_bucket['symbols'].add(row['symbol'])
 
+            raw_note_mentions = extract_missing_data_note_mentions(
+                data_gaps_payload=row.get('data_gaps_payload'),
+                improvement_notes_payload=row.get('improvement_notes_payload'),
+            )
             classification = build_missing_data_classification(
                 data_gaps_payload=row.get('data_gaps_payload'),
                 improvement_notes_payload=row.get('improvement_notes_payload'),
@@ -232,14 +425,23 @@ class AgentContextMissingDataReportService:
                     }
                 )
             note_entries = classification['notes']
+            raw_note_mentions_total += len(raw_note_mentions)
+            day_bucket['raw_note_mentions'] += len(raw_note_mentions)
             unique_note_count += len(note_entries)
             day_bucket['unique_note_count'] += len(note_entries)
+            duplicate_note_mentions = max(len(raw_note_mentions) - len(note_entries), 0)
+            duplicate_note_mentions_total += duplicate_note_mentions
+            day_bucket['duplicate_note_mentions'] += duplicate_note_mentions
+            if duplicate_note_mentions > 0:
+                feedback_rows_with_duplicate_notes += 1
+                day_bucket['feedback_rows_with_duplicate_notes'] += 1
             if note_entries:
                 feedback_rows_with_notes += 1
 
             matched_items = [
                 item for item in raw_categories if not normalized_categories or item['category'] in normalized_categories
             ]
+            matched_categories = {item['category'] for item in matched_items}
             matched_row_notes = {
                 note
                 for item in matched_items
@@ -253,6 +455,8 @@ class AgentContextMissingDataReportService:
                 if isinstance(entry.get('text'), str) and entry['text'].casefold() not in matched_row_note_keys
             ]
             unmatched_note_count += len(row_unmatched_notes)
+            matched_issue_type_note_mentions_for_row: Counter[str] = Counter()
+            row_context_blocks: dict[str, dict[str, Any]] = {}
             if matched_items:
                 feedback_rows_matched += 1
                 matched_roles.add(role)
@@ -277,6 +481,7 @@ class AgentContextMissingDataReportService:
             for item in matched_items:
                 category = item['category']
                 definition = CATEGORY_DEFINITIONS_BY_KEY[category]
+                note_count = int(item.get('note_count') or 0)
                 aggregate = category_aggregates.setdefault(
                     category,
                     {
@@ -293,6 +498,7 @@ class AgentContextMissingDataReportService:
                         'example_notes': [],
                         'date_counts': {},
                         'context_issue_type_counts': {},
+                        'context_issue_type_note_mentions': {},
                     },
                 )
                 aggregate['feedback_row_keys'].add(row_key)
@@ -306,6 +512,12 @@ class AgentContextMissingDataReportService:
                     aggregate['context_issue_type_counts'][normalized_issue_type] = (
                         aggregate['context_issue_type_counts'].get(normalized_issue_type, 0) + 1
                     )
+                    aggregate['context_issue_type_note_mentions'][normalized_issue_type] = (
+                        aggregate['context_issue_type_note_mentions'].get(normalized_issue_type, 0) + note_count
+                    )
+                    matched_issue_type_note_mentions_for_row[normalized_issue_type] += note_count
+                if not item.get('context_issue_types'):
+                    matched_unclassified_note_mentions += note_count
                 for note in item.get('notes', []):
                     if note not in aggregate['example_notes'] and len(aggregate['example_notes']) < self.category_note_example_limit:
                         aggregate['example_notes'].append(note)
@@ -314,14 +526,142 @@ class AgentContextMissingDataReportService:
                     {'feedback_row_keys': set(), 'note_count': 0},
                 )
                 date_counts['feedback_row_keys'].add(row_key)
-                date_counts['note_count'] += int(item.get('note_count') or 0)
+                date_counts['note_count'] += note_count
 
                 per_day_category = day_bucket['category_counts'].setdefault(
                     category,
                     {'feedback_row_keys': set(), 'note_count': 0},
                 )
                 per_day_category['feedback_row_keys'].add(row_key)
-                per_day_category['note_count'] += int(item.get('note_count') or 0)
+                per_day_category['note_count'] += note_count
+
+                for evidence in item.get('context_evidence', []):
+                    if not isinstance(evidence, dict):
+                        continue
+                    block = str(evidence.get('block') or '').strip()
+                    if not block:
+                        continue
+                    row_block = row_context_blocks.setdefault(
+                        block,
+                        {
+                            'categories': set(),
+                            'issue_types': set(),
+                            'requested_symbol_coverage': None,
+                        },
+                    )
+                    row_block['categories'].add(category)
+                    row_block['issue_types'].update(
+                        {
+                            str(issue_type).strip().lower()
+                            for issue_type in evidence.get('issue_types', [])
+                            if str(issue_type).strip()
+                        }
+                    )
+                    coverage = _normalize_requested_symbol_coverage(evidence.get('requested_symbol_coverage'))
+                    if row_block['requested_symbol_coverage'] is None and coverage is not None:
+                        row_block['requested_symbol_coverage'] = coverage
+
+            if matched_items:
+                symbol_bucket = symbol_breakdown.setdefault(
+                    row['symbol'],
+                    {
+                        'feedback_row_keys': set(),
+                        'matched_note_count': 0,
+                        'raw_note_mentions': 0,
+                        'duplicate_note_mentions': 0,
+                        'categories': set(),
+                        'symbols': set(),
+                        'agents': set(),
+                        'roles': set(),
+                        'context_issue_type_note_mentions': {},
+                    },
+                )
+                agent_bucket = agent_breakdown.setdefault(
+                    row['agent_name'],
+                    {
+                        'feedback_row_keys': set(),
+                        'matched_note_count': 0,
+                        'raw_note_mentions': 0,
+                        'duplicate_note_mentions': 0,
+                        'categories': set(),
+                        'symbols': set(),
+                        'agents': set(),
+                        'roles': set(),
+                        'context_issue_type_note_mentions': {},
+                    },
+                )
+                for bucket in (symbol_bucket, agent_bucket):
+                    bucket['feedback_row_keys'].add(row_key)
+                    bucket['matched_note_count'] += len(matched_row_notes)
+                    bucket['raw_note_mentions'] += len(raw_note_mentions)
+                    bucket['duplicate_note_mentions'] += duplicate_note_mentions
+                    bucket['categories'].update(matched_categories)
+                    bucket['symbols'].add(row['symbol'])
+                    bucket['agents'].add(row['agent_name'])
+                    bucket['roles'].add(role)
+                    for issue_type, count in matched_issue_type_note_mentions_for_row.items():
+                        bucket['context_issue_type_note_mentions'][issue_type] = (
+                            bucket['context_issue_type_note_mentions'].get(issue_type, 0) + int(count)
+                        )
+
+                for block, row_block in row_context_blocks.items():
+                    aggregate = context_block_aggregates.setdefault(
+                        block,
+                        {
+                            'feedback_row_keys': set(),
+                            'symbols': set(),
+                            'agents': set(),
+                            'roles': set(),
+                            'categories': set(),
+                            'issue_type_counts': {},
+                            'coverage_status_counts': {},
+                            'coverage_ratio_sum': 0.0,
+                            'coverage_ratio_samples': 0,
+                            'coverage_ratio_min': None,
+                            'coverage_ratio_max': None,
+                            'requested_symbol_count_max': 0,
+                            'present_rows_max': 0,
+                            'partial_rows_max': 0,
+                            'unavailable_rows_max': 0,
+                        },
+                    )
+                    aggregate['feedback_row_keys'].add(row_key)
+                    aggregate['symbols'].add(row['symbol'])
+                    aggregate['agents'].add(row['agent_name'])
+                    aggregate['roles'].add(role)
+                    aggregate['categories'].update(row_block['categories'])
+                    for issue_type in row_block['issue_types']:
+                        aggregate['issue_type_counts'][issue_type] = aggregate['issue_type_counts'].get(issue_type, 0) + 1
+                    coverage = row_block['requested_symbol_coverage']
+                    if coverage is None:
+                        continue
+                    coverage_status = coverage['coverage_status']
+                    aggregate['coverage_status_counts'][coverage_status] = (
+                        aggregate['coverage_status_counts'].get(coverage_status, 0) + 1
+                    )
+                    coverage_ratio = float(coverage['coverage_ratio'])
+                    aggregate['coverage_ratio_sum'] += coverage_ratio
+                    aggregate['coverage_ratio_samples'] += 1
+                    aggregate['coverage_ratio_min'] = (
+                        coverage_ratio
+                        if aggregate['coverage_ratio_min'] is None
+                        else min(float(aggregate['coverage_ratio_min']), coverage_ratio)
+                    )
+                    aggregate['coverage_ratio_max'] = (
+                        coverage_ratio
+                        if aggregate['coverage_ratio_max'] is None
+                        else max(float(aggregate['coverage_ratio_max']), coverage_ratio)
+                    )
+                    aggregate['requested_symbol_count_max'] = max(
+                        aggregate['requested_symbol_count_max'],
+                        int(coverage['requested_symbol_count']),
+                    )
+                    aggregate['present_rows_max'] = max(aggregate['present_rows_max'], int(coverage['present_rows']))
+                    aggregate['partial_rows_max'] = max(aggregate['partial_rows_max'], int(coverage['partial_rows']))
+                    aggregate['unavailable_rows_max'] = max(
+                        aggregate['unavailable_rows_max'],
+                        int(coverage['unavailable_rows']),
+                    )
 
         if persist_missing_categories:
             persisted_updates = self.repository.update_missing_data_categories(rows=persist_updates)
@@ -331,6 +671,7 @@ class AgentContextMissingDataReportService:
         categories_payload: list[dict[str, Any]] = []
         status_counts = {}
         context_issue_type_counts = {}
+        context_issue_type_note_mentions = {}
         for category in sorted(
             category_aggregates.values(),
             key=lambda item: (-len(item['feedback_row_keys']), item['category']),
@@ -338,6 +679,10 @@ class AgentContextMissingDataReportService:
             status_counts[category['status']] = status_counts.get(category['status'], 0) + 1
             for issue_type, count in category['context_issue_type_counts'].items():
                 context_issue_type_counts[issue_type] = context_issue_type_counts.get(issue_type, 0) + int(count)
+            for issue_type, count in category['context_issue_type_note_mentions'].items():
+                context_issue_type_note_mentions[issue_type] = (
+                    context_issue_type_note_mentions.get(issue_type, 0) + int(count)
+                )
             categories_payload.append(
                 {
                     'category': category['category'],
@@ -358,6 +703,7 @@ class AgentContextMissingDataReportService:
                     'roles': sorted(category['roles']),
                     'example_notes': list(category['example_notes']),
                     'context_issue_type_counts': dict(category['context_issue_type_counts']),
+                    'context_issue_type_note_mentions': dict(sorted(category['context_issue_type_note_mentions'].items())),
                     'date_breakdown': [
                         {
                             'market_date': market_date_iso,
@@ -378,6 +724,10 @@ class AgentContextMissingDataReportService:
                     'feedback_rows_matched': len(day_bucket['matched_row_keys']),
                     'distinct_symbols': len(day_bucket['symbols']),
                     'matched_symbols': len(day_bucket['matched_symbols']),
+                    'raw_note_mentions': day_bucket['raw_note_mentions'],
+                    'duplicate_note_mentions': day_bucket['duplicate_note_mentions'],
+                    'duplicate_note_rate': _ratio(day_bucket['duplicate_note_mentions'], day_bucket['raw_note_mentions']),
+                    'feedback_rows_with_duplicate_notes': day_bucket['feedback_rows_with_duplicate_notes'],
                     'unique_note_count': day_bucket['unique_note_count'],
                     'matched_note_count': day_bucket['matched_note_count'],
                     'category_counts': {
@@ -389,6 +739,98 @@ class AgentContextMissingDataReportService:
                     },
                 }
             )
+
+        for category_payload in categories_payload:
+            category_payload['trend'] = _build_category_trend(
+                category_payload,
+                before_market_date=resolved_from.isoformat(),
+                after_market_date=resolved_to.isoformat(),
+            )
+
+        resolution_metrics = {
+            'resolved_by_existing_data': {
+                'category_count': 0,
+                'feedback_rows': 0,
+                'note_mentions': 0,
+                'categories': [],
+            },
+            'requires_external_data': {
+                'category_count': 0,
+                'feedback_rows': 0,
+                'note_mentions': 0,
+                'categories': [],
+            },
+        }
+        for category_payload in categories_payload:
+            group = (
+                'requires_external_data'
+                if category_payload['external_providers']
+                else 'resolved_by_existing_data'
+            )
+            group_bucket = resolution_metrics[group]
+            group_bucket['category_count'] += 1
+            group_bucket['feedback_rows'] += int(category_payload['counts']['feedback_rows'])
+            group_bucket['note_mentions'] += int(category_payload['counts']['note_mentions'])
+            group_bucket['categories'].append(category_payload['category'])
+        for group_bucket in resolution_metrics.values():
+            group_bucket['categories'].sort()
+
+        context_block_coverage_payload: list[dict[str, Any]] = []
+        for block, aggregate in sorted(
+            context_block_aggregates.items(),
+            key=lambda item: (-len(item[1]['feedback_row_keys']), item[0]),
+        ):
+            requested_symbol_coverage = None
+            if aggregate['coverage_ratio_samples'] > 0:
+                requested_symbol_coverage = {
+                    'sample_count': aggregate['coverage_ratio_samples'],
+                    'average_coverage_ratio': round(
+                        aggregate['coverage_ratio_sum'] / aggregate['coverage_ratio_samples'],
+                        4,
+                    ),
+                    'min_coverage_ratio': round(float(aggregate['coverage_ratio_min']), 4),
+                    'max_coverage_ratio': round(float(aggregate['coverage_ratio_max']), 4),
+                    'coverage_status_counts': dict(sorted(aggregate['coverage_status_counts'].items())),
+                    'max_requested_symbol_count': aggregate['requested_symbol_count_max'],
+                    'max_present_rows': aggregate['present_rows_max'],
+                    'max_partial_rows': aggregate['partial_rows_max'],
+                    'max_unavailable_rows': aggregate['unavailable_rows_max'],
+                }
+            context_block_coverage_payload.append(
+                {
+                    'block': block,
+                    'feedback_rows': len(aggregate['feedback_row_keys']),
+                    'symbols': len(aggregate['symbols']),
+                    'agents': len(aggregate['agents']),
+                    'roles': len(aggregate['roles']),
+                    'categories': sorted(aggregate['categories']),
+                    'issue_type_counts': dict(sorted(aggregate['issue_type_counts'].items())),
+                    'requested_symbol_coverage': requested_symbol_coverage,
+                }
+            )
+
+        quality_payload = {
+            'note_metrics': {
+                'raw_note_mentions': raw_note_mentions_total,
+                'unique_note_count': unique_note_count,
+                'duplicate_note_mentions': duplicate_note_mentions_total,
+                'duplicate_note_rate': _ratio(duplicate_note_mentions_total, raw_note_mentions_total),
+                'feedback_rows_with_duplicate_notes': feedback_rows_with_duplicate_notes,
+                'matched_note_count': matched_note_count,
+            },
+            'classification_metrics': {
+                'context_issue_type_note_mentions': dict(sorted(context_issue_type_note_mentions.items())),
+                'unclassified_note_mentions': matched_unclassified_note_mentions,
+            },
+            'resolution_metrics': resolution_metrics,
+            'agent_breakdown': _serialize_dimension_breakdown(agent_breakdown, key_name='agent_name'),
+            'symbol_breakdown': _serialize_dimension_breakdown(symbol_breakdown, key_name='symbol'),
+            'context_block_coverage': context_block_coverage_payload,
+            'range_comparison': _build_range_comparison(
+                date_breakdown_payload=date_breakdown_payload,
+                categories_payload=categories_payload,
+            ),
+        }
 
         return {
             'request': {
@@ -405,6 +847,10 @@ class AgentContextMissingDataReportService:
                 'feedback_rows_with_notes': feedback_rows_with_notes,
                 'feedback_rows_matched': feedback_rows_matched,
                 'feedback_rows_unmatched': max(feedback_rows_with_notes - feedback_rows_matched, 0),
+                'feedback_rows_with_duplicate_notes': feedback_rows_with_duplicate_notes,
+                'raw_note_mentions': raw_note_mentions_total,
+                'duplicate_note_mentions': duplicate_note_mentions_total,
+                'duplicate_note_rate': _ratio(duplicate_note_mentions_total, raw_note_mentions_total),
                 'unique_note_count': unique_note_count,
                 'matched_note_count': matched_note_count,
                 'unmatched_note_count': unmatched_note_count,
@@ -419,6 +865,7 @@ class AgentContextMissingDataReportService:
                 'context_issue_type_counts': context_issue_type_counts,
                 'persisted_updates': persisted_updates,
             },
+            'quality': quality_payload,
             'categories': categories_payload,
             'date_breakdown': date_breakdown_payload,
             'uncategorized_examples': uncategorized_examples,

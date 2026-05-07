@@ -1,8 +1,23 @@
+import json
 from datetime import date
+from pathlib import Path
 import unittest
 
 from app.agent_context.missing_data_report_service import AgentContextMissingDataReportService
 from app.agent_context.missing_data_taxonomy import build_missing_data_categories
+
+
+FIXTURE_PATH = Path(__file__).with_name('fixtures') / 'agent_feedback_data_gap_quality_rows.json'
+
+
+def _load_quality_report_fixture_rows(name: str) -> list[dict]:
+    payload = json.loads(FIXTURE_PATH.read_text())
+    rows = []
+    for item in payload[name]:
+        row = dict(item)
+        row['market_date'] = date.fromisoformat(row['market_date'])
+        rows.append(row)
+    return rows
 
 
 class FakeMissingDataReportRepository:
@@ -260,3 +275,57 @@ class AgentContextMissingDataReportServiceTests(unittest.TestCase):
         factor_row = next(item for item in result['categories'] if item['category'] == 'factor_score_coverage')
         self.assertEqual(factor_row['context_issue_type_counts']['available_but_old'], 1)
         self.assertEqual(factor_row['context_issue_type_counts']['derived_or_fallback'], 1)
+
+    def test_quality_report_regression_fixture_tracks_duplicate_metrics(self):
+        repository = FakeMissingDataReportRepository(_load_quality_report_fixture_rows('duplicate_focus'))
+        service = AgentContextMissingDataReportService(repository=repository)
+
+        result = service.get_summary(market_date='2026-05-05')
+
+        self.assertEqual(result['summary']['raw_note_mentions'], 5)
+        self.assertEqual(result['summary']['duplicate_note_mentions'], 3)
+        self.assertEqual(result['summary']['feedback_rows_with_duplicate_notes'], 1)
+        self.assertEqual(result['summary']['duplicate_note_rate'], 0.6)
+        self.assertEqual(result['quality']['note_metrics']['duplicate_note_rate'], 0.6)
+        self.assertEqual(
+            result['quality']['classification_metrics']['context_issue_type_note_mentions'],
+            {
+                'available_but_old': 1,
+                'derived_or_fallback': 2,
+                'stale': 1,
+            },
+        )
+        self.assertEqual(
+            result['quality']['resolution_metrics']['requires_external_data']['categories'],
+            ['liquidity_turnover_slippage'],
+        )
+        self.assertEqual(
+            result['quality']['resolution_metrics']['resolved_by_existing_data']['categories'],
+            ['factor_score_coverage'],
+        )
+        signal_features = next(
+            item
+            for item in result['quality']['context_block_coverage']
+            if item['block'] == 'signal_features'
+        )
+        self.assertEqual(signal_features['requested_symbol_coverage']['average_coverage_ratio'], 1.0)
+
+    def test_quality_report_regression_fixture_builds_range_and_category_trends(self):
+        repository = FakeMissingDataReportRepository(_load_quality_report_fixture_rows('range_focus'))
+        service = AgentContextMissingDataReportService(repository=repository)
+
+        result = service.get_summary(market_date_from='2026-05-05', market_date_to='2026-05-06')
+
+        comparison = result['quality']['range_comparison']
+        self.assertEqual(comparison['before_market_date'], '2026-05-05')
+        self.assertEqual(comparison['after_market_date'], '2026-05-06')
+        self.assertEqual(comparison['matched_note_delta'], -1)
+        self.assertEqual(comparison['direction'], 'improving')
+        factor_row = next(item for item in result['categories'] if item['category'] == 'factor_score_coverage')
+        liquidity_row = next(item for item in result['categories'] if item['category'] == 'liquidity_turnover_slippage')
+        self.assertEqual(factor_row['trend']['direction'], 'improving')
+        self.assertEqual(factor_row['trend']['note_mentions_delta'], -1)
+        self.assertEqual(liquidity_row['trend']['direction'], 'worsening')
+        self.assertEqual(liquidity_row['trend']['note_mentions_delta'], 1)
+        self.assertEqual(result['date_breakdown'][0]['matched_note_count'], 3)
+        self.assertEqual(result['date_breakdown'][1]['matched_note_count'], 2)
