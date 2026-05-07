@@ -148,6 +148,17 @@ class RecordingAgentContextReadService:
 class DeciderReadyAgentContextReadService:
     def get_symbol_day_context(self, **kwargs):
         return {
+            'summary': {
+                'context_completeness': {
+                    'requested_symbol_count': len(kwargs['symbols']),
+                    'factor_rows': {
+                        'unified_value': {'present_rows': len(kwargs['symbols']), 'missing_rows': 0, 'coverage_status': 'complete'},
+                        'quality': {'present_rows': len(kwargs['symbols']), 'missing_rows': 0, 'coverage_status': 'complete'},
+                        'momentum': {'present_rows': len(kwargs['symbols']), 'missing_rows': 0, 'coverage_status': 'complete'},
+                    },
+                    'signal_features': {'present_rows': 1, 'missing_rows': max(len(kwargs['symbols']) - 1, 0), 'coverage_status': 'sparse'},
+                }
+            },
             'items': [
                 {
                     'symbol': symbol,
@@ -155,6 +166,12 @@ class DeciderReadyAgentContextReadService:
                     'price_context': {'close_price': 85700},
                     'technical_snapshot': {'trend_state': 'uptrend'},
                     'action_summary': {'action_label': 'watch_long'},
+                    'market_relative_context': {
+                        'status': 'available',
+                        'market': 'KOSPI',
+                        'breadth': {'up_count': 470, 'down_count': 260, 'flat_count': 80},
+                        'relative_strength': {'return_percentile': 0.95, 'volume_percentile': 0.93},
+                    },
                     'scores': {
                         'unified_value': {
                             'status': 'available',
@@ -188,6 +205,27 @@ class DeciderReadyAgentContextReadService:
                             'components_possible': 3,
                             'coverage_notes': [],
                             'as_of_market_date': kwargs['market_date'].isoformat(),
+                        },
+                    },
+                    'persisted_factor_rows': {
+                        'unified_value': {'unified_value_score': 0.87, 'unified_value_status': 'scored'},
+                        'quality': {'quality_score': 0.74, 'quality_status': 'scored_partial', 'accruals_ratio': None},
+                        'momentum': {'momentum_percentile': 0.91},
+                        'advanced_value': {'advanced_value_score': 0.81, 'advanced_value_classification': 'eligible'},
+                        'low_risk': {'low_risk_score': 0.67, 'low_risk_classification': 'watchlist'},
+                        'beta': {'low_beta_score': 0.58, 'low_beta_classification': 'eligible'},
+                        'composite': {'composite_score': 0.73, 'composite_classification': 'eligible'},
+                    },
+                    'context_completeness': {
+                        'factor_rows': {
+                            'quality': {'row_status': 'present', 'null_submetric_fields': ['accruals_ratio']},
+                        },
+                        'signal_features': {'row_status': 'missing'},
+                        'market_relative_context': {'status': 'available'},
+                        'sector_peer_mapping': {'status': 'unavailable'},
+                        'requested_symbol_coverage': {
+                            'requested_symbol_count': len(kwargs['symbols']),
+                            'signal_features': {'present_rows': 1, 'missing_rows': max(len(kwargs['symbols']) - 1, 0), 'coverage_status': 'sparse'},
                         },
                     },
                     'fundamentals': {'latest_snapshot': {'highlights': {'operating_income': {'current_amount': 10}}}},
@@ -1070,6 +1108,13 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertEqual(decider_payload['market_context']['summary']['market_bias'], 'risk_on')
         self.assertEqual(decider_payload['market_context']['indices']['kospi']['level'], 2642.07)
         self.assertNotIn('scores', decider_payload['symbol_day_context'])
+        self.assertEqual(decider_payload['symbol_day_context']['market_relative_context']['relative_strength']['return_percentile'], 0.95)
+        self.assertEqual(decider_payload['symbol_day_context']['persisted_factor_rows']['advanced_value']['advanced_value_classification'], 'eligible')
+        self.assertEqual(decider_payload['symbol_day_context']['context_completeness']['sector_peer_mapping']['status'], 'unavailable')
+        self.assertEqual(
+            decider_payload['symbol_day_context']['context_completeness']['requested_symbol_coverage']['signal_features']['coverage_status'],
+            'sparse',
+        )
         self.assertEqual(decider_payload['orchestration']['request_model'], 'openclaw/signal-decider')
         self.assertEqual(
             decider_payload['orchestration']['required_upstream_roles'],

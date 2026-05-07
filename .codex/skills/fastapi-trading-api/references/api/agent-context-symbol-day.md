@@ -1,7 +1,7 @@
 # GET /agent-context/symbol-day
 
 ## Summary
-Returns compact symbol/day analysis context for downstream agents. The `price_context` block is read from persisted `daily_price_contexts`, not derived on request, and `price_context_history` carries up to the latest seven stored rows ending at the requested `market_date`. The same response now includes a structured `scores` block for unified value, quality, and momentum when those stored factor rows exist for the requested date.
+Returns compact symbol/day analysis context for downstream agents. The `price_context` block is read from persisted `daily_price_contexts`, not derived on request, and `price_context_history` carries up to the latest seven stored rows ending at the requested `market_date`. The same response also includes structured `scores`, compact `persisted_factor_rows`, `market_relative_context`, and `context_completeness` metadata so downstream agents can distinguish present factor rows, genuinely missing rows, null submetrics, sparse `daily_signal_features`, and unavailable peer mappings without guessing.
 
 ## Example request
 ```http
@@ -20,13 +20,42 @@ GET /agent-context/symbol-day?market_date=2026-04-15&symbols=005930&fs_div=CFS&d
   "summary": {
     "requested_symbol_count": 1,
     "matched_symbol_count": 1,
-    "price_context_count": 1
+    "price_context_count": 1,
+    "factor_row_counts": {
+      "unified_value": 1,
+      "quality": 1,
+      "momentum": 1,
+      "advanced_value": 1,
+      "low_risk": 1,
+      "beta": 1,
+      "composite": 1
+    },
+    "context_completeness": {
+      "signal_features": {
+        "present_rows": 1,
+        "missing_rows": 0,
+        "coverage_status": "complete"
+      }
+    }
   },
   "items": [
     {
       "symbol": "005930",
       "market_date": "2026-04-15",
       "company": {"name_ko": "삼성전자", "market": "KOSPI"},
+      "market_relative_context": {
+        "status": "available",
+        "market": "KOSPI",
+        "breadth": {
+          "up_count": 470,
+          "down_count": 260,
+          "flat_count": 80
+        },
+        "relative_strength": {
+          "return_percentile": 0.95,
+          "volume_percentile": 0.93
+        }
+      },
       "price_context": {
         "trade_date": "2026-04-15",
         "open_price": 70800,
@@ -114,6 +143,41 @@ GET /agent-context/symbol-day?market_date=2026-04-15&symbols=005930&fs_div=CFS&d
           "components_possible": 3,
           "coverage_notes": [],
           "as_of_market_date": "2026-04-15"
+        }
+      },
+      "persisted_factor_rows": {
+        "advanced_value": {
+          "advanced_value_score": 0.81,
+          "advanced_value_classification": "eligible"
+        },
+        "low_risk": {
+          "low_risk_score": 0.67,
+          "low_risk_classification": "watchlist"
+        },
+        "beta": {
+          "low_beta_score": 0.58,
+          "low_beta_classification": "eligible"
+        },
+        "composite": {
+          "composite_score": 0.73,
+          "composite_classification": "eligible"
+        }
+      },
+      "context_completeness": {
+        "factor_rows": {
+          "quality": {
+            "row_status": "present",
+            "null_submetric_fields": ["accruals_ratio"]
+          }
+        },
+        "signal_features": {"row_status": "present"},
+        "sector_peer_mapping": {"status": "unavailable"},
+        "requested_symbol_coverage": {
+          "signal_features": {
+            "present_rows": 1,
+            "missing_rows": 0,
+            "coverage_status": "complete"
+          }
         }
       },
       "fundamentals": {"latest_business_year": 2025},

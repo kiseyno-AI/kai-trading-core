@@ -10,7 +10,12 @@ from app.dart.fundamentals_store import DartFundamentalsRepository, dart_fundame
 from app.dart.service import FS_DIV_TO_STATEMENT_TYPE, REPORT_CODE_METADATA
 from app.dart.store import DartSyncRepository, dart_sync_repository
 from app.market_data_store import (
+    load_daily_advanced_value_factor_results,
     load_daily_action_summaries,
+    load_daily_beta_factor_results,
+    load_daily_composite_factor_results,
+    load_daily_low_risk_factor_results,
+    load_daily_market_relative_contexts,
     load_daily_momentum_factor_results,
     load_daily_price_context_history,
     load_daily_price_contexts,
@@ -22,6 +27,219 @@ from app.market_data_store import (
 )
 
 PRICE_CONTEXT_HISTORY_DAYS = DEFAULT_DERIVED_CONTEXT_HISTORY_DAYS
+PERSISTED_FACTOR_FAMILIES: tuple[str, ...] = (
+    'unified_value',
+    'quality',
+    'momentum',
+    'advanced_value',
+    'low_risk',
+    'beta',
+    'composite',
+)
+SIGNAL_FEATURE_SUBMETRIC_FIELDS: tuple[str, ...] = (
+    'signal_count',
+    'volume_power_rank',
+    'volume_power',
+    'overtime_volume_rank',
+    'overtime_volume',
+    'overtime_fluctuation_rank',
+    'overtime_fluctuation_rate',
+)
+FACTOR_ROW_FIELDS: dict[str, tuple[str, ...]] = {
+    'unified_value': (
+        'source',
+        'feature_version',
+        'market_date',
+        'unified_value_score',
+        'unified_value_rank',
+        'unified_value_percentile',
+        'components_used',
+        'unified_value_status',
+        'per',
+        'pbr',
+        'dividend_yield',
+        'fcf_yield',
+        'ev_to_ebitda',
+        'per_status',
+        'pbr_status',
+        'dividend_yield_status',
+        'fcf_yield_status',
+        'ev_to_ebitda_status',
+        'captured_at',
+    ),
+    'quality': (
+        'source',
+        'feature_version',
+        'market_date',
+        'quality_score',
+        'quality_rank',
+        'quality_percentile',
+        'components_used',
+        'components_possible',
+        'is_quality_score_complete',
+        'quality_status',
+        'roe',
+        'roa',
+        'gross_profit_to_assets',
+        'operating_cash_flow_to_net_income',
+        'debt_ratio',
+        'accruals_ratio',
+        'roe_status',
+        'roa_status',
+        'gross_profit_to_assets_status',
+        'operating_cash_flow_to_net_income_status',
+        'debt_ratio_status',
+        'accruals_ratio_status',
+        'captured_at',
+    ),
+    'momentum': (
+        'source',
+        'feature_version',
+        'market_date',
+        'momentum_percentile',
+        'momentum_rank',
+        'momentum_12_1',
+        'return_5d',
+        'ma_60',
+        'ma_120',
+        'momentum_percentile_threshold',
+        'passes_momentum_top_percentile',
+        'is_momentum_eligible',
+        'captured_at',
+    ),
+    'advanced_value': (
+        'source',
+        'feature_version',
+        'market_date',
+        'advanced_value_score',
+        'advanced_value_rank',
+        'advanced_value_percentile',
+        'advanced_value_components_used',
+        'advanced_value_classification',
+        'is_advanced_value_eligible',
+        'market_cap_proxy',
+        'enterprise_value',
+        'ebitda',
+        'free_cash_flow',
+        'fcf_yield',
+        'ev_to_ebitda',
+        'fcf_yield_status',
+        'ev_to_ebitda_status',
+        'captured_at',
+    ),
+    'low_risk': (
+        'source',
+        'feature_version',
+        'market_date',
+        'low_risk_score',
+        'low_risk_classification',
+        'is_low_risk_eligible',
+        'volatility_60d',
+        'volatility_120d',
+        'max_drawdown_120d',
+        'avg_trading_value_20d',
+        'volatility_60d_percentile',
+        'volatility_120d_percentile',
+        'max_drawdown_120d_percentile',
+        'liquidity_percentile',
+        'passes_liquidity_floor',
+        'captured_at',
+    ),
+    'beta': (
+        'source',
+        'feature_version',
+        'market_date',
+        'low_beta_score',
+        'low_beta_classification',
+        'is_low_beta_eligible',
+        'benchmark_id',
+        'benchmark_market',
+        'beta_60d',
+        'beta_120d',
+        'beta_60d_percentile',
+        'beta_120d_percentile',
+        'history_days_available',
+        'captured_at',
+    ),
+    'composite': (
+        'source',
+        'feature_version',
+        'market_date',
+        'composite_score',
+        'composite_rank',
+        'composite_percentile',
+        'composite_classification',
+        'is_composite_eligible',
+        'valid_factor_count',
+        'available_base_weight',
+        'has_required_inputs',
+        'is_hard_excluded',
+        'momentum_input',
+        'value_input',
+        'advanced_value_input',
+        'low_risk_input',
+        'low_beta_input',
+        'captured_at',
+    ),
+}
+FACTOR_ROW_STATUS_FIELDS: dict[str, tuple[str, ...]] = {
+    'unified_value': ('unified_value_status', 'per_status', 'pbr_status', 'dividend_yield_status', 'fcf_yield_status', 'ev_to_ebitda_status'),
+    'quality': (
+        'quality_status',
+        'roe_status',
+        'roa_status',
+        'gross_profit_to_assets_status',
+        'operating_cash_flow_to_net_income_status',
+        'debt_ratio_status',
+        'accruals_ratio_status',
+    ),
+    'momentum': tuple(),
+    'advanced_value': ('advanced_value_classification', 'fcf_yield_status', 'ev_to_ebitda_status'),
+    'low_risk': ('low_risk_classification',),
+    'beta': ('low_beta_classification',),
+    'composite': ('composite_classification',),
+}
+FACTOR_ROW_PRIMARY_SCORE_FIELDS: dict[str, str] = {
+    'unified_value': 'unified_value_score',
+    'quality': 'quality_score',
+    'momentum': 'momentum_percentile',
+    'advanced_value': 'advanced_value_score',
+    'low_risk': 'low_risk_score',
+    'beta': 'low_beta_score',
+    'composite': 'composite_score',
+}
+FACTOR_ROW_SUBMETRIC_FIELDS: dict[str, tuple[str, ...]] = {
+    'unified_value': ('per', 'pbr', 'dividend_yield', 'fcf_yield', 'ev_to_ebitda'),
+    'quality': (
+        'roe',
+        'roa',
+        'gross_profit_to_assets',
+        'operating_cash_flow_to_net_income',
+        'debt_ratio',
+        'accruals_ratio',
+    ),
+    'momentum': ('momentum_12_1', 'return_5d', 'ma_60', 'ma_120'),
+    'advanced_value': ('market_cap_proxy', 'enterprise_value', 'ebitda', 'free_cash_flow', 'fcf_yield', 'ev_to_ebitda'),
+    'low_risk': (
+        'volatility_60d',
+        'volatility_120d',
+        'max_drawdown_120d',
+        'avg_trading_value_20d',
+        'volatility_60d_percentile',
+        'volatility_120d_percentile',
+        'max_drawdown_120d_percentile',
+        'liquidity_percentile',
+    ),
+    'beta': ('beta_60d', 'beta_120d', 'beta_60d_percentile', 'beta_120d_percentile'),
+    'composite': (
+        'momentum_input',
+        'value_input',
+        'advanced_value_input',
+        'low_risk_input',
+        'low_beta_input',
+        'composite_score',
+    ),
+}
 
 
 def _normalize_symbols(symbols: Sequence[str]) -> list[str]:
@@ -221,6 +439,109 @@ def _group_price_context_history(
     return grouped
 
 
+def _ratio(numerator: int, denominator: int) -> float | None:
+    if denominator <= 0:
+        return None
+    return round(numerator / denominator, 4)
+
+
+def _coverage_status(*, present_count: int, requested_count: int, partial_label: str = 'partial') -> str:
+    if requested_count <= 0:
+        return 'empty'
+    if present_count <= 0:
+        return 'missing'
+    if present_count >= requested_count:
+        return 'complete'
+    return partial_label
+
+
+def _copy_selected_fields(row: dict[str, Any] | None, *, fields: tuple[str, ...]) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    return {field: row.get(field) for field in fields}
+
+
+def _build_factor_row_completeness(*, family: str, row: dict[str, Any] | None) -> dict[str, Any]:
+    if row is None:
+        return {
+            'row_status': 'missing',
+            'score_status': None,
+            'score_field': FACTOR_ROW_PRIMARY_SCORE_FIELDS[family],
+            'score_value_present': False,
+            'null_submetric_fields': [],
+            'null_submetric_count': 0,
+            'present_submetric_fields': [],
+            'present_submetric_count': 0,
+            'status_fields': {},
+        }
+
+    score_field = FACTOR_ROW_PRIMARY_SCORE_FIELDS[family]
+    submetric_fields = FACTOR_ROW_SUBMETRIC_FIELDS[family]
+    null_submetric_fields = [field for field in submetric_fields if row.get(field) is None]
+    present_submetric_fields = [field for field in submetric_fields if row.get(field) is not None]
+    status_fields = {
+        field: row.get(field)
+        for field in FACTOR_ROW_STATUS_FIELDS[family]
+        if field in row and row.get(field) is not None
+    }
+    primary_status = next((status_fields[field] for field in FACTOR_ROW_STATUS_FIELDS[family] if field in status_fields), None)
+    return {
+        'row_status': 'present',
+        'score_status': primary_status,
+        'score_field': score_field,
+        'score_value_present': row.get(score_field) is not None,
+        'null_submetric_fields': null_submetric_fields,
+        'null_submetric_count': len(null_submetric_fields),
+        'present_submetric_fields': present_submetric_fields,
+        'present_submetric_count': len(present_submetric_fields),
+        'status_fields': status_fields,
+    }
+
+
+def _build_signal_feature_completeness(row: dict[str, Any] | None) -> dict[str, Any]:
+    if row is None:
+        return {
+            'row_status': 'missing',
+            'null_submetric_fields': list(SIGNAL_FEATURE_SUBMETRIC_FIELDS),
+            'null_submetric_count': len(SIGNAL_FEATURE_SUBMETRIC_FIELDS),
+            'present_submetric_fields': [],
+            'present_submetric_count': 0,
+        }
+    null_submetric_fields = [field for field in SIGNAL_FEATURE_SUBMETRIC_FIELDS if row.get(field) is None]
+    present_submetric_fields = [field for field in SIGNAL_FEATURE_SUBMETRIC_FIELDS if row.get(field) is not None]
+    return {
+        'row_status': 'present',
+        'null_submetric_fields': null_submetric_fields,
+        'null_submetric_count': len(null_submetric_fields),
+        'present_submetric_fields': present_submetric_fields,
+        'present_submetric_count': len(present_submetric_fields),
+    }
+
+
+def _build_market_relative_completeness(row: dict[str, Any] | None) -> dict[str, Any]:
+    if row is None:
+        return {
+            'status': 'unavailable',
+            'missing_fields': ['breadth', 'relative_strength'],
+        }
+
+    missing_fields: list[str] = []
+    breadth = row.get('breadth') if isinstance(row.get('breadth'), dict) else None
+    relative_strength = row.get('relative_strength') if isinstance(row.get('relative_strength'), dict) else None
+    if breadth is None:
+        missing_fields.append('breadth')
+    if relative_strength is None:
+        missing_fields.append('relative_strength')
+    elif relative_strength.get('return_percentile') is None:
+        missing_fields.append('relative_strength.return_percentile')
+    if relative_strength is None or relative_strength.get('volume_percentile') is None:
+        missing_fields.append('relative_strength.volume_percentile')
+    return {
+        'status': row.get('status') or ('partial' if missing_fields else 'available'),
+        'missing_fields': missing_fields,
+    }
+
+
 class AgentContextReadService:
     def __init__(
         self,
@@ -275,6 +596,26 @@ class AgentContextReadService:
             symbols=normalized_symbols,
             limit=max(len(normalized_symbols), 1000),
         )
+        advanced_value_rows = load_daily_advanced_value_factor_results(
+            market_date=normalized_market_date,
+            symbols=normalized_symbols,
+            limit=max(len(normalized_symbols), 1000),
+        )
+        low_risk_rows = load_daily_low_risk_factor_results(
+            market_date=normalized_market_date,
+            symbols=normalized_symbols,
+            limit=max(len(normalized_symbols), 1000),
+        )
+        beta_rows = load_daily_beta_factor_results(
+            market_date=normalized_market_date,
+            symbols=normalized_symbols,
+            limit=max(len(normalized_symbols), 1000),
+        )
+        composite_rows = load_daily_composite_factor_results(
+            market_date=normalized_market_date,
+            symbols=normalized_symbols,
+            limit=max(len(normalized_symbols), 1000),
+        )
         price_context_rows = load_daily_price_contexts(
             market_date=normalized_market_date,
             symbols=normalized_symbols,
@@ -284,6 +625,10 @@ class AgentContextReadService:
             market_date=normalized_market_date,
             symbols=normalized_symbols,
             history_days=PRICE_CONTEXT_HISTORY_DAYS,
+        )
+        market_relative_rows = load_daily_market_relative_contexts(
+            market_date=normalized_market_date,
+            symbols=normalized_symbols,
         )
         fundamentals_rows = self.fundamentals_repository.list_stored_fundamentals_summary(
             stock_codes=normalized_symbols,
@@ -302,11 +647,16 @@ class AgentContextReadService:
         unified_value_map = {item['symbol']: item for item in unified_value_rows}
         quality_map = {item['symbol']: item for item in quality_rows}
         momentum_map = {item['symbol']: item for item in momentum_rows}
+        advanced_value_map = {item['symbol']: item for item in advanced_value_rows}
+        low_risk_map = {item['symbol']: item for item in low_risk_rows}
+        beta_map = {item['symbol']: item for item in beta_rows}
+        composite_map = {item['symbol']: item for item in composite_rows}
         price_context_map = {item['symbol']: item['context_payload'] for item in price_context_rows}
         price_context_history_map = _group_price_context_history(
             price_context_history_rows,
             symbols=normalized_symbols,
         )
+        market_relative_map = {item['symbol']: item for item in market_relative_rows}
         fundamentals_map: dict[str, list[dict[str, Any]]] = {symbol: [] for symbol in normalized_symbols}
         for item in fundamentals_rows:
             stock_code = item.get('stock_code')
@@ -316,6 +666,7 @@ class AgentContextReadService:
         items: list[dict[str, Any]] = []
         matched_symbols: list[str] = []
         missing_symbols: list[str] = []
+        factor_row_counts = {family: 0 for family in PERSISTED_FACTOR_FAMILIES}
 
         for symbol in normalized_symbols:
             price_context = price_context_map.get(symbol)
@@ -323,12 +674,58 @@ class AgentContextReadService:
             technical_snapshot = technical_map.get(symbol)
             action_summary = action_map.get(symbol)
             signal_features = signal_feature_map.get(symbol)
+            market_relative_context = market_relative_map.get(symbol)
             scores = build_signal_decider_scores(
                 market_date=normalized_market_date,
                 unified_value_row=unified_value_map.get(symbol),
                 quality_row=quality_map.get(symbol),
                 momentum_row=momentum_map.get(symbol),
             )
+            persisted_factor_rows = {
+                'unified_value': _copy_selected_fields(
+                    unified_value_map.get(symbol),
+                    fields=FACTOR_ROW_FIELDS['unified_value'],
+                ),
+                'quality': _copy_selected_fields(
+                    quality_map.get(symbol),
+                    fields=FACTOR_ROW_FIELDS['quality'],
+                ),
+                'momentum': _copy_selected_fields(
+                    momentum_map.get(symbol),
+                    fields=FACTOR_ROW_FIELDS['momentum'],
+                ),
+                'advanced_value': _copy_selected_fields(
+                    advanced_value_map.get(symbol),
+                    fields=FACTOR_ROW_FIELDS['advanced_value'],
+                ),
+                'low_risk': _copy_selected_fields(
+                    low_risk_map.get(symbol),
+                    fields=FACTOR_ROW_FIELDS['low_risk'],
+                ),
+                'beta': _copy_selected_fields(
+                    beta_map.get(symbol),
+                    fields=FACTOR_ROW_FIELDS['beta'],
+                ),
+                'composite': _copy_selected_fields(
+                    composite_map.get(symbol),
+                    fields=FACTOR_ROW_FIELDS['composite'],
+                ),
+            }
+            for family, row in persisted_factor_rows.items():
+                if row is not None:
+                    factor_row_counts[family] += 1
+            context_completeness = {
+                'factor_rows': {
+                    family: _build_factor_row_completeness(family=family, row=row)
+                    for family, row in persisted_factor_rows.items()
+                },
+                'signal_features': _build_signal_feature_completeness(signal_features),
+                'market_relative_context': _build_market_relative_completeness(market_relative_context),
+                'sector_peer_mapping': {
+                    'status': 'unavailable',
+                    'reason': 'No persisted sector or industry mapping is available for peer comparisons in the current symbol schema.',
+                },
+            }
             fundamentals = _build_fundamentals_summary(
                 fundamentals_map.get(symbol, []),
                 market_date=normalized_market_date,
@@ -373,6 +770,11 @@ class AgentContextReadService:
                 'technical_snapshot': technical_snapshot is not None,
                 'action_summary': action_summary is not None,
                 'signal_features': signal_features is not None,
+                'market_relative_context': (
+                    isinstance(market_relative_context, dict)
+                    and str(market_relative_context.get('status') or 'unavailable') != 'unavailable'
+                ),
+                'persisted_factor_rows': any(row is not None for row in persisted_factor_rows.values()),
                 'fundamentals': fundamentals['latest_snapshot'] is not None,
                 'recent_disclosures': bool(recent_disclosures),
             }
@@ -391,15 +793,80 @@ class AgentContextReadService:
                     'technical_snapshot': technical_snapshot,
                     'action_summary': action_summary,
                     'signal_features': signal_features,
+                    'market_relative_context': market_relative_context,
                     'scores': scores,
+                    'persisted_factor_rows': persisted_factor_rows,
                     'fundamentals': fundamentals,
                     'recent_disclosures': {
                         'count': len(recent_disclosures),
                         'items': recent_disclosures,
                     },
+                    'context_completeness': context_completeness,
                     'availability': availability,
                 }
             )
+
+        requested_symbol_count = len(normalized_symbols)
+        factor_row_coverage = {
+            family: {
+                'present_rows': present_count,
+                'missing_rows': requested_symbol_count - present_count,
+                'coverage_ratio': _ratio(present_count, requested_symbol_count),
+                'coverage_status': _coverage_status(
+                    present_count=present_count,
+                    requested_count=requested_symbol_count,
+                ),
+            }
+            for family, present_count in factor_row_counts.items()
+        }
+        signal_feature_present_count = sum(1 for item in items if item['signal_features'] is not None)
+        market_relative_available_count = sum(
+            1
+            for item in items
+            if str((item.get('market_relative_context') or {}).get('status') or 'unavailable') == 'available'
+        )
+        market_relative_partial_count = sum(
+            1
+            for item in items
+            if str((item.get('market_relative_context') or {}).get('status') or 'unavailable') == 'partial'
+        )
+        requested_symbol_coverage = {
+            'requested_symbol_count': requested_symbol_count,
+            'factor_rows': factor_row_coverage,
+            'signal_features': {
+                'present_rows': signal_feature_present_count,
+                'missing_rows': requested_symbol_count - signal_feature_present_count,
+                'coverage_ratio': _ratio(signal_feature_present_count, requested_symbol_count),
+                'coverage_status': _coverage_status(
+                    present_count=signal_feature_present_count,
+                    requested_count=requested_symbol_count,
+                    partial_label='sparse',
+                ),
+            },
+            'market_relative_context': {
+                'available_rows': market_relative_available_count,
+                'partial_rows': market_relative_partial_count,
+                'unavailable_rows': requested_symbol_count - market_relative_available_count - market_relative_partial_count,
+                'coverage_ratio': _ratio(
+                    market_relative_available_count + market_relative_partial_count,
+                    requested_symbol_count,
+                ),
+                'coverage_status': (
+                    'complete'
+                    if market_relative_available_count == requested_symbol_count and requested_symbol_count > 0
+                    else 'partial'
+                    if (market_relative_available_count + market_relative_partial_count) > 0
+                    else 'missing'
+                ),
+            },
+            'sector_peer_mapping': {
+                'available_rows': 0,
+                'unavailable_rows': requested_symbol_count,
+                'coverage_status': 'unavailable',
+            },
+        }
+        for item in items:
+            item['context_completeness']['requested_symbol_coverage'] = requested_symbol_coverage
 
         return {
             'request': {
@@ -417,12 +884,15 @@ class AgentContextReadService:
                 'technical_snapshot_count': sum(1 for item in items if item['technical_snapshot'] is not None),
                 'action_summary_count': sum(1 for item in items if item['action_summary'] is not None),
                 'signal_feature_count': sum(1 for item in items if item['signal_features'] is not None),
+                'market_relative_context_count': sum(1 for item in items if item['market_relative_context'] is not None),
                 'fundamentals_count': sum(
                     1 for item in items if item['fundamentals']['latest_snapshot'] is not None
                 ),
                 'recent_disclosure_symbol_count': sum(
                     1 for item in items if item['recent_disclosures']['count'] > 0
                 ),
+                'factor_row_counts': factor_row_counts,
+                'context_completeness': requested_symbol_coverage,
             },
             'items': items,
         }
