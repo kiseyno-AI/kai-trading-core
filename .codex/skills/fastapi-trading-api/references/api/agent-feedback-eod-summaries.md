@@ -70,6 +70,12 @@ GET /agent-context/feedback/eod-summaries?market_date=2026-04-21&symbol=005930
       "improvement_notes": [
         "Include next-session sector breadth by industry group."
       ],
+      "missing_data_categories": [
+        {
+          "category": "market_sector_peer_relative",
+          "status": "partially_available"
+        }
+      ],
       "received_at": "2026-04-21T06:10:00+00:00"
     }
   ]
@@ -129,6 +135,12 @@ GET /agent-context/feedback/eod-summaries?market_date=2026-04-21&symbol=005930
     },
     "improvement_notes": [
       "Include next-session sector breadth by industry group."
+    ],
+    "missing_data_categories": [
+      {
+        "category": "market_sector_peer_relative",
+        "status": "partially_available"
+      }
     ],
     "received_at": "2026-04-21T06:10:00+00:00"
   }

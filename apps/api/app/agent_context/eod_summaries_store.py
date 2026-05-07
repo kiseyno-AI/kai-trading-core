@@ -6,6 +6,7 @@ from typing import Any
 from sqlalchemy import select
 
 from app.db import session_scope
+from app.agent_context.missing_data_taxonomy import build_missing_data_categories, enrich_missing_data_categories
 from app.db_models import AgentContextFeedback
 
 EOD_SUMMARIZER_AGENT_NAME = 'eod-summarizer'
@@ -22,6 +23,12 @@ def _feedback_payload(record: AgentContextFeedback) -> dict[str, Any]:
 def _serialize_eod_summary(record: AgentContextFeedback) -> dict[str, Any]:
     payload = _feedback_payload(record)
     risk_flags = payload.get('risk_flags') if isinstance(payload.get('risk_flags'), list) else []
+    raw_categories = record.missing_data_categories_payload
+    if not isinstance(raw_categories, list):
+        raw_categories = build_missing_data_categories(
+            data_gaps_payload=record.data_gaps_payload,
+            improvement_notes_payload=record.improvement_notes_payload,
+        )
     return {
         'symbol': record.symbol,
         'market_date': record.market_date.isoformat(),
@@ -43,6 +50,7 @@ def _serialize_eod_summary(record: AgentContextFeedback) -> dict[str, Any]:
         'fundamental_backdrop': record.fundamental_backdrop_payload,
         'conservative_take': record.conservative_take_payload,
         'improvement_notes': record.improvement_notes_payload,
+        'missing_data_categories': enrich_missing_data_categories(raw_categories),
         'received_at': record.received_at.isoformat() if record.received_at else None,
     }
 

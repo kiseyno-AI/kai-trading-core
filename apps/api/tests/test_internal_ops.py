@@ -386,6 +386,34 @@ class InternalOpsTests(unittest.TestCase):
         self.assertEqual(config.outer_batch_size, 10)
         self.assertFalse(config.reuse_existing)
 
+    def test_get_agent_feedback_data_gap_summary_passes_filters_to_report_service(self) -> None:
+        with (
+            patch('app.internal.ops.bootstrap_runtime') as bootstrap_runtime,
+            patch(
+                'app.internal.ops.agent_context_missing_data_report_service.get_summary',
+                return_value={'summary': {'feedback_rows_matched': 2}},
+            ) as get_summary,
+        ):
+            result = ops.get_agent_feedback_data_gap_summary(
+                market_date_from='2026-05-05',
+                market_date_to='2026-05-06',
+                symbols='005930,000660',
+                agent_name='technical-summarizer',
+                categories='factor_score_coverage,liquidity_turnover_slippage',
+                persist_missing_categories=True,
+            )
+
+        bootstrap_runtime.assert_called_once_with()
+        self.assertEqual(result, {'summary': {'feedback_rows_matched': 2}})
+        self.assertEqual(get_summary.call_args.kwargs['market_date_from'], '2026-05-05')
+        self.assertEqual(get_summary.call_args.kwargs['market_date_to'], '2026-05-06')
+        self.assertEqual(get_summary.call_args.kwargs['symbols'], ('005930', '000660'))
+        self.assertEqual(
+            get_summary.call_args.kwargs['categories'],
+            ('factor_score_coverage', 'liquidity_turnover_slippage'),
+        )
+        self.assertTrue(get_summary.call_args.kwargs['persist_missing_categories'])
+
     def test_compute_market_risk_filters_uses_canonical_feature_version(self) -> None:
         with (
             patch('app.internal.ops.bootstrap_runtime') as bootstrap_runtime,

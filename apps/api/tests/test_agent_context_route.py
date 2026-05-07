@@ -76,6 +76,29 @@ class FakeAgentContextFeedbackService:
         }
 
 
+class FakeAgentContextMissingDataReportService:
+    def __init__(self):
+        self.last_args = None
+
+    def get_summary(self, **kwargs):
+        self.last_args = kwargs
+        return {
+            'request': {
+                'market_date': kwargs['market_date'].isoformat() if kwargs['market_date'] is not None else None,
+                'market_date_from': kwargs['market_date_from'].isoformat() if kwargs['market_date_from'] is not None else None,
+                'market_date_to': kwargs['market_date_to'].isoformat() if kwargs['market_date_to'] is not None else None,
+                'symbols': kwargs['symbols'],
+                'agent_name': kwargs['agent_name'],
+                'categories': kwargs['categories'],
+                'persist_missing_categories': kwargs.get('persist_missing_categories', False),
+            },
+            'summary': {'feedback_rows_matched': 2},
+            'categories': [{'category': 'factor_score_coverage'}],
+            'date_breakdown': [],
+            'uncategorized_examples': [],
+        }
+
+
 class FakeAgentContextEodSummariesService:
     def __init__(self):
         self.inspect_args = None
@@ -1016,6 +1039,33 @@ class AgentContextRouteTests(unittest.TestCase):
         self.assertEqual(fake_service.list_args['agent_name'], 'openclaw')
         self.assertEqual(fake_service.list_args['limit'], 10)
         self.assertEqual(response.json()['items'][0]['symbol'], '005930')
+
+    def test_agent_feedback_data_gap_summary_route_calls_service(self):
+        fake_service = FakeAgentContextMissingDataReportService()
+        original_service = routes_agent_context.agent_context_missing_data_report_service
+        routes_agent_context.agent_context_missing_data_report_service = fake_service
+        try:
+            client = TestClient(self.app)
+            response = client.get(
+                '/agent-context/feedback/data-gap-summary',
+                params=[
+                    ('market_date_from', '2026-05-05'),
+                    ('market_date_to', '2026-05-06'),
+                    ('symbols', '005930,000660'),
+                    ('agent_name', 'technical-summarizer'),
+                    ('categories', 'factor_score_coverage'),
+                ],
+            )
+        finally:
+            routes_agent_context.agent_context_missing_data_report_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(fake_service.last_args['market_date_from'], date.fromisoformat('2026-05-05'))
+        self.assertEqual(fake_service.last_args['market_date_to'], date.fromisoformat('2026-05-06'))
+        self.assertEqual(fake_service.last_args['symbols'], ['005930,000660'])
+        self.assertEqual(fake_service.last_args['agent_name'], 'technical-summarizer')
+        self.assertEqual(fake_service.last_args['categories'], ['factor_score_coverage'])
+        self.assertEqual(response.json()['summary']['feedback_rows_matched'], 2)
 
     def test_compute_decider_evaluations_route_calls_service(self):
         fake_service = FakeDeciderEvaluationService()
