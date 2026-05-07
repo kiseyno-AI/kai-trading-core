@@ -101,6 +101,21 @@ class DartFundamentalsHistoryServiceTests(unittest.TestCase):
                             'ratio_value': None,
                         },
                         {
+                            'metric_key': 'inventories',
+                            'metric_type': 'account',
+                            'statement_type': None,
+                            'statement_name': None,
+                            'account_id': None,
+                            'account_name': None,
+                            'current_amount': None,
+                            'current_cumulative_amount': None,
+                            'prior_amount': None,
+                            'prior_cumulative_amount': None,
+                            'pre_prior_amount': None,
+                            'currency': None,
+                            'ratio_value': None,
+                        },
+                        {
                             'metric_key': 'operating_margin',
                             'metric_type': 'ratio',
                             'statement_type': None,
@@ -186,6 +201,11 @@ class DartFundamentalsHistoryServiceTests(unittest.TestCase):
             entry['fundamental_context']['analysis']['leverage_liquidity']['metrics']['debt_to_equity'],
             '0.6667',
         )
+        self.assertEqual(
+            entry['fundamental_context']['normalized_facts']['balance_sheet']['inventories']['status'],
+            'missing',
+        )
+        self.assertEqual(entry['fundamental_context']['coverage']['mapped_fact_count'], 4)
         self.assertEqual(entry['fundamental_context']['source_provenance']['rcept_no'], '20250312000123')
         self.assertEqual(entry['statements']['count'], 1)
 

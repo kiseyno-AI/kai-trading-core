@@ -538,6 +538,47 @@ class DartServiceTests(unittest.IsolatedAsyncioTestCase):
             fundamental_context['coverage']['missing_fact_keys'],
         )
 
+    def test_build_fundamental_context_treats_hydrated_null_account_highlights_as_missing(self):
+        fundamental_context = build_fundamental_context_from_highlights(
+            {
+                'revenue': {
+                    'statement_type': 'IS',
+                    'statement_name': '손익계산서',
+                    'account_id': 'ifrs-full_Revenue',
+                    'account_name': '매출액',
+                    'current_amount': 1000,
+                    'current_cumulative_amount': 1000,
+                    'prior_amount': 900,
+                    'prior_cumulative_amount': 900,
+                    'pre_prior_amount': None,
+                    'currency': 'KRW',
+                },
+                'inventories': {
+                    'statement_type': None,
+                    'statement_name': None,
+                    'account_id': None,
+                    'account_name': None,
+                    'current_amount': None,
+                    'current_cumulative_amount': None,
+                    'prior_amount': None,
+                    'prior_cumulative_amount': None,
+                    'pre_prior_amount': None,
+                    'currency': None,
+                },
+                'ratios': {},
+            }
+        )
+
+        self.assertEqual(
+            fundamental_context['normalized_facts']['balance_sheet']['inventories']['status'],
+            'missing',
+        )
+        self.assertEqual(fundamental_context['coverage']['mapped_fact_count'], 1)
+        self.assertIn(
+            'balance_sheet.inventories',
+            fundamental_context['coverage']['missing_fact_keys'],
+        )
+
 
 if __name__ == '__main__':
     unittest.main()

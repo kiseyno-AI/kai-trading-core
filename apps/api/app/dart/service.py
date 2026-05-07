@@ -755,7 +755,7 @@ def _build_normalized_facts_from_highlights(highlights: dict[str, Any]) -> dict[
 
 
 def _build_fact_snapshot(fact_key: str, highlight: dict[str, Any] | None) -> dict[str, Any]:
-    if not isinstance(highlight, dict):
+    if _is_missing_highlight(highlight):
         return {
             'status': 'missing',
             'statement_types': sorted(CANONICAL_FACT_MATCHERS[fact_key].get('statement_types') or []),
@@ -793,6 +793,24 @@ def _build_fact_snapshot(fact_key: str, highlight: dict[str, Any] | None) -> dic
         'pre_prior_amount': highlight.get('pre_prior_amount'),
         'currency': highlight.get('currency'),
     }
+
+
+def _is_missing_highlight(highlight: dict[str, Any] | None) -> bool:
+    if not isinstance(highlight, dict):
+        return True
+
+    account_id = highlight.get('account_id')
+    if isinstance(account_id, str):
+        account_id = account_id.strip()
+    account_name = highlight.get('account_name')
+    if isinstance(account_name, str):
+        account_name = account_name.strip()
+    if account_id or account_name:
+        return False
+
+    current_value, _current_basis = _resolve_highlight_value(highlight, current=True)
+    prior_value, _prior_basis = _resolve_highlight_value(highlight, current=False)
+    return current_value is None and prior_value is None and highlight.get('pre_prior_amount') is None
 
 
 def _resolve_highlight_value(highlight: dict[str, Any], *, current: bool) -> tuple[int | None, str | None]:
