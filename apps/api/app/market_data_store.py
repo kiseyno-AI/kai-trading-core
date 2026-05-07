@@ -5,7 +5,7 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Callable
 
-from sqlalchemy import Numeric, and_, case, cast, delete, func, select, text, update
+from sqlalchemy import Numeric, and_, case, cast, delete, func, select, text, true, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import aliased
 
@@ -681,28 +681,11 @@ def load_daily_market_relative_contexts(
         if not target_markets:
             return []
 
-        ranked = (
-            select(
-                Symbol.symbol.label('symbol'),
-                Symbol.market.label('market'),
-                DailyPriceBar.trade_date.label('trade_date'),
-                DailyPriceBar.close_price.label('close_price'),
-                DailyPriceBar.volume.label('volume'),
-                func.row_number()
-                .over(partition_by=DailyPriceBar.symbol_id, order_by=DailyPriceBar.trade_date.desc())
-                .label('bar_rank'),
-            )
-            .join(Symbol, Symbol.id == DailyPriceBar.symbol_id)
-            .where(
-                Symbol.market.in_(target_markets),
-                DailyPriceBar.trade_date <= normalized_market_date,
-            )
-            .subquery()
-        )
         rows = session.execute(
-            select(ranked)
-            .where(ranked.c.bar_rank <= 2)
-            .order_by(ranked.c.market.asc(), ranked.c.symbol.asc(), ranked.c.trade_date.desc())
+            _build_daily_market_relative_rows_query(
+                target_markets=target_markets,
+                market_date=normalized_market_date,
+            )
         ).all()
 
     history_by_symbol: dict[str, list[dict[str, Any]]] = {}
@@ -842,6 +825,72 @@ def load_daily_market_relative_contexts(
             }
         )
     return items
+
+
+def _build_market_relative_trade_dates_subquery(
+    *,
+    target_markets: list[str],
+    market_date: date,
+):
+    # Limit the history lookup to the two relevant trade dates per market so
+    # the downstream bar read stays bounded as the historical table grows.
+    market_scope = (
+        select(Symbol.market.label('market'))
+        .where(Symbol.market.in_(target_markets))
+        .distinct()
+        .subquery()
+    )
+    market_symbol = aliased(Symbol)
+    recent_trade_dates = (
+        select(DailyPriceBar.trade_date.label('trade_date'))
+        .join(market_symbol, market_symbol.id == DailyPriceBar.symbol_id)
+        .where(
+            market_symbol.market == market_scope.c.market,
+            DailyPriceBar.trade_date <= market_date,
+        )
+        .group_by(DailyPriceBar.trade_date)
+        .order_by(DailyPriceBar.trade_date.desc())
+        .limit(2)
+        .lateral('recent_trade_dates')
+    )
+    return (
+        select(
+            market_scope.c.market.label('market'),
+            recent_trade_dates.c.trade_date.label('trade_date'),
+        )
+        .select_from(market_scope.join(recent_trade_dates, true()))
+        .subquery()
+    )
+
+
+def _build_daily_market_relative_rows_query(
+    *,
+    target_markets: list[str],
+    market_date: date,
+):
+    relevant_trade_dates = _build_market_relative_trade_dates_subquery(
+        target_markets=target_markets,
+        market_date=market_date,
+    )
+    return (
+        select(
+            Symbol.symbol.label('symbol'),
+            Symbol.market.label('market'),
+            DailyPriceBar.trade_date.label('trade_date'),
+            DailyPriceBar.close_price.label('close_price'),
+            DailyPriceBar.volume.label('volume'),
+        )
+        .join(Symbol, Symbol.id == DailyPriceBar.symbol_id)
+        .join(
+            relevant_trade_dates,
+            and_(
+                relevant_trade_dates.c.market == Symbol.market,
+                relevant_trade_dates.c.trade_date == DailyPriceBar.trade_date,
+            ),
+        )
+        .where(Symbol.market.in_(target_markets))
+        .order_by(Symbol.market.asc(), Symbol.symbol.asc(), DailyPriceBar.trade_date.desc())
+    )
 
 
 def upsert_daily_price_context(item: dict, *, run_id: int | None = None) -> None:
