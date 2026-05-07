@@ -241,6 +241,354 @@ def _build_evaluation_gate_response(
     }
 
 
+def _to_non_negative_int(value: Any) -> int:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _normalize_signal_decider_action_key(value: Any) -> str:
+    normalized = str(value or '').strip().lower().replace('-', '_')
+    if normalized in {'buy'}:
+        return 'buy'
+    if normalized in {'wait', 'hold', 'watch', 'watchlist'}:
+        return 'wait'
+    if normalized in {'reject', 'avoid', 'skip'}:
+        return 'reject'
+    return 'unknown'
+
+
+def _normalize_text_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    items: list[str] = []
+    for entry in value:
+        text = str(entry).strip() if entry is not None else ''
+        if text:
+            items.append(text)
+    return items
+
+
+def _extract_summary_text(value: Any) -> str | None:
+    if isinstance(value, str):
+        normalized = value.strip()
+        return normalized or None
+    if isinstance(value, dict):
+        for key in ('summary', 'thesis_summary', 'headline', 'text'):
+            candidate = value.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+    return None
+
+
+def _extract_reviewed_count(payload: dict[str, Any] | None) -> int:
+    payload = payload or {}
+    reviewed_count = payload.get('reviewed_decision_count')
+    if reviewed_count is not None:
+        return _to_non_negative_int(reviewed_count)
+    evaluation_coverage = payload.get('evaluation_coverage')
+    if isinstance(evaluation_coverage, dict):
+        complete_count = evaluation_coverage.get('complete_count')
+        if complete_count is not None:
+            return _to_non_negative_int(complete_count)
+    review_status_counts = payload.get('review_status_counts')
+    if isinstance(review_status_counts, dict):
+        if review_status_counts.get('reviewed') is not None:
+            return _to_non_negative_int(review_status_counts.get('reviewed'))
+        if review_status_counts.get('complete') is not None:
+            return _to_non_negative_int(review_status_counts.get('complete'))
+    return 0
+
+
+def _has_review_rows(payload: dict[str, Any]) -> bool:
+    items = payload.get('items')
+    if isinstance(items, list) and len(items) > 0:
+        return True
+    summary = payload.get('summary')
+    if isinstance(summary, dict):
+        decision_count = summary.get('decision_count', summary.get('count'))
+        return _to_non_negative_int(decision_count) > 0
+    return False
+
+
+def _resolve_feedback_review_payload(
+    *,
+    projection_loader,
+    fallback_loader,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    projection_payload = projection_loader()
+    if _has_review_rows(projection_payload):
+        return projection_payload, {
+            'status': 'ready',
+            'source': 'persisted_review_projection',
+            'fallback_used': False,
+        }
+
+    fallback_payload = fallback_loader()
+    if _has_review_rows(fallback_payload):
+        return fallback_payload, {
+            'status': 'fallback',
+            'source': 'signal_decider_snapshot_fallback',
+            'fallback_used': True,
+        }
+
+    return projection_payload, {
+        'status': 'empty',
+        'source': 'persisted_review_projection',
+        'fallback_used': False,
+    }
+
+
+def _build_feedback_review_availability(metadata: dict[str, Any]) -> dict[str, Any]:
+    return {
+        'status': metadata['status'],
+        'source': metadata['source'],
+        'fallback_used': bool(metadata['fallback_used']),
+    }
+
+
+def _build_feedback_calendar_summary_item(raw_item: dict[str, Any], *, source: str) -> dict[str, Any]:
+    decision_count = _to_non_negative_int(raw_item.get('decision_count'))
+    reviewed_count = _extract_reviewed_count(raw_item)
+    action_counts = {'buy': 0, 'wait': 0, 'reject': 0, 'unknown': 0}
+    raw_action_counts = raw_item.get('decision_actions')
+    if isinstance(raw_action_counts, dict):
+        for raw_key, raw_value in raw_action_counts.items():
+            action_counts[_normalize_signal_decider_action_key(raw_key)] += _to_non_negative_int(raw_value)
+
+    return {
+        'market_date': str(raw_item.get('market_date') or ''),
+        'calendar_status': signal_decider_loop_service.build_calendar_day_status(
+            decision_count=decision_count,
+            reviewed_count=reviewed_count,
+        ),
+        'decision_count': decision_count,
+        'decision_actions': action_counts,
+        'review_status_counts': {'reviewed': reviewed_count} if reviewed_count > 0 else {},
+        'reviewed_count': reviewed_count,
+        'pending_review_count': max(decision_count - reviewed_count, 0),
+        'source': source,
+    }
+
+
+def _build_feedback_calendar_response(
+    *,
+    review_payload: dict[str, Any],
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    request_payload = dict(review_payload.get('request') or {})
+    summary_payload = dict(review_payload.get('summary') or {})
+    decision_count = _to_non_negative_int(summary_payload.get('decision_count', summary_payload.get('count')))
+    reviewed_count = _extract_reviewed_count(summary_payload)
+    items = [
+        _build_feedback_calendar_summary_item(item, source=metadata['source'])
+        for item in list(review_payload.get('items') or [])
+        if isinstance(item, dict)
+    ]
+    return {
+        'request': {
+            'month': request_payload.get('month'),
+            'horizons': list(request_payload.get('horizons') or []),
+            'primary_horizon_days': request_payload.get('primary_horizon_days'),
+            'evaluation_version': request_payload.get('evaluation_version'),
+        },
+        'summary': {
+            'month': request_payload.get('month'),
+            'decision_count': decision_count,
+            'reviewed_count': reviewed_count,
+            'status': signal_decider_loop_service.build_calendar_day_status(
+                decision_count=decision_count,
+                reviewed_count=reviewed_count,
+            ),
+            'source': metadata['source'],
+            'request': {
+                'month': request_payload.get('month'),
+                'decision_count': decision_count,
+                'reviewed_count': reviewed_count,
+            },
+        },
+        'items': items,
+        'availability': _build_feedback_review_availability(metadata),
+        'read_model': review_payload.get('read_model'),
+        'taxonomy': review_payload.get('taxonomy'),
+    }
+
+
+def _build_review_realized_results(review_payload: dict[str, Any]) -> dict[str, Any]:
+    realized_results: dict[str, Any] = {}
+    for horizon_item in list(review_payload.get('outcome_horizons') or review_payload.get('horizons') or []):
+        if not isinstance(horizon_item, dict):
+            continue
+        horizon_days = _to_non_negative_int(horizon_item.get('horizon_days'))
+        if horizon_days <= 0:
+            continue
+        realized_results[f'{horizon_days}d'] = {
+            'return_pct': horizon_item.get('close_return_pct'),
+            'realized_return_pct': horizon_item.get('close_return_pct'),
+            'verdict': horizon_item.get('grade_label'),
+            'close_price': horizon_item.get('realized_price') or horizon_item.get('close_price'),
+            'notes': (
+                horizon_item.get('path_analysis', {}).get('path_explanation')
+                if isinstance(horizon_item.get('path_analysis'), dict)
+                else None
+            ),
+        }
+    return realized_results
+
+
+def _build_feedback_review_detail_payload(raw_review: dict[str, Any] | None) -> dict[str, Any] | None:
+    if raw_review is None:
+        return None
+    review_payload = dict(raw_review)
+    outcome_horizons = [
+        dict(item)
+        for item in list(review_payload.get('outcome_horizons') or review_payload.get('horizons') or [])
+        if isinstance(item, dict)
+    ]
+    path_analysis = review_payload.get('path_analysis')
+    trigger_sequence = (
+        path_analysis.get('trigger_sequence')
+        if isinstance(path_analysis, dict)
+        else review_payload.get('intraday_path_result')
+    )
+    review_payload['outcome_horizons'] = outcome_horizons
+    review_payload['horizons'] = outcome_horizons
+    if trigger_sequence:
+        review_payload.setdefault('target_stop_result', trigger_sequence)
+        review_payload.setdefault('intraday_path_result', trigger_sequence)
+    review_summary = review_payload.get('narrative_text') or review_payload.get('review_conclusion_text')
+    if review_summary:
+        review_payload.setdefault('review_summary', review_summary)
+        review_payload.setdefault('replay_summary', review_summary)
+    return review_payload
+
+
+def _build_feedback_review_decision_payload(raw_item: dict[str, Any]) -> dict[str, Any]:
+    raw_decision = dict(raw_item.get('decision') or {})
+    raw_review = dict(raw_item.get('review') or {})
+    review_payload = _build_feedback_review_detail_payload(raw_review) or {}
+    summary_text = _extract_summary_text(raw_item.get('summary'))
+    decision_risks = _normalize_text_list(raw_item.get('decision_risks'))
+    supporting_evidence = _normalize_text_list(raw_item.get('supporting_evidence'))
+    evaluation_payload = {
+        'quality_verdict': review_payload.get('quality_verdict'),
+        'quality_reason': review_payload.get('quality_reason'),
+        'review_conclusion': review_payload.get('review_conclusion'),
+        'target_stop_result': review_payload.get('target_stop_result'),
+        'intraday_path_result': review_payload.get('intraday_path_result'),
+        'outcome_horizons': review_payload.get('outcome_horizons'),
+        'realized_results': _build_review_realized_results(review_payload),
+    }
+    if not any(
+        value not in (None, {}, [])
+        for value in evaluation_payload.values()
+    ):
+        evaluation_payload = {}
+    return {
+        'role': 'signal-decider',
+        'agent_name': 'signal-decider',
+        'symbol': raw_item.get('symbol'),
+        'market_date': raw_item.get('market_date'),
+        'action': raw_decision.get('action'),
+        'preferred_action': raw_decision.get('preferred_action') or raw_decision.get('action'),
+        'next_day_open_action': raw_decision.get('next_day_open_action') or raw_decision.get('action'),
+        'entry_price_basis': raw_decision.get('entry_price_basis'),
+        'target_price': raw_decision.get('target_price'),
+        'expected_return_pct': raw_decision.get('expected_return_pct'),
+        'stop_loss_price': raw_decision.get('stop_loss_price'),
+        'suggested_holding_period': raw_decision.get('suggested_holding_period'),
+        'confidence_score_10': raw_decision.get('confidence_score_10'),
+        'conviction_score_10': raw_decision.get('conviction_score_10'),
+        'thesis_summary': summary_text,
+        'supporting_evidence': supporting_evidence,
+        'risk_flags': decision_risks,
+        'decision_risks': decision_risks,
+        'policy_version': raw_item.get('policy_version'),
+        'evaluation': evaluation_payload or None,
+    }
+
+
+def _build_feedback_review_item(raw_item: dict[str, Any], *, source: str) -> dict[str, Any]:
+    summary_text = _extract_summary_text(raw_item.get('summary'))
+    summary_payload: dict[str, Any] = {}
+    if summary_text is not None:
+        summary_payload['summary'] = summary_text
+    supporting_evidence = _normalize_text_list(raw_item.get('supporting_evidence'))
+    if supporting_evidence:
+        summary_payload['supporting_evidence'] = supporting_evidence
+    decision_risks = _normalize_text_list(raw_item.get('decision_risks'))
+    if decision_risks:
+        summary_payload['decision_risks'] = decision_risks
+    if raw_item.get('policy_version') is not None:
+        summary_payload['policy_version'] = raw_item.get('policy_version')
+    context_payload = raw_item.get('context') if isinstance(raw_item.get('context'), dict) else None
+    run_id = raw_item.get('decision_run_id')
+    return {
+        'snapshot_id': raw_item.get('snapshot_id'),
+        'symbol': raw_item.get('symbol'),
+        'market_date': raw_item.get('market_date'),
+        'run_id': str(run_id) if run_id is not None else None,
+        'captured_at': raw_item.get('received_at') or raw_item.get('created_at'),
+        'decision': _build_feedback_review_decision_payload(raw_item),
+        'review': _build_feedback_review_detail_payload(dict(raw_item.get('review') or {})),
+        'summary': summary_payload or None,
+        'context': context_payload,
+        'source': source,
+    }
+
+
+def _build_feedback_review_response(
+    *,
+    review_payload: dict[str, Any],
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    request_payload = dict(review_payload.get('request') or {})
+    raw_items = [
+        dict(item)
+        for item in list(review_payload.get('items') or [])
+        if isinstance(item, dict)
+    ]
+    items = [
+        _build_feedback_review_item(item, source=metadata['source'])
+        for item in raw_items
+    ]
+    summary_payload = dict(review_payload.get('summary') or {})
+    decision_count = _to_non_negative_int(summary_payload.get('count', len(items)))
+    if decision_count <= 0 and items:
+        decision_count = len(items)
+    reviewed_count = _extract_reviewed_count(summary_payload)
+    if reviewed_count <= 0:
+        reviewed_count = sum(
+            1
+            for item in raw_items
+            if isinstance(item.get('review'), dict) and str(item.get('review', {}).get('status') or '').strip().lower() == 'complete'
+        )
+    status = signal_decider_loop_service.build_calendar_day_status(
+        decision_count=decision_count,
+        reviewed_count=reviewed_count,
+    )
+    return {
+        'request': {
+            'market_date': request_payload.get('market_date'),
+            'horizons': list(request_payload.get('horizons') or []),
+            'primary_horizon_days': request_payload.get('primary_horizon_days'),
+            'evaluation_version': request_payload.get('evaluation_version'),
+        },
+        'summary': {
+            'count': decision_count,
+            'reviewed_count': reviewed_count,
+            'review_status_counts': {'reviewed': reviewed_count} if reviewed_count > 0 else {},
+            'status': status,
+            'source': metadata['source'],
+        },
+        'items': items,
+        'availability': _build_feedback_review_availability(metadata),
+        'read_model': review_payload.get('read_model'),
+        'taxonomy': review_payload.get('taxonomy'),
+    }
+
+
 @router.get('/symbol-day')
 async def get_symbol_day_context(
     market_date: date = Query(...),
@@ -759,6 +1107,72 @@ async def get_agent_feedback_progress(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f'Agent feedback progress read failed: {exc}') from exc
+
+
+@router.get('/feedback/calendar')
+async def get_agent_feedback_calendar_summary(
+    month: str = Query(...),
+    horizons: list[int] | None = Query(default=None),
+    primary_horizon_days: int = Query(default=5),
+    evaluation_version: str | None = Query(default=None),
+) -> dict:
+    try:
+        review_payload, metadata = await run_in_threadpool(
+            _resolve_feedback_review_payload,
+            projection_loader=lambda: signal_decider_calendar_review_service.get_review_calendar(
+                month=month,
+                horizons=horizons,
+                primary_horizon_days=primary_horizon_days,
+                evaluation_version=evaluation_version,
+            ),
+            fallback_loader=lambda: signal_decider_loop_service.get_review_calendar(
+                month=month,
+                horizons=horizons,
+                primary_horizon_days=primary_horizon_days,
+                evaluation_version=evaluation_version,
+            ),
+        )
+        return _build_feedback_calendar_response(
+            review_payload=review_payload,
+            metadata=metadata,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'Agent feedback calendar summary read failed: {exc}') from exc
+
+
+@router.get('/feedback/review')
+async def get_agent_feedback_review_date(
+    market_date: date = Query(...),
+    horizons: list[int] | None = Query(default=None),
+    primary_horizon_days: int = Query(default=5),
+    evaluation_version: str | None = Query(default=None),
+) -> dict:
+    try:
+        review_payload, metadata = await run_in_threadpool(
+            _resolve_feedback_review_payload,
+            projection_loader=lambda: signal_decider_calendar_review_service.get_review_date(
+                market_date=market_date,
+                horizons=horizons,
+                primary_horizon_days=primary_horizon_days,
+                evaluation_version=evaluation_version,
+            ),
+            fallback_loader=lambda: signal_decider_loop_service.get_review_date(
+                market_date=market_date,
+                horizons=horizons,
+                primary_horizon_days=primary_horizon_days,
+                evaluation_version=evaluation_version,
+            ),
+        )
+        return _build_feedback_review_response(
+            review_payload=review_payload,
+            metadata=metadata,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'Agent feedback review read failed: {exc}') from exc
 
 
 @router.get('/feedback/latest')
