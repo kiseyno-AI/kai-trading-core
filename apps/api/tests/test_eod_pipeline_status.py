@@ -3,6 +3,7 @@ from unittest.mock import patch
 
 from app.eod.pipeline_status import (
     DEFAULT_FACTOR_STAGE_ORDER,
+    DEFAULT_PYKRX_ENRICHMENT_CATEGORIES,
     EODPipelineStatusService,
     _load_latest_pipeline_pykrx_run,
 )
@@ -33,6 +34,22 @@ def _full_factor_stage_counts(*, total: int, updated_at: str) -> dict[str, dict]
             'updated_at': updated_at,
         }
         for stage_id in DEFAULT_FACTOR_STAGE_ORDER
+    }
+
+
+def _full_pykrx_enrichment_coverage(*, symbol_count: int, market_count: int, updated_at: str) -> dict[str, dict]:
+    return {
+        'requested_symbol_count': symbol_count,
+        'requested_market_count': market_count,
+        'categories': {
+            category: {
+                'present_rows': symbol_count if category not in {'market_breadth', 'investor_flow_market'} else market_count,
+                'expected_rows': symbol_count if category not in {'market_breadth', 'investor_flow_market'} else market_count,
+                'coverage_status': 'complete',
+                'latest_captured_at': updated_at,
+            }
+            for category in DEFAULT_PYKRX_ENRICHMENT_CATEGORIES
+        },
     }
 
 
@@ -454,6 +471,7 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
             result['stage_order'],
             [
                 'price_collection',
+                'pykrx_enrichment',
                 'technical_snapshots',
                 'action_summaries',
                 'trending_ranks',
@@ -868,6 +886,11 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
                 total=3,
                 updated_at='2026-04-21T10:15:00+00:00',
             ),
+            pykrx_enrichment_loader=lambda **_: _full_pykrx_enrichment_coverage(
+                symbol_count=3,
+                market_count=2,
+                updated_at='2026-04-21T10:12:00+00:00',
+            ),
         )
 
         result = service.read()
@@ -882,3 +905,51 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
         self.assertEqual(result['stages']['composite_factors']['status'], 'completed')
         self.assertEqual(result['stages']['trending_ranks']['processed'], 3)
         self.assertEqual(result['stages']['fundamentals_daily_refresh']['succeeded'], 3)
+
+    def test_read_includes_pykrx_enrichment_stage_from_coverage(self):
+        coverage = {
+            'requested_symbol_count': 2,
+            'requested_market_count': 1,
+            'categories': {
+                category: {
+                    'present_rows': 0,
+                    'expected_rows': 2 if category not in {'market_breadth', 'investor_flow_market'} else 1,
+                    'coverage_status': 'missing',
+                    'latest_captured_at': None,
+                }
+                for category in DEFAULT_PYKRX_ENRICHMENT_CATEGORIES
+            },
+        }
+        coverage['categories']['sector_classification'] = {
+            'present_rows': 2,
+            'expected_rows': 2,
+            'coverage_status': 'complete',
+            'latest_captured_at': '2026-04-21T15:10:00+09:00',
+        }
+        coverage['categories']['market_breadth'] = {
+            'present_rows': 1,
+            'expected_rows': 1,
+            'coverage_status': 'complete',
+            'latest_captured_at': '2026-04-21T15:10:00+09:00',
+        }
+
+        service = EODPipelineStatusService(
+            market_state_loader=lambda: _FakeMarketState(),
+            pykrx_run_loader=lambda **_: None,
+            pykrx_stage_counts_loader=lambda *_: {},
+            live_symbol_count_loader=lambda: 2,
+            fundamentals_refresh_loader=lambda **_: None,
+            factor_stage_counts_loader=lambda **_: {},
+            price_bar_count_loader=lambda **_: 0,
+            pykrx_enrichment_loader=lambda **_: coverage,
+        )
+
+        result = service.read(market_date='2026-04-21', fs_div='CFS')
+
+        self.assertEqual(result['stage_order'][1], 'pykrx_enrichment')
+        self.assertEqual(result['stages']['pykrx_enrichment']['status'], 'partial')
+        self.assertEqual(result['stages']['pykrx_enrichment']['details']['requested_symbol_count'], 2)
+        self.assertEqual(
+            result['stages']['pykrx_enrichment']['details']['categories']['sector_classification']['coverage_status'],
+            'complete',
+        )

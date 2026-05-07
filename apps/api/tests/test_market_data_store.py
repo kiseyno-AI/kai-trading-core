@@ -5,8 +5,13 @@ from sqlalchemy import delete, select
 from sqlalchemy.dialects import postgresql
 
 from app.db import engine, session_scope
-from app.db_models import DailyPriceBar, EODCollectionRun, Symbol
-from app.market_data_store import _build_daily_market_relative_rows_query, load_daily_market_relative_contexts
+from app.db_models import DailyPriceBar, DailyPykrxEnrichmentRow, EODCollectionRun, Symbol
+from app.market_data_store import (
+    _build_daily_market_relative_rows_query,
+    load_daily_market_relative_contexts,
+    load_daily_pykrx_enrichment_rows,
+    upsert_daily_pykrx_enrichment_rows,
+)
 
 
 class MarketRelativeQueryShapeTests(unittest.TestCase):
@@ -285,6 +290,102 @@ class MarketRelativeContextIntegrationTests(unittest.TestCase):
                     ),
                 ]
             )
+
+
+class PykrxEnrichmentStoreIntegrationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        Symbol.__table__.create(bind=engine, checkfirst=True)
+        DailyPykrxEnrichmentRow.__table__.create(bind=engine, checkfirst=True)
+
+    def setUp(self) -> None:
+        self.symbols = ['661501', '661502']
+
+    def tearDown(self) -> None:
+        with session_scope() as session:
+            symbol_ids = list(
+                session.execute(select(Symbol.id).where(Symbol.symbol.in_(self.symbols))).scalars().all()
+            )
+            if symbol_ids:
+                session.execute(delete(DailyPykrxEnrichmentRow).where(DailyPykrxEnrichmentRow.symbol_id.in_(symbol_ids)))
+            session.execute(delete(DailyPykrxEnrichmentRow).where(DailyPykrxEnrichmentRow.scope_key.in_(self.symbols)))
+            session.execute(delete(Symbol).where(Symbol.symbol.in_(self.symbols)))
+
+    def test_upsert_and_load_daily_pykrx_enrichment_rows(self) -> None:
+        inserted = upsert_daily_pykrx_enrichment_rows(
+            rows=[
+                {
+                    'market_date': '2026-04-21',
+                    'market': 'KOSPI',
+                    'category': 'valuation_snapshot',
+                    'scope_type': 'symbol',
+                    'scope_key': '661501',
+                    'source': 'pykrx',
+                    'symbol': '661501',
+                    'name_ko': 'Value Alpha',
+                    'standard_code': 'KR7661501001',
+                    'payload': {'per': 11.2, 'pbr': 1.3},
+                },
+                {
+                    'market_date': '2026-04-21',
+                    'market': 'KOSPI',
+                    'category': 'foreign_ownership',
+                    'scope_type': 'symbol',
+                    'scope_key': '661501',
+                    'source': 'pykrx',
+                    'symbol': '661501',
+                    'name_ko': 'Value Alpha',
+                    'standard_code': 'KR7661501001',
+                    'payload': {'foreign_ownership_ratio_pct': 33.1},
+                },
+                {
+                    'market_date': '2026-04-21',
+                    'market': 'KOSPI',
+                    'category': 'sector_classification',
+                    'scope_type': 'symbol',
+                    'scope_key': '661502',
+                    'source': 'pykrx',
+                    'symbol': '661502',
+                    'name_ko': 'Sector Beta',
+                    'standard_code': 'KR7661502009',
+                    'payload': {'sector_name': '반도체'},
+                },
+            ]
+        )
+        self.assertEqual(inserted, 3)
+
+        updated = upsert_daily_pykrx_enrichment_rows(
+            rows=[
+                {
+                    'market_date': '2026-04-21',
+                    'market': 'KOSPI',
+                    'category': 'valuation_snapshot',
+                    'scope_type': 'symbol',
+                    'scope_key': '661501',
+                    'source': 'pykrx',
+                    'symbol': '661501',
+                    'name_ko': 'Value Alpha',
+                    'standard_code': 'KR7661501001',
+                    'payload': {'per': 10.8, 'pbr': 1.1},
+                }
+            ]
+        )
+        self.assertEqual(updated, 1)
+
+        items = load_daily_pykrx_enrichment_rows(
+            market_date='2026-04-21',
+            categories=['valuation_snapshot', 'foreign_ownership'],
+            symbols=['661501'],
+            limit=10,
+        )
+
+        self.assertEqual(len(items), 2)
+        valuation_row = next(item for item in items if item['category'] == 'valuation_snapshot')
+        foreign_row = next(item for item in items if item['category'] == 'foreign_ownership')
+        self.assertEqual(valuation_row['symbol'], '661501')
+        self.assertEqual(valuation_row['name_ko'], 'Value Alpha')
+        self.assertEqual(valuation_row['payload']['per'], 10.8)
+        self.assertEqual(foreign_row['payload']['foreign_ownership_ratio_pct'], 33.1)
 
 
 if __name__ == '__main__':

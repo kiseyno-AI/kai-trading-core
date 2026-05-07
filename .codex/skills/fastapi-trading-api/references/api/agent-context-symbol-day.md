@@ -1,7 +1,7 @@
 # GET /agent-context/symbol-day
 
 ## Summary
-Returns compact symbol/day analysis context for downstream agents. The payload combines the latest `quote_context` from `current_quote_cache` with persisted `price_context` from `daily_price_contexts`, structured factor-score summaries, and same-day `signal_features`. Major blocks now carry machine-readable `freshness_provenance`, and the top-level `context_provenance` mirror preserves stale, available-but-old, and fallback evidence even when a current block is absent.
+Returns compact symbol/day analysis context for downstream agents. The payload combines the latest `quote_context` from `current_quote_cache` with persisted `price_context` from `daily_price_contexts`, structured factor-score summaries, same-day `signal_features`, and persisted PyKRX enrichment blocks such as `sector_peer_context`, `market_breadth_context`, `investor_flow_context`, `short_selling_context`, and `valuation_context`. Major blocks now carry machine-readable `freshness_provenance`, and the top-level `context_provenance` mirror preserves stale, available-but-old, and fallback evidence even when a current block is absent.
 
 ## Example request
 ```http

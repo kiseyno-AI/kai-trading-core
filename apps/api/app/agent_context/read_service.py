@@ -23,6 +23,7 @@ from app.db_models import (
 from app.dart.fundamentals_store import DartFundamentalsRepository, dart_fundamentals_repository
 from app.dart.service import FS_DIV_TO_STATEMENT_TYPE, REPORT_CODE_METADATA
 from app.dart.store import DartSyncRepository, dart_sync_repository
+from app.eod.pykrx_enrichment import pykrx_enrichment_service
 from app.market_data_store import (
     load_daily_advanced_value_factor_results,
     load_daily_action_summaries,
@@ -1207,6 +1208,256 @@ def _build_market_relative_completeness(row: dict[str, Any] | None) -> dict[str,
     }
 
 
+def _latest_captured_at(rows: Sequence[dict[str, Any] | None]) -> str | None:
+    latest_value = None
+    latest_parsed = None
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        captured_at = row.get('captured_at')
+        parsed = _parse_iso_datetime(captured_at)
+        if parsed is None:
+            continue
+        if latest_parsed is None or parsed > latest_parsed:
+            latest_parsed = parsed
+            latest_value = captured_at
+    return latest_value
+
+
+def _build_pykrx_block_freshness_provenance(
+    *,
+    requested_market_date: date,
+    rows: Sequence[dict[str, Any] | None],
+    source_provider: str,
+    provenance_status: str,
+    requested_symbol_coverage: dict[str, Any] | None = None,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    present_rows = [row for row in rows if isinstance(row, dict)]
+    latest_captured_at = _latest_captured_at(present_rows)
+    if present_rows:
+        freshness_status = FRESHNESS_STATUS_FRESH
+        as_of_market_date = requested_market_date.isoformat()
+        latest_available_market_date = requested_market_date.isoformat()
+        trade_date_relation = 'same_market_date'
+        reason = None
+    else:
+        freshness_status = FRESHNESS_STATUS_MISSING
+        as_of_market_date = None
+        latest_available_market_date = None
+        trade_date_relation = None
+        reason = 'no_stored_pykrx_enrichment_row_for_request_date'
+
+    return _build_freshness_provenance(
+        requested_market_date=requested_market_date,
+        freshness_status=freshness_status,
+        provenance_status=provenance_status,
+        source_tables=('daily_pykrx_enrichment_rows',),
+        source_provider=source_provider,
+        as_of_market_date=as_of_market_date,
+        as_of_timestamp=latest_captured_at if present_rows else None,
+        latest_available_market_date=latest_available_market_date,
+        latest_available_timestamp=latest_captured_at,
+        row_count=len(present_rows),
+        history_row_count=len(present_rows),
+        trade_date_relation_to_request=trade_date_relation,
+        reason=reason,
+        requested_symbol_coverage=requested_symbol_coverage,
+        extra=extra,
+    )
+
+
+def _build_context_block_completeness(
+    context: dict[str, Any] | None,
+    *,
+    unavailable_reason: str,
+) -> dict[str, Any]:
+    if context is None:
+        return {
+            'status': 'unavailable',
+            'reason': unavailable_reason,
+        }
+
+    return {
+        'status': str(context.get('status') or 'available'),
+        'missing_fields': list(context.get('missing_fields') or []),
+    }
+
+
+def _build_sector_peer_context(
+    *,
+    symbol: str,
+    sector_row: dict[str, Any] | None,
+    sector_rows_for_market: Sequence[dict[str, Any]],
+) -> dict[str, Any] | None:
+    if sector_row is None:
+        return None
+
+    payload = _maybe_dict(sector_row.get('payload'))
+    sector_name = payload.get('sector_name')
+    missing_fields = [] if sector_name else ['sector_name']
+    self_entry = {
+        'symbol': symbol,
+        'name_ko': sector_row.get('name_ko'),
+        'market_cap': payload.get('market_cap'),
+        'change_pct': payload.get('change_pct'),
+    }
+    peer_entries: list[dict[str, Any]] = []
+    if sector_name:
+        for row in sector_rows_for_market:
+            row_payload = _maybe_dict(row.get('payload'))
+            if row_payload.get('sector_name') != sector_name:
+                continue
+            row_symbol = row.get('symbol') or row.get('scope_key')
+            entry = {
+                'symbol': row_symbol,
+                'name_ko': row.get('name_ko'),
+                'market_cap': row_payload.get('market_cap'),
+                'change_pct': row_payload.get('change_pct'),
+            }
+            if row_symbol == symbol:
+                self_entry = entry
+                continue
+            peer_entries.append(entry)
+        peer_entries.sort(
+            key=lambda item: (
+                item.get('market_cap') is None,
+                -(int(item.get('market_cap') or 0)),
+                str(item.get('symbol') or ''),
+            )
+        )
+
+    return {
+        'status': 'available' if not missing_fields else 'partial',
+        'market': sector_row.get('market'),
+        'sector_name': sector_name,
+        'close_price': payload.get('close_price'),
+        'market_cap': payload.get('market_cap'),
+        'change_pct': payload.get('change_pct'),
+        'same_sector_symbol_count': len(peer_entries) + 1,
+        'peer_count': len(peer_entries),
+        'peers': peer_entries[:5],
+        'self': self_entry,
+        'missing_fields': missing_fields,
+    }
+
+
+def _build_market_breadth_context(
+    market_row: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if market_row is None:
+        return None
+
+    payload = _maybe_dict(market_row.get('payload'))
+    required_fields = ('market_symbol_count', 'up_count', 'down_count', 'flat_count')
+    missing_fields = [field for field in required_fields if payload.get(field) is None]
+    return {
+        'status': 'available' if not missing_fields else 'partial',
+        **payload,
+        'missing_fields': missing_fields,
+    }
+
+
+def _build_investor_flow_context(
+    *,
+    symbol_row: dict[str, Any] | None,
+    market_row: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if symbol_row is None and market_row is None:
+        return None
+
+    symbol_payload = _maybe_dict(symbol_row.get('payload')) if symbol_row is not None else None
+    market_payload = _maybe_dict(market_row.get('payload')) if market_row is not None else None
+    missing_fields: list[str] = []
+    if not symbol_payload:
+        missing_fields.append('symbol_flow')
+    if not market_payload:
+        missing_fields.append('market_flow')
+    return {
+        'status': 'available' if not missing_fields else 'partial',
+        'market': (
+            symbol_row.get('market')
+            if symbol_row is not None
+            else market_row.get('market')
+            if market_row is not None
+            else None
+        ),
+        'symbol_flow': symbol_payload,
+        'market_flow': market_payload,
+        'missing_fields': missing_fields,
+    }
+
+
+def _build_short_selling_context(
+    short_row: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if short_row is None:
+        return None
+
+    payload = _maybe_dict(short_row.get('payload'))
+    missing_fields: list[str] = []
+    if not _maybe_dict(payload.get('short_volume')):
+        missing_fields.append('short_volume')
+    if not _maybe_dict(payload.get('short_balance')):
+        missing_fields.append('short_balance')
+    return {
+        'status': 'available' if not missing_fields else 'partial',
+        **payload,
+        'missing_fields': missing_fields,
+    }
+
+
+def _build_valuation_context(
+    *,
+    valuation_row: dict[str, Any] | None,
+    foreign_ownership_row: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if valuation_row is None and foreign_ownership_row is None:
+        return None
+
+    valuation_payload = _maybe_dict(valuation_row.get('payload')) if valuation_row is not None else None
+    foreign_payload = _maybe_dict(foreign_ownership_row.get('payload')) if foreign_ownership_row is not None else None
+    missing_fields: list[str] = []
+    if not valuation_payload:
+        missing_fields.append('valuation_snapshot')
+    if not foreign_payload:
+        missing_fields.append('foreign_ownership')
+    return {
+        'status': 'available' if not missing_fields else 'partial',
+        'market': (
+            valuation_row.get('market')
+            if valuation_row is not None
+            else foreign_ownership_row.get('market')
+            if foreign_ownership_row is not None
+            else None
+        ),
+        'valuation_snapshot': valuation_payload,
+        'foreign_ownership': foreign_payload,
+        'missing_fields': missing_fields,
+    }
+
+
+def _build_symbol_block_coverage(
+    *,
+    available_count: int,
+    partial_count: int,
+    requested_count: int,
+) -> dict[str, Any]:
+    return {
+        'available_rows': available_count,
+        'partial_rows': partial_count,
+        'unavailable_rows': requested_count - available_count - partial_count,
+        'coverage_ratio': _ratio(available_count + partial_count, requested_count),
+        'coverage_status': (
+            'complete'
+            if available_count == requested_count and requested_count > 0
+            else 'partial'
+            if (available_count + partial_count) > 0
+            else 'missing'
+        ),
+    }
+
+
 class AgentContextReadService:
     def __init__(
         self,
@@ -1299,6 +1550,10 @@ class AgentContextReadService:
             market_date=normalized_market_date,
             symbols=normalized_symbols,
         )
+        pykrx_enrichment_inputs = pykrx_enrichment_service.load_symbol_day_context_inputs(
+            market_date=normalized_market_date,
+            symbols=normalized_symbols,
+        )
         fundamentals_rows = self.fundamentals_repository.list_stored_fundamentals_summary(
             stock_codes=normalized_symbols,
             fs_div=normalized_fs_div,
@@ -1331,6 +1586,12 @@ class AgentContextReadService:
             symbols=normalized_symbols,
         )
         market_relative_map = {item['symbol']: item for item in market_relative_rows}
+        pykrx_enrichment_by_symbol = dict(pykrx_enrichment_inputs.get('by_symbol') or {})
+        pykrx_enrichment_by_market = dict(pykrx_enrichment_inputs.get('by_market') or {})
+        sector_rows_by_market = {
+            market: list(rows)
+            for market, rows in dict(pykrx_enrichment_inputs.get('sector_rows_by_market') or {}).items()
+        }
         fundamentals_map: dict[str, list[dict[str, Any]]] = {symbol: [] for symbol in normalized_symbols}
         for item in fundamentals_rows:
             stock_code = item.get('stock_code')
@@ -1351,6 +1612,29 @@ class AgentContextReadService:
             action_summary = action_map.get(symbol)
             signal_features = signal_feature_map.get(symbol)
             market_relative_context = market_relative_map.get(symbol)
+            company_row = symbol_map.get(symbol)
+            company_market = str(company_row.get('market') or '').strip().upper() if company_row else ''
+            symbol_enrichment_rows = dict(pykrx_enrichment_by_symbol.get(symbol) or {})
+            market_enrichment_rows = dict(pykrx_enrichment_by_market.get(company_market) or {})
+            sector_peer_context = _build_sector_peer_context(
+                symbol=symbol,
+                sector_row=symbol_enrichment_rows.get('sector_classification'),
+                sector_rows_for_market=sector_rows_by_market.get(company_market, []),
+            )
+            market_breadth_context = _build_market_breadth_context(
+                market_enrichment_rows.get('market_breadth'),
+            )
+            investor_flow_context = _build_investor_flow_context(
+                symbol_row=symbol_enrichment_rows.get('investor_flow_symbol'),
+                market_row=market_enrichment_rows.get('investor_flow_market'),
+            )
+            short_selling_context = _build_short_selling_context(
+                symbol_enrichment_rows.get('short_selling'),
+            )
+            valuation_context = _build_valuation_context(
+                valuation_row=symbol_enrichment_rows.get('valuation_snapshot'),
+                foreign_ownership_row=symbol_enrichment_rows.get('foreign_ownership'),
+            )
             scores = build_signal_decider_scores(
                 market_date=normalized_market_date,
                 unified_value_row=unified_value_map.get(symbol),
@@ -1412,10 +1696,26 @@ class AgentContextReadService:
                 },
                 'signal_features': _build_signal_feature_completeness(signal_features),
                 'market_relative_context': _build_market_relative_completeness(market_relative_context),
-                'sector_peer_mapping': {
-                    'status': 'unavailable',
-                    'reason': 'No persisted sector or industry mapping is available for peer comparisons in the current symbol schema.',
-                },
+                'sector_peer_mapping': _build_context_block_completeness(
+                    sector_peer_context,
+                    unavailable_reason='No persisted PyKRX sector classification is available for the requested date.',
+                ),
+                'market_breadth_context': _build_context_block_completeness(
+                    market_breadth_context,
+                    unavailable_reason='No persisted PyKRX market breadth row is available for the requested date.',
+                ),
+                'investor_flow_context': _build_context_block_completeness(
+                    investor_flow_context,
+                    unavailable_reason='No persisted PyKRX investor flow row is available for the requested date.',
+                ),
+                'short_selling_context': _build_context_block_completeness(
+                    short_selling_context,
+                    unavailable_reason='No persisted PyKRX short-selling row is available for the requested date.',
+                ),
+                'valuation_context': _build_context_block_completeness(
+                    valuation_context,
+                    unavailable_reason='No persisted PyKRX valuation or foreign ownership row is available for the requested date.',
+                ),
             }
             fundamentals = _build_fundamentals_summary(
                 fundamentals_map.get(symbol, []),
@@ -1447,6 +1747,47 @@ class AgentContextReadService:
                 requested_market_date=normalized_market_date,
                 disclosures_limit=disclosures_limit,
             )
+            sector_peer_context_provenance = _build_pykrx_block_freshness_provenance(
+                requested_market_date=normalized_market_date,
+                rows=(symbol_enrichment_rows.get('sector_classification'),),
+                source_provider='pykrx',
+                provenance_status=PROVENANCE_STATUS_PROVIDER_SOURCED,
+                extra={'category': 'sector_classification'},
+            )
+            market_breadth_context_provenance = _build_pykrx_block_freshness_provenance(
+                requested_market_date=normalized_market_date,
+                rows=(market_enrichment_rows.get('market_breadth'),),
+                source_provider='pykrx_derived',
+                provenance_status=PROVENANCE_STATUS_DERIVED,
+                extra={'category': 'market_breadth'},
+            )
+            investor_flow_context_provenance = _build_pykrx_block_freshness_provenance(
+                requested_market_date=normalized_market_date,
+                rows=(
+                    symbol_enrichment_rows.get('investor_flow_symbol'),
+                    market_enrichment_rows.get('investor_flow_market'),
+                ),
+                source_provider='pykrx',
+                provenance_status=PROVENANCE_STATUS_PROVIDER_SOURCED,
+                extra={'categories': ['investor_flow_symbol', 'investor_flow_market']},
+            )
+            short_selling_context_provenance = _build_pykrx_block_freshness_provenance(
+                requested_market_date=normalized_market_date,
+                rows=(symbol_enrichment_rows.get('short_selling'),),
+                source_provider='pykrx',
+                provenance_status=PROVENANCE_STATUS_PROVIDER_SOURCED,
+                extra={'category': 'short_selling'},
+            )
+            valuation_context_provenance = _build_pykrx_block_freshness_provenance(
+                requested_market_date=normalized_market_date,
+                rows=(
+                    symbol_enrichment_rows.get('valuation_snapshot'),
+                    symbol_enrichment_rows.get('foreign_ownership'),
+                ),
+                source_provider='pykrx',
+                provenance_status=PROVENANCE_STATUS_PROVIDER_SOURCED,
+                extra={'categories': ['valuation_snapshot', 'foreign_ownership']},
+            )
             if quote_context is not None:
                 quote_context = {
                     **quote_context,
@@ -1461,6 +1802,31 @@ class AgentContextReadService:
                 signal_features = {
                     **signal_features,
                     'freshness_provenance': signal_features_provenance,
+                }
+            if sector_peer_context is not None:
+                sector_peer_context = {
+                    **sector_peer_context,
+                    'freshness_provenance': sector_peer_context_provenance,
+                }
+            if market_breadth_context is not None:
+                market_breadth_context = {
+                    **market_breadth_context,
+                    'freshness_provenance': market_breadth_context_provenance,
+                }
+            if investor_flow_context is not None:
+                investor_flow_context = {
+                    **investor_flow_context,
+                    'freshness_provenance': investor_flow_context_provenance,
+                }
+            if short_selling_context is not None:
+                short_selling_context = {
+                    **short_selling_context,
+                    'freshness_provenance': short_selling_context_provenance,
+                }
+            if valuation_context is not None:
+                valuation_context = {
+                    **valuation_context,
+                    'freshness_provenance': valuation_context_provenance,
                 }
             fundamentals = {
                 **fundamentals,
@@ -1483,7 +1849,6 @@ class AgentContextReadService:
                 for family, score_payload in scores.items()
             }
 
-            company_row = symbol_map.get(symbol)
             fundamentals_entries = fundamentals_map.get(symbol) or []
             latest_disclosure = recent_disclosures[0] if recent_disclosures else None
             company = {
@@ -1524,10 +1889,15 @@ class AgentContextReadService:
                     isinstance(market_relative_context, dict)
                     and str(market_relative_context.get('status') or 'unavailable') != 'unavailable'
                 ),
-                    'persisted_factor_rows': any(row is not None for row in persisted_factor_rows.values()),
-                    'fundamentals': fundamentals['latest_snapshot'] is not None,
-                    'recent_disclosures': bool(recent_disclosures),
-                }
+                'sector_peer_context': sector_peer_context is not None,
+                'market_breadth_context': market_breadth_context is not None,
+                'investor_flow_context': investor_flow_context is not None,
+                'short_selling_context': short_selling_context is not None,
+                'valuation_context': valuation_context is not None,
+                'persisted_factor_rows': any(row is not None for row in persisted_factor_rows.values()),
+                'fundamentals': fundamentals['latest_snapshot'] is not None,
+                'recent_disclosures': bool(recent_disclosures),
+            }
             if any(availability.values()):
                 matched_symbols.append(symbol)
             else:
@@ -1545,6 +1915,11 @@ class AgentContextReadService:
                     'action_summary': action_summary,
                     'signal_features': signal_features,
                     'market_relative_context': market_relative_context,
+                    'sector_peer_context': sector_peer_context,
+                    'market_breadth_context': market_breadth_context,
+                    'investor_flow_context': investor_flow_context,
+                    'short_selling_context': short_selling_context,
+                    'valuation_context': valuation_context,
                     'scores': scores,
                     'persisted_factor_rows': persisted_factor_rows,
                     'fundamentals': fundamentals,
@@ -1558,6 +1933,11 @@ class AgentContextReadService:
                         'quote_context': quote_context_provenance,
                         'price_context': price_context_provenance,
                         'signal_features': signal_features_provenance,
+                        'sector_peer_context': sector_peer_context_provenance,
+                        'market_breadth_context': market_breadth_context_provenance,
+                        'investor_flow_context': investor_flow_context_provenance,
+                        'short_selling_context': short_selling_context_provenance,
+                        'valuation_context': valuation_context_provenance,
                         'fundamentals': fundamentals_provenance,
                         'recent_disclosures': recent_disclosures_provenance,
                         'factor_rows': factor_row_provenance,
@@ -1590,6 +1970,56 @@ class AgentContextReadService:
             for item in items
             if str((item.get('market_relative_context') or {}).get('status') or 'unavailable') == 'partial'
         )
+        sector_peer_available_count = sum(
+            1
+            for item in items
+            if str((item.get('sector_peer_context') or {}).get('status') or 'unavailable') == 'available'
+        )
+        sector_peer_partial_count = sum(
+            1
+            for item in items
+            if str((item.get('sector_peer_context') or {}).get('status') or 'unavailable') == 'partial'
+        )
+        market_breadth_available_count = sum(
+            1
+            for item in items
+            if str((item.get('market_breadth_context') or {}).get('status') or 'unavailable') == 'available'
+        )
+        market_breadth_partial_count = sum(
+            1
+            for item in items
+            if str((item.get('market_breadth_context') or {}).get('status') or 'unavailable') == 'partial'
+        )
+        investor_flow_available_count = sum(
+            1
+            for item in items
+            if str((item.get('investor_flow_context') or {}).get('status') or 'unavailable') == 'available'
+        )
+        investor_flow_partial_count = sum(
+            1
+            for item in items
+            if str((item.get('investor_flow_context') or {}).get('status') or 'unavailable') == 'partial'
+        )
+        short_selling_available_count = sum(
+            1
+            for item in items
+            if str((item.get('short_selling_context') or {}).get('status') or 'unavailable') == 'available'
+        )
+        short_selling_partial_count = sum(
+            1
+            for item in items
+            if str((item.get('short_selling_context') or {}).get('status') or 'unavailable') == 'partial'
+        )
+        valuation_available_count = sum(
+            1
+            for item in items
+            if str((item.get('valuation_context') or {}).get('status') or 'unavailable') == 'available'
+        )
+        valuation_partial_count = sum(
+            1
+            for item in items
+            if str((item.get('valuation_context') or {}).get('status') or 'unavailable') == 'partial'
+        )
         requested_symbol_coverage = {
             'requested_symbol_count': requested_symbol_count,
             'factor_rows': factor_row_coverage,
@@ -1619,15 +2049,40 @@ class AgentContextReadService:
                     else 'missing'
                 ),
             },
-            'sector_peer_mapping': {
-                'available_rows': 0,
-                'unavailable_rows': requested_symbol_count,
-                'coverage_status': 'unavailable',
-            },
+            'sector_peer_mapping': _build_symbol_block_coverage(
+                available_count=sector_peer_available_count,
+                partial_count=sector_peer_partial_count,
+                requested_count=requested_symbol_count,
+            ),
+            'market_breadth_context': _build_symbol_block_coverage(
+                available_count=market_breadth_available_count,
+                partial_count=market_breadth_partial_count,
+                requested_count=requested_symbol_count,
+            ),
+            'investor_flow_context': _build_symbol_block_coverage(
+                available_count=investor_flow_available_count,
+                partial_count=investor_flow_partial_count,
+                requested_count=requested_symbol_count,
+            ),
+            'short_selling_context': _build_symbol_block_coverage(
+                available_count=short_selling_available_count,
+                partial_count=short_selling_partial_count,
+                requested_count=requested_symbol_count,
+            ),
+            'valuation_context': _build_symbol_block_coverage(
+                available_count=valuation_available_count,
+                partial_count=valuation_partial_count,
+                requested_count=requested_symbol_count,
+            ),
         }
         for item in items:
             item['context_completeness']['requested_symbol_coverage'] = requested_symbol_coverage
             item['context_provenance']['signal_features']['requested_symbol_coverage'] = requested_symbol_coverage['signal_features']
+            item['context_provenance']['sector_peer_context']['requested_symbol_coverage'] = requested_symbol_coverage['sector_peer_mapping']
+            item['context_provenance']['market_breadth_context']['requested_symbol_coverage'] = requested_symbol_coverage['market_breadth_context']
+            item['context_provenance']['investor_flow_context']['requested_symbol_coverage'] = requested_symbol_coverage['investor_flow_context']
+            item['context_provenance']['short_selling_context']['requested_symbol_coverage'] = requested_symbol_coverage['short_selling_context']
+            item['context_provenance']['valuation_context']['requested_symbol_coverage'] = requested_symbol_coverage['valuation_context']
             for family in PERSISTED_FACTOR_FAMILIES:
                 item['context_provenance']['factor_rows'][family]['requested_symbol_coverage'] = factor_row_coverage[family]
 
@@ -1649,6 +2104,11 @@ class AgentContextReadService:
                 'action_summary_count': sum(1 for item in items if item['action_summary'] is not None),
                 'signal_feature_count': sum(1 for item in items if item['signal_features'] is not None),
                 'market_relative_context_count': sum(1 for item in items if item['market_relative_context'] is not None),
+                'sector_peer_context_count': sum(1 for item in items if item['sector_peer_context'] is not None),
+                'market_breadth_context_count': sum(1 for item in items if item['market_breadth_context'] is not None),
+                'investor_flow_context_count': sum(1 for item in items if item['investor_flow_context'] is not None),
+                'short_selling_context_count': sum(1 for item in items if item['short_selling_context'] is not None),
+                'valuation_context_count': sum(1 for item in items if item['valuation_context'] is not None),
                 'fundamentals_count': sum(
                     1 for item in items if item['fundamentals']['latest_snapshot'] is not None
                 ),

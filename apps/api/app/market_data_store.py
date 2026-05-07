@@ -21,6 +21,7 @@ from app.db_models import (
     DailyMarketRiskSnapshot,
     DailyMomentumFactorResult,
     DailyMarketParticipationContext,
+    DailyPykrxEnrichmentRow,
     DailyPiotroskiFilterResult,
     DailyPriceBar,
     DailyPriceContext,
@@ -3698,3 +3699,171 @@ def load_daily_market_participation_context_history(
         }
         for row in reversed(rows)
     ]
+
+
+def upsert_daily_pykrx_enrichment_rows(
+    *,
+    rows: list[dict[str, Any]],
+) -> int:
+    if not rows:
+        return 0
+
+    refreshed_at = datetime.utcnow()
+    symbol_inputs: dict[str, dict[str, Any]] = {}
+    for raw in rows:
+        symbol = raw.get('symbol')
+        if symbol is None:
+            continue
+        normalized_symbol = str(symbol).strip().upper().zfill(6) if str(symbol).strip().isdigit() else str(symbol).strip().upper()
+        if not normalized_symbol:
+            continue
+        symbol_inputs[normalized_symbol] = {
+            'symbol': normalized_symbol,
+            'market': str(raw.get('market') or 'KRX').strip().upper(),
+            'name_ko': str(raw.get('name_ko') or normalized_symbol).strip() or normalized_symbol,
+            'standard_code': raw.get('standard_code'),
+            'instrument_type': str(raw.get('instrument_type') or 'equity').strip() or 'equity',
+            'source': str(raw.get('symbol_source') or raw.get('source') or 'pykrx').strip() or 'pykrx',
+            'is_active': True,
+            'last_refreshed_at': refreshed_at,
+        }
+
+    with session_scope() as session:
+        symbol_id_by_symbol: dict[str, int] = {}
+        if symbol_inputs:
+            symbol_rows = list(symbol_inputs.values())
+            statement = pg_insert(Symbol).values(symbol_rows)
+            session.execute(
+                statement.on_conflict_do_update(
+                    index_elements=[Symbol.symbol],
+                    set_={
+                        'standard_code': statement.excluded.standard_code,
+                        'name_ko': statement.excluded.name_ko,
+                        'market': statement.excluded.market,
+                        'instrument_type': statement.excluded.instrument_type,
+                        'source': statement.excluded.source,
+                        'is_active': statement.excluded.is_active,
+                        'last_refreshed_at': statement.excluded.last_refreshed_at,
+                        'updated_at': refreshed_at,
+                    },
+                )
+            )
+            symbol_id_by_symbol = {
+                symbol: symbol_id
+                for symbol, symbol_id in session.execute(
+                    select(Symbol.symbol, Symbol.id).where(Symbol.symbol.in_(list(symbol_inputs.keys())))
+                ).all()
+            }
+
+        values: list[dict[str, Any]] = []
+        for raw in rows:
+            normalized_scope_type = str(raw.get('scope_type') or '').strip().lower()
+            normalized_scope_key = str(raw.get('scope_key') or '').strip()
+            if not normalized_scope_type or not normalized_scope_key:
+                raise ValueError('scope_type and scope_key are required for pykrx enrichment rows')
+            symbol = raw.get('symbol')
+            normalized_symbol = None
+            if symbol is not None:
+                text = str(symbol).strip().upper()
+                normalized_symbol = text.zfill(6) if text.isdigit() else text
+            values.append(
+                {
+                    'symbol_id': symbol_id_by_symbol.get(normalized_symbol) if normalized_symbol else None,
+                    'market_date': _normalize_trade_date(raw['market_date']),
+                    'market': str(raw.get('market') or 'KRX').strip().upper(),
+                    'category': str(raw['category']).strip(),
+                    'scope_type': normalized_scope_type,
+                    'scope_key': normalized_scope_key,
+                    'source': str(raw.get('source') or 'pykrx').strip() or 'pykrx',
+                    'payload': dict(raw.get('payload') or {}),
+                    'captured_at': refreshed_at,
+                    'updated_at': refreshed_at,
+                }
+            )
+
+        statement = pg_insert(DailyPykrxEnrichmentRow).values(values)
+        session.execute(
+            statement.on_conflict_do_update(
+                constraint='uq_daily_pykrx_enrichment_rows_scope',
+                set_={
+                    'symbol_id': statement.excluded.symbol_id,
+                    'market': statement.excluded.market,
+                    'payload': statement.excluded.payload,
+                    'captured_at': statement.excluded.captured_at,
+                    'updated_at': refreshed_at,
+                },
+            )
+        )
+    return len(values)
+
+
+def load_daily_pykrx_enrichment_rows(
+    *,
+    market_date: str | date,
+    categories: Sequence[str] | None = None,
+    scope_types: Sequence[str] | None = None,
+    markets: Sequence[str] | None = None,
+    symbols: Sequence[str] | None = None,
+    source: str | None = None,
+    limit: int | None = 5000,
+) -> list[dict[str, Any]]:
+    normalized_market_date = _normalize_trade_date(market_date)
+    normalized_symbols = [
+        item.strip().upper().zfill(6) if item.strip().isdigit() else item.strip().upper()
+        for item in (symbols or [])
+        if str(item).strip()
+    ]
+    normalized_categories = [str(item).strip() for item in (categories or []) if str(item).strip()]
+    normalized_scope_types = [str(item).strip().lower() for item in (scope_types or []) if str(item).strip()]
+    normalized_markets = [str(item).strip().upper() for item in (markets or []) if str(item).strip()]
+
+    with session_scope() as session:
+        stmt = (
+            select(
+                DailyPykrxEnrichmentRow,
+                Symbol.symbol,
+                Symbol.name_ko,
+                Symbol.standard_code,
+            )
+            .select_from(DailyPykrxEnrichmentRow)
+            .outerjoin(Symbol, Symbol.id == DailyPykrxEnrichmentRow.symbol_id)
+            .where(DailyPykrxEnrichmentRow.market_date == normalized_market_date)
+            .order_by(
+                DailyPykrxEnrichmentRow.category.asc(),
+                DailyPykrxEnrichmentRow.market.asc(),
+                DailyPykrxEnrichmentRow.scope_type.asc(),
+                DailyPykrxEnrichmentRow.scope_key.asc(),
+            )
+        )
+        if normalized_categories:
+            stmt = stmt.where(DailyPykrxEnrichmentRow.category.in_(normalized_categories))
+        if normalized_scope_types:
+            stmt = stmt.where(DailyPykrxEnrichmentRow.scope_type.in_(normalized_scope_types))
+        if normalized_markets:
+            stmt = stmt.where(DailyPykrxEnrichmentRow.market.in_(normalized_markets))
+        if normalized_symbols:
+            stmt = stmt.where(Symbol.symbol.in_(normalized_symbols))
+        if source:
+            stmt = stmt.where(DailyPykrxEnrichmentRow.source == source)
+        if limit:
+            stmt = stmt.limit(limit)
+        rows = session.execute(stmt).all()
+        items: list[dict[str, Any]] = []
+        for row, symbol, name_ko, standard_code in rows:
+            items.append(
+                {
+                    'id': row.id,
+                    'market_date': row.market_date.isoformat(),
+                    'market': row.market,
+                    'category': row.category,
+                    'scope_type': row.scope_type,
+                    'scope_key': row.scope_key,
+                    'source': row.source,
+                    'payload': row.payload,
+                    'captured_at': row.captured_at.isoformat() if row.captured_at else None,
+                    'symbol': symbol,
+                    'name_ko': name_ko,
+                    'standard_code': standard_code,
+                }
+            )
+        return items

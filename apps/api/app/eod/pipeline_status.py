@@ -21,6 +21,7 @@ from app.db_models import (
 from app.dart.fundamentals_capture_service import dart_fundamentals_capture_service
 from app.eod.daily_pipeline_stages import FACTOR_STAGE_ORDER, STAGE_DEFINITIONS
 from app.eod.pykrx_backfill import DEFAULT_MARKETS, PYKRX_BACKFILL_SERVICE
+from app.eod.pykrx_enrichment import DEFAULT_PYKRX_ENRICHMENT_CATEGORIES, pykrx_enrichment_service
 from app.eod.pipeline_status_support import (
     PYKRX_STAGE_ORDER,
     STAGE_LABELS,
@@ -52,7 +53,12 @@ DEFAULT_FACTOR_STAGE_ORDER = tuple(
     for stage_id in FACTOR_STAGE_ORDER
     if STAGE_DEFINITIONS[stage_id].default_selected
 )
-PIPELINE_STAGE_ORDER = PYKRX_STAGE_ORDER + ('fundamentals_daily_refresh',) + DEFAULT_FACTOR_STAGE_ORDER
+PIPELINE_STAGE_ORDER = (
+    ('price_collection', 'pykrx_enrichment')
+    + tuple(stage_id for stage_id in PYKRX_STAGE_ORDER if stage_id != 'price_collection')
+    + ('fundamentals_daily_refresh',)
+    + DEFAULT_FACTOR_STAGE_ORDER
+)
 FACTOR_STAGE_MODELS = {
     'momentum_factors': DailyMomentumFactorResult,
     'value_factors': DailyValueFactorResult,
@@ -110,6 +116,14 @@ def _noop_price_bar_count_loader(*, market_date: str) -> int:
     return 0
 
 
+def _load_pykrx_enrichment_coverage(*, market_date: str) -> dict[str, Any]:
+    return pykrx_enrichment_service.inspect(
+        market_date=market_date,
+        categories=DEFAULT_PYKRX_ENRICHMENT_CATEGORIES,
+        limit=1,
+    ).get('coverage') or {}
+
+
 def _load_factor_stage_counts(*, market_date: str) -> dict[str, dict[str, Any]]:
     normalized_market_date = date.fromisoformat(market_date)
     counts: dict[str, dict[str, Any]] = {}
@@ -146,6 +160,7 @@ class EODPipelineStatusService:
     fundamentals_refresh_loader: Callable = _load_latest_fundamentals_refresh_run
     factor_stage_counts_loader: Callable = _noop_factor_stage_counts_loader
     price_bar_count_loader: Callable = _noop_price_bar_count_loader
+    pykrx_enrichment_loader: Callable = _load_pykrx_enrichment_coverage
 
     def read(
         self,
@@ -167,6 +182,10 @@ class EODPipelineStatusService:
             stage_counts=pykrx_stage_counts,
             live_symbols_total=live_symbols_total,
         )
+        pykrx_enrichment_stage = self._build_pykrx_enrichment_stage(
+            market_date=resolved_market_date,
+            coverage=dict(self.pykrx_enrichment_loader(market_date=resolved_market_date) or {}),
+        )
         fundamentals_stage = self._build_fundamentals_stage(
             market_date=resolved_market_date,
             fs_div=resolved_fs_div,
@@ -177,6 +196,7 @@ class EODPipelineStatusService:
             stored_price_rows = int(dict(pykrx_stage_counts.get('price_collection') or {}).get('persisted') or 0)
         stages = {
             **pykrx_stages,
+            'pykrx_enrichment': pykrx_enrichment_stage,
             'fundamentals_daily_refresh': fundamentals_stage,
         }
         price_stage = stages['price_collection']
@@ -205,6 +225,62 @@ class EODPipelineStatusService:
             'status': self._resolve_overall_status(stages),
             'stage_order': list(PIPELINE_STAGE_ORDER),
             'stages': stages,
+        }
+
+    def _build_pykrx_enrichment_stage(
+        self,
+        *,
+        market_date: str,
+        coverage: dict[str, Any],
+    ) -> dict[str, Any]:
+        category_rows = dict(coverage.get('categories') or {})
+        total = len(DEFAULT_PYKRX_ENRICHMENT_CATEGORIES)
+        latest_captured_at = None
+        for item in category_rows.values():
+            candidate = item.get('latest_captured_at')
+            if candidate and (latest_captured_at is None or str(candidate) > str(latest_captured_at)):
+                latest_captured_at = candidate
+        all_missing = bool(category_rows) and all(int(item.get('present_rows') or 0) <= 0 for item in category_rows.values())
+        present_count = sum(1 for item in category_rows.values() if int(item.get('present_rows') or 0) > 0)
+        failed_count = sum(1 for item in category_rows.values() if str(item.get('coverage_status') or 'missing') == 'missing')
+        if not category_rows or (all_missing and latest_captured_at is None):
+            counts = build_stage_counts(total=total, succeeded=0, failed=0, processed=0)
+            status = 'pending'
+        else:
+            counts = build_stage_counts(
+                total=total,
+                succeeded=present_count,
+                failed=failed_count,
+                processed=present_count + failed_count,
+            )
+            if all(str(item.get('coverage_status') or '') == 'complete' for item in category_rows.values()):
+                status = 'completed'
+            else:
+                status = 'partial'
+        return {
+            'task': 'pykrx_enrichment',
+            'label': STAGE_LABELS['pykrx_enrichment'],
+            'status': status,
+            'source_status': status if category_rows else None,
+            'market_date': market_date,
+            'started_at': None,
+            'updated_at': latest_captured_at,
+            'completed_at': latest_captured_at if status in {'completed', 'partial'} else None,
+            'processed': counts.processed,
+            'total': counts.total,
+            'succeeded': counts.succeeded,
+            'failed': counts.failed,
+            'remaining': counts.remaining,
+            'current_step': None,
+            'current_activity': _default_activity(STAGE_LABELS['pykrx_enrichment'], status),
+            'current_symbol': None,
+            'current_period': None,
+            'source_run_ids': {},
+            'details': {
+                'requested_symbol_count': coverage.get('requested_symbol_count'),
+                'requested_market_count': coverage.get('requested_market_count'),
+                'categories': category_rows,
+            },
         }
 
     def _build_pykrx_stages(

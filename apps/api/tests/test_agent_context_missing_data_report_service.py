@@ -210,8 +210,8 @@ class AgentContextMissingDataReportServiceTests(unittest.TestCase):
         self.assertEqual(repository.persisted_rows, [{'id': 7, 'missing_data_categories_payload': raw_categories}])
         investor_row = next(item for item in result['categories'] if item['category'] == 'investor_flows_short_selling')
         consensus_row = next(item for item in result['categories'] if item['category'] == 'consensus_guidance')
-        self.assertEqual(investor_row['status'], 'external_data_required')
-        self.assertIn('KIS investor flow endpoints', investor_row['external_providers'])
+        self.assertEqual(investor_row['status'], 'partially_available')
+        self.assertIn('PyKRX EOD investor flow and short-selling statistics', investor_row['external_providers'])
         self.assertEqual(consensus_row['status'], 'external_data_required')
         self.assertEqual(consensus_row['counts']['roles'], 1)
 

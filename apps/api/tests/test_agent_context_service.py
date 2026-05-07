@@ -1,3 +1,4 @@
+from contextlib import ExitStack
 import unittest
 from unittest.mock import patch
 
@@ -1094,3 +1095,199 @@ class AgentContextReadServiceTests(unittest.TestCase):
             result['items'][0]['context_provenance']['signal_features']['requested_symbol_coverage']['present_rows'],
             2,
         )
+
+    def test_get_symbol_day_context_includes_pykrx_enrichment_blocks(self):
+        captured_at = '2026-04-08T15:00:00+09:00'
+
+        class EmptyFundamentalsRepository:
+            def list_stored_fundamentals_summary(self, *, stock_codes, fs_div=None):
+                return []
+
+        class EmptyDisclosureRepository:
+            def list_recent_events_by_stock_codes(self, *, stock_codes, receipt_date_to=None, limit_per_symbol=5):
+                return {symbol: [] for symbol in stock_codes}
+
+        service = AgentContextReadService(
+            fundamentals_repository=EmptyFundamentalsRepository(),
+            disclosure_repository=EmptyDisclosureRepository(),
+        )
+
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch(
+                    'app.agent_context.read_service.load_symbols',
+                    return_value=[
+                        {
+                            'id': 1,
+                            'symbol': '005930',
+                            'standard_code': 'KR7005930003',
+                            'name_ko': '삼성전자',
+                            'market': 'KOSPI',
+                            'instrument_type': 'equity',
+                            'source': 'pykrx',
+                            'is_active': True,
+                            'last_refreshed_at': None,
+                        }
+                    ],
+                )
+            )
+            stack.enter_context(patch('app.agent_context.read_service.load_daily_technical_snapshots', return_value=[]))
+            stack.enter_context(patch('app.agent_context.read_service.load_daily_signal_features', return_value=[]))
+            stack.enter_context(patch('app.agent_context.read_service.load_daily_action_summaries', return_value=[]))
+            stack.enter_context(patch('app.agent_context.read_service.load_daily_price_contexts', return_value=[]))
+            stack.enter_context(patch('app.agent_context.read_service.load_daily_price_context_history', return_value=[]))
+            stack.enter_context(patch('app.agent_context.read_service.load_current_quotes', return_value=[]))
+            stack.enter_context(patch('app.agent_context.read_service.load_daily_unified_value_factor_results', return_value=[]))
+            stack.enter_context(patch('app.agent_context.read_service.load_daily_quality_factor_results', return_value=[]))
+            stack.enter_context(patch('app.agent_context.read_service.load_daily_momentum_factor_results', return_value=[]))
+            stack.enter_context(patch('app.agent_context.read_service.load_daily_advanced_value_factor_results', return_value=[]))
+            stack.enter_context(patch('app.agent_context.read_service.load_daily_low_risk_factor_results', return_value=[]))
+            stack.enter_context(patch('app.agent_context.read_service.load_daily_beta_factor_results', return_value=[]))
+            stack.enter_context(patch('app.agent_context.read_service.load_daily_composite_factor_results', return_value=[]))
+            stack.enter_context(patch('app.agent_context.read_service.load_daily_market_relative_contexts', return_value=[]))
+            stack.enter_context(patch('app.agent_context.read_service.build_signal_decider_scores', return_value={}))
+            stack.enter_context(
+                patch(
+                    'app.agent_context.read_service._load_latest_symbol_day_block_history',
+                    return_value=EMPTY_LATEST_PRIOR_ROWS,
+                )
+            )
+            stack.enter_context(
+                patch(
+                    'app.agent_context.read_service.pykrx_enrichment_service.load_symbol_day_context_inputs',
+                    return_value={
+                        'by_symbol': {
+                            '005930': {
+                                'sector_classification': {
+                                    'symbol': '005930',
+                                    'market': 'KOSPI',
+                                    'name_ko': '삼성전자',
+                                    'captured_at': captured_at,
+                                    'payload': {
+                                        'sector_name': '반도체',
+                                        'close_price': 71000,
+                                        'market_cap': 420000000000,
+                                        'change_pct': 1.2,
+                                    },
+                                },
+                                'investor_flow_symbol': {
+                                    'symbol': '005930',
+                                    'market': 'KOSPI',
+                                    'captured_at': captured_at,
+                                    'payload': {
+                                        'investor_groups': {
+                                            '외국인': {'net_value': 1200000},
+                                            '기관합계': {'net_value': -350000},
+                                        }
+                                    },
+                                },
+                                'short_selling': {
+                                    'symbol': '005930',
+                                    'market': 'KOSPI',
+                                    'captured_at': captured_at,
+                                    'payload': {
+                                        'short_volume': {'short_volume': 1000, 'short_volume_ratio_pct': 0.35},
+                                        'short_balance': {'short_balance_ratio_pct': 0.45},
+                                    },
+                                },
+                                'valuation_snapshot': {
+                                    'symbol': '005930',
+                                    'market': 'KOSPI',
+                                    'captured_at': captured_at,
+                                    'payload': {
+                                        'market_cap': 420000000000,
+                                        'per': 11.1,
+                                        'pbr': 1.3,
+                                    },
+                                },
+                                'foreign_ownership': {
+                                    'symbol': '005930',
+                                    'market': 'KOSPI',
+                                    'captured_at': captured_at,
+                                    'payload': {
+                                        'foreign_ownership_ratio_pct': 51.2,
+                                        'foreign_limit_exhaustion_rate_pct': 73.4,
+                                    },
+                                },
+                            }
+                        },
+                        'by_market': {
+                            'KOSPI': {
+                                'market_breadth': {
+                                    'market': 'KOSPI',
+                                    'captured_at': captured_at,
+                                    'payload': {
+                                        'market_symbol_count': 900,
+                                        'up_count': 500,
+                                        'down_count': 300,
+                                        'flat_count': 100,
+                                        'advance_decline_ratio': 1.6667,
+                                    },
+                                },
+                                'investor_flow_market': {
+                                    'market': 'KOSPI',
+                                    'captured_at': captured_at,
+                                    'payload': {
+                                        'investor_groups': [
+                                            {'investor_type': '외국인', 'net_value': 800000000},
+                                            {'investor_type': '기관합계', 'net_value': -240000000},
+                                        ]
+                                    },
+                                },
+                            }
+                        },
+                        'sector_rows_by_market': {
+                            'KOSPI': [
+                                {
+                                    'symbol': '005930',
+                                    'market': 'KOSPI',
+                                    'name_ko': '삼성전자',
+                                    'captured_at': captured_at,
+                                    'payload': {
+                                        'sector_name': '반도체',
+                                        'market_cap': 420000000000,
+                                        'change_pct': 1.2,
+                                    },
+                                },
+                                {
+                                    'symbol': '000660',
+                                    'market': 'KOSPI',
+                                    'name_ko': 'SK하이닉스',
+                                    'captured_at': captured_at,
+                                    'payload': {
+                                        'sector_name': '반도체',
+                                        'market_cap': 180000000000,
+                                        'change_pct': 0.9,
+                                    },
+                                },
+                            ]
+                        },
+                    },
+                )
+            )
+
+            result = service.get_symbol_day_context(
+                market_date='2026-04-08',
+                symbols=['005930'],
+                fs_div='CFS',
+                disclosures_limit=3,
+            )
+
+        item = result['items'][0]
+        self.assertEqual(item['sector_peer_context']['sector_name'], '반도체')
+        self.assertEqual(item['sector_peer_context']['peer_count'], 1)
+        self.assertEqual(item['sector_peer_context']['peers'][0]['symbol'], '000660')
+        self.assertEqual(item['market_breadth_context']['advance_decline_ratio'], 1.6667)
+        self.assertEqual(item['investor_flow_context']['symbol_flow']['investor_groups']['외국인']['net_value'], 1200000)
+        self.assertEqual(item['investor_flow_context']['market_flow']['investor_groups'][0]['investor_type'], '외국인')
+        self.assertEqual(item['short_selling_context']['short_balance']['short_balance_ratio_pct'], 0.45)
+        self.assertEqual(item['valuation_context']['valuation_snapshot']['per'], 11.1)
+        self.assertEqual(item['valuation_context']['foreign_ownership']['foreign_ownership_ratio_pct'], 51.2)
+        self.assertEqual(item['context_provenance']['sector_peer_context']['freshness_status'], 'fresh')
+        self.assertEqual(item['context_provenance']['market_breadth_context']['provenance_status'], 'derived_from_provider_data')
+        self.assertEqual(item['context_provenance']['investor_flow_context']['source_tables'], ['daily_pykrx_enrichment_rows'])
+        self.assertEqual(item['context_completeness']['sector_peer_mapping']['status'], 'available')
+        self.assertEqual(item['context_completeness']['requested_symbol_coverage']['valuation_context']['coverage_status'], 'complete')
+        self.assertEqual(result['summary']['sector_peer_context_count'], 1)
+        self.assertEqual(result['summary']['investor_flow_context_count'], 1)
+        self.assertEqual(result['summary']['context_completeness']['market_breadth_context']['coverage_status'], 'complete')
