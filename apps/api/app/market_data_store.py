@@ -3,7 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from decimal import Decimal
-from typing import Callable
+from typing import Any, Callable
 
 from sqlalchemy import Numeric, and_, case, cast, delete, func, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -108,6 +108,14 @@ def _trend_direction(value: float | None) -> str:
     if value is None or value == 0:
         return 'flat'
     return 'up' if value > 0 else 'down'
+
+
+def _rank_percentile_desc(rank: int, total: int) -> float | None:
+    if rank <= 0 or total <= 0:
+        return None
+    if total == 1:
+        return 1.0
+    return round(1.0 - ((rank - 1) / (total - 1)), 6)
 
 
 DAY_BASED_TRENDING_PERIODS = ('1d', '5d', '20d')
@@ -648,6 +656,192 @@ def load_recent_price_bars_by_symbol(
             }
         )
     return grouped
+
+
+def load_daily_market_relative_contexts(
+    *,
+    market_date: str | date,
+    symbols: list[str],
+) -> list[dict]:
+    normalized_symbols = list(dict.fromkeys(symbols))
+    if not normalized_symbols:
+        return []
+
+    normalized_market_date = _normalize_trade_date(market_date)
+    with session_scope() as session:
+        target_markets = [
+            market
+            for market, in session.execute(
+                select(Symbol.market)
+                .where(Symbol.symbol.in_(normalized_symbols))
+                .distinct()
+            ).all()
+            if market
+        ]
+        if not target_markets:
+            return []
+
+        ranked = (
+            select(
+                Symbol.symbol.label('symbol'),
+                Symbol.market.label('market'),
+                DailyPriceBar.trade_date.label('trade_date'),
+                DailyPriceBar.close_price.label('close_price'),
+                DailyPriceBar.volume.label('volume'),
+                func.row_number()
+                .over(partition_by=DailyPriceBar.symbol_id, order_by=DailyPriceBar.trade_date.desc())
+                .label('bar_rank'),
+            )
+            .join(Symbol, Symbol.id == DailyPriceBar.symbol_id)
+            .where(
+                Symbol.market.in_(target_markets),
+                DailyPriceBar.trade_date <= normalized_market_date,
+            )
+            .subquery()
+        )
+        rows = session.execute(
+            select(ranked)
+            .where(ranked.c.bar_rank <= 2)
+            .order_by(ranked.c.market.asc(), ranked.c.symbol.asc(), ranked.c.trade_date.desc())
+        ).all()
+
+    history_by_symbol: dict[str, list[dict[str, Any]]] = {}
+    market_by_symbol: dict[str, str] = {}
+    for row in rows:
+        mapping = row._mapping
+        symbol = str(mapping['symbol'])
+        market_by_symbol.setdefault(symbol, str(mapping['market']))
+        history_by_symbol.setdefault(symbol, []).append(
+            {
+                'trade_date': mapping['trade_date'],
+                'close_price': int(mapping['close_price']) if mapping['close_price'] is not None else None,
+                'volume': int(mapping['volume']) if mapping['volume'] is not None else None,
+            }
+        )
+
+    market_entries: dict[str, list[dict[str, Any]]] = {}
+    requested_entry_by_symbol: dict[str, dict[str, Any]] = {}
+    for symbol, bars in history_by_symbol.items():
+        if not bars or bars[0].get('trade_date') != normalized_market_date:
+            continue
+        current = bars[0]
+        previous = bars[1] if len(bars) > 1 else None
+        previous_close = previous.get('close_price') if previous else None
+        close_price = current.get('close_price')
+        volume = current.get('volume')
+        return_pct = None
+        if close_price is not None and previous_close not in (None, 0):
+            return_pct = round(((float(close_price) - float(previous_close)) / float(previous_close)) * 100.0, 6)
+
+        market = market_by_symbol.get(symbol)
+        if not market:
+            continue
+        entry = {
+            'symbol': symbol,
+            'market': market,
+            'return_pct': return_pct,
+            'volume': volume,
+            'has_previous_close': previous_close not in (None, 0),
+        }
+        market_entries.setdefault(market, []).append(entry)
+        if symbol in normalized_symbols:
+            requested_entry_by_symbol[symbol] = entry
+
+    summaries_by_market: dict[str, dict[str, Any]] = {}
+    for market, entries in market_entries.items():
+        up_count = sum(1 for entry in entries if entry.get('return_pct') is not None and entry['return_pct'] > 0)
+        down_count = sum(1 for entry in entries if entry.get('return_pct') is not None and entry['return_pct'] < 0)
+        flat_count = sum(1 for entry in entries if entry.get('return_pct') == 0)
+        missing_previous_close_count = sum(1 for entry in entries if not entry.get('has_previous_close'))
+        comparable_return_entries = sorted(
+            [entry for entry in entries if entry.get('return_pct') is not None],
+            key=lambda item: (-float(item['return_pct']), item['symbol']),
+        )
+        comparable_volume_entries = sorted(
+            [entry for entry in entries if entry.get('volume') is not None],
+            key=lambda item: (-int(item['volume']), item['symbol']),
+        )
+        return_rank_by_symbol = {
+            item['symbol']: rank
+            for rank, item in enumerate(comparable_return_entries, start=1)
+        }
+        volume_rank_by_symbol = {
+            item['symbol']: rank
+            for rank, item in enumerate(comparable_volume_entries, start=1)
+        }
+        summaries_by_market[market] = {
+            'market_symbol_count': len(entries),
+            'up_count': up_count,
+            'down_count': down_count,
+            'flat_count': flat_count,
+            'missing_previous_close_count': missing_previous_close_count,
+            'return_rank_by_symbol': return_rank_by_symbol,
+            'volume_rank_by_symbol': volume_rank_by_symbol,
+            'return_population': len(comparable_return_entries),
+            'volume_population': len(comparable_volume_entries),
+        }
+
+    items: list[dict] = []
+    for symbol in normalized_symbols:
+        entry = requested_entry_by_symbol.get(symbol)
+        if entry is None:
+            items.append(
+                {
+                    'symbol': symbol,
+                    'market_date': normalized_market_date.isoformat(),
+                    'status': 'unavailable',
+                    'market': market_by_symbol.get(symbol),
+                    'breadth': None,
+                    'relative_strength': None,
+                }
+            )
+            continue
+
+        market = entry['market']
+        market_summary = summaries_by_market.get(market) or {}
+        return_rank = market_summary.get('return_rank_by_symbol', {}).get(symbol)
+        return_population = int(market_summary.get('return_population') or 0)
+        volume_rank = market_summary.get('volume_rank_by_symbol', {}).get(symbol)
+        volume_population = int(market_summary.get('volume_population') or 0)
+        status = 'available'
+        if return_rank is None or volume_rank is None:
+            status = 'partial'
+
+        items.append(
+            {
+                'symbol': symbol,
+                'market_date': normalized_market_date.isoformat(),
+                'status': status,
+                'market': market,
+                'breadth': {
+                    'basis': 'close_vs_previous_close',
+                    'market_symbol_count': int(market_summary.get('market_symbol_count') or 0),
+                    'up_count': int(market_summary.get('up_count') or 0),
+                    'down_count': int(market_summary.get('down_count') or 0),
+                    'flat_count': int(market_summary.get('flat_count') or 0),
+                    'missing_previous_close_count': int(market_summary.get('missing_previous_close_count') or 0),
+                },
+                'relative_strength': {
+                    'return_pct': entry.get('return_pct'),
+                    'return_rank': return_rank,
+                    'return_percentile': (
+                        _rank_percentile_desc(return_rank, return_population)
+                        if return_rank is not None and return_population > 0
+                        else None
+                    ),
+                    'return_population': return_population,
+                    'volume': entry.get('volume'),
+                    'volume_rank': volume_rank,
+                    'volume_percentile': (
+                        _rank_percentile_desc(volume_rank, volume_population)
+                        if volume_rank is not None and volume_population > 0
+                        else None
+                    ),
+                    'volume_population': volume_population,
+                },
+            }
+        )
+    return items
 
 
 def upsert_daily_price_context(item: dict, *, run_id: int | None = None) -> None:

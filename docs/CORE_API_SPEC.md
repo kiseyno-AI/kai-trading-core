@@ -830,8 +830,24 @@ Authorization: Bearer <token>
     "technical_snapshot_count": 1,
     "action_summary_count": 1,
     "signal_feature_count": 1,
+    "factor_row_counts": {
+      "unified_value": 1,
+      "quality": 1,
+      "momentum": 1,
+      "advanced_value": 1,
+      "low_risk": 1,
+      "beta": 1,
+      "composite": 1
+    },
     "fundamentals_count": 0,
-    "recent_disclosure_symbol_count": 0
+    "recent_disclosure_symbol_count": 0,
+    "context_completeness": {
+      "signal_features": {
+        "present_rows": 1,
+        "missing_rows": 0,
+        "coverage_status": "complete"
+      }
+    }
   },
   "items": [
     {
@@ -928,6 +944,29 @@ Authorization: Bearer <token>
         "volume_power_rank": 3,
         "overtime_volume_rank": 7
       },
+      "market_relative_context": {
+        "status": "available",
+        "market": "KOSPI",
+        "breadth": {
+          "up_count": 470,
+          "down_count": 260,
+          "flat_count": 80
+        },
+        "relative_strength": {
+          "return_percentile": 0.95,
+          "volume_percentile": 0.93
+        }
+      },
+      "persisted_factor_rows": {
+        "advanced_value": {
+          "advanced_value_score": 0.81,
+          "advanced_value_classification": "eligible"
+        },
+        "composite": {
+          "composite_score": 0.73,
+          "composite_classification": "eligible"
+        }
+      },
       "fundamentals": {
         "latest_snapshot": null,
         "history_summary": {
@@ -948,8 +987,20 @@ Authorization: Bearer <token>
         "technical_snapshot": true,
         "action_summary": true,
         "signal_features": true,
+        "market_relative_context": true,
+        "persisted_factor_rows": true,
         "fundamentals": false,
         "recent_disclosures": false
+      },
+      "context_completeness": {
+        "factor_rows": {
+          "quality": {
+            "row_status": "present",
+            "null_submetric_fields": ["accruals_ratio"]
+          }
+        },
+        "signal_features": {"row_status": "present"},
+        "sector_peer_mapping": {"status": "unavailable"}
       }
     }
   ]
@@ -965,6 +1016,7 @@ It is a composed read payload intended for:
 - low-roundtrip consumers.
 
 `price_context` is read from persisted `daily_price_contexts`, which the EOD pipeline derives from stored `daily_price_bars` for the same market date. `price_context_history` carries up to the latest seven persisted rows ending at the requested `market_date`.
+`persisted_factor_rows` keeps compact snapshots of stored factor families, `market_relative_context` derives same-market breadth and return/volume percentiles from stored `daily_price_bars`, and `context_completeness` separates present rows, genuinely missing rows, null submetrics, sparse signal-feature coverage, and the currently unavailable sector/industry peer-mapping lane.
 
 ### Important nullability
 Each subsection can be absent independently.
