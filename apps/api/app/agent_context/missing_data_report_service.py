@@ -250,6 +250,7 @@ class AgentContextMissingDataReportService:
                 for entry in note_entries
                 if isinstance(entry.get('text'), str) and entry['text'].casefold() not in matched_row_note_keys
             ]
+            unmatched_note_count += len(row_unmatched_notes)
             if matched_items:
                 feedback_rows_matched += 1
                 matched_roles.add(role)
@@ -259,8 +260,6 @@ class AgentContextMissingDataReportService:
                 day_bucket['matched_row_keys'].add(row_key)
                 day_bucket['matched_symbols'].add(row['symbol'])
                 day_bucket['matched_note_count'] += len(matched_row_notes)
-            else:
-                unmatched_note_count += len(row_unmatched_notes)
 
             if row_unmatched_notes and len(uncategorized_examples) < self.uncategorized_example_limit:
                 uncategorized_examples.append(

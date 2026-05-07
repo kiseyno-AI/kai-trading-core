@@ -57,6 +57,82 @@ class AgentContextMissingDataReportServiceTests(unittest.TestCase):
         self.assertEqual(factor_row['example_notes'], ['Need factor score coverage.'])
         self.assertEqual(market_row['counts']['note_mentions'], 1)
 
+    def test_summary_counts_unmatched_notes_on_partially_matched_rows(self):
+        repository = FakeMissingDataReportRepository(
+            [
+                {
+                    'id': 2,
+                    'market_date': date(2026, 5, 5),
+                    'symbol': '005930',
+                    'agent_name': 'signal-decider',
+                    'feedback_payload': {'role': 'signal-decider'},
+                    'normalized_feedback_payload': {'role': 'signal-decider'},
+                    'data_gaps_payload': None,
+                    'improvement_notes_payload': ['Need factor score coverage.', '추가 메모 필요'],
+                    'missing_data_categories_payload': None,
+                }
+            ]
+        )
+        service = AgentContextMissingDataReportService(repository=repository)
+
+        result = service.get_summary(market_date='2026-05-05')
+
+        self.assertEqual(result['summary']['feedback_rows_matched'], 1)
+        self.assertEqual(result['summary']['matched_note_count'], 1)
+        self.assertEqual(result['summary']['unmatched_note_count'], 1)
+        self.assertEqual(
+            result['uncategorized_examples'],
+            [
+                {
+                    'market_date': '2026-05-05',
+                    'symbol': '005930',
+                    'agent_name': 'signal-decider',
+                    'role': 'signal-decider',
+                    'note': '추가 메모 필요',
+                }
+            ],
+        )
+
+    def test_summary_counts_filtered_out_notes_as_unmatched_examples(self):
+        repository = FakeMissingDataReportRepository(
+            [
+                {
+                    'id': 3,
+                    'market_date': date(2026, 5, 5),
+                    'symbol': '005930',
+                    'agent_name': 'signal-decider',
+                    'feedback_payload': {'role': 'signal-decider'},
+                    'normalized_feedback_payload': {'role': 'signal-decider'},
+                    'data_gaps_payload': None,
+                    'improvement_notes_payload': ['Need factor score coverage.', '시장/업종 상대 비교 필요'],
+                    'missing_data_categories_payload': None,
+                }
+            ]
+        )
+        service = AgentContextMissingDataReportService(repository=repository)
+
+        result = service.get_summary(
+            market_date='2026-05-05',
+            categories=['factor_score_coverage'],
+        )
+
+        self.assertEqual(result['summary']['feedback_rows_matched'], 1)
+        self.assertEqual(result['summary']['matched_note_count'], 1)
+        self.assertEqual(result['summary']['unmatched_note_count'], 1)
+        self.assertEqual([item['category'] for item in result['categories']], ['factor_score_coverage'])
+        self.assertEqual(
+            result['uncategorized_examples'],
+            [
+                {
+                    'market_date': '2026-05-05',
+                    'symbol': '005930',
+                    'agent_name': 'signal-decider',
+                    'role': 'signal-decider',
+                    'note': '시장/업종 상대 비교 필요',
+                }
+            ],
+        )
+
     def test_summary_includes_date_breakdown_and_category_trends(self):
         repository = FakeMissingDataReportRepository(
             [
