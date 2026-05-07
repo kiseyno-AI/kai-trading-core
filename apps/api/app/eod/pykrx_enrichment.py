@@ -173,6 +173,33 @@ def _frame_value(frame: pd.DataFrame, symbol: str, column: Any) -> Any:
         return None
 
 
+def _frame_value_candidates(frame: pd.DataFrame, symbol: str, *columns: Any) -> Any:
+    for column in columns:
+        value = _frame_value(frame, symbol, column)
+        if value is None:
+            continue
+        try:
+            if pd.isna(value):
+                continue
+        except TypeError:
+            pass
+        return value
+    return None
+
+
+def _first_present(*values: Any) -> Any:
+    for value in values:
+        if value is None:
+            continue
+        try:
+            if pd.isna(value):
+                continue
+        except TypeError:
+            pass
+        return value
+    return None
+
+
 class PykrxEnrichmentService:
     def __init__(self) -> None:
         self._request_pause_seconds = max(
@@ -742,6 +769,15 @@ class PykrxEnrichmentService:
                     market=market,
                     include=['주식'],
                 )
+                value_frame = self._fetch_frame(
+                    cache=cache,
+                    cache_key=('short_selling_value', market_date_yyyymmdd, market),
+                    operation='short_selling_value',
+                    func=stock.get_shorting_value_by_ticker,
+                    date=market_date_yyyymmdd,
+                    market=market,
+                    include=['주식'],
+                )
                 balance_frame = self._fetch_frame(
                     cache=cache,
                     cache_key=('short_selling_balance', market_date_yyyymmdd, market),
@@ -765,12 +801,33 @@ class PykrxEnrichmentService:
                 payload = {
                     'market': market,
                     'short_volume': {
-                        'short_volume': _to_int(_frame_value(volume_frame, symbol, ('거래량', '공매도'))),
-                        'total_volume': _to_int(_frame_value(volume_frame, symbol, ('거래량', '매수'))),
-                        'short_volume_ratio_pct': _to_float(_frame_value(volume_frame, symbol, ('거래량', '비중'))),
-                        'short_value': _to_int(_frame_value(volume_frame, symbol, ('거래대금', '공매도'))),
-                        'total_value': _to_int(_frame_value(volume_frame, symbol, ('거래대금', '매수'))),
-                        'short_value_ratio_pct': _to_float(_frame_value(volume_frame, symbol, ('거래대금', '비중'))),
+                        'short_volume': _to_int(
+                            _frame_value_candidates(volume_frame, symbol, ('거래량', '공매도'), '공매도')
+                        ),
+                        'total_volume': _to_int(
+                            _frame_value_candidates(volume_frame, symbol, ('거래량', '매수'), '매수')
+                        ),
+                        'short_volume_ratio_pct': _to_float(
+                            _frame_value_candidates(volume_frame, symbol, ('거래량', '비중'), '비중')
+                        ),
+                        'short_value': _to_int(
+                            _first_present(
+                                _frame_value_candidates(value_frame, symbol, ('거래대금', '공매도'), '공매도'),
+                                _frame_value_candidates(volume_frame, symbol, ('거래대금', '공매도')),
+                            )
+                        ),
+                        'total_value': _to_int(
+                            _first_present(
+                                _frame_value_candidates(value_frame, symbol, ('거래대금', '매수'), '매수'),
+                                _frame_value_candidates(volume_frame, symbol, ('거래대금', '매수')),
+                            )
+                        ),
+                        'short_value_ratio_pct': _to_float(
+                            _first_present(
+                                _frame_value_candidates(value_frame, symbol, ('거래대금', '비중'), '비중'),
+                                _frame_value_candidates(volume_frame, symbol, ('거래대금', '비중')),
+                            )
+                        ),
                     },
                     'short_balance': {
                         'short_balance_qty': _to_int(_frame_value(balance_frame, symbol, '공매도잔고')),
