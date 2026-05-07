@@ -84,6 +84,34 @@ class DailyTechnicalSnapshotServiceTests(unittest.TestCase):
                 bars=bars,
             )
 
+    def test_compute_snapshot_carries_price_bar_quality_and_estimated_turnover_for_zero_open_rows(self):
+        service = DailyTechnicalSnapshotService()
+        bars = _bars()
+        bars[-2]['trade_date'] = '2026-05-02'
+        bars[-2]['close_price'] = 70200
+        bars[-1]['trade_date'] = '2026-05-06'
+        bars[-1]['open_price'] = 0
+        bars[-1]['high_price'] = 71500
+        bars[-1]['low_price'] = 70500
+        bars[-1]['close_price'] = 71000
+        bars[-1]['volume'] = 120000
+        bars[-1]['turnover'] = 0
+
+        result = service.compute_snapshot(
+            symbol='005930',
+            market_date='2026-05-06',
+            bars=bars,
+            source='pykrx',
+        )
+
+        price_bar_context = result.signal_payload['price_bar_context']
+        self.assertEqual(price_bar_context['liquidity']['turnover_source'], 'estimated')
+        self.assertEqual(price_bar_context['liquidity']['turnover_krw'], 8520000000)
+        self.assertTrue(price_bar_context['price_bar_quality']['open_price_zero'])
+        self.assertTrue(price_bar_context['price_bar_quality']['turnover_missing_or_zero'])
+        self.assertFalse(price_bar_context['gap']['reliable'])
+        self.assertIsNone(price_bar_context['gap']['gap_points'])
+
     def test_compute_and_persist_ignores_progress_callback_failures(self):
         service = DailyTechnicalSnapshotService()
         progress_updates: list[dict] = []

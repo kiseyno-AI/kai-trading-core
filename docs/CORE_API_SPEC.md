@@ -174,6 +174,7 @@ Authorization: Bearer <token>
   - live quote source,
   - daily bar fallback,
   - cache.
+- `bid_price` and `ask_price` may appear on live KIS-backed rows when the upstream quote included spread fields; fallback rows can omit them.
 
 ### UX guidance
 If `available` is false:
@@ -825,6 +826,7 @@ Authorization: Bearer <token>
   "summary": {
     "requested_symbol_count": 1,
     "matched_symbol_count": 1,
+    "quote_context_count": 1,
     "missing_symbols": [],
     "price_context_count": 1,
     "technical_snapshot_count": 1,
@@ -863,6 +865,25 @@ Authorization: Bearer <token>
           "corp_name": null
         }
       },
+      "quote_context": {
+        "available": true,
+        "source": "kis",
+        "market_state": "OPEN",
+        "price": 71550,
+        "trade_date": "2026-04-09",
+        "cached_at": "2026-04-09T09:57:00+09:00",
+        "freshness": {
+          "trade_date_relation_to_request": "same_market_date",
+          "same_market_date_as_request": true
+        },
+        "spread": {
+          "available": true,
+          "bid_price": 71500,
+          "ask_price": 71600,
+          "spread_points": 100,
+          "spread_bps_of_price": 13.9762
+        }
+      },
       "price_context": {
         "trade_date": "2026-04-09",
         "source": "pykrx",
@@ -870,6 +891,17 @@ Authorization: Bearer <token>
         "high_price": 72000,
         "low_price": 69500,
         "close_price": 71500,
+        "liquidity": {
+          "turnover_krw": 8800000000,
+          "turnover_source": "provider",
+          "turnover_is_estimated": false
+        },
+        "price_bar_quality": {
+          "open_price_zero": false,
+          "turnover_missing_or_zero": false,
+          "gap_unreliable_due_to_open": false,
+          "issue_codes": []
+        },
         "candle": {
           "direction": "bullish",
           "body_points": 1500,
@@ -892,7 +924,8 @@ Authorization: Bearer <token>
           "gap_points": 200,
           "gap_percent": 0.2865,
           "direction": "up",
-          "filled_intraday": true
+          "filled_intraday": true,
+          "reliable": true
         }
       },
       "price_context_history": [
@@ -983,6 +1016,7 @@ Authorization: Bearer <token>
       },
       "availability": {
         "company": true,
+        "quote_context": true,
         "price_context": true,
         "technical_snapshot": true,
         "action_summary": true,
@@ -1015,7 +1049,8 @@ It is a composed read payload intended for:
 - summary card generation,
 - low-roundtrip consumers.
 
-`price_context` is read from persisted `daily_price_contexts`, which the EOD pipeline derives from stored `daily_price_bars` for the same market date. `price_context_history` carries up to the latest seven persisted rows ending at the requested `market_date`.
+`quote_context` is the latest `current_quote_cache` view when one exists, so the payload can distinguish true quote absence from stale-or-spread-less rows without making agents guess from missing prose.
+`price_context` is read from persisted `daily_price_contexts`, which the EOD pipeline derives from stored `daily_price_bars` for the same market date. It now includes derived liquidity (`turnover_source`, provider vs estimated turnover) plus `price_bar_quality` flags for zero opens, zero turnover, and unreliable gap semantics. `price_context_history` carries up to the latest seven persisted rows ending at the requested `market_date`.
 `persisted_factor_rows` keeps compact snapshots of stored factor families, `market_relative_context` derives same-market breadth and return/volume percentiles from stored `daily_price_bars`, and `context_completeness` separates present rows, genuinely missing rows, null submetrics, sparse signal-feature coverage, and the currently unavailable sector/industry peer-mapping lane.
 
 ### Important nullability

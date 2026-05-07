@@ -106,6 +106,10 @@ class DailyActionSummaryService:
         volume_context = signal_payload.get('volume') or {}
         volatility_context = signal_payload.get('volatility') or {}
         stop_context = volatility_context.get('stop_context') or {}
+        price_bar_context = signal_payload.get('price_bar_context') or {}
+        price_bar_quality = price_bar_context.get('price_bar_quality') or {}
+        liquidity_context = price_bar_context.get('liquidity') or {}
+        gap_context = price_bar_context.get('gap') or {}
 
         close_price = int(snapshot['close_price'])
         atr_14 = snapshot.get('atr_14')
@@ -304,6 +308,30 @@ class DailyActionSummaryService:
                 'return_20d': return_20d,
                 'volume_ratio_20d': volume_ratio_20d,
                 'atr_pct_14': atr_pct_14,
+            },
+            'data_quality': {
+                'price_bar_quality': {
+                    'open_price_zero': bool(price_bar_quality.get('open_price_zero')),
+                    'turnover_missing_or_zero': bool(price_bar_quality.get('turnover_missing_or_zero')),
+                    'volume_zero': bool(price_bar_quality.get('volume_zero')),
+                    'gap_unreliable_due_to_open': bool(price_bar_quality.get('gap_unreliable_due_to_open')),
+                    'possible_suspension_or_special_session': bool(
+                        price_bar_quality.get('possible_suspension_or_special_session')
+                    ),
+                    'issue_codes': list(price_bar_quality.get('issue_codes') or []),
+                },
+                'liquidity': {
+                    'turnover_krw': liquidity_context.get('turnover_krw'),
+                    'turnover_source': liquidity_context.get('turnover_source'),
+                    'turnover_is_estimated': bool(liquidity_context.get('turnover_is_estimated')),
+                    'provider_turnover_krw': liquidity_context.get('provider_turnover_krw'),
+                    'estimated_turnover_krw': liquidity_context.get('estimated_turnover_krw'),
+                },
+                'gap': {
+                    'direction': gap_context.get('direction'),
+                    'gap_percent': gap_context.get('gap_percent'),
+                    'reliable': gap_context.get('reliable'),
+                },
             },
         }
 

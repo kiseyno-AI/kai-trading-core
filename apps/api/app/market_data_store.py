@@ -204,6 +204,14 @@ def persist_quote_snapshot(payload: dict) -> None:
         current.captured_at = datetime.utcnow()
 
 
+def _serialize_current_quote_cache_row(row: CurrentQuoteCache, *, symbol: str) -> dict:
+    payload = dict(row.payload or {})
+    payload['symbol'] = symbol
+    payload['cached_at'] = row.updated_at.isoformat()
+    payload['captured_at'] = row.captured_at.isoformat() if row.captured_at else None
+    return payload
+
+
 def load_current_quote(symbol: str) -> dict | None:
     with session_scope() as session:
         row = session.execute(
@@ -213,9 +221,29 @@ def load_current_quote(symbol: str) -> dict | None:
         ).scalar_one_or_none()
         if row is None:
             return None
-        payload = dict(row.payload)
-        payload['cached_at'] = row.updated_at.isoformat()
-        return payload
+        return _serialize_current_quote_cache_row(row, symbol=symbol)
+
+
+def load_current_quotes(
+    *,
+    symbols: list[str] | None = None,
+    limit: int = 100,
+) -> list[dict]:
+    with session_scope() as session:
+        stmt = (
+            select(CurrentQuoteCache, Symbol.symbol)
+            .join(Symbol, Symbol.id == CurrentQuoteCache.symbol_id)
+            .order_by(Symbol.symbol.asc())
+            .limit(limit)
+        )
+        if symbols:
+            stmt = stmt.where(Symbol.symbol.in_(symbols))
+
+        rows = session.execute(stmt).all()
+        return [
+            _serialize_current_quote_cache_row(row, symbol=symbol)
+            for row, symbol in rows
+        ]
 
 
 def persist_market_status_snapshot(state: MarketState, *, source: str = 'api') -> None:

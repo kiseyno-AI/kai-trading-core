@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from calendar import monthrange
-from datetime import date
+from datetime import date, datetime
 from typing import Any, Sequence
 
 from app.agent_context.derived_contexts import DEFAULT_DERIVED_CONTEXT_HISTORY_DAYS, build_price_context
@@ -23,6 +23,7 @@ from app.market_data_store import (
     load_daily_signal_features,
     load_daily_technical_snapshots,
     load_daily_unified_value_factor_results,
+    load_current_quotes,
     load_symbols,
 )
 
@@ -439,6 +440,118 @@ def _group_price_context_history(
     return grouped
 
 
+def _to_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str):
+        text = value.strip().replace(',', '')
+        if not text:
+            return None
+        try:
+            return int(float(text))
+        except ValueError:
+            return None
+    return None
+
+
+def _to_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        text = value.strip().replace(',', '')
+        if not text:
+            return None
+        try:
+            return float(text)
+        except ValueError:
+            return None
+    return None
+
+
+def _parse_iso_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    normalized = value.replace('Z', '+00:00')
+    try:
+        return datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+
+
+def _build_quote_context(row: dict[str, Any] | None, *, market_date: date) -> dict[str, Any] | None:
+    if row is None:
+        return None
+
+    price = _to_int(row.get('price'))
+    bid_price = _to_int(row.get('bid_price'))
+    ask_price = _to_int(row.get('ask_price'))
+    spread_points = ask_price - bid_price if ask_price is not None and bid_price is not None else None
+    if spread_points is not None and spread_points < 0:
+        spread_available = False
+        spread_reason = 'negative_spread'
+        spread_points = None
+    elif spread_points is not None:
+        spread_available = True
+        spread_reason = None
+    else:
+        spread_available = False
+        spread_reason = 'missing_bid_or_ask'
+
+    raw_trade_date = row.get('trade_date')
+    try:
+        quote_trade_date = date.fromisoformat(str(raw_trade_date)).isoformat() if raw_trade_date else None
+    except ValueError:
+        quote_trade_date = None
+
+    relation = 'unknown'
+    if quote_trade_date is not None:
+        if quote_trade_date == market_date.isoformat():
+            relation = 'same_market_date'
+        elif quote_trade_date > market_date.isoformat():
+            relation = 'after_market_date'
+        else:
+            relation = 'before_market_date'
+
+    return {
+        'available': bool(row.get('available')) if row.get('available') is not None else price is not None,
+        'source': row.get('source'),
+        'market_state': row.get('market_state'),
+        'is_live': row.get('is_live'),
+        'fallback': row.get('fallback'),
+        'price': price,
+        'change': _to_int(row.get('change')),
+        'change_pct': _to_float(row.get('change_pct')),
+        'volume': _to_int(row.get('volume')),
+        'turnover': _to_int(row.get('turnover')),
+        'as_of': row.get('as_of'),
+        'trade_date': quote_trade_date,
+        'cached_at': row.get('cached_at'),
+        'captured_at': row.get('captured_at'),
+        'freshness': {
+            'trade_date_relation_to_request': relation,
+            'same_market_date_as_request': relation == 'same_market_date',
+            'cached_at': row.get('cached_at'),
+            'captured_at': row.get('captured_at'),
+            'quote_trade_date': quote_trade_date,
+            'has_cached_timestamp': _parse_iso_datetime(row.get('cached_at')) is not None,
+        },
+        'spread': {
+            'available': spread_available,
+            'bid_price': bid_price,
+            'ask_price': ask_price,
+            'spread_points': spread_points,
+            'spread_bps_of_price': round((spread_points / price) * 10000, 4)
+            if spread_points is not None and price is not None and price > 0
+            else None,
+            'reason': spread_reason,
+        },
+    }
+
+
 def _ratio(numerator: int, denominator: int) -> float | None:
     if denominator <= 0:
         return None
@@ -616,6 +729,10 @@ class AgentContextReadService:
             symbols=normalized_symbols,
             limit=max(len(normalized_symbols), 1000),
         )
+        quote_rows = load_current_quotes(
+            symbols=normalized_symbols,
+            limit=max(len(normalized_symbols), 1000),
+        )
         price_context_rows = load_daily_price_contexts(
             market_date=normalized_market_date,
             symbols=normalized_symbols,
@@ -651,6 +768,7 @@ class AgentContextReadService:
         low_risk_map = {item['symbol']: item for item in low_risk_rows}
         beta_map = {item['symbol']: item for item in beta_rows}
         composite_map = {item['symbol']: item for item in composite_rows}
+        quote_map = {item['symbol']: item for item in quote_rows}
         price_context_map = {item['symbol']: item['context_payload'] for item in price_context_rows}
         price_context_history_map = _group_price_context_history(
             price_context_history_rows,
@@ -669,6 +787,7 @@ class AgentContextReadService:
         factor_row_counts = {family: 0 for family in PERSISTED_FACTOR_FAMILIES}
 
         for symbol in normalized_symbols:
+            quote_context = _build_quote_context(quote_map.get(symbol), market_date=normalized_market_date)
             price_context = price_context_map.get(symbol)
             price_context_history = price_context_history_map.get(symbol, [])
             technical_snapshot = technical_map.get(symbol)
@@ -766,6 +885,7 @@ class AgentContextReadService:
 
             availability = {
                 'company': company_row is not None,
+                'quote_context': quote_context is not None,
                 'price_context': price_context is not None,
                 'technical_snapshot': technical_snapshot is not None,
                 'action_summary': action_summary is not None,
@@ -788,6 +908,7 @@ class AgentContextReadService:
                     'symbol': symbol,
                     'market_date': normalized_market_date.isoformat(),
                     'company': company,
+                    'quote_context': quote_context,
                     'price_context': price_context,
                     'price_context_history': price_context_history,
                     'technical_snapshot': technical_snapshot,
@@ -880,6 +1001,7 @@ class AgentContextReadService:
                 'requested_symbol_count': len(normalized_symbols),
                 'matched_symbol_count': len(matched_symbols),
                 'missing_symbols': missing_symbols,
+                'quote_context_count': sum(1 for item in items if item['quote_context'] is not None),
                 'price_context_count': sum(1 for item in items if item['price_context'] is not None),
                 'technical_snapshot_count': sum(1 for item in items if item['technical_snapshot'] is not None),
                 'action_summary_count': sum(1 for item in items if item['action_summary'] is not None),
