@@ -425,8 +425,9 @@
 
 ## Daily signal feature notes
 - `daily_signal_features` is the DB-backed KIS ranking feature layer keyed by `symbol_id + market_date`.
-- The current scope intentionally covers only `volume-power`, `overtime-volume`, and `overtime-fluctuation`.
-- `POST /eod/signal-features/collect` calls those KIS ranking sources, normalizes symbol-level ranks and metrics, and upserts one compact feature row per symbol/date.
+- Direct KIS inputs still come from `volume-power`, `overtime-volume`, and `overtime-fluctuation`, but the persisted row can now backfill missing symbols from already-owned bars, factor rows, and cached quotes when enough stored inputs exist.
+- `POST /eod/signal-features/collect` calls the ranking endpoints when available, then expands the stored row set across the active daily-bar universe plus the current agent-feedback candidate universe. Each row now carries JSON-level provenance (`row_kind`, direct-source count, fallback groups) and component freshness metadata so downstream readers can separate direct ranking truth from owned-data fallback context.
+- `GET /eod/signal-features` now reports explicit market-date coverage for both the active daily-bar universe and the current agent-feedback candidate universe, alongside row-kind counts such as `direct_only`, `direct_plus_fallback`, and `fallback_only`.
 - The same collect path now also rebuilds `daily_market_participation_contexts` for that market date from the stored `daily_signal_features` rows, so market-summary payloads no longer derive participation context on demand.
 - Repo-owned bootstrap/backfill for the new derived-context tables is the internal ops command `python3.11 -m app.internal.ops agent-derived-contexts-backfill-recent`, which fills the recent seven trading days ending yesterday from existing `daily_price_bars` and stored `daily_signal_features` without changing the steady-state daily EOD scope.
 - For shell-driven operations, prefer `python3.11 -m app.internal.ops kis-daily-signal-features-collect --market-date YYYY-MM-DD` from `apps/api`.

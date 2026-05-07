@@ -14,6 +14,7 @@ from app.agent_context.signal_decider_loop_service import (
     SignalDeciderLoopService,
     SignalDeciderLoopRepository,
     _merge_policy_metadata_preserving_audit,
+    build_signal_decider_feature_snapshot,
 )
 from app.db_models import AgentContextFeedback, Base, SignalDeciderDecisionSnapshot, SignalDeciderEvaluation
 
@@ -553,6 +554,24 @@ class FakeSignalDeciderLoopRepository:
 
 
 class SignalDeciderLoopServiceTests(unittest.TestCase):
+    def test_build_signal_decider_feature_snapshot_marks_owned_fallback_signal_rows(self):
+        snapshot = build_signal_decider_feature_snapshot(
+            symbol_day_context={
+                'signal_features': {
+                    'signal_count': 0,
+                    'row_kind': 'fallback_only',
+                    'provenance': {
+                        'row_kind': 'fallback_only',
+                        'fallback_groups_present': ['price_action', 'factor_scores'],
+                    },
+                }
+            }
+        )
+
+        self.assertEqual(snapshot['signal_features']['signal_count'], 0)
+        self.assertEqual(snapshot['signal_features']['row_kind'], 'fallback_only')
+        self.assertTrue(snapshot['signal_features']['has_owned_fallback_features'])
+
     def test_prepare_feedback_persistence_adds_policy_and_feature_snapshot(self):
         service = SignalDeciderLoopService(repository=FakeSignalDeciderLoopRepository([]))
 

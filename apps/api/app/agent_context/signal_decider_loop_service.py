@@ -552,6 +552,10 @@ def build_signal_decider_feature_snapshot(
             'volume_power_rank': _to_int(signal_features.get('volume_power_rank')),
             'overtime_volume_rank': _to_int(signal_features.get('overtime_volume_rank')),
             'overtime_fluctuation_rank': _to_int(signal_features.get('overtime_fluctuation_rank')),
+            'row_kind': _normalize_optional_text(signal_features.get('row_kind')),
+            'has_owned_fallback_features': bool(
+                _maybe_dict(signal_features.get('provenance')).get('fallback_groups_present')
+            ),
         },
         'price_context': {
             'close_location_ratio': _to_float(price_context.get('close_location_ratio')),

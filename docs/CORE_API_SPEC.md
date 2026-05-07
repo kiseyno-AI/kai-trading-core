@@ -667,7 +667,7 @@ Authorization: Bearer <token>
 ---
 
 ## 2.5 `GET /eod/signal-features`
-Returns stored daily KIS ranking signal features.
+Returns stored daily KIS ranking signal features plus owned-data fallback coverage metadata.
 
 ### Example request
 ```http
@@ -681,13 +681,57 @@ Authorization: Bearer <token>
   "market_date": "2026-04-14",
   "summary": {
     "entries": 1,
+    "entries_for_market_date": 76,
     "requested_symbols": ["005930"],
     "matched_symbols": ["005930"],
-    "missing_symbols": []
+    "missing_symbols": [],
+    "coverage": {
+      "market_date": "2026-04-14",
+      "persisted_row_count": 76,
+      "direct_signal_source_row_count": 12,
+      "fallback_only_row_count": 64,
+      "row_kind_counts": {
+        "direct_plus_fallback": 12,
+        "fallback_only": 64
+      },
+      "active_universe": {
+        "label": "active_daily_bar_universe",
+        "availability": "available",
+        "symbol_count": 76,
+        "present_rows": 76,
+        "missing_rows": 0,
+        "coverage_ratio": 1.0,
+        "coverage_status": "complete",
+        "missing_symbols_preview": []
+      },
+      "candidate_universe": {
+        "label": "agent_feedback_candidate_universe",
+        "availability": "available",
+        "symbol_count": 18,
+        "present_rows": 18,
+        "missing_rows": 0,
+        "coverage_ratio": 1.0,
+        "coverage_status": "complete",
+        "missing_symbols_preview": []
+      },
+      "requested_scope": {
+        "label": "requested_symbol_scope",
+        "availability": "available",
+        "symbol_count": 1,
+        "present_rows": 1,
+        "missing_rows": 0,
+        "coverage_ratio": 1.0,
+        "coverage_status": "complete",
+        "missing_symbols_preview": []
+      }
+    }
   },
   "items": [
     {
       "symbol": "005930",
+      "name_ko": "삼성전자",
+      "market": "KOSPI",
+      "market_date": "2026-04-14",
       "source": "kis_ranking",
       "signal_count": 2,
       "volume_power_rank": 3,
@@ -695,7 +739,59 @@ Authorization: Bearer <token>
       "overtime_volume_rank": 7,
       "overtime_volume": 120000,
       "overtime_fluctuation_rank": null,
-      "overtime_fluctuation_rate": null
+      "overtime_fluctuation_rate": null,
+      "row_kind": "direct_plus_fallback",
+      "provenance": {
+        "row_kind": "direct_plus_fallback",
+        "direct_signal_sources": ["overtime-volume", "volume-power"],
+        "direct_signal_source_count": 2,
+        "fallback_groups_present": [
+          "price_action",
+          "liquidity",
+          "returns",
+          "volatility",
+          "factor_scores",
+          "quote_snapshot"
+        ],
+        "active_universe_member": true,
+        "candidate_universe_member": true
+      },
+      "freshness": {
+        "market_date": "2026-04-14",
+        "direct_sources_collected_at": "2026-04-14T15:42:10+00:00",
+        "price_bars": {
+          "trade_date": "2026-04-14",
+          "trade_date_relation_to_market_date": "same_market_date"
+        },
+        "quote_snapshot": {
+          "trade_date": "2026-04-14",
+          "trade_date_relation_to_market_date": "same_market_date"
+        },
+        "factor_scores": {
+          "families_present": ["quality", "momentum", "low_risk"],
+          "latest_captured_at": "2026-04-14T15:31:00+00:00"
+        }
+      },
+      "fallback_features": {
+        "price_action": {
+          "close_return_1d_pct": 1.287553,
+          "candle_direction": "bullish",
+          "close_location_label": "near_high"
+        },
+        "liquidity": {
+          "turnover_source": "provider",
+          "turnover_is_estimated": false
+        },
+        "returns": {
+          "close_return_1d_pct": 1.287553,
+          "return_5d": 4.921771
+        },
+        "quote_snapshot": {
+          "available": true,
+          "source": "kis",
+          "fallback": false
+        }
+      }
     }
   ]
 }
@@ -704,7 +800,10 @@ Authorization: Bearer <token>
 ### Notes
 - Stored rows are keyed by symbol and market date.
 - The current persisted sources are `volume-power`, `overtime-volume`, and `overtime-fluctuation`.
-- `POST /eod/signal-features/collect` is the operator path that calls KIS and upserts these rows.
+- `POST /eod/signal-features/collect` is the operator path that calls KIS when available, expands the row set across the active daily-bar universe and candidate universe, and upserts the merged rows.
+- Each stored row can be `direct_only`, `direct_plus_fallback`, or `fallback_only`.
+- `fallback_features` come from already-owned bars, persisted factor rows, and cached quote data. They are contextual fallback values, not replacement live ranking truth.
+- The collect response also returns `source_errors`, `coverage`, `items_total`, and `items_returned`.
 - The same collect path also refreshes the persisted market-wide participation block used by the EOD summarizer payload, so participation context is no longer derived from signal rows during payload build time.
 
 ---
@@ -975,7 +1074,47 @@ Authorization: Bearer <token>
         "source": "kis_ranking",
         "signal_count": 2,
         "volume_power_rank": 3,
-        "overtime_volume_rank": 7
+        "overtime_volume_rank": 7,
+        "row_kind": "direct_plus_fallback",
+        "provenance": {
+          "row_kind": "direct_plus_fallback",
+          "direct_signal_source_count": 2,
+          "fallback_groups_present": [
+            "price_action",
+            "liquidity",
+            "returns",
+            "volatility",
+            "factor_scores",
+            "quote_snapshot"
+          ]
+        },
+        "freshness": {
+          "market_date": "2026-04-09",
+          "price_bars": {
+            "trade_date": "2026-04-09",
+            "trade_date_relation_to_market_date": "same_market_date"
+          },
+          "quote_snapshot": {
+            "trade_date": "2026-04-09",
+            "trade_date_relation_to_market_date": "same_market_date"
+          }
+        },
+        "fallback_features": {
+          "price_action": {
+            "close_return_1d_pct": 2.43553,
+            "candle_direction": "bullish",
+            "close_location_label": "near_high"
+          },
+          "factor_scores": {
+            "quality": {
+              "score": 0.741,
+              "status": "partial"
+            },
+            "momentum": {
+              "score": 0.914
+            }
+          }
+        }
       },
       "market_relative_context": {
         "status": "available",
@@ -1033,7 +1172,19 @@ Authorization: Bearer <token>
             "null_submetric_fields": ["accruals_ratio"]
           }
         },
-        "signal_features": {"row_status": "present"},
+        "signal_features": {
+          "row_status": "present",
+          "row_kind": "direct_plus_fallback",
+          "direct_signal_source_count": 2,
+          "fallback_groups_present": [
+            "price_action",
+            "liquidity",
+            "returns",
+            "volatility",
+            "factor_scores",
+            "quote_snapshot"
+          ]
+        },
         "sector_peer_mapping": {"status": "unavailable"}
       }
     }
@@ -1051,6 +1202,7 @@ It is a composed read payload intended for:
 
 `quote_context` is the latest `current_quote_cache` view when one exists, so the payload can distinguish true quote absence from stale-or-spread-less rows without making agents guess from missing prose.
 `price_context` is read from persisted `daily_price_contexts`, which the EOD pipeline derives from stored `daily_price_bars` for the same market date. It now includes derived liquidity (`turnover_source`, provider vs estimated turnover) plus `price_bar_quality` flags for zero opens, zero turnover, and unreliable gap semantics. `price_context_history` carries up to the latest seven persisted rows ending at the requested `market_date`.
+`signal_features` may be a direct KIS row, a direct-plus-fallback row, or a fallback-only row assembled from owned data. Fallback values are intentionally marked so downstream agents do not treat them as live external ranking truth.
 `persisted_factor_rows` keeps compact snapshots of stored factor families, `market_relative_context` derives same-market breadth and return/volume percentiles from stored `daily_price_bars`, and `context_completeness` separates present rows, genuinely missing rows, null submetrics, sparse signal-feature coverage, and the currently unavailable sector/industry peer-mapping lane.
 
 ### Important nullability

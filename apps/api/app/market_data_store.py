@@ -3565,6 +3565,8 @@ def load_daily_signal_feature_context_rows(
                 'overtime_fluctuation_rank': feature.overtime_fluctuation_rank,
                 'overtime_fluctuation_rate': _decimal_to_float(feature.overtime_fluctuation_rate),
                 'feature_payload': feature.feature_payload or {},
+                'row_kind': ((feature.feature_payload or {}).get('row_provenance') or {}).get('row_kind'),
+                'provenance': (feature.feature_payload or {}).get('row_provenance'),
             }
             for feature, symbol in rows
         ]
@@ -3578,7 +3580,7 @@ def load_daily_signal_features(
 ) -> list[dict]:
     with session_scope() as session:
         stmt = (
-            select(DailySignalFeature, Symbol.symbol)
+            select(DailySignalFeature, Symbol.symbol, Symbol.name_ko, Symbol.market)
             .join(Symbol, Symbol.id == DailySignalFeature.symbol_id)
             .where(DailySignalFeature.market_date == _normalize_trade_date(market_date))
             .order_by(DailySignalFeature.signal_count.desc(), Symbol.symbol.asc())
@@ -3591,6 +3593,8 @@ def load_daily_signal_features(
         return [
             {
                 'symbol': symbol,
+                'name_ko': name_ko,
+                'market': market,
                 'market_date': feature.market_date.isoformat(),
                 'source': feature.source,
                 'signal_count': int(feature.signal_count),
@@ -3601,9 +3605,13 @@ def load_daily_signal_features(
                 'overtime_fluctuation_rank': feature.overtime_fluctuation_rank,
                 'overtime_fluctuation_rate': _decimal_to_float(feature.overtime_fluctuation_rate),
                 'feature_payload': feature.feature_payload,
+                'row_kind': ((feature.feature_payload or {}).get('row_provenance') or {}).get('row_kind'),
+                'provenance': (feature.feature_payload or {}).get('row_provenance'),
+                'freshness': (feature.feature_payload or {}).get('freshness'),
+                'fallback_features': (feature.feature_payload or {}).get('fallback_features'),
                 'captured_at': feature.captured_at.isoformat() if feature.captured_at else None,
             }
-            for feature, symbol in rows
+            for feature, symbol, name_ko, market in rows
         ]
 
 
