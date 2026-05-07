@@ -6,7 +6,12 @@ from typing import Any
 
 from app.core.audit_logging import log_fetch_event
 from app.dart.fundamentals_store import DartFundamentalsRepository, dart_fundamentals_repository
-from app.dart.service import FS_DIV_TO_STATEMENT_TYPE, REPORT_CODE_METADATA
+from app.dart.service import (
+    FS_DIV_TO_STATEMENT_TYPE,
+    REPORT_CODE_METADATA,
+    build_fundamental_context_from_highlights,
+    classify_disclosure_event,
+)
 
 
 class DartFundamentalsHistoryService:
@@ -181,6 +186,40 @@ def _build_period_end_date(*, business_year: int, period_end_month: int | None) 
 def _build_history_entry(item: dict[str, Any], *, period_end_date: date | None) -> dict[str, Any]:
     report_meta = REPORT_CODE_METADATA.get(item['report_code'], {})
     statement_rows = item['statement_rows']
+    highlights = _hydrate_highlights(item['highlights'])
+    filing_metadata = {
+        'rcept_no': item['rcept_no'],
+        'receipt_date': item['disclosure'].get('receipt_date'),
+        'captured_at': item.get('captured_at'),
+        'report_name': item['disclosure'].get('report_nm'),
+        'filing_category': item['filing_category'],
+    }
+    period_metadata = {
+        'business_year': item['business_year'],
+        'report_code': item['report_code'],
+        'report_label': report_meta.get('label'),
+        'period_type': item['period_type'],
+        'period_scope': report_meta.get('scope'),
+        'quarter': report_meta.get('quarter'),
+        'period_end_month': item.get('period_end_month'),
+        'period_end_date': period_end_date.isoformat() if period_end_date else None,
+    }
+    statement_metadata = {
+        'fs_div': item['fs_div'],
+        'fs_label': FS_DIV_TO_STATEMENT_TYPE.get(item['fs_div']),
+        'statement_type': item['statement_type'],
+        'currency': item.get('currency'),
+        'source_status': item.get('source_status'),
+        'source_message': item.get('source_message'),
+        'dataset': 'stored_dart_fundamentals',
+        'source_provider': 'dart',
+    }
+    disclosure_flags = classify_disclosure_event(
+        report_name=item['disclosure'].get('report_nm'),
+        remark=item['disclosure'].get('remark'),
+        filing_category=item['filing_category'],
+        is_financial_report=True,
+    )
     return {
         'filing': {
             'rcept_no': item['rcept_no'],
@@ -188,6 +227,8 @@ def _build_history_entry(item: dict[str, Any], *, period_end_date: date | None) 
             'filing_category': item['filing_category'],
             'receipt_date': item['disclosure'].get('receipt_date'),
             'captured_at': item.get('captured_at'),
+            'is_correction': disclosure_flags['is_correction'],
+            'disclosure_tags': disclosure_flags['disclosure_tags'],
         },
         'period': {
             'business_year': item['business_year'],
@@ -208,7 +249,13 @@ def _build_history_entry(item: dict[str, Any], *, period_end_date: date | None) 
             'source_message': item.get('source_message'),
             'row_count': len(statement_rows),
         },
-        'highlights': _hydrate_highlights(item['highlights']),
+        'highlights': highlights,
+        'fundamental_context': build_fundamental_context_from_highlights(
+            highlights,
+            filing_metadata=filing_metadata,
+            period_metadata=period_metadata,
+            statement_metadata=statement_metadata,
+        ),
         'statements': {
             'count': len(statement_rows),
             'items': statement_rows,

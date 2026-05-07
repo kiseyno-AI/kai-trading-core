@@ -1,6 +1,6 @@
 import unittest
 
-from app.dart.service import DartService, build_fundamentals_dataset
+from app.dart.service import DartService, build_fundamental_context_from_highlights, build_fundamentals_dataset
 
 
 class FakeDartClient:
@@ -77,6 +77,36 @@ class FakeDartClient:
                     'rcept_no': '20260311001234',
                     'reprt_code': reprt_code,
                     'bsns_year': bsns_year,
+                    'sj_div': 'BS',
+                    'sj_nm': '재무상태표',
+                    'account_id': 'ifrs-full_CurrentAssets',
+                    'account_nm': '유동자산',
+                    'thstrm_nm': '제 57 기말',
+                    'thstrm_amount': '320,000',
+                    'frmtrm_nm': '제 56 기말',
+                    'frmtrm_amount': '300,000',
+                    'ord': '2',
+                    'currency': 'KRW',
+                },
+                {
+                    'rcept_no': '20260311001234',
+                    'reprt_code': reprt_code,
+                    'bsns_year': bsns_year,
+                    'sj_div': 'BS',
+                    'sj_nm': '재무상태표',
+                    'account_id': 'ifrs-full_CashAndCashEquivalents',
+                    'account_nm': '현금및현금성자산',
+                    'thstrm_nm': '제 57 기말',
+                    'thstrm_amount': '90,000',
+                    'frmtrm_nm': '제 56 기말',
+                    'frmtrm_amount': '80,000',
+                    'ord': '3',
+                    'currency': 'KRW',
+                },
+                {
+                    'rcept_no': '20260311001234',
+                    'reprt_code': reprt_code,
+                    'bsns_year': bsns_year,
                     'sj_div': 'IS',
                     'sj_nm': '손익계산서',
                     'account_id': 'ifrs-full_Revenue',
@@ -87,7 +117,7 @@ class FakeDartClient:
                     'frmtrm_nm': '제 56 기',
                     'frmtrm_amount': '95,000',
                     'frmtrm_add_amount': '95,000',
-                    'ord': '2',
+                    'ord': '4',
                     'currency': 'KRW',
                 },
                 {
@@ -102,7 +132,7 @@ class FakeDartClient:
                     'thstrm_amount': '20,000',
                     'frmtrm_nm': '제 56 기',
                     'frmtrm_amount': '18,000',
-                    'ord': '3',
+                    'ord': '5',
                     'currency': 'KRW',
                 },
                 {
@@ -117,7 +147,7 @@ class FakeDartClient:
                     'thstrm_amount': '15,000',
                     'frmtrm_nm': '제 56 기',
                     'frmtrm_amount': '14,000',
-                    'ord': '4',
+                    'ord': '6',
                     'currency': 'KRW',
                 },
                 {
@@ -132,7 +162,22 @@ class FakeDartClient:
                     'thstrm_amount': '300,000',
                     'frmtrm_nm': '제 56 기말',
                     'frmtrm_amount': '280,000',
-                    'ord': '5',
+                    'ord': '7',
+                    'currency': 'KRW',
+                },
+                {
+                    'rcept_no': '20260311001234',
+                    'reprt_code': reprt_code,
+                    'bsns_year': bsns_year,
+                    'sj_div': 'BS',
+                    'sj_nm': '재무상태표',
+                    'account_id': 'ifrs-full_CurrentLiabilities',
+                    'account_nm': '유동부채',
+                    'thstrm_nm': '제 57 기말',
+                    'thstrm_amount': '180,000',
+                    'frmtrm_nm': '제 56 기말',
+                    'frmtrm_amount': '165,000',
+                    'ord': '8',
                     'currency': 'KRW',
                 },
                 {
@@ -147,7 +192,22 @@ class FakeDartClient:
                     'thstrm_amount': '200,000',
                     'frmtrm_nm': '제 56 기말',
                     'frmtrm_amount': '170,000',
-                    'ord': '6',
+                    'ord': '9',
+                    'currency': 'KRW',
+                },
+                {
+                    'rcept_no': '20260311001234',
+                    'reprt_code': reprt_code,
+                    'bsns_year': bsns_year,
+                    'sj_div': 'CF',
+                    'sj_nm': '현금흐름표',
+                    'account_id': 'ifrs-full_CashFlowsFromUsedInOperatingActivities',
+                    'account_nm': '영업활동순현금흐름',
+                    'thstrm_nm': '제 57 기',
+                    'thstrm_amount': '25,000',
+                    'frmtrm_nm': '제 56 기',
+                    'frmtrm_amount': '21,000',
+                    'ord': '10',
                     'currency': 'KRW',
                 },
             ],
@@ -198,11 +258,27 @@ class DartServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.financials_args['reprt_code'], '11011')
         self.assertEqual(client.financials_args['fs_div'], 'CFS')
         self.assertEqual(result['request']['dataset'], 'fnlttSinglAcntAll')
-        self.assertEqual(result['statements']['count'], 6)
+        self.assertEqual(result['statements']['count'], 10)
         self.assertEqual(result['statements']['items'][0]['current_amount'], 500000)
         self.assertEqual(result['highlights']['total_assets']['current_amount'], 500000)
         self.assertEqual(result['highlights']['revenue']['current_cumulative_amount'], 100000)
         self.assertEqual(result['highlights']['ratios']['operating_margin'], '0.2000')
+        self.assertEqual(
+            result['fundamental_context']['normalized_facts']['balance_sheet']['current_assets']['current_value'],
+            320000,
+        )
+        self.assertEqual(
+            result['fundamental_context']['analysis']['leverage_liquidity']['metrics']['current_ratio'],
+            '1.7778',
+        )
+        self.assertEqual(
+            result['fundamental_context']['analysis']['cash_flow_quality']['metrics']['operating_cash_flow_to_net_income'],
+            '1.6667',
+        )
+        self.assertEqual(
+            result['fundamental_context']['normalized_facts']['cash_flow_statement']['investing_cash_flow']['status'],
+            'missing',
+        )
 
     async def test_fundamentals_keeps_period_and_statement_type_usability(self):
         client = FakeDartClient()
@@ -415,6 +491,93 @@ class DartServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(dataset['highlights']['total_equity']['statement_type'], 'BS')
         self.assertEqual(dataset['highlights']['total_equity']['current_amount'], 307554)
+
+    def test_build_fundamentals_dataset_handles_missing_accounts_gracefully_in_context(self):
+        dataset = build_fundamentals_dataset(
+            {
+                'list': [
+                    {
+                        'rcept_no': '20260407000004',
+                        'reprt_code': '11011',
+                        'bsns_year': '2024',
+                        'sj_div': 'IS',
+                        'sj_nm': '손익계산서',
+                        'account_id': 'ifrs-full_Revenue',
+                        'account_nm': '매출액',
+                        'thstrm_amount': '1000',
+                        'ord': '1',
+                        'currency': 'KRW',
+                    },
+                    {
+                        'rcept_no': '20260407000004',
+                        'reprt_code': '11011',
+                        'bsns_year': '2024',
+                        'sj_div': 'BS',
+                        'sj_nm': '재무상태표',
+                        'account_id': 'ifrs-full_Liabilities',
+                        'account_nm': '부채총계',
+                        'thstrm_amount': '500',
+                        'ord': '2',
+                        'currency': 'KRW',
+                    },
+                ],
+            }
+        )
+
+        context = dataset['highlights']
+        self.assertIsNone(context['ratios']['operating_margin'])
+        fundamental_context = build_fundamental_context_from_highlights(context)
+
+        self.assertEqual(
+            fundamental_context['normalized_facts']['balance_sheet']['total_assets']['status'],
+            'missing',
+        )
+        self.assertEqual(fundamental_context['analysis']['profitability']['status'], 'missing')
+        self.assertIn(
+            'balance_sheet.total_assets',
+            fundamental_context['coverage']['missing_fact_keys'],
+        )
+
+    def test_build_fundamental_context_treats_hydrated_null_account_highlights_as_missing(self):
+        fundamental_context = build_fundamental_context_from_highlights(
+            {
+                'revenue': {
+                    'statement_type': 'IS',
+                    'statement_name': '손익계산서',
+                    'account_id': 'ifrs-full_Revenue',
+                    'account_name': '매출액',
+                    'current_amount': 1000,
+                    'current_cumulative_amount': 1000,
+                    'prior_amount': 900,
+                    'prior_cumulative_amount': 900,
+                    'pre_prior_amount': None,
+                    'currency': 'KRW',
+                },
+                'inventories': {
+                    'statement_type': None,
+                    'statement_name': None,
+                    'account_id': None,
+                    'account_name': None,
+                    'current_amount': None,
+                    'current_cumulative_amount': None,
+                    'prior_amount': None,
+                    'prior_cumulative_amount': None,
+                    'pre_prior_amount': None,
+                    'currency': None,
+                },
+                'ratios': {},
+            }
+        )
+
+        self.assertEqual(
+            fundamental_context['normalized_facts']['balance_sheet']['inventories']['status'],
+            'missing',
+        )
+        self.assertEqual(fundamental_context['coverage']['mapped_fact_count'], 1)
+        self.assertIn(
+            'balance_sheet.inventories',
+            fundamental_context['coverage']['missing_fact_keys'],
+        )
 
 
 if __name__ == '__main__':

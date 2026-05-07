@@ -21,7 +21,12 @@ from app.db_models import (
     Symbol,
 )
 from app.dart.fundamentals_store import DartFundamentalsRepository, dart_fundamentals_repository
-from app.dart.service import FS_DIV_TO_STATEMENT_TYPE, REPORT_CODE_METADATA
+from app.dart.service import (
+    FS_DIV_TO_STATEMENT_TYPE,
+    REPORT_CODE_METADATA,
+    build_fundamental_context_from_highlights,
+    classify_disclosure_event,
+)
 from app.dart.store import DartSyncRepository, dart_sync_repository
 from app.eod.pykrx_enrichment import pykrx_enrichment_service
 from app.market_data_store import (
@@ -355,6 +360,40 @@ def _build_fundamentals_snapshot(item: dict[str, Any], *, period_end_date: date 
     report_meta = REPORT_CODE_METADATA.get(item['report_code'], {})
     statement_rows = item.get('statement_rows') or []
     statement_row_count = item.get('statement_row_count')
+    highlights = _summarize_highlights(item.get('highlights') or [])
+    filing_metadata = {
+        'rcept_no': item['rcept_no'],
+        'receipt_date': item['disclosure'].get('receipt_date'),
+        'captured_at': item.get('captured_at'),
+        'report_name': item['disclosure'].get('report_nm'),
+        'filing_category': item['filing_category'],
+    }
+    period_metadata = {
+        'business_year': item['business_year'],
+        'report_code': item['report_code'],
+        'report_label': report_meta.get('label'),
+        'period_type': item['period_type'],
+        'period_scope': report_meta.get('scope'),
+        'quarter': report_meta.get('quarter'),
+        'period_end_month': item.get('period_end_month'),
+        'period_end_date': period_end_date.isoformat() if period_end_date else None,
+    }
+    statement_metadata = {
+        'fs_div': item['fs_div'],
+        'fs_label': FS_DIV_TO_STATEMENT_TYPE.get(item['fs_div']),
+        'statement_type': item['statement_type'],
+        'currency': item.get('currency'),
+        'source_status': item.get('source_status'),
+        'source_message': item.get('source_message'),
+        'dataset': 'stored_dart_fundamentals',
+        'source_provider': 'dart',
+    }
+    disclosure_flags = classify_disclosure_event(
+        report_name=item['disclosure'].get('report_nm'),
+        remark=item['disclosure'].get('remark'),
+        filing_category=item['filing_category'],
+        is_financial_report=True,
+    )
     return {
         'filing': {
             'rcept_no': item['rcept_no'],
@@ -362,6 +401,8 @@ def _build_fundamentals_snapshot(item: dict[str, Any], *, period_end_date: date 
             'filing_category': item['filing_category'],
             'receipt_date': item['disclosure'].get('receipt_date'),
             'captured_at': item.get('captured_at'),
+            'is_correction': disclosure_flags['is_correction'],
+            'disclosure_tags': disclosure_flags['disclosure_tags'],
         },
         'period': {
             'business_year': item['business_year'],
@@ -382,7 +423,13 @@ def _build_fundamentals_snapshot(item: dict[str, Any], *, period_end_date: date 
             'source_message': item.get('source_message'),
             'row_count': statement_row_count if statement_row_count is not None else len(statement_rows),
         },
-        'highlights': _summarize_highlights(item.get('highlights') or []),
+        'highlights': highlights,
+        'fundamental_context': build_fundamental_context_from_highlights(
+            highlights,
+            filing_metadata=filing_metadata,
+            period_metadata=period_metadata,
+            statement_metadata=statement_metadata,
+        ),
     }
 
 
@@ -456,6 +503,12 @@ def _build_fundamentals_summary(items: list[dict[str, Any]], *, market_date: dat
 
 
 def _serialize_disclosure(item: dict[str, Any]) -> dict[str, Any]:
+    disclosure_flags = classify_disclosure_event(
+        report_name=item.get('report_nm'),
+        remark=item.get('remark'),
+        filing_category=item.get('filing_category'),
+        is_financial_report=item.get('is_financial_report'),
+    )
     return {
         'rcept_no': item['rcept_no'],
         'corp_code': item['corp_code'],
@@ -466,6 +519,59 @@ def _serialize_disclosure(item: dict[str, Any]) -> dict[str, Any]:
         'receipt_date': item['receipt_date'],
         'remark': item['remark'],
         'fundamentals_capture_status': item['fundamentals_capture_status'],
+        'is_correction': item.get('is_correction', disclosure_flags['is_correction']),
+        'is_ownership_related': item.get('is_ownership_related', disclosure_flags['is_ownership_related']),
+        'is_large_holder_related': item.get('is_large_holder_related', disclosure_flags['is_large_holder_related']),
+        'is_audit_related': item.get('is_audit_related', disclosure_flags['is_audit_related']),
+        'disclosure_tags': item.get('disclosure_tags', disclosure_flags['disclosure_tags']),
+    }
+
+
+def _build_disclosure_context(
+    *,
+    disclosures: list[dict[str, Any]],
+    latest_snapshot: dict[str, Any] | None,
+) -> dict[str, Any]:
+    snapshot_rcept_no = None
+    if isinstance(latest_snapshot, dict):
+        snapshot_rcept_no = ((latest_snapshot.get('filing') or {}).get('rcept_no') or '').strip() or None
+
+    financial_reports = [item for item in disclosures if item.get('is_financial_report')]
+    corrections = [item for item in disclosures if item.get('is_correction')]
+    ownership_related = [item for item in disclosures if item.get('is_ownership_related')]
+    large_holder_related = [item for item in disclosures if item.get('is_large_holder_related')]
+    audit_related = [item for item in disclosures if item.get('is_audit_related')]
+    linked_snapshot_disclosure = next(
+        (item for item in disclosures if snapshot_rcept_no and item.get('rcept_no') == snapshot_rcept_no),
+        None,
+    )
+    newer_financial_reports = [
+        item
+        for item in financial_reports
+        if snapshot_rcept_no is not None and item.get('rcept_no') != snapshot_rcept_no
+    ]
+    return {
+        'summary': {
+            'recent_disclosure_count': len(disclosures),
+            'financial_report_count': len(financial_reports),
+            'correction_count': len(corrections),
+            'ownership_related_count': len(ownership_related),
+            'large_holder_related_count': len(large_holder_related),
+            'audit_related_count': len(audit_related),
+            'newer_financial_report_count': len(newer_financial_reports),
+        },
+        'latest_snapshot_relation': {
+            'snapshot_rcept_no': snapshot_rcept_no,
+            'linked_recent_disclosure_rcept_no': linked_snapshot_disclosure.get('rcept_no') if linked_snapshot_disclosure else None,
+            'has_linked_recent_disclosure': linked_snapshot_disclosure is not None,
+        },
+        'recent_corrections': corrections[:3],
+        'recent_ownership_large_holder_changes': [
+            item
+            for item in disclosures
+            if item.get('is_ownership_related') or item.get('is_large_holder_related')
+        ][:3],
+        'recent_financial_reports': financial_reports[:3],
     }
 
 
@@ -1724,6 +1830,10 @@ class AgentContextReadService:
             recent_disclosures = [
                 _serialize_disclosure(item) for item in disclosures_by_symbol.get(symbol, [])
             ]
+            disclosure_context = _build_disclosure_context(
+                disclosures=recent_disclosures,
+                latest_snapshot=fundamentals.get('latest_snapshot'),
+            )
             quote_context_provenance = _build_quote_freshness_provenance(
                 row=raw_quote_row,
                 requested_market_date=normalized_market_date,
@@ -1830,9 +1940,18 @@ class AgentContextReadService:
                 }
             fundamentals = {
                 **fundamentals,
+                'disclosure_context': disclosure_context,
                 'freshness_provenance': fundamentals_provenance,
             }
             if isinstance(fundamentals.get('latest_snapshot'), dict):
+                if isinstance(fundamentals['latest_snapshot'].get('fundamental_context'), dict):
+                    fundamentals['latest_snapshot']['fundamental_context'] = {
+                        **fundamentals['latest_snapshot']['fundamental_context'],
+                        'source_provenance': {
+                            **(fundamentals['latest_snapshot']['fundamental_context'].get('source_provenance') or {}),
+                            'freshness_provenance': fundamentals_provenance,
+                        },
+                    }
                 fundamentals['latest_snapshot'] = {
                     **fundamentals['latest_snapshot'],
                     'freshness_provenance': fundamentals_provenance,

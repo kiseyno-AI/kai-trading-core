@@ -46,8 +46,9 @@ STATEMENT_TYPE_TO_FS_DIV = {
     'separate': 'OFS',
 }
 
-HIGHLIGHT_ACCOUNT_MATCHERS = {
+CANONICAL_FACT_MATCHERS: dict[str, dict[str, Any]] = {
     'revenue': {
+        'section': 'income_statement',
         'statement_types': {'IS', 'CIS'},
         'account_ids': {
             'ifrs-full_Revenue',
@@ -66,9 +67,7 @@ HIGHLIGHT_ACCOUNT_MATCHERS = {
             '순이자손익',
             '보험영업수익',
         },
-        'account_name_contains': {
-            '수익(매출액)',
-        },
+        'account_name_contains': {'수익(매출액)'},
         'account_name_excludes': {
             '매출원가',
             '매출총이익',
@@ -78,7 +77,21 @@ HIGHLIGHT_ACCOUNT_MATCHERS = {
             '기타영업수익',
         },
     },
+    'gross_profit': {
+        'section': 'income_statement',
+        'statement_types': {'IS', 'CIS'},
+        'account_ids': {
+            'ifrs-full_GrossProfit',
+            'ifrs_GrossProfit',
+        },
+        'account_names': {
+            '매출총이익',
+            '매출총손실',
+            'Gross profit',
+        },
+    },
     'operating_income': {
+        'section': 'income_statement',
         'statement_types': {'IS', 'CIS'},
         'account_ids': {
             'dart_OperatingIncomeLoss',
@@ -87,31 +100,90 @@ HIGHLIGHT_ACCOUNT_MATCHERS = {
         },
         'account_names': {'영업이익', '영업손실', '영업이익(손실)', '영업손익', 'Operating income'},
     },
+    'profit_before_tax': {
+        'section': 'income_statement',
+        'statement_types': {'IS', 'CIS'},
+        'account_ids': {
+            'ifrs-full_ProfitLossBeforeTax',
+            'ifrs_ProfitLossBeforeTax',
+        },
+        'account_names': {
+            '법인세비용차감전순이익',
+            '법인세비용차감전순손실',
+            '법인세비용차감전순이익(손실)',
+            '세전이익',
+            '세전손익',
+            'Profit before tax',
+        },
+    },
     'net_income': {
+        'section': 'income_statement',
         'statement_types': {'IS', 'CIS'},
         'account_ids': {
             'ifrs-full_ProfitLoss',
             'ifrs_ProfitLoss',
             'ifrs-full_ProfitLossAttributableToOwnersOfParent',
         },
-        'account_names': {'당기순이익', '당기순손실', '분기순이익', '반기순이익', 'Profit (loss)', '당기순이익(손실)'},
+        'account_names': {
+            '당기순이익',
+            '당기순손실',
+            '분기순이익',
+            '반기순이익',
+            'Profit (loss)',
+            '당기순이익(손실)',
+        },
     },
     'total_assets': {
+        'section': 'balance_sheet',
         'statement_types': {'BS'},
         'account_ids': {'ifrs-full_Assets', 'ifrs_Assets'},
         'account_names': {'자산총계', 'Assets'},
     },
+    'current_assets': {
+        'section': 'balance_sheet',
+        'statement_types': {'BS'},
+        'account_ids': {'ifrs-full_CurrentAssets', 'ifrs_CurrentAssets'},
+        'account_names': {'유동자산', 'Current assets'},
+    },
+    'cash_and_cash_equivalents': {
+        'section': 'balance_sheet',
+        'statement_types': {'BS'},
+        'account_ids': {
+            'ifrs-full_CashAndCashEquivalents',
+            'ifrs_CashAndCashEquivalents',
+        },
+        'account_names': {
+            '현금및현금성자산',
+            '현금및현금성자산(유동)',
+            'Cash and cash equivalents',
+        },
+    },
+    'inventories': {
+        'section': 'balance_sheet',
+        'statement_types': {'BS'},
+        'account_ids': {'ifrs-full_Inventories', 'ifrs_Inventories'},
+        'account_names': {'재고자산', 'Inventories'},
+    },
     'total_liabilities': {
+        'section': 'balance_sheet',
         'statement_types': {'BS'},
         'account_ids': {'ifrs-full_Liabilities', 'ifrs_Liabilities'},
         'account_names': {'부채총계', 'Liabilities'},
     },
+    'current_liabilities': {
+        'section': 'balance_sheet',
+        'statement_types': {'BS'},
+        'account_ids': {'ifrs-full_CurrentLiabilities', 'ifrs_CurrentLiabilities'},
+        'account_names': {'유동부채', 'Current liabilities'},
+    },
     'total_equity': {
+        'section': 'balance_sheet',
         'statement_types': {'BS'},
         'account_ids': {'ifrs-full_Equity', 'ifrs_Equity'},
         'account_names': {'자본총계', 'Equity'},
     },
     'operating_cash_flow': {
+        'section': 'cash_flow_statement',
         'statement_types': {'CF'},
         'account_ids': {
             'ifrs-full_CashFlowsFromUsedInOperatingActivities',
@@ -124,7 +196,88 @@ HIGHLIGHT_ACCOUNT_MATCHERS = {
             'Cash flows from operating activities',
         },
     },
+    'investing_cash_flow': {
+        'section': 'cash_flow_statement',
+        'statement_types': {'CF'},
+        'account_ids': {
+            'ifrs-full_CashFlowsFromUsedInInvestingActivities',
+            'ifrs-full_NetCashFlowsFromUsedInInvestingActivities',
+        },
+        'account_names': {
+            '투자활동으로 인한 현금흐름',
+            '투자활동현금흐름',
+            '투자활동순현금흐름',
+            'Cash flows from investing activities',
+        },
+    },
+    'financing_cash_flow': {
+        'section': 'cash_flow_statement',
+        'statement_types': {'CF'},
+        'account_ids': {
+            'ifrs-full_CashFlowsFromUsedInFinancingActivities',
+            'ifrs-full_NetCashFlowsFromUsedInFinancingActivities',
+        },
+        'account_names': {
+            '재무활동으로 인한 현금흐름',
+            '재무활동현금흐름',
+            '재무활동순현금흐름',
+            'Cash flows from financing activities',
+        },
+    },
 }
+
+CANONICAL_FACT_KEYS_BY_SECTION: dict[str, tuple[str, ...]] = {
+    'balance_sheet': (
+        'total_assets',
+        'current_assets',
+        'cash_and_cash_equivalents',
+        'inventories',
+        'total_liabilities',
+        'current_liabilities',
+        'total_equity',
+    ),
+    'income_statement': (
+        'revenue',
+        'gross_profit',
+        'operating_income',
+        'profit_before_tax',
+        'net_income',
+    ),
+    'cash_flow_statement': (
+        'operating_cash_flow',
+        'investing_cash_flow',
+        'financing_cash_flow',
+    ),
+}
+
+DISCLOSURE_CORRECTION_REPORT_TOKENS = (
+    '[기재정정]',
+    '[첨부정정]',
+    '[정정]',
+    '기재정정',
+    '첨부정정',
+    '정정',
+)
+DISCLOSURE_CORRECTION_REMARK_TOKENS = {'정', '정정', '기재정정', '첨부정정'}
+DISCLOSURE_OWNERSHIP_TOKENS = (
+    '대량보유',
+    '주식등의 대량보유',
+    '최대주주',
+    '주요주주',
+    '임원ㆍ주요주주',
+    '소유주식',
+    '지분',
+    '보유상황',
+)
+DISCLOSURE_LARGE_HOLDER_TOKENS = (
+    '대량보유',
+    '5%',
+    '주요주주',
+)
+DISCLOSURE_AUDIT_TOKENS = (
+    '감사보고서',
+    '검토보고서',
+)
 
 _MATCH_NORMALIZATION_PATTERN = re.compile(r'[\s\-\_\(\)\[\]\{\}/\\,.:;]+')
 
@@ -223,6 +376,36 @@ class DartService:
             fs_div=resolved_fs_div,
         )
         dataset = build_fundamentals_dataset(statements)
+        filing_metadata = {
+            'rcept_no': next(
+                (item.get('receipt_number') for item in dataset['items'] if item.get('receipt_number')),
+                None,
+            ),
+            'receipt_date': None,
+            'captured_at': None,
+            'report_name': report_meta['label'],
+            'filing_category': report_meta['label'],
+        }
+        period_metadata = {
+            'business_year': business_year,
+            'report_code': resolved_report_code,
+            'report_label': report_meta['label'],
+            'period_type': report_meta['period'],
+            'period_scope': report_meta['scope'],
+            'quarter': report_meta['quarter'],
+            'period_end_month': None,
+            'period_end_date': None,
+        }
+        statement_metadata = {
+            'fs_div': resolved_fs_div,
+            'fs_label': FS_DIV_TO_STATEMENT_TYPE[resolved_fs_div],
+            'statement_type': normalized_statement_type,
+            'currency': dataset['currency'],
+            'source_status': statements.get('status'),
+            'source_message': statements.get('message'),
+            'dataset': 'fnlttSinglAcntAll',
+            'source_provider': 'dart',
+        }
 
         return {
             'lookup': {
@@ -253,6 +436,12 @@ class DartService:
                 'dataset': 'fnlttSinglAcntAll',
             },
             'highlights': dataset['highlights'],
+            'fundamental_context': build_fundamental_context_from_highlights(
+                dataset['highlights'],
+                filing_metadata=filing_metadata,
+                period_metadata=period_metadata,
+                statement_metadata=statement_metadata,
+            ),
             'statements': {
                 'status': statements.get('status'),
                 'message': statements.get('message'),
@@ -368,10 +557,94 @@ class DartService:
 
 def build_fundamentals_dataset(statements: dict[str, Any]) -> dict[str, Any]:
     items = [_normalize_statement_item(item) for item in statements.get('list', [])]
+    highlights = _build_highlights(items)
     return {
         'items': items,
-        'highlights': _build_highlights(items),
+        'highlights': highlights,
         'currency': next((item['currency'] for item in items if item.get('currency')), None),
+    }
+
+
+def build_fundamental_context_from_highlights(
+    highlights: dict[str, Any],
+    *,
+    filing_metadata: dict[str, Any] | None = None,
+    period_metadata: dict[str, Any] | None = None,
+    statement_metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    normalized_facts = _build_normalized_facts_from_highlights(highlights)
+    return {
+        'normalized_facts': normalized_facts,
+        'analysis': _build_analysis_from_normalized_facts(normalized_facts),
+        'coverage': _build_normalized_fact_coverage(normalized_facts),
+        'source_provenance': {
+            'provider': (statement_metadata or {}).get('source_provider', 'dart'),
+            'dataset': (statement_metadata or {}).get('dataset', 'stored_dart_fundamentals'),
+            'rcept_no': (filing_metadata or {}).get('rcept_no'),
+            'receipt_date': (filing_metadata or {}).get('receipt_date'),
+            'captured_at': (filing_metadata or {}).get('captured_at'),
+            'report_name': (filing_metadata or {}).get('report_name'),
+            'filing_category': (filing_metadata or {}).get('filing_category'),
+            'business_year': (period_metadata or {}).get('business_year'),
+            'report_code': (period_metadata or {}).get('report_code'),
+            'report_label': (period_metadata or {}).get('report_label'),
+            'period_type': (period_metadata or {}).get('period_type'),
+            'period_scope': (period_metadata or {}).get('period_scope'),
+            'quarter': (period_metadata or {}).get('quarter'),
+            'period_end_month': (period_metadata or {}).get('period_end_month'),
+            'period_end_date': (period_metadata or {}).get('period_end_date'),
+            'fs_div': (statement_metadata or {}).get('fs_div'),
+            'fs_label': (statement_metadata or {}).get('fs_label'),
+            'statement_type': (statement_metadata or {}).get('statement_type'),
+            'currency': (statement_metadata or {}).get('currency'),
+            'source_status': (statement_metadata or {}).get('source_status'),
+            'source_message': (statement_metadata or {}).get('source_message'),
+        },
+    }
+
+
+def classify_disclosure_event(
+    *,
+    report_name: str | None,
+    remark: str | None = None,
+    filing_category: str | None = None,
+    is_financial_report: bool | None = None,
+) -> dict[str, Any]:
+    normalized_report_name = (report_name or '').strip()
+    normalized_remark = (remark or '').strip()
+    report_name_lower = normalized_report_name.lower()
+    remark_lower = normalized_remark.lower()
+    is_correction = (
+        any(token in normalized_report_name for token in DISCLOSURE_CORRECTION_REPORT_TOKENS)
+        or normalized_remark in DISCLOSURE_CORRECTION_REMARK_TOKENS
+        or any(token in remark_lower for token in ('정정', 'correction'))
+    )
+    is_ownership_related = any(token in normalized_report_name for token in DISCLOSURE_OWNERSHIP_TOKENS)
+    is_large_holder_related = any(token in normalized_report_name for token in DISCLOSURE_LARGE_HOLDER_TOKENS)
+    is_audit_related = any(token in normalized_report_name for token in DISCLOSURE_AUDIT_TOKENS)
+    tags: list[str] = []
+    if is_financial_report:
+        tags.append('financial_report')
+    if filing_category:
+        tags.append(str(filing_category))
+    if is_correction:
+        tags.append('correction')
+    if is_ownership_related:
+        tags.append('ownership_related')
+    if is_large_holder_related:
+        tags.append('large_holder_related')
+    if is_audit_related:
+        tags.append('audit_related')
+    if 'ownership_related' in tags and 'large_holder_related' in tags:
+        tags.append('ownership_large_holder_change')
+    return {
+        'is_correction': is_correction,
+        'is_ownership_related': is_ownership_related,
+        'is_large_holder_related': is_large_holder_related,
+        'is_audit_related': is_audit_related,
+        'disclosure_tags': tags,
+        'normalized_report_name': report_name_lower or None,
+        'normalized_remark': remark_lower or None,
     }
 
 
@@ -402,11 +675,45 @@ def _normalize_statement_item(item: dict[str, Any]) -> dict[str, Any]:
 
 
 def _build_highlights(items: list[dict[str, Any]]) -> dict[str, Any]:
-    highlights: dict[str, Any] = {}
-    matched_items: dict[str, dict[str, Any] | None] = {}
+    matches = _collect_fact_matches(items)
+    highlights = {
+        key: _serialize_matched_item(matches.get(key))
+        for key in CANONICAL_FACT_MATCHERS
+    }
 
-    for key, matcher in HIGHLIGHT_ACCOUNT_MATCHERS.items():
-        matched_item = _find_statement_item(
+    revenue = _fact_current_decimal(matches.get('revenue'))
+    gross_profit = _fact_current_decimal(matches.get('gross_profit'))
+    operating_income = _fact_current_decimal(matches.get('operating_income'))
+    net_income = _fact_current_decimal(matches.get('net_income'))
+    total_assets = _fact_current_decimal(matches.get('total_assets'))
+    liabilities = _fact_current_decimal(matches.get('total_liabilities'))
+    equity = _fact_current_decimal(matches.get('total_equity'))
+    current_assets = _fact_current_decimal(matches.get('current_assets'))
+    current_liabilities = _fact_current_decimal(matches.get('current_liabilities'))
+    cash = _fact_current_decimal(matches.get('cash_and_cash_equivalents'))
+    operating_cash_flow = _fact_current_decimal(matches.get('operating_cash_flow'))
+
+    highlights['ratios'] = {
+        'gross_margin': _safe_ratio(gross_profit, revenue),
+        'operating_margin': _safe_ratio(operating_income, revenue),
+        'net_margin': _safe_ratio(net_income, revenue),
+        'return_on_assets': _safe_ratio(net_income, total_assets),
+        'return_on_equity': _safe_ratio(net_income, equity),
+        'debt_ratio': _safe_ratio(liabilities, equity),
+        'liabilities_to_assets': _safe_ratio(liabilities, total_assets),
+        'current_ratio': _safe_ratio(current_assets, current_liabilities),
+        'cash_ratio': _safe_ratio(cash, current_liabilities),
+        'operating_cash_flow_to_net_income': _safe_ratio(operating_cash_flow, net_income),
+        'operating_cash_flow_to_operating_income': _safe_ratio(operating_cash_flow, operating_income),
+        'operating_cash_flow_margin': _safe_ratio(operating_cash_flow, revenue),
+    }
+    return highlights
+
+
+def _collect_fact_matches(items: list[dict[str, Any]]) -> dict[str, dict[str, Any] | None]:
+    matches: dict[str, dict[str, Any] | None] = {}
+    for key, matcher in CANONICAL_FACT_MATCHERS.items():
+        matches[key] = _find_statement_item(
             items,
             statement_types=matcher.get('statement_types'),
             account_ids=matcher['account_ids'],
@@ -414,36 +721,231 @@ def _build_highlights(items: list[dict[str, Any]]) -> dict[str, Any]:
             account_name_contains=matcher.get('account_name_contains'),
             account_name_excludes=matcher.get('account_name_excludes'),
         )
-        matched_items[key] = matched_item
-        if matched_item is None:
-            highlights[key] = None
-            continue
+    return matches
 
-        highlights[key] = {
-            'statement_type': matched_item.get('statement_type'),
-            'statement_name': matched_item.get('statement_name'),
-            'account_id': matched_item.get('account_id'),
-            'account_name': matched_item.get('account_name'),
-            'current_amount': matched_item.get('current_amount'),
-            'current_cumulative_amount': matched_item.get('current_cumulative_amount'),
-            'prior_amount': matched_item.get('prior_amount'),
-            'prior_cumulative_amount': matched_item.get('prior_cumulative_amount'),
-            'pre_prior_amount': matched_item.get('pre_prior_amount'),
-            'currency': matched_item.get('currency'),
+
+def _serialize_matched_item(item: dict[str, Any] | None) -> dict[str, Any] | None:
+    if item is None:
+        return None
+    return {
+        'statement_type': item.get('statement_type'),
+        'statement_name': item.get('statement_name'),
+        'account_id': item.get('account_id'),
+        'account_name': item.get('account_name'),
+        'current_amount': item.get('current_amount'),
+        'current_cumulative_amount': item.get('current_cumulative_amount'),
+        'prior_amount': item.get('prior_amount'),
+        'prior_cumulative_amount': item.get('prior_cumulative_amount'),
+        'pre_prior_amount': item.get('pre_prior_amount'),
+        'currency': item.get('currency'),
+    }
+
+
+def _build_normalized_facts_from_highlights(highlights: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    blocks: dict[str, dict[str, Any]] = {}
+    for section, fact_keys in CANONICAL_FACT_KEYS_BY_SECTION.items():
+        blocks[section] = {
+            fact_key: _build_fact_snapshot(
+                fact_key,
+                highlights.get(fact_key),
+            )
+            for fact_key in fact_keys
+        }
+    return blocks
+
+
+def _build_fact_snapshot(fact_key: str, highlight: dict[str, Any] | None) -> dict[str, Any]:
+    if _is_missing_highlight(highlight):
+        return {
+            'status': 'missing',
+            'statement_types': sorted(CANONICAL_FACT_MATCHERS[fact_key].get('statement_types') or []),
+            'account_id': None,
+            'account_name': None,
+            'current_value': None,
+            'current_value_basis': None,
+            'prior_value': None,
+            'prior_value_basis': None,
+            'current_amount': None,
+            'current_cumulative_amount': None,
+            'prior_amount': None,
+            'prior_cumulative_amount': None,
+            'pre_prior_amount': None,
+            'currency': None,
         }
 
-    revenue = _to_decimal((matched_items.get('revenue') or {}).get('current_amount'))
-    operating_income = _to_decimal((matched_items.get('operating_income') or {}).get('current_amount'))
-    net_income = _to_decimal((matched_items.get('net_income') or {}).get('current_amount'))
-    liabilities = _to_decimal((matched_items.get('total_liabilities') or {}).get('current_amount'))
-    equity = _to_decimal((matched_items.get('total_equity') or {}).get('current_amount'))
-
-    highlights['ratios'] = {
-        'operating_margin': _safe_ratio(operating_income, revenue),
-        'net_margin': _safe_ratio(net_income, revenue),
-        'debt_ratio': _safe_ratio(liabilities, equity),
+    current_value, current_basis = _resolve_highlight_value(highlight, current=True)
+    prior_value, prior_basis = _resolve_highlight_value(highlight, current=False)
+    return {
+        'status': 'available',
+        'statement_types': sorted(CANONICAL_FACT_MATCHERS[fact_key].get('statement_types') or []),
+        'statement_type': highlight.get('statement_type'),
+        'statement_name': highlight.get('statement_name'),
+        'account_id': highlight.get('account_id'),
+        'account_name': highlight.get('account_name'),
+        'current_value': current_value,
+        'current_value_basis': current_basis,
+        'prior_value': prior_value,
+        'prior_value_basis': prior_basis,
+        'current_amount': highlight.get('current_amount'),
+        'current_cumulative_amount': highlight.get('current_cumulative_amount'),
+        'prior_amount': highlight.get('prior_amount'),
+        'prior_cumulative_amount': highlight.get('prior_cumulative_amount'),
+        'pre_prior_amount': highlight.get('pre_prior_amount'),
+        'currency': highlight.get('currency'),
     }
-    return highlights
+
+
+def _is_missing_highlight(highlight: dict[str, Any] | None) -> bool:
+    if not isinstance(highlight, dict):
+        return True
+
+    account_id = highlight.get('account_id')
+    if isinstance(account_id, str):
+        account_id = account_id.strip()
+    account_name = highlight.get('account_name')
+    if isinstance(account_name, str):
+        account_name = account_name.strip()
+    if account_id or account_name:
+        return False
+
+    current_value, _current_basis = _resolve_highlight_value(highlight, current=True)
+    prior_value, _prior_basis = _resolve_highlight_value(highlight, current=False)
+    return current_value is None and prior_value is None and highlight.get('pre_prior_amount') is None
+
+
+def _resolve_highlight_value(highlight: dict[str, Any], *, current: bool) -> tuple[int | None, str | None]:
+    statement_type = str(highlight.get('statement_type') or '').strip().upper()
+    if current:
+        cumulative_key = 'current_cumulative_amount'
+        amount_key = 'current_amount'
+    else:
+        cumulative_key = 'prior_cumulative_amount'
+        amount_key = 'prior_amount'
+
+    if statement_type in {'IS', 'CIS', 'CF'} and highlight.get(cumulative_key) is not None:
+        return highlight.get(cumulative_key), cumulative_key
+    if highlight.get(amount_key) is not None:
+        return highlight.get(amount_key), amount_key
+    return highlight.get(cumulative_key), cumulative_key if highlight.get(cumulative_key) is not None else None
+
+
+def _build_analysis_from_normalized_facts(normalized_facts: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    profitability_metrics, profitability_missing = _build_metric_values(
+        {
+            'gross_margin': ('gross_profit', 'revenue'),
+            'operating_margin': ('operating_income', 'revenue'),
+            'net_margin': ('net_income', 'revenue'),
+            'return_on_assets': ('net_income', 'total_assets'),
+            'return_on_equity': ('net_income', 'total_equity'),
+        },
+        normalized_facts,
+    )
+    leverage_liquidity_metrics, leverage_liquidity_missing = _build_metric_values(
+        {
+            'debt_to_equity': ('total_liabilities', 'total_equity'),
+            'liabilities_to_assets': ('total_liabilities', 'total_assets'),
+            'current_ratio': ('current_assets', 'current_liabilities'),
+            'cash_ratio': ('cash_and_cash_equivalents', 'current_liabilities'),
+        },
+        normalized_facts,
+    )
+    cash_flow_quality_metrics, cash_flow_quality_missing = _build_metric_values(
+        {
+            'operating_cash_flow_to_net_income': ('operating_cash_flow', 'net_income'),
+            'operating_cash_flow_to_operating_income': ('operating_cash_flow', 'operating_income'),
+            'operating_cash_flow_margin': ('operating_cash_flow', 'revenue'),
+        },
+        normalized_facts,
+    )
+    return {
+        'profitability': _build_metric_section(
+            metrics=profitability_metrics,
+            missing_inputs=profitability_missing,
+        ),
+        'leverage_liquidity': _build_metric_section(
+            metrics=leverage_liquidity_metrics,
+            missing_inputs=leverage_liquidity_missing,
+        ),
+        'cash_flow_quality': _build_metric_section(
+            metrics=cash_flow_quality_metrics,
+            missing_inputs=cash_flow_quality_missing,
+        ),
+    }
+
+
+def _build_metric_values(
+    metric_pairs: dict[str, tuple[str, str]],
+    normalized_facts: dict[str, dict[str, Any]],
+) -> tuple[dict[str, str | None], list[str]]:
+    metrics: dict[str, str | None] = {}
+    missing_inputs: set[str] = set()
+    for metric_name, (numerator_key, denominator_key) in metric_pairs.items():
+        numerator = _normalized_fact_decimal(normalized_facts, numerator_key)
+        denominator = _normalized_fact_decimal(normalized_facts, denominator_key)
+        if numerator is None:
+            missing_inputs.add(numerator_key)
+        if denominator in (None, Decimal('0')):
+            missing_inputs.add(denominator_key)
+        metrics[metric_name] = _safe_ratio(numerator, denominator)
+    return metrics, sorted(missing_inputs)
+
+
+def _build_metric_section(
+    *,
+    metrics: dict[str, str | None],
+    missing_inputs: list[str],
+) -> dict[str, Any]:
+    available_metric_count = sum(1 for value in metrics.values() if value is not None)
+    if available_metric_count == 0:
+        status = 'missing'
+    elif available_metric_count == len(metrics) and not missing_inputs:
+        status = 'available'
+    else:
+        status = 'partial'
+    return {
+        'status': status,
+        'metrics': metrics,
+        'available_metric_count': available_metric_count,
+        'metric_count': len(metrics),
+        'missing_inputs': missing_inputs,
+    }
+
+
+def _build_normalized_fact_coverage(normalized_facts: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    missing_fact_keys: list[str] = []
+    mapped_fact_count = 0
+    for section, facts in normalized_facts.items():
+        for fact_key, fact_snapshot in facts.items():
+            if fact_snapshot.get('status') == 'available':
+                mapped_fact_count += 1
+                continue
+            missing_fact_keys.append(f'{section}.{fact_key}')
+    total_fact_count = sum(len(facts) for facts in normalized_facts.values())
+    return {
+        'mapped_fact_count': mapped_fact_count,
+        'total_fact_count': total_fact_count,
+        'missing_fact_count': total_fact_count - mapped_fact_count,
+        'missing_fact_keys': missing_fact_keys,
+    }
+
+
+def _normalized_fact_decimal(
+    normalized_facts: dict[str, dict[str, Any]],
+    fact_key: str,
+) -> Decimal | None:
+    for facts in normalized_facts.values():
+        fact_snapshot = facts.get(fact_key)
+        if fact_snapshot is None:
+            continue
+        return _to_decimal(fact_snapshot.get('current_value'))
+    return None
+
+
+def _fact_current_decimal(item: dict[str, Any] | None) -> Decimal | None:
+    if item is None:
+        return None
+    value, _value_basis = _resolve_highlight_value(item, current=True)
+    return _to_decimal(value)
 
 
 def _find_statement_item(
