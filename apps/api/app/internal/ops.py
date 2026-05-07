@@ -30,6 +30,7 @@ from app.eod.daily_pipeline_stages import daily_pipeline_stage_service
 from app.eod.master import refresh_master_if_due
 from app.eod.master_state import master_refresh_state
 from app.eod.pykrx_backfill import DEFAULT_MARKETS, PYKRX_BACKFILL_SERVICE
+from app.eod.pykrx_enrichment import pykrx_enrichment_service
 from app.eod.state import job_state
 from app.eod.technical_snapshots import daily_technical_snapshot_service
 from app.market.clock import get_market_state
@@ -134,6 +135,46 @@ def backfill_pykrx_daily_bar_fundamentals(
         markets=parsed_markets or DEFAULT_MARKETS,
         limit=limit,
         symbol=symbol,
+    )
+
+
+def collect_pykrx_enrichment(
+    *,
+    market_date: str,
+    markets: str | None = None,
+    symbols: str | None = None,
+    categories: str | None = None,
+) -> dict[str, Any]:
+    bootstrap_runtime()
+    parsed_markets = [item.strip().upper() for item in (markets or settings.eod_auto_pykrx_markets).split(',') if item.strip()]
+    parsed_symbols = [item.strip() for item in symbols.split(',') if item.strip()] if symbols else None
+    parsed_categories = [item.strip() for item in categories.split(',') if item.strip()] if categories else None
+    return pykrx_enrichment_service.collect_for_market_date(
+        market_date=market_date,
+        markets=parsed_markets or list(DEFAULT_MARKETS),
+        symbols=parsed_symbols,
+        categories=parsed_categories,
+    )
+
+
+def inspect_pykrx_enrichment(
+    *,
+    market_date: str,
+    markets: str | None = None,
+    symbols: str | None = None,
+    categories: str | None = None,
+    limit: int = 200,
+) -> dict[str, Any]:
+    bootstrap_runtime()
+    parsed_markets = [item.strip().upper() for item in markets.split(',') if item.strip()] if markets else None
+    parsed_symbols = [item.strip() for item in symbols.split(',') if item.strip()] if symbols else None
+    parsed_categories = [item.strip() for item in categories.split(',') if item.strip()] if categories else None
+    return pykrx_enrichment_service.inspect(
+        market_date=market_date,
+        markets=parsed_markets,
+        symbols=parsed_symbols,
+        categories=parsed_categories,
+        limit=limit,
     )
 
 
@@ -681,6 +722,25 @@ def _build_parser() -> argparse.ArgumentParser:
     pykrx_fundamentals_backfill_parser.add_argument('--limit', type=int)
     pykrx_fundamentals_backfill_parser.add_argument('--symbol')
 
+    pykrx_enrichment_collect_parser = subparsers.add_parser(
+        'eod-pykrx-enrichment-collect',
+        help='Collect persisted PyKRX enrichment rows for one market date without live broker credentials',
+    )
+    pykrx_enrichment_collect_parser.add_argument('--market-date', required=True)
+    pykrx_enrichment_collect_parser.add_argument('--markets')
+    pykrx_enrichment_collect_parser.add_argument('--symbols')
+    pykrx_enrichment_collect_parser.add_argument('--categories')
+
+    pykrx_enrichment_inspect_parser = subparsers.add_parser(
+        'eod-pykrx-enrichment-inspect',
+        help='Inspect persisted PyKRX enrichment rows and per-category coverage for one market date',
+    )
+    pykrx_enrichment_inspect_parser.add_argument('--market-date', required=True)
+    pykrx_enrichment_inspect_parser.add_argument('--markets')
+    pykrx_enrichment_inspect_parser.add_argument('--symbols')
+    pykrx_enrichment_inspect_parser.add_argument('--categories')
+    pykrx_enrichment_inspect_parser.add_argument('--limit', type=int, default=200)
+
     dart_daily_parser = subparsers.add_parser(
         'dart-fundamentals-daily-run-if-due',
         help='Run DART fundamentals daily incremental refresh directly',
@@ -952,6 +1012,21 @@ def main(argv: Iterable[str] | None = None) -> int:
             markets=args.markets,
             limit=args.limit,
             symbol=args.symbol,
+        )
+    elif args.command == 'eod-pykrx-enrichment-collect':
+        payload = collect_pykrx_enrichment(
+            market_date=args.market_date,
+            markets=args.markets,
+            symbols=args.symbols,
+            categories=args.categories,
+        )
+    elif args.command == 'eod-pykrx-enrichment-inspect':
+        payload = inspect_pykrx_enrichment(
+            market_date=args.market_date,
+            markets=args.markets,
+            symbols=args.symbols,
+            categories=args.categories,
+            limit=args.limit,
         )
     elif args.command == 'dart-fundamentals-daily-run-if-due':
         payload = run_dart_fundamentals_daily_if_due(

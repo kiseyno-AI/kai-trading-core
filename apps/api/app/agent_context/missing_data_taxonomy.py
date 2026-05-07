@@ -82,11 +82,16 @@ CATEGORY_DEFINITIONS: tuple[MissingDataCategoryDefinition, ...] = (
         key='market_sector_peer_relative',
         label='market / sector / peer relative comparison',
         status='partially_available',
-        internal_tables=('daily_market_relative_contexts', 'daily_market_participation_contexts', 'daily_price_bars'),
-        external_providers=('KRX sector/peer classification',),
+        internal_tables=(
+            'daily_market_relative_contexts',
+            'daily_market_participation_contexts',
+            'daily_price_bars',
+            'daily_pykrx_enrichment_rows',
+        ),
+        external_providers=('PyKRX sector classifications',),
         operator_hint=(
-            'Market breadth and market-relative context are derivable internally, while sector and peer mapping are '
-            'still only partially wired.'
+            'Stored market-relative context already covers breadth and percentile comparisons, and PyKRX sector rows now '
+            'persist basic peer grouping, but deeper industry or index-relative wiring is still partial.'
         ),
         keywords=(
             '시장',
@@ -162,10 +167,14 @@ CATEGORY_DEFINITIONS: tuple[MissingDataCategoryDefinition, ...] = (
     MissingDataCategoryDefinition(
         key='investor_flows_short_selling',
         label='investor flows / short-selling',
-        status='external_data_required',
-        internal_tables=(),
-        external_providers=('KIS investor flow endpoints', 'KRX short-selling statistics'),
-        operator_hint='Investor-segment flow and short-selling datasets are not currently persisted as a first-class internal table set.',
+        status='partially_available',
+        internal_tables=('daily_pykrx_enrichment_rows',),
+        external_providers=('PyKRX EOD investor flow and short-selling statistics',),
+        operator_hint=(
+            'Daily PyKRX enrichment now persists investor-flow and short-selling context without live broker '
+            'credentials, but coverage still depends on market/date availability and only the wired categories surface in '
+            'agent context today.'
+        ),
         keywords=(
             '수급',
             '투자자별',
@@ -279,7 +288,7 @@ CATEGORY_DEFINITIONS_BY_KEY = {definition.key: definition for definition in CATE
 CATEGORY_CONTEXT_PROVENANCE_PATHS: dict[str, tuple[str, ...]] = {
     'liquidity_turnover_slippage': ('quote_context', 'price_context', 'signal_features'),
     'financial_detail_quarter_cashflow': ('fundamentals',),
-    'market_sector_peer_relative': ('factor_rows.composite', 'signal_features'),
+    'market_sector_peer_relative': ('market_breadth_context', 'sector_peer_context', 'factor_rows.composite', 'signal_features'),
     'factor_score_coverage': (
         'factor_rows.unified_value',
         'factor_rows.quality',
@@ -291,6 +300,7 @@ CATEGORY_CONTEXT_PROVENANCE_PATHS: dict[str, tuple[str, ...]] = {
         'signal_features',
     ),
     'technical_evidence_support_resistance': ('price_context',),
+    'investor_flows_short_selling': ('investor_flow_context', 'short_selling_context'),
     'disclosures_news_events': ('fundamentals', 'recent_disclosures'),
     'after_hours_intraday_realtime': ('quote_context', 'signal_features'),
     'price_bar_quality_session_state': ('price_context',),

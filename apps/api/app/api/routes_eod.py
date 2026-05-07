@@ -11,6 +11,7 @@ from app.eod.freshness import eod_freshness_service
 from app.eod.master import refresh_master_if_due
 from app.eod.pipeline_status import eod_pipeline_status_service
 from app.eod.pykrx_backfill import DEFAULT_MARKETS, PYKRX_BACKFILL_SERVICE
+from app.eod.pykrx_enrichment import pykrx_enrichment_service
 from app.eod.screening_results import screening_result_read_service
 from app.eod.master_state import master_refresh_state
 from app.eod.service import EOD_SERVICE
@@ -227,6 +228,56 @@ async def run_pykrx_daily_if_due(
         )
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f'pykrx daily EOD run failed: {exc}') from exc
+
+
+@router.post('/pykrx/enrichment/collect')
+async def collect_pykrx_enrichment(
+    market_date: str,
+    markets: str = ','.join(DEFAULT_MARKETS),
+    symbols: str | None = None,
+    categories: str | None = None,
+) -> dict:
+    try:
+        parsed_markets = [item.strip().upper() for item in markets.split(',') if item.strip()]
+        parsed_symbols = [item.strip() for item in symbols.split(',') if item.strip()] if symbols else None
+        parsed_categories = [item.strip() for item in categories.split(',') if item.strip()] if categories else None
+        return await asyncio.to_thread(
+            pykrx_enrichment_service.collect_for_market_date,
+            market_date=market_date,
+            markets=parsed_markets or DEFAULT_MARKETS,
+            symbols=parsed_symbols,
+            categories=parsed_categories,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f'pykrx enrichment collect failed: {exc}') from exc
+
+
+@router.get('/pykrx/enrichment')
+async def inspect_pykrx_enrichment(
+    market_date: str,
+    markets: str | None = None,
+    symbols: str | None = None,
+    categories: str | None = None,
+    limit: int = Query(default=200, ge=1, le=20000),
+) -> dict:
+    try:
+        parsed_markets = [item.strip().upper() for item in markets.split(',') if item.strip()] if markets else None
+        parsed_symbols = [item.strip() for item in symbols.split(',') if item.strip()] if symbols else None
+        parsed_categories = [item.strip() for item in categories.split(',') if item.strip()] if categories else None
+        return await asyncio.to_thread(
+            pykrx_enrichment_service.inspect,
+            market_date=market_date,
+            markets=parsed_markets,
+            symbols=parsed_symbols,
+            categories=parsed_categories,
+            limit=limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'pykrx enrichment inspect failed: {exc}') from exc
 
 
 @router.post('/technical-snapshots/compute')

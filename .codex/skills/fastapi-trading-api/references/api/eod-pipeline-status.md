@@ -5,7 +5,7 @@ Operator-facing live status API for the post-close EOD pipeline.
 
 Canonical semantics for this route and `GET /eod/freshness` live in `docs/EOD_STATUS_SEMANTICS_CONTRACT.md`.
 
-Unlike `GET /eod/freshness`, this route focuses on in-flight work. It reports the current stage status for pykrx daily price collection, technical snapshot compute, action summary compute, stored trending-rank rebuild, and the latest DART fundamentals daily refresh run for the requested `market_date`.
+Unlike `GET /eod/freshness`, this route focuses on in-flight work. It reports the current stage status for pykrx daily price collection, persisted PyKRX enrichment coverage, technical snapshot compute, action summary compute, stored trending-rank rebuild, and the latest DART fundamentals daily refresh run for the requested `market_date`.
 
 The same payload now also reports the default-selected factor/scoring stages for that market date: `momentum_factors`, `value_factors`, `low_risk_factors`, `beta_factors`, `advanced_value_factors`, `unified_value_factors`, `quality_factors`, and `composite_factors`. Those stages are derived from stored result-row coverage, so a completed core EOD day with missing scoring rows stays `partial` instead of reading as a false completed success.
 
@@ -24,6 +24,7 @@ GET /eod/pipeline/status?market_date=2026-04-21&fs_div=CFS
   "status": "running",
   "stage_order": [
     "price_collection",
+    "pykrx_enrichment",
     "technical_snapshots",
     "action_summaries",
     "trending_ranks",
@@ -45,6 +46,21 @@ GET /eod/pipeline/status?market_date=2026-04-21&fs_div=CFS
       "failed": 0,
       "source_run_ids": {
         "eod_run_id": 184
+      }
+    },
+    "pykrx_enrichment": {
+      "status": "partial",
+      "processed": 7,
+      "total": 7,
+      "failed": 2,
+      "details": {
+        "categories": {
+          "sector_classification": {
+            "coverage_status": "complete",
+            "present_rows": 3579,
+            "expected_rows": 3579
+          }
+        }
       }
     },
     "technical_snapshots": {

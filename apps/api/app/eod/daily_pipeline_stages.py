@@ -16,6 +16,7 @@ from app.dart.fundamentals_capture_service import dart_fundamentals_capture_serv
 from app.eod.action_summaries import daily_action_summary_service
 from app.eod.master import refresh_master_if_due
 from app.eod.pykrx_backfill import DEFAULT_MARKETS, PYKRX_BACKFILL_SERVICE
+from app.eod.pykrx_enrichment import pykrx_enrichment_service
 from app.eod.technical_snapshots import daily_technical_snapshot_service
 from app.market.clock import get_market_state
 from app.market_data_store import compute_and_persist_daily_trending_ranks
@@ -65,7 +66,9 @@ FACTOR_STAGE_ORDER: tuple[str, ...] = (
 DAILY_STAGE_ORDER: tuple[str, ...] = (
     'master_refresh',
     'pykrx_universe_refresh',
-    *PYKRX_PIPELINE_STAGE_ORDER,
+    'price_collection',
+    'pykrx_enrichment',
+    *(stage_id for stage_id in PYKRX_PIPELINE_STAGE_ORDER if stage_id != 'price_collection'),
     'market_risk_snapshots',
     'fundamentals_daily_refresh',
     'piotroski_filter',
@@ -77,7 +80,9 @@ DAILY_STAGE_ORDER: tuple[str, ...] = (
 DEFAULT_DAILY_STAGE_ORDER: tuple[str, ...] = (
     'master_refresh',
     'pykrx_universe_refresh',
-    *PYKRX_PIPELINE_STAGE_ORDER,
+    'price_collection',
+    'pykrx_enrichment',
+    *(stage_id for stage_id in PYKRX_PIPELINE_STAGE_ORDER if stage_id != 'price_collection'),
     'fundamentals_daily_refresh',
     'piotroski_filter',
     *FACTOR_STAGE_ORDER,
@@ -157,6 +162,18 @@ STAGE_DEFINITIONS: dict[str, DailyStageDefinition] = {
         supports_force=True,
         inspect_routes=('/eod/pipeline/status', '/eod/pykrx/daily/run-if-due'),
         output_tables=('daily_price_bars', 'eod_collection_runs'),
+        default_selected=True,
+    ),
+    'pykrx_enrichment': DailyStageDefinition(
+        id='pykrx_enrichment',
+        label='pykrx enrichment collect',
+        group='market_data',
+        description='Persist PyKRX EOD enrichment rows for sector, breadth, investor flow, short-selling, and valuation context.',
+        depends_on=('price_collection',),
+        supports_symbols=True,
+        supports_markets=True,
+        inspect_routes=('/eod/pykrx/enrichment', '/eod/pipeline/status'),
+        output_tables=('daily_pykrx_enrichment_rows',),
         default_selected=True,
     ),
     'technical_snapshots': DailyStageDefinition(
@@ -382,10 +399,12 @@ class DailyPipelineStageService:
         self,
         *,
         pykrx_service=PYKRX_BACKFILL_SERVICE,
+        pykrx_enrichment_service_ref=pykrx_enrichment_service,
         feedback_retry_service=agent_feedback_retry_service,
         decision_loop_service=signal_decider_loop_service,
     ) -> None:
         self.pykrx_service = pykrx_service
+        self.pykrx_enrichment_service = pykrx_enrichment_service_ref
         self.feedback_retry_service = feedback_retry_service
         self.decision_loop_service = decision_loop_service
 
@@ -503,6 +522,12 @@ class DailyPipelineStageService:
                 markets=tuple(markets),
                 limit=symbol_limit,
                 deactivate_missing=symbol_limit is None,
+            )
+        if stage_id == 'pykrx_enrichment':
+            return self.pykrx_enrichment_service.collect_for_market_date(
+                market_date=market_date,
+                markets=markets,
+                symbols=symbols,
             )
         if stage_id == 'technical_snapshots':
             return daily_technical_snapshot_service.rebuild_for_market_date(

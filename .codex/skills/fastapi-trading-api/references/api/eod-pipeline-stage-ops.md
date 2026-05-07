@@ -5,7 +5,7 @@ Lists the canonical daily stage catalog and runs an explicit subset of those sta
 
 `GET /eod/pipeline/stages` returns the stable stage order, default operator sequence, dependency metadata, inspect routes, and output-table hints so operators can decide which stages to run.
 
-The default operator sequence now includes the factor/scoring stages after `fundamentals_daily_refresh` and `piotroski_filter`: `momentum_factors`, `value_factors`, `low_risk_factors`, `beta_factors`, `advanced_value_factors`, `unified_value_factors`, `quality_factors`, and `composite_factors`.
+The default operator sequence now includes `pykrx_enrichment` immediately after `price_collection`, then the factor/scoring stages after `fundamentals_daily_refresh` and `piotroski_filter`: `momentum_factors`, `value_factors`, `low_risk_factors`, `beta_factors`, `advanced_value_factors`, `unified_value_factors`, `quality_factors`, and `composite_factors`.
 
 `POST /eod/pipeline/run` accepts a stage subset, preserves canonical ordering, and delegates execution to the reusable stage operations. Callers should include any prerequisites they need; the catalog response exposes `depends_on` for inspectability.
 

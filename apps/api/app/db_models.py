@@ -1024,6 +1024,33 @@ class DailyMarketParticipationContext(Base, TimestampMixin):
     captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
+class DailyPykrxEnrichmentRow(Base, TimestampMixin):
+    __tablename__ = 'daily_pykrx_enrichment_rows'
+    __table_args__ = (
+        UniqueConstraint(
+            'market_date',
+            'category',
+            'scope_type',
+            'scope_key',
+            'source',
+            name='uq_daily_pykrx_enrichment_rows_scope',
+        ),
+        Index('ix_daily_pykrx_enrichment_rows_market_category', 'market_date', 'category'),
+        Index('ix_daily_pykrx_enrichment_rows_symbol_market_category', 'symbol_id', 'market_date', 'category'),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol_id: Mapped[int | None] = mapped_column(ForeignKey('symbols.id', ondelete='CASCADE'), index=True)
+    market_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    market: Mapped[str] = mapped_column(String(32), nullable=False, default='KRX', index=True)
+    category: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    scope_type: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    scope_key: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default='pykrx', index=True)
+    payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
 class AgentContextFeedback(Base, TimestampMixin):
     __tablename__ = 'agent_context_feedback'
     __table_args__ = (

@@ -199,6 +199,52 @@ class FakeActionSummaryService:
         }
 
 
+class FakePykrxEnrichmentService:
+    def __init__(self):
+        self.collect_args = None
+        self.inspect_args = None
+
+    def collect_for_market_date(self, **kwargs):
+        self.collect_args = kwargs
+        return {
+            'market_date': kwargs['market_date'],
+            'status': 'completed',
+            'categories_requested': kwargs.get('categories') or ['sector_classification'],
+            'coverage': {
+                'categories': {
+                    'sector_classification': {
+                        'present_rows': 1,
+                        'expected_rows': 1,
+                        'coverage_status': 'complete',
+                    }
+                }
+            },
+        }
+
+    def inspect(self, **kwargs):
+        self.inspect_args = kwargs
+        return {
+            'market_date': kwargs['market_date'],
+            'summary': {'rows_returned': 1},
+            'coverage': {
+                'categories': {
+                    'investor_flow_symbol': {
+                        'present_rows': 1,
+                        'expected_rows': 1,
+                        'coverage_status': 'complete',
+                    }
+                }
+            },
+            'items': [
+                {
+                    'symbol': '005930',
+                    'category': 'investor_flow_symbol',
+                    'payload': {'investor_groups': {'외국인': {'net_value': 1200000}}},
+                }
+            ],
+        }
+
+
 class FakeSignalFeatureService:
     def __init__(self):
         self.collect_args = None
@@ -945,11 +991,19 @@ class FakePipelineStatusService:
             'market_date': kwargs.get('market_date') or '2026-04-21',
             'fs_div': kwargs.get('fs_div') or 'CFS',
             'status': 'running',
-            'stage_order': ['price_collection', 'technical_snapshots', 'fundamentals_daily_refresh'],
+            'stage_order': ['price_collection', 'pykrx_enrichment', 'technical_snapshots', 'fundamentals_daily_refresh'],
             'stages': {
                 'price_collection': {
                     'status': 'completed',
                     'source_run_ids': {'eod_run_id': 101},
+                },
+                'pykrx_enrichment': {
+                    'status': 'partial',
+                    'details': {
+                        'categories': {
+                            'sector_classification': {'coverage_status': 'complete'}
+                        }
+                    },
                 },
                 'technical_snapshots': {
                     'status': 'running',
@@ -1130,6 +1184,68 @@ class EODRouteTests(unittest.TestCase):
         self.assertEqual(fake_service.run_args['feedback_max_cycles'], 4)
         self.assertFalse(fake_service.run_args['reuse_existing_feedback'])
         self.assertEqual(response.json()['status'], 'completed')
+
+    def test_collect_pykrx_enrichment_route_calls_service(self):
+        fake_service = FakePykrxEnrichmentService()
+        original_service = routes_eod.pykrx_enrichment_service
+        routes_eod.pykrx_enrichment_service = fake_service
+        try:
+            client = TestClient(self.app)
+            response = client.post(
+                '/eod/pykrx/enrichment/collect',
+                params={
+                    'market_date': '2026-04-21',
+                    'markets': 'KOSPI,KOSDAQ',
+                    'symbols': '005930,000660',
+                    'categories': 'sector_classification,investor_flow_symbol',
+                },
+            )
+        finally:
+            routes_eod.pykrx_enrichment_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            fake_service.collect_args,
+            {
+                'market_date': '2026-04-21',
+                'markets': ['KOSPI', 'KOSDAQ'],
+                'symbols': ['005930', '000660'],
+                'categories': ['sector_classification', 'investor_flow_symbol'],
+            },
+        )
+        self.assertEqual(response.json()['coverage']['categories']['sector_classification']['coverage_status'], 'complete')
+
+    def test_inspect_pykrx_enrichment_route_calls_service(self):
+        fake_service = FakePykrxEnrichmentService()
+        original_service = routes_eod.pykrx_enrichment_service
+        routes_eod.pykrx_enrichment_service = fake_service
+        try:
+            client = TestClient(self.app)
+            response = client.get(
+                '/eod/pykrx/enrichment',
+                params={
+                    'market_date': '2026-04-21',
+                    'markets': 'KOSPI',
+                    'symbols': '005930',
+                    'categories': 'investor_flow_symbol',
+                    'limit': 5,
+                },
+            )
+        finally:
+            routes_eod.pykrx_enrichment_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            fake_service.inspect_args,
+            {
+                'market_date': '2026-04-21',
+                'markets': ['KOSPI'],
+                'symbols': ['005930'],
+                'categories': ['investor_flow_symbol'],
+                'limit': 5,
+            },
+        )
+        self.assertEqual(response.json()['items'][0]['payload']['investor_groups']['외국인']['net_value'], 1200000)
 
     def test_compute_technical_snapshots_route_calls_service(self):
         fake_service = FakeTechnicalSnapshotService()

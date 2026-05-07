@@ -105,6 +105,9 @@ class Settings(BaseSettings):
     eod_auto_pykrx_refresh_universe: bool = True
     eod_auto_pykrx_stale_run_minutes: int = 30
     eod_pykrx_request_timeout_seconds: int = 20
+    eod_pykrx_enrichment_pause_seconds: float = 0.05
+    eod_pykrx_enrichment_retry_count: int = 2
+    eod_pykrx_enrichment_retry_backoff_seconds: float = 0.5
 
     openclaw_base_url: str = 'http://127.0.0.1:18789'
     openclaw_gateway_token: Optional[str] = None

@@ -13,6 +13,7 @@ PYKRX_STAGE_ORDER = (
 )
 STAGE_LABELS = {
     'price_collection': 'pykrx daily price collection',
+    'pykrx_enrichment': 'pykrx enrichment collect',
     'technical_snapshots': 'technical snapshot compute',
     'action_summaries': 'action summary compute',
     'trending_ranks': 'stored trending rank rebuild',
