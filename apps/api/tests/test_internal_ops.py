@@ -438,6 +438,33 @@ class InternalOpsTests(unittest.TestCase):
         )
         self.assertTrue(get_summary.call_args.kwargs['persist_missing_categories'])
 
+    def test_cli_agent_feedback_data_gap_quality_report_alias_outputs_json(self) -> None:
+        stdout = io.StringIO()
+        with (
+            patch(
+                'app.internal.ops.get_agent_feedback_data_gap_summary',
+                return_value={'summary': {'duplicate_note_rate': 0.25}},
+            ) as get_summary,
+            redirect_stdout(stdout),
+        ):
+            exit_code = ops.main(
+                [
+                    'agent-feedback-data-gap-quality-report',
+                    '--market-date-from',
+                    '2026-05-05',
+                    '--market-date-to',
+                    '2026-05-06',
+                    '--agent-name',
+                    'technical-summarizer',
+                ]
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(json.loads(stdout.getvalue()), {'summary': {'duplicate_note_rate': 0.25}})
+        self.assertEqual(get_summary.call_args.kwargs['market_date_from'], '2026-05-05')
+        self.assertEqual(get_summary.call_args.kwargs['market_date_to'], '2026-05-06')
+        self.assertEqual(get_summary.call_args.kwargs['agent_name'], 'technical-summarizer')
+
     def test_compute_market_risk_filters_uses_canonical_feature_version(self) -> None:
         with (
             patch('app.internal.ops.bootstrap_runtime') as bootstrap_runtime,

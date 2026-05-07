@@ -906,7 +906,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     feedback_data_gap_summary_parser = subparsers.add_parser(
         'agent-feedback-data-gap-summary',
-        help='Summarize normalized missing-data feedback categories for operators',
+        help='Generate the operator data-gap feedback quality report',
     )
     feedback_data_gap_summary_parser.add_argument('--market-date')
     feedback_data_gap_summary_parser.add_argument('--market-date-from')
@@ -915,6 +915,21 @@ def _build_parser() -> argparse.ArgumentParser:
     feedback_data_gap_summary_parser.add_argument('--agent-name')
     feedback_data_gap_summary_parser.add_argument('--categories')
     feedback_data_gap_summary_parser.add_argument(
+        '--persist-missing-categories',
+        choices=('true', 'false'),
+        default='false',
+    )
+    feedback_data_gap_quality_report_parser = subparsers.add_parser(
+        'agent-feedback-data-gap-quality-report',
+        help='Alias for the operator data-gap feedback quality report',
+    )
+    feedback_data_gap_quality_report_parser.add_argument('--market-date')
+    feedback_data_gap_quality_report_parser.add_argument('--market-date-from')
+    feedback_data_gap_quality_report_parser.add_argument('--market-date-to')
+    feedback_data_gap_quality_report_parser.add_argument('--symbols')
+    feedback_data_gap_quality_report_parser.add_argument('--agent-name')
+    feedback_data_gap_quality_report_parser.add_argument('--categories')
+    feedback_data_gap_quality_report_parser.add_argument(
         '--persist-missing-categories',
         choices=('true', 'false'),
         default='false',
@@ -1139,7 +1154,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             outer_batch_size=args.outer_batch_size,
             reuse_existing=args.reuse_existing == 'true',
         )
-    elif args.command == 'agent-feedback-data-gap-summary':
+    elif args.command in {'agent-feedback-data-gap-summary', 'agent-feedback-data-gap-quality-report'}:
         payload = get_agent_feedback_data_gap_summary(
             market_date=args.market_date,
             market_date_from=args.market_date_from,

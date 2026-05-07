@@ -365,6 +365,21 @@ def _extract_note_entries(value: Any, *, source: str, notes_by_key: dict[str, di
             _extract_note_entries(item, source=source, notes_by_key=notes_by_key)
 
 
+def _append_note_mentions(value: Any, *, mentions: list[str]) -> None:
+    if isinstance(value, str):
+        text = sanitize_missing_data_note(value)
+        if text:
+            mentions.append(text)
+        return
+    if isinstance(value, dict):
+        for nested_value in value.values():
+            _append_note_mentions(nested_value, mentions=mentions)
+        return
+    if isinstance(value, (list, tuple, set)):
+        for item in value:
+            _append_note_mentions(item, mentions=mentions)
+
+
 def _extract_context_provenance(context_payload: Any) -> dict[str, Any]:
     if not isinstance(context_payload, dict):
         return {}
@@ -432,6 +447,17 @@ def extract_missing_data_notes(
     _extract_note_entries(data_gaps_payload, source='data_gaps', notes_by_key=notes_by_key)
     _extract_note_entries(improvement_notes_payload, source='improvement_notes', notes_by_key=notes_by_key)
     return list(notes_by_key.values())
+
+
+def extract_missing_data_note_mentions(
+    *,
+    data_gaps_payload: Any,
+    improvement_notes_payload: Any,
+) -> list[str]:
+    mentions: list[str] = []
+    _append_note_mentions(data_gaps_payload, mentions=mentions)
+    _append_note_mentions(improvement_notes_payload, mentions=mentions)
+    return mentions
 
 
 def _classify_note_categories(note_text: str) -> list[str]:
