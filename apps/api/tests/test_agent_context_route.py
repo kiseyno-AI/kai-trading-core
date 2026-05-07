@@ -359,6 +359,15 @@ class FakeSignalDeciderLoopService:
         self.policy_detail_args = None
         self.policy_activate_args = None
 
+    def build_calendar_day_status(self, *, decision_count: int, reviewed_count: int) -> str:
+        if decision_count <= 0:
+            return 'empty'
+        if reviewed_count >= decision_count:
+            return 'reviewed'
+        if reviewed_count > 0:
+            return 'partial'
+        return 'stored'
+
     def list_decisions(self, **kwargs):
         self.decision_args = kwargs
         return {
@@ -404,11 +413,12 @@ class FakeSignalDeciderLoopService:
             },
             'read_model': {'name': 'signal_decider_replay_review'},
             'taxonomy': {'version': 'signal_decider_replay_review_v1'},
-            'summary': {'day_count': 1, 'decision_count': 2},
+            'summary': {'day_count': 1, 'decision_count': 2, 'reviewed_decision_count': 2},
             'items': [
                 {
                     'market_date': '2026-04-23',
                     'decision_count': 2,
+                    'reviewed_decision_count': 2,
                     'scorecard': {'target_hit_count': 1},
                 }
             ],
@@ -425,14 +435,37 @@ class FakeSignalDeciderLoopService:
             },
             'read_model': {'name': 'signal_decider_replay_review'},
             'taxonomy': {'version': 'signal_decider_replay_review_v1'},
-            'summary': {'count': 1, 'evaluation_coverage': {'status': 'complete'}},
+            'summary': {'count': 1, 'evaluation_coverage': {'status': 'complete', 'complete_count': 1}},
             'items': [
                 {
                     'snapshot_id': 84,
+                    'decision_run_id': 'signal-review-run-84',
+                    'market_date': kwargs['market_date'].isoformat(),
                     'symbol': '005930',
+                    'policy_version': 'signal_decider_policy_v1',
+                    'decision': {
+                        'action': 'buy',
+                        'preferred_action': 'buy',
+                        'next_day_open_action': 'buy',
+                        'target_price': 82000,
+                        'stop_loss_price': 73500,
+                        'expected_return_pct': 4.2,
+                        'entry_price_basis': 'next_open',
+                        'suggested_holding_period': '3d',
+                        'confidence_score_10': 8,
+                        'conviction_score_10': 7,
+                    },
+                    'summary': 'Momentum and fundamentals align for a tactical next-day setup.',
+                    'supporting_evidence': ['Relative strength remained constructive.'],
+                    'decision_risks': ['Gap-down open'],
+                    'received_at': '2026-04-23T07:45:00+00:00',
                     'review': {
                         'status': 'complete',
                         'insight': {'code': 'buy_should_have_taken', 'priority': 'low'},
+                        'quality_verdict': 'good_buy',
+                        'quality_reason': 'Target was touched and the stop-loss was never touched inside the review window.',
+                        'review_conclusion': 'Buy held up on replay.',
+                        'intraday_path_result': 'target_hit_first',
                         'narrative': {
                             'insight_code': 'buy_should_have_taken',
                             'insight_priority': 'low',
@@ -449,7 +482,11 @@ class FakeSignalDeciderLoopService:
                             'summary_text': 'Buy held up on replay. Target was touched and the stop-loss was never touched inside the review window.',
                         },
                         'narrative_text': 'Buy held up on replay. Target was touched and the stop-loss was never touched inside the review window.',
-                        'path_analysis': {'path_marker': 'target_hit'},
+                        'path_analysis': {'path_marker': 'target_hit', 'trigger_sequence': 'target_hit_first'},
+                        'outcome_horizons': [
+                            {'horizon_days': 1, 'close_return_pct': 0.82, 'grade_label': 'good_buy'},
+                            {'horizon_days': 5, 'close_return_pct': 3.14, 'grade_label': 'good_buy'},
+                        ],
                     },
                 }
             ],
@@ -646,12 +683,18 @@ class FakeSignalDeciderCalendarReviewService:
                 'artifact_source': 'signal_decider_calendar_review_items',
             },
             'taxonomy': {'version': 'signal_decider_replay_review_v1'},
-            'summary': {'day_count': 1, 'decision_count': 2, 'calendar_status': 'reviewed'},
+            'summary': {
+                'day_count': 1,
+                'decision_count': 2,
+                'reviewed_decision_count': 2,
+                'calendar_status': 'reviewed',
+            },
             'items': [
                 {
                     'market_date': '2026-04-23',
                     'calendar_status': 'reviewed',
                     'decision_count': 2,
+                    'reviewed_decision_count': 2,
                     'scorecard': {'target_hit_count': 1},
                 }
             ],
@@ -679,11 +722,30 @@ class FakeSignalDeciderCalendarReviewService:
                 'artifact_source': 'signal_decider_calendar_review_items',
             },
             'taxonomy': {'version': 'signal_decider_replay_review_v1'},
-            'summary': {'count': 1, 'evaluation_coverage': {'status': 'complete'}},
+            'summary': {'count': 1, 'evaluation_coverage': {'status': 'complete', 'complete_count': 1}},
             'items': [
                 {
                     'snapshot_id': 84,
+                    'decision_run_id': 'signal-review-run-84',
+                    'market_date': kwargs['market_date'].isoformat(),
                     'symbol': '005930',
+                    'policy_version': 'signal_decider_policy_v1',
+                    'decision': {
+                        'action': 'buy',
+                        'preferred_action': 'buy',
+                        'next_day_open_action': 'buy',
+                        'target_price': 82000,
+                        'stop_loss_price': 73500,
+                        'expected_return_pct': 4.2,
+                        'entry_price_basis': 'next_open',
+                        'suggested_holding_period': '3d',
+                        'confidence_score_10': 8,
+                        'conviction_score_10': 7,
+                    },
+                    'summary': 'Momentum and fundamentals align for a tactical next-day setup.',
+                    'supporting_evidence': ['Relative strength remained constructive.'],
+                    'decision_risks': ['Gap-down open'],
+                    'received_at': '2026-04-23T07:45:00+00:00',
                     'review': {
                         'status': 'complete',
                         'insight': {'code': 'buy_should_have_taken', 'priority': 'low'},
@@ -691,7 +753,7 @@ class FakeSignalDeciderCalendarReviewService:
                         'quality_reason': 'Target was touched and the stop-loss was never touched inside the review window.',
                         'review_conclusion': 'Buy held up on replay.',
                         'path_outcome': 'target_hit',
-                        'intraday_path_result': 'target_only',
+                        'intraday_path_result': 'target_hit_first',
                         'narrative': {
                             'insight_code': 'buy_should_have_taken',
                             'insight_priority': 'low',
@@ -708,7 +770,11 @@ class FakeSignalDeciderCalendarReviewService:
                             'summary_text': 'Buy held up on replay. Target was touched and the stop-loss was never touched inside the review window.',
                         },
                         'narrative_text': 'Buy held up on replay. Target was touched and the stop-loss was never touched inside the review window.',
-                        'path_analysis': {'path_marker': 'target_hit'},
+                        'path_analysis': {'path_marker': 'target_hit', 'trigger_sequence': 'target_hit_first'},
+                        'outcome_horizons': [
+                            {'horizon_days': 1, 'close_return_pct': 0.82, 'grade_label': 'good_buy'},
+                            {'horizon_days': 5, 'close_return_pct': 3.14, 'grade_label': 'good_buy'},
+                        ],
                     },
                 }
             ],
@@ -767,6 +833,44 @@ class FakeSignalDeciderCalendarReviewService:
                 },
                 'observed_price_path': [{'trade_date': '2026-04-24'}],
             },
+        }
+
+
+class EmptySignalDeciderCalendarReviewService(FakeSignalDeciderCalendarReviewService):
+    def get_review_calendar(self, **kwargs):
+        self.calendar_args = kwargs
+        return {
+            'request': {
+                'month': kwargs['month'],
+                'horizons': kwargs['horizons'],
+                'primary_horizon_days': kwargs['primary_horizon_days'],
+                'evaluation_version': kwargs['evaluation_version'],
+            },
+            'read_model': {
+                'name': 'signal_decider_replay_review',
+                'artifact_source': 'signal_decider_calendar_review_items',
+            },
+            'taxonomy': {'version': 'signal_decider_replay_review_v1'},
+            'summary': {'day_count': 0, 'decision_count': 0, 'reviewed_decision_count': 0, 'calendar_status': 'empty'},
+            'items': [],
+        }
+
+    def get_review_date(self, **kwargs):
+        self.review_date_args = kwargs
+        return {
+            'request': {
+                'market_date': kwargs['market_date'].isoformat(),
+                'horizons': kwargs['horizons'],
+                'primary_horizon_days': kwargs['primary_horizon_days'],
+                'evaluation_version': kwargs['evaluation_version'],
+            },
+            'read_model': {
+                'name': 'signal_decider_replay_review',
+                'artifact_source': 'signal_decider_calendar_review_items',
+            },
+            'taxonomy': {'version': 'signal_decider_replay_review_v1'},
+            'summary': {'count': 0, 'evaluation_coverage': {'status': 'empty', 'complete_count': 0}},
+            'items': [],
         }
 
 
@@ -1016,6 +1120,128 @@ class AgentContextRouteTests(unittest.TestCase):
         self.assertEqual(fake_service.last_args['run_id'], 'symbol-run-2026-04-14-abc123')
         self.assertEqual(fake_service.last_args['symbols'], ['005930'])
         self.assertEqual(response.json()['summary']['run_id'], 'symbol-run-2026-04-14-abc123')
+
+    def test_feedback_calendar_summary_route_uses_projection_review_surface(self):
+        fake_projection_service = FakeSignalDeciderCalendarReviewService()
+        fake_loop_service = FakeSignalDeciderLoopService()
+        original_projection_service = routes_agent_context.signal_decider_calendar_review_service
+        original_loop_service = routes_agent_context.signal_decider_loop_service
+        routes_agent_context.signal_decider_calendar_review_service = fake_projection_service
+        routes_agent_context.signal_decider_loop_service = fake_loop_service
+        try:
+            client = TestClient(self.app)
+            response = client.get(
+                '/agent-context/feedback/calendar',
+                params=[
+                    ('month', '2026-04'),
+                    ('horizons', '1'),
+                    ('horizons', '5'),
+                    ('primary_horizon_days', '5'),
+                    ('evaluation_version', 'signal_decider_eval_v1'),
+                ],
+            )
+        finally:
+            routes_agent_context.signal_decider_calendar_review_service = original_projection_service
+            routes_agent_context.signal_decider_loop_service = original_loop_service
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(fake_projection_service.calendar_args['month'], '2026-04')
+        self.assertEqual(fake_projection_service.calendar_args['horizons'], [1, 5])
+        self.assertIsNone(fake_loop_service.calendar_args)
+        self.assertEqual(payload['summary']['decision_count'], 2)
+        self.assertEqual(payload['summary']['reviewed_count'], 2)
+        self.assertEqual(payload['summary']['source'], 'persisted_review_projection')
+        self.assertEqual(payload['availability']['status'], 'ready')
+        self.assertEqual(payload['items'][0]['review_status_counts']['reviewed'], 2)
+        self.assertEqual(payload['items'][0]['calendar_status'], 'reviewed')
+
+    def test_feedback_calendar_summary_route_falls_back_when_projection_is_empty(self):
+        fake_projection_service = EmptySignalDeciderCalendarReviewService()
+        fake_loop_service = FakeSignalDeciderLoopService()
+        original_projection_service = routes_agent_context.signal_decider_calendar_review_service
+        original_loop_service = routes_agent_context.signal_decider_loop_service
+        routes_agent_context.signal_decider_calendar_review_service = fake_projection_service
+        routes_agent_context.signal_decider_loop_service = fake_loop_service
+        try:
+            client = TestClient(self.app)
+            response = client.get(
+                '/agent-context/feedback/calendar',
+                params=[('month', '2026-04')],
+            )
+        finally:
+            routes_agent_context.signal_decider_calendar_review_service = original_projection_service
+            routes_agent_context.signal_decider_loop_service = original_loop_service
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(fake_projection_service.calendar_args['month'], '2026-04')
+        self.assertEqual(fake_loop_service.calendar_args['month'], '2026-04')
+        self.assertEqual(payload['summary']['source'], 'signal_decider_snapshot_fallback')
+        self.assertEqual(payload['availability']['status'], 'fallback')
+        self.assertEqual(payload['items'][0]['decision_count'], 2)
+
+    def test_feedback_review_route_uses_projection_review_surface(self):
+        fake_projection_service = FakeSignalDeciderCalendarReviewService()
+        fake_loop_service = FakeSignalDeciderLoopService()
+        original_projection_service = routes_agent_context.signal_decider_calendar_review_service
+        original_loop_service = routes_agent_context.signal_decider_loop_service
+        routes_agent_context.signal_decider_calendar_review_service = fake_projection_service
+        routes_agent_context.signal_decider_loop_service = fake_loop_service
+        try:
+            client = TestClient(self.app)
+            response = client.get(
+                '/agent-context/feedback/review',
+                params=[
+                    ('market_date', '2026-04-23'),
+                    ('horizons', '1'),
+                    ('horizons', '5'),
+                    ('primary_horizon_days', '5'),
+                    ('evaluation_version', 'signal_decider_eval_v1'),
+                ],
+            )
+        finally:
+            routes_agent_context.signal_decider_calendar_review_service = original_projection_service
+            routes_agent_context.signal_decider_loop_service = original_loop_service
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(fake_projection_service.review_date_args['market_date'], date.fromisoformat('2026-04-23'))
+        self.assertEqual(fake_projection_service.review_date_args['horizons'], [1, 5])
+        self.assertIsNone(fake_loop_service.review_date_args)
+        self.assertEqual(payload['summary']['count'], 1)
+        self.assertEqual(payload['summary']['reviewed_count'], 1)
+        self.assertEqual(payload['summary']['source'], 'persisted_review_projection')
+        self.assertEqual(payload['availability']['status'], 'ready')
+        self.assertEqual(payload['items'][0]['decision']['next_day_open_action'], 'buy')
+        self.assertEqual(payload['items'][0]['decision']['evaluation']['target_stop_result'], 'target_hit_first')
+        self.assertEqual(payload['items'][0]['review']['quality_reason'], 'Target was touched and the stop-loss was never touched inside the review window.')
+        self.assertEqual(len(payload['items'][0]['review']['outcome_horizons']), 2)
+
+    def test_feedback_review_route_falls_back_when_projection_is_empty(self):
+        fake_projection_service = EmptySignalDeciderCalendarReviewService()
+        fake_loop_service = FakeSignalDeciderLoopService()
+        original_projection_service = routes_agent_context.signal_decider_calendar_review_service
+        original_loop_service = routes_agent_context.signal_decider_loop_service
+        routes_agent_context.signal_decider_calendar_review_service = fake_projection_service
+        routes_agent_context.signal_decider_loop_service = fake_loop_service
+        try:
+            client = TestClient(self.app)
+            response = client.get(
+                '/agent-context/feedback/review',
+                params=[('market_date', '2026-04-23')],
+            )
+        finally:
+            routes_agent_context.signal_decider_calendar_review_service = original_projection_service
+            routes_agent_context.signal_decider_loop_service = original_loop_service
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(fake_projection_service.review_date_args['market_date'], date.fromisoformat('2026-04-23'))
+        self.assertEqual(fake_loop_service.review_date_args['market_date'], date.fromisoformat('2026-04-23'))
+        self.assertEqual(payload['summary']['source'], 'signal_decider_snapshot_fallback')
+        self.assertEqual(payload['availability']['status'], 'fallback')
+        self.assertEqual(payload['items'][0]['symbol'], '005930')
 
     def test_symbol_day_context_route_maps_validation_error_to_400(self):
         original_service = routes_agent_context.agent_context_read_service
