@@ -9,6 +9,7 @@ from uuid import uuid4
 from sqlalchemy import select
 
 from app.agent_context.orchestrator_helpers import normalize_requested_symbols as _normalize_requested_symbols
+from app.agent_context.prerequisite_service import agent_feedback_prerequisite_service
 from app.agent_context.eligibility import (
     AGENT_FEEDBACK_ELIGIBILITY_FILTERS,
     AGENT_FEEDBACK_ELIGIBILITY_RULE,
@@ -490,7 +491,7 @@ class AgentFeedbackRetryService:
             for role_state in snapshot.role_states.values()
         )
 
-    def run_retry_cycles(self, *, config: FeedbackRetryCycleConfig) -> dict[str, Any]:
+    def run_retry_cycles(self, *, config: FeedbackRetryCycleConfig, force: bool = False) -> dict[str, Any]:
         roles = tuple(config.roles)
         raw_requested_symbols = getattr(config, 'symbols', None)
         requested_symbols = (
@@ -498,6 +499,34 @@ class AgentFeedbackRetryService:
             if raw_requested_symbols is not None
             else None
         )
+        prerequisites = agent_feedback_prerequisite_service.inspect_feedback_prerequisites(
+            market_date=config.market_date,
+        )
+        if not force and not prerequisites['ready']:
+            progress = self._get_retry_progress(
+                market_date=config.market_date,
+                roles=roles,
+                symbols=list(requested_symbols) if requested_symbols is not None else None,
+                run_id=None,
+            )
+            return {
+                'market_date': config.market_date.isoformat(),
+                'roles': list(roles),
+                'max_cycles': config.max_cycles,
+                'outer_batch_size': config.outer_batch_size,
+                'reuse_existing': config.reuse_existing,
+                'requested_symbols': list(requested_symbols) if requested_symbols is not None else None,
+                'eligible_symbols': None,
+                'skipped_symbols': [],
+                'run_id': None,
+                'status': prerequisites['status'],
+                'gated': True,
+                'cycles': [],
+                'final_pending': int(progress.get('summary', {}).get('pending_symbols') or 0),
+                'completed': False,
+                'prerequisites': prerequisites,
+                'progress': progress,
+            }
         eligible_symbols = self._load_eligible_symbols(
             market_date=config.market_date,
             requested_symbols=requested_symbols,
@@ -906,6 +935,7 @@ class AgentFeedbackRetryService:
             'eligible_symbols': list(eligible_symbols) if requested_symbols is not None else None,
             'skipped_symbols': skipped_symbols,
             'run_id': request_run_id,
+            'status': str(progress.get('summary', {}).get('run_status') or 'completed'),
             'cycles': cycles,
             'final_pending': len(final_pending_symbols),
             'completed': len(final_pending_symbols) == 0,

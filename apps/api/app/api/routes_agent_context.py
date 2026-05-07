@@ -19,6 +19,7 @@ from app.agent_context.eligibility import (
     resolve_agent_feedback_scope,
 )
 from app.agent_context.feedback_service import agent_context_feedback_service
+from app.agent_context.prerequisite_service import agent_feedback_prerequisite_service
 from app.agent_context.missing_data_report_service import agent_context_missing_data_report_service
 from app.agent_context.orchestrator import agent_feedback_orchestrator
 from app.agent_context.progress_service import agent_context_progress_service
@@ -80,6 +81,7 @@ class AgentSymbolFeedbackDispatchRequest(BaseModel):
     disclosures_limit: int = Field(default=5, ge=0, le=20)
     reuse_existing: bool = True
     wait_for_completion: bool = True
+    force: bool = False
 
 
 class AgentFeedbackRetryCyclesRequest(BaseModel):
@@ -91,6 +93,7 @@ class AgentFeedbackRetryCyclesRequest(BaseModel):
     max_cycles: int = Field(default=3, ge=1, le=20)
     outer_batch_size: int = Field(default=20, ge=1, le=200)
     reuse_existing: bool = True
+    force: bool = False
 
 
 class AgentFeedbackFollowupRequest(BaseModel):
@@ -102,6 +105,7 @@ class AgentFeedbackFollowupRequest(BaseModel):
     max_cycles: int = Field(default=3, ge=1, le=20)
     outer_batch_size: int = Field(default=20, ge=1, le=500)
     reuse_existing: bool = True
+    force: bool = False
 
 
 class AgentFeedbackCleanupRunRequest(BaseModel):
@@ -180,6 +184,61 @@ class AgentSubagentExperimentRequest(BaseModel):
     disclosures_limit: int = Field(default=5, ge=0, le=20)
     per_role_parallelism: int = Field(default=5, ge=1, le=10)
     wait_for_completion: bool = True
+    force: bool = False
+
+
+def _inspect_feedback_prerequisites(
+    *,
+    market_date: date,
+    fs_div: str | None = None,
+    force: bool = False,
+) -> dict[str, Any] | None:
+    if force:
+        return None
+    prerequisites = agent_feedback_prerequisite_service.inspect_feedback_prerequisites(
+        market_date=market_date,
+        fs_div=fs_div,
+    )
+    return None if prerequisites['ready'] else prerequisites
+
+
+def _build_feedback_gate_response(
+    *,
+    request_payload: dict[str, Any],
+    prerequisites: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        'request': request_payload,
+        'summary': {
+            'status': prerequisites['status'],
+            'completed': 0,
+            'failed': 0,
+            'skipped': 0,
+            'flushed_to_db': 0,
+            'gated': True,
+        },
+        'items': [],
+        'failures': [],
+        'prerequisites': prerequisites,
+    }
+
+
+def _build_evaluation_gate_response(
+    *,
+    request_payload: dict[str, Any],
+    prerequisites: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        'request': request_payload,
+        'summary': {
+            'status': prerequisites['status'],
+            'gated': True,
+            'outcomes_upserted': 0,
+            'evaluations_upserted': 0,
+        },
+        'items': [],
+        'prerequisites': prerequisites,
+    }
 
 
 @router.get('/symbol-day')
@@ -250,17 +309,21 @@ async def dispatch_symbol_agent_feedback(
                 fs_div=payload.fs_div,
                 disclosures_limit=payload.disclosures_limit,
                 reuse_existing=payload.reuse_existing,
+                force=payload.force,
             )
 
-        request_run_id = f"symbol-run-{payload.market_date.isoformat()}-{uuid.uuid4().hex[:10]}"
         requested_roles = list(payload.roles or EXPECTED_ROLES)
         requested_symbols = list(dict.fromkeys(payload.symbols))
-        started_at = datetime.now(timezone.utc)
+        prerequisites = _inspect_feedback_prerequisites(
+            market_date=payload.market_date,
+            fs_div=payload.fs_div,
+            force=payload.force,
+        )
         request_payload = {
             'market_date': payload.market_date.isoformat(),
             'symbols': requested_symbols,
             'requested_symbols': requested_symbols,
-            'request_run_id': request_run_id,
+            'request_run_id': None,
             'roles': requested_roles,
             'fs_div': payload.fs_div,
             'disclosures_limit': payload.disclosures_limit,
@@ -268,6 +331,19 @@ async def dispatch_symbol_agent_feedback(
             'scope': resolve_agent_feedback_scope(requested_symbols=requested_symbols),
             'eligibility_rule': AGENT_FEEDBACK_ELIGIBILITY_RULE,
             'eligibility_filters': list(AGENT_FEEDBACK_ELIGIBILITY_FILTERS),
+            'wait_for_completion': False,
+        }
+        if prerequisites is not None:
+            return _build_feedback_gate_response(
+                request_payload=request_payload,
+                prerequisites=prerequisites,
+            )
+
+        request_run_id = f"symbol-run-{payload.market_date.isoformat()}-{uuid.uuid4().hex[:10]}"
+        started_at = datetime.now(timezone.utc)
+        request_payload = {
+            **request_payload,
+            'request_run_id': request_run_id,
             'mode': 'role_sequential_runtime_buffered',
         }
 
@@ -363,6 +439,7 @@ async def dispatch_symbol_agent_feedback(
                     disclosures_limit=payload.disclosures_limit,
                     reuse_existing=payload.reuse_existing,
                     request_run_id=request_run_id,
+                    force=payload.force,
                 )
             except Exception as exc:  # noqa: BLE001
                 try:
@@ -432,6 +509,7 @@ async def run_agent_feedback_retry_cycles(payload: AgentFeedbackRetryCyclesReque
         return await run_in_threadpool(
             agent_feedback_retry_service.run_retry_cycles,
             config=config,
+            force=payload.force,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -453,6 +531,7 @@ async def run_agent_feedback_followup(payload: AgentFeedbackFollowupRequest) -> 
         return await run_in_threadpool(
             agent_feedback_retry_service.run_retry_cycles,
             config=config,
+            force=payload.force,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -495,6 +574,27 @@ async def list_agent_feedback_session_cleanup(
 @router.post('/feedback/dispatch/subagent-experiment')
 async def dispatch_symbol_agent_feedback_via_subagents(payload: AgentSubagentExperimentRequest, background_tasks: BackgroundTasks) -> dict:
     try:
+        prerequisites = _inspect_feedback_prerequisites(
+            market_date=payload.market_date,
+            fs_div=payload.fs_div,
+            force=payload.force,
+        )
+        if prerequisites is not None:
+            return _build_feedback_gate_response(
+                request_payload={
+                    'market_date': payload.market_date.isoformat(),
+                    'symbols': payload.symbols,
+                    'requested_symbols': payload.symbols,
+                    'request_run_id': None,
+                    'roles': payload.roles or EXPECTED_ROLES,
+                    'fs_div': payload.fs_div,
+                    'disclosures_limit': payload.disclosures_limit,
+                    'per_role_parallelism': payload.per_role_parallelism,
+                    'mode': 'subagent_experiment',
+                    'wait_for_completion': payload.wait_for_completion,
+                },
+                prerequisites=prerequisites,
+            )
         if not payload.wait_for_completion:
             request_run_id = f'subagent-symbol-run-{payload.market_date.isoformat()}-api-{payload.per_role_parallelism}x{len(payload.symbols)}'
 
@@ -758,6 +858,18 @@ async def list_agent_feedback(
 @router.post('/decider/evaluations/compute')
 async def compute_decider_post_decision_evaluations(payload: DeciderEvaluationComputeRequest) -> dict:
     try:
+        prerequisites = _inspect_feedback_prerequisites(
+            market_date=payload.market_date_to,
+            force=payload.force_recompute,
+        )
+        if prerequisites is not None:
+            request_payload = payload.model_dump() if hasattr(payload, 'model_dump') else payload.dict()
+            request_payload['market_date_from'] = payload.market_date_from.isoformat()
+            request_payload['market_date_to'] = payload.market_date_to.isoformat()
+            return _build_evaluation_gate_response(
+                request_payload=request_payload,
+                prerequisites=prerequisites,
+            )
         return await run_in_threadpool(
             decider_post_decision_evaluation_service.compute_evaluations,
             market_date_from=payload.market_date_from,
@@ -1032,6 +1144,18 @@ async def get_signal_decider_diagnostics(
 @router.post('/signal-decider/evaluations/compute')
 async def compute_signal_decider_evaluations(payload: SignalDeciderEvaluationComputeRequest) -> dict:
     try:
+        prerequisites = _inspect_feedback_prerequisites(
+            market_date=payload.market_date_to,
+            force=payload.force_recompute,
+        )
+        if prerequisites is not None:
+            request_payload = payload.model_dump() if hasattr(payload, 'model_dump') else payload.dict()
+            request_payload['market_date_from'] = payload.market_date_from.isoformat()
+            request_payload['market_date_to'] = payload.market_date_to.isoformat()
+            return _build_evaluation_gate_response(
+                request_payload=request_payload,
+                prerequisites=prerequisites,
+            )
         return await run_in_threadpool(
             signal_decider_loop_service.compute_evaluations,
             market_date_from=payload.market_date_from,

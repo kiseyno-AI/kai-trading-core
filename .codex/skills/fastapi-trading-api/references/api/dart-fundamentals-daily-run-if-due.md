@@ -3,7 +3,7 @@
 ## Summary
 Runs the daily incremental DART fundamentals refresh for the requested market date, and can continue retryable capture events for multiple in-run cycles. When `retry_cycles` is omitted, the service uses the configured daily automatic retry count. A successful run also rebuilds persisted daily Piotroski filter rows for the same market date and returns that follow-up summary.
 
-When `OPENCLAW_FEEDBACK_TRIGGER_AFTER_FUNDAMENTALS_REFRESH=true`, the service can then trigger the bounded agent-feedback retry workflow, but only after the Piotroski follow-up completes without persistence failures. That feedback workflow is scoped to symbols whose persisted filter row passed on that same `market_date`.
+When `OPENCLAW_FEEDBACK_TRIGGER_AFTER_FUNDAMENTALS_REFRESH=true`, the service can then trigger the bounded agent-feedback retry workflow, but only after the Piotroski follow-up completes without persistence failures and the same-day feedback prerequisites are ready: fundamentals refresh, market-risk filter, Piotroski filter, and all factor/scoring stages must be terminal and successful enough for agent context. If those prerequisites are still pending or blocked, `feedback_followup` returns `triggered=false`, `reason=feedback_prerequisites_not_ready`, and a `prerequisites` block instead of dispatching feedback.
 
 ## Example request
 `POST /disclosures/dart/fundamentals/daily/run-if-due?market_date=2026-04-16&capture_limit=500&force=false&fs_div=CFS`
@@ -46,7 +46,7 @@ When `OPENCLAW_FEEDBACK_TRIGGER_AFTER_FUNDAMENTALS_REFRESH=true`, the service ca
   "piotroski_filter_error": null,
   "feedback_followup": {
     "market_date": "2026-04-16",
-    "roles": ["eod-summarizer", "technical-summarizer", "fundamental-summarizer"],
+    "roles": ["eod-summarizer", "technical-summarizer", "fundamental-summarizer", "short-term-decider", "signal-decider"],
     "completed": false,
     "final_pending": 12
   },

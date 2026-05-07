@@ -11,6 +11,7 @@ from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Awaitable, Callable
 
+from app.agent_context.prerequisite_service import agent_feedback_prerequisite_service
 from app.core.audit_logging import log_fetch_event
 from app.agent_context.retry_service import EXPECTED_ROLES, FeedbackRetryCycleConfig, agent_feedback_retry_service
 from app.core.settings import settings
@@ -2026,7 +2027,6 @@ class DartFundamentalsCaptureService:
             )
             should_trigger_feedback_followup = (
                 feedback_followup_requested
-                and status in {'completed', 'partial'}
                 and piotroski_filter_followup is not None
                 and not piotroski_filter_followup_error
                 and int(piotroski_filter_followup.get('results_failed') or 0) == 0
@@ -2044,19 +2044,32 @@ class DartFundamentalsCaptureService:
                     'market_date': resolved_market_date.isoformat(),
                 }
             if should_trigger_feedback_followup:
-                try:
-                    feedback_followup = await asyncio.to_thread(
-                        agent_feedback_retry_service.run_retry_cycles,
-                        config=FeedbackRetryCycleConfig(
-                            market_date=resolved_market_date,
-                            roles=EXPECTED_ROLES,
-                            max_cycles=settings.openclaw_feedback_retry_max_cycles,
-                            outer_batch_size=settings.openclaw_feedback_retry_outer_batch_size,
-                            reuse_existing=True,
-                        ),
-                    )
-                except Exception as exc:
-                    feedback_followup_error = str(exc)
+                prerequisites = agent_feedback_prerequisite_service.inspect_feedback_prerequisites(
+                    market_date=resolved_market_date,
+                    fs_div=resolved_fs_div,
+                )
+                if not prerequisites['ready']:
+                    feedback_followup = {
+                        'triggered': False,
+                        'reason': 'feedback_prerequisites_not_ready',
+                        'status': prerequisites['status'],
+                        'market_date': resolved_market_date.isoformat(),
+                        'prerequisites': prerequisites,
+                    }
+                else:
+                    try:
+                        feedback_followup = await asyncio.to_thread(
+                            agent_feedback_retry_service.run_retry_cycles,
+                            config=FeedbackRetryCycleConfig(
+                                market_date=resolved_market_date,
+                                roles=EXPECTED_ROLES,
+                                max_cycles=settings.openclaw_feedback_retry_max_cycles,
+                                outer_batch_size=settings.openclaw_feedback_retry_outer_batch_size,
+                                reuse_existing=True,
+                            ),
+                        )
+                    except Exception as exc:
+                        feedback_followup_error = str(exc)
 
                 metadata = {
                     **metadata,

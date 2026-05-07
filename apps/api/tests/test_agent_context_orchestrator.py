@@ -10,6 +10,7 @@ from unittest.mock import patch
 from app.agent_context import orchestrator as orchestrator_module
 from app.agent_context.orchestrator import AgentFeedbackOrchestrator, OpenClawAgentClient
 from app.agent_context.orchestrator_helpers import coerce_decoded_batch_response, correlate_decoded_batch_response, repair_json_tail
+from app.agent_context.prerequisite_service import FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER
 from app.agent_context.runtime_state import RuntimeFeedbackRunState, RuntimeFeedbackStateStore
 
 
@@ -40,6 +41,33 @@ def _batch_result(symbol: str) -> dict:
         'started_at': '2026-04-14T01:00:00+00:00',
         'completed_at': '2026-04-14T01:01:00+00:00',
         'session_ref': {'session_key': 'feedback/eod-summarizer/slot-01'},
+    }
+
+
+def _feedback_prerequisites(*, status: str = 'ready', missing_stage_ids: list[str] | None = None) -> dict:
+    missing_stage_ids = list(missing_stage_ids or [])
+    ready = status == 'ready'
+    return {
+        'market_date': '2026-04-14',
+        'fs_div': 'CFS',
+        'status': status,
+        'ready': ready,
+        'required_stage_ids': list(FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER),
+        'ready_stage_ids': list(FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER) if ready else [],
+        'waiting_stage_ids': missing_stage_ids if status == 'waiting' else [],
+        'blocked_stage_ids': missing_stage_ids if status == 'blocked' else [],
+        'missing_prerequisites': [
+            {
+                'stage': stage_id,
+                'label': stage_id.replace('_', ' '),
+                'status': 'running' if status == 'waiting' else 'partial',
+                'gate_status': status,
+                'current_activity': f'{status} {stage_id}',
+                'details': {},
+            }
+            for stage_id in missing_stage_ids
+        ],
+        'stages': {},
     }
 
 
@@ -633,6 +661,14 @@ def _patch_feedback_eligibility(*symbols: str):
 
 
 class AgentFeedbackOrchestratorTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.prerequisite_patcher = patch(
+            'app.agent_context.orchestrator.agent_feedback_prerequisite_service.inspect_feedback_prerequisites',
+            side_effect=lambda **_: _feedback_prerequisites(),
+        )
+        self.prerequisite_patcher.start()
+        self.addCleanup(self.prerequisite_patcher.stop)
+
     def test_openclaw_client_uses_default_timeout_when_configured_timeout_is_non_positive(self):
         fake_settings = SimpleNamespace(
             openclaw_base_url='https://openclaw.example',
@@ -758,7 +794,27 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertEqual(dispatched_symbols, ['000660'])
         self.assertEqual([item['symbol'] for item in feedback_service.bulk_items], ['000660'])
         self.assertEqual([target.symbol for target in cleanup_service.targets], ['000660'])
-        self.assertEqual(result['summary']['completed'], 1)
+
+    def test_dispatch_for_symbols_returns_blocked_gate_when_prerequisites_are_not_ready(self):
+        service = AgentFeedbackOrchestrator()
+
+        with patch(
+            'app.agent_context.orchestrator.agent_feedback_prerequisite_service.inspect_feedback_prerequisites',
+            side_effect=lambda **_: _feedback_prerequisites(
+                status='blocked',
+                missing_stage_ids=['quality_factors', 'composite_factors'],
+            ),
+        ):
+            result = service.dispatch_for_symbols(
+                market_date='2026-04-14',
+                symbols=['005930'],
+                roles=['technical-summarizer'],
+            )
+
+        self.assertTrue(result['summary']['gated'])
+        self.assertEqual(result['summary']['status'], 'blocked')
+        self.assertEqual(result['items'], [])
+        self.assertEqual(result['summary']['completed'], 0)
 
     def test_buffered_symbol_dispatch_cleans_each_batch_session_once(self):
         service = AgentFeedbackOrchestrator()

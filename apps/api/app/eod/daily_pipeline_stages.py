@@ -6,6 +6,7 @@ from datetime import date
 from typing import Any, Sequence
 
 from app.agent_context.retry_service import FeedbackRetryCycleConfig, agent_feedback_retry_service
+from app.agent_context.prerequisite_service import agent_feedback_prerequisite_service
 from app.agent_context.roles import DECISION_SUPPORT_AGENT_NAMES, SUMMARIZER_AGENT_NAMES
 from app.agent_context.signal_decider_loop_service import (
     DEFAULT_SIGNAL_DECIDER_EVALUATION_LOOKBACK_DAYS,
@@ -360,7 +361,7 @@ STAGE_DEFINITIONS: dict[str, DailyStageDefinition] = {
         label='agent feedback summarizer dispatch',
         group='agent_feedback',
         description='Run the persisted symbol-level summarizer stages over the symbol universe that passes both active pre-filters.',
-        depends_on=('market_risk_filter', 'piotroski_filter'),
+        depends_on=('market_risk_filter', 'piotroski_filter', *FACTOR_STAGE_ORDER),
         supports_symbols=True,
         supports_capture_limit=True,
         inspect_routes=('/agent-context/feedback/progress', '/agent-context/feedback/status'),
@@ -635,6 +636,16 @@ class DailyPipelineStageService:
                 source=COMPOSITE_FACTOR_SOURCE,
             )
         if stage_id in {'agent_feedback_summaries', 'signal_decider'}:
+            prerequisites = agent_feedback_prerequisite_service.inspect_feedback_prerequisites(
+                market_date=market_date,
+                fs_div=fs_div,
+            )
+            if not force and not prerequisites['ready']:
+                return self._build_prerequisite_gate_result(
+                    stage_id=stage_id,
+                    market_date=market_date,
+                    prerequisites=prerequisites,
+                )
             roles = (
                 SUMMARIZER_AGENT_NAMES
                 if stage_id == 'agent_feedback_summaries'
@@ -648,9 +659,20 @@ class DailyPipelineStageService:
                     max_cycles=feedback_max_cycles,
                     outer_batch_size=feedback_outer_batch_size,
                     reuse_existing=reuse_existing_feedback,
-                )
+                ),
+                force=force,
             )
         if stage_id == 'signal_decider_evaluations':
+            prerequisites = agent_feedback_prerequisite_service.inspect_feedback_prerequisites(
+                market_date=market_date,
+                fs_div=fs_div,
+            )
+            if not force and not prerequisites['ready']:
+                return self._build_prerequisite_gate_result(
+                    stage_id=stage_id,
+                    market_date=market_date,
+                    prerequisites=prerequisites,
+                )
             return self.decision_loop_service.compute_recent_evaluations(
                 as_of_market_date=market_date,
                 lookback_days=DEFAULT_SIGNAL_DECIDER_EVALUATION_LOOKBACK_DAYS,
@@ -658,6 +680,26 @@ class DailyPipelineStageService:
                 force_recompute=force,
             )
         raise ValueError(f'Unsupported daily stage: {stage_id}')
+
+    @staticmethod
+    def _build_prerequisite_gate_result(
+        *,
+        stage_id: str,
+        market_date: str,
+        prerequisites: dict[str, Any],
+    ) -> dict[str, Any]:
+        gate_status = str(prerequisites.get('status') or 'waiting').strip().lower()
+        if gate_status not in {'waiting', 'blocked'}:
+            gate_status = 'waiting'
+        return {
+            'triggered': False,
+            'status': gate_status,
+            'reason': 'feedback_prerequisites_not_ready',
+            'market_date': market_date,
+            'stage': stage_id,
+            'prerequisites': prerequisites,
+            'missing_prerequisites': prerequisites.get('missing_prerequisites') or [],
+        }
 
     def _extract_pykrx_stage_result(self, stage_id: str, result: dict[str, Any]) -> dict[str, Any]:
         if result.get('skipped') or result.get('triggered') is False:
@@ -748,6 +790,9 @@ class DailyPipelineStageService:
             'contexts_failed',
         )
         if result.get('skipped') or result.get('triggered') is False:
+            raw_gate_status = str(result.get('status') or '').strip().lower()
+            if raw_gate_status in {'waiting', 'blocked'}:
+                return raw_gate_status
             return 'skipped'
         raw_status = str(result.get('status') or '').strip()
         if raw_status:
@@ -784,6 +829,10 @@ class DailyPipelineStageService:
     @staticmethod
     def _resolve_overall_status(stage_outcomes: Sequence[dict[str, Any]]) -> str:
         statuses = [str(item.get('status') or 'completed') for item in stage_outcomes]
+        if any(status == 'blocked' for status in statuses):
+            return 'blocked'
+        if any(status == 'waiting' for status in statuses):
+            return 'waiting'
         if any(status == 'failed' for status in statuses):
             return 'failed'
         if any(status == 'running' for status in statuses):

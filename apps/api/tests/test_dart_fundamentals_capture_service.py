@@ -3,11 +3,39 @@ import asyncio
 from datetime import date
 from unittest.mock import patch
 
+from app.agent_context.prerequisite_service import FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER
 from app.dart.fundamentals_capture_service import (
     DartFundamentalsCaptureService,
     build_row_payloads,
     infer_fundamentals_request,
 )
+
+
+def _feedback_prerequisites(*, status: str = 'ready', missing_stage_ids: list[str] | None = None) -> dict:
+    missing_stage_ids = list(missing_stage_ids or [])
+    ready = status == 'ready'
+    return {
+        'market_date': '2026-04-14',
+        'fs_div': 'CFS',
+        'status': status,
+        'ready': ready,
+        'required_stage_ids': list(FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER),
+        'ready_stage_ids': list(FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER) if ready else [],
+        'waiting_stage_ids': missing_stage_ids if status == 'waiting' else [],
+        'blocked_stage_ids': missing_stage_ids if status == 'blocked' else [],
+        'missing_prerequisites': [
+            {
+                'stage': stage_id,
+                'label': stage_id.replace('_', ' '),
+                'status': 'running' if status == 'waiting' else 'partial',
+                'gate_status': status,
+                'current_activity': f'{status} {stage_id}',
+                'details': {},
+            }
+            for stage_id in missing_stage_ids
+        ],
+        'stages': {},
+    }
 
 
 class FakeCaptureClient:
@@ -913,10 +941,16 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
                 'openclaw_feedback_trigger_after_fundamentals_refresh',
                 True,
             ):
-                with patch(
-                    'app.dart.fundamentals_capture_service.agent_feedback_retry_service.run_retry_cycles',
-                    return_value={'completed': True, 'final_pending': 0},
-                ) as run_retry_cycles:
+                with (
+                    patch(
+                        'app.dart.fundamentals_capture_service.agent_feedback_prerequisite_service.inspect_feedback_prerequisites',
+                        side_effect=lambda **_: _feedback_prerequisites(),
+                    ),
+                    patch(
+                        'app.dart.fundamentals_capture_service.agent_feedback_retry_service.run_retry_cycles',
+                        return_value={'completed': True, 'final_pending': 0},
+                    ) as run_retry_cycles,
+                ):
                     result = await service.run_daily_incremental_refresh(
                         market_date=date(2026, 4, 14),
                         capture_limit=10,
@@ -928,9 +962,68 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(run_retry_cycles.call_args.kwargs['config'].market_date, date(2026, 4, 14))
         self.assertEqual(
             run_retry_cycles.call_args.kwargs['config'].roles,
-            ('eod-summarizer', 'technical-summarizer', 'fundamental-summarizer', 'signal-decider'),
+            (
+                'eod-summarizer',
+                'technical-summarizer',
+                'fundamental-summarizer',
+                'short-term-decider',
+                'signal-decider',
+            ),
         )
         self.assertEqual(result['feedback_followup'], {'completed': True, 'final_pending': 0})
+
+    async def test_daily_incremental_refresh_gates_feedback_followup_until_factor_prerequisites_finish(self):
+        client = FakeCaptureClient()
+        repository = FakeCaptureRepository()
+        repository.symbol_states = {
+            '005930': {
+                'stock_code': '005930',
+                'has_fundamentals': True,
+                'latest_fundamentals_receipt_date': '2026-04-01',
+                'latest_snapshot': {'id': 100},
+            },
+        }
+        service = DartFundamentalsCaptureService(
+            client=client,
+            repository=repository,
+            active_symbol_loader=lambda: [{'symbol': '005930'}],
+        )
+
+        with (
+            patch(
+                'app.dart.sync_service.dart_disclosure_sync_service.sync_disclosures_for_corporations',
+                return_value={
+                    'run_id': 77,
+                    'status': 'completed',
+                    'financial_report_events': 1,
+                },
+            ),
+            patch.object(
+                __import__('app.dart.fundamentals_capture_service', fromlist=['settings']).settings,
+                'openclaw_feedback_trigger_after_fundamentals_refresh',
+                True,
+            ),
+            patch(
+                'app.dart.fundamentals_capture_service.agent_feedback_prerequisite_service.inspect_feedback_prerequisites',
+                side_effect=lambda **_: _feedback_prerequisites(
+                    status='waiting',
+                    missing_stage_ids=['quality_factors', 'composite_factors'],
+                ),
+            ),
+            patch(
+                'app.dart.fundamentals_capture_service.agent_feedback_retry_service.run_retry_cycles',
+            ) as run_retry_cycles,
+        ):
+            result = await service.run_daily_incremental_refresh(
+                market_date=date(2026, 4, 14),
+                capture_limit=10,
+                fs_div='CFS',
+                trigger='test_daily',
+            )
+
+        run_retry_cycles.assert_not_called()
+        self.assertEqual(result['feedback_followup']['reason'], 'feedback_prerequisites_not_ready')
+        self.assertEqual(result['feedback_followup']['status'], 'waiting')
 
     async def test_daily_incremental_refresh_can_disable_hidden_followups_for_stage_orchestration(self):
         client = FakeCaptureClient()

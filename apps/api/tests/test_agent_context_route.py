@@ -1,11 +1,40 @@
 from datetime import date
 import unittest
+from unittest.mock import patch
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.api import routes_agent_context
+from app.agent_context.prerequisite_service import FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER
 from app.agent_context.runtime_state import RuntimeFeedbackStateStore
+
+
+def _feedback_prerequisites(*, status: str = 'ready', missing_stage_ids: list[str] | None = None) -> dict:
+    missing_stage_ids = list(missing_stage_ids or [])
+    ready = status == 'ready'
+    return {
+        'market_date': '2026-04-14',
+        'fs_div': 'CFS',
+        'status': status,
+        'ready': ready,
+        'required_stage_ids': list(FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER),
+        'ready_stage_ids': list(FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER) if ready else [],
+        'waiting_stage_ids': missing_stage_ids if status == 'waiting' else [],
+        'blocked_stage_ids': missing_stage_ids if status == 'blocked' else [],
+        'missing_prerequisites': [
+            {
+                'stage': stage_id,
+                'label': stage_id.replace('_', ' '),
+                'status': 'running' if status == 'waiting' else 'partial',
+                'gate_status': status,
+                'current_activity': f'{status} {stage_id}',
+                'details': {},
+            }
+            for stage_id in missing_stage_ids
+        ],
+        'stages': {},
+    }
 
 
 class FakeAgentContextReadService:
@@ -137,7 +166,7 @@ class FakeAgentFeedbackRetryService:
     def __init__(self):
         self.last_config = None
 
-    def run_retry_cycles(self, *, config):
+    def run_retry_cycles(self, *, config, force: bool = False):
         self.last_config = config
         return {
             'market_date': config.market_date.isoformat(),
@@ -146,6 +175,7 @@ class FakeAgentFeedbackRetryService:
             'max_cycles': config.max_cycles,
             'outer_batch_size': config.outer_batch_size,
             'reuse_existing': config.reuse_existing,
+            'force': force,
             'cycles': [],
             'final_pending': 0,
             'completed': True,
@@ -778,6 +808,12 @@ class AgentContextRouteTests(unittest.TestCase):
     def setUp(self):
         self.app = FastAPI()
         self.app.include_router(routes_agent_context.router)
+        self.prerequisite_patcher = patch(
+            'app.api.routes_agent_context.agent_feedback_prerequisite_service.inspect_feedback_prerequisites',
+            side_effect=lambda **_: _feedback_prerequisites(),
+        )
+        self.prerequisite_patcher.start()
+        self.addCleanup(self.prerequisite_patcher.stop)
 
     def test_symbol_day_context_route_calls_service(self):
         fake_service = FakeAgentContextReadService()
@@ -836,6 +872,31 @@ class AgentContextRouteTests(unittest.TestCase):
         self.assertEqual(summary['first_feedback_at'], '2026-04-14T01:00:00+00:00')
         self.assertEqual(summary['completed_feedback_per_minute'], 0.6)
         self.assertEqual(summary['estimated_completion_at'], '2026-04-14T01:05:00+00:00')
+
+    def test_symbol_dispatch_route_returns_waiting_gate_when_prerequisites_are_not_ready(self):
+        with patch(
+            'app.api.routes_agent_context.agent_feedback_prerequisite_service.inspect_feedback_prerequisites',
+            side_effect=lambda **_: _feedback_prerequisites(
+                status='waiting',
+                missing_stage_ids=['fundamentals_daily_refresh', 'quality_factors'],
+            ),
+        ):
+            client = TestClient(self.app)
+            response = client.post(
+                '/agent-context/feedback/dispatch/symbols',
+                json={
+                    'market_date': '2026-04-14',
+                    'symbols': ['005930'],
+                    'roles': ['technical-summarizer'],
+                    'wait_for_completion': False,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertTrue(payload['summary']['gated'])
+        self.assertEqual(payload['summary']['status'], 'waiting')
+        self.assertEqual(payload['items'], [])
 
     def test_symbol_dispatch_background_route_starts_durable_queued_run_and_reuses_same_run_id(self):
         fake_orchestrator = FakeBackgroundDispatchOrchestrator()

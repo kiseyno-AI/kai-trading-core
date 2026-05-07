@@ -4,6 +4,7 @@
 Computes or refreshes raw synthetic realized outcomes plus versioned grading rows for immutable stored `signal-decider` decision snapshots over a date range.
 
 The same evaluation refresh now also runs in the default daily EOD stage catalog as `signal_decider_evaluations`, which revisits the recent decision window after new price bars arrive.
+By default the compute route now gates on same-day feedback prerequisites for the requested date window. If fundamentals, filtering, or factor/scoring stages are still pending or blocked for the relevant market date, the response returns `summary.status=waiting|blocked`, `summary.gated=true`, and a `prerequisites` block instead of refreshing evaluations. Operators can bypass that check with `force_recompute=true`.
 
 ## Example request
 ```http

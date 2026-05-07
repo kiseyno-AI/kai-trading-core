@@ -18,6 +18,7 @@ from fastapi.encoders import jsonable_encoder
 from sqlalchemy import select
 
 from app.agent_context.feedback_service import agent_context_feedback_service
+from app.agent_context.prerequisite_service import agent_feedback_prerequisite_service
 from app.agent_context.eligibility import (
     AGENT_FEEDBACK_ELIGIBILITY_FILTERS,
     AGENT_FEEDBACK_ELIGIBILITY_RULE,
@@ -2304,10 +2305,44 @@ class AgentFeedbackOrchestrator:
         disclosures_limit: int = 5,
         reuse_existing: bool = True,
         request_run_id: str | None = None,
+        force: bool = False,
     ) -> dict[str, Any]:
         normalized_market_date = market_date if isinstance(market_date, date) else date.fromisoformat(market_date)
         specs = self._select_specs(roles=roles)
         requested_symbols = _normalize_requested_symbols(symbols)
+        prerequisites = agent_feedback_prerequisite_service.inspect_feedback_prerequisites(
+            market_date=normalized_market_date,
+            fs_div=fs_div,
+        )
+        if not force and not prerequisites['ready']:
+            return {
+                'request': {
+                    'market_date': normalized_market_date.isoformat(),
+                    'symbols': requested_symbols,
+                    'requested_symbols': requested_symbols,
+                    'request_run_id': None,
+                    'roles': [spec.role for spec in specs],
+                    'fs_div': fs_div,
+                    'disclosures_limit': disclosures_limit,
+                    'reuse_existing': reuse_existing,
+                    'scope': resolve_agent_feedback_scope(requested_symbols=requested_symbols),
+                    'eligibility_rule': AGENT_FEEDBACK_ELIGIBILITY_RULE,
+                    'eligibility_filters': list(AGENT_FEEDBACK_ELIGIBILITY_FILTERS),
+                    'skipped_symbols': [],
+                    'mode': 'role_sequential_runtime_buffered',
+                },
+                'summary': {
+                    'status': prerequisites['status'],
+                    'completed': 0,
+                    'failed': 0,
+                    'skipped': 0,
+                    'flushed_to_db': 0,
+                    'gated': True,
+                },
+                'items': [],
+                'failures': [],
+                'prerequisites': prerequisites,
+            }
         dispatch_symbols, skipped_symbols = _split_requested_symbols_by_agent_feedback_eligibility(
             market_date=normalized_market_date,
             requested_symbols=requested_symbols,
