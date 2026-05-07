@@ -192,17 +192,40 @@ class KISIntradaySnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload['coverage']['status'], 'available')
         self.assertEqual(payload['freshness_status'], 'fresh')
 
-    async def test_collect_snapshots_is_disabled_without_credentials(self) -> None:
+    async def test_collect_snapshots_is_disabled_without_credentials_before_universe_lookup(self) -> None:
         settings.kis_app_key = ''
         settings.kis_app_secret = ''
         client = FakeKISIntradayClient()
         service = KISIntradaySnapshotService(client=client)
 
-        with patch.object(client, 'fetch_domestic_quote', new=AsyncMock(side_effect=AssertionError('should not call KIS'))):
+        with (
+            patch.object(service, '_capture_universe', side_effect=AssertionError('should not load universe')),
+            patch.object(client, 'fetch_domestic_quote', new=AsyncMock(side_effect=AssertionError('should not call KIS'))),
+        ):
             result = await service.collect_snapshots(symbols=['005930'])
 
         self.assertEqual(result['status'], 'disabled')
         self.assertEqual(result['reason'], 'kis_credentials_missing')
+        self.assertEqual(result['requested_symbols'], ['005930'])
+        self.assertEqual(result['summary']['matched_symbol_count'], 1)
+        self.assertEqual(result['snapshots_persisted'], 0)
+        self.assertFalse(result['items'])
+
+    async def test_collect_snapshots_is_disabled_by_feature_flag_before_universe_lookup(self) -> None:
+        settings.kis_intraday_snapshot_enabled = False
+        client = FakeKISIntradayClient()
+        service = KISIntradaySnapshotService(client=client)
+
+        with (
+            patch.object(service, '_capture_universe', side_effect=AssertionError('should not load universe')),
+            patch.object(client, 'fetch_domestic_quote', new=AsyncMock(side_effect=AssertionError('should not call KIS'))),
+        ):
+            result = await service.collect_snapshots(symbols=['005930'])
+
+        self.assertEqual(result['status'], 'disabled')
+        self.assertEqual(result['reason'], 'kis_intraday_snapshot_disabled')
+        self.assertEqual(result['requested_symbols'], ['005930'])
+        self.assertEqual(result['summary']['matched_symbol_count'], 1)
         self.assertEqual(result['snapshots_persisted'], 0)
         self.assertFalse(result['items'])
 

@@ -793,8 +793,7 @@ class KISIntradaySnapshotService:
         include_news: bool = True,
     ) -> dict[str, Any]:
         runtime = self.runtime_status()
-        symbol_inputs = self._capture_universe(symbols)
-        requested_symbols = [item.symbol for item in symbol_inputs]
+        requested_symbols = _normalize_symbols(symbols) or []
         if not runtime['ready']:
             return {
                 'status': 'disabled',
@@ -814,6 +813,8 @@ class KISIntradaySnapshotService:
                 'failed_symbol_errors': [],
                 'items': [],
             }
+        symbol_inputs = self._capture_universe(symbols)
+        requested_symbols = [item.symbol for item in symbol_inputs]
         if not symbol_inputs:
             return {
                 'status': 'empty_universe',
