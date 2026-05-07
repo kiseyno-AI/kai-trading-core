@@ -1,7 +1,7 @@
 # GET /agent-context/symbol-day
 
 ## Summary
-Returns compact symbol/day analysis context for downstream agents. The payload combines the latest `quote_context` from `current_quote_cache` with persisted `price_context` from `daily_price_contexts`, structured factor-score summaries, and same-day `signal_features`. When `signal_features` are present, the row now explicitly marks whether the symbol carries direct KIS ranking evidence, owned-data fallback context, or both.
+Returns compact symbol/day analysis context for downstream agents. The payload combines the latest `quote_context` from `current_quote_cache` with persisted `price_context` from `daily_price_contexts`, structured factor-score summaries, and same-day `signal_features`. Major blocks now carry machine-readable `freshness_provenance`, and the top-level `context_provenance` mirror preserves stale, available-but-old, and fallback evidence even when a current block is absent.
 
 ## Example request
 ```http
@@ -49,7 +49,28 @@ GET /agent-context/symbol-day?market_date=2026-04-15&symbols=005930&fs_div=CFS&d
         "available": true,
         "source": "kis",
         "trade_date": "2026-04-15",
-        "cached_at": "2026-04-15T09:57:00+09:00"
+        "cached_at": "2026-04-15T09:57:00+09:00",
+        "freshness_provenance": {
+          "freshness_status": "fresh",
+          "provenance_status": "provider_sourced",
+          "issue_types": [],
+          "requested_market_date": "2026-04-15",
+          "as_of_market_date": "2026-04-15",
+          "as_of_timestamp": "2026-04-15T09:57:00+09:00",
+          "latest_available_market_date": "2026-04-15",
+          "latest_available_timestamp": "2026-04-15T09:57:00+09:00",
+          "trade_date_relation_to_request": "same_market_date",
+          "source_tables": ["current_quote_cache", "quote_snapshots"],
+          "source_provider": "kis",
+          "row_count": 1,
+          "history_row_count": 1,
+          "is_missing": false,
+          "is_stale": false,
+          "is_available_but_old": false,
+          "is_provider_sourced": true,
+          "is_derived": false,
+          "is_fallback": false
+        }
       },
       "price_context": {
         "trade_date": "2026-04-15",
@@ -64,6 +85,25 @@ GET /agent-context/symbol-day?market_date=2026-04-15&symbols=005930&fs_div=CFS&d
           "turnover_missing_or_zero": false,
           "gap_unreliable_due_to_open": false,
           "issue_codes": []
+        },
+        "freshness_provenance": {
+          "freshness_status": "fresh",
+          "provenance_status": "derived_from_provider_data",
+          "issue_types": [],
+          "requested_market_date": "2026-04-15",
+          "as_of_market_date": "2026-04-15",
+          "latest_available_market_date": "2026-04-15",
+          "trade_date_relation_to_request": "same_market_date",
+          "source_tables": ["daily_price_contexts", "daily_price_bars"],
+          "source_provider": "pykrx",
+          "row_count": 1,
+          "history_row_count": 7,
+          "is_missing": false,
+          "is_stale": false,
+          "is_available_but_old": false,
+          "is_provider_sourced": false,
+          "is_derived": true,
+          "is_fallback": false
         }
       },
       "signal_features": {
@@ -109,16 +149,138 @@ GET /agent-context/symbol-day?market_date=2026-04-15&symbols=005930&fs_div=CFS&d
               "status": "partial"
             }
           }
+        },
+        "freshness_provenance": {
+          "freshness_status": "fresh",
+          "provenance_status": "provider_plus_fallback",
+          "issue_types": ["derived_or_fallback"],
+          "requested_market_date": "2026-04-15",
+          "as_of_market_date": "2026-04-15",
+          "latest_available_market_date": "2026-04-15",
+          "trade_date_relation_to_request": "same_market_date",
+          "source_tables": ["daily_signal_features", "daily_price_bars", "current_quote_cache"],
+          "source_provider": "kis_ranking",
+          "row_count": 1,
+          "history_row_count": 1,
+          "is_missing": false,
+          "is_stale": false,
+          "is_available_but_old": false,
+          "is_provider_sourced": false,
+          "is_derived": true,
+          "is_fallback": true
         }
       },
       "scores": {
         "quality": {
           "status": "partial",
-          "score": 0.741
+          "score": 0.741,
+          "freshness_provenance": {
+            "freshness_status": "fresh",
+            "provenance_status": "derived_from_provider_data",
+            "issue_types": [],
+            "requested_market_date": "2026-04-15",
+            "as_of_market_date": "2026-04-15",
+            "latest_available_market_date": "2026-04-15",
+            "source_tables": ["daily_quality_factor_results"],
+            "source_provider": "internal_factor_pipeline",
+            "row_count": 1,
+            "history_row_count": 1
+          }
         },
         "momentum": {
           "status": "available",
           "score": 0.914
+        }
+      },
+      "persisted_factor_rows": {
+        "quality": {
+          "score": 0.741,
+          "freshness_provenance": {
+            "freshness_status": "fresh",
+            "provenance_status": "derived_from_provider_data",
+            "issue_types": [],
+            "requested_market_date": "2026-04-15",
+            "as_of_market_date": "2026-04-15",
+            "latest_available_market_date": "2026-04-15",
+            "source_tables": ["daily_quality_factor_results"],
+            "source_provider": "internal_factor_pipeline",
+            "row_count": 1,
+            "history_row_count": 1
+          }
+        }
+      },
+      "fundamentals": {
+        "latest_snapshot": {
+          "period": {
+            "period_end_date": "2024-12-31"
+          }
+        },
+        "freshness_provenance": {
+          "freshness_status": "available_but_old",
+          "provenance_status": "provider_sourced",
+          "issue_types": ["available_but_old"],
+          "requested_market_date": "2026-04-15",
+          "as_of_market_date": "2024-12-31",
+          "latest_available_market_date": "2024-12-31",
+          "source_tables": ["dart_fundamentals_snapshots"],
+          "source_provider": "dart"
+        }
+      },
+      "recent_disclosures": {
+        "count": 1,
+        "items": [
+          {
+            "receipt_no": "20260415000123"
+          }
+        ],
+        "freshness_provenance": {
+          "freshness_status": "available_but_old",
+          "provenance_status": "provider_sourced",
+          "issue_types": ["available_but_old"],
+          "requested_market_date": "2026-04-15",
+          "as_of_market_date": "2026-04-14",
+          "latest_available_market_date": "2026-04-14",
+          "source_tables": ["dart_disclosure_events"],
+          "source_provider": "dart"
+        }
+      },
+      "context_provenance": {
+        "quote_context": {
+          "freshness_status": "fresh",
+          "provenance_status": "provider_sourced",
+          "issue_types": []
+        },
+        "price_context": {
+          "freshness_status": "fresh",
+          "provenance_status": "derived_from_provider_data",
+          "issue_types": []
+        },
+        "signal_features": {
+          "freshness_status": "fresh",
+          "provenance_status": "provider_plus_fallback",
+          "issue_types": ["derived_or_fallback"],
+          "requested_symbol_coverage": {
+            "present_rows": 1,
+            "missing_rows": 0,
+            "coverage_status": "complete"
+          }
+        },
+        "fundamentals": {
+          "freshness_status": "available_but_old",
+          "provenance_status": "provider_sourced",
+          "issue_types": ["available_but_old"]
+        },
+        "recent_disclosures": {
+          "freshness_status": "available_but_old",
+          "provenance_status": "provider_sourced",
+          "issue_types": ["available_but_old"]
+        },
+        "factor_rows": {
+          "quality": {
+            "freshness_status": "fresh",
+            "provenance_status": "derived_from_provider_data",
+            "issue_types": []
+          }
         }
       },
       "context_completeness": {
@@ -147,3 +309,8 @@ GET /agent-context/symbol-day?market_date=2026-04-15&symbols=005930&fs_div=CFS&d
   ]
 }
 ```
+
+## Notes
+- `freshness_provenance` is attached to the concrete block payload when that block exists in the current response.
+- `context_provenance` is the authoritative stale/fallback mirror for major blocks and remains present even when `quote_context`, `price_context`, `signal_features`, or a stored factor row is `null` for the requested `market_date`.
+- Consumers should treat `freshness_status=stale` or `available_but_old` as "data exists, but it is older than the requested market date", not as a missing-data condition.

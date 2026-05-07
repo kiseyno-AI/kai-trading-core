@@ -80,6 +80,7 @@ def _serialize_feedback(record: AgentContextFeedback) -> dict[str, Any]:
         raw_categories = build_missing_data_categories(
             data_gaps_payload=record.data_gaps_payload,
             improvement_notes_payload=record.improvement_notes_payload,
+            context_payload=record.context_payload,
         )
     return {
         'id': record.id,
@@ -342,6 +343,7 @@ class AgentContextFeedbackRepository:
                         raw_categories = build_missing_data_categories(
                             data_gaps_payload=row['data_gaps_payload'],
                             improvement_notes_payload=row['improvement_notes_payload'],
+                            context_payload=row['context_payload'],
                         )
                     accepted.append(
                         {
@@ -424,6 +426,7 @@ class AgentContextFeedbackRepository:
                         else build_missing_data_categories(
                             data_gaps_payload=row.data_gaps_payload,
                             improvement_notes_payload=row.improvement_notes_payload,
+                            context_payload=row.context_payload,
                         )
                     ),
                 }
@@ -515,6 +518,7 @@ class AgentContextFeedbackService:
             'missing_data_categories_payload': build_missing_data_categories(
                 data_gaps_payload=data_gaps_payload,
                 improvement_notes_payload=improvement_notes_payload,
+                context_payload=context_payload,
             ),
             'context_payload': context_payload,
         }

@@ -107,6 +107,7 @@ class AgentContextMissingDataReportRepository:
                     AgentContextFeedback.data_gaps_payload,
                     AgentContextFeedback.improvement_notes_payload,
                     AgentContextFeedback.missing_data_categories_payload,
+                    AgentContextFeedback.context_payload,
                 )
                 .where(AgentContextFeedback.market_date >= market_date_from)
                 .where(AgentContextFeedback.market_date <= market_date_to)
@@ -220,6 +221,7 @@ class AgentContextMissingDataReportService:
             classification = build_missing_data_classification(
                 data_gaps_payload=row.get('data_gaps_payload'),
                 improvement_notes_payload=row.get('improvement_notes_payload'),
+                context_payload=row.get('context_payload'),
             )
             raw_categories = classification['categories']
             if persist_missing_categories and row.get('missing_data_categories_payload') != raw_categories:
@@ -290,12 +292,20 @@ class AgentContextMissingDataReportService:
                         'roles': set(),
                         'example_notes': [],
                         'date_counts': {},
+                        'context_issue_type_counts': {},
                     },
                 )
                 aggregate['feedback_row_keys'].add(row_key)
                 aggregate['symbols'].add(row['symbol'])
                 aggregate['agents'].add(row['agent_name'])
                 aggregate['roles'].add(role)
+                for issue_type in item.get('context_issue_types', []):
+                    normalized_issue_type = str(issue_type).strip().lower()
+                    if not normalized_issue_type:
+                        continue
+                    aggregate['context_issue_type_counts'][normalized_issue_type] = (
+                        aggregate['context_issue_type_counts'].get(normalized_issue_type, 0) + 1
+                    )
                 for note in item.get('notes', []):
                     if note not in aggregate['example_notes'] and len(aggregate['example_notes']) < self.category_note_example_limit:
                         aggregate['example_notes'].append(note)
@@ -320,11 +330,14 @@ class AgentContextMissingDataReportService:
 
         categories_payload: list[dict[str, Any]] = []
         status_counts = {}
+        context_issue_type_counts = {}
         for category in sorted(
             category_aggregates.values(),
             key=lambda item: (-len(item['feedback_row_keys']), item['category']),
         ):
             status_counts[category['status']] = status_counts.get(category['status'], 0) + 1
+            for issue_type, count in category['context_issue_type_counts'].items():
+                context_issue_type_counts[issue_type] = context_issue_type_counts.get(issue_type, 0) + int(count)
             categories_payload.append(
                 {
                     'category': category['category'],
@@ -344,6 +357,7 @@ class AgentContextMissingDataReportService:
                     'agents': sorted(category['agents']),
                     'roles': sorted(category['roles']),
                     'example_notes': list(category['example_notes']),
+                    'context_issue_type_counts': dict(category['context_issue_type_counts']),
                     'date_breakdown': [
                         {
                             'market_date': market_date_iso,
@@ -402,6 +416,7 @@ class AgentContextMissingDataReportService:
                 'distinct_roles_matched': len(matched_roles),
                 'category_count': len(categories_payload),
                 'status_counts': status_counts,
+                'context_issue_type_counts': context_issue_type_counts,
                 'persisted_updates': persisted_updates,
             },
             'categories': categories_payload,
