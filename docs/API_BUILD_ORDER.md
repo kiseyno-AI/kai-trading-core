@@ -21,31 +21,34 @@
 18. Stored trending stocks read route
 19. KIS realtime trending route
 20. KIS daily ranking signal-feature collect/inspect routes
-21. KIS daily market-risk snapshot collect/inspect routes
-22. KIS daily market-risk filter compute/read routes
-23. Daily Piotroski filter result read route
-24. Daily low-risk factor compute/read routes
-25. Agent feedback intake/read routes for OpenClaw summaries
-26. Role-specific post-EOD agent feedback dispatch route
-27. Daily price momentum factor compute/inspect routes
-28. Daily value factor compute/read routes
-29. Daily beta factor compute/read routes
-30. Daily advanced value factor compute/read routes
-31. Daily unified value factor compute/read routes
-32. Daily quality factor compute/read routes
-33. Daily composite factor compute/read routes
-34. Signal-decider evaluation, diagnostics, and policy-candidate routes
-35. Internal trading order control, inquiry, and reconciliation routes
-36. Signal-decider next-open execution planning and market-open submit routes
-37. Signal-decider intraday auto-sell diagnostics and runtime submit routes
-38. Signal-decider actual execution outcome reporting routes
-39. Signal-decider replay review calendar routes
-40. Core-owned exec runtime dashboard read APIs
+21. KIS intraday execution-context snapshot collect/inspect routes
+22. KIS daily market-risk snapshot collect/inspect routes
+23. KIS daily market-risk filter compute/read routes
+24. Daily Piotroski filter result read route
+25. Daily low-risk factor compute/read routes
+26. Agent feedback intake/read routes for OpenClaw summaries
+27. Role-specific post-EOD agent feedback dispatch route
+28. Daily price momentum factor compute/inspect routes
+29. Daily value factor compute/read routes
+30. Daily beta factor compute/read routes
+31. Daily advanced value factor compute/read routes
+32. Daily unified value factor compute/read routes
+33. Daily quality factor compute/read routes
+34. Daily composite factor compute/read routes
+35. Signal-decider evaluation, diagnostics, and policy-candidate routes
+36. Internal trading order control, inquiry, and reconciliation routes
+37. Signal-decider next-open execution planning and market-open submit routes
+38. Signal-decider intraday auto-sell diagnostics and runtime submit routes
+39. Signal-decider actual execution outcome reporting routes
+40. Signal-decider replay review calendar routes
+41. Core-owned exec runtime dashboard read APIs
 
 ## Current routes
 - `POST /broker/kis/token`
 - `GET /broker/kis/health`
 - `GET /broker/kis/quote?symbol=005930&market_code=J`
+- `POST /broker/kis/intraday-snapshots/collect?symbols=005930,000660&market_code=J&max_ranking_pages=2&max_news_items=5&include_news=true`
+- `GET /broker/kis/intraday-snapshots?symbols=005930,000660&limit=100`
 - `POST /trading/orders/buy`
 - `POST /trading/orders/sell`
 - `POST /trading/orders/reconcile`
@@ -252,7 +255,15 @@
 - Realtime notices append durable rows into `broker_order_events` with `source=ws_notice`, preserve the raw decrypted field payload, and patch the current `broker_orders` snapshot when the notice advances the known order state.
 - Duplicate notices are deduplicated through a stable websocket event fingerprint. Older notices can still be persisted for audit, but they do not regress a newer `broker_orders` snapshot.
 - `GET /broker/kis/health` now includes a `realtime_order_notices` block with connection status, last message timing, reconnect attempts, subscription or auth lifecycle state, last fatal vs recoverable error, and ingest counters.
-- `GET /broker/kis/health` also includes `market_snapshot_runtime` and `portfolio_summary_runtime` so operators can confirm route-specific readiness without triggering the full downstream payloads.
+- `GET /broker/kis/health` also includes `market_snapshot_runtime`, `portfolio_summary_runtime`, and `intraday_snapshot_runtime` so operators can confirm route-specific readiness without triggering the full downstream payloads.
+
+## KIS intraday snapshot notes
+- `kis_intraday_snapshots` is the append-only intraday history table for execution-aware KIS captures, and `current_kis_intraday_snapshot_cache` is the latest-per-symbol cache that powers fast reads and agent context enrichment.
+- `POST /broker/kis/intraday-snapshots/collect` is the credential-aware capture path separate from the PyKRX/DART EOD jobs. It collects current quote, orderbook, ranking/liquidity, investor/program activity, and optional KIS news-title hints where available, then persists both history and current-cache rows with `source`, `feature_version`, `market_code`, `as_of_market_date`, `as_of_timestamp`, availability/freshness, and per-surface provenance.
+- The collect route is intentionally safe when KIS is not configured: it returns `status=disabled` with `runtime.blocking_reasons` instead of making partial live requests.
+- `GET /broker/kis/intraday-snapshots` is the thin read API for the current cache. It returns explicit `available`, `partial`, `unavailable`, `fresh`, and `stale` summary counts plus the normalized per-symbol snapshot payload.
+- The normalized payload exposes `quote`, `orderbook`, `liquidity`, `investor_program_activity`, and `news_hints` blocks. High-value execution-context fields include spread, orderbook imbalance, volume-power/rank, quote-balance rank, investor/program net activity, and headline-level event tags inferred from KIS news titles.
+- For shell-driven operations, prefer `python3.11 -m app.internal.ops kis-intraday-snapshots-collect --symbols 005930 --include-news true` from `apps/api`.
 
 ## EOD freshness read-layer notes
 - Canonical semantics live in `docs/EOD_STATUS_SEMANTICS_CONTRACT.md`.
@@ -354,6 +365,7 @@
 - Symbol-day context now also includes `market_relative_context` derived from stored `daily_price_bars`: per-market up/down/flat breadth counts plus each symbol's same-market return and volume percentiles when sufficient prior-bar context exists. Requested-universe coverage is surfaced under `summary.context_completeness` and repeated per item under `context_completeness.requested_symbol_coverage`.
 - Symbol-day context now also includes persisted PyKRX enrichment blocks when they exist for the requested date: `sector_peer_context`, `market_breadth_context`, `investor_flow_context`, `short_selling_context`, and `valuation_context`. These expose sector/peer grouping, market breadth, investor-flow by symbol plus market, short-selling metrics, valuation snapshot fields, and foreign-ownership / exhaustion rates without requiring live broker wiring.
 - Symbol-day context now also includes `quote_context` from the latest `current_quote_cache` row when one exists. It keeps quote availability explicit, carries `cached_at` freshness metadata, and exposes last-known bid/ask spread only when those fields were actually present upstream.
+- Symbol-day context now also includes `intraday_execution_context` from `current_kis_intraday_snapshot_cache` when one exists. This block is intentionally separate from completed EOD facts and carries normalized intraday `quote`, `orderbook`, `liquidity`, `investor_program_activity`, and `news_hints` sub-blocks plus explicit `coverage`, `availability`, and freshness/provenance metadata.
 - Symbol-day context now also includes `price_context` plus up to seven recent persisted `price_context_history` entries read from `daily_price_contexts`, which the pykrx EOD pipeline derives from stored `daily_price_bars`: OHLC, intraday range, candle body and wick interpretation, close location inside the day's range, gap-versus-previous-close fields when a valid open exists, derived liquidity (`turnover_source`, provider vs estimated turnover), and explicit `price_bar_quality` flags such as `open_price_zero`, `turnover_missing_or_zero`, and `gap_unreliable_due_to_open`.
 - Major machine-consumption blocks now also carry `freshness_provenance`: `quote_context`, `price_context`, `signal_features`, `fundamentals`, `recent_disclosures`, each stored factor row, and the derived `scores` family mirrors. The metadata is machine-readable rather than prose-only: `freshness_status` (`fresh`, `stale`, `available_but_old`, `missing`), `provenance_status` (`provider_sourced`, `derived_from_provider_data`, `fallback_from_owned_data`, `provider_plus_fallback`), `issue_types`, requested vs latest available market date/timestamp, source tables/provider, row counts, and requested-symbol coverage where relevant.
 - Symbol-day context now also includes top-level `context_provenance` so consumers can still see stale or fallback evidence even when the current block payload is `null`. This is the guardrail for "available but old" versus truly missing context: stale existing rows stay visible as stale metadata instead of being silently omitted or misreported as missing.

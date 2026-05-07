@@ -67,6 +67,34 @@ class FakePortfolioSummaryService:
         }
 
 
+class FakeKISIntradaySnapshotService:
+    def runtime_status(self) -> dict:
+        return {
+            'enabled': True,
+            'ready': True,
+            'credentials_configured': True,
+            'kis_use_mock': True,
+            'market_code': 'J',
+            'max_ranking_pages': 2,
+            'news_limit': 5,
+            'blocking_reasons': [],
+        }
+
+    async def collect_snapshots(self, **kwargs) -> dict:
+        return {
+            'status': 'ok',
+            'requested_symbols': kwargs.get('symbols') or [],
+            'snapshots_persisted': 1,
+            'items': [{'symbol': '005930', 'availability_status': 'available'}],
+        }
+
+    def inspect(self, **kwargs) -> dict:
+        return {
+            'summary': {'entries': 1, 'available_count': 1, 'partial_count': 0, 'unavailable_count': 0},
+            'items': [{'symbol': '005930', 'availability_status': 'available', 'freshness_status': 'fresh'}],
+        }
+
+
 class KISRouteTests(unittest.TestCase):
     def setUp(self) -> None:
         self.app = FastAPI()
@@ -75,16 +103,19 @@ class KISRouteTests(unittest.TestCase):
         self.original_realtime_service = routes_kis.kis_realtime_order_notice_service
         self.original_market_snapshot_service = routes_kis.market_snapshot_service
         self.original_portfolio_summary_service = routes_kis.portfolio_summary_service
+        self.original_intraday_snapshot_service = routes_kis.kis_intraday_snapshot_service
         routes_kis.kis_client = FakeKISClient()
         routes_kis.kis_realtime_order_notice_service = FakeRealtimeOrderNoticeService()
         routes_kis.market_snapshot_service = FakeMarketSnapshotService()
         routes_kis.portfolio_summary_service = FakePortfolioSummaryService()
+        routes_kis.kis_intraday_snapshot_service = FakeKISIntradaySnapshotService()
 
     def tearDown(self) -> None:
         routes_kis.kis_client = self.original_client
         routes_kis.kis_realtime_order_notice_service = self.original_realtime_service
         routes_kis.market_snapshot_service = self.original_market_snapshot_service
         routes_kis.portfolio_summary_service = self.original_portfolio_summary_service
+        routes_kis.kis_intraday_snapshot_service = self.original_intraday_snapshot_service
 
     def test_health_route_includes_realtime_order_notice_snapshot(self) -> None:
         client = TestClient(self.app)
@@ -100,6 +131,28 @@ class KISRouteTests(unittest.TestCase):
         self.assertTrue(payload['portfolio_summary_runtime']['ready'])
         self.assertEqual(payload['portfolio_summary_runtime']['configured_account_count'], 2)
         self.assertEqual(payload['portfolio_summary_runtime']['kis_environment'], 'real')
+        self.assertTrue(payload['intraday_snapshot_runtime']['ready'])
+        self.assertEqual(payload['intraday_snapshot_runtime']['market_code'], 'J')
+
+    def test_intraday_snapshot_collect_route_passes_scope_through(self) -> None:
+        client = TestClient(self.app)
+        response = client.post('/broker/kis/intraday-snapshots/collect?symbols=005930,000660&max_news_items=2')
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload['status'], 'ok')
+        self.assertEqual(payload['requested_symbols'], ['005930', '000660'])
+        self.assertEqual(payload['snapshots_persisted'], 1)
+
+    def test_intraday_snapshot_read_route_returns_summary(self) -> None:
+        client = TestClient(self.app)
+        response = client.get('/broker/kis/intraday-snapshots?symbols=005930&limit=5')
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload['summary']['entries'], 1)
+        self.assertEqual(payload['items'][0]['symbol'], '005930')
+        self.assertEqual(payload['items'][0]['freshness_status'], 'fresh')
 
 
 if __name__ == '__main__':

@@ -243,6 +243,30 @@ class InternalOpsTests(unittest.TestCase):
         self.assertEqual(collect_features.call_args.kwargs['sources'], ['volume-power', 'overtime-volume'])
         self.assertEqual(collect_features.call_args.kwargs['max_pages'], 2)
 
+    def test_collect_kis_intraday_snapshots_uses_direct_service_call(self) -> None:
+        with (
+            patch('app.internal.ops.bootstrap_runtime') as bootstrap_runtime,
+            patch(
+                'app.internal.ops.kis_intraday_snapshot_service.collect_snapshots',
+                new=AsyncMock(return_value={'snapshots_persisted': 1}),
+            ) as collect_snapshots,
+        ):
+            result = ops.collect_kis_intraday_snapshots(
+                symbols='005930,000660',
+                market_code='J',
+                max_ranking_pages=1,
+                max_news_items=2,
+                include_news=False,
+            )
+
+        bootstrap_runtime.assert_called_once_with()
+        self.assertEqual(result, {'snapshots_persisted': 1})
+        self.assertEqual(collect_snapshots.call_args.kwargs['symbols'], ['005930', '000660'])
+        self.assertEqual(collect_snapshots.call_args.kwargs['market_code'], 'J')
+        self.assertEqual(collect_snapshots.call_args.kwargs['max_ranking_pages'], 1)
+        self.assertEqual(collect_snapshots.call_args.kwargs['max_news_items'], 2)
+        self.assertEqual(collect_snapshots.call_args.kwargs['include_news'], False)
+
     def test_collect_daily_piotroski_filter_results_uses_direct_service_call(self) -> None:
         with (
             patch('app.internal.ops.bootstrap_runtime') as bootstrap_runtime,

@@ -215,11 +215,17 @@ CATEGORY_DEFINITIONS: tuple[MissingDataCategoryDefinition, ...] = (
         key='after_hours_intraday_realtime',
         label='after-hours / intraday / realtime',
         status='partially_available',
-        internal_tables=('quote_snapshots', 'current_quote_cache', 'daily_signal_features'),
+        internal_tables=(
+            'quote_snapshots',
+            'current_quote_cache',
+            'daily_signal_features',
+            'kis_intraday_snapshots',
+            'current_kis_intraday_snapshot_cache',
+        ),
         external_providers=('KIS realtime quote/trending APIs',),
         operator_hint=(
-            'Current quote and ranking snapshots exist, but full intraday or after-hours history is not persisted '
-            'end-to-end yet.'
+            'Current quote, ranking, and KIS intraday execution-context snapshots now persist quote/orderbook/'
+            'liquidity context, but full tick or after-hours history is still not stored end-to-end.'
         ),
         keywords=(
             '시간외',

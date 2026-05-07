@@ -387,6 +387,16 @@ class KISClient:
             },
         )
 
+    async def fetch_domestic_orderbook(self, symbol: str, market_code: str = 'J') -> dict:
+        return await self._get(
+            '/uapi/domestic-stock/v1/quotations/inquire-asking-price-exp-ccn',
+            tr_id='FHKST01010200',
+            params={
+                'FID_COND_MRKT_DIV_CODE': market_code,
+                'FID_INPUT_ISCD': symbol,
+            },
+        )
+
     async def fetch_domestic_quote_risk_status(self, symbol: str, market_code: str = 'J') -> dict:
         return await self._get(
             '/uapi/domestic-stock/v1/quotations/inquire-price-2',
@@ -458,6 +468,60 @@ class KISClient:
                 'FID_INPUT_ISCD': market_code,
                 'FID_INPUT_ISCD_2': sector_code,
             },
+        )
+
+    async def fetch_domestic_program_trade_by_stock(
+        self,
+        symbol: str,
+        *,
+        market_code: str = 'J',
+    ) -> dict:
+        return await self._get(
+            '/uapi/domestic-stock/v1/quotations/program-trade-by-stock',
+            tr_id='FHPPG04650101',
+            params={
+                'FID_COND_MRKT_DIV_CODE': market_code,
+                'FID_INPUT_ISCD': symbol,
+            },
+        )
+
+    async def fetch_domestic_investor_trend_estimate(self, symbol: str) -> dict:
+        return await self._get(
+            '/uapi/domestic-stock/v1/quotations/investor-trend-estimate',
+            tr_id='HHPTJ04160200',
+            params={
+                'MKSC_SHRN_ISCD': symbol,
+            },
+        )
+
+    async def fetch_domestic_news_titles(
+        self,
+        *,
+        symbol: str = '',
+        news_offer_enterprise_code: str = '',
+        market_class_code: str = '',
+        title_contains: str = '',
+        input_date: str = '',
+        input_hour: str = '',
+        rank_sort_cls_code: str = '',
+        input_serial_number: str = '',
+        max_pages: int = 10,
+    ) -> dict:
+        return await self._get_paginated_ranking(
+            '/uapi/domestic-stock/v1/quotations/news-title',
+            tr_id='FHKST01011800',
+            params={
+                'FID_NEWS_OFER_ENTP_CODE': news_offer_enterprise_code,
+                'FID_COND_MRKT_CLS_CODE': market_class_code,
+                'FID_INPUT_ISCD': symbol,
+                'FID_TITL_CNTT': title_contains,
+                'FID_INPUT_DATE_1': input_date,
+                'FID_INPUT_HOUR_1': input_hour,
+                'FID_RANK_SORT_CLS_CODE': rank_sort_cls_code,
+                'FID_INPUT_SRNO': input_serial_number,
+            },
+            output_keys=('output',),
+            max_pages=max_pages,
         )
 
     async def submit_domestic_cash_order(
@@ -877,6 +941,39 @@ class KISClient:
                 'FID_VOL_CNT': '0',
                 'FID_INPUT_DATE_1': '0',
             },
+        )
+
+    async def fetch_domestic_quote_balance_ranking(
+        self,
+        *,
+        market_code: str = 'J',
+        input_iscd: str = '0000',
+        rank_sort_cls_code: str = '0',
+        div_cls_code: str = '0',
+        target_cls_code: str = '0',
+        target_exclude_cls_code: str = '0',
+        min_price: str = '',
+        max_price: str = '',
+        min_volume: str = '',
+        max_pages: int = 10,
+    ) -> dict:
+        return await self._get_paginated_ranking(
+            '/uapi/domestic-stock/v1/ranking/quote-balance',
+            tr_id='FHPST01720000',
+            params={
+                'fid_vol_cnt': min_volume,
+                'fid_cond_mrkt_div_code': market_code,
+                'fid_cond_scr_div_code': '20172',
+                'fid_input_iscd': input_iscd,
+                'fid_rank_sort_cls_code': rank_sort_cls_code,
+                'fid_div_cls_code': div_cls_code,
+                'fid_trgt_cls_code': target_cls_code,
+                'fid_trgt_exls_cls_code': target_exclude_cls_code,
+                'fid_input_price_1': min_price,
+                'fid_input_price_2': max_price,
+            },
+            output_keys=('output',),
+            max_pages=max_pages,
         )
 
     async def fetch_domestic_fluctuation_rank(self, market_code: str = 'J', count: int = 20) -> dict:
