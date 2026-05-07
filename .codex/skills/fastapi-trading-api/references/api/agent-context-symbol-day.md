@@ -1,7 +1,7 @@
 # GET /agent-context/symbol-day
 
 ## Summary
-Returns compact symbol/day analysis context for downstream agents. The `price_context` block is read from persisted `daily_price_contexts`, not derived on request, and `price_context_history` carries up to the latest seven stored rows ending at the requested `market_date`. The same response also includes structured `scores`, compact `persisted_factor_rows`, `market_relative_context`, and `context_completeness` metadata so downstream agents can distinguish present factor rows, genuinely missing rows, null submetrics, sparse `daily_signal_features`, and unavailable peer mappings without guessing.
+Returns compact symbol/day analysis context for downstream agents. The payload now combines the latest `quote_context` from `current_quote_cache` with persisted `price_context` from `daily_price_contexts`, including quote freshness, optional bid/ask spread, derived liquidity (`turnover_source`, provider vs estimated turnover), and explicit `price_bar_quality` flags for zero-open or zero-turnover bars. `price_context_history` still carries up to the latest seven stored rows ending at the requested `market_date`, and the same response keeps structured `scores`, compact `persisted_factor_rows`, `market_relative_context`, and `context_completeness` metadata so downstream agents can distinguish present factor rows, genuinely missing rows, null submetrics, sparse `daily_signal_features`, and unavailable peer mappings without guessing.
 
 ## Example request
 ```http
@@ -20,6 +20,7 @@ GET /agent-context/symbol-day?market_date=2026-04-15&symbols=005930&fs_div=CFS&d
   "summary": {
     "requested_symbol_count": 1,
     "matched_symbol_count": 1,
+    "quote_context_count": 1,
     "price_context_count": 1,
     "factor_row_counts": {
       "unified_value": 1,
@@ -43,6 +44,22 @@ GET /agent-context/symbol-day?market_date=2026-04-15&symbols=005930&fs_div=CFS&d
       "symbol": "005930",
       "market_date": "2026-04-15",
       "company": {"name_ko": "삼성전자", "market": "KOSPI"},
+      "quote_context": {
+        "available": true,
+        "source": "kis",
+        "trade_date": "2026-04-15",
+        "cached_at": "2026-04-15T09:57:00+09:00",
+        "freshness": {
+          "trade_date_relation_to_request": "same_market_date",
+          "same_market_date_as_request": true
+        },
+        "spread": {
+          "available": true,
+          "bid_price": 72050,
+          "ask_price": 72150,
+          "spread_points": 100
+        }
+      },
       "market_relative_context": {
         "status": "available",
         "market": "KOSPI",
@@ -62,6 +79,17 @@ GET /agent-context/symbol-day?market_date=2026-04-15&symbols=005930&fs_div=CFS&d
         "high_price": 72500,
         "low_price": 70300,
         "close_price": 72100,
+        "liquidity": {
+          "turnover_krw": 9300000000,
+          "turnover_source": "provider",
+          "turnover_is_estimated": false
+        },
+        "price_bar_quality": {
+          "open_price_zero": false,
+          "turnover_missing_or_zero": false,
+          "gap_unreliable_due_to_open": false,
+          "issue_codes": []
+        },
         "candle": {"direction": "bullish", "body_size": "medium", "wick_bias": "upper"},
         "session_range": {
           "points": 2200,
@@ -75,7 +103,8 @@ GET /agent-context/symbol-day?market_date=2026-04-15&symbols=005930&fs_div=CFS&d
           "gap_points": 400,
           "gap_percent": 0.5682,
           "direction": "up",
-          "filled_intraday": true
+          "filled_intraday": true,
+          "reliable": true
         }
       },
       "price_context_history": [

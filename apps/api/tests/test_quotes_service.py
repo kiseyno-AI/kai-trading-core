@@ -180,13 +180,27 @@ class QuoteServiceTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch('app.quotes.service.get_market_state', return_value=market_state),
             patch.object(service, '_resolve_company_name', new=resolve_company_name),
-            patch.object(service.client, 'fetch_domestic_quote', new=AsyncMock(return_value={'output': {'stck_prpr': '61500'}})),
+            patch.object(
+                service.client,
+                'fetch_domestic_quote',
+                new=AsyncMock(
+                    return_value={
+                        'output': {
+                            'stck_prpr': '61500',
+                            'bidp': '61400',
+                            'askp': '61500',
+                        }
+                    }
+                ),
+            ),
             patch('app.quotes.service.persist_quote_snapshot'),
         ):
             result = await service.get_quote('005930')
 
         self.assertEqual(result['source'], 'kis')
         self.assertEqual(result['company_name'], 'Samsung Electronics')
+        self.assertEqual(result['bid_price'], 61400)
+        self.assertEqual(result['ask_price'], 61500)
         resolve_company_name.assert_awaited_once_with('005930')
 
 

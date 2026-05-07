@@ -33,6 +33,24 @@ def _to_float(value: Any) -> float | None:
     return None
 
 
+def _to_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, Decimal):
+        return int(value)
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str):
+        text = value.strip().replace(',', '')
+        if not text:
+            return None
+        try:
+            return int(float(text))
+        except ValueError:
+            return None
+    return None
+
+
 def _round_float(value: float | None, *, digits: int = 4) -> float | None:
     if value is None:
         return None
@@ -87,6 +105,77 @@ def _classify_close_position(position: float | None) -> str | None:
     return 'near_high'
 
 
+def _build_liquidity_context(
+    *,
+    close_price: int,
+    volume: int | None,
+    turnover: int | None,
+) -> dict[str, Any]:
+    provider_turnover_krw = turnover if turnover is not None and turnover > 0 else None
+    estimated_turnover_krw = close_price * volume if close_price > 0 and volume is not None and volume > 0 else None
+    if provider_turnover_krw is not None:
+        turnover_source = 'provider'
+        turnover_krw = provider_turnover_krw
+    elif estimated_turnover_krw is not None:
+        turnover_source = 'estimated'
+        turnover_krw = estimated_turnover_krw
+    else:
+        turnover_source = 'missing'
+        turnover_krw = None
+    return {
+        'turnover_krw': turnover_krw,
+        'turnover_source': turnover_source,
+        'turnover_is_estimated': turnover_source == 'estimated',
+        'provider_turnover_krw': provider_turnover_krw,
+        'estimated_turnover_krw': estimated_turnover_krw,
+    }
+
+
+def _build_price_bar_quality(
+    *,
+    open_price: int,
+    high_price: int,
+    low_price: int,
+    close_price: int,
+    volume: int | None,
+    turnover: int | None,
+) -> dict[str, Any]:
+    open_price_zero = open_price <= 0
+    turnover_missing_or_zero = turnover is None or turnover <= 0
+    volume_zero = volume is None or volume <= 0
+    gap_unreliable_due_to_open = open_price_zero
+    possible_suspension_or_special_session = (
+        open_price_zero
+        and close_price > 0
+        and (
+            volume_zero
+            or turnover_missing_or_zero
+            or high_price <= 0
+            or low_price <= 0
+        )
+    )
+    issue_codes = [
+        code
+        for code, is_present in (
+            ('open_price_zero', open_price_zero),
+            ('turnover_missing_or_zero', turnover_missing_or_zero),
+            ('volume_zero', volume_zero),
+            ('gap_unreliable_due_to_open', gap_unreliable_due_to_open),
+            ('possible_suspension_or_special_session', possible_suspension_or_special_session),
+        )
+        if is_present
+    ]
+    return {
+        'open_price_zero': open_price_zero,
+        'turnover_missing_or_zero': turnover_missing_or_zero,
+        'volume_zero': volume_zero,
+        'gap_unreliable_due_to_open': gap_unreliable_due_to_open,
+        'possible_suspension_or_special_session': possible_suspension_or_special_session,
+        'has_any_issue': bool(issue_codes),
+        'issue_codes': issue_codes,
+    }
+
+
 def build_price_context(price_bars: list[dict[str, Any]]) -> dict[str, Any] | None:
     if not price_bars:
         return None
@@ -94,37 +183,58 @@ def build_price_context(price_bars: list[dict[str, Any]]) -> dict[str, Any] | No
     current = price_bars[0]
     previous = price_bars[1] if len(price_bars) > 1 else None
 
-    open_price = current.get('open_price')
-    high_price = current.get('high_price')
-    low_price = current.get('low_price')
-    close_price = current.get('close_price')
+    open_price = _to_int(current.get('open_price'))
+    high_price = _to_int(current.get('high_price'))
+    low_price = _to_int(current.get('low_price'))
+    close_price = _to_int(current.get('close_price'))
     if None in (open_price, high_price, low_price, close_price):
         return None
+    volume = _to_int(current.get('volume'))
+    turnover = _to_int(current.get('turnover'))
+    previous_close_price = _to_int(previous.get('close_price')) if previous else None
+    has_valid_open = open_price > 0
 
-    range_points = max(int(high_price) - int(low_price), 0)
-    body_points_signed = int(close_price) - int(open_price)
-    body_points = abs(body_points_signed)
-    upper_wick_points = max(int(high_price) - max(int(open_price), int(close_price)), 0)
-    lower_wick_points = max(min(int(open_price), int(close_price)) - int(low_price), 0)
+    range_points = max(high_price - low_price, 0)
     close_position_in_range = (
-        _round_float((int(close_price) - int(low_price)) / range_points) if range_points > 0 else None
+        _round_float((close_price - low_price) / range_points) if range_points > 0 else None
     )
-    body_percent_of_range = _percent(body_points, range_points)
-    previous_close_price = previous.get('close_price') if previous else None
-    gap_points = int(open_price) - int(previous_close_price) if previous_close_price is not None else None
+    if has_valid_open:
+        body_points_signed = close_price - open_price
+        body_points = abs(body_points_signed)
+        body_percent_of_range = _percent(body_points, range_points)
+        upper_wick_points = max(high_price - max(open_price, close_price), 0)
+        lower_wick_points = max(min(open_price, close_price) - low_price, 0)
+        body_percent_of_open = _percent(body_points, open_price)
+        session_range_percent_of_open = _percent(range_points, open_price)
+        wick_bias = _classify_wick_bias(
+            upper_wick_points=upper_wick_points,
+            lower_wick_points=lower_wick_points,
+        )
+        if body_points_signed > 0:
+            candle_direction = 'bullish'
+        elif body_points_signed < 0:
+            candle_direction = 'bearish'
+        else:
+            candle_direction = 'flat'
+    else:
+        body_points_signed = None
+        body_points = None
+        body_percent_of_range = None
+        upper_wick_points = None
+        lower_wick_points = None
+        body_percent_of_open = None
+        session_range_percent_of_open = None
+        wick_bias = None
+        candle_direction = 'unknown'
+
+    gap_reliable = previous_close_price is not None and previous_close_price > 0 and has_valid_open
+    gap_points = open_price - previous_close_price if gap_reliable else None
     gap_percent = _percent(gap_points, previous_close_price) if gap_points is not None else None
     gap_filled_intraday = None
     if gap_points is not None and gap_points > 0:
-        gap_filled_intraday = int(low_price) <= int(previous_close_price)
+        gap_filled_intraday = low_price <= previous_close_price
     elif gap_points is not None and gap_points < 0:
-        gap_filled_intraday = int(high_price) >= int(previous_close_price)
-
-    if body_points_signed > 0:
-        candle_direction = 'bullish'
-    elif body_points_signed < 0:
-        candle_direction = 'bearish'
-    else:
-        candle_direction = 'flat'
+        gap_filled_intraday = high_price >= previous_close_price
 
     if gap_points is None:
         gap_direction = None
@@ -135,42 +245,56 @@ def build_price_context(price_bars: list[dict[str, Any]]) -> dict[str, Any] | No
     else:
         gap_direction = 'flat'
 
+    liquidity = _build_liquidity_context(
+        close_price=close_price,
+        volume=volume,
+        turnover=turnover,
+    )
+    price_bar_quality = _build_price_bar_quality(
+        open_price=open_price,
+        high_price=high_price,
+        low_price=low_price,
+        close_price=close_price,
+        volume=volume,
+        turnover=turnover,
+    )
+
     return {
         'trade_date': current.get('trade_date'),
         'source': current.get('source'),
         'captured_at': current.get('captured_at'),
-        'open_price': int(open_price),
-        'high_price': int(high_price),
-        'low_price': int(low_price),
-        'close_price': int(close_price),
-        'volume': current.get('volume'),
-        'turnover': current.get('turnover'),
+        'open_price': open_price,
+        'high_price': high_price,
+        'low_price': low_price,
+        'close_price': close_price,
+        'volume': volume,
+        'turnover': turnover,
+        'liquidity': liquidity,
+        'price_bar_quality': price_bar_quality,
         'candle': {
             'direction': candle_direction,
             'body_points': body_points,
-            'body_percent_of_open': _percent(body_points, open_price),
+            'body_percent_of_open': body_percent_of_open,
             'body_percent_of_range': body_percent_of_range,
             'body_size': _classify_body_size(body_percent_of_range),
             'upper_wick_points': upper_wick_points,
             'lower_wick_points': lower_wick_points,
-            'wick_bias': _classify_wick_bias(
-                upper_wick_points=upper_wick_points,
-                lower_wick_points=lower_wick_points,
-            ),
+            'wick_bias': wick_bias,
         },
         'session_range': {
             'points': range_points,
-            'percent_of_open': _percent(range_points, open_price),
+            'percent_of_open': session_range_percent_of_open,
             'close_position_in_range': close_position_in_range,
             'close_position_label': _classify_close_position(close_position_in_range),
         },
         'gap': {
             'previous_trade_date': previous.get('trade_date') if previous else None,
-            'previous_close_price': int(previous_close_price) if previous_close_price is not None else None,
+            'previous_close_price': previous_close_price,
             'gap_points': gap_points,
             'gap_percent': gap_percent,
             'direction': gap_direction,
             'filled_intraday': gap_filled_intraday,
+            'reliable': gap_reliable,
         },
     }
 
@@ -268,8 +392,6 @@ class DailyPriceContextService:
 
         items: list[dict[str, Any]] = []
         failed_symbols: list[str] = []
-        items: list[dict[str, Any]] = []
-        failed_symbols: list[str] = []
         expected_trade_date = normalized_market_date.isoformat()
         for symbol in target_symbols:
             price_bars = price_bars_by_symbol.get(symbol, [])
@@ -278,9 +400,6 @@ class DailyPriceContextService:
                 continue
 
             context_payload = build_price_context(price_bars)
-            if context_payload is None:
-                failed_symbols.append(symbol)
-                continue
             if context_payload is None:
                 failed_symbols.append(symbol)
                 continue

@@ -289,11 +289,13 @@
 ## EOD technical snapshot notes
 - `daily_technical_snapshots` is the DB-backed post-EOD signal layer keyed by `symbol_id + market_date`.
 - The current deterministic signal set is intentionally small: MA alignment and trend state, 5d and 20d returns, 20d volume ratio, 20d breakout or breakdown flags, and ATR-based volatility context.
+- The stored `signal_payload` now also carries `price_bar_context` from the same daily bar: safe gap semantics, derived liquidity (`turnover_source`, provider vs estimated turnover), and `price_bar_quality` flags so downstream consumers do not treat `open_price=0` as a normal open.
 - The pykrx daily EOD path computes and persists these snapshots after daily bar persistence completes, so downstream agents can consume stored data rather than recomputing chart state ad hoc.
 - For manual reruns after an EOD capture, use `python3.11 -m app.eod.technical_snapshots --market-date YYYY-MM-DD` from `apps/api`.
 
 ## Quote fallback notes
 - `GET /quotes/{symbol}` and `GET /quotes/tracked` now expose explicit quote provenance through `source`, `fallback`, `available`, `fallback_reason`, `unavailable_reason`, `cached_at`, and `trade_date`.
+- Live KIS quote payloads can also carry `bid_price` and `ask_price` when the upstream response includes them, while daily-bar and stale-cache fallbacks may omit spread fields entirely.
 - Freshness policy is deliberate:
   - live KIS quote first
   - then current-market-date `daily_price_bars`
@@ -329,6 +331,7 @@
 ## EOD action summary notes
 - `daily_action_summaries` is the DB-backed rules and scoring layer keyed by `symbol_id + market_date`, reading only stored `daily_technical_snapshots`.
 - The current summary contract is deterministic and machine-friendly: `action_label`, `bias_direction`, `signal_score`, `confidence_tier`, `risk_tier`, `reasons`, and trigger, invalidation, support, and resistance levels.
+- The stored `summary_payload` now also exposes `data_quality` copied from the technical snapshot's price-bar context, so agents can explicitly say “estimated turnover” or “gap unreliable due to zero open” instead of flattening those cases into generic missing-data notes.
 - The pykrx daily EOD path computes and persists these action summaries immediately after technical snapshots.
 - For manual reruns after an EOD capture, use `python3.11 -m app.eod.action_summaries --market-date YYYY-MM-DD` from `apps/api`.
 
@@ -338,7 +341,8 @@
 - Symbol-day context now also includes a structured `scores` block for the stored unified-value, quality, and momentum families when those rows exist for the requested date. Each family carries `status`, raw score/rank/percentile fields, `higher_is_better`, centralized meaning/method text tied to the real factor implementations, component usage counts and keys, coverage notes, and `as_of_market_date` so downstream agents can distinguish full, partial, and unavailable score context without guessing.
 - Symbol-day context now also includes compact `persisted_factor_rows` snapshots for the stored unified-value, quality, momentum, advanced-value, low-risk, beta, and composite families when those rows exist for the requested date. Each symbol also carries `context_completeness` so downstream agents can separate “row exists”, “row missing”, “row present but some submetrics are null”, sparse `daily_signal_features`, and the current lack of stored sector/industry peer mappings.
 - Symbol-day context now also includes `market_relative_context` derived from stored `daily_price_bars`: per-market up/down/flat breadth counts plus each symbol's same-market return and volume percentiles when sufficient prior-bar context exists. Requested-universe coverage is surfaced under `summary.context_completeness` and repeated per item under `context_completeness.requested_symbol_coverage`.
-- Symbol-day context now also includes `price_context` plus up to seven recent persisted `price_context_history` entries read from `daily_price_contexts`, which the pykrx EOD pipeline derives from stored `daily_price_bars`: OHLC, intraday range, candle body and wick interpretation, close location inside the day's range, and gap-versus-previous-close fields when a prior stored close exists.
+- Symbol-day context now also includes `quote_context` from the latest `current_quote_cache` row when one exists. It keeps quote availability explicit, carries `cached_at` freshness metadata, and exposes last-known bid/ask spread only when those fields were actually present upstream.
+- Symbol-day context now also includes `price_context` plus up to seven recent persisted `price_context_history` entries read from `daily_price_contexts`, which the pykrx EOD pipeline derives from stored `daily_price_bars`: OHLC, intraday range, candle body and wick interpretation, close location inside the day's range, gap-versus-previous-close fields when a valid open exists, derived liquidity (`turnover_source`, provider vs estimated turnover), and explicit `price_bar_quality` flags such as `open_price_zero`, `turnover_missing_or_zero`, and `gap_unreliable_due_to_open`.
 - Symbol-day context now uses exact-date technical snapshots for downstream agent dispatch and does not silently fall back to older technical snapshot rows.
 - The response is intentionally block-oriented and compact so downstream agents can prioritize and interpret instead of re-querying multiple endpoints or parsing prose-heavy summaries.
 

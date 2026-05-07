@@ -14,6 +14,15 @@ logger = logging.getLogger(__name__)
 MAX_RECENT_DAILY_BAR_AGE_DAYS = 3
 
 
+def _parse_optional_int(value) -> int | None:
+    if value in (None, ''):
+        return None
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
 def normalize_kis_quote(symbol: str, raw: dict, market_state: str) -> dict:
     output = raw.get('output', {}) if isinstance(raw, dict) else {}
     return {
@@ -24,6 +33,8 @@ def normalize_kis_quote(symbol: str, raw: dict, market_state: str) -> dict:
         'change_pct': float(output.get('prdy_ctrt', 0) or 0),
         'volume': int(output.get('acml_vol', 0) or 0),
         'turnover': int(output.get('acml_tr_pbmn', 0) or 0),
+        'bid_price': _parse_optional_int(output.get('bidp') or output.get('bidp1')),
+        'ask_price': _parse_optional_int(output.get('askp') or output.get('askp1')),
         'as_of': output.get('stck_cntg_hour'),
         'market_state': market_state,
         'source': 'kis',

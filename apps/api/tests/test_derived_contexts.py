@@ -2,10 +2,62 @@ from datetime import date
 import unittest
 from unittest.mock import patch
 
-from app.agent_context.derived_contexts import DailyPriceContextService, DerivedContextBackfillService
+from app.agent_context.derived_contexts import DailyPriceContextService, DerivedContextBackfillService, build_price_context
 
 
 class DailyPriceContextServiceTests(unittest.TestCase):
+    def test_build_price_context_uses_estimated_turnover_and_flags_zero_open_rows(self):
+        context = build_price_context(
+            [
+                {
+                    'trade_date': '2026-05-06',
+                    'open_price': 0,
+                    'high_price': 71500,
+                    'low_price': 70500,
+                    'close_price': 71000,
+                    'volume': 120000,
+                    'turnover': 0,
+                    'source': 'pykrx',
+                    'captured_at': '2026-05-06T15:30:00+09:00',
+                },
+                {
+                    'trade_date': '2026-05-02',
+                    'open_price': 70000,
+                    'high_price': 70600,
+                    'low_price': 69800,
+                    'close_price': 70200,
+                    'volume': 100000,
+                    'turnover': 7020000000,
+                    'source': 'pykrx',
+                    'captured_at': '2026-05-02T15:30:00+09:00',
+                },
+            ]
+        )
+
+        self.assertEqual(context['liquidity']['turnover_source'], 'estimated')
+        self.assertEqual(context['liquidity']['turnover_krw'], 8520000000)
+        self.assertEqual(context['liquidity']['provider_turnover_krw'], None)
+        self.assertEqual(context['liquidity']['estimated_turnover_krw'], 8520000000)
+        self.assertTrue(context['price_bar_quality']['open_price_zero'])
+        self.assertTrue(context['price_bar_quality']['turnover_missing_or_zero'])
+        self.assertFalse(context['price_bar_quality']['volume_zero'])
+        self.assertTrue(context['price_bar_quality']['gap_unreliable_due_to_open'])
+        self.assertTrue(context['price_bar_quality']['possible_suspension_or_special_session'])
+        self.assertEqual(
+            context['price_bar_quality']['issue_codes'],
+            [
+                'open_price_zero',
+                'turnover_missing_or_zero',
+                'gap_unreliable_due_to_open',
+                'possible_suspension_or_special_session',
+            ],
+        )
+        self.assertEqual(context['candle']['direction'], 'unknown')
+        self.assertEqual(context['candle']['body_points'], None)
+        self.assertEqual(context['gap']['reliable'], False)
+        self.assertEqual(context['gap']['gap_points'], None)
+        self.assertEqual(context['gap']['direction'], None)
+
     @patch('app.agent_context.derived_contexts.upsert_daily_price_context')
     @patch('app.agent_context.derived_contexts.load_recent_price_bars_by_symbol')
     def test_rebuild_skips_symbols_without_bar_for_requested_market_date(

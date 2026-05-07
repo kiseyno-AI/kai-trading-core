@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Callable, Iterable, Sequence
 
+from app.agent_context.derived_contexts import build_price_context
 from app.market_data_store import (
     list_symbols_with_daily_bar_on_date,
     load_daily_bars_for_symbol,
@@ -49,6 +50,13 @@ def _true_ranges(bars: Sequence[dict]) -> list[float]:
         low = float(current['low_price'])
         values.append(max(high - low, abs(high - previous_close), abs(low - previous_close)))
     return values
+
+
+def _build_price_bar_context(bars: Sequence[dict]) -> dict | None:
+    if not bars:
+        return None
+    latest_and_previous = list(reversed(list(bars[-2:])))
+    return build_price_context(latest_and_previous)
 
 
 @dataclass
@@ -124,6 +132,7 @@ class DailyTechnicalSnapshotService:
         prior_high_20 = max((float(item['high_price']) for item in trailing_20), default=None)
         prior_low_20 = min((float(item['low_price']) for item in trailing_20), default=None)
         close_price = int(latest['close_price'])
+        price_bar_context = _build_price_bar_context(bars)
 
         breakout_20d = bool(prior_high_20 is not None and close_price > prior_high_20)
         breakdown_20d = bool(prior_low_20 is not None and close_price < prior_low_20)
@@ -180,6 +189,7 @@ class DailyTechnicalSnapshotService:
                     'one_atr_below_close': stop_multiple_1_atr,
                 },
             },
+            'price_bar_context': price_bar_context,
             'trend_state': trend_state,
         }
 

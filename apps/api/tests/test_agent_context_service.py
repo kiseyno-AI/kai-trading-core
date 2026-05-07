@@ -109,6 +109,7 @@ class AgentContextReadServiceTests(unittest.TestCase):
     @patch('app.agent_context.read_service.load_daily_momentum_factor_results')
     @patch('app.agent_context.read_service.load_daily_quality_factor_results')
     @patch('app.agent_context.read_service.load_daily_unified_value_factor_results')
+    @patch('app.agent_context.read_service.load_current_quotes')
     @patch('app.agent_context.read_service.load_daily_price_context_history')
     @patch('app.agent_context.read_service.load_daily_price_contexts')
     @patch('app.agent_context.read_service.load_daily_action_summaries')
@@ -123,6 +124,7 @@ class AgentContextReadServiceTests(unittest.TestCase):
         load_actions_mock,
         load_price_contexts_mock,
         load_price_context_history_mock,
+        load_current_quotes_mock,
         load_unified_value_mock,
         load_quality_mock,
         load_momentum_mock,
@@ -448,6 +450,27 @@ class AgentContextReadServiceTests(unittest.TestCase):
                 'captured_at': '2026-04-08T15:00:00+09:00',
             }
         ]
+        load_current_quotes_mock.return_value = [
+            {
+                'symbol': '005930',
+                'source': 'kis',
+                'market_state': 'OPEN',
+                'is_live': True,
+                'fallback': False,
+                'available': True,
+                'price': 71550,
+                'change': 50,
+                'change_pct': 0.07,
+                'volume': 150000,
+                'turnover': 9000000000,
+                'bid_price': 71500,
+                'ask_price': 71600,
+                'as_of': '095700',
+                'trade_date': '2026-04-08',
+                'cached_at': '2026-04-08T09:57:00+09:00',
+                'captured_at': '2026-04-08T09:57:00+09:00',
+            }
+        ]
         load_price_contexts_mock.return_value = [
             {
                 'symbol': '005930',
@@ -463,6 +486,22 @@ class AgentContextReadServiceTests(unittest.TestCase):
                     'close_price': 71500,
                     'volume': 123456,
                     'turnover': 8800000000,
+                    'liquidity': {
+                        'turnover_krw': 8800000000,
+                        'turnover_source': 'provider',
+                        'turnover_is_estimated': False,
+                        'provider_turnover_krw': 8800000000,
+                        'estimated_turnover_krw': 8827104000,
+                    },
+                    'price_bar_quality': {
+                        'open_price_zero': False,
+                        'turnover_missing_or_zero': False,
+                        'volume_zero': False,
+                        'gap_unreliable_due_to_open': False,
+                        'possible_suspension_or_special_session': False,
+                        'has_any_issue': False,
+                        'issue_codes': [],
+                    },
                     'candle': {
                         'direction': 'bullish',
                         'body_points': 1500,
@@ -486,6 +525,7 @@ class AgentContextReadServiceTests(unittest.TestCase):
                         'gap_percent': 0.2865,
                         'direction': 'up',
                         'filled_intraday': False,
+                        'reliable': True,
                     },
                 },
                 'captured_at': '2026-04-08T15:30:00+09:00',
@@ -564,6 +604,7 @@ class AgentContextReadServiceTests(unittest.TestCase):
 
         self.assertEqual(result['summary']['requested_symbol_count'], 2)
         self.assertEqual(result['summary']['matched_symbol_count'], 1)
+        self.assertEqual(result['summary']['quote_context_count'], 1)
         self.assertEqual(result['summary']['price_context_count'], 1)
         self.assertEqual(result['summary']['technical_snapshot_count'], 1)
         self.assertEqual(result['summary']['action_summary_count'], 1)
@@ -579,10 +620,21 @@ class AgentContextReadServiceTests(unittest.TestCase):
         self.assertEqual(first_item['symbol'], '005930')
         self.assertEqual(first_item['company']['name_ko'], '삼성전자')
         self.assertEqual(first_item['company']['dart']['corp_code'], '00126380')
+        self.assertTrue(first_item['quote_context']['available'])
+        self.assertEqual(first_item['quote_context']['source'], 'kis')
+        self.assertEqual(first_item['quote_context']['spread']['spread_points'], 100)
+        self.assertEqual(first_item['quote_context']['spread']['spread_bps_of_price'], 13.9762)
+        self.assertEqual(
+            first_item['quote_context']['freshness']['trade_date_relation_to_request'],
+            'same_market_date',
+        )
         self.assertEqual(first_item['price_context']['open_price'], 70000)
+        self.assertEqual(first_item['price_context']['liquidity']['turnover_source'], 'provider')
+        self.assertEqual(first_item['price_context']['price_bar_quality']['issue_codes'], [])
         self.assertEqual(first_item['price_context']['gap']['previous_close_price'], 69800)
         self.assertEqual(first_item['price_context']['gap']['direction'], 'up')
         self.assertFalse(first_item['price_context']['gap']['filled_intraday'])
+        self.assertTrue(first_item['price_context']['gap']['reliable'])
         self.assertEqual(first_item['price_context']['session_range']['close_position_label'], 'upper_half')
         self.assertEqual(first_item['price_context']['candle']['wick_bias'], 'upper')
         self.assertEqual(len(first_item['price_context_history']), 2)
@@ -617,10 +669,12 @@ class AgentContextReadServiceTests(unittest.TestCase):
         self.assertEqual(first_item['fundamentals']['latest_snapshot']['period']['period_end_date'], '2024-12-31')
         self.assertEqual(first_item['fundamentals']['latest_snapshot']['statement']['row_count'], 1)
         self.assertEqual(first_item['recent_disclosures']['count'], 1)
+        self.assertTrue(first_item['availability']['quote_context'])
         self.assertTrue(first_item['availability']['price_context'])
 
         second_item = result['items'][1]
         self.assertEqual(second_item['symbol'], '000660')
+        self.assertIsNone(second_item['quote_context'])
         self.assertIsNone(second_item['price_context'])
         self.assertEqual(second_item['price_context_history'], [])
         self.assertIsNone(second_item['technical_snapshot'])
@@ -634,6 +688,7 @@ class AgentContextReadServiceTests(unittest.TestCase):
         self.assertEqual(second_item['context_completeness']['sector_peer_mapping']['status'], 'unavailable')
         self.assertIsNone(second_item['fundamentals']['latest_snapshot'])
         self.assertEqual(second_item['recent_disclosures']['count'], 0)
+        self.assertFalse(second_item['availability']['quote_context'])
         self.assertFalse(second_item['availability']['price_context'])
 
     def test_get_symbol_day_context_requires_at_least_one_symbol(self):
@@ -687,6 +742,7 @@ class AgentContextReadServiceTests(unittest.TestCase):
     @patch('app.agent_context.read_service.load_daily_momentum_factor_results')
     @patch('app.agent_context.read_service.load_daily_quality_factor_results')
     @patch('app.agent_context.read_service.load_daily_unified_value_factor_results')
+    @patch('app.agent_context.read_service.load_current_quotes', return_value=[])
     @patch('app.agent_context.read_service.load_daily_price_context_history', return_value=[])
     @patch('app.agent_context.read_service.load_daily_price_contexts', return_value=[])
     @patch('app.agent_context.read_service.load_daily_action_summaries', return_value=[])
@@ -701,6 +757,7 @@ class AgentContextReadServiceTests(unittest.TestCase):
         _load_actions_mock,
         _load_price_contexts_mock,
         _load_price_context_history_mock,
+        _load_current_quotes_mock,
         load_unified_value_mock,
         load_quality_mock,
         load_momentum_mock,

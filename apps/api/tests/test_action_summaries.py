@@ -112,6 +112,61 @@ class DailyActionSummaryServiceTests(unittest.TestCase):
         self.assertEqual(result.confidence_tier, 'low')
         self.assertEqual(result.risk_tier, 'unknown')
 
+    def test_compute_summary_preserves_price_bar_quality_and_estimated_liquidity_context(self):
+        service = DailyActionSummaryService()
+
+        result = service.compute_summary(
+            _snapshot(
+                signal_payload={
+                    'range': {
+                        'prior_20d_high': 171.0,
+                        'prior_20d_low': 149.0,
+                    },
+                    'volatility': {
+                        'stop_context': {
+                            'one_atr_below_close': 176.0,
+                        },
+                    },
+                    'price_bar_context': {
+                        'liquidity': {
+                            'turnover_krw': 8520000000,
+                            'turnover_source': 'estimated',
+                            'turnover_is_estimated': True,
+                            'provider_turnover_krw': None,
+                            'estimated_turnover_krw': 8520000000,
+                        },
+                        'price_bar_quality': {
+                            'open_price_zero': True,
+                            'turnover_missing_or_zero': True,
+                            'volume_zero': False,
+                            'gap_unreliable_due_to_open': True,
+                            'possible_suspension_or_special_session': True,
+                            'issue_codes': [
+                                'open_price_zero',
+                                'turnover_missing_or_zero',
+                                'gap_unreliable_due_to_open',
+                                'possible_suspension_or_special_session',
+                            ],
+                        },
+                        'gap': {
+                            'direction': None,
+                            'gap_percent': None,
+                            'reliable': False,
+                        },
+                    },
+                },
+            )
+        )
+
+        self.assertEqual(
+            result.summary_payload['data_quality']['liquidity']['turnover_source'],
+            'estimated',
+        )
+        self.assertTrue(result.summary_payload['data_quality']['liquidity']['turnover_is_estimated'])
+        self.assertTrue(result.summary_payload['data_quality']['price_bar_quality']['open_price_zero'])
+        self.assertTrue(result.summary_payload['data_quality']['price_bar_quality']['gap_unreliable_due_to_open'])
+        self.assertEqual(result.summary_payload['data_quality']['gap']['reliable'], False)
+
     def test_rebuild_ignores_progress_callback_failures(self):
         service = DailyActionSummaryService()
         progress_updates: list[dict] = []
