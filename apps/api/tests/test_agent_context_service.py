@@ -1,7 +1,12 @@
 import unittest
 from unittest.mock import patch
 
-from app.agent_context.read_service import AgentContextReadService, _build_price_context
+from app.agent_context.read_service import AgentContextReadService, PERSISTED_FACTOR_FAMILIES, _build_price_context
+
+EMPTY_LATEST_PRIOR_ROWS = {
+    'factor_rows': {family: {} for family in PERSISTED_FACTOR_FAMILIES},
+    'signal_features': {},
+}
 
 
 class FakeFundamentalsRepository:
@@ -614,13 +619,16 @@ class AgentContextReadServiceTests(unittest.TestCase):
             fundamentals_repository=FakeFundamentalsRepository(),
             disclosure_repository=FakeDisclosureRepository(),
         )
-
-        result = service.get_symbol_day_context(
-            market_date='2026-04-08',
-            symbols=['005930', '000660'],
-            fs_div='cfs',
-            disclosures_limit=3,
-        )
+        with patch(
+            'app.agent_context.read_service._load_latest_symbol_day_block_history',
+            return_value=EMPTY_LATEST_PRIOR_ROWS,
+        ):
+            result = service.get_symbol_day_context(
+                market_date='2026-04-08',
+                symbols=['005930', '000660'],
+                fs_div='cfs',
+                disclosures_limit=3,
+            )
 
         self.assertEqual(load_technical_mock.call_args.kwargs['fallback_window_days'], 0)
 
@@ -650,6 +658,8 @@ class AgentContextReadServiceTests(unittest.TestCase):
             first_item['quote_context']['freshness']['trade_date_relation_to_request'],
             'same_market_date',
         )
+        self.assertEqual(first_item['quote_context']['freshness_provenance']['freshness_status'], 'fresh')
+        self.assertEqual(first_item['quote_context']['freshness_provenance']['provenance_status'], 'provider_sourced')
         self.assertEqual(first_item['price_context']['open_price'], 70000)
         self.assertEqual(first_item['price_context']['liquidity']['turnover_source'], 'provider')
         self.assertEqual(first_item['price_context']['price_bar_quality']['issue_codes'], [])
@@ -659,6 +669,8 @@ class AgentContextReadServiceTests(unittest.TestCase):
         self.assertTrue(first_item['price_context']['gap']['reliable'])
         self.assertEqual(first_item['price_context']['session_range']['close_position_label'], 'upper_half')
         self.assertEqual(first_item['price_context']['candle']['wick_bias'], 'upper')
+        self.assertEqual(first_item['price_context']['freshness_provenance']['freshness_status'], 'fresh')
+        self.assertEqual(first_item['price_context']['freshness_provenance']['provenance_status'], 'derived_from_provider_data')
         self.assertEqual(len(first_item['price_context_history']), 2)
         self.assertEqual(first_item['price_context_history'][0]['market_date'], '2026-04-07')
         self.assertEqual(first_item['price_context_history'][1]['market_date'], '2026-04-08')
@@ -668,8 +680,11 @@ class AgentContextReadServiceTests(unittest.TestCase):
         self.assertEqual(first_item['signal_features']['signal_count'], 2)
         self.assertEqual(first_item['signal_features']['provenance']['row_kind'], 'direct_plus_fallback')
         self.assertEqual(first_item['signal_features']['fallback_features']['price_action']['close_return_1d_pct'], 2.43)
+        self.assertEqual(first_item['signal_features']['freshness_provenance']['provenance_status'], 'provider_plus_fallback')
+        self.assertEqual(first_item['signal_features']['freshness_provenance']['issue_types'], ['derived_or_fallback'])
         self.assertEqual(first_item['scores']['unified_value']['status'], 'available')
         self.assertEqual(first_item['scores']['unified_value']['score'], 0.84)
+        self.assertEqual(first_item['scores']['unified_value']['freshness_provenance']['freshness_status'], 'fresh')
         self.assertEqual(first_item['scores']['quality']['status'], 'partial')
         self.assertEqual(first_item['scores']['quality']['components_used'], 5)
         self.assertEqual(first_item['scores']['quality']['components_possible'], 6)
@@ -678,6 +693,10 @@ class AgentContextReadServiceTests(unittest.TestCase):
         self.assertEqual(first_item['scores']['momentum']['score'], 0.91)
         self.assertEqual(first_item['scores']['momentum']['components_possible'], 3)
         self.assertEqual(first_item['persisted_factor_rows']['advanced_value']['advanced_value_classification'], 'eligible')
+        self.assertEqual(
+            first_item['persisted_factor_rows']['advanced_value']['freshness_provenance']['freshness_status'],
+            'fresh',
+        )
         self.assertEqual(first_item['persisted_factor_rows']['low_risk']['low_risk_classification'], 'watchlist')
         self.assertEqual(first_item['persisted_factor_rows']['beta']['low_beta_classification'], 'eligible')
         self.assertEqual(first_item['persisted_factor_rows']['composite']['composite_classification'], 'eligible')
@@ -694,7 +713,13 @@ class AgentContextReadServiceTests(unittest.TestCase):
         self.assertEqual(first_item['context_completeness']['requested_symbol_coverage']['signal_features']['present_rows'], 1)
         self.assertEqual(first_item['fundamentals']['latest_snapshot']['period']['period_end_date'], '2024-12-31')
         self.assertEqual(first_item['fundamentals']['latest_snapshot']['statement']['row_count'], 1)
+        self.assertEqual(first_item['fundamentals']['freshness_provenance']['freshness_status'], 'available_but_old')
         self.assertEqual(first_item['recent_disclosures']['count'], 1)
+        self.assertEqual(first_item['recent_disclosures']['freshness_provenance']['freshness_status'], 'available_but_old')
+        self.assertEqual(
+            first_item['context_provenance']['signal_features']['requested_symbol_coverage']['missing_rows'],
+            1,
+        )
         self.assertTrue(first_item['availability']['quote_context'])
         self.assertTrue(first_item['availability']['price_context'])
 
@@ -709,11 +734,13 @@ class AgentContextReadServiceTests(unittest.TestCase):
         self.assertEqual(second_item['scores']['unified_value']['status'], 'unavailable')
         self.assertEqual(second_item['scores']['quality']['status'], 'unavailable')
         self.assertEqual(second_item['scores']['momentum']['status'], 'unavailable')
+        self.assertEqual(second_item['scores']['unified_value']['freshness_provenance']['freshness_status'], 'missing')
         self.assertEqual(second_item['context_completeness']['signal_features']['row_status'], 'missing')
         self.assertEqual(second_item['context_completeness']['signal_features']['row_kind'], 'missing')
         self.assertEqual(second_item['context_completeness']['market_relative_context']['status'], 'unavailable')
         self.assertEqual(second_item['context_completeness']['sector_peer_mapping']['status'], 'unavailable')
         self.assertIsNone(second_item['fundamentals']['latest_snapshot'])
+        self.assertEqual(second_item['context_provenance']['signal_features']['freshness_status'], 'missing')
         self.assertEqual(second_item['recent_disclosures']['count'], 0)
         self.assertFalse(second_item['availability']['quote_context'])
         self.assertFalse(second_item['availability']['price_context'])
@@ -760,6 +787,137 @@ class AgentContextReadServiceTests(unittest.TestCase):
         self.assertEqual(context['gap']['direction'], 'up')
         self.assertTrue(context['gap']['filled_intraday'])
         self.assertEqual(context['session_range']['close_position_label'], 'lower_half')
+
+    def test_get_symbol_day_context_marks_stale_and_available_but_old_blocks_without_silently_omitting_them(self):
+        latest_prior_rows = {
+            'factor_rows': {
+                family: (
+                    {
+                        '005930': {
+                            'market_date': '2026-04-07',
+                            'captured_at': '2026-04-07T15:00:00+09:00',
+                            'source': 'unified_value_v1',
+                        }
+                    }
+                    if family == 'unified_value'
+                    else {}
+                )
+                for family in PERSISTED_FACTOR_FAMILIES
+            },
+            'signal_features': {
+                '005930': {
+                    'market_date': '2026-04-07',
+                    'captured_at': '2026-04-07T15:00:00+09:00',
+                    'source': 'kis_ranking',
+                }
+            },
+        }
+
+        class EmptyFundamentalsRepository:
+            def list_stored_fundamentals_summary(self, *, stock_codes, fs_div=None):
+                return []
+
+        class EmptyDisclosureRepository:
+            def list_recent_events_by_stock_codes(self, *, stock_codes, receipt_date_to=None, limit_per_symbol=5):
+                return {symbol: [] for symbol in stock_codes}
+
+        service = AgentContextReadService(
+            fundamentals_repository=EmptyFundamentalsRepository(),
+            disclosure_repository=EmptyDisclosureRepository(),
+        )
+
+        with (
+            patch(
+                'app.agent_context.read_service.load_symbols',
+                return_value=[
+                    {
+                        'id': 1,
+                        'symbol': '005930',
+                        'standard_code': 'KR7005930003',
+                        'name_ko': '삼성전자',
+                        'market': 'KOSPI',
+                        'instrument_type': 'equity',
+                        'source': 'pykrx',
+                        'is_active': True,
+                        'last_refreshed_at': None,
+                    }
+                ],
+            ),
+            patch('app.agent_context.read_service.load_daily_technical_snapshots', return_value=[]),
+            patch('app.agent_context.read_service.load_daily_action_summaries', return_value=[]),
+            patch('app.agent_context.read_service.load_daily_signal_features', return_value=[]),
+            patch('app.agent_context.read_service.load_daily_unified_value_factor_results', return_value=[]),
+            patch('app.agent_context.read_service.load_daily_quality_factor_results', return_value=[]),
+            patch('app.agent_context.read_service.load_daily_momentum_factor_results', return_value=[]),
+            patch('app.agent_context.read_service.load_daily_advanced_value_factor_results', return_value=[]),
+            patch('app.agent_context.read_service.load_daily_low_risk_factor_results', return_value=[]),
+            patch('app.agent_context.read_service.load_daily_beta_factor_results', return_value=[]),
+            patch('app.agent_context.read_service.load_daily_composite_factor_results', return_value=[]),
+            patch(
+                'app.agent_context.read_service.load_current_quotes',
+                return_value=[
+                    {
+                        'symbol': '005930',
+                        'source': 'kis',
+                        'market_state': 'CLOSED',
+                        'is_live': False,
+                        'fallback': False,
+                        'available': True,
+                        'price': 70100,
+                        'change': -200,
+                        'change_pct': -0.28,
+                        'volume': 99000,
+                        'turnover': 6400000000,
+                        'as_of': '153000',
+                        'trade_date': '2026-04-07',
+                        'cached_at': '2026-04-07T15:30:00+09:00',
+                        'captured_at': '2026-04-07T15:30:00+09:00',
+                    }
+                ],
+            ),
+            patch('app.agent_context.read_service.load_daily_price_contexts', return_value=[]),
+            patch(
+                'app.agent_context.read_service.load_daily_price_context_history',
+                return_value=[
+                    {
+                        'symbol': '005930',
+                        'market_date': '2026-04-07',
+                        'source': 'pykrx',
+                        'context_payload': {
+                            'trade_date': '2026-04-07',
+                            'source': 'pykrx',
+                            'captured_at': '2026-04-07T15:30:00+09:00',
+                            'close_price': 70100,
+                        },
+                        'captured_at': '2026-04-07T15:30:00+09:00',
+                    }
+                ],
+            ),
+            patch('app.agent_context.read_service.load_daily_market_relative_contexts', return_value=[]),
+            patch(
+                'app.agent_context.read_service._load_latest_symbol_day_block_history',
+                return_value=latest_prior_rows,
+            ),
+        ):
+            result = service.get_symbol_day_context(
+                market_date='2026-04-08',
+                symbols=['005930'],
+                fs_div='CFS',
+                disclosures_limit=3,
+            )
+
+        item = result['items'][0]
+        self.assertEqual(item['quote_context']['freshness_provenance']['freshness_status'], 'stale')
+        self.assertEqual(item['quote_context']['freshness_provenance']['issue_types'], ['stale'])
+        self.assertIsNone(item['price_context'])
+        self.assertEqual(item['context_provenance']['price_context']['freshness_status'], 'stale')
+        self.assertEqual(item['context_provenance']['price_context']['latest_available_market_date'], '2026-04-07')
+        self.assertIsNone(item['signal_features'])
+        self.assertEqual(item['context_provenance']['signal_features']['freshness_status'], 'stale')
+        self.assertEqual(item['context_provenance']['signal_features']['latest_available_market_date'], '2026-04-07')
+        self.assertIsNone(item['persisted_factor_rows']['unified_value'])
+        self.assertEqual(item['context_provenance']['factor_rows']['unified_value']['freshness_status'], 'available_but_old')
+        self.assertEqual(item['scores']['unified_value']['freshness_provenance']['freshness_status'], 'available_but_old')
 
     @patch('app.agent_context.read_service.load_daily_market_relative_contexts', return_value=[])
     @patch('app.agent_context.read_service.load_daily_composite_factor_results', return_value=[])
@@ -908,12 +1066,16 @@ class AgentContextReadServiceTests(unittest.TestCase):
             fundamentals_repository=EmptyFundamentalsRepository(),
             disclosure_repository=EmptyDisclosureRepository(),
         )
-        result = service.get_symbol_day_context(
-            market_date='2026-05-06',
-            symbols=symbols,
-            fs_div='CFS',
-            disclosures_limit=3,
-        )
+        with patch(
+            'app.agent_context.read_service._load_latest_symbol_day_block_history',
+            return_value=EMPTY_LATEST_PRIOR_ROWS,
+        ):
+            result = service.get_symbol_day_context(
+                market_date='2026-05-06',
+                symbols=symbols,
+                fs_div='CFS',
+                disclosures_limit=3,
+            )
 
         coverage = result['summary']['context_completeness']
         self.assertEqual(coverage['factor_rows']['unified_value']['present_rows'], 76)
@@ -927,4 +1089,8 @@ class AgentContextReadServiceTests(unittest.TestCase):
         self.assertEqual(
             result['items'][0]['context_completeness']['requested_symbol_coverage']['signal_features']['missing_rows'],
             74,
+        )
+        self.assertEqual(
+            result['items'][0]['context_provenance']['signal_features']['requested_symbol_coverage']['present_rows'],
+            2,
         )

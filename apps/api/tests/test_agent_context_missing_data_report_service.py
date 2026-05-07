@@ -214,3 +214,49 @@ class AgentContextMissingDataReportServiceTests(unittest.TestCase):
         self.assertIn('KIS investor flow endpoints', investor_row['external_providers'])
         self.assertEqual(consensus_row['status'], 'external_data_required')
         self.assertEqual(consensus_row['counts']['roles'], 1)
+
+    def test_summary_aggregates_context_issue_type_counts_when_metadata_is_present(self):
+        repository = FakeMissingDataReportRepository(
+            [
+                {
+                    'id': 9,
+                    'market_date': date(2026, 5, 6),
+                    'symbol': '005930',
+                    'agent_name': 'technical-summarizer',
+                    'feedback_payload': {'role': 'technical-summarizer'},
+                    'normalized_feedback_payload': {'role': 'technical-summarizer'},
+                    'data_gaps_payload': None,
+                    'improvement_notes_payload': ['Need factor score coverage.'],
+                    'missing_data_categories_payload': None,
+                    'context_payload': {
+                        'symbol_day_context': {
+                            'context_provenance': {
+                                'factor_rows': {
+                                    'unified_value': {
+                                        'issue_types': ['available_but_old'],
+                                        'freshness_status': 'available_but_old',
+                                        'provenance_status': 'derived_from_provider_data',
+                                        'source_tables': ['daily_unified_value_factor_results'],
+                                    }
+                                },
+                                'signal_features': {
+                                    'issue_types': ['derived_or_fallback'],
+                                    'freshness_status': 'fresh',
+                                    'provenance_status': 'provider_plus_fallback',
+                                    'source_tables': ['daily_signal_features'],
+                                },
+                            }
+                        }
+                    },
+                }
+            ]
+        )
+        service = AgentContextMissingDataReportService(repository=repository)
+
+        result = service.get_summary(market_date='2026-05-06')
+
+        self.assertEqual(result['summary']['context_issue_type_counts']['available_but_old'], 1)
+        self.assertEqual(result['summary']['context_issue_type_counts']['derived_or_fallback'], 1)
+        factor_row = next(item for item in result['categories'] if item['category'] == 'factor_score_coverage')
+        self.assertEqual(factor_row['context_issue_type_counts']['available_but_old'], 1)
+        self.assertEqual(factor_row['context_issue_type_counts']['derived_or_fallback'], 1)

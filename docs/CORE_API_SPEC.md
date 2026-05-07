@@ -981,6 +981,16 @@ Authorization: Bearer <token>
           "ask_price": 71600,
           "spread_points": 100,
           "spread_bps_of_price": 13.9762
+        },
+        "freshness_provenance": {
+          "freshness_status": "fresh",
+          "provenance_status": "provider_sourced",
+          "issue_types": [],
+          "requested_market_date": "2026-04-09",
+          "as_of_market_date": "2026-04-09",
+          "latest_available_market_date": "2026-04-09",
+          "source_tables": ["current_quote_cache", "quote_snapshots"],
+          "source_provider": "kis"
         }
       },
       "price_context": {
@@ -1025,6 +1035,16 @@ Authorization: Bearer <token>
           "direction": "up",
           "filled_intraday": true,
           "reliable": true
+        },
+        "freshness_provenance": {
+          "freshness_status": "fresh",
+          "provenance_status": "derived_from_provider_data",
+          "issue_types": [],
+          "requested_market_date": "2026-04-09",
+          "as_of_market_date": "2026-04-09",
+          "latest_available_market_date": "2026-04-09",
+          "source_tables": ["daily_price_contexts", "daily_price_bars"],
+          "source_provider": "pykrx"
         }
       },
       "price_context_history": [
@@ -1114,6 +1134,16 @@ Authorization: Bearer <token>
               "score": 0.914
             }
           }
+        },
+        "freshness_provenance": {
+          "freshness_status": "fresh",
+          "provenance_status": "provider_plus_fallback",
+          "issue_types": ["derived_or_fallback"],
+          "requested_market_date": "2026-04-09",
+          "as_of_market_date": "2026-04-09",
+          "latest_available_market_date": "2026-04-09",
+          "source_tables": ["daily_signal_features", "daily_price_bars", "current_quote_cache"],
+          "source_provider": "kis_ranking"
         }
       },
       "market_relative_context": {
@@ -1132,7 +1162,17 @@ Authorization: Bearer <token>
       "persisted_factor_rows": {
         "advanced_value": {
           "advanced_value_score": 0.81,
-          "advanced_value_classification": "eligible"
+          "advanced_value_classification": "eligible",
+          "freshness_provenance": {
+            "freshness_status": "fresh",
+            "provenance_status": "derived_from_provider_data",
+            "issue_types": [],
+            "requested_market_date": "2026-04-09",
+            "as_of_market_date": "2026-04-09",
+            "latest_available_market_date": "2026-04-09",
+            "source_tables": ["daily_advanced_value_factor_results"],
+            "source_provider": "internal_factor_pipeline"
+          }
         },
         "composite": {
           "composite_score": 0.73,
@@ -1147,11 +1187,31 @@ Authorization: Bearer <token>
           "latest_period_end_date": null,
           "available_business_years": [],
           "recent_periods": []
+        },
+        "freshness_provenance": {
+          "freshness_status": "missing",
+          "provenance_status": "provider_sourced",
+          "issue_types": ["missing"],
+          "requested_market_date": "2026-04-09",
+          "as_of_market_date": null,
+          "latest_available_market_date": null,
+          "source_tables": ["dart_fundamentals_snapshots"],
+          "source_provider": "dart"
         }
       },
       "recent_disclosures": {
         "count": 0,
-        "items": []
+        "items": [],
+        "freshness_provenance": {
+          "freshness_status": "missing",
+          "provenance_status": "provider_sourced",
+          "issue_types": ["missing"],
+          "requested_market_date": "2026-04-09",
+          "as_of_market_date": null,
+          "latest_available_market_date": null,
+          "source_tables": ["dart_disclosure_events"],
+          "source_provider": "dart"
+        }
       },
       "availability": {
         "company": true,
@@ -1186,6 +1246,45 @@ Authorization: Bearer <token>
           ]
         },
         "sector_peer_mapping": {"status": "unavailable"}
+      },
+      "context_provenance": {
+        "quote_context": {
+          "freshness_status": "fresh",
+          "provenance_status": "provider_sourced",
+          "issue_types": []
+        },
+        "price_context": {
+          "freshness_status": "fresh",
+          "provenance_status": "derived_from_provider_data",
+          "issue_types": []
+        },
+        "signal_features": {
+          "freshness_status": "fresh",
+          "provenance_status": "provider_plus_fallback",
+          "issue_types": ["derived_or_fallback"],
+          "requested_symbol_coverage": {
+            "present_rows": 1,
+            "missing_rows": 0,
+            "coverage_status": "complete"
+          }
+        },
+        "fundamentals": {
+          "freshness_status": "missing",
+          "provenance_status": "provider_sourced",
+          "issue_types": ["missing"]
+        },
+        "recent_disclosures": {
+          "freshness_status": "missing",
+          "provenance_status": "provider_sourced",
+          "issue_types": ["missing"]
+        },
+        "factor_rows": {
+          "advanced_value": {
+            "freshness_status": "fresh",
+            "provenance_status": "derived_from_provider_data",
+            "issue_types": []
+          }
+        }
       }
     }
   ]
@@ -1203,6 +1302,7 @@ It is a composed read payload intended for:
 `quote_context` is the latest `current_quote_cache` view when one exists, so the payload can distinguish true quote absence from stale-or-spread-less rows without making agents guess from missing prose.
 `price_context` is read from persisted `daily_price_contexts`, which the EOD pipeline derives from stored `daily_price_bars` for the same market date. It now includes derived liquidity (`turnover_source`, provider vs estimated turnover) plus `price_bar_quality` flags for zero opens, zero turnover, and unreliable gap semantics. `price_context_history` carries up to the latest seven persisted rows ending at the requested `market_date`.
 `signal_features` may be a direct KIS row, a direct-plus-fallback row, or a fallback-only row assembled from owned data. Fallback values are intentionally marked so downstream agents do not treat them as live external ranking truth.
+Major blocks now also expose `freshness_provenance`, and the top-level `context_provenance` mirror remains available even when a current block payload is `null`. Consumers should interpret `stale` and `available_but_old` as "stored evidence exists but predates the requested market date", not as a missing-data case.
 `persisted_factor_rows` keeps compact snapshots of stored factor families, `market_relative_context` derives same-market breadth and return/volume percentiles from stored `daily_price_bars`, and `context_completeness` separates present rows, genuinely missing rows, null submetrics, sparse signal-feature coverage, and the currently unavailable sector/industry peer-mapping lane.
 
 ### Important nullability
@@ -1245,7 +1345,17 @@ Content-Type: application/json
   },
   "context": {
     "source_route": "/agent-context/symbol-day",
-    "market_date": "2026-04-14"
+    "market_date": "2026-04-14",
+    "symbol_day_context": {
+      "context_provenance": {
+        "quote_context": {
+          "freshness_status": "stale",
+          "provenance_status": "provider_sourced",
+          "issue_types": ["stale"],
+          "source_tables": ["current_quote_cache", "quote_snapshots"]
+        }
+      }
+    }
   }
 }
 ```
@@ -1287,6 +1397,7 @@ Content-Type: application/json
 ### Notes
 - `summary` and `feedback` are JSON objects; at least one must be non-empty.
 - Stored feedback is append-only and separate from deterministic action summaries.
+- When `context` includes symbol-day `context_provenance`, missing-data normalization can enrich stored categories with provenance-aware issue typing such as `missing`, `stale`, `available_but_old`, and `derived_or_fallback`.
 - This route does not trigger orders, positions, or live trading.
 
 ---

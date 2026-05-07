@@ -276,6 +276,25 @@ CATEGORY_DEFINITIONS: tuple[MissingDataCategoryDefinition, ...] = (
 )
 
 CATEGORY_DEFINITIONS_BY_KEY = {definition.key: definition for definition in CATEGORY_DEFINITIONS}
+CATEGORY_CONTEXT_PROVENANCE_PATHS: dict[str, tuple[str, ...]] = {
+    'liquidity_turnover_slippage': ('quote_context', 'price_context', 'signal_features'),
+    'financial_detail_quarter_cashflow': ('fundamentals',),
+    'market_sector_peer_relative': ('factor_rows.composite', 'signal_features'),
+    'factor_score_coverage': (
+        'factor_rows.unified_value',
+        'factor_rows.quality',
+        'factor_rows.momentum',
+        'factor_rows.advanced_value',
+        'factor_rows.low_risk',
+        'factor_rows.beta',
+        'factor_rows.composite',
+        'signal_features',
+    ),
+    'technical_evidence_support_resistance': ('price_context',),
+    'disclosures_news_events': ('fundamentals', 'recent_disclosures'),
+    'after_hours_intraday_realtime': ('quote_context', 'signal_features'),
+    'price_bar_quality_session_state': ('price_context',),
+}
 
 
 def _normalize_whitespace(value: str) -> str:
@@ -330,6 +349,64 @@ def _extract_note_entries(value: Any, *, source: str, notes_by_key: dict[str, di
             _extract_note_entries(item, source=source, notes_by_key=notes_by_key)
 
 
+def _extract_context_provenance(context_payload: Any) -> dict[str, Any]:
+    if not isinstance(context_payload, dict):
+        return {}
+    direct = context_payload.get('context_provenance')
+    if isinstance(direct, dict):
+        return direct
+    symbol_day_context = context_payload.get('symbol_day_context')
+    if isinstance(symbol_day_context, dict):
+        nested = symbol_day_context.get('context_provenance')
+        if isinstance(nested, dict):
+            return nested
+    return {}
+
+
+def _resolve_context_provenance_path(context_provenance: dict[str, Any], path: str) -> dict[str, Any] | None:
+    current: Any = context_provenance
+    for segment in path.split('.'):
+        if not isinstance(current, dict):
+            return None
+        current = current.get(segment)
+    if isinstance(current, dict):
+        return current
+    return None
+
+
+def _build_category_context_evidence(*, category: str, context_payload: Any) -> tuple[list[str], list[dict[str, Any]]]:
+    context_provenance = _extract_context_provenance(context_payload)
+    if not context_provenance:
+        return [], []
+
+    evidence: list[dict[str, Any]] = []
+    issue_types: set[str] = set()
+    for path in CATEGORY_CONTEXT_PROVENANCE_PATHS.get(category, ()):
+        metadata = _resolve_context_provenance_path(context_provenance, path)
+        if metadata is None:
+            continue
+        block_issue_types = [
+            str(issue_type).strip()
+            for issue_type in metadata.get('issue_types', [])
+            if str(issue_type).strip()
+        ]
+        issue_types.update(block_issue_types)
+        evidence.append(
+            {
+                'block': path,
+                'issue_types': block_issue_types,
+                'freshness_status': metadata.get('freshness_status'),
+                'provenance_status': metadata.get('provenance_status'),
+                'as_of_market_date': metadata.get('as_of_market_date'),
+                'latest_available_market_date': metadata.get('latest_available_market_date'),
+                'source_tables': list(metadata.get('source_tables') or []),
+                'requested_symbol_coverage': metadata.get('requested_symbol_coverage'),
+            }
+        )
+
+    return sorted(issue_types), evidence
+
+
 def extract_missing_data_notes(
     *,
     data_gaps_payload: Any,
@@ -354,6 +431,7 @@ def build_missing_data_classification(
     *,
     data_gaps_payload: Any,
     improvement_notes_payload: Any,
+    context_payload: Any = None,
 ) -> dict[str, Any]:
     note_entries = extract_missing_data_notes(
         data_gaps_payload=data_gaps_payload,
@@ -381,12 +459,18 @@ def build_missing_data_classification(
         if bucket is None:
             continue
         notes = [sanitize_missing_data_note(note) for note in bucket['notes']]
+        context_issue_types, context_evidence = _build_category_context_evidence(
+            category=definition.key,
+            context_payload=context_payload,
+        )
         categories.append(
             {
                 'category': definition.key,
                 'note_count': len(notes),
                 'notes': notes,
                 'sources': sorted(bucket['sources']),
+                'context_issue_types': context_issue_types,
+                'context_evidence': context_evidence,
             }
         )
     uncategorized_notes = [
@@ -405,10 +489,12 @@ def build_missing_data_categories(
     *,
     data_gaps_payload: Any,
     improvement_notes_payload: Any,
+    context_payload: Any = None,
 ) -> list[dict[str, Any]]:
     return build_missing_data_classification(
         data_gaps_payload=data_gaps_payload,
         improvement_notes_payload=improvement_notes_payload,
+        context_payload=context_payload,
     )['categories']
 
 
@@ -436,6 +522,35 @@ def enrich_missing_data_categories(raw_categories: Any) -> list[dict[str, Any]]:
                 if _normalize_whitespace(str(source))
             }
         )
+        context_issue_types = sorted(
+            {
+                _normalize_whitespace(str(issue_type)).lower()
+                for issue_type in item.get('context_issue_types', [])
+                if _normalize_whitespace(str(issue_type))
+            }
+        )
+        context_evidence: list[dict[str, Any]] = []
+        for evidence in item.get('context_evidence', []):
+            if not isinstance(evidence, dict):
+                continue
+            context_evidence.append(
+                {
+                    'block': _normalize_whitespace(str(evidence.get('block') or '')),
+                    'issue_types': sorted(
+                        {
+                            _normalize_whitespace(str(issue_type)).lower()
+                            for issue_type in evidence.get('issue_types', [])
+                            if _normalize_whitespace(str(issue_type))
+                        }
+                    ),
+                    'freshness_status': evidence.get('freshness_status'),
+                    'provenance_status': evidence.get('provenance_status'),
+                    'as_of_market_date': evidence.get('as_of_market_date'),
+                    'latest_available_market_date': evidence.get('latest_available_market_date'),
+                    'source_tables': list(evidence.get('source_tables') or []),
+                    'requested_symbol_coverage': evidence.get('requested_symbol_coverage'),
+                }
+            )
         enriched.append(
             {
                 'category': definition.key,
@@ -447,6 +562,8 @@ def enrich_missing_data_categories(raw_categories: Any) -> list[dict[str, Any]]:
                 'note_count': note_count,
                 'notes': notes,
                 'sources': sources,
+                'context_issue_types': context_issue_types,
+                'context_evidence': context_evidence,
             }
         )
     return enriched

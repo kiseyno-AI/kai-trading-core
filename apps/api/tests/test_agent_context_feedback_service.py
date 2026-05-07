@@ -238,6 +238,24 @@ class AgentContextFeedbackServiceTests(unittest.TestCase):
                     'Add support/resistance evidence.',
                 ],
             },
+            context={
+                'symbol_day_context': {
+                    'context_provenance': {
+                        'quote_context': {
+                            'issue_types': ['stale'],
+                            'freshness_status': 'stale',
+                            'provenance_status': 'provider_sourced',
+                            'source_tables': ['current_quote_cache', 'quote_snapshots'],
+                        },
+                        'price_context': {
+                            'issue_types': ['derived_or_fallback'],
+                            'freshness_status': 'fresh',
+                            'provenance_status': 'provider_plus_fallback',
+                            'source_tables': ['daily_price_contexts', 'daily_price_bars'],
+                        },
+                    }
+                }
+            },
         )
 
         categories = repository.created['missing_data_categories_payload']
@@ -247,6 +265,8 @@ class AgentContextFeedbackServiceTests(unittest.TestCase):
         )
         self.assertEqual(categories[0]['note_count'], 1)
         self.assertEqual(categories[1]['notes'], ['Add support/resistance evidence.'])
+        self.assertEqual(categories[0]['context_issue_types'], ['derived_or_fallback', 'stale'])
+        self.assertEqual(categories[0]['context_evidence'][0]['block'], 'quote_context')
 
     def test_bulk_submit_feedback_normalizes_and_uses_bulk_upsert(self):
         repository = FakeFeedbackRepository()

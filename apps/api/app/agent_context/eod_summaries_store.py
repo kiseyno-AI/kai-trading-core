@@ -28,6 +28,7 @@ def _serialize_eod_summary(record: AgentContextFeedback) -> dict[str, Any]:
         raw_categories = build_missing_data_categories(
             data_gaps_payload=record.data_gaps_payload,
             improvement_notes_payload=record.improvement_notes_payload,
+            context_payload=record.context_payload,
         )
     return {
         'symbol': record.symbol,

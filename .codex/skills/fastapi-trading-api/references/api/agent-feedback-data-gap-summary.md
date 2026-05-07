@@ -1,7 +1,7 @@
 # GET /agent-context/feedback/data-gap-summary
 
 ## Summary
-Aggregates normalized agent missing-data feedback by date or date range so operators can prioritize backlog items and context wiring fixes.
+Aggregates normalized agent missing-data feedback by date or date range so operators can prioritize backlog items and context wiring fixes. When stored feedback includes agent-context provenance metadata, the summary also separates `missing`, `stale`, `available_but_old`, and `derived_or_fallback` issue types instead of flattening them into one generic complaint bucket.
 
 ## Example request
 ```http
@@ -15,7 +15,12 @@ GET /agent-context/feedback/data-gap-summary?market_date_from=2026-05-01&market_
     "feedback_rows_scanned": 24,
     "feedback_rows_matched": 7,
     "matched_note_count": 9,
-    "category_count": 1
+    "category_count": 1,
+    "context_issue_type_counts": {
+      "stale": 4,
+      "derived_or_fallback": 3,
+      "available_but_old": 1
+    }
   },
   "categories": [
     {
@@ -28,6 +33,10 @@ GET /agent-context/feedback/data-gap-summary?market_date_from=2026-05-01&market_
         "note_mentions": 9,
         "symbols": 6,
         "roles": 2
+      },
+      "context_issue_type_counts": {
+        "stale": 4,
+        "derived_or_fallback": 3
       },
       "affected_symbols": ["000660", "005930"],
       "example_notes": ["거래대금과 슬리피지 근거 필요"]

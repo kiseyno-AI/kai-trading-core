@@ -4,8 +4,22 @@ from calendar import monthrange
 from datetime import date, datetime
 from typing import Any, Sequence
 
+from sqlalchemy import func, select
+
 from app.agent_context.derived_contexts import DEFAULT_DERIVED_CONTEXT_HISTORY_DAYS, build_price_context
 from app.agent_context.score_context import build_signal_decider_scores
+from app.db import session_scope
+from app.db_models import (
+    DailyAdvancedValueFactorResult,
+    DailyBetaFactorResult,
+    DailyCompositeFactorResult,
+    DailyLowRiskFactorResult,
+    DailyMomentumFactorResult,
+    DailyQualityFactorResult,
+    DailySignalFeature,
+    DailyUnifiedValueFactorResult,
+    Symbol,
+)
 from app.dart.fundamentals_store import DartFundamentalsRepository, dart_fundamentals_repository
 from app.dart.service import FS_DIV_TO_STATEMENT_TYPE, REPORT_CODE_METADATA
 from app.dart.store import DartSyncRepository, dart_sync_repository
@@ -28,6 +42,14 @@ from app.market_data_store import (
 )
 
 PRICE_CONTEXT_HISTORY_DAYS = DEFAULT_DERIVED_CONTEXT_HISTORY_DAYS
+FRESHNESS_STATUS_FRESH = 'fresh'
+FRESHNESS_STATUS_STALE = 'stale'
+FRESHNESS_STATUS_AVAILABLE_BUT_OLD = 'available_but_old'
+FRESHNESS_STATUS_MISSING = 'missing'
+PROVENANCE_STATUS_PROVIDER_SOURCED = 'provider_sourced'
+PROVENANCE_STATUS_DERIVED = 'derived_from_provider_data'
+PROVENANCE_STATUS_FALLBACK = 'fallback_from_owned_data'
+PROVENANCE_STATUS_PROVIDER_PLUS_FALLBACK = 'provider_plus_fallback'
 PERSISTED_FACTOR_FAMILIES: tuple[str, ...] = (
     'unified_value',
     'quality',
@@ -240,6 +262,33 @@ FACTOR_ROW_SUBMETRIC_FIELDS: dict[str, tuple[str, ...]] = {
         'low_beta_input',
         'composite_score',
     ),
+}
+FACTOR_ROW_PRIMARY_TABLES: dict[str, str] = {
+    'unified_value': 'daily_unified_value_factor_results',
+    'quality': 'daily_quality_factor_results',
+    'momentum': 'daily_momentum_factor_results',
+    'advanced_value': 'daily_advanced_value_factor_results',
+    'low_risk': 'daily_low_risk_factor_results',
+    'beta': 'daily_beta_factor_results',
+    'composite': 'daily_composite_factor_results',
+}
+FACTOR_ROW_MODELS: dict[str, type[Any]] = {
+    'unified_value': DailyUnifiedValueFactorResult,
+    'quality': DailyQualityFactorResult,
+    'momentum': DailyMomentumFactorResult,
+    'advanced_value': DailyAdvancedValueFactorResult,
+    'low_risk': DailyLowRiskFactorResult,
+    'beta': DailyBetaFactorResult,
+    'composite': DailyCompositeFactorResult,
+}
+FACTOR_ROW_SOURCE_PROVIDERS: dict[str, str] = {
+    'unified_value': 'internal_factor_pipeline',
+    'quality': 'internal_factor_pipeline',
+    'momentum': 'internal_factor_pipeline',
+    'advanced_value': 'internal_factor_pipeline',
+    'low_risk': 'internal_factor_pipeline',
+    'beta': 'internal_factor_pipeline',
+    'composite': 'internal_factor_pipeline',
 }
 
 
@@ -472,6 +521,12 @@ def _to_float(value: Any) -> float | None:
     return None
 
 
+def _maybe_dict(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    return {}
+
+
 def _parse_iso_datetime(value: str | None) -> datetime | None:
     if not value:
         return None
@@ -480,6 +535,496 @@ def _parse_iso_datetime(value: str | None) -> datetime | None:
         return datetime.fromisoformat(normalized)
     except ValueError:
         return None
+
+
+def _parse_iso_date(value: Any) -> date | None:
+    if isinstance(value, date):
+        return value
+    if value is None:
+        return None
+    try:
+        return date.fromisoformat(str(value))
+    except ValueError:
+        return None
+
+
+def _trade_date_relation_to_request(*, as_of_market_date: str | None, requested_market_date: date) -> str | None:
+    parsed_as_of = _parse_iso_date(as_of_market_date)
+    if parsed_as_of is None:
+        return None
+    if parsed_as_of == requested_market_date:
+        return 'same_market_date'
+    if parsed_as_of < requested_market_date:
+        return 'before_market_date'
+    return 'after_market_date'
+
+
+def _issue_types_for_metadata(*, freshness_status: str, provenance_status: str) -> list[str]:
+    issue_types: list[str] = []
+    if freshness_status == FRESHNESS_STATUS_MISSING:
+        issue_types.append('missing')
+    elif freshness_status == FRESHNESS_STATUS_STALE:
+        issue_types.append('stale')
+    elif freshness_status == FRESHNESS_STATUS_AVAILABLE_BUT_OLD:
+        issue_types.append('available_but_old')
+    if provenance_status in {PROVENANCE_STATUS_FALLBACK, PROVENANCE_STATUS_PROVIDER_PLUS_FALLBACK}:
+        issue_types.append('derived_or_fallback')
+    return issue_types
+
+
+def _build_freshness_provenance(
+    *,
+    requested_market_date: date,
+    freshness_status: str,
+    provenance_status: str,
+    source_tables: Sequence[str],
+    source_provider: str | None,
+    as_of_market_date: str | None = None,
+    as_of_timestamp: str | None = None,
+    latest_available_market_date: str | None = None,
+    latest_available_timestamp: str | None = None,
+    row_count: int | None = None,
+    history_row_count: int | None = None,
+    trade_date_relation_to_request: str | None = None,
+    reason: str | None = None,
+    requested_symbol_coverage: dict[str, Any] | None = None,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    metadata = {
+        'freshness_status': freshness_status,
+        'provenance_status': provenance_status,
+        'issue_types': _issue_types_for_metadata(
+            freshness_status=freshness_status,
+            provenance_status=provenance_status,
+        ),
+        'requested_market_date': requested_market_date.isoformat(),
+        'as_of_market_date': as_of_market_date,
+        'as_of_timestamp': as_of_timestamp,
+        'latest_available_market_date': latest_available_market_date,
+        'latest_available_timestamp': latest_available_timestamp,
+        'trade_date_relation_to_request': trade_date_relation_to_request,
+        'source_tables': list(source_tables),
+        'source_provider': source_provider,
+        'row_count': row_count,
+        'history_row_count': history_row_count,
+        'reason': reason,
+        'is_missing': freshness_status == FRESHNESS_STATUS_MISSING,
+        'is_stale': freshness_status == FRESHNESS_STATUS_STALE,
+        'is_available_but_old': freshness_status == FRESHNESS_STATUS_AVAILABLE_BUT_OLD,
+        'is_provider_sourced': provenance_status == PROVENANCE_STATUS_PROVIDER_SOURCED,
+        'is_derived': provenance_status in {
+            PROVENANCE_STATUS_DERIVED,
+            PROVENANCE_STATUS_FALLBACK,
+            PROVENANCE_STATUS_PROVIDER_PLUS_FALLBACK,
+        },
+        'is_fallback': provenance_status in {
+            PROVENANCE_STATUS_FALLBACK,
+            PROVENANCE_STATUS_PROVIDER_PLUS_FALLBACK,
+        },
+    }
+    if requested_symbol_coverage is not None:
+        metadata['requested_symbol_coverage'] = requested_symbol_coverage
+    if extra:
+        metadata.update(extra)
+    return metadata
+
+
+def _load_latest_prior_rows_for_model(
+    *,
+    model: type[Any],
+    market_date: date,
+    symbols: Sequence[str],
+) -> dict[str, dict[str, Any]]:
+    normalized_symbols = list(dict.fromkeys(symbols))
+    if not normalized_symbols:
+        return {}
+
+    with session_scope() as session:
+        ranked = (
+            select(
+                Symbol.symbol.label('symbol'),
+                model.market_date.label('market_date'),
+                model.captured_at.label('captured_at'),
+                model.source.label('source'),
+                func.row_number()
+                .over(
+                    partition_by=model.symbol_id,
+                    order_by=(model.market_date.desc(), model.captured_at.desc(), model.id.desc()),
+                )
+                .label('row_rank'),
+            )
+            .join(Symbol, Symbol.id == model.symbol_id)
+            .where(
+                Symbol.symbol.in_(normalized_symbols),
+                model.market_date < market_date,
+            )
+            .subquery()
+        )
+        rows = session.execute(select(ranked).where(ranked.c.row_rank == 1)).all()
+
+    return {
+        row.symbol: {
+            'market_date': row.market_date.isoformat() if row.market_date else None,
+            'captured_at': row.captured_at.isoformat() if row.captured_at else None,
+            'source': row.source,
+        }
+        for row in rows
+    }
+
+
+def _load_latest_symbol_day_block_history(
+    *,
+    market_date: date,
+    symbols: Sequence[str],
+) -> dict[str, Any]:
+    factor_rows = {
+        family: _load_latest_prior_rows_for_model(
+            model=model,
+            market_date=market_date,
+            symbols=symbols,
+        )
+        for family, model in FACTOR_ROW_MODELS.items()
+    }
+    signal_features = _load_latest_prior_rows_for_model(
+        model=DailySignalFeature,
+        market_date=market_date,
+        symbols=symbols,
+    )
+    return {
+        'factor_rows': factor_rows,
+        'signal_features': signal_features,
+    }
+
+
+def _build_factor_row_freshness_provenance(
+    *,
+    family: str,
+    row: dict[str, Any] | None,
+    latest_prior_row: dict[str, Any] | None,
+    requested_market_date: date,
+) -> dict[str, Any]:
+    requested_market_date_iso = requested_market_date.isoformat()
+    current_market_date = row.get('market_date') if row is not None else None
+    current_captured_at = row.get('captured_at') if row is not None else None
+    if row is not None and current_market_date == requested_market_date_iso:
+        freshness_status = FRESHNESS_STATUS_FRESH
+        as_of_market_date = current_market_date
+        as_of_timestamp = current_captured_at
+        latest_available_market_date = current_market_date
+        latest_available_timestamp = current_captured_at
+        reason = None
+    elif latest_prior_row is not None:
+        freshness_status = FRESHNESS_STATUS_AVAILABLE_BUT_OLD
+        as_of_market_date = None
+        as_of_timestamp = None
+        latest_available_market_date = latest_prior_row.get('market_date')
+        latest_available_timestamp = latest_prior_row.get('captured_at')
+        reason = 'latest_prior_factor_row_available'
+    else:
+        freshness_status = FRESHNESS_STATUS_MISSING
+        as_of_market_date = None
+        as_of_timestamp = None
+        latest_available_market_date = None
+        latest_available_timestamp = None
+        reason = 'no_stored_factor_row_for_or_before_request_date'
+
+    source_provider = (
+        row.get('source')
+        if row is not None
+        else latest_prior_row.get('source')
+        if latest_prior_row is not None
+        else FACTOR_ROW_SOURCE_PROVIDERS[family]
+    )
+    trade_date_relation = _trade_date_relation_to_request(
+        as_of_market_date=current_market_date if row is not None else latest_prior_row.get('market_date') if latest_prior_row else None,
+        requested_market_date=requested_market_date,
+    )
+    return _build_freshness_provenance(
+        requested_market_date=requested_market_date,
+        freshness_status=freshness_status,
+        provenance_status=PROVENANCE_STATUS_DERIVED,
+        source_tables=(FACTOR_ROW_PRIMARY_TABLES[family],),
+        source_provider=source_provider,
+        as_of_market_date=as_of_market_date,
+        as_of_timestamp=as_of_timestamp,
+        latest_available_market_date=latest_available_market_date,
+        latest_available_timestamp=latest_available_timestamp,
+        row_count=1 if row is not None else 0,
+        trade_date_relation_to_request=trade_date_relation,
+        reason=reason,
+    )
+
+
+def _build_quote_freshness_provenance(
+    *,
+    row: dict[str, Any] | None,
+    requested_market_date: date,
+) -> dict[str, Any]:
+    if row is None:
+        return _build_freshness_provenance(
+            requested_market_date=requested_market_date,
+            freshness_status=FRESHNESS_STATUS_MISSING,
+            provenance_status=PROVENANCE_STATUS_PROVIDER_SOURCED,
+            source_tables=('current_quote_cache', 'quote_snapshots'),
+            source_provider='kis',
+            row_count=0,
+            reason='no_current_quote_cache_row',
+        )
+
+    quote_trade_date = row.get('trade_date')
+    trade_date_relation = _trade_date_relation_to_request(
+        as_of_market_date=quote_trade_date,
+        requested_market_date=requested_market_date,
+    )
+    freshness_status = (
+        FRESHNESS_STATUS_FRESH
+        if trade_date_relation in {None, 'same_market_date'}
+        else FRESHNESS_STATUS_STALE
+    )
+    provenance_status = (
+        PROVENANCE_STATUS_PROVIDER_PLUS_FALLBACK
+        if bool(row.get('fallback'))
+        else PROVENANCE_STATUS_PROVIDER_SOURCED
+    )
+    return _build_freshness_provenance(
+        requested_market_date=requested_market_date,
+        freshness_status=freshness_status,
+        provenance_status=provenance_status,
+        source_tables=('current_quote_cache', 'quote_snapshots'),
+        source_provider=str(row.get('source') or 'kis'),
+        as_of_market_date=quote_trade_date,
+        as_of_timestamp=row.get('captured_at') or row.get('cached_at'),
+        latest_available_market_date=quote_trade_date,
+        latest_available_timestamp=row.get('captured_at') or row.get('cached_at'),
+        row_count=1,
+        trade_date_relation_to_request=trade_date_relation,
+        reason='quote_fallback_used' if bool(row.get('fallback')) else None,
+    )
+
+
+def _build_price_context_freshness_provenance(
+    *,
+    price_context: dict[str, Any] | None,
+    price_context_history: list[dict[str, Any]],
+    requested_market_date: date,
+) -> dict[str, Any]:
+    latest_history = price_context_history[-1] if price_context_history else None
+    liquidity = price_context.get('liquidity') if isinstance(price_context, dict) else None
+    price_bar_quality = price_context.get('price_bar_quality') if isinstance(price_context, dict) else None
+    turnover_is_estimated = bool((liquidity or {}).get('turnover_is_estimated'))
+    issue_codes = list((price_bar_quality or {}).get('issue_codes') or [])
+    if price_context is not None:
+        trade_date = price_context.get('trade_date')
+        trade_date_relation = _trade_date_relation_to_request(
+            as_of_market_date=trade_date,
+            requested_market_date=requested_market_date,
+        )
+        freshness_status = (
+            FRESHNESS_STATUS_FRESH
+            if trade_date_relation in {None, 'same_market_date'}
+            else FRESHNESS_STATUS_STALE
+        )
+        provenance_status = (
+            PROVENANCE_STATUS_PROVIDER_PLUS_FALLBACK
+            if turnover_is_estimated
+            else PROVENANCE_STATUS_DERIVED
+        )
+        return _build_freshness_provenance(
+            requested_market_date=requested_market_date,
+            freshness_status=freshness_status,
+            provenance_status=provenance_status,
+            source_tables=('daily_price_contexts', 'daily_price_bars'),
+            source_provider=str(price_context.get('source') or 'pykrx'),
+            as_of_market_date=trade_date,
+            as_of_timestamp=price_context.get('captured_at'),
+            latest_available_market_date=trade_date,
+            latest_available_timestamp=price_context.get('captured_at'),
+            row_count=1,
+            history_row_count=len(price_context_history),
+            trade_date_relation_to_request=trade_date_relation,
+            reason='estimated_turnover_from_owned_bars' if turnover_is_estimated else None,
+            extra={
+                'turnover_source': (liquidity or {}).get('turnover_source'),
+                'price_bar_issue_codes': issue_codes,
+            },
+        )
+
+    latest_trade_date = latest_history.get('market_date') if latest_history is not None else None
+    latest_source = latest_history.get('source') if latest_history is not None else 'pykrx'
+    return _build_freshness_provenance(
+        requested_market_date=requested_market_date,
+        freshness_status=FRESHNESS_STATUS_STALE if latest_history is not None else FRESHNESS_STATUS_MISSING,
+        provenance_status=PROVENANCE_STATUS_DERIVED,
+        source_tables=('daily_price_contexts', 'daily_price_bars'),
+        source_provider=str(latest_source or 'pykrx'),
+        latest_available_market_date=latest_trade_date,
+        latest_available_timestamp=latest_history.get('captured_at') if latest_history is not None else None,
+        row_count=0,
+        history_row_count=len(price_context_history),
+        trade_date_relation_to_request=_trade_date_relation_to_request(
+            as_of_market_date=latest_trade_date,
+            requested_market_date=requested_market_date,
+        ),
+        reason='latest_prior_price_context_available' if latest_history is not None else 'no_stored_price_context_for_or_before_request_date',
+    )
+
+
+def _build_signal_features_freshness_provenance(
+    *,
+    signal_features: dict[str, Any] | None,
+    latest_prior_row: dict[str, Any] | None,
+    requested_market_date: date,
+) -> dict[str, Any]:
+    if signal_features is not None:
+        row_freshness = signal_features.get('freshness') if isinstance(signal_features.get('freshness'), dict) else {}
+        as_of_market_date = str(row_freshness.get('market_date') or signal_features.get('market_date') or '')
+        if not as_of_market_date:
+            as_of_market_date = requested_market_date.isoformat()
+        row_kind = str(signal_features.get('row_kind') or (signal_features.get('provenance') or {}).get('row_kind') or '')
+        if row_kind == 'fallback_only':
+            provenance_status = PROVENANCE_STATUS_FALLBACK
+        elif row_kind == 'direct_plus_fallback':
+            provenance_status = PROVENANCE_STATUS_PROVIDER_PLUS_FALLBACK
+        else:
+            provenance_status = PROVENANCE_STATUS_PROVIDER_SOURCED
+        trade_date_relation = _trade_date_relation_to_request(
+            as_of_market_date=as_of_market_date,
+            requested_market_date=requested_market_date,
+        )
+        freshness_status = (
+            FRESHNESS_STATUS_FRESH
+            if trade_date_relation in {None, 'same_market_date'}
+            else FRESHNESS_STATUS_STALE
+        )
+        return _build_freshness_provenance(
+            requested_market_date=requested_market_date,
+            freshness_status=freshness_status,
+            provenance_status=provenance_status,
+            source_tables=('daily_signal_features',),
+            source_provider=str(signal_features.get('source') or 'kis_ranking'),
+            as_of_market_date=as_of_market_date,
+            as_of_timestamp=signal_features.get('captured_at'),
+            latest_available_market_date=as_of_market_date,
+            latest_available_timestamp=signal_features.get('captured_at'),
+            row_count=1,
+            trade_date_relation_to_request=trade_date_relation,
+            reason='owned_fallback_features_present' if provenance_status != PROVENANCE_STATUS_PROVIDER_SOURCED else None,
+            extra={
+                'row_kind': row_kind or None,
+                'direct_signal_source_count': (
+                    (signal_features.get('provenance') or {}).get('direct_signal_source_count')
+                ),
+                'fallback_groups_present': list(
+                    (signal_features.get('provenance') or {}).get('fallback_groups_present') or []
+                ),
+            },
+        )
+
+    latest_available_market_date = latest_prior_row.get('market_date') if latest_prior_row is not None else None
+    return _build_freshness_provenance(
+        requested_market_date=requested_market_date,
+        freshness_status=FRESHNESS_STATUS_STALE if latest_prior_row is not None else FRESHNESS_STATUS_MISSING,
+        provenance_status=PROVENANCE_STATUS_PROVIDER_SOURCED,
+        source_tables=('daily_signal_features',),
+        source_provider=str(latest_prior_row.get('source') or 'kis_ranking') if latest_prior_row is not None else 'kis_ranking',
+        latest_available_market_date=latest_available_market_date,
+        latest_available_timestamp=latest_prior_row.get('captured_at') if latest_prior_row is not None else None,
+        row_count=0,
+        trade_date_relation_to_request=_trade_date_relation_to_request(
+            as_of_market_date=latest_available_market_date,
+            requested_market_date=requested_market_date,
+        ),
+        reason='latest_prior_signal_feature_row_available' if latest_prior_row is not None else 'no_stored_signal_feature_row_for_or_before_request_date',
+    )
+
+
+def _build_fundamentals_freshness_provenance(
+    *,
+    fundamentals: dict[str, Any],
+    requested_market_date: date,
+) -> dict[str, Any]:
+    latest_snapshot = fundamentals.get('latest_snapshot') if isinstance(fundamentals, dict) else None
+    history_summary = fundamentals.get('history_summary') if isinstance(fundamentals, dict) else {}
+    latest_receipt_date = history_summary.get('latest_receipt_date') if isinstance(history_summary, dict) else None
+    latest_captured_at = (
+        latest_snapshot.get('filing', {}).get('captured_at')
+        if isinstance(latest_snapshot, dict)
+        else None
+    )
+    trade_date_relation = _trade_date_relation_to_request(
+        as_of_market_date=latest_receipt_date,
+        requested_market_date=requested_market_date,
+    )
+    if latest_snapshot is None:
+        freshness_status = FRESHNESS_STATUS_MISSING
+        reason = 'no_stored_fundamentals_snapshot'
+    elif trade_date_relation == 'same_market_date':
+        freshness_status = FRESHNESS_STATUS_FRESH
+        reason = None
+    else:
+        freshness_status = FRESHNESS_STATUS_AVAILABLE_BUT_OLD
+        reason = 'latest_fundamentals_snapshot_precedes_request_date'
+    return _build_freshness_provenance(
+        requested_market_date=requested_market_date,
+        freshness_status=freshness_status,
+        provenance_status=PROVENANCE_STATUS_PROVIDER_SOURCED,
+        source_tables=('dart_fundamentals_snapshots', 'dart_fundamentals_rows', 'dart_disclosure_events'),
+        source_provider='dart',
+        as_of_market_date=latest_receipt_date if latest_snapshot is not None else None,
+        as_of_timestamp=latest_captured_at if latest_snapshot is not None else None,
+        latest_available_market_date=latest_receipt_date,
+        latest_available_timestamp=latest_captured_at,
+        row_count=1 if latest_snapshot is not None else 0,
+        history_row_count=int(history_summary.get('entries') or 0) if isinstance(history_summary, dict) else 0,
+        trade_date_relation_to_request=trade_date_relation,
+        reason=reason,
+        extra={
+            'statement_row_count': (
+                _maybe_dict(latest_snapshot.get('statement')).get('row_count')
+                if isinstance(latest_snapshot, dict)
+                else None
+            ),
+            'latest_period_end_date': history_summary.get('latest_period_end_date') if isinstance(history_summary, dict) else None,
+            'available_business_years': history_summary.get('available_business_years') if isinstance(history_summary, dict) else [],
+        },
+    )
+
+
+def _build_recent_disclosures_freshness_provenance(
+    *,
+    disclosures: list[dict[str, Any]],
+    requested_market_date: date,
+    disclosures_limit: int,
+) -> dict[str, Any]:
+    latest_receipt_date = disclosures[0].get('receipt_date') if disclosures else None
+    trade_date_relation = _trade_date_relation_to_request(
+        as_of_market_date=latest_receipt_date,
+        requested_market_date=requested_market_date,
+    )
+    if not disclosures:
+        freshness_status = FRESHNESS_STATUS_MISSING
+        reason = 'no_recent_disclosures_up_to_request_date'
+    elif trade_date_relation == 'same_market_date':
+        freshness_status = FRESHNESS_STATUS_FRESH
+        reason = None
+    else:
+        freshness_status = FRESHNESS_STATUS_AVAILABLE_BUT_OLD
+        reason = 'latest_disclosure_precedes_request_date'
+    return _build_freshness_provenance(
+        requested_market_date=requested_market_date,
+        freshness_status=freshness_status,
+        provenance_status=PROVENANCE_STATUS_PROVIDER_SOURCED,
+        source_tables=('dart_disclosure_events',),
+        source_provider='dart',
+        as_of_market_date=latest_receipt_date,
+        latest_available_market_date=latest_receipt_date,
+        row_count=len(disclosures),
+        trade_date_relation_to_request=trade_date_relation,
+        reason=reason,
+        extra={
+            'limit_per_symbol': disclosures_limit,
+        },
+    )
 
 
 def _build_quote_context(row: dict[str, Any] | None, *, market_date: date) -> dict[str, Any] | None:
@@ -758,6 +1303,10 @@ class AgentContextReadService:
             stock_codes=normalized_symbols,
             fs_div=normalized_fs_div,
         )
+        latest_prior_rows = _load_latest_symbol_day_block_history(
+            market_date=normalized_market_date,
+            symbols=normalized_symbols,
+        )
         disclosures_by_symbol = self.disclosure_repository.list_recent_events_by_stock_codes(
             stock_codes=normalized_symbols,
             receipt_date_to=normalized_market_date,
@@ -794,7 +1343,8 @@ class AgentContextReadService:
         factor_row_counts = {family: 0 for family in PERSISTED_FACTOR_FAMILIES}
 
         for symbol in normalized_symbols:
-            quote_context = _build_quote_context(quote_map.get(symbol), market_date=normalized_market_date)
+            raw_quote_row = quote_map.get(symbol)
+            quote_context = _build_quote_context(raw_quote_row, market_date=normalized_market_date)
             price_context = price_context_map.get(symbol)
             price_context_history = price_context_history_map.get(symbol, [])
             technical_snapshot = technical_map.get(symbol)
@@ -837,6 +1387,21 @@ class AgentContextReadService:
                     fields=FACTOR_ROW_FIELDS['composite'],
                 ),
             }
+            factor_row_provenance = {
+                family: _build_factor_row_freshness_provenance(
+                    family=family,
+                    row=row,
+                    latest_prior_row=((latest_prior_rows.get('factor_rows') or {}).get(family) or {}).get(symbol),
+                    requested_market_date=normalized_market_date,
+                )
+                for family, row in persisted_factor_rows.items()
+            }
+            for family, row in list(persisted_factor_rows.items()):
+                if row is not None:
+                    persisted_factor_rows[family] = {
+                        **row,
+                        'freshness_provenance': factor_row_provenance[family],
+                    }
             for family, row in persisted_factor_rows.items():
                 if row is not None:
                     factor_row_counts[family] += 1
@@ -859,6 +1424,64 @@ class AgentContextReadService:
             recent_disclosures = [
                 _serialize_disclosure(item) for item in disclosures_by_symbol.get(symbol, [])
             ]
+            quote_context_provenance = _build_quote_freshness_provenance(
+                row=raw_quote_row,
+                requested_market_date=normalized_market_date,
+            )
+            price_context_provenance = _build_price_context_freshness_provenance(
+                price_context=price_context,
+                price_context_history=price_context_history,
+                requested_market_date=normalized_market_date,
+            )
+            signal_features_provenance = _build_signal_features_freshness_provenance(
+                signal_features=signal_features,
+                latest_prior_row=(latest_prior_rows.get('signal_features') or {}).get(symbol),
+                requested_market_date=normalized_market_date,
+            )
+            fundamentals_provenance = _build_fundamentals_freshness_provenance(
+                fundamentals=fundamentals,
+                requested_market_date=normalized_market_date,
+            )
+            recent_disclosures_provenance = _build_recent_disclosures_freshness_provenance(
+                disclosures=recent_disclosures,
+                requested_market_date=normalized_market_date,
+                disclosures_limit=disclosures_limit,
+            )
+            if quote_context is not None:
+                quote_context = {
+                    **quote_context,
+                    'freshness_provenance': quote_context_provenance,
+                }
+            if price_context is not None:
+                price_context = {
+                    **price_context,
+                    'freshness_provenance': price_context_provenance,
+                }
+            if signal_features is not None:
+                signal_features = {
+                    **signal_features,
+                    'freshness_provenance': signal_features_provenance,
+                }
+            fundamentals = {
+                **fundamentals,
+                'freshness_provenance': fundamentals_provenance,
+            }
+            if isinstance(fundamentals.get('latest_snapshot'), dict):
+                fundamentals['latest_snapshot'] = {
+                    **fundamentals['latest_snapshot'],
+                    'freshness_provenance': fundamentals_provenance,
+                }
+            scores = {
+                family: (
+                    {
+                        **score_payload,
+                        'freshness_provenance': factor_row_provenance[family],
+                    }
+                    if isinstance(score_payload, dict)
+                    else score_payload
+                )
+                for family, score_payload in scores.items()
+            }
 
             company_row = symbol_map.get(symbol)
             fundamentals_entries = fundamentals_map.get(symbol) or []
@@ -901,10 +1524,10 @@ class AgentContextReadService:
                     isinstance(market_relative_context, dict)
                     and str(market_relative_context.get('status') or 'unavailable') != 'unavailable'
                 ),
-                'persisted_factor_rows': any(row is not None for row in persisted_factor_rows.values()),
-                'fundamentals': fundamentals['latest_snapshot'] is not None,
-                'recent_disclosures': bool(recent_disclosures),
-            }
+                    'persisted_factor_rows': any(row is not None for row in persisted_factor_rows.values()),
+                    'fundamentals': fundamentals['latest_snapshot'] is not None,
+                    'recent_disclosures': bool(recent_disclosures),
+                }
             if any(availability.values()):
                 matched_symbols.append(symbol)
             else:
@@ -928,8 +1551,17 @@ class AgentContextReadService:
                     'recent_disclosures': {
                         'count': len(recent_disclosures),
                         'items': recent_disclosures,
+                        'freshness_provenance': recent_disclosures_provenance,
                     },
                     'context_completeness': context_completeness,
+                    'context_provenance': {
+                        'quote_context': quote_context_provenance,
+                        'price_context': price_context_provenance,
+                        'signal_features': signal_features_provenance,
+                        'fundamentals': fundamentals_provenance,
+                        'recent_disclosures': recent_disclosures_provenance,
+                        'factor_rows': factor_row_provenance,
+                    },
                     'availability': availability,
                 }
             )
@@ -995,6 +1627,9 @@ class AgentContextReadService:
         }
         for item in items:
             item['context_completeness']['requested_symbol_coverage'] = requested_symbol_coverage
+            item['context_provenance']['signal_features']['requested_symbol_coverage'] = requested_symbol_coverage['signal_features']
+            for family in PERSISTED_FACTOR_FAMILIES:
+                item['context_provenance']['factor_rows'][family]['requested_symbol_coverage'] = factor_row_coverage[family]
 
         return {
             'request': {
