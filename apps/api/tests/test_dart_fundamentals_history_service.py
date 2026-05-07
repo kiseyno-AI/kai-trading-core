@@ -37,6 +37,7 @@ class DartFundamentalsHistoryServiceTests(unittest.TestCase):
                     'disclosure': {
                         'report_nm': '사업보고서 (2024.12)',
                         'receipt_date': '2025-03-12',
+                        'remark': None,
                     },
                     'highlights': [
                         {
@@ -50,6 +51,51 @@ class DartFundamentalsHistoryServiceTests(unittest.TestCase):
                             'current_cumulative_amount': 100,
                             'prior_amount': 90,
                             'prior_cumulative_amount': 90,
+                            'pre_prior_amount': None,
+                            'currency': 'KRW',
+                            'ratio_value': None,
+                        },
+                        {
+                            'metric_key': 'total_assets',
+                            'metric_type': 'account',
+                            'statement_type': 'BS',
+                            'statement_name': '재무상태표',
+                            'account_id': 'ifrs-full_Assets',
+                            'account_name': '자산총계',
+                            'current_amount': 400,
+                            'current_cumulative_amount': None,
+                            'prior_amount': 380,
+                            'prior_cumulative_amount': None,
+                            'pre_prior_amount': None,
+                            'currency': 'KRW',
+                            'ratio_value': None,
+                        },
+                        {
+                            'metric_key': 'total_liabilities',
+                            'metric_type': 'account',
+                            'statement_type': 'BS',
+                            'statement_name': '재무상태표',
+                            'account_id': 'ifrs-full_Liabilities',
+                            'account_name': '부채총계',
+                            'current_amount': 160,
+                            'current_cumulative_amount': None,
+                            'prior_amount': 150,
+                            'prior_cumulative_amount': None,
+                            'pre_prior_amount': None,
+                            'currency': 'KRW',
+                            'ratio_value': None,
+                        },
+                        {
+                            'metric_key': 'total_equity',
+                            'metric_type': 'account',
+                            'statement_type': 'BS',
+                            'statement_name': '재무상태표',
+                            'account_id': 'ifrs-full_Equity',
+                            'account_name': '자본총계',
+                            'current_amount': 240,
+                            'current_cumulative_amount': None,
+                            'prior_amount': 230,
+                            'prior_cumulative_amount': None,
                             'pre_prior_amount': None,
                             'currency': 'KRW',
                             'ratio_value': None,
@@ -104,8 +150,9 @@ class DartFundamentalsHistoryServiceTests(unittest.TestCase):
                     'source_message': 'OK',
                     'captured_at': '2024-11-14T01:02:03+00:00',
                     'disclosure': {
-                        'report_nm': '분기보고서 (2024.09)',
+                        'report_nm': '[기재정정] 분기보고서 (2024.09)',
                         'receipt_date': '2024-11-14',
+                        'remark': '정',
                     },
                     'highlights': [],
                     'statement_rows': [],
@@ -131,6 +178,15 @@ class DartFundamentalsHistoryServiceTests(unittest.TestCase):
         self.assertEqual(entry['period']['report_code'], '11011')
         self.assertEqual(entry['highlights']['revenue']['current_amount'], 100)
         self.assertEqual(entry['highlights']['ratios']['operating_margin'], '0.2000')
+        self.assertEqual(
+            entry['fundamental_context']['normalized_facts']['balance_sheet']['total_assets']['current_value'],
+            400,
+        )
+        self.assertEqual(
+            entry['fundamental_context']['analysis']['leverage_liquidity']['metrics']['debt_to_equity'],
+            '0.6667',
+        )
+        self.assertEqual(entry['fundamental_context']['source_provenance']['rcept_no'], '20250312000123')
         self.assertEqual(entry['statements']['count'], 1)
 
     def test_history_service_reports_missing_symbols(self):

@@ -16,6 +16,7 @@ from app.db_models import (
     DartFundamentalsRow,
     DartFundamentalsSnapshot,
 )
+from app.dart.service import classify_disclosure_event
 
 
 CAPTURE_STATUS_PENDING = 'pending'
@@ -808,6 +809,12 @@ class DartFundamentalsRepository:
             return items
 
     def _serialize_event(self, row: DartDisclosureEvent) -> dict[str, Any]:
+        disclosure_flags = classify_disclosure_event(
+            report_name=row.report_nm,
+            remark=row.remark,
+            filing_category=row.filing_category,
+            is_financial_report=True,
+        )
         return {
             'id': row.id,
             'rcept_no': row.rcept_no,
@@ -817,11 +824,17 @@ class DartFundamentalsRepository:
             'report_nm': row.report_nm,
             'filing_category': row.filing_category,
             'receipt_date': row.receipt_date.isoformat() if row.receipt_date else None,
+            'remark': row.remark,
             'fundamentals_capture_status': row.fundamentals_capture_status,
             'fundamentals_capture_attempts': row.fundamentals_capture_attempts,
             'fundamentals_last_attempt_at': row.fundamentals_last_attempt_at.isoformat() if row.fundamentals_last_attempt_at else None,
             'fundamentals_last_success_at': row.fundamentals_last_success_at.isoformat() if row.fundamentals_last_success_at else None,
             'fundamentals_last_error': row.fundamentals_last_error,
+            'is_correction': disclosure_flags['is_correction'],
+            'is_ownership_related': disclosure_flags['is_ownership_related'],
+            'is_large_holder_related': disclosure_flags['is_large_holder_related'],
+            'is_audit_related': disclosure_flags['is_audit_related'],
+            'disclosure_tags': disclosure_flags['disclosure_tags'],
         }
 
     def _serialize_snapshot(self, row: DartFundamentalsSnapshot) -> dict[str, Any]:
