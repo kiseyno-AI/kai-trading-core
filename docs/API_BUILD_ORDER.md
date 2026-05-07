@@ -151,6 +151,7 @@
 - `GET /agent-context/feedback/eod-summaries?market_date=YYYY-MM-DD&symbol=005930`
 - `GET /agent-context/feedback/latest?market_date=YYYY-MM-DD&symbols=005930&symbols=000660`
 - `GET /agent-context/feedback/payloads?market_date=YYYY-MM-DD&symbols=005930`
+- `GET /agent-context/feedback/data-gap-summary?market_date_from=YYYY-MM-DD&market_date_to=YYYY-MM-DD&agent_name=technical-summarizer&categories=factor_score_coverage`
 - `GET /agent-context/feedback/requests?market_date=YYYY-MM-DD&symbols=005930`
 - `GET /agent-context/feedback/status?market_date=YYYY-MM-DD&symbols=005930&symbols=000660`
 - `GET /agent-context/feedback/progress?market_date=YYYY-MM-DD&run_id=symbol-run-...`
@@ -354,7 +355,9 @@
 - Symbol dispatch now uses direct parallel fan-out over `/v1/responses`: Core chunks symbols, calls the same summarizer agent ids multiple times in parallel, and merges/stores one normalized result per symbol and role.
 - Operational tuning for symbol dispatch is controlled by `OPENCLAW_AGENT_SYMBOL_CHUNK_SIZE` and `OPENCLAW_AGENT_PARALLEL_SUBTASKS`.
 - `GET /agent-context/feedback/latest` returns the latest reusable feedback bundle by symbol and role, including whether Core would re-dispatch now or reuse the latest stored result.
-- `GET /agent-context/feedback/payloads` reads stored agent feedback payloads by symbol and date.
+- Stored agent feedback rows now also carry normalized `missing_data_categories` derived from `data_gaps_payload` and `improvement_notes_payload`. Each category includes a stable taxonomy key, operator-facing status (`available_but_not_wired`, `partially_available`, `external_data_required`, or `data_quality_issue`), the relevant internal tables, and any required external providers.
+- `GET /agent-context/feedback/payloads` reads stored agent feedback payloads by symbol and date and also exposes the normalized `missing_data_categories` alongside the stored payload.
+- `GET /agent-context/feedback/data-gap-summary` aggregates those categories for operators by date or date range, agent, symbol subset, and category filter. It returns counts, affected symbols, roles, example notes, per-day breakdowns, uncategorized note examples, and the internal-table vs external-provider mapping needed for backlog prioritization.
 - `GET /agent-context/feedback/requests` reads the stored request/context payloads that were sent to the agents by symbol and date.
 - `GET /agent-context/feedback/status` reports whether the default four-stage feedback workflow (`eod-summarizer`, `technical-summarizer`, `fundamental-summarizer`, `signal-decider`) is pending, in progress, partial, or completed for requested symbols, plus completed counts and pending agents.
 - `POST /agent-context/feedback/dispatch/symbols` now creates and checkpoints a durable `agent_context_feedback_runs` row for every normal symbol-dispatch run. The row records `running`, `partial`, `completed`, or `failed` lifecycle states plus durable per-run summary snapshots so same-day overlaps and interrupted runs stay auditable.
@@ -370,6 +373,7 @@
 - Recommended daily operations pattern is retry cycles over the active-pre-filter intersection: one intersection-scoped pass, then one or more bounded follow-up cycles over only the remaining incomplete eligible symbols, so transient gateway or agent failures do not require rerunning the full date universe.
 - Repo helper entrypoint for that pattern: from `apps/api`, run `python3.11 -m scripts.run_feedback_retry_cycles`.
 - One-symbol daily smoke variant of the same path: from `apps/api`, run `python3.11 -m scripts.run_feedback_retry_cycles --market-date YYYY-MM-DD --symbols 005930` or `python3.11 -m app.internal.ops agent-feedback-retry-cycles --market-date YYYY-MM-DD --symbols 005930`.
+- Repo-owned taxonomy/backfill helper: from `apps/api`, run `python3.11 -m app.internal.ops agent-feedback-data-gap-summary --market-date-from YYYY-MM-DD --market-date-to YYYY-MM-DD --persist-missing-categories true`.
 - Repo helper entrypoint for session deletion retries: from `apps/api`, run `python3.11 scripts/cleanup_stale_feedback_sessions.py --limit 100`. Successful immediate deletions are not persisted; only failed deletions remain queued.
 - End-to-end one-command smoke path: from `apps/api`, run `python3.11 -m app.internal.ops agent-feedback-symbol-cleanup-smoke --market-date YYYY-MM-DD --symbols 005930,000660,...`.
 - When `DART_API_KEY` is configured, the default daily EOD steady-state loop includes DART daily incremental fundamentals refresh immediately after successful daily pykrx capture. That refresh rebuilds persisted Piotroski filter rows for the same `market_date`, and when `OPENCLAW_FEEDBACK_TRIGGER_AFTER_FUNDAMENTALS_REFRESH=true` it can then automatically trigger the feedback retry-cycle workflow only after the Piotroski follow-up completes without persistence failures. The resulting feedback dispatch and retry scope is the intersection of the persisted active pre-filters for that same `market_date`.

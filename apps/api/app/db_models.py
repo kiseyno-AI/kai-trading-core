@@ -1057,6 +1057,7 @@ class AgentContextFeedback(Base, TimestampMixin):
     fundamental_backdrop_payload: Mapped[dict | None] = mapped_column(JSON)
     conservative_take_payload: Mapped[dict | None] = mapped_column(JSON)
     improvement_notes_payload: Mapped[list | dict | None] = mapped_column(JSON)
+    missing_data_categories_payload: Mapped[list | None] = mapped_column(JSON)
     context_payload: Mapped[dict | None] = mapped_column(JSON)
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
 

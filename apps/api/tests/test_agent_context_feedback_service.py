@@ -28,6 +28,7 @@ class FakeFeedbackRepository:
             },
             'summary': kwargs['summary_payload'],
             'feedback': kwargs['feedback_payload'],
+            'missing_data_categories': kwargs['missing_data_categories_payload'],
             'context': kwargs['context_payload'],
             'received_at': '2026-04-14T15:00:00+00:00',
         }
@@ -46,6 +47,7 @@ class FakeFeedbackRepository:
                 },
                 'summary': item['summary_payload'],
                 'feedback': item['feedback_payload'],
+                'missing_data_categories': item['missing_data_categories_payload'],
                 'context': item['context_payload'],
                 'received_at': '2026-04-14T15:00:00+00:00',
             }
@@ -210,6 +212,41 @@ class AgentContextFeedbackServiceTests(unittest.TestCase):
         )
         self.assertEqual(repository.created['feedback_payload']['specialist_disagreement'][0], 'Fundamentals were constructive but not decisive.')
         self.assertTrue(result['accepted'])
+
+    def test_submit_feedback_derives_missing_data_categories_from_feedback_notes(self):
+        repository = FakeFeedbackRepository()
+        service = AgentContextFeedbackService(
+            repository=repository,
+            decision_loop_service=FakeSignalDeciderLoopService(),
+        )
+
+        service.submit_feedback(
+            market_date='2026-05-06',
+            symbol='005930',
+            agent_name='technical-summarizer',
+            feedback={
+                'role': 'technical-summarizer',
+                'summary': 'Need more precise evidence.',
+                'confidence': 0.61,
+                'details': {
+                    'data_gaps': {
+                        'items': ['Need liquidity turnover context.'],
+                    }
+                },
+                'improvement_notes': [
+                    'Need liquidity turnover context.',
+                    'Add support/resistance evidence.',
+                ],
+            },
+        )
+
+        categories = repository.created['missing_data_categories_payload']
+        self.assertEqual(
+            [item['category'] for item in categories],
+            ['liquidity_turnover_slippage', 'technical_evidence_support_resistance'],
+        )
+        self.assertEqual(categories[0]['note_count'], 1)
+        self.assertEqual(categories[1]['notes'], ['Add support/resistance evidence.'])
 
     def test_bulk_submit_feedback_normalizes_and_uses_bulk_upsert(self):
         repository = FakeFeedbackRepository()

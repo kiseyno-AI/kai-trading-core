@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parents[2] / '.env', override=False)
 
 from app.agent_context.derived_contexts import derived_context_backfill_service
+from app.agent_context.missing_data_report_service import agent_context_missing_data_report_service
 from app.agent_context.orchestrator import agent_feedback_orchestrator
 from app.agent_context.retry_service import EXPECTED_ROLES, FeedbackRetryCycleConfig, agent_feedback_retry_service
 from app.agent_context.session_cleanup_service import agent_feedback_session_cleanup_service
@@ -474,6 +475,30 @@ def run_agent_feedback_retry_cycles(
     )
 
 
+def get_agent_feedback_data_gap_summary(
+    *,
+    market_date: str | None = None,
+    market_date_from: str | None = None,
+    market_date_to: str | None = None,
+    symbols: str | None = None,
+    agent_name: str | None = None,
+    categories: str | None = None,
+    persist_missing_categories: bool = False,
+) -> dict[str, Any]:
+    bootstrap_runtime()
+    parsed_symbols = tuple(item.strip() for item in symbols.split(',') if item.strip()) if symbols else None
+    parsed_categories = tuple(item.strip() for item in categories.split(',') if item.strip()) if categories else None
+    return agent_context_missing_data_report_service.get_summary(
+        market_date=market_date,
+        market_date_from=market_date_from,
+        market_date_to=market_date_to,
+        symbols=parsed_symbols,
+        agent_name=agent_name,
+        categories=parsed_categories,
+        persist_missing_categories=persist_missing_categories,
+    )
+
+
 def run_agent_feedback_symbol_cleanup_smoke(
     *,
     market_date: str,
@@ -784,6 +809,22 @@ def _build_parser() -> argparse.ArgumentParser:
     feedback_retry_parser.add_argument('--outer-batch-size', type=int, default=20)
     feedback_retry_parser.add_argument('--reuse-existing', choices=('true', 'false'), default='true')
 
+    feedback_data_gap_summary_parser = subparsers.add_parser(
+        'agent-feedback-data-gap-summary',
+        help='Summarize normalized missing-data feedback categories for operators',
+    )
+    feedback_data_gap_summary_parser.add_argument('--market-date')
+    feedback_data_gap_summary_parser.add_argument('--market-date-from')
+    feedback_data_gap_summary_parser.add_argument('--market-date-to')
+    feedback_data_gap_summary_parser.add_argument('--symbols')
+    feedback_data_gap_summary_parser.add_argument('--agent-name')
+    feedback_data_gap_summary_parser.add_argument('--categories')
+    feedback_data_gap_summary_parser.add_argument(
+        '--persist-missing-categories',
+        choices=('true', 'false'),
+        default='false',
+    )
+
     signal_decider_evaluations_parser = subparsers.add_parser(
         'agent-signal-decider-evaluations-compute',
         help='Refresh recent signal-decider realized outcomes and verdict rows directly',
@@ -978,6 +1019,16 @@ def main(argv: Iterable[str] | None = None) -> int:
             max_cycles=args.max_cycles,
             outer_batch_size=args.outer_batch_size,
             reuse_existing=args.reuse_existing == 'true',
+        )
+    elif args.command == 'agent-feedback-data-gap-summary':
+        payload = get_agent_feedback_data_gap_summary(
+            market_date=args.market_date,
+            market_date_from=args.market_date_from,
+            market_date_to=args.market_date_to,
+            symbols=args.symbols,
+            agent_name=args.agent_name,
+            categories=args.categories,
+            persist_missing_categories=args.persist_missing_categories == 'true',
         )
     elif args.command == 'agent-signal-decider-evaluations-compute':
         payload = compute_signal_decider_evaluations(

@@ -9,6 +9,7 @@ from sqlalchemy.orm import Query
 
 from app.db import session_scope
 from app.db_models import AgentContextFeedback
+from app.agent_context.missing_data_taxonomy import build_missing_data_categories, enrich_missing_data_categories
 from app.agent_context.signal_decider_loop_service import signal_decider_loop_service
 
 BULK_UPSERT_CHUNK_SIZE = 100
@@ -74,6 +75,12 @@ def _normalize_json_object(value: dict[str, Any] | None, *, field_name: str) -> 
 
 
 def _serialize_feedback(record: AgentContextFeedback) -> dict[str, Any]:
+    raw_categories = record.missing_data_categories_payload
+    if not isinstance(raw_categories, list):
+        raw_categories = build_missing_data_categories(
+            data_gaps_payload=record.data_gaps_payload,
+            improvement_notes_payload=record.improvement_notes_payload,
+        )
     return {
         'id': record.id,
         'market_date': record.market_date.isoformat(),
@@ -97,6 +104,7 @@ def _serialize_feedback(record: AgentContextFeedback) -> dict[str, Any]:
         'fundamental_backdrop': record.fundamental_backdrop_payload,
         'conservative_take': record.conservative_take_payload,
         'improvement_notes': record.improvement_notes_payload,
+        'missing_data_categories': enrich_missing_data_categories(raw_categories),
         'context': record.context_payload,
         'received_at': record.received_at.isoformat() if record.received_at else None,
     }
@@ -159,6 +167,7 @@ class AgentContextFeedbackRepository:
         fundamental_backdrop_payload: dict[str, Any] | None,
         conservative_take_payload: dict[str, Any] | None,
         improvement_notes_payload: list[Any] | dict[str, Any] | None,
+        missing_data_categories_payload: list[Any] | None,
         context_payload: dict[str, Any] | None,
     ) -> dict[str, Any]:
         received_at = datetime.now(timezone.utc)
@@ -183,6 +192,7 @@ class AgentContextFeedbackRepository:
                 fundamental_backdrop_payload=fundamental_backdrop_payload,
                 conservative_take_payload=conservative_take_payload,
                 improvement_notes_payload=improvement_notes_payload,
+                missing_data_categories_payload=missing_data_categories_payload,
                 context_payload=context_payload,
                 received_at=received_at,
             )
@@ -205,6 +215,7 @@ class AgentContextFeedbackRepository:
                     'fundamental_backdrop_payload': fundamental_backdrop_payload,
                     'conservative_take_payload': conservative_take_payload,
                     'improvement_notes_payload': improvement_notes_payload,
+                    'missing_data_categories_payload': missing_data_categories_payload,
                     'context_payload': context_payload,
                     'received_at': received_at,
                     'updated_at': received_at,
@@ -273,6 +284,7 @@ class AgentContextFeedbackRepository:
                         'fundamental_backdrop_payload': excluded.fundamental_backdrop_payload,
                         'conservative_take_payload': excluded.conservative_take_payload,
                         'improvement_notes_payload': excluded.improvement_notes_payload,
+                        'missing_data_categories_payload': excluded.missing_data_categories_payload,
                         'context_payload': excluded.context_payload,
                         'received_at': excluded.received_at,
                         'updated_at': received_at,
@@ -298,6 +310,7 @@ class AgentContextFeedbackRepository:
                     AgentContextFeedback.fundamental_backdrop_payload,
                     AgentContextFeedback.conservative_take_payload,
                     AgentContextFeedback.improvement_notes_payload,
+                    AgentContextFeedback.missing_data_categories_payload,
                     AgentContextFeedback.context_payload,
                     AgentContextFeedback.received_at,
                 )
@@ -324,6 +337,12 @@ class AgentContextFeedbackRepository:
                     )
                     if snapshot_item is not None:
                         snapshot_items.append(snapshot_item)
+                    raw_categories = row['missing_data_categories_payload']
+                    if not isinstance(raw_categories, list):
+                        raw_categories = build_missing_data_categories(
+                            data_gaps_payload=row['data_gaps_payload'],
+                            improvement_notes_payload=row['improvement_notes_payload'],
+                        )
                     accepted.append(
                         {
                             'id': row['id'],
@@ -348,6 +367,7 @@ class AgentContextFeedbackRepository:
                             'fundamental_backdrop': row['fundamental_backdrop_payload'],
                             'conservative_take': row['conservative_take_payload'],
                             'improvement_notes': row['improvement_notes_payload'],
+                            'missing_data_categories': enrich_missing_data_categories(raw_categories),
                             'context': row['context_payload'],
                             'received_at': row['received_at'].isoformat() if row['received_at'] else None,
                         }
@@ -398,6 +418,14 @@ class AgentContextFeedbackRepository:
                     'run_id': row.run_id,
                     'received_at': row.received_at.isoformat() if row.received_at else None,
                     'payload': row.feedback_payload,
+                    'missing_data_categories': enrich_missing_data_categories(
+                        row.missing_data_categories_payload
+                        if isinstance(row.missing_data_categories_payload, list)
+                        else build_missing_data_categories(
+                            data_gaps_payload=row.data_gaps_payload,
+                            improvement_notes_payload=row.improvement_notes_payload,
+                        )
+                    ),
                 }
                 for row in rows
             ]
@@ -462,6 +490,8 @@ class AgentContextFeedbackService:
             context_payload=context_payload,
         )
         details_payload = feedback_payload.get('details') if isinstance(feedback_payload.get('details'), dict) else {}
+        data_gaps_payload = details_payload.get('data_gaps')
+        improvement_notes_payload = feedback_payload.get('improvement_notes')
         return {
             'market_date': _normalize_market_date(market_date),
             'symbol': _normalize_symbol(symbol),
@@ -478,10 +508,14 @@ class AgentContextFeedbackService:
             'trend_context_payload': details_payload.get('trend_context'),
             'support_resistance_payload': details_payload.get('support_resistance'),
             'anomalies_and_gaps_payload': details_payload.get('anomalies_and_gaps'),
-            'data_gaps_payload': details_payload.get('data_gaps'),
+            'data_gaps_payload': data_gaps_payload,
             'fundamental_backdrop_payload': details_payload.get('fundamental_backdrop'),
             'conservative_take_payload': details_payload.get('conservative_take'),
-            'improvement_notes_payload': feedback_payload.get('improvement_notes'),
+            'improvement_notes_payload': improvement_notes_payload,
+            'missing_data_categories_payload': build_missing_data_categories(
+                data_gaps_payload=data_gaps_payload,
+                improvement_notes_payload=improvement_notes_payload,
+            ),
             'context_payload': context_payload,
         }
 

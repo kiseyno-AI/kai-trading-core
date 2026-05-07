@@ -11,6 +11,6 @@ GET /agent-context/feedback?market_date=2026-04-15&symbols=005930&agent_name=fun
 ## Example response
 ```json
 {
-  "items": [{"market_date": "2026-04-15", "symbol": "005930", "agent": {"name": "fundamental-summarizer"}, "feedback": {"role": "fundamental-summarizer", "summary": "No material DART change detected."}}]
+  "items": [{"market_date": "2026-04-15", "symbol": "005930", "agent": {"name": "fundamental-summarizer"}, "feedback": {"role": "fundamental-summarizer", "summary": "No material DART change detected."}, "missing_data_categories": [{"category": "financial_detail_quarter_cashflow", "status": "partially_available"}]}]
 }
 ```

@@ -19,6 +19,7 @@ from app.agent_context.eligibility import (
     resolve_agent_feedback_scope,
 )
 from app.agent_context.feedback_service import agent_context_feedback_service
+from app.agent_context.missing_data_report_service import agent_context_missing_data_report_service
 from app.agent_context.orchestrator import agent_feedback_orchestrator
 from app.agent_context.progress_service import agent_context_progress_service
 from app.agent_context.reuse_service import agent_context_reuse_service
@@ -580,6 +581,30 @@ async def list_agent_feedback_payloads(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f'Agent feedback payload read failed: {exc}') from exc
+
+
+@router.get('/feedback/data-gap-summary')
+async def get_agent_feedback_data_gap_summary(
+    market_date: date | None = Query(default=None),
+    market_date_from: date | None = Query(default=None),
+    market_date_to: date | None = Query(default=None),
+    symbols: list[str] | None = Query(default=None),
+    agent_name: str | None = Query(default=None),
+    categories: list[str] | None = Query(default=None),
+) -> dict:
+    try:
+        return agent_context_missing_data_report_service.get_summary(
+            market_date=market_date,
+            market_date_from=market_date_from,
+            market_date_to=market_date_to,
+            symbols=symbols,
+            agent_name=agent_name,
+            categories=categories,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'Agent feedback data-gap summary failed: {exc}') from exc
 
 
 @router.get('/feedback/requests')
