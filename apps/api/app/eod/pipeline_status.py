@@ -9,6 +9,8 @@ from sqlalchemy import func, select
 from app.core.settings import settings
 from app.db import session_scope
 from app.db_models import (
+    DailyMarketRiskFilterResult,
+    DailyPiotroskiFilterResult,
     DailyAdvancedValueFactorResult,
     DailyBetaFactorResult,
     DailyCompositeFactorResult,
@@ -53,10 +55,15 @@ DEFAULT_FACTOR_STAGE_ORDER = tuple(
     for stage_id in FACTOR_STAGE_ORDER
     if STAGE_DEFINITIONS[stage_id].default_selected
 )
+FILTER_STAGE_ORDER = (
+    'market_risk_filter',
+    'piotroski_filter',
+)
 PIPELINE_STAGE_ORDER = (
     ('price_collection', 'pykrx_enrichment')
     + tuple(stage_id for stage_id in PYKRX_STAGE_ORDER if stage_id != 'price_collection')
     + ('fundamentals_daily_refresh',)
+    + FILTER_STAGE_ORDER
     + DEFAULT_FACTOR_STAGE_ORDER
 )
 FACTOR_STAGE_MODELS = {
@@ -68,6 +75,11 @@ FACTOR_STAGE_MODELS = {
     'unified_value_factors': DailyUnifiedValueFactorResult,
     'quality_factors': DailyQualityFactorResult,
     'composite_factors': DailyCompositeFactorResult,
+}
+ROW_COUNT_STAGE_MODELS = {
+    'market_risk_filter': DailyMarketRiskFilterResult,
+    'piotroski_filter': DailyPiotroskiFilterResult,
+    **FACTOR_STAGE_MODELS,
 }
 
 
@@ -112,6 +124,10 @@ def _noop_factor_stage_counts_loader(*, market_date: str) -> dict[str, dict[str,
     return {}
 
 
+def _noop_row_count_stage_counts_loader(*, market_date: str) -> dict[str, dict[str, Any]]:
+    return {}
+
+
 def _noop_price_bar_count_loader(*, market_date: str) -> int:
     return 0
 
@@ -144,6 +160,26 @@ def _load_factor_stage_counts(*, market_date: str) -> dict[str, dict[str, Any]]:
     return counts
 
 
+def _load_row_count_stage_counts(*, market_date: str) -> dict[str, dict[str, Any]]:
+    normalized_market_date = date.fromisoformat(market_date)
+    counts: dict[str, dict[str, Any]] = {}
+    with session_scope() as session:
+        for stage_id, model in ROW_COUNT_STAGE_MODELS.items():
+            persisted, updated_at = session.execute(
+                select(
+                    func.count(func.distinct(model.symbol_id)),
+                    func.max(model.captured_at),
+                )
+                .select_from(model)
+                .where(model.market_date == normalized_market_date)
+            ).one()
+            counts[stage_id] = {
+                'persisted': int(persisted or 0),
+                'updated_at': updated_at.isoformat() if updated_at else None,
+            }
+    return counts
+
+
 def _stage_label(stage_id: str) -> str:
     if stage_id in STAGE_LABELS:
         return STAGE_LABELS[stage_id]
@@ -159,6 +195,7 @@ class EODPipelineStatusService:
     live_symbol_count_loader: Callable = count_live_symbols
     fundamentals_refresh_loader: Callable = _load_latest_fundamentals_refresh_run
     factor_stage_counts_loader: Callable = _noop_factor_stage_counts_loader
+    row_count_stage_counts_loader: Callable = _noop_row_count_stage_counts_loader
     price_bar_count_loader: Callable = _noop_price_bar_count_loader
     pykrx_enrichment_loader: Callable = _load_pykrx_enrichment_coverage
 
@@ -190,7 +227,19 @@ class EODPipelineStatusService:
             market_date=resolved_market_date,
             fs_div=resolved_fs_div,
         )
-        factor_stage_counts = self.factor_stage_counts_loader(market_date=resolved_market_date)
+        row_count_stage_counts = dict(
+            self.row_count_stage_counts_loader(market_date=resolved_market_date) or {}
+        )
+        if any(stage_id not in row_count_stage_counts for stage_id in FACTOR_STAGE_MODELS):
+            legacy_factor_stage_counts = dict(
+                self.factor_stage_counts_loader(market_date=resolved_market_date) or {}
+            )
+            for stage_id in FACTOR_STAGE_MODELS:
+                if stage_id in row_count_stage_counts:
+                    continue
+                row_count_stage_counts[stage_id] = dict(
+                    legacy_factor_stage_counts.get(stage_id) or {}
+                )
         stored_price_rows = int(self.price_bar_count_loader(market_date=resolved_market_date) or 0)
         if stored_price_rows <= 0:
             stored_price_rows = int(dict(pykrx_stage_counts.get('price_collection') or {}).get('persisted') or 0)
@@ -200,14 +249,24 @@ class EODPipelineStatusService:
             'fundamentals_daily_refresh': fundamentals_stage,
         }
         price_stage = stages['price_collection']
-        for stage_id in DEFAULT_FACTOR_STAGE_ORDER:
-            stages[stage_id] = self._build_factor_stage(
+        for stage_id in FILTER_STAGE_ORDER:
+            stages[stage_id] = self._build_row_count_stage(
                 stage_id=stage_id,
                 market_date=resolved_market_date,
                 price_stage=price_stage,
                 price_rows_persisted=stored_price_rows,
                 prior_stages=stages,
-                aggregate=dict(factor_stage_counts.get(stage_id) or {}),
+                aggregate=dict(row_count_stage_counts.get(stage_id) or {}),
+                live_symbols_total=live_symbols_total,
+            )
+        for stage_id in DEFAULT_FACTOR_STAGE_ORDER:
+            stages[stage_id] = self._build_row_count_stage(
+                stage_id=stage_id,
+                market_date=resolved_market_date,
+                price_stage=price_stage,
+                price_rows_persisted=stored_price_rows,
+                prior_stages=stages,
+                aggregate=dict(row_count_stage_counts.get(stage_id) or {}),
                 live_symbols_total=live_symbols_total,
             )
         return {
@@ -631,7 +690,7 @@ class EODPipelineStatusService:
             },
         }
 
-    def _build_factor_stage(
+    def _build_row_count_stage(
         self,
         *,
         stage_id: str,
@@ -689,7 +748,7 @@ class EODPipelineStatusService:
             'failed': counts.failed,
             'remaining': counts.remaining,
             'current_step': None,
-            'current_activity': self._build_factor_activity(
+            'current_activity': self._build_row_count_stage_activity(
                 stage_id=stage_id,
                 status=status,
                 persisted=persisted,
@@ -743,7 +802,7 @@ class EODPipelineStatusService:
         return expected_total
 
     @staticmethod
-    def _build_factor_activity(
+    def _build_row_count_stage_activity(
         *,
         stage_id: str,
         status: str,
@@ -781,5 +840,6 @@ class EODPipelineStatusService:
 
 eod_pipeline_status_service = EODPipelineStatusService(
     factor_stage_counts_loader=_load_factor_stage_counts,
+    row_count_stage_counts_loader=_load_row_count_stage_counts,
     price_bar_count_loader=lambda *, market_date: count_daily_price_bars_for_date(market_date),
 )

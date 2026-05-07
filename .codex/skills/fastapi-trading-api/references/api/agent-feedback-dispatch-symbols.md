@@ -5,6 +5,7 @@ Dispatches symbol-level summarizer feedback collection with optional freshness-a
 
 Core dispatches only the subset of requested symbols that sit in the intersection of the persisted active pre-filters for the requested `market_date`: `daily_market_risk_filter_results.passed_filter=true` and `daily_piotroski_filter_results.passed_filter=true`. Requested symbols outside that universe are returned in `request.skipped_symbols` and are not dispatched.
 Each normal dispatch also creates a durable `agent_context_feedback_runs` row, checkpoints role progress as the run advances, and finalizes that run row even when the cycle exits partially. When `wait_for_completion=false`, Core now creates the durable queued run row before returning and reuses the same `request_run_id` when the background work starts.
+Normal dispatch now also gates on same-day feedback prerequisites: DART fundamentals refresh, market-risk filter, Piotroski filter, and the factor/scoring stages must all be terminal and successful enough for agent context. When prerequisites are still running or incomplete, the route returns `summary.status=waiting|blocked`, `summary.gated=true`, and a `prerequisites` block instead of starting dispatch. Operators can bypass that guard only with `force=true`.
 
 ## Example request
 ```http
@@ -16,7 +17,8 @@ Content-Type: application/json
   "symbols": ["005930", "000660"],
   "roles": ["eod-summarizer", "technical-summarizer", "fundamental-summarizer"],
   "reuse_existing": true,
-  "wait_for_completion": false
+  "wait_for_completion": false,
+  "force": false
 }
 ```
 
@@ -38,6 +40,36 @@ Content-Type: application/json
   "summary": {
     "status": "queued",
     "queued": 2
+  }
+}
+```
+
+## Gated response
+```json
+{
+  "request": {
+    "market_date": "2026-04-15",
+    "symbols": ["005930"]
+  },
+  "summary": {
+    "status": "waiting",
+    "completed": 0,
+    "failed": 0,
+    "skipped": 0,
+    "flushed_to_db": 0,
+    "gated": true
+  },
+  "items": [],
+  "failures": [],
+  "prerequisites": {
+    "status": "waiting",
+    "waiting_stage_ids": ["quality_factors", "composite_factors"],
+    "missing_prerequisites": [
+      {
+        "stage": "quality_factors",
+        "gate_status": "waiting"
+      }
+    ]
   }
 }
 ```

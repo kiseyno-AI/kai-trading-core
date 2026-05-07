@@ -3,6 +3,8 @@
 ## Summary
 Computes or refreshes the generic durable 5-trading-day post-decision evaluation rows for persisted `signal-decider` and `short-term-decider` feedback. The current slice uses stored daily OHLC bars only and records one upserted row per feedback source into `decider_post_decision_evaluations`.
 
+By default the compute route now gates on same-day feedback prerequisites for the requested date window. If fundamentals, filtering, or factor/scoring stages are still pending or blocked for the relevant market date, the response returns `summary.status=waiting|blocked`, `summary.gated=true`, and a `prerequisites` block instead of refreshing evaluations. Operators can bypass that check with `force_recompute=true`.
+
 ## Example request
 ```http
 POST /agent-context/decider/evaluations/compute

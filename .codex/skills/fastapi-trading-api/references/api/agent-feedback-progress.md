@@ -1,7 +1,7 @@
 # GET /agent-context/feedback/progress
 
 ## Summary
-Reports aggregate progress for the default four-role symbol feedback workflow.
+Reports aggregate progress for the default five-role symbol feedback workflow.
 
 The response is now a stable coverage and liveness snapshot:
 - `total_symbols` uses the durable run scope when a matching dispatch or retry run exists; otherwise it falls back to the active symbol set with `daily_price_bars` for the requested market date, optionally narrowed to requested symbols
@@ -13,6 +13,7 @@ The response is now a stable coverage and liveness snapshot:
 - `boundary_progress_ratio` and `boundary_progress_percent` keep the separate symbol-boundary coverage signal that used to drive the top-level percentage
 - `terminal_feedback_count` shows how many expected feedback items are already terminal via either stored feedback or stored failure rows
 - `run_status` indicates whether feedback appears to be actively moving, stalled, pending, or completed
+- when prerequisites are not ready and no live or durable run exists yet, `run_status` can be `waiting` or `blocked`, and the top-level `prerequisites` block explains which upstream stages still gate dispatch
 - `latest_feedback_at` and `seconds_since_last_feedback` help operators tell whether a run is still alive
 - `first_feedback_at`, `elapsed_seconds`, rates, and ETA fields are calculated only from feedback rows for the same target symbol universe used by the progress counts
 - `estimated_completion_at` is an ETA for active runs and the latest feedback timestamp for already completed runs
@@ -52,6 +53,11 @@ GET /agent-context/feedback/progress?market_date=2026-04-16&run_id=feedback-cycl
         "requested_count": 4331,
         "completed_count": 134,
         "error_count": 1
+      },
+      "short-term-decider": {
+        "requested_count": 4331,
+        "completed_count": 120,
+        "error_count": 4
       }
     }
   },
@@ -81,6 +87,11 @@ GET /agent-context/feedback/progress?market_date=2026-04-16&run_id=feedback-cycl
     "estimated_remaining_seconds": 198267,
     "estimated_completion_at": "2026-04-19T15:59:15.210342+09:00",
     "eta_confidence": "medium"
+  },
+  "prerequisites": {
+    "status": "ready",
+    "waiting_stage_ids": [],
+    "blocked_stage_ids": []
   }
 }
 ```

@@ -131,6 +131,47 @@ def _run_daily_factor_followup(*, market_date: str) -> dict[str, Any]:
     }
 
 
+def _run_daily_feedback_followup(*, market_date: str, enabled: bool) -> dict[str, Any]:
+    if not enabled:
+        return {
+            'triggered': False,
+            'reason': 'followup_disabled',
+            'market_date': market_date,
+        }
+
+    from datetime import date
+
+    from app.agent_context.prerequisite_service import agent_feedback_prerequisite_service
+    from app.agent_context.retry_service import EXPECTED_ROLES, FeedbackRetryCycleConfig, agent_feedback_retry_service
+    from app.core.settings import settings
+
+    prerequisites = agent_feedback_prerequisite_service.inspect_feedback_prerequisites(
+        market_date=market_date,
+    )
+    if not prerequisites['ready']:
+        return {
+            'triggered': False,
+            'reason': 'feedback_prerequisites_not_ready',
+            'status': prerequisites['status'],
+            'market_date': market_date,
+            'prerequisites': prerequisites,
+        }
+
+    result = agent_feedback_retry_service.run_retry_cycles(
+        config=FeedbackRetryCycleConfig(
+            market_date=date.fromisoformat(market_date),
+            roles=EXPECTED_ROLES,
+            max_cycles=settings.openclaw_feedback_retry_max_cycles,
+            outer_batch_size=settings.openclaw_feedback_retry_outer_batch_size,
+            reuse_existing=True,
+        )
+    )
+    return {
+        'triggered': True,
+        **result,
+    }
+
+
 def run_market_data_pipeline(
     service,
     *,
@@ -838,6 +879,7 @@ def run_market_data_pipeline(
                 market_date=latest_trade_date,
                 capture_limit=500,
                 trigger='eod_pykrx_followup',
+                run_feedback_followup=False,
             )
         )
         fundamentals_status = str(result['fundamentals_followup'].get('status') or '').strip().lower()
@@ -850,6 +892,10 @@ def run_market_data_pipeline(
                 'market_date': latest_trade_date,
                 'fundamentals_status': fundamentals_status or None,
             }
+        result['feedback_followup'] = _run_daily_feedback_followup(
+            market_date=latest_trade_date,
+            enabled=bool(dependencies.settings.openclaw_feedback_trigger_after_fundamentals_refresh),
+        )
     elif chain_fundamentals_followup and mode == 'daily_auto' and status in {'completed', 'completed_with_errors'}:
         result['fundamentals_followup'] = {
             'triggered': False,
@@ -861,6 +907,10 @@ def run_market_data_pipeline(
             'reason': 'dart_api_key_not_configured',
             'market_date': latest_trade_date,
         }
+        result['feedback_followup'] = _run_daily_feedback_followup(
+            market_date=latest_trade_date,
+            enabled=bool(dependencies.settings.openclaw_feedback_trigger_after_fundamentals_refresh),
+        )
     if retry_context is not None:
         result['retry'] = retry_context
     dependencies.log_fetch('run_collection', status, **{key: value for key, value in result.items() if key != 'status'})

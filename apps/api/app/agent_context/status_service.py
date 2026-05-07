@@ -6,6 +6,7 @@ from typing import Any, Sequence
 from sqlalchemy import select
 
 from app.agent_context.roles import DEFAULT_AGENT_NAMES
+from app.agent_context.prerequisite_service import agent_feedback_prerequisite_service
 from app.agent_context.feedback_service import _normalize_market_date, _normalize_symbols
 from app.db import session_scope
 from app.db_models import AgentContextFeedback
@@ -33,6 +34,9 @@ class AgentContextStatusService:
         normalized_symbols = _normalize_symbols(symbols)
         if not normalized_symbols:
             raise ValueError('symbols is required')
+        prerequisites = agent_feedback_prerequisite_service.inspect_feedback_prerequisites(
+            market_date=normalized_market_date,
+        )
 
         with session_scope() as session:
             orm_rows = session.execute(
@@ -76,7 +80,7 @@ class AgentContextStatusService:
                 status = 'in_progress'
                 in_progress_symbols += 1
             else:
-                status = 'pending'
+                status = prerequisites['status'] if not prerequisites['ready'] else 'pending'
                 pending_symbols += 1
 
             items.append(
@@ -88,12 +92,16 @@ class AgentContextStatusService:
                     'pending_agents': pending_agents,
                     'completed_count': len(completed_agents),
                     'expected_count': len(EXPECTED_AGENT_NAMES),
+                    'prerequisites_ready': prerequisites['ready'],
+                    'missing_prerequisites': prerequisites['missing_prerequisites'],
                 }
             )
 
         overall_status = 'completed'
         if in_progress_symbols:
             overall_status = 'in_progress'
+        elif not prerequisites['ready'] and completed_symbols == 0:
+            overall_status = prerequisites['status']
         elif pending_symbols and completed_symbols == 0:
             overall_status = 'pending'
         elif pending_symbols:
@@ -115,6 +123,7 @@ class AgentContextStatusService:
                 'expected_feedback_count': len(normalized_symbols) * len(EXPECTED_AGENT_NAMES),
             },
             'items': items,
+            'prerequisites': prerequisites,
         }
 
 

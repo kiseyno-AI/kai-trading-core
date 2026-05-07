@@ -8,6 +8,7 @@ from typing import Any, Sequence
 from sqlalchemy import select
 
 from app.agent_context.feedback_service import _normalize_market_date, _normalize_symbols
+from app.agent_context.prerequisite_service import agent_feedback_prerequisite_service
 from app.agent_context.run_modes import DAILY_RETRY_CYCLE_MODE
 from app.agent_context.run_state_service import agent_context_feedback_run_state_service
 from app.agent_context.status_service import EXPECTED_AGENT_NAMES
@@ -28,6 +29,9 @@ class AgentContextProgressService:
         normalized_market_date = _normalize_market_date(market_date)
         normalized_symbols = _normalize_symbols(symbols) if symbols is not None else None
         expected_agent_names = self._normalize_expected_agents(expected_agents)
+        prerequisites = agent_feedback_prerequisite_service.inspect_feedback_prerequisites(
+            market_date=normalized_market_date,
+        )
         resolved_run = self._resolve_run_snapshot(
             market_date=normalized_market_date,
             symbols=normalized_symbols,
@@ -76,8 +80,8 @@ class AgentContextProgressService:
                     result_payload = self._build_result_from_summary(
                         market_date=normalized_market_date,
                         summary=summary_payload,
-                    expected_agents=expected_agent_names,
-                )
+                        expected_agents=expected_agent_names,
+                    )
         elif resolved_run is not None:
             if (
                 run_id is None
@@ -110,6 +114,25 @@ class AgentContextProgressService:
                     summary=summary_payload,
                     expected_agents=expected_agent_names,
                 )
+        if (
+            not prerequisites['ready']
+            and state is None
+            and resolved_run is None
+            and int(summary_payload.get('completed_feedback_count') or 0) == 0
+        ):
+            summary_payload = {
+                **summary_payload,
+                'run_id': run_id,
+                'run_status': prerequisites['status'],
+                'run_table_status': prerequisites['status'],
+                'is_live': False,
+                'current_role': None,
+                'completed_roles': [],
+                'remaining_roles': list(expected_agent_names),
+                'cycle_status': prerequisites['status'],
+                'prerequisites_ready': False,
+                'missing_prerequisites': prerequisites['missing_prerequisites'],
+            }
         summary_payload = self._normalize_summary_progress_fields(summary_payload)
 
         return {
@@ -121,6 +144,7 @@ class AgentContextProgressService:
             },
             'result': result_payload,
             'summary': summary_payload,
+            'prerequisites': prerequisites,
         }
 
     def _resolve_progress_scope_symbols(

@@ -532,6 +532,10 @@ class PykrxBackfillServiceTests(TestCase):
                 'app.eod.pykrx_pipeline_runner._run_daily_factor_followup',
                 return_value={'triggered': True, 'status': 'completed', 'stages': {}},
             ) as factor_followup,
+            patch(
+                'app.eod.pykrx_pipeline_runner._run_daily_feedback_followup',
+                return_value={'triggered': True, 'status': 'completed'},
+            ) as feedback_followup,
             patch('app.eod.pykrx_backfill.complete_eod_collection_run'),
         ):
             result = service._run_market_data_pipeline(
@@ -552,11 +556,17 @@ class PykrxBackfillServiceTests(TestCase):
             market_date='2026-04-03',
             capture_limit=500,
             trigger='eod_pykrx_followup',
+            run_feedback_followup=False,
         )
         factor_followup.assert_called_once_with(market_date='2026-04-03')
+        feedback_followup.assert_called_once_with(market_date='2026-04-03', enabled=False)
         self.assertEqual(
             result['factor_scoring_followup'],
             {'triggered': True, 'status': 'completed', 'stages': {}},
+        )
+        self.assertEqual(
+            result['feedback_followup'],
+            {'triggered': True, 'status': 'completed'},
         )
 
     def test_run_collection_daily_auto_rebuilds_price_contexts_when_selected_stages_are_explicit(self) -> None:

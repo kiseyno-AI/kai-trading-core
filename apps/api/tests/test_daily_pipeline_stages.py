@@ -2,7 +2,34 @@ import unittest
 from unittest.mock import patch
 
 from app.agent_context.roles import DECISION_SUPPORT_AGENT_NAMES, SUMMARIZER_AGENT_NAMES
-from app.eod.daily_pipeline_stages import DailyPipelineStageService
+from app.eod.daily_pipeline_stages import FACTOR_STAGE_ORDER, DailyPipelineStageService
+
+
+def _feedback_prerequisites(*, status: str = 'ready', missing_stage_ids: list[str] | None = None) -> dict:
+    missing_stage_ids = list(missing_stage_ids or [])
+    ready = status == 'ready'
+    return {
+        'market_date': '2026-04-14',
+        'fs_div': 'CFS',
+        'status': status,
+        'ready': ready,
+        'required_stage_ids': ['fundamentals_daily_refresh', 'market_risk_filter', 'piotroski_filter', *FACTOR_STAGE_ORDER],
+        'ready_stage_ids': [] if not ready else ['fundamentals_daily_refresh', 'market_risk_filter', 'piotroski_filter', *FACTOR_STAGE_ORDER],
+        'waiting_stage_ids': missing_stage_ids if status == 'waiting' else [],
+        'blocked_stage_ids': missing_stage_ids if status == 'blocked' else [],
+        'missing_prerequisites': [
+            {
+                'stage': stage_id,
+                'label': stage_id.replace('_', ' '),
+                'status': 'running' if status == 'waiting' else 'partial',
+                'gate_status': status,
+                'current_activity': f'{status} {stage_id}',
+                'details': {},
+            }
+            for stage_id in missing_stage_ids
+        ],
+        'stages': {},
+    }
 
 
 class _FakePykrxStageRunner:
@@ -31,8 +58,8 @@ class _FakeFeedbackRetryService:
     def __init__(self) -> None:
         self.calls: list[dict] = []
 
-    def run_retry_cycles(self, *, config):
-        self.calls.append({'config': config})
+    def run_retry_cycles(self, *, config, force: bool = False):
+        self.calls.append({'config': config, 'force': force})
         return {
             'completed': True,
             'final_pending': 0,
@@ -76,17 +103,26 @@ class _FakeSkippedPykrxStageRunner:
 
 
 class DailyPipelineStageServiceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.prerequisite_patcher = patch(
+            'app.eod.daily_pipeline_stages.agent_feedback_prerequisite_service.inspect_feedback_prerequisites',
+            side_effect=lambda **_: _feedback_prerequisites(),
+        )
+        self.prerequisite_patcher.start()
+        self.addCleanup(self.prerequisite_patcher.stop)
+
     def test_describe_returns_canonical_stage_order_and_default_sequence(self) -> None:
         service = DailyPipelineStageService()
 
         payload = service.describe()
 
         self.assertEqual(
-            payload['stage_order'][:6],
+            payload['stage_order'][:7],
             [
                 'master_refresh',
                 'pykrx_universe_refresh',
                 'price_collection',
+                'pykrx_enrichment',
                 'technical_snapshots',
                 'action_summaries',
                 'trending_ranks',
@@ -105,7 +141,7 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         )
         self.assertEqual(
             agent_feedback_stage['depends_on'],
-            ['market_risk_filter', 'piotroski_filter'],
+            ['market_risk_filter', 'piotroski_filter', *FACTOR_STAGE_ORDER],
         )
         unified_value_stage = next(
             stage
@@ -226,13 +262,14 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             [
                 'master_refresh',
                 'pykrx_universe_refresh',
+                'pykrx_enrichment',
                 'fundamentals_daily_refresh',
-                'piotroski_filter',
             ],
         )
         self.assertEqual(
-            executed_stage_ids[4:12],
+            executed_stage_ids[4:13],
             [
+                'piotroski_filter',
                 'momentum_factors',
                 'value_factors',
                 'low_risk_factors',
@@ -243,6 +280,34 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                 'composite_factors',
             ],
         )
+
+    def test_run_gates_feedback_stage_until_prerequisites_are_ready(self) -> None:
+        pykrx_runner = _FakePykrxStageRunner()
+        feedback_retry_service = _FakeFeedbackRetryService()
+        service = DailyPipelineStageService(
+            pykrx_service=pykrx_runner,
+            feedback_retry_service=feedback_retry_service,
+        )
+
+        with patch(
+            'app.eod.daily_pipeline_stages.agent_feedback_prerequisite_service.inspect_feedback_prerequisites',
+            side_effect=lambda **_: _feedback_prerequisites(
+                status='waiting',
+                missing_stage_ids=['fundamentals_daily_refresh', 'quality_factors'],
+            ),
+        ):
+            result = service.run(
+                market_date='2026-04-14',
+                stages=['agent_feedback_summaries'],
+            )
+
+        self.assertEqual(result['status'], 'waiting')
+        self.assertEqual(result['stages']['agent_feedback_summaries']['status'], 'waiting')
+        self.assertEqual(
+            result['stages']['agent_feedback_summaries']['result']['reason'],
+            'feedback_prerequisites_not_ready',
+        )
+        self.assertEqual(feedback_retry_service.calls, [])
 
     def test_run_rejects_unknown_stage(self) -> None:
         service = DailyPipelineStageService()

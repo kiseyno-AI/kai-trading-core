@@ -37,6 +37,20 @@ def _full_factor_stage_counts(*, total: int, updated_at: str) -> dict[str, dict]
     }
 
 
+def _full_feedback_prerequisite_stage_counts(*, total: int, updated_at: str) -> dict[str, dict]:
+    return {
+        'market_risk_filter': {
+            'persisted': total,
+            'updated_at': updated_at,
+        },
+        'piotroski_filter': {
+            'persisted': total,
+            'updated_at': updated_at,
+        },
+        **_full_factor_stage_counts(total=total, updated_at=updated_at),
+    }
+
+
 def _full_pykrx_enrichment_coverage(*, symbol_count: int, market_count: int, updated_at: str) -> dict[str, dict]:
     return {
         'requested_symbol_count': symbol_count,
@@ -476,6 +490,8 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
                 'action_summaries',
                 'trending_ranks',
                 'fundamentals_daily_refresh',
+                'market_risk_filter',
+                'piotroski_filter',
                 'momentum_factors',
                 'value_factors',
                 'low_risk_factors',
@@ -697,7 +713,7 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
             pykrx_stage_counts_loader=lambda *_: stage_counts,
             live_symbol_count_loader=lambda: 3579,
             fundamentals_refresh_loader=lambda **_: fundamentals_run,
-            factor_stage_counts_loader=lambda **_: _full_factor_stage_counts(
+            row_count_stage_counts_loader=lambda **_: _full_feedback_prerequisite_stage_counts(
                 total=2810,
                 updated_at='2026-05-06T07:15:00+00:00',
             ),
@@ -882,7 +898,7 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
             pykrx_stage_counts_loader=lambda *_: stage_counts,
             live_symbol_count_loader=lambda: 3579,
             fundamentals_refresh_loader=lambda **_: fundamentals_run,
-            factor_stage_counts_loader=lambda **_: _full_factor_stage_counts(
+            row_count_stage_counts_loader=lambda **_: _full_feedback_prerequisite_stage_counts(
                 total=3,
                 updated_at='2026-04-21T10:15:00+00:00',
             ),

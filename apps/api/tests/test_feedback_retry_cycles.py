@@ -10,11 +10,39 @@ from app.agent_context.retry_service import (
     RoleSequenceRoleState,
     RoleSequenceSnapshot,
 )
+from app.agent_context.prerequisite_service import FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER
 from scripts import run_feedback_retry_cycles
 
 
 def _decision(*, should_dispatch):
     return SimpleNamespace(should_dispatch=should_dispatch)
+
+
+def _feedback_prerequisites(*, status: str = 'ready', missing_stage_ids: list[str] | None = None) -> dict:
+    missing_stage_ids = list(missing_stage_ids or [])
+    ready = status == 'ready'
+    return {
+        'market_date': '2026-04-16',
+        'fs_div': 'CFS',
+        'status': status,
+        'ready': ready,
+        'required_stage_ids': list(FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER),
+        'ready_stage_ids': list(FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER) if ready else [],
+        'waiting_stage_ids': missing_stage_ids if status == 'waiting' else [],
+        'blocked_stage_ids': missing_stage_ids if status == 'blocked' else [],
+        'missing_prerequisites': [
+            {
+                'stage': stage_id,
+                'label': stage_id.replace('_', ' '),
+                'status': 'running' if status == 'waiting' else 'partial',
+                'gate_status': status,
+                'current_activity': f'{status} {stage_id}',
+                'details': {},
+            }
+            for stage_id in missing_stage_ids
+        ],
+        'stages': {},
+    }
 
 
 def _role_state(
@@ -101,6 +129,14 @@ class RecordingRunStateService:
 
 
 class FeedbackRetryCycleTests(unittest.TestCase):
+    def setUp(self):
+        self.prerequisite_patcher = patch(
+            'app.agent_context.retry_service.agent_feedback_prerequisite_service.inspect_feedback_prerequisites',
+            side_effect=lambda **_: _feedback_prerequisites(),
+        )
+        self.prerequisite_patcher.start()
+        self.addCleanup(self.prerequisite_patcher.stop)
+
     def test_load_incomplete_symbols_keeps_stale_feedback_retryable(self):
         service = AgentFeedbackRetryService()
 
@@ -377,6 +413,38 @@ class FeedbackRetryCycleTests(unittest.TestCase):
         self.assertEqual(result['requested_symbols'], ['005930'])
         self.assertEqual(result['eligible_symbols'], ['005930'])
         self.assertEqual(result['skipped_symbols'], [])
+
+    def test_run_retry_cycles_returns_waiting_gate_when_prerequisites_are_not_ready(self):
+        service = AgentFeedbackRetryService()
+        run_state_service = RecordingRunStateService()
+
+        with (
+            patch(
+                'app.agent_context.retry_service.agent_feedback_prerequisite_service.inspect_feedback_prerequisites',
+                side_effect=lambda **_: _feedback_prerequisites(
+                    status='waiting',
+                    missing_stage_ids=['fundamentals_daily_refresh', 'composite_factors'],
+                ),
+            ),
+            patch(
+                'app.agent_context.retry_service.agent_context_feedback_run_state_service',
+                run_state_service,
+            ),
+        ):
+            result = service.run_retry_cycles(
+                config=SimpleNamespace(
+                    market_date=date.fromisoformat('2026-04-16'),
+                    roles=EXPECTED_ROLES,
+                    max_cycles=3,
+                    outer_batch_size=20,
+                    reuse_existing=True,
+                )
+            )
+
+        self.assertTrue(result['gated'])
+        self.assertEqual(result['status'], 'waiting')
+        self.assertEqual(result['run_id'], None)
+        self.assertEqual(run_state_service.started, [])
 
     def test_run_retry_cycles_persists_role_boundaries_and_advances_past_terminal_failures(self):
         service = AgentFeedbackRetryService()

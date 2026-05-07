@@ -8,6 +8,7 @@ The retry universe is the persisted active-pre-filter intersection for the reque
 Callers can optionally provide `symbols` to restrict the real daily retry cycle to one explicit symbol or a small explicit symbol list. Core still runs the same summarizer and decider sequence, persists through the same durable tables, and keeps the run inspectable through the normal progress/latest/read surfaces. Requested symbols outside the active-pre-filter intersection are reported as `skipped_symbols`.
 
 The response includes cycle and batch details plus a fresh `progress` snapshot using the same response shape as `GET /agent-context/feedback/progress`. Consumers can read `progress.summary.first_feedback_at`, `elapsed_seconds`, rate fields, and ETA fields immediately after the retry request completes.
+Retry cycles now also enforce the same-day feedback prerequisites by default. If fundamentals, filtering, or factor/scoring stages are still pending or blocked, the route returns a gated `waiting` or `blocked` response with a `prerequisites` block and does not create a new durable run. Operators can bypass that safety check only with `force=true`.
 
 ## Example request
 ```http
@@ -20,7 +21,8 @@ Content-Type: application/json
   "roles": ["eod-summarizer", "technical-summarizer", "fundamental-summarizer"],
   "max_cycles": 3,
   "outer_batch_size": 20,
-  "reuse_existing": true
+  "reuse_existing": true,
+  "force": false
 }
 ```
 
@@ -72,6 +74,24 @@ Content-Type: application/json
       "estimated_completion_at": "2026-04-16T01:05:17+00:00",
       "eta_confidence": "high"
     }
+  }
+}
+```
+
+## Gated response
+```json
+{
+  "market_date": "2026-04-16",
+  "requested_symbols": ["005930"],
+  "roles": ["eod-summarizer", "technical-summarizer", "fundamental-summarizer"],
+  "status": "blocked",
+  "gated": true,
+  "cycles": [],
+  "final_pending": 1,
+  "completed": false,
+  "prerequisites": {
+    "status": "blocked",
+    "blocked_stage_ids": ["quality_factors", "composite_factors"]
   }
 }
 ```

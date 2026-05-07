@@ -13,6 +13,7 @@ load_dotenv(Path(__file__).resolve().parents[2] / '.env', override=False)
 from app.agent_context.derived_contexts import derived_context_backfill_service
 from app.agent_context.missing_data_report_service import agent_context_missing_data_report_service
 from app.agent_context.orchestrator import agent_feedback_orchestrator
+from app.agent_context.prerequisite_service import agent_feedback_prerequisite_service
 from app.agent_context.retry_service import EXPECTED_ROLES, FeedbackRetryCycleConfig, agent_feedback_retry_service
 from app.agent_context.session_cleanup_service import agent_feedback_session_cleanup_service
 from app.agent_context.signal_decider_calendar_review_service import signal_decider_calendar_review_service
@@ -319,6 +320,28 @@ def compute_signal_decider_evaluations(
     bootstrap_runtime()
     parsed_symbols = [item.strip() for item in symbols.split(',') if item.strip()] if symbols else None
     parsed_horizons = [int(item.strip()) for item in horizons.split(',') if item.strip()] if horizons else None
+    prerequisites = agent_feedback_prerequisite_service.inspect_feedback_prerequisites(
+        market_date=market_date,
+    )
+    if not force_recompute and not prerequisites['ready']:
+        return {
+            'request': {
+                'as_of_market_date': market_date,
+                'lookback_days': lookback_days,
+                'symbols': parsed_symbols,
+                'horizons': parsed_horizons,
+                'evaluation_version': evaluation_version,
+                'force_recompute': force_recompute,
+            },
+            'summary': {
+                'status': prerequisites['status'],
+                'gated': True,
+                'outcomes_upserted': 0,
+                'evaluations_upserted': 0,
+            },
+            'items': [],
+            'prerequisites': prerequisites,
+        }
     return signal_decider_loop_service.compute_recent_evaluations(
         as_of_market_date=market_date,
         lookback_days=lookback_days,
@@ -524,6 +547,7 @@ def run_agent_feedback_retry_cycles(
     max_cycles: int = 3,
     outer_batch_size: int = 20,
     reuse_existing: bool = True,
+    force: bool = False,
 ) -> dict[str, Any]:
     bootstrap_runtime()
     parsed_symbols = tuple(item.strip() for item in symbols.split(',') if item.strip()) if symbols else None
@@ -536,7 +560,8 @@ def run_agent_feedback_retry_cycles(
             max_cycles=max_cycles,
             outer_batch_size=outer_batch_size,
             reuse_existing=reuse_existing,
-        )
+        ),
+        force=force,
     )
 
 
@@ -903,6 +928,7 @@ def _build_parser() -> argparse.ArgumentParser:
     feedback_retry_parser.add_argument('--max-cycles', type=int, default=3)
     feedback_retry_parser.add_argument('--outer-batch-size', type=int, default=20)
     feedback_retry_parser.add_argument('--reuse-existing', choices=('true', 'false'), default='true')
+    feedback_retry_parser.add_argument('--force', action='store_true')
 
     feedback_data_gap_summary_parser = subparsers.add_parser(
         'agent-feedback-data-gap-summary',
@@ -1153,6 +1179,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             max_cycles=args.max_cycles,
             outer_batch_size=args.outer_batch_size,
             reuse_existing=args.reuse_existing == 'true',
+            force=args.force,
         )
     elif args.command in {'agent-feedback-data-gap-summary', 'agent-feedback-data-gap-quality-report'}:
         payload = get_agent_feedback_data_gap_summary(

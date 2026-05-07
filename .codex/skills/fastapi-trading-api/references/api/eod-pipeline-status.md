@@ -5,9 +5,9 @@ Operator-facing live status API for the post-close EOD pipeline.
 
 Canonical semantics for this route and `GET /eod/freshness` live in `docs/EOD_STATUS_SEMANTICS_CONTRACT.md`.
 
-Unlike `GET /eod/freshness`, this route focuses on in-flight work. It reports the current stage status for pykrx daily price collection, persisted PyKRX enrichment coverage, technical snapshot compute, action summary compute, stored trending-rank rebuild, and the latest DART fundamentals daily refresh run for the requested `market_date`.
+Unlike `GET /eod/freshness`, this route focuses on in-flight work. It reports the current stage status for pykrx daily price collection, persisted PyKRX enrichment coverage, technical snapshot compute, action summary compute, stored trending-rank rebuild, the latest DART fundamentals daily refresh run, and the same-day filter or factor-scoring prerequisites that now gate agent-feedback follow-up for the requested `market_date`.
 
-The same payload now also reports the default-selected factor/scoring stages for that market date: `momentum_factors`, `value_factors`, `low_risk_factors`, `beta_factors`, `advanced_value_factors`, `unified_value_factors`, `quality_factors`, and `composite_factors`. Those stages are derived from stored result-row coverage, so a completed core EOD day with missing scoring rows stays `partial` instead of reading as a false completed success.
+The same payload now also reports the default-selected filtering and factor/scoring stages for that market date: `market_risk_filter`, `piotroski_filter`, `momentum_factors`, `value_factors`, `low_risk_factors`, `beta_factors`, `advanced_value_factors`, `unified_value_factors`, `quality_factors`, and `composite_factors`. Those stages are derived from stored result-row coverage, so a completed core EOD day with missing filter or scoring rows stays `partial` instead of reading as a false completed success.
 
 The default `market_date` is the current Seoul calendar date from `server_time[:10]`. On weekends, holidays, or other break-days, callers must pass `market_date` explicitly if they want the previous trading day's pipeline view instead of the current calendar date.
 
@@ -29,6 +29,8 @@ GET /eod/pipeline/status?market_date=2026-04-21&fs_div=CFS
     "action_summaries",
     "trending_ranks",
     "fundamentals_daily_refresh",
+    "market_risk_filter",
+    "piotroski_filter",
     "momentum_factors",
     "value_factors",
     "low_risk_factors",
@@ -88,6 +90,13 @@ GET /eod/pipeline/status?market_date=2026-04-21&fs_div=CFS
         "capture_run_id": 700,
         "capture_run_ids": [699, 700]
       }
+    },
+    "market_risk_filter": {
+      "status": "pending",
+      "processed": 0,
+      "total": 3579,
+      "failed": 0,
+      "current_activity": "Waiting on pykrx daily price collection"
     },
     "momentum_factors": {
       "status": "pending",
