@@ -189,6 +189,8 @@ class AgentContextReadServiceTests(unittest.TestCase):
         load_signal_features_mock.return_value = [
             {
                 'symbol': '005930',
+                'name_ko': '삼성전자',
+                'market': 'KOSPI',
                 'market_date': '2026-04-08',
                 'source': 'kis_ranking',
                 'signal_count': 2,
@@ -198,7 +200,27 @@ class AgentContextReadServiceTests(unittest.TestCase):
                 'overtime_volume': 120000,
                 'overtime_fluctuation_rank': None,
                 'overtime_fluctuation_rate': None,
-                'feature_payload': {'sources': {'volume-power': {'rank': 3}}},
+                'row_kind': 'direct_plus_fallback',
+                'provenance': {
+                    'row_kind': 'direct_plus_fallback',
+                    'direct_signal_source_count': 2,
+                    'fallback_groups_present': ['price_action', 'factor_scores'],
+                },
+                'freshness': {
+                    'market_date': '2026-04-08',
+                    'direct_sources_collected_at': '2026-04-08T15:00:00+09:00',
+                },
+                'fallback_features': {
+                    'price_action': {'close_return_1d_pct': 2.43},
+                },
+                'feature_payload': {
+                    'sources': {'volume-power': {'rank': 3}},
+                    'row_provenance': {
+                        'row_kind': 'direct_plus_fallback',
+                        'direct_signal_source_count': 2,
+                        'fallback_groups_present': ['price_action', 'factor_scores'],
+                    },
+                },
                 'captured_at': '2026-04-08T15:00:00+09:00',
             }
         ]
@@ -644,6 +666,8 @@ class AgentContextReadServiceTests(unittest.TestCase):
         self.assertEqual(first_item['technical_snapshot']['trend_state'], 'uptrend')
         self.assertEqual(first_item['action_summary']['action_label'], 'long_breakout')
         self.assertEqual(first_item['signal_features']['signal_count'], 2)
+        self.assertEqual(first_item['signal_features']['provenance']['row_kind'], 'direct_plus_fallback')
+        self.assertEqual(first_item['signal_features']['fallback_features']['price_action']['close_return_1d_pct'], 2.43)
         self.assertEqual(first_item['scores']['unified_value']['status'], 'available')
         self.assertEqual(first_item['scores']['unified_value']['score'], 0.84)
         self.assertEqual(first_item['scores']['quality']['status'], 'partial')
@@ -664,6 +688,8 @@ class AgentContextReadServiceTests(unittest.TestCase):
             ['accruals_ratio'],
         )
         self.assertEqual(first_item['context_completeness']['signal_features']['row_status'], 'present')
+        self.assertEqual(first_item['context_completeness']['signal_features']['row_kind'], 'direct_plus_fallback')
+        self.assertEqual(first_item['context_completeness']['signal_features']['fallback_groups_present'], ['price_action', 'factor_scores'])
         self.assertEqual(first_item['context_completeness']['market_relative_context']['status'], 'available')
         self.assertEqual(first_item['context_completeness']['requested_symbol_coverage']['signal_features']['present_rows'], 1)
         self.assertEqual(first_item['fundamentals']['latest_snapshot']['period']['period_end_date'], '2024-12-31')
@@ -684,6 +710,7 @@ class AgentContextReadServiceTests(unittest.TestCase):
         self.assertEqual(second_item['scores']['quality']['status'], 'unavailable')
         self.assertEqual(second_item['scores']['momentum']['status'], 'unavailable')
         self.assertEqual(second_item['context_completeness']['signal_features']['row_status'], 'missing')
+        self.assertEqual(second_item['context_completeness']['signal_features']['row_kind'], 'missing')
         self.assertEqual(second_item['context_completeness']['market_relative_context']['status'], 'unavailable')
         self.assertEqual(second_item['context_completeness']['sector_peer_mapping']['status'], 'unavailable')
         self.assertIsNone(second_item['fundamentals']['latest_snapshot'])

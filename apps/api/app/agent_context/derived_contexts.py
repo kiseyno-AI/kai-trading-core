@@ -305,12 +305,15 @@ def build_signal_participation_context(
     limit: int,
 ) -> dict[str, Any]:
     distribution: dict[str, int] = {}
+    row_kind_counts: dict[str, int] = {}
     for row in rows:
         signal_count = row.get('signal_count')
         if signal_count is None:
             continue
         key = str(int(signal_count))
         distribution[key] = distribution.get(key, 0) + 1
+        row_kind = str((row.get('provenance') or {}).get('row_kind') or row.get('row_kind') or 'unknown')
+        row_kind_counts[row_kind] = row_kind_counts.get(row_kind, 0) + 1
 
     source_counts = {
         source: sum(1 for row in rows if row.get(rank_key) is not None)
@@ -338,6 +341,9 @@ def build_signal_participation_context(
     return {
         'captured_symbol_count': len(rows),
         'signal_count_distribution': dict(sorted(distribution.items())),
+        'row_kind_counts': row_kind_counts,
+        'direct_signal_source_row_count': sum(1 for row in rows if int(row.get('signal_count') or 0) > 0),
+        'fallback_only_row_count': row_kind_counts.get('fallback_only', 0),
         'source_counts': source_counts,
         'leaders_by_source': leaders_by_source,
     }

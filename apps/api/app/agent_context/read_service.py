@@ -615,15 +615,22 @@ def _build_signal_feature_completeness(row: dict[str, Any] | None) -> dict[str, 
     if row is None:
         return {
             'row_status': 'missing',
+            'row_kind': 'missing',
+            'direct_signal_source_count': 0,
+            'fallback_groups_present': [],
             'null_submetric_fields': list(SIGNAL_FEATURE_SUBMETRIC_FIELDS),
             'null_submetric_count': len(SIGNAL_FEATURE_SUBMETRIC_FIELDS),
             'present_submetric_fields': [],
             'present_submetric_count': 0,
         }
+    provenance = row.get('provenance') or {}
     null_submetric_fields = [field for field in SIGNAL_FEATURE_SUBMETRIC_FIELDS if row.get(field) is None]
     present_submetric_fields = [field for field in SIGNAL_FEATURE_SUBMETRIC_FIELDS if row.get(field) is not None]
     return {
         'row_status': 'present',
+        'row_kind': provenance.get('row_kind') or row.get('row_kind'),
+        'direct_signal_source_count': int(provenance.get('direct_signal_source_count') or row.get('signal_count') or 0),
+        'fallback_groups_present': list(provenance.get('fallback_groups_present') or []),
         'null_submetric_fields': null_submetric_fields,
         'null_submetric_count': len(null_submetric_fields),
         'present_submetric_fields': present_submetric_fields,

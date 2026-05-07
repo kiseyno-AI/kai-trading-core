@@ -624,9 +624,12 @@ def run_market_data_pipeline(
             signal_total = int(signal_feature_result.get('features_persisted', 0)) + int(
                 signal_feature_result.get('features_failed', 0)
             )
+            signal_source_errors = signal_feature_result.get('source_errors') or {}
             persist_stage_progress(
                 stage='signal_features',
-                status='completed' if not signal_feature_result.get('features_failed') else 'partial',
+                status='completed'
+                if not signal_feature_result.get('features_failed') and not signal_source_errors
+                else 'partial',
                 current_step='signal_features_completed',
                 current_activity='Daily KIS signal features collected',
                 processed=signal_total,
@@ -636,6 +639,8 @@ def run_market_data_pipeline(
                 extra={
                     'sources': signal_feature_result.get('sources'),
                     'source_counts': signal_feature_result.get('source_counts'),
+                    'source_errors': signal_source_errors,
+                    'coverage': signal_feature_result.get('coverage'),
                 },
             )
         except Exception as exc:
