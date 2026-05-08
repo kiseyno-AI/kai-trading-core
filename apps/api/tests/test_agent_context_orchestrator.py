@@ -148,13 +148,22 @@ class RepairJsonTailTests(unittest.TestCase):
                 },
                 'decider_data_quality_context': {
                     'status': 'partial',
+                    'decision_priority': {
+                        'core_execution': {'status': 'available', 'blocking_by_default': True},
+                        'auxiliary_context': {'status': 'partial', 'blocking_by_default': False},
+                    },
                     'blocks': {
                         'liquidity_turnover': {
                             'status': 'partial',
                             'turnover': {'status': 'partial', 'turnover_source': 'derived'},
+                            'decision_guidance': {'decision_tier': 'core_execution'},
                         },
                         'disclosures_news': {
                             'status': 'provider_error',
+                            'decision_guidance': {
+                                'decision_tier': 'auxiliary_context',
+                                'empty_is_neutral_by_default': True,
+                            },
                             'providers': {
                                 'external_news': {'status': 'provider_error', 'reason': 'naver_search_credentials_missing'}
                             },
@@ -174,8 +183,16 @@ class RepairJsonTailTests(unittest.TestCase):
         self.assertEqual(trimmed['liquidity_context']['intraday']['quote_spread_points'], 100)
         self.assertEqual(trimmed['decider_data_quality_context']['status'], 'partial')
         self.assertEqual(
+            trimmed['decider_data_quality_context']['decision_priority']['core_execution']['status'],
+            'available',
+        )
+        self.assertEqual(
             trimmed['decider_data_quality_context']['blocks']['disclosures_news']['providers']['external_news']['status'],
             'provider_error',
+        )
+        self.assertEqual(
+            trimmed['decider_data_quality_context']['blocks']['disclosures_news']['decision_guidance']['decision_tier'],
+            'auxiliary_context',
         )
 
 
@@ -1313,6 +1330,11 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         short_term_payload = next(payload for payload in client.decider_payloads if payload['role'] == 'short-term-decider')
         self.assertEqual(short_term_payload['orchestration']['request_model'], 'openclaw/short-term-decider')
         self.assertIn('trigger_price', short_term_payload['output_contract']['required_feedback_fields'])
+        self.assertTrue(
+            short_term_payload['decision_support_constraints']['missing_context_policy'][
+                'auxiliary_context_absence_not_tradeability_blocker'
+            ]
+        )
         self.assertEqual(short_term_payload['decider_data_quality_context']['status'], 'partial')
         self.assertEqual(
             short_term_payload['decider_data_quality_context']['blocks']['disclosures_news']['providers']['external_news']['status'],
@@ -1363,6 +1385,14 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertEqual(
             decider_payload['orchestration']['required_upstream_roles'],
             ['eod-summarizer', 'technical-summarizer', 'fundamental-summarizer'],
+        )
+        self.assertTrue(
+            decider_payload['decision_support_constraints']['missing_context_policy']['empty_recent_news_is_neutral']
+        )
+        self.assertTrue(
+            decider_payload['decision_support_constraints']['missing_context_policy'][
+                'quarterly_financial_detail_confidence_only_unless_thesis_depends_on_it'
+            ]
         )
         self.assertEqual(decider_payload['output_contract']['assigned_symbol'], '005930')
         self.assertTrue(decider_payload['output_contract']['batch_envelope_required'])

@@ -9,6 +9,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.agent_context.derived_contexts import DEFAULT_DERIVED_CONTEXT_HISTORY_DAYS, build_price_context
+from app.agent_context.missing_data_taxonomy import CATEGORY_DEFINITIONS_BY_KEY
 from app.agent_context.score_context import build_signal_decider_scores
 from app.core.settings import settings
 from app.db import session_scope
@@ -428,6 +429,65 @@ DECIDER_QUALITY_STATUS_EMPTY = 'empty'
 DECIDER_QUALITY_STATUS_STALE = 'stale'
 DECIDER_QUALITY_STATUS_PARTIAL = 'partial'
 DECIDER_QUALITY_STATUS_AVAILABLE = 'available'
+DECIDER_DECISION_TIER_CORE_EXECUTION = 'core_execution'
+DECIDER_DECISION_TIER_SUPPORTING_CONTEXT = 'supporting_context'
+DECIDER_DECISION_TIER_AUXILIARY_CONTEXT = 'auxiliary_context'
+DECIDER_QUALITY_BLOCK_CATEGORY_KEYS: dict[str, str] = {
+    'factor_score_coverage': 'factor_score_coverage',
+    'liquidity_turnover': 'liquidity_turnover_slippage',
+    'intraday_realtime': 'after_hours_intraday_realtime',
+    'financials_cashflow': 'financial_detail_quarter_cashflow',
+    'disclosures_news': 'disclosures_news_events',
+    'flows_short_selling': 'investor_flows_short_selling',
+    'sector_relative_strength': 'market_sector_peer_relative',
+    'technical_evidence': 'technical_evidence_support_resistance',
+}
+DECIDER_QUALITY_DEGRADED_STATUSES = frozenset(
+    {
+        DECIDER_QUALITY_STATUS_PARTIAL,
+        DECIDER_QUALITY_STATUS_STALE,
+        DECIDER_QUALITY_STATUS_EMPTY,
+        DECIDER_QUALITY_STATUS_UNAVAILABLE,
+        DECIDER_QUALITY_STATUS_PROVIDER_ERROR,
+    }
+)
+DECIDER_PRIORITY_TIER_ORDER: tuple[str, ...] = (
+    DECIDER_DECISION_TIER_CORE_EXECUTION,
+    DECIDER_DECISION_TIER_SUPPORTING_CONTEXT,
+    DECIDER_DECISION_TIER_AUXILIARY_CONTEXT,
+)
+DECIDER_PRIORITY_TIER_DEFAULTS: dict[str, dict[str, Any]] = {
+    DECIDER_DECISION_TIER_CORE_EXECUTION: {
+        'severity': 'high',
+        'default_missing_effect': 'core_blocker',
+        'blocking_by_default': True,
+        'empty_is_neutral_by_default': False,
+        'interpretation': (
+            'Primary execution, liquidity, spread, freshness, and session-state evidence. '
+            'Degraded data here can justify conservative wait/reject decisions.'
+        ),
+    },
+    DECIDER_DECISION_TIER_SUPPORTING_CONTEXT: {
+        'severity': 'medium',
+        'default_missing_effect': 'supporting_gap',
+        'blocking_by_default': False,
+        'empty_is_neutral_by_default': False,
+        'interpretation': (
+            'Supporting thesis-quality context. Gaps here should usually narrow confidence or require stronger '
+            'confirmation, but they are not standalone tradeability blockers by default.'
+        ),
+    },
+    DECIDER_DECISION_TIER_AUXILIARY_CONTEXT: {
+        'severity': 'low',
+        'default_missing_effect': 'confidence_reducer',
+        'blocking_by_default': False,
+        'empty_is_neutral_by_default': True,
+        'interpretation': (
+            'Auxiliary context only. Missing or empty data here should be neutral or a confidence reducer by '
+            'default, not a standalone reason to classify the symbol as untradeable.'
+        ),
+    },
+}
 
 
 def _compact_provenance_summary(metadata: dict[str, Any] | None) -> dict[str, Any]:
@@ -555,6 +615,86 @@ def _summarize_overall_decider_quality_status(statuses: Sequence[str]) -> str:
     }:
         return DECIDER_QUALITY_STATUS_EMPTY
     return DECIDER_QUALITY_STATUS_UNAVAILABLE
+
+
+def _decider_quality_block_definition(block_name: str) -> Any:
+    category_key = DECIDER_QUALITY_BLOCK_CATEGORY_KEYS.get(block_name)
+    if category_key is None:
+        return None
+    return CATEGORY_DEFINITIONS_BY_KEY.get(category_key)
+
+
+def _build_decider_block_decision_guidance(
+    *,
+    block_name: str,
+    status: str,
+    report_period_type: str | None = None,
+) -> dict[str, Any]:
+    definition = _decider_quality_block_definition(block_name)
+    if definition is None:
+        return {}
+
+    interpretation = DECIDER_PRIORITY_TIER_DEFAULTS[definition.decision_tier]['interpretation']
+    if block_name == 'disclosures_news':
+        if status == DECIDER_QUALITY_STATUS_EMPTY:
+            interpretation = (
+                'No captured recent news/disclosures. Treat as neutral unless separate risk evidence suggests an '
+                'event-driven risk or catalyst.'
+            )
+        else:
+            interpretation = (
+                'News, disclosures, and event headlines are auxiliary by default. Missing coverage should reduce '
+                'confidence only, not force wait/reject on its own.'
+            )
+    elif block_name == 'financials_cashflow':
+        if report_period_type == 'annual':
+            interpretation = (
+                'Annual fundamentals are still usable context. Missing detailed quarterly or cash-flow fields should '
+                'reduce confidence only unless the thesis explicitly depends on those details.'
+            )
+        else:
+            interpretation = (
+                'Detailed quarterly and cash-flow context is auxiliary by default. Missing fields should reduce '
+                'confidence only when the thesis materially depends on them.'
+            )
+
+    return {
+        'category': definition.key,
+        'decision_tier': definition.decision_tier,
+        'severity': definition.severity,
+        'default_missing_effect': definition.default_decider_effect,
+        'blocking_by_default': definition.default_decider_effect == 'core_blocker',
+        'empty_is_neutral_by_default': definition.empty_is_neutral_by_default,
+        'interpretation': interpretation,
+    }
+
+
+def _build_decider_quality_priority_summary(blocks: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    summary: dict[str, Any] = {}
+    for tier in DECIDER_PRIORITY_TIER_ORDER:
+        tier_blocks = [
+            (block_name, block)
+            for block_name, block in blocks.items()
+            if _maybe_dict(block.get('decision_guidance')).get('decision_tier') == tier
+        ]
+        defaults = DECIDER_PRIORITY_TIER_DEFAULTS[tier]
+        statuses = [str(block.get('status') or DECIDER_QUALITY_STATUS_UNAVAILABLE) for _, block in tier_blocks]
+        degraded_block_names = [
+            block_name
+            for block_name, block in tier_blocks
+            if str(block.get('status') or DECIDER_QUALITY_STATUS_UNAVAILABLE) in DECIDER_QUALITY_DEGRADED_STATUSES
+        ]
+        summary[tier] = {
+            'status': _summarize_overall_decider_quality_status(statuses),
+            'severity': defaults['severity'],
+            'default_missing_effect': defaults['default_missing_effect'],
+            'blocking_by_default': defaults['blocking_by_default'],
+            'empty_is_neutral_by_default': defaults['empty_is_neutral_by_default'],
+            'block_names': [block_name for block_name, _ in tier_blocks],
+            'degraded_block_names': degraded_block_names,
+            'interpretation': defaults['interpretation'],
+        }
+    return summary
 
 
 def _normalize_symbols(symbols: Sequence[str]) -> list[str]:
@@ -2611,6 +2751,9 @@ def _build_decider_financials_quality_context(
     advanced_value_row: dict[str, Any] | None,
 ) -> dict[str, Any]:
     latest_snapshot = _maybe_dict(fundamentals.get('latest_snapshot'))
+    period = _maybe_dict(latest_snapshot.get('period'))
+    report_code = str(period.get('report_code') or '').strip() or None
+    report_meta = REPORT_CODE_METADATA.get(report_code or '', {})
     fundamental_context = _maybe_dict(latest_snapshot.get('fundamental_context'))
     normalized_facts = _maybe_dict(fundamental_context.get('normalized_facts'))
     income_statement = _maybe_dict(normalized_facts.get('income_statement'))
@@ -2637,6 +2780,16 @@ def _build_decider_financials_quality_context(
         for field_name, raw_status in core_field_statuses.items()
         if str(raw_status or '').strip().lower() == 'available'
     ]
+    available_cash_flow_fields = [
+        field_name
+        for field_name in ('operating_cash_flow', 'investing_cash_flow', 'financing_cash_flow')
+        if str(core_field_statuses.get(field_name) or '').strip().lower() == 'available'
+    ]
+    missing_cash_flow_fields = [
+        field_name
+        for field_name in ('operating_cash_flow', 'investing_cash_flow', 'financing_cash_flow')
+        if str(core_field_statuses.get(field_name) or '').strip().lower() != 'available'
+    ]
     missing_core_fields = [
         field_name
         for field_name, raw_status in core_field_statuses.items()
@@ -2659,13 +2812,18 @@ def _build_decider_financials_quality_context(
         'status': status,
         'receipt_date': _maybe_dict(latest_snapshot.get('filing')).get('receipt_date'),
         'report_name': _maybe_dict(latest_snapshot.get('filing')).get('report_name'),
-        'period_end_date': _maybe_dict(latest_snapshot.get('period')).get('period_end_date'),
-        'business_year': _maybe_dict(latest_snapshot.get('period')).get('business_year'),
-        'report_code': _maybe_dict(latest_snapshot.get('period')).get('report_code'),
+        'period_end_date': period.get('period_end_date'),
+        'business_year': period.get('business_year'),
+        'report_code': report_code,
+        'report_period_type': report_meta.get('period'),
+        'report_scope': report_meta.get('scope'),
+        'annual_only_context': report_meta.get('period') == 'annual',
         'source_status': _maybe_dict(latest_snapshot.get('statement')).get('source_status'),
         'core_field_statuses': core_field_statuses,
         'available_core_fields': available_core_fields,
         'missing_core_fields': missing_core_fields,
+        'available_cash_flow_fields': available_cash_flow_fields,
+        'missing_cash_flow_fields': missing_cash_flow_fields,
         'freshness': _compact_provenance_summary(fundamentals_provenance),
     }
 
@@ -2705,6 +2863,12 @@ def _build_decider_disclosures_news_quality_context(
     external_news_provider = _maybe_dict(recent_external_news.get('provider'))
     return {
         'status': status,
+        'empty_news_is_neutral': external_news_state == DECIDER_QUALITY_STATUS_EMPTY,
+        'empty_state_interpretation': (
+            'No captured recent optional news context; neutral unless separate risk evidence exists.'
+            if external_news_state == DECIDER_QUALITY_STATUS_EMPTY
+            else None
+        ),
         'providers': {
             'dart_recent_events': {
                 'status': dart_state,
@@ -2974,14 +3138,26 @@ def _build_decider_data_quality_context(
             action_summary=action_summary,
         ),
     }
-    block_status_counts = _quality_status_counts(blocks)
+    annotated_blocks: dict[str, dict[str, Any]] = {}
+    for block_name, block in blocks.items():
+        guidance = _build_decider_block_decision_guidance(
+            block_name=block_name,
+            status=str(block.get('status') or DECIDER_QUALITY_STATUS_UNAVAILABLE),
+            report_period_type=str(block.get('report_period_type') or '').strip() or None,
+        )
+        annotated_blocks[block_name] = {
+            **block,
+            'decision_guidance': guidance,
+        }
+    block_status_counts = _quality_status_counts(annotated_blocks)
     return {
         'status': _summarize_overall_decider_quality_status(
-            [str(block.get('status') or '') for block in blocks.values()]
+            [str(block.get('status') or '') for block in annotated_blocks.values()]
         ),
         'requested_market_date': market_date.isoformat(),
         'block_status_counts': block_status_counts,
-        'blocks': blocks,
+        'decision_priority': _build_decider_quality_priority_summary(annotated_blocks),
+        'blocks': annotated_blocks,
     }
 
 

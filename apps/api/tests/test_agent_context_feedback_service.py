@@ -263,7 +263,13 @@ class AgentContextFeedbackServiceTests(unittest.TestCase):
             [item['category'] for item in categories],
             ['liquidity_turnover_slippage', 'technical_evidence_support_resistance'],
         )
+        self.assertEqual(categories[0]['decision_tier'], 'core_execution')
+        self.assertEqual(categories[0]['severity'], 'high')
+        self.assertTrue(categories[0]['blocking_by_default'])
         self.assertEqual(categories[0]['note_count'], 1)
+        self.assertEqual(categories[1]['decision_tier'], 'supporting_context')
+        self.assertEqual(categories[1]['severity'], 'medium')
+        self.assertFalse(categories[1]['blocking_by_default'])
         self.assertEqual(categories[1]['notes'], ['Add support/resistance evidence.'])
         self.assertEqual(categories[0]['context_issue_types'], ['derived_or_fallback', 'stale'])
         self.assertEqual(categories[0]['context_evidence'][0]['block'], 'quote_context')

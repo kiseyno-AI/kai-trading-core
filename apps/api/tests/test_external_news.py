@@ -275,9 +275,47 @@ class ExternalNewsContextTests(unittest.TestCase):
         self.assertEqual(block['status'], 'provider_error')
         self.assertEqual(block['providers']['dart_recent_events']['status'], 'empty')
         self.assertEqual(block['providers']['external_news']['status'], 'provider_error')
+        self.assertFalse(block['empty_news_is_neutral'])
         self.assertEqual(
             block['providers']['external_news']['provider_reason'],
             'naver_search_credentials_missing',
+        )
+
+    def test_decider_quality_context_treats_empty_news_as_auxiliary_neutral_context(self) -> None:
+        block = _build_decider_disclosures_news_quality_context(
+            recent_dart_events={
+                'status': 'empty',
+                'reason': 'no_recent_disclosures',
+                'summary': {},
+                'item_count': 0,
+            },
+            recent_disclosures_provenance={
+                'freshness_status': 'missing',
+                'provenance_status': 'provider_sourced',
+                'reason': 'no_recent_disclosures_up_to_request_date',
+            },
+            recent_external_news={
+                'status': 'empty',
+                'reason': 'no_recent_external_news_found',
+                'provider': {
+                    'provider': 'naver_news_search',
+                    'enabled': True,
+                    'status': 'available',
+                    'reason': None,
+                },
+            },
+            recent_external_news_provenance={
+                'freshness_status': 'missing',
+                'provenance_status': 'provider_sourced',
+                'reason': 'no_recent_external_news_found',
+            },
+        )
+
+        self.assertEqual(block['status'], 'empty')
+        self.assertTrue(block['empty_news_is_neutral'])
+        self.assertEqual(
+            block['empty_state_interpretation'],
+            'No captured recent optional news context; neutral unless separate risk evidence exists.',
         )
 
 
