@@ -74,7 +74,37 @@ def _normalize_json_object(value: dict[str, Any] | None, *, field_name: str) -> 
     return value
 
 
-def _serialize_feedback(record: AgentContextFeedback) -> dict[str, Any]:
+def _extract_compact_feedback_context(record: AgentContextFeedback) -> dict[str, Any] | None:
+    context_payload = record.context_payload
+    if not isinstance(context_payload, dict):
+        return None
+
+    symbol_day_context = context_payload.get('symbol_day_context') or context_payload.get('symbolDayContext')
+    if not isinstance(symbol_day_context, dict):
+        return None
+
+    compact_symbol_context: dict[str, Any] = {}
+    for key in ('symbol', 'market', 'sector', 'industry'):
+        value = symbol_day_context.get(key)
+        if value is not None:
+            compact_symbol_context[key] = value
+
+    company = symbol_day_context.get('company')
+    if isinstance(company, dict):
+        compact_company = {
+            key: company[key]
+            for key in ('name', 'name_ko', 'ticker')
+            if company.get(key) is not None
+        }
+        if compact_company:
+            compact_symbol_context['company'] = compact_company
+
+    if not compact_symbol_context:
+        return None
+    return {'symbol_day_context': compact_symbol_context}
+
+
+def _serialize_feedback(record: AgentContextFeedback, *, compact: bool = False) -> dict[str, Any]:
     raw_categories = record.missing_data_categories_payload
     if not isinstance(raw_categories, list):
         raw_categories = build_missing_data_categories(
@@ -82,7 +112,7 @@ def _serialize_feedback(record: AgentContextFeedback) -> dict[str, Any]:
             improvement_notes_payload=record.improvement_notes_payload,
             context_payload=record.context_payload,
         )
-    return {
+    base_payload = {
         'id': record.id,
         'market_date': record.market_date.isoformat(),
         'symbol': record.symbol,
@@ -93,6 +123,22 @@ def _serialize_feedback(record: AgentContextFeedback) -> dict[str, Any]:
         },
         'summary': record.summary_payload,
         'feedback': record.feedback_payload,
+        'received_at': record.received_at.isoformat() if record.received_at else None,
+    }
+    if compact:
+        return {
+            **base_payload,
+            'summary': {},
+            'normalized_feedback': None,
+            'details': record.details_payload,
+            'data_gaps': record.data_gaps_payload,
+            'improvement_notes': record.improvement_notes_payload,
+            'missing_data_categories': enrich_missing_data_categories(raw_categories),
+            'context': _extract_compact_feedback_context(record),
+            'compact': True,
+        }
+    return {
+        **base_payload,
         'normalized_feedback': record.normalized_feedback_payload,
         'details': record.details_payload,
         'breadth_context': record.breadth_context_payload,
@@ -107,7 +153,6 @@ def _serialize_feedback(record: AgentContextFeedback) -> dict[str, Any]:
         'improvement_notes': record.improvement_notes_payload,
         'missing_data_categories': enrich_missing_data_categories(raw_categories),
         'context': record.context_payload,
-        'received_at': record.received_at.isoformat() if record.received_at else None,
     }
 
 
@@ -388,6 +433,7 @@ class AgentContextFeedbackRepository:
         symbols: list[str],
         agent_name: str | None = None,
         limit: int = 50,
+        compact: bool = False,
     ) -> list[dict[str, Any]]:
         with session_scope() as session:
             stmt = select(AgentContextFeedback)
@@ -396,7 +442,7 @@ class AgentContextFeedbackRepository:
 
 
             rows = session.execute(stmt).scalars().all()
-            return [_serialize_feedback(row) for row in rows]
+            return [_serialize_feedback(row, compact=compact) for row in rows]
 
 
     def list_feedback_payloads(
@@ -562,6 +608,7 @@ class AgentContextFeedbackService:
         symbols: Sequence[str] | None = None,
         agent_name: str | None = None,
         limit: int = 50,
+        compact: bool = False,
     ) -> dict[str, Any]:
         normalized_market_date = _normalize_market_date(market_date)
         normalized_symbols = _normalize_symbols(symbols)
@@ -571,6 +618,7 @@ class AgentContextFeedbackService:
             symbols=normalized_symbols,
             agent_name=normalized_agent_name,
             limit=limit,
+            compact=compact,
         )
         return {
             'request': {
@@ -578,6 +626,7 @@ class AgentContextFeedbackService:
                 'symbols': normalized_symbols,
                 'agent_name': normalized_agent_name,
                 'limit': limit,
+                'compact': compact,
             },
             'summary': {
                 'count': len(items),

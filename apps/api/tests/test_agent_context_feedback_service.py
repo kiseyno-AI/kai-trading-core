@@ -328,5 +328,24 @@ class AgentContextFeedbackServiceTests(unittest.TestCase):
         self.assertEqual(repository.list_args['symbols'], ['005930', '000660'])
         self.assertEqual(repository.list_args['agent_name'], 'openclaw')
         self.assertEqual(repository.list_args['limit'], 10)
+        self.assertFalse(repository.list_args['compact'])
         self.assertEqual(result['request']['symbols'], ['005930', '000660'])
         self.assertEqual(result['summary']['count'], 1)
+
+    def test_list_feedback_passes_compact_projection_flag(self):
+        repository = FakeFeedbackRepository()
+        service = AgentContextFeedbackService(
+            repository=repository,
+            decision_loop_service=FakeSignalDeciderLoopService(),
+        )
+
+        result = service.list_feedback(
+            market_date='2026-04-14',
+            symbols=['005930'],
+            agent_name='short-term-decider',
+            limit=5,
+            compact=True,
+        )
+
+        self.assertTrue(repository.list_args['compact'])
+        self.assertTrue(result['request']['compact'])
