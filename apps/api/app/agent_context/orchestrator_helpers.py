@@ -709,6 +709,11 @@ def build_signal_decider_payload(
 ) -> dict[str, Any]:
     symbol_day_context = jsonable_encoder(strip_runtime_session_fields(item))
     score_context = symbol_day_context.pop('scores', {}) if isinstance(symbol_day_context.get('scores'), dict) else {}
+    factor_summary = (
+        symbol_day_context.pop('factor_summary', {})
+        if isinstance(symbol_day_context.get('factor_summary'), dict)
+        else {}
+    )
     requested_at = datetime.now(timezone.utc).isoformat()
     symbol = str(item.get('symbol') or '')
     resolved_signal_decider_policy = jsonable_encoder(
@@ -783,6 +788,7 @@ def build_signal_decider_payload(
         'market_date': market_date.isoformat(),
         'symbol_day_context': symbol_day_context,
         'scores': jsonable_encoder(score_context),
+        'factor_summary': jsonable_encoder(factor_summary),
         'market_context': jsonable_encoder(market_context or {}),
         'upstream_summaries': jsonable_encoder(upstream_summaries),
         'upstream_traceability': jsonable_encoder(upstream_traceability),

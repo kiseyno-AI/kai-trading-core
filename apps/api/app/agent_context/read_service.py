@@ -21,6 +21,7 @@ from app.db_models import (
     DailyQualityFactorResult,
     DailySignalFeature,
     DailyUnifiedValueFactorResult,
+    DailyValueFactorResult,
     Symbol,
 )
 from app.dart.fundamentals_store import DartFundamentalsRepository, dart_fundamentals_repository
@@ -49,9 +50,11 @@ from app.market_data_store import (
     load_daily_signal_features,
     load_daily_technical_snapshots,
     load_daily_unified_value_factor_results,
+    load_daily_value_factor_results,
     load_current_quotes,
     load_symbols,
 )
+from app.signals.momentum_factor import enrich_momentum_audit_fields
 
 PRICE_CONTEXT_HISTORY_DAYS = DEFAULT_DERIVED_CONTEXT_HISTORY_DAYS
 FRESHNESS_STATUS_FRESH = 'fresh'
@@ -63,6 +66,7 @@ PROVENANCE_STATUS_DERIVED = 'derived_from_provider_data'
 PROVENANCE_STATUS_FALLBACK = 'fallback_from_owned_data'
 PROVENANCE_STATUS_PROVIDER_PLUS_FALLBACK = 'provider_plus_fallback'
 PERSISTED_FACTOR_FAMILIES: tuple[str, ...] = (
+    'value',
     'unified_value',
     'quality',
     'momentum',
@@ -81,6 +85,26 @@ SIGNAL_FEATURE_SUBMETRIC_FIELDS: tuple[str, ...] = (
     'overtime_fluctuation_rate',
 )
 FACTOR_ROW_FIELDS: dict[str, tuple[str, ...]] = {
+    'value': (
+        'source',
+        'feature_version',
+        'market_date',
+        'value_score',
+        'value_rank',
+        'value_percentile',
+        'value_status',
+        'per',
+        'pbr',
+        'dividend_yield',
+        'per_status',
+        'per_rank',
+        'pbr_rank',
+        'dividend_yield_rank',
+        'per_percentile',
+        'pbr_percentile',
+        'dividend_yield_percentile',
+        'captured_at',
+    ),
     'unified_value': (
         'source',
         'feature_version',
@@ -137,8 +161,12 @@ FACTOR_ROW_FIELDS: dict[str, tuple[str, ...]] = {
         'return_5d',
         'ma_60',
         'ma_120',
+        'momentum_eligibility_status',
         'momentum_percentile_threshold',
         'passes_momentum_top_percentile',
+        'passes_trend_confirmation',
+        'has_sufficient_cross_sectional_context',
+        'is_recent_overheated',
         'is_momentum_eligible',
         'captured_at',
     ),
@@ -218,6 +246,7 @@ FACTOR_ROW_FIELDS: dict[str, tuple[str, ...]] = {
     ),
 }
 FACTOR_ROW_STATUS_FIELDS: dict[str, tuple[str, ...]] = {
+    'value': ('value_status', 'per_status'),
     'unified_value': ('unified_value_status', 'per_status', 'pbr_status', 'dividend_yield_status', 'fcf_yield_status', 'ev_to_ebitda_status'),
     'quality': (
         'quality_status',
@@ -228,13 +257,14 @@ FACTOR_ROW_STATUS_FIELDS: dict[str, tuple[str, ...]] = {
         'debt_ratio_status',
         'accruals_ratio_status',
     ),
-    'momentum': tuple(),
+    'momentum': ('momentum_eligibility_status',),
     'advanced_value': ('advanced_value_classification', 'fcf_yield_status', 'ev_to_ebitda_status'),
     'low_risk': ('low_risk_classification',),
     'beta': ('low_beta_classification',),
     'composite': ('composite_classification',),
 }
 FACTOR_ROW_PRIMARY_SCORE_FIELDS: dict[str, str] = {
+    'value': 'value_score',
     'unified_value': 'unified_value_score',
     'quality': 'quality_score',
     'momentum': 'momentum_percentile',
@@ -244,6 +274,7 @@ FACTOR_ROW_PRIMARY_SCORE_FIELDS: dict[str, str] = {
     'composite': 'composite_score',
 }
 FACTOR_ROW_SUBMETRIC_FIELDS: dict[str, tuple[str, ...]] = {
+    'value': ('per', 'pbr', 'dividend_yield'),
     'unified_value': ('per', 'pbr', 'dividend_yield', 'fcf_yield', 'ev_to_ebitda'),
     'quality': (
         'roe',
@@ -276,6 +307,7 @@ FACTOR_ROW_SUBMETRIC_FIELDS: dict[str, tuple[str, ...]] = {
     ),
 }
 FACTOR_ROW_PRIMARY_TABLES: dict[str, str] = {
+    'value': 'daily_value_factor_results',
     'unified_value': 'daily_unified_value_factor_results',
     'quality': 'daily_quality_factor_results',
     'momentum': 'daily_momentum_factor_results',
@@ -285,6 +317,7 @@ FACTOR_ROW_PRIMARY_TABLES: dict[str, str] = {
     'composite': 'daily_composite_factor_results',
 }
 FACTOR_ROW_MODELS: dict[str, type[Any]] = {
+    'value': DailyValueFactorResult,
     'unified_value': DailyUnifiedValueFactorResult,
     'quality': DailyQualityFactorResult,
     'momentum': DailyMomentumFactorResult,
@@ -294,6 +327,7 @@ FACTOR_ROW_MODELS: dict[str, type[Any]] = {
     'composite': DailyCompositeFactorResult,
 }
 FACTOR_ROW_SOURCE_PROVIDERS: dict[str, str] = {
+    'value': 'internal_factor_pipeline',
     'unified_value': 'internal_factor_pipeline',
     'quality': 'internal_factor_pipeline',
     'momentum': 'internal_factor_pipeline',
@@ -302,6 +336,94 @@ FACTOR_ROW_SOURCE_PROVIDERS: dict[str, str] = {
     'beta': 'internal_factor_pipeline',
     'composite': 'internal_factor_pipeline',
 }
+FACTOR_SUMMARY_SCORE_FIELDS: dict[str, str] = {
+    'value': 'value_score',
+    'unified_value': 'unified_value_score',
+    'quality': 'quality_score',
+    'momentum': 'momentum_percentile',
+    'advanced_value': 'advanced_value_score',
+    'low_risk': 'low_risk_score',
+    'beta': 'low_beta_score',
+    'composite': 'composite_score',
+}
+FACTOR_SUMMARY_RANK_FIELDS: dict[str, str | None] = {
+    'value': 'value_rank',
+    'unified_value': 'unified_value_rank',
+    'quality': 'quality_rank',
+    'momentum': 'momentum_rank',
+    'advanced_value': 'advanced_value_rank',
+    'low_risk': None,
+    'beta': None,
+    'composite': 'composite_rank',
+}
+FACTOR_SUMMARY_PERCENTILE_FIELDS: dict[str, str | None] = {
+    'value': 'value_percentile',
+    'unified_value': 'unified_value_percentile',
+    'quality': 'quality_percentile',
+    'momentum': 'momentum_percentile',
+    'advanced_value': 'advanced_value_percentile',
+    'low_risk': None,
+    'beta': None,
+    'composite': 'composite_percentile',
+}
+FACTOR_SUMMARY_RAW_STATUS_FIELDS: dict[str, str] = {
+    'value': 'value_status',
+    'unified_value': 'unified_value_status',
+    'quality': 'quality_status',
+    'momentum': 'momentum_eligibility_status',
+    'advanced_value': 'advanced_value_classification',
+    'low_risk': 'low_risk_classification',
+    'beta': 'low_beta_classification',
+    'composite': 'composite_classification',
+}
+FACTOR_SUMMARY_ELIGIBILITY_FIELDS: dict[str, str | None] = {
+    'value': None,
+    'unified_value': None,
+    'quality': None,
+    'momentum': 'is_momentum_eligible',
+    'advanced_value': 'is_advanced_value_eligible',
+    'low_risk': 'is_low_risk_eligible',
+    'beta': 'is_low_beta_eligible',
+    'composite': 'is_composite_eligible',
+}
+FACTOR_SUMMARY_STATUS_AVAILABLE = 'available'
+FACTOR_SUMMARY_STATUS_NOT_ELIGIBLE = 'not_eligible'
+FACTOR_SUMMARY_STATUS_INSUFFICIENT_HISTORY = 'insufficient_history'
+FACTOR_SUMMARY_STATUS_MISSING_SOURCE_ROW = 'missing_source_row'
+FACTOR_SUMMARY_STATUS_STORAGE_UNAVAILABLE = 'storage_unavailable'
+FACTOR_SUMMARY_STATUS_NOT_COMPUTED_FOR_MARKET_DATE = 'not_computed_for_market_date'
+FACTOR_SUMMARY_NOT_COMPUTED_RAW_STATUSES = frozenset({'missing_market_date_bar'})
+FACTOR_SUMMARY_INSUFFICIENT_HISTORY_RAW_STATUSES = frozenset({'insufficient_history'})
+FACTOR_SUMMARY_NOT_ELIGIBLE_RAW_STATUSES = frozenset(
+    {
+        'trend_not_confirmed',
+        'below_top_percentile_cutoff',
+        'recently_overheated',
+        'watchlist',
+        'ineligible',
+        'liquidity_excluded',
+        'hard_excluded',
+        'insufficient_inputs',
+        'insufficient_components',
+        'insufficient_fundamentals',
+    }
+)
+FACTOR_SUMMARY_EXPLICIT_STATUS_FAMILIES = frozenset({'momentum', 'advanced_value', 'low_risk', 'beta', 'composite'})
+
+
+def _compact_provenance_summary(metadata: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(metadata, dict):
+        return {}
+    compact = {
+        'freshness_status': metadata.get('freshness_status'),
+        'provenance_status': metadata.get('provenance_status'),
+        'issue_types': list(metadata.get('issue_types') or []),
+        'as_of_market_date': metadata.get('as_of_market_date'),
+        'latest_available_market_date': metadata.get('latest_available_market_date'),
+        'source_tables': list(metadata.get('source_tables') or []),
+        'reason': metadata.get('reason'),
+    }
+    return {key: value for key, value in compact.items() if value not in (None, [], {})}
 
 
 def _normalize_symbols(symbols: Sequence[str]) -> list[str]:
@@ -790,22 +912,34 @@ def _load_latest_symbol_day_block_history(
     market_date: date,
     symbols: Sequence[str],
 ) -> dict[str, Any]:
-    factor_rows = {
-        family: _load_latest_prior_rows_for_model(
-            model=model,
+    factor_rows: dict[str, dict[str, dict[str, Any]]] = {}
+    factor_storage_unavailable: dict[str, bool] = {}
+    for family, model in FACTOR_ROW_MODELS.items():
+        try:
+            factor_rows[family] = _load_latest_prior_rows_for_model(
+                model=model,
+                market_date=market_date,
+                symbols=symbols,
+            )
+            factor_storage_unavailable[family] = False
+        except SQLAlchemyError:
+            factor_rows[family] = {}
+            factor_storage_unavailable[family] = True
+    try:
+        signal_features = _load_latest_prior_rows_for_model(
+            model=DailySignalFeature,
             market_date=market_date,
             symbols=symbols,
         )
-        for family, model in FACTOR_ROW_MODELS.items()
-    }
-    signal_features = _load_latest_prior_rows_for_model(
-        model=DailySignalFeature,
-        market_date=market_date,
-        symbols=symbols,
-    )
+        signal_features_storage_unavailable = False
+    except SQLAlchemyError:
+        signal_features = {}
+        signal_features_storage_unavailable = True
     return {
         'factor_rows': factor_rows,
+        'factor_storage_unavailable': factor_storage_unavailable,
         'signal_features': signal_features,
+        'signal_features_storage_unavailable': signal_features_storage_unavailable,
     }
 
 
@@ -815,7 +949,20 @@ def _build_factor_row_freshness_provenance(
     row: dict[str, Any] | None,
     latest_prior_row: dict[str, Any] | None,
     requested_market_date: date,
+    current_storage_unavailable: bool = False,
+    prior_storage_unavailable: bool = False,
 ) -> dict[str, Any]:
+    if current_storage_unavailable or (row is None and prior_storage_unavailable):
+        return _build_freshness_provenance(
+            requested_market_date=requested_market_date,
+            freshness_status=FRESHNESS_STATUS_MISSING,
+            provenance_status=FACTOR_SUMMARY_STATUS_STORAGE_UNAVAILABLE,
+            source_tables=(FACTOR_ROW_PRIMARY_TABLES[family],),
+            source_provider=FACTOR_ROW_SOURCE_PROVIDERS[family],
+            row_count=0,
+            reason=f'{family}_factor_storage_unavailable',
+        )
+
     requested_market_date_iso = requested_market_date.isoformat()
     current_market_date = row.get('market_date') if row is not None else None
     current_captured_at = row.get('captured_at') if row is not None else None
@@ -987,7 +1134,20 @@ def _build_signal_features_freshness_provenance(
     signal_features: dict[str, Any] | None,
     latest_prior_row: dict[str, Any] | None,
     requested_market_date: date,
+    current_storage_unavailable: bool = False,
+    prior_storage_unavailable: bool = False,
 ) -> dict[str, Any]:
+    if current_storage_unavailable or (signal_features is None and prior_storage_unavailable):
+        return _build_freshness_provenance(
+            requested_market_date=requested_market_date,
+            freshness_status=FRESHNESS_STATUS_MISSING,
+            provenance_status=FACTOR_SUMMARY_STATUS_STORAGE_UNAVAILABLE,
+            source_tables=('daily_signal_features',),
+            source_provider='kis_ranking',
+            row_count=0,
+            reason='signal_features_storage_unavailable',
+        )
+
     if signal_features is not None:
         row_freshness = signal_features.get('freshness') if isinstance(signal_features.get('freshness'), dict) else {}
         as_of_market_date = str(row_freshness.get('market_date') or signal_features.get('market_date') or '')
@@ -1366,7 +1526,194 @@ def _copy_selected_fields(row: dict[str, Any] | None, *, fields: tuple[str, ...]
     return {field: row.get(field) for field in fields}
 
 
-def _build_factor_row_completeness(*, family: str, row: dict[str, Any] | None) -> dict[str, Any]:
+def _factor_summary_view_row(*, family: str, row: dict[str, Any] | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    if family == 'momentum':
+        return enrich_momentum_audit_fields(dict(row))
+    return row
+
+
+def _factor_summary_source_status(*, family: str, row: dict[str, Any] | None) -> str | None:
+    view_row = _factor_summary_view_row(family=family, row=row)
+    if view_row is None:
+        return None
+    raw_value = view_row.get(FACTOR_SUMMARY_RAW_STATUS_FIELDS[family])
+    text = str(raw_value or '').strip()
+    return text or None
+
+
+def _resolve_factor_summary_status(
+    *,
+    family: str,
+    row: dict[str, Any] | None,
+    freshness_provenance: dict[str, Any],
+    current_storage_unavailable: bool,
+    prior_storage_unavailable: bool,
+) -> str:
+    if current_storage_unavailable or (row is None and prior_storage_unavailable):
+        return FACTOR_SUMMARY_STATUS_STORAGE_UNAVAILABLE
+
+    freshness_status = str(freshness_provenance.get('freshness_status') or '').strip()
+    if row is None:
+        if freshness_status in {FRESHNESS_STATUS_STALE, FRESHNESS_STATUS_AVAILABLE_BUT_OLD}:
+            return FACTOR_SUMMARY_STATUS_NOT_COMPUTED_FOR_MARKET_DATE
+        return FACTOR_SUMMARY_STATUS_MISSING_SOURCE_ROW
+
+    source_status = _factor_summary_source_status(family=family, row=row)
+    if source_status in FACTOR_SUMMARY_NOT_COMPUTED_RAW_STATUSES:
+        return FACTOR_SUMMARY_STATUS_NOT_COMPUTED_FOR_MARKET_DATE
+    if source_status in FACTOR_SUMMARY_INSUFFICIENT_HISTORY_RAW_STATUSES:
+        return FACTOR_SUMMARY_STATUS_INSUFFICIENT_HISTORY
+    if family in FACTOR_SUMMARY_EXPLICIT_STATUS_FAMILIES and source_status in FACTOR_SUMMARY_NOT_ELIGIBLE_RAW_STATUSES:
+        return FACTOR_SUMMARY_STATUS_NOT_ELIGIBLE
+    return FACTOR_SUMMARY_STATUS_AVAILABLE
+
+
+def _build_factor_summary_entry(
+    *,
+    family: str,
+    row: dict[str, Any] | None,
+    score_context: dict[str, Any] | None,
+    freshness_provenance: dict[str, Any],
+    current_storage_unavailable: bool,
+    prior_storage_unavailable: bool,
+) -> dict[str, Any]:
+    view_row = _factor_summary_view_row(family=family, row=row)
+    score_field = FACTOR_SUMMARY_SCORE_FIELDS[family]
+    rank_field = FACTOR_SUMMARY_RANK_FIELDS[family]
+    percentile_field = FACTOR_SUMMARY_PERCENTILE_FIELDS[family]
+    eligibility_field = FACTOR_SUMMARY_ELIGIBILITY_FIELDS[family]
+    score = _to_float(view_row.get(score_field)) if view_row is not None else None
+    rank = _to_int(view_row.get(rank_field)) if view_row is not None and rank_field else None
+    percentile = _to_float(view_row.get(percentile_field)) if view_row is not None and percentile_field else None
+    source_status = _factor_summary_source_status(family=family, row=view_row)
+    entry = {
+        'status': _resolve_factor_summary_status(
+            family=family,
+            row=view_row,
+            freshness_provenance=freshness_provenance,
+            current_storage_unavailable=current_storage_unavailable,
+            prior_storage_unavailable=prior_storage_unavailable,
+        ),
+        'source_status': source_status,
+        'score': score,
+        'score_available': score is not None,
+        'rank': rank,
+        'percentile': percentile,
+        'eligible': (
+            bool(view_row.get(eligibility_field))
+            if view_row is not None and eligibility_field and view_row.get(eligibility_field) is not None
+            else None
+        ),
+        'source': (view_row or {}).get('source'),
+        'feature_version': (view_row or {}).get('feature_version') or (view_row or {}).get('source'),
+        'as_of_market_date': (view_row or {}).get('market_date'),
+        'captured_at': (view_row or {}).get('captured_at'),
+        'coverage_notes': list((score_context or {}).get('coverage_notes') or []),
+        'components_used': _to_int((score_context or {}).get('components_used')),
+        'components_possible': _to_int((score_context or {}).get('components_possible')),
+        'provenance': _compact_provenance_summary(freshness_provenance),
+    }
+    return {
+        key: value
+        for key, value in entry.items()
+        if value not in (None, [], {})
+    }
+
+
+def _build_signal_features_summary_entry(
+    *,
+    row: dict[str, Any] | None,
+    freshness_provenance: dict[str, Any],
+    current_storage_unavailable: bool,
+    prior_storage_unavailable: bool,
+) -> dict[str, Any]:
+    if current_storage_unavailable or (row is None and prior_storage_unavailable):
+        status = FACTOR_SUMMARY_STATUS_STORAGE_UNAVAILABLE
+    elif row is None:
+        freshness_status = str(freshness_provenance.get('freshness_status') or '').strip()
+        status = (
+            FACTOR_SUMMARY_STATUS_NOT_COMPUTED_FOR_MARKET_DATE
+            if freshness_status == FRESHNESS_STATUS_STALE
+            else FACTOR_SUMMARY_STATUS_MISSING_SOURCE_ROW
+        )
+    else:
+        status = FACTOR_SUMMARY_STATUS_AVAILABLE
+    provenance = row.get('provenance') if isinstance((row or {}).get('provenance'), dict) else {}
+    entry = {
+        'status': status,
+        'signal_count': _to_int((row or {}).get('signal_count')),
+        'row_kind': (row or {}).get('row_kind') or provenance.get('row_kind'),
+        'direct_signal_source_count': _to_int(provenance.get('direct_signal_source_count')),
+        'fallback_groups_present': list(provenance.get('fallback_groups_present') or []),
+        'source': (row or {}).get('source'),
+        'feature_version': (row or {}).get('source'),
+        'as_of_market_date': ((row or {}).get('freshness') or {}).get('market_date') if isinstance((row or {}).get('freshness'), dict) else (row or {}).get('market_date'),
+        'captured_at': (row or {}).get('captured_at'),
+        'provenance': _compact_provenance_summary(freshness_provenance),
+    }
+    return {
+        key: value
+        for key, value in entry.items()
+        if value not in (None, [], {})
+    }
+
+
+def _build_factor_summary(
+    *,
+    requested_market_date: date,
+    factor_rows: dict[str, dict[str, Any] | None],
+    factor_provenance: dict[str, dict[str, Any]],
+    factor_storage_unavailable: dict[str, bool] | None,
+    factor_prior_storage_unavailable: dict[str, bool] | None,
+    scores: dict[str, dict[str, Any]],
+    signal_features: dict[str, Any] | None,
+    signal_features_provenance: dict[str, Any],
+    signal_features_storage_unavailable: bool = False,
+    signal_features_prior_storage_unavailable: bool = False,
+) -> dict[str, Any]:
+    factor_scores = {
+        family: _build_factor_summary_entry(
+            family=family,
+            row=factor_rows.get(family),
+            score_context=scores.get(family),
+            freshness_provenance=factor_provenance.get(family, {}),
+            current_storage_unavailable=bool((factor_storage_unavailable or {}).get(family)),
+            prior_storage_unavailable=bool((factor_prior_storage_unavailable or {}).get(family)),
+        )
+        for family in PERSISTED_FACTOR_FAMILIES
+    }
+    return {
+        'requested_market_date': requested_market_date.isoformat(),
+        'factor_scores': factor_scores,
+        'signal_features': _build_signal_features_summary_entry(
+            row=signal_features,
+            freshness_provenance=signal_features_provenance,
+            current_storage_unavailable=signal_features_storage_unavailable,
+            prior_storage_unavailable=signal_features_prior_storage_unavailable,
+        ),
+    }
+
+
+def _build_factor_row_completeness(
+    *,
+    family: str,
+    row: dict[str, Any] | None,
+    storage_unavailable: bool = False,
+) -> dict[str, Any]:
+    if storage_unavailable:
+        return {
+            'row_status': FACTOR_SUMMARY_STATUS_STORAGE_UNAVAILABLE,
+            'score_status': None,
+            'score_field': FACTOR_ROW_PRIMARY_SCORE_FIELDS[family],
+            'score_value_present': False,
+            'null_submetric_fields': [],
+            'null_submetric_count': 0,
+            'present_submetric_fields': [],
+            'present_submetric_count': 0,
+            'status_fields': {},
+        }
     if row is None:
         return {
             'row_status': 'missing',
@@ -1403,7 +1750,22 @@ def _build_factor_row_completeness(*, family: str, row: dict[str, Any] | None) -
     }
 
 
-def _build_signal_feature_completeness(row: dict[str, Any] | None) -> dict[str, Any]:
+def _build_signal_feature_completeness(
+    row: dict[str, Any] | None,
+    *,
+    storage_unavailable: bool = False,
+) -> dict[str, Any]:
+    if storage_unavailable:
+        return {
+            'row_status': FACTOR_SUMMARY_STATUS_STORAGE_UNAVAILABLE,
+            'row_kind': FACTOR_SUMMARY_STATUS_STORAGE_UNAVAILABLE,
+            'direct_signal_source_count': 0,
+            'fallback_groups_present': [],
+            'null_submetric_fields': [],
+            'null_submetric_count': 0,
+            'present_submetric_fields': [],
+            'present_submetric_count': 0,
+        }
     if row is None:
         return {
             'row_status': 'missing',
@@ -1851,45 +2213,88 @@ class AgentContextReadService:
             symbols=normalized_symbols,
             limit=max(len(normalized_symbols), 1000),
         )
-        signal_feature_rows = load_daily_signal_features(
-            market_date=normalized_market_date,
-            symbols=normalized_symbols,
-            limit=max(len(normalized_symbols), 1000),
+        factor_storage_unavailable = {family: False for family in PERSISTED_FACTOR_FAMILIES}
+
+        def _load_factor_rows(family: str, loader) -> list[dict[str, Any]]:
+            try:
+                return loader()
+            except SQLAlchemyError:
+                factor_storage_unavailable[family] = True
+                return []
+
+        signal_features_storage_unavailable = False
+        try:
+            signal_feature_rows = load_daily_signal_features(
+                market_date=normalized_market_date,
+                symbols=normalized_symbols,
+                limit=max(len(normalized_symbols), 1000),
+            )
+        except SQLAlchemyError:
+            signal_features_storage_unavailable = True
+            signal_feature_rows = []
+        value_rows = _load_factor_rows(
+            'value',
+            lambda: load_daily_value_factor_results(
+                market_date=normalized_market_date,
+                symbols=normalized_symbols,
+                limit=max(len(normalized_symbols), 1000),
+            ),
         )
-        unified_value_rows = load_daily_unified_value_factor_results(
-            market_date=normalized_market_date,
-            symbols=normalized_symbols,
-            limit=max(len(normalized_symbols), 1000),
+        unified_value_rows = _load_factor_rows(
+            'unified_value',
+            lambda: load_daily_unified_value_factor_results(
+                market_date=normalized_market_date,
+                symbols=normalized_symbols,
+                limit=max(len(normalized_symbols), 1000),
+            ),
         )
-        quality_rows = load_daily_quality_factor_results(
-            market_date=normalized_market_date,
-            symbols=normalized_symbols,
-            limit=max(len(normalized_symbols), 1000),
+        quality_rows = _load_factor_rows(
+            'quality',
+            lambda: load_daily_quality_factor_results(
+                market_date=normalized_market_date,
+                symbols=normalized_symbols,
+                limit=max(len(normalized_symbols), 1000),
+            ),
         )
-        momentum_rows = load_daily_momentum_factor_results(
-            market_date=normalized_market_date,
-            symbols=normalized_symbols,
-            limit=max(len(normalized_symbols), 1000),
+        momentum_rows = _load_factor_rows(
+            'momentum',
+            lambda: load_daily_momentum_factor_results(
+                market_date=normalized_market_date,
+                symbols=normalized_symbols,
+                limit=max(len(normalized_symbols), 1000),
+            ),
         )
-        advanced_value_rows = load_daily_advanced_value_factor_results(
-            market_date=normalized_market_date,
-            symbols=normalized_symbols,
-            limit=max(len(normalized_symbols), 1000),
+        advanced_value_rows = _load_factor_rows(
+            'advanced_value',
+            lambda: load_daily_advanced_value_factor_results(
+                market_date=normalized_market_date,
+                symbols=normalized_symbols,
+                limit=max(len(normalized_symbols), 1000),
+            ),
         )
-        low_risk_rows = load_daily_low_risk_factor_results(
-            market_date=normalized_market_date,
-            symbols=normalized_symbols,
-            limit=max(len(normalized_symbols), 1000),
+        low_risk_rows = _load_factor_rows(
+            'low_risk',
+            lambda: load_daily_low_risk_factor_results(
+                market_date=normalized_market_date,
+                symbols=normalized_symbols,
+                limit=max(len(normalized_symbols), 1000),
+            ),
         )
-        beta_rows = load_daily_beta_factor_results(
-            market_date=normalized_market_date,
-            symbols=normalized_symbols,
-            limit=max(len(normalized_symbols), 1000),
+        beta_rows = _load_factor_rows(
+            'beta',
+            lambda: load_daily_beta_factor_results(
+                market_date=normalized_market_date,
+                symbols=normalized_symbols,
+                limit=max(len(normalized_symbols), 1000),
+            ),
         )
-        composite_rows = load_daily_composite_factor_results(
-            market_date=normalized_market_date,
-            symbols=normalized_symbols,
-            limit=max(len(normalized_symbols), 1000),
+        composite_rows = _load_factor_rows(
+            'composite',
+            lambda: load_daily_composite_factor_results(
+                market_date=normalized_market_date,
+                symbols=normalized_symbols,
+                limit=max(len(normalized_symbols), 1000),
+            ),
         )
         quote_rows = load_current_quotes(
             symbols=normalized_symbols,
@@ -1960,6 +2365,7 @@ class AgentContextReadService:
         technical_map = {item['symbol']: item for item in technical_rows}
         action_map = {item['symbol']: item for item in action_rows}
         signal_feature_map = {item['symbol']: item for item in signal_feature_rows}
+        value_map = {item['symbol']: item for item in value_rows}
         unified_value_map = {item['symbol']: item for item in unified_value_rows}
         quality_map = {item['symbol']: item for item in quality_rows}
         momentum_map = {item['symbol']: item for item in momentum_rows}
@@ -1967,6 +2373,10 @@ class AgentContextReadService:
         low_risk_map = {item['symbol']: item for item in low_risk_rows}
         beta_map = {item['symbol']: item for item in beta_rows}
         composite_map = {item['symbol']: item for item in composite_rows}
+        factor_prior_storage_unavailable = dict(latest_prior_rows.get('factor_storage_unavailable') or {})
+        signal_features_prior_storage_unavailable = bool(
+            latest_prior_rows.get('signal_features_storage_unavailable') or False
+        )
         quote_map = {item['symbol']: item for item in quote_rows}
         intraday_execution_map = {item['symbol']: item for item in intraday_execution_rows}
         price_context_map = {item['symbol']: item['context_payload'] for item in price_context_rows}
@@ -2026,48 +2436,64 @@ class AgentContextReadService:
                 valuation_row=symbol_enrichment_rows.get('valuation_snapshot'),
                 foreign_ownership_row=symbol_enrichment_rows.get('foreign_ownership'),
             )
+            current_factor_rows = {
+                'value': value_map.get(symbol),
+                'unified_value': unified_value_map.get(symbol),
+                'quality': quality_map.get(symbol),
+                'momentum': momentum_map.get(symbol),
+                'advanced_value': advanced_value_map.get(symbol),
+                'low_risk': low_risk_map.get(symbol),
+                'beta': beta_map.get(symbol),
+                'composite': composite_map.get(symbol),
+            }
             scores = build_signal_decider_scores(
                 market_date=normalized_market_date,
-                unified_value_row=unified_value_map.get(symbol),
-                quality_row=quality_map.get(symbol),
-                momentum_row=momentum_map.get(symbol),
+                unified_value_row=current_factor_rows['unified_value'],
+                quality_row=current_factor_rows['quality'],
+                momentum_row=current_factor_rows['momentum'],
             )
             persisted_factor_rows = {
+                'value': _copy_selected_fields(
+                    current_factor_rows['value'],
+                    fields=FACTOR_ROW_FIELDS['value'],
+                ),
                 'unified_value': _copy_selected_fields(
-                    unified_value_map.get(symbol),
+                    current_factor_rows['unified_value'],
                     fields=FACTOR_ROW_FIELDS['unified_value'],
                 ),
                 'quality': _copy_selected_fields(
-                    quality_map.get(symbol),
+                    current_factor_rows['quality'],
                     fields=FACTOR_ROW_FIELDS['quality'],
                 ),
                 'momentum': _copy_selected_fields(
-                    momentum_map.get(symbol),
+                    _factor_summary_view_row(family='momentum', row=current_factor_rows['momentum']),
                     fields=FACTOR_ROW_FIELDS['momentum'],
                 ),
                 'advanced_value': _copy_selected_fields(
-                    advanced_value_map.get(symbol),
+                    current_factor_rows['advanced_value'],
                     fields=FACTOR_ROW_FIELDS['advanced_value'],
                 ),
                 'low_risk': _copy_selected_fields(
-                    low_risk_map.get(symbol),
+                    current_factor_rows['low_risk'],
                     fields=FACTOR_ROW_FIELDS['low_risk'],
                 ),
                 'beta': _copy_selected_fields(
-                    beta_map.get(symbol),
+                    current_factor_rows['beta'],
                     fields=FACTOR_ROW_FIELDS['beta'],
                 ),
                 'composite': _copy_selected_fields(
-                    composite_map.get(symbol),
+                    current_factor_rows['composite'],
                     fields=FACTOR_ROW_FIELDS['composite'],
                 ),
             }
             factor_row_provenance = {
                 family: _build_factor_row_freshness_provenance(
                     family=family,
-                    row=row,
+                    row=current_factor_rows.get(family),
                     latest_prior_row=((latest_prior_rows.get('factor_rows') or {}).get(family) or {}).get(symbol),
                     requested_market_date=normalized_market_date,
+                    current_storage_unavailable=bool(factor_storage_unavailable.get(family)),
+                    prior_storage_unavailable=bool(factor_prior_storage_unavailable.get(family)),
                 )
                 for family, row in persisted_factor_rows.items()
             }
@@ -2098,10 +2524,17 @@ class AgentContextReadService:
             )
             context_completeness = {
                 'factor_rows': {
-                    family: _build_factor_row_completeness(family=family, row=row)
+                    family: _build_factor_row_completeness(
+                        family=family,
+                        row=row,
+                        storage_unavailable=bool(factor_storage_unavailable.get(family)),
+                    )
                     for family, row in persisted_factor_rows.items()
                 },
-                'signal_features': _build_signal_feature_completeness(signal_features),
+                'signal_features': _build_signal_feature_completeness(
+                    signal_features,
+                    storage_unavailable=signal_features_storage_unavailable,
+                ),
                 'intraday_execution_context': _build_intraday_execution_completeness(intraday_execution_row),
                 'market_relative_context': _build_market_relative_completeness(market_relative_context),
                 'sector_peer_mapping': _build_context_block_completeness(
@@ -2152,6 +2585,8 @@ class AgentContextReadService:
                 signal_features=signal_features,
                 latest_prior_row=(latest_prior_rows.get('signal_features') or {}).get(symbol),
                 requested_market_date=normalized_market_date,
+                current_storage_unavailable=signal_features_storage_unavailable,
+                prior_storage_unavailable=signal_features_prior_storage_unavailable,
             )
             intraday_execution_provenance = _build_intraday_execution_freshness_provenance(
                 row=intraday_execution_row,
@@ -2286,6 +2721,18 @@ class AgentContextReadService:
                 )
                 for family, score_payload in scores.items()
             }
+            factor_summary = _build_factor_summary(
+                requested_market_date=normalized_market_date,
+                factor_rows=current_factor_rows,
+                factor_provenance=factor_row_provenance,
+                factor_storage_unavailable=factor_storage_unavailable,
+                factor_prior_storage_unavailable=factor_prior_storage_unavailable,
+                scores=scores,
+                signal_features=signal_features,
+                signal_features_provenance=signal_features_provenance,
+                signal_features_storage_unavailable=signal_features_storage_unavailable,
+                signal_features_prior_storage_unavailable=signal_features_prior_storage_unavailable,
+            )
 
             fundamentals_entries = fundamentals_map.get(symbol) or []
             latest_disclosure = recent_disclosures[0] if recent_disclosures else None
@@ -2363,6 +2810,7 @@ class AgentContextReadService:
                     'short_selling_context': short_selling_context,
                     'valuation_context': valuation_context,
                     'scores': scores,
+                    'factor_summary': factor_summary,
                     'persisted_factor_rows': persisted_factor_rows,
                     'fundamentals': fundamentals,
                     'recent_disclosures': {
