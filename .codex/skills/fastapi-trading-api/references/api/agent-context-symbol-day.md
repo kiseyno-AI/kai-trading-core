@@ -7,6 +7,8 @@ The response also includes a compact `factor_summary` block per symbol/day. This
 
 The response now also includes a compact `liquidity_context` block per symbol/day. It keeps the daily turnover state explicit with `available`, `derived`, `stale`, `missing_price_or_volume`, and `storage_unavailable` statuses, plus low-risk liquidity ranking fields and intraday quote/orderbook freshness where those rows exist.
 
+The response also includes a compact `decider_data_quality_context` block per symbol/day. This is the decider-facing availability and provenance summary over factor-score coverage, liquidity/turnover, intraday freshness, financial/cash-flow detail, disclosures/news, investor flow and short-selling, sector/relative-strength context, and technical evidence. It keeps `available`, `partial`, `stale`, `empty`, `unavailable`, and `provider_error` semantics explicit so downstream deciders can distinguish no recent items from provider/storage failures.
+
 ## Example request
 ```http
 GET /agent-context/symbol-day?market_date=2026-04-15&symbols=005930&fs_div=CFS&disclosures_limit=5
@@ -241,6 +243,56 @@ GET /agent-context/symbol-day?market_date=2026-04-15&symbols=005930&fs_div=CFS&d
           "volume_power_rank": 3,
           "quote_balance_rank": 5
         }
+      },
+      "decider_data_quality_context": {
+        "status": "partial",
+        "block_status_counts": {
+          "available": 2,
+          "partial": 3,
+          "stale": 1,
+          "empty": 0,
+          "unavailable": 0,
+          "provider_error": 1
+        },
+        "blocks": {
+          "liquidity_turnover": {
+            "status": "available",
+            "turnover": {
+              "status": "partial",
+              "source_status": "derived",
+              "turnover_source": "derived",
+              "turnover_krw": 8520000000
+            },
+            "liquidity_ranking": {
+              "status": "available",
+              "avg_trading_value_20d": 1200000000
+            },
+            "intraday_liquidity": {
+              "status": "partial",
+              "quote_spread_points": 100,
+              "quote_balance_rank": 5
+            }
+          },
+          "disclosures_news": {
+            "status": "provider_error",
+            "providers": {
+              "dart_recent_events": {
+                "status": "empty",
+                "item_count": 0
+              },
+              "external_news": {
+                "status": "provider_error",
+                "provider_reason": "naver_search_credentials_missing"
+              }
+            }
+          },
+          "technical_evidence": {
+            "status": "available",
+            "support_price": 68000,
+            "resistance_price": 70800,
+            "breakout_20d": true
+          }
+        }
       }
     }
   ]
@@ -253,5 +305,6 @@ GET /agent-context/symbol-day?market_date=2026-04-15&symbols=005930&fs_div=CFS&d
 - `fundamentals.disclosure_context` summarizes recent corrections and ownership or large-holder changes from the existing DART disclosure event stream; it does not require a separate ownership-only endpoint.
 - `factor_summary.factor_scores` covers the persisted factor families `value`, `unified_value`, `quality`, `momentum`, `advanced_value`, `low_risk`, `beta`, and `composite`.
 - `liquidity_context.turnover` is the prompt-trim-safe turnover summary. `status="derived"` means provider turnover was missing or zero but `close_price * volume` was safely derivable from the stored daily bar. `status="stale"` means Core only had a prior stored price-context row for that symbol.
+- `decider_data_quality_context` is the compact prompt-safe quality overlay that both deciders can read without re-parsing the heavier raw context blocks. It surfaces source-specific `empty` vs `provider_error` semantics for DART and external news, and it keeps stale or derived liquidity/intraday inputs explicit.
 - `factor_summary` status values are canonical and machine-readable: `available`, `not_eligible`, `insufficient_history`, `missing_source_row`, `storage_unavailable`, and `not_computed_for_market_date`.
 - `factor_summary.signal_features` gives the same compact status/provenance treatment to the persisted `daily_signal_features` row.

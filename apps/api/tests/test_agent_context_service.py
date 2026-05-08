@@ -9,11 +9,12 @@ from app.agent_context.read_service import (
     AgentContextReadService,
     PERSISTED_FACTOR_FAMILIES,
     _build_compact_liquidity_context,
+    _build_decider_data_quality_context,
     _build_factor_summary_entry,
     _build_price_context,
-    _load_latest_symbol_day_block_history,
     _build_recent_dart_events_context,
     _build_recent_disclosures_freshness_provenance,
+    _load_latest_symbol_day_block_history,
 )
 
 EMPTY_LATEST_PRIOR_ROWS = {
@@ -984,6 +985,19 @@ class AgentContextReadServiceTests(unittest.TestCase):
         self.assertEqual(first_item['liquidity_context']['intraday']['status'], 'partial')
         self.assertEqual(first_item['liquidity_context']['intraday']['quote_spread_points'], 100)
         self.assertEqual(first_item['liquidity_context']['intraday']['quote_balance_rank'], 5)
+        self.assertEqual(first_item['decider_data_quality_context']['status'], 'partial')
+        self.assertEqual(
+            first_item['decider_data_quality_context']['blocks']['liquidity_turnover']['status'],
+            'available',
+        )
+        self.assertEqual(
+            first_item['decider_data_quality_context']['blocks']['liquidity_turnover']['turnover']['status'],
+            'available',
+        )
+        self.assertEqual(
+            first_item['decider_data_quality_context']['blocks']['intraday_realtime']['status'],
+            'partial',
+        )
         self.assertEqual(first_item['intraday_execution_context']['status'], 'partial')
         self.assertEqual(first_item['intraday_execution_context']['quote']['spread_points'], 100)
         self.assertAlmostEqual(first_item['intraday_execution_context']['orderbook']['imbalance'], 0.076923, places=6)
@@ -1076,6 +1090,10 @@ class AgentContextReadServiceTests(unittest.TestCase):
             'dart',
         )
         self.assertEqual(first_item['fundamentals']['freshness_provenance']['freshness_status'], 'available_but_old')
+        self.assertIn(
+            'operating_cash_flow',
+            first_item['decider_data_quality_context']['blocks']['financials_cashflow']['available_core_fields'],
+        )
         self.assertEqual(first_item['recent_disclosures']['count'], 2)
         self.assertEqual(first_item['recent_disclosures']['freshness_provenance']['freshness_status'], 'available_but_old')
         self.assertEqual(first_item['recent_disclosures']['items'][0]['is_correction'], True)
@@ -1100,6 +1118,18 @@ class AgentContextReadServiceTests(unittest.TestCase):
         self.assertEqual(
             first_item['context_provenance']['intraday_execution_context']['requested_symbol_coverage']['partial_rows'],
             1,
+        )
+        self.assertEqual(
+            first_item['decider_data_quality_context']['blocks']['technical_evidence']['support_price'],
+            68000.0,
+        )
+        self.assertEqual(
+            first_item['decider_data_quality_context']['blocks']['technical_evidence']['resistance_price'],
+            70800.0,
+        )
+        self.assertEqual(
+            first_item['decider_data_quality_context']['blocks']['factor_score_coverage']['required_scores']['quality']['status'],
+            'available',
         )
         self.assertTrue(first_item['availability']['quote_context'])
         self.assertTrue(first_item['availability']['price_context'])
@@ -1130,6 +1160,14 @@ class AgentContextReadServiceTests(unittest.TestCase):
         self.assertEqual(second_item['context_provenance']['signal_features']['freshness_status'], 'missing')
         self.assertEqual(second_item['context_provenance']['intraday_execution_context']['freshness_status'], 'missing')
         self.assertEqual(second_item['recent_disclosures']['count'], 0)
+        self.assertEqual(
+            second_item['decider_data_quality_context']['blocks']['intraday_realtime']['status'],
+            'unavailable',
+        )
+        self.assertEqual(
+            second_item['decider_data_quality_context']['blocks']['factor_score_coverage']['status'],
+            'unavailable',
+        )
         self.assertFalse(second_item['availability']['quote_context'])
         self.assertFalse(second_item['availability']['price_context'])
         self.assertFalse(second_item['availability']['intraday_execution_context'])
@@ -1517,6 +1555,8 @@ class AgentContextReadServiceTests(unittest.TestCase):
         self.assertEqual(item['liquidity_context']['ranking']['liquidity_rank'], 17)
         self.assertEqual(item['liquidity_context']['ranking']['liquidity_percentile'], 0.82)
         self.assertTrue(item['liquidity_context']['ranking']['passes_liquidity_floor'])
+        self.assertEqual(item['decider_data_quality_context']['blocks']['liquidity_turnover']['status'], 'stale')
+        self.assertEqual(item['decider_data_quality_context']['blocks']['intraday_realtime']['status'], 'stale')
         self.assertIsNone(item['signal_features'])
         self.assertEqual(item['context_provenance']['signal_features']['freshness_status'], 'stale')
         self.assertEqual(item['context_provenance']['signal_features']['latest_available_market_date'], '2026-04-07')
@@ -1746,6 +1786,105 @@ class AgentContextReadServiceTests(unittest.TestCase):
         self.assertEqual(item['liquidity_context']['ranking']['reason'], 'low_risk_liquidity_fields_missing')
         self.assertEqual(item['context_completeness']['factor_rows']['value']['row_status'], 'storage_unavailable')
         self.assertEqual(item['factor_summary']['signal_features']['status'], 'missing_source_row')
+
+    def test_build_decider_data_quality_context_marks_factor_score_provider_error_for_factor_storage_failure(self):
+        result = _build_decider_data_quality_context(
+            market_date=date(2026, 4, 8),
+            scores={
+                'unified_value': {
+                    'status': 'unavailable',
+                    'freshness_provenance': {'provenance_status': 'storage_unavailable'},
+                },
+                'quality': {'status': 'unavailable'},
+                'momentum': {'status': 'unavailable'},
+            },
+            factor_summary={
+                'signal_features': {'status': 'missing_source_row'},
+            },
+            liquidity_context={},
+            quote_context=None,
+            quote_context_provenance={},
+            intraday_execution_context=None,
+            intraday_execution_provenance={},
+            intraday_execution_completeness={'status': 'unavailable'},
+            fundamentals={},
+            fundamentals_provenance={},
+            recent_dart_events={},
+            recent_disclosures_provenance={},
+            recent_external_news={},
+            recent_external_news_provenance={},
+            investor_flow_context=None,
+            investor_flow_provenance={},
+            short_selling_context=None,
+            short_selling_provenance={},
+            market_relative_context=None,
+            market_relative_provenance=None,
+            sector_peer_context=None,
+            sector_peer_provenance=None,
+            market_breadth_context=None,
+            market_breadth_provenance=None,
+            technical_snapshot=None,
+            action_summary=None,
+            unified_value_row=None,
+            advanced_value_row=None,
+        )
+
+        factor_score_block = result['blocks']['factor_score_coverage']
+        self.assertEqual(result['status'], 'provider_error')
+        self.assertEqual(factor_score_block['status'], 'provider_error')
+        self.assertEqual(factor_score_block['required_scores']['unified_value']['status'], 'provider_error')
+        self.assertEqual(result['block_status_counts']['provider_error'], 1)
+        self.assertEqual(result['block_status_counts']['unavailable'], 7)
+
+    def test_build_decider_data_quality_context_marks_factor_score_provider_error_for_signal_feature_storage_failure(self):
+        result = _build_decider_data_quality_context(
+            market_date=date(2026, 4, 8),
+            scores={
+                'unified_value': {'status': 'unavailable'},
+                'quality': {'status': 'unavailable'},
+                'momentum': {'status': 'unavailable'},
+            },
+            factor_summary={
+                'signal_features': {
+                    'status': 'storage_unavailable',
+                    'provenance': {'provenance_status': 'storage_unavailable'},
+                }
+            },
+            liquidity_context={},
+            quote_context=None,
+            quote_context_provenance={},
+            intraday_execution_context=None,
+            intraday_execution_provenance={},
+            intraday_execution_completeness={'status': 'unavailable'},
+            fundamentals={},
+            fundamentals_provenance={},
+            recent_dart_events={},
+            recent_disclosures_provenance={},
+            recent_external_news={},
+            recent_external_news_provenance={},
+            investor_flow_context=None,
+            investor_flow_provenance={},
+            short_selling_context=None,
+            short_selling_provenance={},
+            market_relative_context=None,
+            market_relative_provenance=None,
+            sector_peer_context=None,
+            sector_peer_provenance=None,
+            market_breadth_context=None,
+            market_breadth_provenance=None,
+            technical_snapshot=None,
+            action_summary=None,
+            unified_value_row=None,
+            advanced_value_row=None,
+        )
+
+        factor_score_block = result['blocks']['factor_score_coverage']
+        self.assertEqual(result['status'], 'provider_error')
+        self.assertEqual(factor_score_block['status'], 'provider_error')
+        self.assertEqual(factor_score_block['signal_features']['status'], 'provider_error')
+        self.assertEqual(factor_score_block['signal_features']['source_status'], 'storage_unavailable')
+        self.assertEqual(result['block_status_counts']['provider_error'], 1)
+        self.assertEqual(result['block_status_counts']['unavailable'], 7)
 
     def test_load_latest_symbol_day_block_history_only_requests_low_risk_liquidity_fields(self):
         with patch('app.agent_context.read_service._load_latest_prior_rows_for_model', return_value={}) as load_prior_rows_mock:

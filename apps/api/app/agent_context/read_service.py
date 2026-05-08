@@ -422,6 +422,12 @@ FACTOR_SUMMARY_NOT_ELIGIBLE_RAW_STATUSES = frozenset(
     }
 )
 FACTOR_SUMMARY_SCORE_REQUIRED_FAMILIES = frozenset({'value', 'unified_value', 'quality'})
+DECIDER_QUALITY_STATUS_PROVIDER_ERROR = 'provider_error'
+DECIDER_QUALITY_STATUS_UNAVAILABLE = 'unavailable'
+DECIDER_QUALITY_STATUS_EMPTY = 'empty'
+DECIDER_QUALITY_STATUS_STALE = 'stale'
+DECIDER_QUALITY_STATUS_PARTIAL = 'partial'
+DECIDER_QUALITY_STATUS_AVAILABLE = 'available'
 
 
 def _compact_provenance_summary(metadata: dict[str, Any] | None) -> dict[str, Any]:
@@ -437,6 +443,118 @@ def _compact_provenance_summary(metadata: dict[str, Any] | None) -> dict[str, An
         'reason': metadata.get('reason'),
     }
     return {key: value for key, value in compact.items() if value not in (None, [], {})}
+
+
+def _normalize_decider_quality_status(
+    raw_status: Any,
+    *,
+    freshness_provenance: dict[str, Any] | None = None,
+    treat_derived_as_partial: bool = False,
+) -> str:
+    status = str(raw_status or '').strip().lower()
+    provenance = _compact_provenance_summary(freshness_provenance)
+    freshness_status = str(provenance.get('freshness_status') or '').strip().lower()
+    provenance_status = str(provenance.get('provenance_status') or '').strip().lower()
+
+    if status == FACTOR_SUMMARY_STATUS_STORAGE_UNAVAILABLE or provenance_status in {
+        FACTOR_SUMMARY_STATUS_STORAGE_UNAVAILABLE,
+        'external_provider_unavailable',
+    }:
+        return DECIDER_QUALITY_STATUS_PROVIDER_ERROR
+    if status == DECIDER_QUALITY_STATUS_EMPTY:
+        return DECIDER_QUALITY_STATUS_EMPTY
+    if status in {'unavailable', 'missing', FACTOR_SUMMARY_STATUS_MISSING_SOURCE_ROW, LIQUIDITY_TURNOVER_STATUS_MISSING_PRICE_OR_VOLUME}:
+        return DECIDER_QUALITY_STATUS_UNAVAILABLE
+    if status in {LIQUIDITY_TURNOVER_STATUS_STALE} or freshness_status in {
+        FRESHNESS_STATUS_STALE,
+        FRESHNESS_STATUS_AVAILABLE_BUT_OLD,
+    }:
+        return DECIDER_QUALITY_STATUS_STALE
+    if status in {
+        DECIDER_QUALITY_STATUS_PARTIAL,
+        FACTOR_SUMMARY_STATUS_NOT_ELIGIBLE,
+        FACTOR_SUMMARY_STATUS_INSUFFICIENT_HISTORY,
+        FACTOR_SUMMARY_STATUS_NOT_COMPUTED_FOR_MARKET_DATE,
+    }:
+        return DECIDER_QUALITY_STATUS_PARTIAL
+    if treat_derived_as_partial and status == LIQUIDITY_TURNOVER_STATUS_DERIVED:
+        return DECIDER_QUALITY_STATUS_PARTIAL
+    if status:
+        return DECIDER_QUALITY_STATUS_AVAILABLE
+    return DECIDER_QUALITY_STATUS_UNAVAILABLE
+
+
+def _max_iso_timestamp(*values: Any) -> str | None:
+    latest_text = None
+    latest_value = None
+    for value in values:
+        parsed = _parse_iso_datetime(value if isinstance(value, str) else str(value) if value is not None else None)
+        if parsed is None:
+            continue
+        if latest_value is None or parsed > latest_value:
+            latest_value = parsed
+            latest_text = parsed.isoformat()
+    return latest_text
+
+
+def _non_empty_text_list(values: Sequence[Any]) -> list[str]:
+    normalized: list[str] = []
+    for value in values:
+        text = str(value or '').strip()
+        if text and text not in normalized:
+            normalized.append(text)
+    return normalized
+
+
+def _quality_status_counts(blocks: dict[str, dict[str, Any]]) -> dict[str, int]:
+    counts = {
+        DECIDER_QUALITY_STATUS_AVAILABLE: 0,
+        DECIDER_QUALITY_STATUS_PARTIAL: 0,
+        DECIDER_QUALITY_STATUS_STALE: 0,
+        DECIDER_QUALITY_STATUS_EMPTY: 0,
+        DECIDER_QUALITY_STATUS_UNAVAILABLE: 0,
+        DECIDER_QUALITY_STATUS_PROVIDER_ERROR: 0,
+    }
+    for block in blocks.values():
+        status = str((block or {}).get('status') or DECIDER_QUALITY_STATUS_UNAVAILABLE)
+        if status not in counts:
+            counts[DECIDER_QUALITY_STATUS_PARTIAL] += 1
+            continue
+        counts[status] += 1
+    return counts
+
+
+def _summarize_overall_decider_quality_status(statuses: Sequence[str]) -> str:
+    normalized = [status for status in statuses if status]
+    if not normalized:
+        return DECIDER_QUALITY_STATUS_UNAVAILABLE
+    unique = set(normalized)
+    if unique == {DECIDER_QUALITY_STATUS_AVAILABLE}:
+        return DECIDER_QUALITY_STATUS_AVAILABLE
+    if unique == {DECIDER_QUALITY_STATUS_EMPTY}:
+        return DECIDER_QUALITY_STATUS_EMPTY
+    if DECIDER_QUALITY_STATUS_AVAILABLE in unique:
+        return DECIDER_QUALITY_STATUS_PARTIAL
+    if unique == {DECIDER_QUALITY_STATUS_STALE}:
+        return DECIDER_QUALITY_STATUS_STALE
+    if DECIDER_QUALITY_STATUS_STALE in unique and unique <= {
+        DECIDER_QUALITY_STATUS_STALE,
+        DECIDER_QUALITY_STATUS_EMPTY,
+    }:
+        return DECIDER_QUALITY_STATUS_STALE
+    if DECIDER_QUALITY_STATUS_PROVIDER_ERROR in unique and unique <= {
+        DECIDER_QUALITY_STATUS_PROVIDER_ERROR,
+        DECIDER_QUALITY_STATUS_UNAVAILABLE,
+    }:
+        return DECIDER_QUALITY_STATUS_PROVIDER_ERROR
+    if DECIDER_QUALITY_STATUS_PARTIAL in unique:
+        return DECIDER_QUALITY_STATUS_PARTIAL
+    if DECIDER_QUALITY_STATUS_EMPTY in unique and unique <= {
+        DECIDER_QUALITY_STATUS_EMPTY,
+        DECIDER_QUALITY_STATUS_UNAVAILABLE,
+    }:
+        return DECIDER_QUALITY_STATUS_EMPTY
+    return DECIDER_QUALITY_STATUS_UNAVAILABLE
 
 
 def _normalize_symbols(symbols: Sequence[str]) -> list[str]:
@@ -1629,6 +1747,7 @@ def _build_fundamentals_freshness_provenance(
     *,
     fundamentals: dict[str, Any],
     requested_market_date: date,
+    storage_unavailable: bool = False,
 ) -> dict[str, Any]:
     latest_snapshot = fundamentals.get('latest_snapshot') if isinstance(fundamentals, dict) else None
     history_summary = fundamentals.get('history_summary') if isinstance(fundamentals, dict) else {}
@@ -1642,19 +1761,26 @@ def _build_fundamentals_freshness_provenance(
         as_of_market_date=latest_receipt_date,
         requested_market_date=requested_market_date,
     )
-    if latest_snapshot is None:
+    if storage_unavailable:
         freshness_status = FRESHNESS_STATUS_MISSING
+        provenance_status = FACTOR_SUMMARY_STATUS_STORAGE_UNAVAILABLE
+        reason = 'dart_fundamentals_storage_unavailable'
+    elif latest_snapshot is None:
+        freshness_status = FRESHNESS_STATUS_MISSING
+        provenance_status = PROVENANCE_STATUS_PROVIDER_SOURCED
         reason = 'no_stored_fundamentals_snapshot'
     elif trade_date_relation == 'same_market_date':
         freshness_status = FRESHNESS_STATUS_FRESH
+        provenance_status = PROVENANCE_STATUS_PROVIDER_SOURCED
         reason = None
     else:
         freshness_status = FRESHNESS_STATUS_AVAILABLE_BUT_OLD
+        provenance_status = PROVENANCE_STATUS_PROVIDER_SOURCED
         reason = 'latest_fundamentals_snapshot_precedes_request_date'
     return _build_freshness_provenance(
         requested_market_date=requested_market_date,
         freshness_status=freshness_status,
-        provenance_status=PROVENANCE_STATUS_PROVIDER_SOURCED,
+        provenance_status=provenance_status,
         source_tables=('dart_fundamentals_snapshots', 'dart_fundamentals_rows', 'dart_disclosure_events'),
         source_provider='dart',
         as_of_market_date=latest_receipt_date if latest_snapshot is not None else None,
@@ -2250,6 +2376,612 @@ def _build_context_block_completeness(
     return {
         'status': str(context.get('status') or 'available'),
         'missing_fields': list(context.get('missing_fields') or []),
+    }
+
+
+def _build_decider_factor_score_quality_context(
+    *,
+    scores: dict[str, Any],
+    factor_summary: dict[str, Any],
+) -> dict[str, Any]:
+    score_entries: dict[str, dict[str, Any]] = {}
+    score_states: list[str] = []
+    for family in ('unified_value', 'quality', 'momentum'):
+        score_payload = _maybe_dict(scores.get(family))
+        raw_status = str(score_payload.get('status') or 'unavailable')
+        normalized_status = _normalize_decider_quality_status(
+            raw_status,
+            freshness_provenance=_maybe_dict(score_payload.get('freshness_provenance')),
+        )
+        if normalized_status == DECIDER_QUALITY_STATUS_PARTIAL and raw_status == 'partial':
+            normalized_status = DECIDER_QUALITY_STATUS_AVAILABLE
+        score_entries[family] = {
+            'status': normalized_status,
+            'source_status': raw_status,
+            'score_available': score_payload.get('score') is not None,
+            'components_used': score_payload.get('components_used'),
+            'components_possible': score_payload.get('components_possible'),
+            'freshness': _compact_provenance_summary(_maybe_dict(score_payload.get('freshness_provenance'))),
+        }
+        score_states.append(normalized_status)
+
+    signal_features_summary = _maybe_dict(factor_summary.get('signal_features'))
+    signal_features_state = _normalize_decider_quality_status(
+        signal_features_summary.get('status'),
+        freshness_provenance=_maybe_dict(signal_features_summary.get('provenance')),
+    )
+    all_states = [*score_states, signal_features_state]
+    status = (
+        DECIDER_QUALITY_STATUS_AVAILABLE
+        if all(state == DECIDER_QUALITY_STATUS_AVAILABLE for state in all_states)
+        else DECIDER_QUALITY_STATUS_PROVIDER_ERROR
+        if DECIDER_QUALITY_STATUS_PROVIDER_ERROR in all_states
+        and DECIDER_QUALITY_STATUS_AVAILABLE not in all_states
+        else DECIDER_QUALITY_STATUS_PARTIAL
+        if any(state == DECIDER_QUALITY_STATUS_AVAILABLE for state in score_states)
+        or signal_features_state == DECIDER_QUALITY_STATUS_AVAILABLE
+        else DECIDER_QUALITY_STATUS_UNAVAILABLE
+    )
+    coverage_notes = _non_empty_text_list(
+        note
+        for family in ('unified_value', 'quality', 'momentum')
+        for note in list(_maybe_dict(scores.get(family)).get('coverage_notes') or [])
+    )
+    return {
+        'status': status,
+        'required_scores': score_entries,
+        'signal_features': {
+            'status': signal_features_state,
+            'source_status': signal_features_summary.get('status'),
+            'row_kind': signal_features_summary.get('row_kind'),
+            'fallback_groups_present': list(signal_features_summary.get('fallback_groups_present') or []),
+            'freshness': _compact_provenance_summary(_maybe_dict(signal_features_summary.get('provenance'))),
+        },
+        'coverage_notes': coverage_notes,
+    }
+
+
+def _build_decider_liquidity_turnover_quality_context(
+    *,
+    liquidity_context: dict[str, Any],
+) -> dict[str, Any]:
+    turnover = _maybe_dict(liquidity_context.get('turnover'))
+    ranking = _maybe_dict(liquidity_context.get('ranking'))
+    intraday = _maybe_dict(liquidity_context.get('intraday'))
+    turnover_state = _normalize_decider_quality_status(
+        turnover.get('status'),
+        freshness_provenance=_maybe_dict(turnover.get('provenance')),
+        treat_derived_as_partial=True,
+    )
+    ranking_state = _normalize_decider_quality_status(
+        ranking.get('status'),
+        freshness_provenance=_maybe_dict(ranking.get('provenance')),
+    )
+    intraday_state = _normalize_decider_quality_status(
+        intraday.get('status'),
+        freshness_provenance=_maybe_dict(_maybe_dict(intraday.get('provenance')).get('intraday_execution_context')),
+    )
+    if turnover_state == DECIDER_QUALITY_STATUS_PROVIDER_ERROR and ranking_state in {
+        DECIDER_QUALITY_STATUS_PROVIDER_ERROR,
+        DECIDER_QUALITY_STATUS_UNAVAILABLE,
+    }:
+        status = DECIDER_QUALITY_STATUS_PROVIDER_ERROR
+    elif turnover_state == DECIDER_QUALITY_STATUS_STALE:
+        status = DECIDER_QUALITY_STATUS_STALE
+    elif turnover_state == DECIDER_QUALITY_STATUS_AVAILABLE and ranking_state == DECIDER_QUALITY_STATUS_AVAILABLE:
+        status = (
+            DECIDER_QUALITY_STATUS_AVAILABLE
+            if intraday_state in {DECIDER_QUALITY_STATUS_AVAILABLE, DECIDER_QUALITY_STATUS_PARTIAL}
+            else DECIDER_QUALITY_STATUS_PARTIAL
+        )
+    elif any(
+        state in {DECIDER_QUALITY_STATUS_AVAILABLE, DECIDER_QUALITY_STATUS_PARTIAL}
+        for state in (turnover_state, ranking_state, intraday_state)
+    ):
+        status = DECIDER_QUALITY_STATUS_PARTIAL
+    else:
+        status = _summarize_overall_decider_quality_status([turnover_state, ranking_state, intraday_state])
+
+    quality_flags = _non_empty_text_list(
+        [
+            turnover.get('reason') if turnover_state != DECIDER_QUALITY_STATUS_AVAILABLE else None,
+            ranking.get('reason') if ranking_state != DECIDER_QUALITY_STATUS_AVAILABLE else None,
+            intraday.get('reason') if intraday_state != DECIDER_QUALITY_STATUS_AVAILABLE else None,
+        ]
+    )
+    return {
+        'status': status,
+        'turnover': {
+            'status': turnover_state,
+            'source_status': turnover.get('status'),
+            'reason': turnover.get('reason'),
+            'freshness_status': turnover.get('freshness_status'),
+            'turnover_source': turnover.get('turnover_source'),
+            'turnover_krw': turnover.get('turnover_krw'),
+            'provider_turnover_krw': turnover.get('provider_turnover_krw'),
+            'derived_turnover_krw': turnover.get('derived_turnover_krw'),
+            'trade_date': turnover.get('trade_date'),
+            'price_bar_issue_codes': list(turnover.get('price_bar_issue_codes') or []),
+            'freshness': _compact_provenance_summary(_maybe_dict(turnover.get('provenance'))),
+        },
+        'liquidity_ranking': {
+            'status': ranking_state,
+            'source_status': ranking.get('status'),
+            'reason': ranking.get('reason'),
+            'avg_trading_value_20d': ranking.get('avg_trading_value_20d'),
+            'liquidity_rank': ranking.get('liquidity_rank'),
+            'liquidity_percentile': ranking.get('liquidity_percentile'),
+            'passes_liquidity_floor': ranking.get('passes_liquidity_floor'),
+            'as_of_market_date': ranking.get('as_of_market_date'),
+            'freshness': _compact_provenance_summary(_maybe_dict(ranking.get('provenance'))),
+        },
+        'intraday_liquidity': {
+            'status': intraday_state,
+            'source_status': intraday.get('status'),
+            'reason': intraday.get('reason'),
+            'freshness_status': intraday.get('freshness_status'),
+            'quote_freshness_status': intraday.get('quote_freshness_status'),
+            'quote_trade_date': intraday.get('quote_trade_date'),
+            'as_of_market_date': intraday.get('as_of_market_date'),
+            'as_of_timestamp': intraday.get('as_of_timestamp'),
+            'quote_spread_points': intraday.get('quote_spread_points'),
+            'quote_spread_bps_of_price': intraday.get('quote_spread_bps_of_price'),
+            'orderbook_imbalance': intraday.get('orderbook_imbalance'),
+            'volume_power_rank': intraday.get('volume_power_rank'),
+            'volume_rank': intraday.get('volume_rank'),
+            'quote_balance_rank': intraday.get('quote_balance_rank'),
+            'freshness': _compact_provenance_summary(
+                _maybe_dict(_maybe_dict(intraday.get('provenance')).get('intraday_execution_context'))
+            ),
+        },
+        'quality_flags': quality_flags,
+    }
+
+
+def _build_decider_intraday_quality_context(
+    *,
+    quote_context: dict[str, Any] | None,
+    quote_provenance: dict[str, Any],
+    intraday_execution_context: dict[str, Any] | None,
+    intraday_execution_provenance: dict[str, Any],
+    intraday_execution_completeness: dict[str, Any],
+) -> dict[str, Any]:
+    quote_state = (
+        _normalize_decider_quality_status('available', freshness_provenance=quote_provenance)
+        if isinstance(quote_context, dict)
+        else _normalize_decider_quality_status('unavailable', freshness_provenance=quote_provenance)
+    )
+    intraday_state = _normalize_decider_quality_status(
+        _maybe_dict(intraday_execution_context).get('status') or intraday_execution_completeness.get('status'),
+        freshness_provenance=intraday_execution_provenance,
+    )
+    if intraday_state == DECIDER_QUALITY_STATUS_STALE or quote_state == DECIDER_QUALITY_STATUS_STALE:
+        status = DECIDER_QUALITY_STATUS_STALE
+    elif intraday_state == DECIDER_QUALITY_STATUS_AVAILABLE:
+        status = DECIDER_QUALITY_STATUS_AVAILABLE
+    elif quote_state == DECIDER_QUALITY_STATUS_AVAILABLE or intraday_state == DECIDER_QUALITY_STATUS_PARTIAL:
+        status = DECIDER_QUALITY_STATUS_PARTIAL
+    else:
+        status = _summarize_overall_decider_quality_status([quote_state, intraday_state])
+
+    intraday_quote = _maybe_dict(_maybe_dict(intraday_execution_context).get('quote'))
+    intraday_orderbook = _maybe_dict(_maybe_dict(intraday_execution_context).get('orderbook'))
+    intraday_liquidity = _maybe_dict(_maybe_dict(intraday_execution_context).get('liquidity'))
+    investor_program_activity = _maybe_dict(_maybe_dict(intraday_execution_context).get('investor_program_activity'))
+    news_hints = _maybe_dict(_maybe_dict(intraday_execution_context).get('news_hints'))
+    spread = _maybe_dict(_maybe_dict(quote_context).get('spread'))
+    return {
+        'status': status,
+        'quote': {
+            'status': quote_state,
+            'trade_date': _maybe_dict(quote_context).get('trade_date'),
+            'captured_at': _maybe_dict(quote_context).get('captured_at'),
+            'market_state': _maybe_dict(quote_context).get('market_state'),
+            'quote_spread_points': spread.get('spread_points') or intraday_quote.get('spread_points'),
+            'freshness': _compact_provenance_summary(quote_provenance),
+        },
+        'intraday_snapshot': {
+            'status': intraday_state,
+            'source_status': _maybe_dict(intraday_execution_context).get('status') or intraday_execution_completeness.get('status'),
+            'reason': intraday_execution_provenance.get('reason'),
+            'market_state': _maybe_dict(intraday_execution_context).get('market_state'),
+            'as_of_market_date': _maybe_dict(intraday_execution_context).get('as_of_market_date'),
+            'as_of_timestamp': _maybe_dict(intraday_execution_context).get('as_of_timestamp'),
+            'available_blocks': intraday_execution_completeness.get('available_blocks'),
+            'partial_blocks': intraday_execution_completeness.get('partial_blocks'),
+            'total_blocks': intraday_execution_completeness.get('total_blocks'),
+            'quote_available': bool(intraday_quote),
+            'orderbook_available': bool(intraday_orderbook),
+            'liquidity_available': bool(intraday_liquidity),
+            'investor_program_activity_available': bool(investor_program_activity),
+            'news_hints_available': bool(news_hints),
+            'orderbook_imbalance': intraday_orderbook.get('imbalance'),
+            'volume_power_rank': intraday_liquidity.get('volume_power_rank'),
+            'quote_balance_rank': intraday_liquidity.get('quote_balance_rank'),
+            'freshness': _compact_provenance_summary(intraday_execution_provenance),
+        },
+    }
+
+
+def _build_decider_financials_quality_context(
+    *,
+    fundamentals: dict[str, Any],
+    fundamentals_provenance: dict[str, Any],
+    unified_value_row: dict[str, Any] | None,
+    advanced_value_row: dict[str, Any] | None,
+) -> dict[str, Any]:
+    latest_snapshot = _maybe_dict(fundamentals.get('latest_snapshot'))
+    fundamental_context = _maybe_dict(latest_snapshot.get('fundamental_context'))
+    normalized_facts = _maybe_dict(fundamental_context.get('normalized_facts'))
+    income_statement = _maybe_dict(normalized_facts.get('income_statement'))
+    balance_sheet = _maybe_dict(normalized_facts.get('balance_sheet'))
+    cash_flow_statement = _maybe_dict(normalized_facts.get('cash_flow_statement'))
+
+    core_field_statuses = {
+        'gross_profit': _maybe_dict(income_statement.get('gross_profit')).get('status'),
+        'current_assets': _maybe_dict(balance_sheet.get('current_assets')).get('status'),
+        'current_liabilities': _maybe_dict(balance_sheet.get('current_liabilities')).get('status'),
+        'cash_and_cash_equivalents': _maybe_dict(balance_sheet.get('cash_and_cash_equivalents')).get('status'),
+        'operating_cash_flow': _maybe_dict(cash_flow_statement.get('operating_cash_flow')).get('status'),
+        'investing_cash_flow': _maybe_dict(cash_flow_statement.get('investing_cash_flow')).get('status'),
+        'financing_cash_flow': _maybe_dict(cash_flow_statement.get('financing_cash_flow')).get('status'),
+        'ev_to_ebitda': (
+            str(_maybe_dict(unified_value_row).get('ev_to_ebitda_status') or '').strip() or None
+        )
+        or (
+            str(_maybe_dict(advanced_value_row).get('ev_to_ebitda_status') or '').strip() or None
+        ),
+    }
+    available_core_fields = [
+        field_name
+        for field_name, raw_status in core_field_statuses.items()
+        if str(raw_status or '').strip().lower() == 'available'
+    ]
+    missing_core_fields = [
+        field_name
+        for field_name, raw_status in core_field_statuses.items()
+        if str(raw_status or '').strip().lower() not in {'available'}
+    ]
+    freshness_status = str(fundamentals_provenance.get('freshness_status') or '')
+    if fundamentals_provenance.get('provenance_status') == FACTOR_SUMMARY_STATUS_STORAGE_UNAVAILABLE:
+        status = DECIDER_QUALITY_STATUS_PROVIDER_ERROR
+    elif not latest_snapshot:
+        status = DECIDER_QUALITY_STATUS_UNAVAILABLE
+    elif freshness_status in {FRESHNESS_STATUS_STALE, FRESHNESS_STATUS_AVAILABLE_BUT_OLD} and not missing_core_fields:
+        status = DECIDER_QUALITY_STATUS_STALE
+    elif available_core_fields and missing_core_fields:
+        status = DECIDER_QUALITY_STATUS_PARTIAL
+    elif available_core_fields:
+        status = DECIDER_QUALITY_STATUS_AVAILABLE
+    else:
+        status = DECIDER_QUALITY_STATUS_UNAVAILABLE
+    return {
+        'status': status,
+        'receipt_date': _maybe_dict(latest_snapshot.get('filing')).get('receipt_date'),
+        'report_name': _maybe_dict(latest_snapshot.get('filing')).get('report_name'),
+        'period_end_date': _maybe_dict(latest_snapshot.get('period')).get('period_end_date'),
+        'business_year': _maybe_dict(latest_snapshot.get('period')).get('business_year'),
+        'report_code': _maybe_dict(latest_snapshot.get('period')).get('report_code'),
+        'source_status': _maybe_dict(latest_snapshot.get('statement')).get('source_status'),
+        'core_field_statuses': core_field_statuses,
+        'available_core_fields': available_core_fields,
+        'missing_core_fields': missing_core_fields,
+        'freshness': _compact_provenance_summary(fundamentals_provenance),
+    }
+
+
+def _build_decider_disclosures_news_quality_context(
+    *,
+    recent_dart_events: dict[str, Any],
+    recent_disclosures_provenance: dict[str, Any],
+    recent_external_news: dict[str, Any],
+    recent_external_news_provenance: dict[str, Any],
+) -> dict[str, Any]:
+    dart_state = _normalize_decider_quality_status(
+        recent_dart_events.get('status'),
+        freshness_provenance=recent_disclosures_provenance,
+    )
+    external_news_state = _normalize_decider_quality_status(
+        recent_external_news.get('status'),
+        freshness_provenance=recent_external_news_provenance,
+    )
+    if dart_state == DECIDER_QUALITY_STATUS_AVAILABLE and external_news_state in {
+        DECIDER_QUALITY_STATUS_AVAILABLE,
+        DECIDER_QUALITY_STATUS_EMPTY,
+    }:
+        status = DECIDER_QUALITY_STATUS_AVAILABLE
+    elif dart_state == DECIDER_QUALITY_STATUS_EMPTY and external_news_state == DECIDER_QUALITY_STATUS_EMPTY:
+        status = DECIDER_QUALITY_STATUS_EMPTY
+    elif any(
+        state in {DECIDER_QUALITY_STATUS_AVAILABLE, DECIDER_QUALITY_STATUS_STALE}
+        for state in (dart_state, external_news_state)
+    ):
+        status = DECIDER_QUALITY_STATUS_PARTIAL
+    elif any(state == DECIDER_QUALITY_STATUS_PROVIDER_ERROR for state in (dart_state, external_news_state)):
+        status = DECIDER_QUALITY_STATUS_PROVIDER_ERROR
+    else:
+        status = _summarize_overall_decider_quality_status([dart_state, external_news_state])
+    dart_summary = _maybe_dict(recent_dart_events.get('summary'))
+    external_news_provider = _maybe_dict(recent_external_news.get('provider'))
+    return {
+        'status': status,
+        'providers': {
+            'dart_recent_events': {
+                'status': dart_state,
+                'source_status': recent_dart_events.get('status'),
+                'reason': recent_dart_events.get('reason'),
+                'item_count': recent_dart_events.get('item_count'),
+                'latest_receipt_date': recent_disclosures_provenance.get('latest_available_market_date'),
+                'correction_count': dart_summary.get('correction_count'),
+                'ownership_related_count': dart_summary.get('ownership_related_count'),
+                'large_holder_related_count': dart_summary.get('large_holder_related_count'),
+                'freshness': _compact_provenance_summary(recent_disclosures_provenance),
+            },
+            'external_news': {
+                'status': external_news_state,
+                'source_status': recent_external_news.get('status'),
+                'reason': recent_external_news.get('reason'),
+                'item_count': recent_external_news.get('item_count'),
+                'latest_published_at': recent_external_news_provenance.get('latest_available_timestamp'),
+                'provider_status': external_news_provider.get('status'),
+                'provider_reason': external_news_provider.get('reason'),
+                'freshness': _compact_provenance_summary(recent_external_news_provenance),
+            },
+        },
+    }
+
+
+def _build_decider_flow_short_selling_quality_context(
+    *,
+    investor_flow_context: dict[str, Any] | None,
+    investor_flow_provenance: dict[str, Any],
+    short_selling_context: dict[str, Any] | None,
+    short_selling_provenance: dict[str, Any],
+) -> dict[str, Any]:
+    investor_flow_state = _normalize_decider_quality_status(
+        _maybe_dict(investor_flow_context).get('status'),
+        freshness_provenance=investor_flow_provenance,
+    )
+    short_selling_state = _normalize_decider_quality_status(
+        _maybe_dict(short_selling_context).get('status'),
+        freshness_provenance=short_selling_provenance,
+    )
+    if investor_flow_state == DECIDER_QUALITY_STATUS_AVAILABLE and short_selling_state == DECIDER_QUALITY_STATUS_AVAILABLE:
+        status = DECIDER_QUALITY_STATUS_AVAILABLE
+    elif any(
+        state in {DECIDER_QUALITY_STATUS_AVAILABLE, DECIDER_QUALITY_STATUS_STALE}
+        for state in (investor_flow_state, short_selling_state)
+    ):
+        status = DECIDER_QUALITY_STATUS_PARTIAL
+    else:
+        status = _summarize_overall_decider_quality_status([investor_flow_state, short_selling_state])
+    investor_flow_payload = _maybe_dict(investor_flow_context)
+    short_payload = _maybe_dict(short_selling_context)
+    return {
+        'status': status,
+        'investor_flow': {
+            'status': investor_flow_state,
+            'source_status': investor_flow_payload.get('status'),
+            'has_symbol_flow': bool(_maybe_dict(investor_flow_payload.get('symbol_flow'))),
+            'has_market_flow': bool(_maybe_dict(investor_flow_payload.get('market_flow'))),
+            'missing_fields': list(investor_flow_payload.get('missing_fields') or []),
+            'freshness': _compact_provenance_summary(investor_flow_provenance),
+        },
+        'short_selling': {
+            'status': short_selling_state,
+            'source_status': short_payload.get('status'),
+            'has_short_volume': bool(_maybe_dict(short_payload.get('short_volume'))),
+            'has_short_balance': bool(_maybe_dict(short_payload.get('short_balance'))),
+            'missing_fields': list(short_payload.get('missing_fields') or []),
+            'freshness': _compact_provenance_summary(short_selling_provenance),
+        },
+    }
+
+
+def _build_decider_relative_strength_quality_context(
+    *,
+    market_relative_context: dict[str, Any] | None,
+    sector_peer_context: dict[str, Any] | None,
+    market_breadth_context: dict[str, Any] | None,
+    market_relative_provenance: dict[str, Any] | None,
+    sector_peer_provenance: dict[str, Any] | None,
+    market_breadth_provenance: dict[str, Any] | None,
+) -> dict[str, Any]:
+    market_relative_payload = _maybe_dict(market_relative_context)
+    sector_peer_payload = _maybe_dict(sector_peer_context)
+    market_breadth_payload = _maybe_dict(market_breadth_context)
+    market_relative_state = _normalize_decider_quality_status(
+        market_relative_payload.get('status'),
+        freshness_provenance=market_relative_provenance,
+    )
+    sector_peer_state = _normalize_decider_quality_status(
+        sector_peer_payload.get('status'),
+        freshness_provenance=sector_peer_provenance,
+    )
+    market_breadth_state = _normalize_decider_quality_status(
+        market_breadth_payload.get('status'),
+        freshness_provenance=market_breadth_provenance,
+    )
+    if market_relative_state == DECIDER_QUALITY_STATUS_AVAILABLE and sector_peer_state in {
+        DECIDER_QUALITY_STATUS_AVAILABLE,
+        DECIDER_QUALITY_STATUS_PARTIAL,
+    }:
+        status = DECIDER_QUALITY_STATUS_AVAILABLE
+    elif any(
+        state in {DECIDER_QUALITY_STATUS_AVAILABLE, DECIDER_QUALITY_STATUS_STALE}
+        for state in (market_relative_state, sector_peer_state, market_breadth_state)
+    ):
+        status = DECIDER_QUALITY_STATUS_PARTIAL
+    else:
+        status = _summarize_overall_decider_quality_status(
+            [market_relative_state, sector_peer_state, market_breadth_state]
+        )
+    relative_strength = _maybe_dict(market_relative_payload.get('relative_strength'))
+    breadth = _maybe_dict(market_relative_payload.get('breadth'))
+    return {
+        'status': status,
+        'market_relative': {
+            'status': market_relative_state,
+            'source_status': market_relative_payload.get('status'),
+            'return_percentile': relative_strength.get('return_percentile'),
+            'volume_percentile': relative_strength.get('volume_percentile'),
+            'market_symbol_count': breadth.get('market_symbol_count'),
+            'up_count': breadth.get('up_count'),
+            'down_count': breadth.get('down_count'),
+            'freshness': _compact_provenance_summary(market_relative_provenance or {}),
+        },
+        'sector_peers': {
+            'status': sector_peer_state,
+            'source_status': sector_peer_payload.get('status'),
+            'sector_name': sector_peer_payload.get('sector_name'),
+            'peer_count': sector_peer_payload.get('peer_count'),
+            'same_sector_symbol_count': sector_peer_payload.get('same_sector_symbol_count'),
+            'freshness': _compact_provenance_summary(sector_peer_provenance or {}),
+        },
+        'market_breadth': {
+            'status': market_breadth_state,
+            'source_status': market_breadth_payload.get('status'),
+            'market_symbol_count': market_breadth_payload.get('market_symbol_count'),
+            'up_count': market_breadth_payload.get('up_count'),
+            'down_count': market_breadth_payload.get('down_count'),
+            'flat_count': market_breadth_payload.get('flat_count'),
+            'freshness': _compact_provenance_summary(market_breadth_provenance or {}),
+        },
+    }
+
+
+def _build_decider_technical_evidence_quality_context(
+    *,
+    market_date: date,
+    technical_snapshot: dict[str, Any] | None,
+    action_summary: dict[str, Any] | None,
+) -> dict[str, Any]:
+    technical = _maybe_dict(technical_snapshot)
+    action = _maybe_dict(action_summary)
+    has_structured_levels = any(
+        action.get(field) is not None
+        for field in ('support_price', 'resistance_price', 'invalidation_price', 'trigger_price')
+    )
+    if not technical and not action:
+        status = DECIDER_QUALITY_STATUS_UNAVAILABLE
+    elif technical and has_structured_levels:
+        status = DECIDER_QUALITY_STATUS_AVAILABLE
+    else:
+        status = DECIDER_QUALITY_STATUS_PARTIAL
+    missing_fields = [
+        field_name
+        for field_name in ('support_price', 'resistance_price', 'invalidation_price')
+        if action.get(field_name) is None
+    ]
+    return {
+        'status': status,
+        'as_of_market_date': market_date.isoformat(),
+        'captured_at': _max_iso_timestamp(technical.get('captured_at'), action.get('captured_at')),
+        'technical_snapshot_available': bool(technical),
+        'action_summary_available': bool(action),
+        'trend_state': technical.get('trend_state'),
+        'ma_alignment': technical.get('ma_alignment'),
+        'breakout_20d': technical.get('breakout_20d'),
+        'breakdown_20d': technical.get('breakdown_20d'),
+        'volume_ratio_20d': technical.get('volume_ratio_20d'),
+        'action_label': action.get('action_label'),
+        'signal_score': action.get('signal_score'),
+        'support_price': action.get('support_price'),
+        'resistance_price': action.get('resistance_price'),
+        'invalidation_price': action.get('invalidation_price'),
+        'trigger_price': action.get('trigger_price'),
+        'reasons': list(action.get('reasons') or [])[:5],
+        'missing_fields': missing_fields,
+    }
+
+
+def _build_decider_data_quality_context(
+    *,
+    market_date: date,
+    scores: dict[str, Any],
+    factor_summary: dict[str, Any],
+    liquidity_context: dict[str, Any],
+    quote_context: dict[str, Any] | None,
+    quote_context_provenance: dict[str, Any],
+    intraday_execution_context: dict[str, Any] | None,
+    intraday_execution_provenance: dict[str, Any],
+    intraday_execution_completeness: dict[str, Any],
+    fundamentals: dict[str, Any],
+    fundamentals_provenance: dict[str, Any],
+    recent_dart_events: dict[str, Any],
+    recent_disclosures_provenance: dict[str, Any],
+    recent_external_news: dict[str, Any],
+    recent_external_news_provenance: dict[str, Any],
+    investor_flow_context: dict[str, Any] | None,
+    investor_flow_provenance: dict[str, Any],
+    short_selling_context: dict[str, Any] | None,
+    short_selling_provenance: dict[str, Any],
+    market_relative_context: dict[str, Any] | None,
+    market_relative_provenance: dict[str, Any] | None,
+    sector_peer_context: dict[str, Any] | None,
+    sector_peer_provenance: dict[str, Any] | None,
+    market_breadth_context: dict[str, Any] | None,
+    market_breadth_provenance: dict[str, Any] | None,
+    technical_snapshot: dict[str, Any] | None,
+    action_summary: dict[str, Any] | None,
+    unified_value_row: dict[str, Any] | None,
+    advanced_value_row: dict[str, Any] | None,
+) -> dict[str, Any]:
+    blocks = {
+        'factor_score_coverage': _build_decider_factor_score_quality_context(
+            scores=scores,
+            factor_summary=factor_summary,
+        ),
+        'liquidity_turnover': _build_decider_liquidity_turnover_quality_context(
+            liquidity_context=liquidity_context,
+        ),
+        'intraday_realtime': _build_decider_intraday_quality_context(
+            quote_context=quote_context,
+            quote_provenance=quote_context_provenance,
+            intraday_execution_context=intraday_execution_context,
+            intraday_execution_provenance=intraday_execution_provenance,
+            intraday_execution_completeness=intraday_execution_completeness,
+        ),
+        'financials_cashflow': _build_decider_financials_quality_context(
+            fundamentals=fundamentals,
+            fundamentals_provenance=fundamentals_provenance,
+            unified_value_row=unified_value_row,
+            advanced_value_row=advanced_value_row,
+        ),
+        'disclosures_news': _build_decider_disclosures_news_quality_context(
+            recent_dart_events=recent_dart_events,
+            recent_disclosures_provenance=recent_disclosures_provenance,
+            recent_external_news=recent_external_news,
+            recent_external_news_provenance=recent_external_news_provenance,
+        ),
+        'flows_short_selling': _build_decider_flow_short_selling_quality_context(
+            investor_flow_context=investor_flow_context,
+            investor_flow_provenance=investor_flow_provenance,
+            short_selling_context=short_selling_context,
+            short_selling_provenance=short_selling_provenance,
+        ),
+        'sector_relative_strength': _build_decider_relative_strength_quality_context(
+            market_relative_context=market_relative_context,
+            sector_peer_context=sector_peer_context,
+            market_breadth_context=market_breadth_context,
+            market_relative_provenance=market_relative_provenance,
+            sector_peer_provenance=sector_peer_provenance,
+            market_breadth_provenance=market_breadth_provenance,
+        ),
+        'technical_evidence': _build_decider_technical_evidence_quality_context(
+            market_date=market_date,
+            technical_snapshot=technical_snapshot,
+            action_summary=action_summary,
+        ),
+    }
+    block_status_counts = _quality_status_counts(blocks)
+    return {
+        'status': _summarize_overall_decider_quality_status(
+            [str(block.get('status') or '') for block in blocks.values()]
+        ),
+        'requested_market_date': market_date.isoformat(),
+        'block_status_counts': block_status_counts,
+        'blocks': blocks,
     }
 
 
@@ -2946,6 +3678,7 @@ class AgentContextReadService:
             fundamentals_provenance = _build_fundamentals_freshness_provenance(
                 fundamentals=fundamentals,
                 requested_market_date=normalized_market_date,
+                storage_unavailable=dart_storage_unavailable,
             )
             recent_disclosures_provenance = _build_recent_disclosures_freshness_provenance(
                 disclosures=recent_disclosures,
@@ -3100,6 +3833,37 @@ class AgentContextReadService:
                 intraday_execution_context=intraday_execution_context,
                 intraday_execution_freshness_provenance=intraday_execution_provenance,
             )
+            decider_data_quality_context = _build_decider_data_quality_context(
+                market_date=normalized_market_date,
+                scores=scores,
+                factor_summary=factor_summary,
+                liquidity_context=liquidity_context,
+                quote_context=quote_context,
+                quote_context_provenance=quote_context_provenance,
+                intraday_execution_context=intraday_execution_context,
+                intraday_execution_provenance=intraday_execution_provenance,
+                intraday_execution_completeness=context_completeness['intraday_execution_context'],
+                fundamentals=fundamentals,
+                fundamentals_provenance=fundamentals_provenance,
+                recent_dart_events=recent_dart_events,
+                recent_disclosures_provenance=recent_disclosures_provenance,
+                recent_external_news=recent_external_news,
+                recent_external_news_provenance=recent_external_news_provenance,
+                investor_flow_context=investor_flow_context,
+                investor_flow_provenance=investor_flow_context_provenance,
+                short_selling_context=short_selling_context,
+                short_selling_provenance=short_selling_context_provenance,
+                market_relative_context=market_relative_context,
+                market_relative_provenance=None,
+                sector_peer_context=sector_peer_context,
+                sector_peer_provenance=sector_peer_context_provenance,
+                market_breadth_context=market_breadth_context,
+                market_breadth_provenance=market_breadth_context_provenance,
+                technical_snapshot=technical_snapshot,
+                action_summary=action_summary,
+                unified_value_row=current_factor_rows['unified_value'],
+                advanced_value_row=current_factor_rows['advanced_value'],
+            )
 
             fundamentals_entries = fundamentals_map.get(symbol) or []
             latest_disclosure = recent_disclosures[0] if recent_disclosures else None
@@ -3166,6 +3930,7 @@ class AgentContextReadService:
                     'quote_context': quote_context,
                     'price_context': price_context,
                     'liquidity_context': liquidity_context,
+                    'decider_data_quality_context': decider_data_quality_context,
                     'intraday_execution_context': intraday_execution_context,
                     'price_context_history': price_context_history,
                     'technical_snapshot': technical_snapshot,

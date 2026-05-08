@@ -13,6 +13,7 @@ from app.external_news.provider import NaverNewsSearchProvider
 from app.external_news.service import ExternalNewsService
 from app.external_news.provider import ExternalNewsItem
 from app.agent_context.read_service import (
+    _build_decider_disclosures_news_quality_context,
     _build_external_news_freshness_provenance,
     _build_recent_external_news_context,
 )
@@ -240,6 +241,44 @@ class ExternalNewsContextTests(unittest.TestCase):
         self.assertEqual(context['items'][0]['sentiment'], 'positive')
         self.assertEqual(context['classification_summary']['event_tag_counts']['contract'], 1)
         self.assertEqual(context['classification_summary']['max_materiality_score'], 0.62)
+
+    def test_decider_quality_context_distinguishes_empty_disclosures_from_news_provider_error(self) -> None:
+        block = _build_decider_disclosures_news_quality_context(
+            recent_dart_events={
+                'status': 'empty',
+                'reason': 'no_recent_disclosures',
+                'summary': {},
+                'item_count': 0,
+            },
+            recent_disclosures_provenance={
+                'freshness_status': 'missing',
+                'provenance_status': 'provider_sourced',
+                'reason': 'no_recent_disclosures_up_to_request_date',
+            },
+            recent_external_news={
+                'status': 'unavailable',
+                'reason': 'naver_search_credentials_missing',
+                'provider': {
+                    'provider': 'naver_news_search',
+                    'enabled': False,
+                    'status': 'disabled',
+                    'reason': 'naver_search_credentials_missing',
+                },
+            },
+            recent_external_news_provenance={
+                'freshness_status': 'missing',
+                'provenance_status': 'external_provider_unavailable',
+                'reason': 'naver_search_credentials_missing',
+            },
+        )
+
+        self.assertEqual(block['status'], 'provider_error')
+        self.assertEqual(block['providers']['dart_recent_events']['status'], 'empty')
+        self.assertEqual(block['providers']['external_news']['status'], 'provider_error')
+        self.assertEqual(
+            block['providers']['external_news']['provider_reason'],
+            'naver_search_credentials_missing',
+        )
 
 
 if __name__ == '__main__':
