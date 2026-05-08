@@ -1,8 +1,15 @@
 from contextlib import ExitStack
+from datetime import date
 import unittest
 from unittest.mock import patch
 
-from app.agent_context.read_service import AgentContextReadService, PERSISTED_FACTOR_FAMILIES, _build_price_context
+from app.agent_context.read_service import (
+    AgentContextReadService,
+    PERSISTED_FACTOR_FAMILIES,
+    _build_price_context,
+    _build_recent_dart_events_context,
+    _build_recent_disclosures_freshness_provenance,
+)
 
 EMPTY_LATEST_PRIOR_ROWS = {
     'factor_rows': {family: {} for family in PERSISTED_FACTOR_FAMILIES},
@@ -332,6 +339,33 @@ class FakeDisclosureRepository:
             ],
             '000660': [],
         }
+
+
+class DartEventContextTests(unittest.TestCase):
+    def test_recent_dart_events_distinguishes_empty_from_storage_unavailable(self):
+        empty = _build_recent_dart_events_context(
+            disclosures=[],
+            fundamentals={'latest_snapshot': None},
+            storage_unavailable=False,
+        )
+        unavailable = _build_recent_dart_events_context(
+            disclosures=[],
+            fundamentals={'latest_snapshot': None},
+            storage_unavailable=True,
+        )
+        provenance = _build_recent_disclosures_freshness_provenance(
+            disclosures=[],
+            requested_market_date=date(2026, 4, 8),
+            disclosures_limit=3,
+            storage_unavailable=True,
+        )
+
+        self.assertEqual(empty['status'], 'empty')
+        self.assertEqual(empty['reason'], 'no_recent_disclosures')
+        self.assertEqual(unavailable['status'], 'unavailable')
+        self.assertEqual(unavailable['reason'], 'dart_disclosure_storage_unavailable')
+        self.assertEqual(provenance['provenance_status'], 'storage_unavailable')
+        self.assertEqual(provenance['reason'], 'dart_disclosure_storage_unavailable')
 
 
 class AgentContextReadServiceTests(unittest.TestCase):

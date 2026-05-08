@@ -492,6 +492,18 @@ def trim_batch_item_for_prompt(item: dict[str, Any]) -> dict[str, Any]:
         if isinstance(items, list):
             recent_disclosures['items'] = items[:3]
             recent_disclosures['count'] = min(recent_disclosures.get('count', len(items)), len(recent_disclosures['items']))
+    recent_dart_events = trimmed.get('recent_dart_events')
+    if isinstance(recent_dart_events, dict):
+        items = recent_dart_events.get('items')
+        if isinstance(items, list):
+            recent_dart_events['items'] = items[:3]
+            recent_dart_events['item_count'] = min(recent_dart_events.get('item_count', len(items)), len(recent_dart_events['items']))
+    recent_external_news = trimmed.get('recent_external_news')
+    if isinstance(recent_external_news, dict):
+        items = recent_external_news.get('items')
+        if isinstance(items, list):
+            recent_external_news['items'] = items[:3]
+            recent_external_news['item_count'] = min(recent_external_news.get('item_count', len(items)), len(recent_external_news['items']))
     return trimmed
 
 

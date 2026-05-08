@@ -76,6 +76,7 @@ DAILY_STAGE_ORDER: tuple[str, ...] = (
     'piotroski_filter',
     *FACTOR_STAGE_ORDER,
     'external_news_collect',
+    'external_news_enrich',
     'agent_feedback_summaries',
     'signal_decider',
     'signal_decider_evaluations',
@@ -90,6 +91,7 @@ DEFAULT_DAILY_STAGE_ORDER: tuple[str, ...] = (
     'piotroski_filter',
     *FACTOR_STAGE_ORDER,
     'external_news_collect',
+    'external_news_enrich',
     'agent_feedback_summaries',
     'signal_decider',
     'signal_decider_evaluations',
@@ -371,12 +373,24 @@ STAGE_DEFINITIONS: dict[str, DailyStageDefinition] = {
         output_tables=('external_news_items',),
         default_selected=True,
     ),
+    'external_news_enrich': DailyStageDefinition(
+        id='external_news_enrich',
+        label='external news context enrich',
+        group='external_data',
+        description='Apply deterministic tags, sentiment, and materiality labels to recent persisted external news before agent dispatch.',
+        depends_on=('external_news_collect',),
+        supports_symbols=True,
+        supports_symbol_limit=True,
+        inspect_routes=('/external/news',),
+        output_tables=('external_news_items',),
+        default_selected=True,
+    ),
     'agent_feedback_summaries': DailyStageDefinition(
         id='agent_feedback_summaries',
         label='agent feedback summarizer dispatch',
         group='agent_feedback',
         description='Run the persisted symbol-level summarizer stages over the symbol universe that passes both active pre-filters.',
-        depends_on=('market_risk_filter', 'piotroski_filter', *FACTOR_STAGE_ORDER, 'external_news_collect'),
+        depends_on=('market_risk_filter', 'piotroski_filter', *FACTOR_STAGE_ORDER, 'external_news_collect', 'external_news_enrich'),
         supports_symbols=True,
         supports_capture_limit=True,
         inspect_routes=('/agent-context/feedback/progress', '/agent-context/feedback/status'),
@@ -658,6 +672,12 @@ class DailyPipelineStageService:
                     display=settings.external_news_default_display,
                     symbol_limit=symbol_limit,
                 )
+            )
+        if stage_id == 'external_news_enrich':
+            return external_news_service.enrich_recent_classification(
+                symbols=symbols,
+                lookback_days=settings.external_news_context_lookback_days,
+                limit=symbol_limit or 1000,
             )
         if stage_id in {'agent_feedback_summaries', 'signal_decider'}:
             prerequisites = agent_feedback_prerequisite_service.inspect_feedback_prerequisites(

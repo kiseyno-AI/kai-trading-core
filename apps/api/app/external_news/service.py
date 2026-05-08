@@ -7,7 +7,7 @@ from typing import Any, Sequence
 from app.agent_context.eligibility import load_agent_feedback_eligible_symbols
 from app.core.settings import settings
 from app.external_news.provider import ExternalNewsProvider, NaverNewsSearchProvider
-from app.external_news.store import list_external_news_items, persist_external_news_items
+from app.external_news.store import enrich_recent_external_news_classification, list_external_news_items, persist_external_news_items
 from app.market_data_store import load_symbols
 
 
@@ -153,6 +153,35 @@ class ExternalNewsService:
         result.setdefault('summary', {})['eligible_symbol_count'] = len(eligible_symbols)
         result['summary']['collected_symbol_count'] = len(eligible_symbols)
         return result
+
+    def enrich_recent_classification(
+        self,
+        *,
+        symbols: Sequence[str] | str | None = None,
+        lookback_days: int | None = None,
+        limit: int = 1000,
+    ) -> dict[str, Any]:
+        normalized_symbols = _normalize_symbols(symbols)
+        provider_status = self.provider_status()
+        try:
+            result = enrich_recent_external_news_classification(
+                symbols=normalized_symbols or None,
+                lookback_days=lookback_days or settings.external_news_context_lookback_days,
+                limit=limit,
+            )
+        except Exception as exc:
+            return {
+                'status': 'unavailable',
+                'reason': 'external_news_storage_unavailable',
+                'error_class': exc.__class__.__name__,
+                'provider': provider_status,
+                'requested_symbols': normalized_symbols,
+            }
+        return {
+            **result,
+            'provider': provider_status,
+            'requested_symbols': normalized_symbols,
+        }
 
     def list_news(self, *, symbols: Sequence[str] | str | None = None, limit: int = 100) -> dict[str, Any]:
         normalized_symbols = _normalize_symbols(symbols)

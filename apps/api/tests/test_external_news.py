@@ -8,6 +8,7 @@ from unittest.mock import patch
 import httpx
 
 from app.core.settings import settings
+from app.external_news.classifier import classify_external_news_item
 from app.external_news.provider import NaverNewsSearchProvider
 from app.external_news.service import ExternalNewsService
 from app.external_news.provider import ExternalNewsItem
@@ -172,6 +173,21 @@ class NaverNewsProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(items[0].published_at.isoformat(), '2026-05-08T00:00:00+00:00')
 
 
+class ExternalNewsClassifierTests(unittest.TestCase):
+    def test_rule_based_classifier_tags_sentiment_and_materiality(self) -> None:
+        classification = classify_external_news_item(
+            title='삼성전자 대규모 반도체 공급 계약 체결, 실적 개선 기대',
+            description='증권가는 영업이익 성장과 목표주가 상향을 전망했다.',
+            payload={'raw': {'pubDate': 'Fri, 08 May 2026 09:00:00 +0900'}},
+        )
+
+        self.assertIn('contract', classification['event_tags'])
+        self.assertIn('earnings', classification['event_tags'])
+        self.assertEqual(classification['sentiment'], 'positive')
+        self.assertGreaterEqual(classification['materiality_score'], 0.5)
+        self.assertEqual(classification['classifier'], 'rule_based_external_news_v1')
+
+
 class ExternalNewsContextTests(unittest.TestCase):
     def test_context_distinguishes_provider_unavailable_from_no_news(self) -> None:
         disabled = _build_recent_external_news_context(
@@ -199,6 +215,31 @@ class ExternalNewsContextTests(unittest.TestCase):
         )
         self.assertEqual(provenance['freshness_status'], 'missing')
         self.assertEqual(provenance['provenance_status'], 'external_provider_unavailable')
+
+    def test_context_exposes_news_classification_fields(self) -> None:
+        context = _build_recent_external_news_context(
+            [
+                {
+                    'provider': 'fake_news',
+                    'title': '삼성전자 공급 계약',
+                    'description': '실적 개선 기대',
+                    'url': 'https://example.test/news/1',
+                    'published_at': '2026-05-08T00:00:00+00:00',
+                    'collected_at': '2026-05-08T00:01:00+00:00',
+                    'event_tags': ['contract', 'earnings'],
+                    'sentiment': 'positive',
+                    'materiality_score': 0.62,
+                    'materiality_bucket': 'medium',
+                }
+            ],
+            provider_status={'provider': 'fake_news', 'enabled': True, 'status': 'available', 'reason': None},
+        )
+
+        self.assertEqual(context['status'], 'available')
+        self.assertEqual(context['items'][0]['event_tags'], ['contract', 'earnings'])
+        self.assertEqual(context['items'][0]['sentiment'], 'positive')
+        self.assertEqual(context['classification_summary']['event_tag_counts']['contract'], 1)
+        self.assertEqual(context['classification_summary']['max_materiality_score'], 0.62)
 
 
 if __name__ == '__main__':

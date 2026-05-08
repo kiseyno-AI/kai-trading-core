@@ -7,6 +7,7 @@ from sqlalchemy import desc, or_, select
 
 from app.db import session_scope
 from app.db_models import ExternalNewsItem, Symbol
+from app.external_news.classifier import classify_external_news_item
 from app.external_news.provider import ExternalNewsItem as ProviderNewsItem
 
 
@@ -14,7 +15,26 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _classification_from_payload(payload: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    classification = payload.get('classification')
+    return classification if isinstance(classification, dict) else {}
+
+
+def _payload_with_classification(item: ProviderNewsItem) -> dict[str, Any]:
+    payload = dict(item.payload or {})
+    payload['classification'] = classify_external_news_item(
+        title=item.title,
+        description=item.description,
+        payload=payload,
+    )
+    return payload
+
+
 def _serialize(row: ExternalNewsItem, *, symbol: str, name_ko: str | None, market: str | None) -> dict[str, Any]:
+    payload = row.payload or {}
+    classification = _classification_from_payload(payload)
     return {
         'id': row.id,
         'symbol': symbol,
@@ -29,7 +49,12 @@ def _serialize(row: ExternalNewsItem, *, symbol: str, name_ko: str | None, marke
         'source_url': row.source_url,
         'published_at': row.published_at.isoformat() if row.published_at else None,
         'collected_at': row.collected_at.isoformat() if row.collected_at else None,
-        'payload': row.payload or {},
+        'event_tags': list(classification.get('event_tags') or []),
+        'sentiment': classification.get('sentiment'),
+        'materiality_score': classification.get('materiality_score'),
+        'materiality_bucket': classification.get('materiality_bucket'),
+        'classification': classification,
+        'payload': payload,
     }
 
 
@@ -60,6 +85,7 @@ def persist_external_news_items(*, symbol: str, items: Sequence[ProviderNewsItem
                 .where(or_(*dedupe_conditions))
             )
             existing = session.execute(stmt).scalar_one_or_none()
+            payload = _payload_with_classification(item)
             if existing is None:
                 session.add(
                     ExternalNewsItem(
@@ -73,7 +99,7 @@ def persist_external_news_items(*, symbol: str, items: Sequence[ProviderNewsItem
                         source_url=item.source_url,
                         published_at=item.published_at,
                         collected_at=now,
-                        payload=item.payload,
+                        payload=payload,
                     )
                 )
                 inserted += 1
@@ -86,7 +112,7 @@ def persist_external_news_items(*, symbol: str, items: Sequence[ProviderNewsItem
             existing.source_url = item.source_url
             existing.published_at = item.published_at or existing.published_at
             existing.collected_at = now
-            existing.payload = item.payload
+            existing.payload = payload
             updated += 1
     return {'inserted': inserted, 'updated': updated, 'skipped': skipped}
 
@@ -115,6 +141,47 @@ def list_external_news_items(
             )
         rows = session.execute(stmt).all()
         return [_serialize(row, symbol=symbol, name_ko=name_ko, market=market) for row, symbol, name_ko, market in rows]
+
+
+def enrich_recent_external_news_classification(
+    *,
+    symbols: Sequence[str] | None = None,
+    lookback_days: int = 14,
+    limit: int = 1000,
+) -> dict[str, Any]:
+    since = _utcnow() - timedelta(days=lookback_days)
+    inspected = 0
+    updated = 0
+    with session_scope() as session:
+        stmt = (
+            select(ExternalNewsItem)
+            .join(Symbol, Symbol.id == ExternalNewsItem.symbol_id)
+            .where(or_(ExternalNewsItem.published_at.is_(None), ExternalNewsItem.published_at >= since))
+            .order_by(desc(ExternalNewsItem.published_at).nullslast(), desc(ExternalNewsItem.collected_at))
+            .limit(limit)
+        )
+        if symbols:
+            stmt = stmt.where(Symbol.symbol.in_(list(symbols)))
+        for row in session.execute(stmt).scalars().all():
+            inspected += 1
+            payload = dict(row.payload or {})
+            existing = payload.get('classification') if isinstance(payload.get('classification'), dict) else None
+            if existing and existing.get('classifier') == 'rule_based_external_news_v1':
+                continue
+            payload['classification'] = classify_external_news_item(
+                title=row.title,
+                description=row.description,
+                payload=payload,
+            )
+            row.payload = payload
+            updated += 1
+    return {
+        'status': 'ok',
+        'lookback_days': lookback_days,
+        'symbols': list(symbols or []),
+        'items_inspected': inspected,
+        'items_updated': updated,
+    }
 
 
 def list_recent_external_news_for_symbols(

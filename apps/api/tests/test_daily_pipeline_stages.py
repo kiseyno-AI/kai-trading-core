@@ -132,8 +132,13 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         self.assertIn('momentum_factors', payload['default_daily_stage_order'])
         self.assertIn('composite_factors', payload['default_daily_stage_order'])
         self.assertIn('external_news_collect', payload['default_daily_stage_order'])
+        self.assertIn('external_news_enrich', payload['default_daily_stage_order'])
         self.assertLess(
             payload['default_daily_stage_order'].index('external_news_collect'),
+            payload['default_daily_stage_order'].index('external_news_enrich'),
+        )
+        self.assertLess(
+            payload['default_daily_stage_order'].index('external_news_enrich'),
             payload['default_daily_stage_order'].index('signal_decider'),
         )
         self.assertIn('signal_decider', payload['default_daily_stage_order'])
@@ -191,6 +196,12 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             external_news_stage['depends_on'],
             ['market_risk_filter', 'piotroski_filter', *FACTOR_STAGE_ORDER],
         )
+        external_news_enrich_stage = next(
+            stage
+            for stage in payload['stages']
+            if stage['id'] == 'external_news_enrich'
+        )
+        self.assertEqual(external_news_enrich_stage['depends_on'], ['external_news_collect'])
         agent_feedback_stage = next(
             stage
             for stage in payload['stages']
@@ -198,9 +209,10 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         )
         self.assertEqual(
             agent_feedback_stage['depends_on'],
-            ['market_risk_filter', 'piotroski_filter', *FACTOR_STAGE_ORDER, 'external_news_collect'],
+            ['market_risk_filter', 'piotroski_filter', *FACTOR_STAGE_ORDER, 'external_news_collect', 'external_news_enrich'],
         )
         self.assertTrue(external_news_stage['default_selected'])
+        self.assertTrue(external_news_enrich_stage['default_selected'])
 
     def test_run_reorders_requested_subset_and_splits_feedback_stages(self) -> None:
         pykrx_runner = _FakePykrxStageRunner()
@@ -296,6 +308,7 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             ],
         )
         self.assertEqual(executed_stage_ids[13], 'external_news_collect')
+        self.assertEqual(executed_stage_ids[14], 'external_news_enrich')
 
     def test_run_gates_feedback_stage_until_prerequisites_are_ready(self) -> None:
         pykrx_runner = _FakePykrxStageRunner()

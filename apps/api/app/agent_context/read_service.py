@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from calendar import monthrange
+from collections import Counter
 from datetime import date, datetime
 from typing import Any, Sequence
 
@@ -1185,25 +1186,33 @@ def _build_recent_disclosures_freshness_provenance(
     disclosures: list[dict[str, Any]],
     requested_market_date: date,
     disclosures_limit: int,
+    storage_unavailable: bool = False,
 ) -> dict[str, Any]:
     latest_receipt_date = disclosures[0].get('receipt_date') if disclosures else None
     trade_date_relation = _trade_date_relation_to_request(
         as_of_market_date=latest_receipt_date,
         requested_market_date=requested_market_date,
     )
-    if not disclosures:
+    if storage_unavailable:
         freshness_status = FRESHNESS_STATUS_MISSING
+        provenance_status = 'storage_unavailable'
+        reason = 'dart_disclosure_storage_unavailable'
+    elif not disclosures:
+        freshness_status = FRESHNESS_STATUS_MISSING
+        provenance_status = PROVENANCE_STATUS_PROVIDER_SOURCED
         reason = 'no_recent_disclosures_up_to_request_date'
     elif trade_date_relation == 'same_market_date':
         freshness_status = FRESHNESS_STATUS_FRESH
+        provenance_status = PROVENANCE_STATUS_PROVIDER_SOURCED
         reason = None
     else:
         freshness_status = FRESHNESS_STATUS_AVAILABLE_BUT_OLD
+        provenance_status = PROVENANCE_STATUS_PROVIDER_SOURCED
         reason = 'latest_disclosure_precedes_request_date'
     return _build_freshness_provenance(
         requested_market_date=requested_market_date,
         freshness_status=freshness_status,
-        provenance_status=PROVENANCE_STATUS_PROVIDER_SOURCED,
+        provenance_status=provenance_status,
         source_tables=('dart_disclosure_events',),
         source_provider='dart',
         as_of_market_date=latest_receipt_date,
@@ -1215,6 +1224,54 @@ def _build_recent_disclosures_freshness_provenance(
             'limit_per_symbol': disclosures_limit,
         },
     )
+
+
+def _build_recent_dart_events_context(
+    *,
+    disclosures: list[dict[str, Any]],
+    fundamentals: dict[str, Any],
+    storage_unavailable: bool,
+) -> dict[str, Any]:
+    latest_snapshot = fundamentals.get('latest_snapshot') if isinstance(fundamentals, dict) else None
+    disclosure_context = (
+        fundamentals.get('disclosure_context')
+        if isinstance(fundamentals.get('disclosure_context'), dict)
+        else _build_disclosure_context(disclosures=disclosures, latest_snapshot=latest_snapshot)
+    )
+    if storage_unavailable:
+        status = 'unavailable'
+        reason = 'dart_disclosure_storage_unavailable'
+    elif disclosures:
+        status = 'available'
+        reason = None
+    else:
+        status = 'empty'
+        reason = 'no_recent_disclosures'
+    summary = dict(disclosure_context.get('summary') or {})
+    return {
+        'status': status,
+        'reason': reason,
+        'source': 'stored_dart_disclosure_events',
+        'item_count': len(disclosures),
+        'summary': summary,
+        'latest_snapshot_relation': disclosure_context.get('latest_snapshot_relation') or {},
+        'items': [
+            {
+                'rcept_no': item.get('rcept_no'),
+                'receipt_date': item.get('receipt_date'),
+                'report_nm': item.get('report_nm'),
+                'filing_category': item.get('filing_category'),
+                'is_financial_report': item.get('is_financial_report'),
+                'is_correction': item.get('is_correction'),
+                'is_ownership_related': item.get('is_ownership_related'),
+                'is_large_holder_related': item.get('is_large_holder_related'),
+                'is_audit_related': item.get('is_audit_related'),
+                'disclosure_tags': list(item.get('disclosure_tags') or []),
+                'fundamentals_capture_status': item.get('fundamentals_capture_status'),
+            }
+            for item in disclosures[:3]
+        ],
+    }
 
 
 def _build_quote_context(row: dict[str, Any] | None, *, market_date: date) -> dict[str, Any] | None:
@@ -1662,12 +1719,33 @@ def _build_recent_external_news_context(items: list[dict[str, Any]], *, provider
     else:
         status = 'empty'
         reason = 'no_recent_external_news_found'
+    limited_items = items[: settings.external_news_context_limit]
+    event_tag_counts = Counter(
+        tag
+        for item in limited_items
+        for tag in list(item.get('event_tags') or [])
+    )
+    sentiment_counts = Counter(
+        str(item.get('sentiment'))
+        for item in limited_items
+        if item.get('sentiment')
+    )
+    max_materiality = max(
+        (float(item.get('materiality_score') or 0.0) for item in limited_items),
+        default=None,
+    )
     return {
         'status': status,
         'reason': reason,
         'provider': provider_status,
         'lookback_days': settings.external_news_context_lookback_days,
         'item_count': len(items),
+        'classification_summary': {
+            'event_tag_counts': dict(event_tag_counts),
+            'sentiment_counts': dict(sentiment_counts),
+            'max_materiality_score': max_materiality,
+            'classifier': 'rule_based_external_news_v1' if limited_items else None,
+        },
         'items': [
             {
                 'provider': item.get('provider'),
@@ -1676,8 +1754,12 @@ def _build_recent_external_news_context(items: list[dict[str, Any]], *, provider
                 'url': item.get('url'),
                 'published_at': item.get('published_at'),
                 'collected_at': item.get('collected_at'),
+                'event_tags': list(item.get('event_tags') or []),
+                'sentiment': item.get('sentiment'),
+                'materiality_score': item.get('materiality_score'),
+                'materiality_bucket': item.get('materiality_bucket'),
             }
-            for item in items[: settings.external_news_context_limit]
+            for item in limited_items
         ],
     }
 
@@ -1835,19 +1917,28 @@ class AgentContextReadService:
             market_date=normalized_market_date,
             symbols=normalized_symbols,
         )
-        fundamentals_rows = self.fundamentals_repository.list_stored_fundamentals_summary(
-            stock_codes=normalized_symbols,
-            fs_div=normalized_fs_div,
-        )
+        dart_storage_unavailable = False
+        try:
+            fundamentals_rows = self.fundamentals_repository.list_stored_fundamentals_summary(
+                stock_codes=normalized_symbols,
+                fs_div=normalized_fs_div,
+            )
+        except SQLAlchemyError:
+            dart_storage_unavailable = True
+            fundamentals_rows = []
         latest_prior_rows = _load_latest_symbol_day_block_history(
             market_date=normalized_market_date,
             symbols=normalized_symbols,
         )
-        disclosures_by_symbol = self.disclosure_repository.list_recent_events_by_stock_codes(
-            stock_codes=normalized_symbols,
-            receipt_date_to=normalized_market_date,
-            limit_per_symbol=disclosures_limit,
-        )
+        try:
+            disclosures_by_symbol = self.disclosure_repository.list_recent_events_by_stock_codes(
+                stock_codes=normalized_symbols,
+                receipt_date_to=normalized_market_date,
+                limit_per_symbol=disclosures_limit,
+            )
+        except SQLAlchemyError:
+            dart_storage_unavailable = True
+            disclosures_by_symbol = {symbol: [] for symbol in normalized_symbols}
         external_news_provider_status = _external_news_provider_status()
         external_news_by_symbol: dict[str, list[dict[str, Any]]] = {}
         if external_news_provider_status.get('enabled'):
@@ -1989,6 +2080,18 @@ class AgentContextReadService:
             for family, row in persisted_factor_rows.items():
                 if row is not None:
                     factor_row_counts[family] += 1
+            fundamentals = _build_fundamentals_summary(
+                fundamentals_map.get(symbol, []),
+                market_date=normalized_market_date,
+            )
+            recent_disclosures = [
+                _serialize_disclosure(item) for item in disclosures_by_symbol.get(symbol, [])
+            ]
+            recent_dart_events = _build_recent_dart_events_context(
+                disclosures=recent_disclosures,
+                fundamentals=fundamentals,
+                storage_unavailable=dart_storage_unavailable,
+            )
             recent_external_news = _build_recent_external_news_context(
                 external_news_by_symbol.get(symbol, []),
                 provider_status=external_news_provider_status,
@@ -2021,19 +2124,17 @@ class AgentContextReadService:
                     valuation_context,
                     unavailable_reason='No persisted PyKRX valuation or foreign ownership row is available for the requested date.',
                 ),
+                'recent_dart_events': {
+                    'status': recent_dart_events.get('status'),
+                    'missing_fields': [] if recent_dart_events.get('status') == 'available' else ['items'],
+                    'unavailable_reason': recent_dart_events.get('reason'),
+                },
                 'recent_external_news': {
                     'status': recent_external_news.get('status'),
                     'missing_fields': [] if recent_external_news.get('status') == 'available' else ['items'],
                     'unavailable_reason': recent_external_news.get('reason'),
                 },
             }
-            fundamentals = _build_fundamentals_summary(
-                fundamentals_map.get(symbol, []),
-                market_date=normalized_market_date,
-            )
-            recent_disclosures = [
-                _serialize_disclosure(item) for item in disclosures_by_symbol.get(symbol, [])
-            ]
             disclosure_context = _build_disclosure_context(
                 disclosures=recent_disclosures,
                 latest_snapshot=fundamentals.get('latest_snapshot'),
@@ -2064,6 +2165,7 @@ class AgentContextReadService:
                 disclosures=recent_disclosures,
                 requested_market_date=normalized_market_date,
                 disclosures_limit=disclosures_limit,
+                storage_unavailable=dart_storage_unavailable,
             )
             recent_external_news_provenance = _build_external_news_freshness_provenance(
                 context=recent_external_news,
@@ -2234,6 +2336,7 @@ class AgentContextReadService:
                 'persisted_factor_rows': any(row is not None for row in persisted_factor_rows.values()),
                 'fundamentals': fundamentals['latest_snapshot'] is not None,
                 'recent_disclosures': bool(recent_disclosures),
+                'recent_dart_events': recent_dart_events.get('status') == 'available',
                 'recent_external_news': recent_external_news.get('status') == 'available',
             }
             if any(availability.values()):
@@ -2267,6 +2370,10 @@ class AgentContextReadService:
                         'items': recent_disclosures,
                         'freshness_provenance': recent_disclosures_provenance,
                     },
+                    'recent_dart_events': {
+                        **recent_dart_events,
+                        'freshness_provenance': recent_disclosures_provenance,
+                    },
                     'recent_external_news': {
                         **recent_external_news,
                         'freshness_provenance': recent_external_news_provenance,
@@ -2284,6 +2391,7 @@ class AgentContextReadService:
                         'valuation_context': valuation_context_provenance,
                         'fundamentals': fundamentals_provenance,
                         'recent_disclosures': recent_disclosures_provenance,
+                        'recent_dart_events': recent_disclosures_provenance,
                         'recent_external_news': recent_external_news_provenance,
                         'factor_rows': factor_row_provenance,
                     },
@@ -2375,6 +2483,16 @@ class AgentContextReadService:
             for item in items
             if str((item.get('valuation_context') or {}).get('status') or 'unavailable') == 'partial'
         )
+        recent_dart_events_available_count = sum(
+            1
+            for item in items
+            if str((item.get('recent_dart_events') or {}).get('status') or 'unavailable') == 'available'
+        )
+        recent_dart_events_unavailable_count = sum(
+            1
+            for item in items
+            if str((item.get('recent_dart_events') or {}).get('status') or 'unavailable') == 'unavailable'
+        )
         external_news_available_count = sum(
             1
             for item in items
@@ -2439,6 +2557,22 @@ class AgentContextReadService:
                 partial_count=valuation_partial_count,
                 requested_count=requested_symbol_count,
             ),
+            'recent_dart_events': {
+                'available_rows': recent_dart_events_available_count,
+                'partial_rows': 0,
+                'unavailable_rows': recent_dart_events_unavailable_count,
+                'empty_rows': requested_symbol_count - recent_dart_events_available_count - recent_dart_events_unavailable_count,
+                'coverage_ratio': _ratio(recent_dart_events_available_count, requested_symbol_count),
+                'coverage_status': (
+                    'complete'
+                    if recent_dart_events_available_count == requested_symbol_count and requested_symbol_count > 0
+                    else 'partial'
+                    if recent_dart_events_available_count > 0
+                    else 'unavailable'
+                    if recent_dart_events_unavailable_count == requested_symbol_count and requested_symbol_count > 0
+                    else 'missing'
+                ),
+            },
             'recent_external_news': {
                 'available_rows': external_news_available_count,
                 'partial_rows': 0,
@@ -2463,6 +2597,7 @@ class AgentContextReadService:
             item['context_provenance']['investor_flow_context']['requested_symbol_coverage'] = requested_symbol_coverage['investor_flow_context']
             item['context_provenance']['short_selling_context']['requested_symbol_coverage'] = requested_symbol_coverage['short_selling_context']
             item['context_provenance']['valuation_context']['requested_symbol_coverage'] = requested_symbol_coverage['valuation_context']
+            item['context_provenance']['recent_dart_events']['requested_symbol_coverage'] = requested_symbol_coverage['recent_dart_events']
             item['context_provenance']['recent_external_news']['requested_symbol_coverage'] = requested_symbol_coverage['recent_external_news']
             for family in PERSISTED_FACTOR_FAMILIES:
                 item['context_provenance']['factor_rows'][family]['requested_symbol_coverage'] = factor_row_coverage[family]
@@ -2496,6 +2631,9 @@ class AgentContextReadService:
                 ),
                 'recent_disclosure_symbol_count': sum(
                     1 for item in items if item['recent_disclosures']['count'] > 0
+                ),
+                'recent_dart_event_symbol_count': sum(
+                    1 for item in items if item['recent_dart_events']['status'] == 'available'
                 ),
                 'recent_external_news_symbol_count': sum(
                     1 for item in items if item['recent_external_news']['status'] == 'available'
