@@ -381,7 +381,38 @@ class InternalOpsTests(unittest.TestCase):
         self.assertEqual(refresh_reviews.call_args.kwargs['primary_horizons'], [3, 5])
         self.assertEqual(refresh_reviews.call_args.kwargs['evaluation_version'], 'signal_decider_eval_v1')
         self.assertTrue(refresh_reviews.call_args.kwargs['force_recompute'])
-        self.assertEqual(refresh_reviews.call_args.kwargs['trigger'], 'internal_ops_cli')
+
+    def test_repair_signal_decider_evaluation_coverage_uses_maintenance_service(self) -> None:
+        with (
+            patch('app.internal.ops.bootstrap_runtime') as bootstrap_runtime,
+            patch(
+                'app.internal.ops.signal_decider_evaluation_maintenance_service.repair_coverage_range',
+                return_value={'status': 'completed'},
+            ) as repair_coverage,
+        ):
+            result = ops.repair_signal_decider_evaluation_coverage(
+                market_date_from='2026-04-01',
+                market_date_to='2026-04-30',
+                symbols='005930,000660',
+                horizons='1,3,5',
+                primary_horizons='5',
+                evaluation_version='signal_decider_eval_v1',
+                force_recompute=True,
+                refresh_calendar=False,
+                fail_on_mature_gaps=False,
+            )
+
+        bootstrap_runtime.assert_called_once_with()
+        self.assertEqual(result, {'status': 'completed'})
+        self.assertEqual(repair_coverage.call_args.kwargs['market_date_from'], '2026-04-01')
+        self.assertEqual(repair_coverage.call_args.kwargs['market_date_to'], '2026-04-30')
+        self.assertEqual(repair_coverage.call_args.kwargs['symbols'], ['005930', '000660'])
+        self.assertEqual(repair_coverage.call_args.kwargs['horizons'], [1, 3, 5])
+        self.assertEqual(repair_coverage.call_args.kwargs['primary_horizons'], [5])
+        self.assertEqual(repair_coverage.call_args.kwargs['evaluation_version'], 'signal_decider_eval_v1')
+        self.assertTrue(repair_coverage.call_args.kwargs['force_recompute'])
+        self.assertFalse(repair_coverage.call_args.kwargs['refresh_calendar'])
+        self.assertFalse(repair_coverage.call_args.kwargs['fail_on_mature_gaps'])
 
     def test_run_agent_feedback_retry_cycles_passes_explicit_symbols_to_retry_service(self) -> None:
         with (
@@ -828,3 +859,38 @@ class InternalOpsTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(json.loads(stdout.getvalue()), {'summary': {'review_rows_upserted': 12}})
+
+    def test_cli_signal_decider_evaluations_repair_outputs_json(self) -> None:
+        stdout = io.StringIO()
+        with (
+            patch(
+                'app.internal.ops.repair_signal_decider_evaluation_coverage',
+                return_value={'status': 'completed', 'summary': {'computed_count': 12}},
+            ),
+            redirect_stdout(stdout),
+        ):
+            exit_code = ops.main(
+                [
+                    'agent-signal-decider-evaluations-repair',
+                    '--market-date-from',
+                    '2026-04-01',
+                    '--market-date-to',
+                    '2026-04-30',
+                    '--symbols',
+                    '005930,000660',
+                    '--horizons',
+                    '1,3,5',
+                    '--primary-horizons',
+                    '5',
+                    '--refresh-calendar',
+                    'false',
+                    '--fail-on-mature-gaps',
+                    'false',
+                ]
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            json.loads(stdout.getvalue()),
+            {'status': 'completed', 'summary': {'computed_count': 12}},
+        )

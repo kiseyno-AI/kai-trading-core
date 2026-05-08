@@ -4,6 +4,7 @@ from copy import deepcopy
 from datetime import date
 from typing import Any
 import unittest
+from unittest.mock import patch
 
 from app.agent_context.signal_decider_calendar_review_service import SignalDeciderCalendarReviewService
 from app.agent_context.signal_decider_loop_service import SignalDeciderLoopRepository, SignalDeciderLoopService
@@ -307,6 +308,28 @@ class SignalDeciderCalendarReviewServiceTests(unittest.TestCase):
         self.assertEqual(self.loop_service.compute_args['horizons'], [1, 3, 5])
         self.assertEqual(sorted(item['primary_horizon_days'] for item in self.repository.items.values()), [3, 5])
         self.assertEqual(result['run']['status'], 'completed')
+
+    def test_refresh_recent_reviews_forwards_suppressed_evaluation_refresh(self) -> None:
+        evaluation_summary = {'computed_count': 3, 'not_computed_count': 0}
+
+        with patch.object(self.service, 'refresh_reviews', return_value={'summary': {'review_rows_upserted': 1}}) as refresh_reviews:
+            result = self.service.refresh_recent_reviews(
+                as_of_market_date='2026-04-30',
+                lookback_days=7,
+                horizons=[1, 3, 5],
+                primary_horizons=[5],
+                evaluation_version='signal_decider_eval_test',
+                force_recompute=True,
+                trigger='test_runner',
+                refresh_evaluations=False,
+                evaluation_refresh_summary=evaluation_summary,
+            )
+
+        self.assertEqual(result, {'summary': {'review_rows_upserted': 1}})
+        self.assertEqual(refresh_reviews.call_args.kwargs['market_date_from'], date.fromisoformat('2026-04-23'))
+        self.assertEqual(refresh_reviews.call_args.kwargs['market_date_to'], date.fromisoformat('2026-04-30'))
+        self.assertFalse(refresh_reviews.call_args.kwargs['refresh_evaluations'])
+        self.assertEqual(refresh_reviews.call_args.kwargs['evaluation_refresh_summary'], evaluation_summary)
 
     def test_get_review_calendar_reads_persisted_rows(self) -> None:
         self.service.refresh_recent_reviews(

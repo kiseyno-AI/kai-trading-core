@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from datetime import datetime, timedelta, timezone
 from unittest import IsolatedAsyncioTestCase, TestCase
 from unittest.mock import ANY, AsyncMock, patch
@@ -483,70 +483,105 @@ class PykrxBackfillServiceTests(TestCase):
     def test_run_collection_always_chains_fundamentals_for_daily_auto(self, evaluation_followup) -> None:
         service = PykrxBackfillService()
 
-        with (
-            patch('app.eod.pykrx_backfill.settings.dart_api_key', 'test-dart-key'),
-            patch.object(
-                service,
-                'load_active_universe',
-                return_value=[PykrxSymbol(symbol='005930', market='KOSPI', name_ko='Samsung Electronics')],
-            ),
-            patch.object(service, 'resolve_latest_trade_date', return_value='2026-04-03'),
-            patch.object(service, '_load_symbol_fundamentals', return_value=None),
-            patch.object(service, '_map_symbol_bars', return_value=[{
-                'trade_date': '2026-04-03',
-                'open_price': 1,
-                'high_price': 2,
-                'low_price': 1,
-                'close_price': 2,
-                'volume': 3,
-                'turnover': 4,
-            }]),
-            patch('app.eod.pykrx_backfill.create_eod_collection_run', return_value=12),
-            patch('app.eod.pykrx_backfill._get_market_ohlcv_by_date', return_value=SimpleNamespace(empty=False)),
-            patch('app.eod.pykrx_backfill.persist_daily_price_bars', return_value=1),
-            patch('app.eod.pykrx_backfill.update_eod_collection_run_progress'),
-            patch(
-                'app.eod.pykrx_backfill.daily_price_context_service.rebuild_for_market_date',
-                return_value={'contexts_persisted': 1, 'contexts_failed': 0},
-            ),
-            patch(
-                'app.eod.pykrx_backfill.daily_technical_snapshot_service.rebuild_for_market_date',
-                return_value={'snapshots_persisted': 1, 'snapshots_failed': 0},
-            ),
-            patch(
-                'app.eod.pykrx_backfill.daily_action_summary_service.rebuild_for_market_date',
-                return_value={'action_summaries_persisted': 1, 'action_summaries_failed': 0},
-            ),
-            patch(
-                'app.eod.pykrx_backfill.compute_and_persist_daily_trending_ranks',
-                return_value={'trending_ranks_persisted': 3},
-            ),
-            patch(
-                'app.eod.pykrx_backfill.daily_signal_feature_service.refresh_for_market_date',
-                return_value={'features_persisted': 0, 'features_failed': 0, 'sources': [], 'source_counts': {}},
-            ),
-            patch(
-                'app.eod.pykrx_backfill.daily_market_risk_filter_service.rebuild_for_market_date',
-                return_value={'results_persisted': 1, 'results_failed': 0, 'summary': {'passed_count': 1, 'watchlist_count': 0}},
-            ),
-            patch(
-                'app.eod.pykrx_backfill.dart_fundamentals_capture_service.run_daily_incremental_refresh',
-                return_value={'status': 'completed', 'trigger': 'eod_pykrx_followup'},
-            ) as fundamentals_refresh,
-            patch(
-                'app.eod.pykrx_pipeline_runner._run_daily_factor_followup',
-                return_value={'triggered': True, 'status': 'completed', 'stages': {}},
-            ) as factor_followup,
-            patch(
-                'app.eod.pykrx_pipeline_runner._run_daily_external_news_followup',
-                return_value={'triggered': True, 'status': 'disabled', 'reason': 'naver_search_credentials_missing'},
-            ) as external_news_followup,
-            patch(
-                'app.eod.pykrx_pipeline_runner._run_daily_feedback_followup',
-                return_value={'triggered': True, 'status': 'completed'},
-            ) as feedback_followup,
-            patch('app.eod.pykrx_backfill.complete_eod_collection_run'),
-        ):
+        with ExitStack() as stack:
+            stack.enter_context(patch('app.eod.pykrx_backfill.settings.dart_api_key', 'test-dart-key'))
+            stack.enter_context(
+                patch.object(
+                    service,
+                    'load_active_universe',
+                    return_value=[PykrxSymbol(symbol='005930', market='KOSPI', name_ko='Samsung Electronics')],
+                )
+            )
+            stack.enter_context(patch.object(service, 'resolve_latest_trade_date', return_value='2026-04-03'))
+            stack.enter_context(patch.object(service, '_load_symbol_fundamentals', return_value=None))
+            stack.enter_context(
+                patch.object(
+                    service,
+                    '_map_symbol_bars',
+                    return_value=[{
+                        'trade_date': '2026-04-03',
+                        'open_price': 1,
+                        'high_price': 2,
+                        'low_price': 1,
+                        'close_price': 2,
+                        'volume': 3,
+                        'turnover': 4,
+                    }],
+                )
+            )
+            stack.enter_context(patch('app.eod.pykrx_backfill.create_eod_collection_run', return_value=12))
+            stack.enter_context(
+                patch('app.eod.pykrx_backfill._get_market_ohlcv_by_date', return_value=SimpleNamespace(empty=False))
+            )
+            stack.enter_context(patch('app.eod.pykrx_backfill.persist_daily_price_bars', return_value=1))
+            stack.enter_context(patch('app.eod.pykrx_backfill.update_eod_collection_run_progress'))
+            stack.enter_context(
+                patch(
+                    'app.eod.pykrx_backfill.daily_price_context_service.rebuild_for_market_date',
+                    return_value={'contexts_persisted': 1, 'contexts_failed': 0},
+                )
+            )
+            stack.enter_context(
+                patch(
+                    'app.eod.pykrx_backfill.daily_technical_snapshot_service.rebuild_for_market_date',
+                    return_value={'snapshots_persisted': 1, 'snapshots_failed': 0},
+                )
+            )
+            stack.enter_context(
+                patch(
+                    'app.eod.pykrx_backfill.daily_action_summary_service.rebuild_for_market_date',
+                    return_value={'action_summaries_persisted': 1, 'action_summaries_failed': 0},
+                )
+            )
+            stack.enter_context(
+                patch(
+                    'app.eod.pykrx_backfill.compute_and_persist_daily_trending_ranks',
+                    return_value={'trending_ranks_persisted': 3},
+                )
+            )
+            stack.enter_context(
+                patch(
+                    'app.eod.pykrx_backfill.daily_signal_feature_service.refresh_for_market_date',
+                    return_value={'features_persisted': 0, 'features_failed': 0, 'sources': [], 'source_counts': {}},
+                )
+            )
+            stack.enter_context(
+                patch(
+                    'app.eod.pykrx_backfill.daily_market_risk_filter_service.rebuild_for_market_date',
+                    return_value={'results_persisted': 1, 'results_failed': 0, 'summary': {'passed_count': 1, 'watchlist_count': 0}},
+                )
+            )
+            fundamentals_refresh = stack.enter_context(
+                patch(
+                    'app.eod.pykrx_backfill.dart_fundamentals_capture_service.run_daily_incremental_refresh',
+                    return_value={'status': 'completed', 'trigger': 'eod_pykrx_followup'},
+                )
+            )
+            factor_followup = stack.enter_context(
+                patch(
+                    'app.eod.pykrx_pipeline_runner._run_daily_factor_followup',
+                    return_value={'triggered': True, 'status': 'completed', 'stages': {}},
+                )
+            )
+            external_news_followup = stack.enter_context(
+                patch(
+                    'app.eod.pykrx_pipeline_runner._run_daily_external_news_followup',
+                    return_value={'triggered': True, 'status': 'disabled', 'reason': 'naver_search_credentials_missing'},
+                )
+            )
+            feedback_followup = stack.enter_context(
+                patch(
+                    'app.eod.pykrx_pipeline_runner._run_daily_feedback_followup',
+                    return_value={'triggered': True, 'status': 'completed'},
+                )
+            )
+            evaluation_followup = stack.enter_context(
+                patch(
+                    'app.eod.pykrx_pipeline_runner._run_daily_signal_decider_evaluation_followup',
+                    return_value={'triggered': True, 'status': 'completed', 'summary': {'computed_count': 4}},
+                )
+            )
+            stack.enter_context(patch('app.eod.pykrx_backfill.complete_eod_collection_run'))
             result = service._run_market_data_pipeline(
                 start_date='20260403',
                 end_date='20260403',
@@ -585,7 +620,7 @@ class PykrxBackfillServiceTests(TestCase):
         )
         self.assertEqual(
             result['signal_decider_evaluation_followup'],
-            {'triggered': True, 'summary': {'not_computed_count': 0}},
+            {'triggered': True, 'status': 'completed', 'summary': {'computed_count': 4}},
         )
 
     def test_run_collection_daily_auto_rebuilds_price_contexts_when_selected_stages_are_explicit(self) -> None:
@@ -669,57 +704,84 @@ class PykrxBackfillServiceTests(TestCase):
     def test_run_collection_skips_fundamentals_followup_when_dart_is_not_configured(self, evaluation_followup) -> None:
         service = PykrxBackfillService()
 
-        with (
-            patch('app.eod.pykrx_backfill.settings.dart_api_key', ''),
-            patch.object(
-                service,
-                'load_active_universe',
-                return_value=[PykrxSymbol(symbol='005930', market='KOSPI', name_ko='Samsung Electronics')],
-            ),
-            patch.object(service, 'resolve_latest_trade_date', return_value='2026-04-03'),
-            patch.object(service, '_load_symbol_fundamentals', return_value=None),
-            patch.object(service, '_map_symbol_bars', return_value=[{
-                'trade_date': '2026-04-03',
-                'open_price': 1,
-                'high_price': 2,
-                'low_price': 1,
-                'close_price': 2,
-                'volume': 3,
-                'turnover': 4,
-            }]),
-            patch('app.eod.pykrx_backfill.create_eod_collection_run', return_value=12),
-            patch('app.eod.pykrx_backfill._get_market_ohlcv_by_date', return_value=SimpleNamespace(empty=False)),
-            patch('app.eod.pykrx_backfill.persist_daily_price_bars', return_value=1),
-            patch('app.eod.pykrx_backfill.update_eod_collection_run_progress'),
-            patch(
-                'app.eod.pykrx_backfill.daily_price_context_service.rebuild_for_market_date',
-                return_value={'contexts_persisted': 1, 'contexts_failed': 0},
-            ),
-            patch(
-                'app.eod.pykrx_backfill.daily_technical_snapshot_service.rebuild_for_market_date',
-                return_value={'snapshots_persisted': 1, 'snapshots_failed': 0},
-            ),
-            patch(
-                'app.eod.pykrx_backfill.daily_action_summary_service.rebuild_for_market_date',
-                return_value={'action_summaries_persisted': 1, 'action_summaries_failed': 0},
-            ),
-            patch(
-                'app.eod.pykrx_backfill.compute_and_persist_daily_trending_ranks',
-                return_value={'trending_ranks_persisted': 3},
-            ),
-            patch(
-                'app.eod.pykrx_backfill.daily_signal_feature_service.refresh_for_market_date',
-                return_value={'features_persisted': 0, 'features_failed': 0, 'sources': [], 'source_counts': {}},
-            ),
-            patch(
-                'app.eod.pykrx_backfill.daily_market_risk_filter_service.rebuild_for_market_date',
-                return_value={'results_persisted': 1, 'results_failed': 0, 'summary': {'passed_count': 1, 'watchlist_count': 0}},
-            ),
-            patch(
-                'app.eod.pykrx_backfill.dart_fundamentals_capture_service.run_daily_incremental_refresh',
-            ) as fundamentals_refresh,
-            patch('app.eod.pykrx_backfill.complete_eod_collection_run'),
-        ):
+        with ExitStack() as stack:
+            stack.enter_context(patch('app.eod.pykrx_backfill.settings.dart_api_key', ''))
+            stack.enter_context(
+                patch.object(
+                    service,
+                    'load_active_universe',
+                    return_value=[PykrxSymbol(symbol='005930', market='KOSPI', name_ko='Samsung Electronics')],
+                )
+            )
+            stack.enter_context(patch.object(service, 'resolve_latest_trade_date', return_value='2026-04-03'))
+            stack.enter_context(patch.object(service, '_load_symbol_fundamentals', return_value=None))
+            stack.enter_context(
+                patch.object(
+                    service,
+                    '_map_symbol_bars',
+                    return_value=[{
+                        'trade_date': '2026-04-03',
+                        'open_price': 1,
+                        'high_price': 2,
+                        'low_price': 1,
+                        'close_price': 2,
+                        'volume': 3,
+                        'turnover': 4,
+                    }],
+                )
+            )
+            stack.enter_context(patch('app.eod.pykrx_backfill.create_eod_collection_run', return_value=12))
+            stack.enter_context(
+                patch('app.eod.pykrx_backfill._get_market_ohlcv_by_date', return_value=SimpleNamespace(empty=False))
+            )
+            stack.enter_context(patch('app.eod.pykrx_backfill.persist_daily_price_bars', return_value=1))
+            stack.enter_context(patch('app.eod.pykrx_backfill.update_eod_collection_run_progress'))
+            stack.enter_context(
+                patch(
+                    'app.eod.pykrx_backfill.daily_price_context_service.rebuild_for_market_date',
+                    return_value={'contexts_persisted': 1, 'contexts_failed': 0},
+                )
+            )
+            stack.enter_context(
+                patch(
+                    'app.eod.pykrx_backfill.daily_technical_snapshot_service.rebuild_for_market_date',
+                    return_value={'snapshots_persisted': 1, 'snapshots_failed': 0},
+                )
+            )
+            stack.enter_context(
+                patch(
+                    'app.eod.pykrx_backfill.daily_action_summary_service.rebuild_for_market_date',
+                    return_value={'action_summaries_persisted': 1, 'action_summaries_failed': 0},
+                )
+            )
+            stack.enter_context(
+                patch(
+                    'app.eod.pykrx_backfill.compute_and_persist_daily_trending_ranks',
+                    return_value={'trending_ranks_persisted': 3},
+                )
+            )
+            stack.enter_context(
+                patch(
+                    'app.eod.pykrx_backfill.daily_signal_feature_service.refresh_for_market_date',
+                    return_value={'features_persisted': 0, 'features_failed': 0, 'sources': [], 'source_counts': {}},
+                )
+            )
+            stack.enter_context(
+                patch(
+                    'app.eod.pykrx_backfill.daily_market_risk_filter_service.rebuild_for_market_date',
+                    return_value={'results_persisted': 1, 'results_failed': 0, 'summary': {'passed_count': 1, 'watchlist_count': 0}},
+                )
+            )
+            fundamentals_refresh = stack.enter_context(
+                patch('app.eod.pykrx_backfill.dart_fundamentals_capture_service.run_daily_incremental_refresh')
+            )
+            evaluation_followup = stack.enter_context(
+                patch(
+                    'app.eod.pykrx_pipeline_runner._run_daily_signal_decider_evaluation_followup',
+                    return_value={'triggered': True, 'status': 'warning', 'summary': {'not_computed_count': 1}},
+                )
+            )
+            stack.enter_context(patch('app.eod.pykrx_backfill.complete_eod_collection_run'))
             result = service._run_market_data_pipeline(
                 start_date='20260403',
                 end_date='20260403',
@@ -750,7 +812,7 @@ class PykrxBackfillServiceTests(TestCase):
         evaluation_followup.assert_called_once_with(market_date='2026-04-03', enabled=True)
         self.assertEqual(
             result['signal_decider_evaluation_followup'],
-            {'triggered': True, 'summary': {'not_computed_count': 0}},
+            {'triggered': True, 'status': 'warning', 'summary': {'not_computed_count': 1}},
         )
         fundamentals_refresh.assert_not_called()
 

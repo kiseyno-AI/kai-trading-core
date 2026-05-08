@@ -2055,6 +2055,61 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
         self.assertEqual(result['request']['lookback_days'], DEFAULT_SIGNAL_DECIDER_EVALUATION_LOOKBACK_DAYS)
         self.assertEqual(result['request']['as_of_market_date'], '2026-04-30')
 
+    def test_compute_recent_evaluations_backfills_mature_short_horizons_while_keeping_5d_pending(self):
+        repository = FakeSignalDeciderLoopRepository(
+            [
+                _feedback_row(
+                    feedback_id=1,
+                    snapshot_id=101,
+                    market_date='2026-04-30',
+                    symbol='005930',
+                    action='buy',
+                    target_price=110,
+                    stop_loss_price=95,
+                )
+            ]
+        )
+        service = SignalDeciderLoopService(repository=repository)
+
+        future_bars = [
+            {'trade_date': '2026-04-30', 'open_price': 99, 'high_price': 100, 'low_price': 98, 'close_price': 99, 'volume': 1000},
+            {'trade_date': '2026-05-04', 'open_price': 100, 'high_price': 103, 'low_price': 99, 'close_price': 102, 'volume': 1000},
+            {'trade_date': '2026-05-06', 'open_price': 102, 'high_price': 106, 'low_price': 101, 'close_price': 105, 'volume': 1000},
+            {'trade_date': '2026-05-07', 'open_price': 105, 'high_price': 108, 'low_price': 104, 'close_price': 107, 'volume': 1000},
+            {'trade_date': '2026-05-08', 'open_price': 107, 'high_price': 109, 'low_price': 106, 'close_price': 108, 'volume': 1000},
+        ]
+        latest_bar = [future_bars[-1]]
+
+        def fake_load(symbol, **kwargs):
+            self.assertEqual(symbol, '005930')
+            if kwargs.get('limit') == 1 and kwargs.get('prefer_recent_limit', True):
+                return latest_bar
+            return future_bars
+
+        with patch(
+            'app.agent_context.signal_decider_loop_service.load_daily_bars_for_symbol_range',
+            side_effect=fake_load,
+        ):
+            result = service.compute_recent_evaluations(
+                as_of_market_date='2026-05-08',
+                lookback_days=14,
+                horizons=[1, 3, 5],
+                evaluation_version='signal_decider_eval_test',
+            )
+
+        self.assertEqual(result['summary']['status'], 'completed')
+        self.assertEqual(result['summary']['computed_count'], 2)
+        self.assertEqual(result['summary']['pending_maturity_count'], 1)
+        self.assertEqual(result['summary']['insufficient_price_data_count'], 0)
+        self.assertEqual(result['summary']['not_computed_count'], 0)
+        self.assertEqual(result['summary']['warning_count'], 0)
+        item = result['items'][0]
+        evaluations = {entry['horizon_days']: entry for entry in item['evaluations']}
+        self.assertEqual(evaluations[1]['status_reason'], 'computed')
+        self.assertEqual(evaluations[3]['status_reason'], 'computed')
+        self.assertEqual(evaluations[5]['status_reason'], 'pending_maturity')
+        self.assertEqual(evaluations[5]['evaluation_status'], 'pending')
+
     def test_get_aggregate_diagnostics_summarizes_horizon_metrics_and_contributors(self):
         repository = FakeSignalDeciderLoopRepository(
             [

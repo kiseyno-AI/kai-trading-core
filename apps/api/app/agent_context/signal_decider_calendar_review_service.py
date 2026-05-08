@@ -439,6 +439,8 @@ class SignalDeciderCalendarReviewService:
         trigger: str = 'manual',
         as_of_market_date: str | date | None = None,
         lookback_days: int | None = None,
+        refresh_evaluations: bool = True,
+        evaluation_refresh_summary: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         normalized_from = _normalize_market_date(market_date_from)
         normalized_to = _normalize_market_date(market_date_to)
@@ -467,14 +469,18 @@ class SignalDeciderCalendarReviewService:
         )
         run_id = int(run['id'])
         try:
-            evaluation_result = self.loop_service.compute_evaluations(
-                market_date_from=normalized_from,
-                market_date_to=normalized_to,
-                symbols=normalized_symbols,
-                horizons=normalized_horizons,
-                evaluation_version=resolved_version,
-                force_recompute=force_recompute,
-            )
+            if refresh_evaluations:
+                evaluation_result = self.loop_service.compute_evaluations(
+                    market_date_from=normalized_from,
+                    market_date_to=normalized_to,
+                    symbols=normalized_symbols,
+                    horizons=normalized_horizons,
+                    evaluation_version=resolved_version,
+                    force_recompute=force_recompute,
+                )
+                resolved_evaluation_summary = dict(evaluation_result.get('summary') or {})
+            else:
+                resolved_evaluation_summary = dict(evaluation_refresh_summary or {})
             snapshot_rows = self.loop_service.repository.list_decision_snapshots(
                 market_date_from=normalized_from,
                 market_date_to=normalized_to,
@@ -505,7 +511,7 @@ class SignalDeciderCalendarReviewService:
                 'decision_count': len(snapshot_rows),
                 'review_rows_upserted': len(persisted_items),
                 'primary_horizon_count': len(normalized_primary_horizons),
-                'evaluation_refresh': evaluation_result.get('summary') or {},
+                'evaluation_refresh': resolved_evaluation_summary,
             }
             finished_run = self.repository.finish_run(
                 run_id=run_id,
@@ -548,6 +554,8 @@ class SignalDeciderCalendarReviewService:
         evaluation_version: str | None = None,
         force_recompute: bool = False,
         trigger: str = 'manual',
+        refresh_evaluations: bool = True,
+        evaluation_refresh_summary: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         normalized_as_of_market_date = _normalize_market_date(as_of_market_date)
         resolved_lookback_days = max(1, int(lookback_days))
@@ -563,6 +571,8 @@ class SignalDeciderCalendarReviewService:
             evaluation_version=evaluation_version,
             force_recompute=force_recompute,
             trigger=trigger,
+            refresh_evaluations=refresh_evaluations,
+            evaluation_refresh_summary=evaluation_refresh_summary,
         )
 
     def inspect_maintenance(

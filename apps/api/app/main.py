@@ -25,6 +25,9 @@ from app.api.routes_symbols import router as symbols_router
 from app.api.routes_portfolio import router as portfolio_router
 from app.api.routes_trading_accounts import router as trading_accounts_router
 from app.api.routes_trading import router as trading_router
+from app.agent_context.signal_decider_evaluation_maintenance_service import (
+    signal_decider_evaluation_maintenance_service,
+)
 from app.core.audit_logging import (
     build_api_request_event,
     configure_file_logging,
@@ -67,6 +70,16 @@ async def lifespan(_: FastAPI):
         await portfolio_summary_service.refresh_portfolio_summary_if_due(trigger='startup', force=True)
     except Exception as exc:
         logger.warning('Portfolio summary startup refresh failed; serving cache when available: %s', exc)
+    try:
+        await asyncio.to_thread(
+            signal_decider_evaluation_maintenance_service.refresh_latest_stored_coverage,
+            trigger='startup',
+        )
+    except Exception as exc:
+        logger.warning(
+            'Signal-decider evaluation startup refresh failed; recent review coverage may stay stale: %s',
+            exc,
+        )
     await background_runner.start()
     try:
         yield
