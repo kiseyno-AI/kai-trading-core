@@ -146,6 +146,21 @@ class RepairJsonTailTests(unittest.TestCase):
                         'quote_spread_points': 100,
                     },
                 },
+                'decider_data_quality_context': {
+                    'status': 'partial',
+                    'blocks': {
+                        'liquidity_turnover': {
+                            'status': 'partial',
+                            'turnover': {'status': 'partial', 'turnover_source': 'derived'},
+                        },
+                        'disclosures_news': {
+                            'status': 'provider_error',
+                            'providers': {
+                                'external_news': {'status': 'provider_error', 'reason': 'naver_search_credentials_missing'}
+                            },
+                        },
+                    },
+                },
                 'persisted_factor_rows': {
                     'value': {'value_score': 0.92, 'value_status': 'scored'},
                 },
@@ -157,6 +172,11 @@ class RepairJsonTailTests(unittest.TestCase):
         self.assertEqual(trimmed['factor_summary']['signal_features']['row_kind'], 'direct_plus_fallback')
         self.assertEqual(trimmed['liquidity_context']['turnover']['status'], 'derived')
         self.assertEqual(trimmed['liquidity_context']['intraday']['quote_spread_points'], 100)
+        self.assertEqual(trimmed['decider_data_quality_context']['status'], 'partial')
+        self.assertEqual(
+            trimmed['decider_data_quality_context']['blocks']['disclosures_news']['providers']['external_news']['status'],
+            'provider_error',
+        )
 
 
 class FakeFuture:
@@ -252,6 +272,40 @@ class DeciderReadyAgentContextReadService:
                             'status': 'partial',
                             'quote_spread_points': 100,
                             'quote_balance_rank': 5,
+                        },
+                    },
+                    'decider_data_quality_context': {
+                        'status': 'partial',
+                        'blocks': {
+                            'liquidity_turnover': {
+                                'status': 'available',
+                                'turnover': {
+                                    'status': 'available',
+                                    'turnover_source': 'provider',
+                                },
+                                'intraday_liquidity': {
+                                    'status': 'partial',
+                                    'quote_balance_rank': 5,
+                                },
+                            },
+                            'financials_cashflow': {
+                                'status': 'partial',
+                                'available_core_fields': ['current_assets', 'operating_cash_flow'],
+                                'missing_core_fields': ['financing_cash_flow'],
+                            },
+                            'disclosures_news': {
+                                'status': 'partial',
+                                'providers': {
+                                    'dart_recent_events': {
+                                        'status': 'available',
+                                        'item_count': 1,
+                                    },
+                                    'external_news': {
+                                        'status': 'provider_error',
+                                        'reason': 'naver_search_credentials_missing',
+                                    },
+                                },
+                            },
                         },
                     },
                     'technical_snapshot': {'trend_state': 'uptrend'},
@@ -1259,6 +1313,11 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         short_term_payload = next(payload for payload in client.decider_payloads if payload['role'] == 'short-term-decider')
         self.assertEqual(short_term_payload['orchestration']['request_model'], 'openclaw/short-term-decider')
         self.assertIn('trigger_price', short_term_payload['output_contract']['required_feedback_fields'])
+        self.assertEqual(short_term_payload['decider_data_quality_context']['status'], 'partial')
+        self.assertEqual(
+            short_term_payload['decider_data_quality_context']['blocks']['disclosures_news']['providers']['external_news']['status'],
+            'provider_error',
+        )
         decider_payload = next(payload for payload in client.decider_payloads if payload['role'] == 'signal-decider')
         self.assertEqual(decider_payload['upstream_summaries']['eod-summarizer']['details']['breadth_context']['market_bias'], 'constructive')
         self.assertEqual(
@@ -1277,12 +1336,22 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertEqual(decider_payload['factor_summary']['signal_features']['status'], 'missing_source_row')
         self.assertEqual(decider_payload['liquidity_context']['turnover']['status'], 'available')
         self.assertEqual(decider_payload['liquidity_context']['intraday']['quote_balance_rank'], 5)
+        self.assertEqual(decider_payload['decider_data_quality_context']['status'], 'partial')
+        self.assertEqual(
+            decider_payload['decider_data_quality_context']['blocks']['liquidity_turnover']['turnover']['turnover_source'],
+            'provider',
+        )
+        self.assertEqual(
+            decider_payload['decider_data_quality_context']['blocks']['disclosures_news']['providers']['external_news']['status'],
+            'provider_error',
+        )
         self.assertEqual(decider_payload['market_context']['status'], 'ready')
         self.assertEqual(decider_payload['market_context']['summary']['market_bias'], 'risk_on')
         self.assertEqual(decider_payload['market_context']['indices']['kospi']['level'], 2642.07)
         self.assertNotIn('scores', decider_payload['symbol_day_context'])
         self.assertNotIn('factor_summary', decider_payload['symbol_day_context'])
         self.assertNotIn('liquidity_context', decider_payload['symbol_day_context'])
+        self.assertNotIn('decider_data_quality_context', decider_payload['symbol_day_context'])
         self.assertEqual(decider_payload['symbol_day_context']['market_relative_context']['relative_strength']['return_percentile'], 0.95)
         self.assertEqual(decider_payload['symbol_day_context']['persisted_factor_rows']['advanced_value']['advanced_value_classification'], 'eligible')
         self.assertEqual(decider_payload['symbol_day_context']['context_completeness']['sector_peer_mapping']['status'], 'unavailable')

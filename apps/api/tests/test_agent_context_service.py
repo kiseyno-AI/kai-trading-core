@@ -984,6 +984,19 @@ class AgentContextReadServiceTests(unittest.TestCase):
         self.assertEqual(first_item['liquidity_context']['intraday']['status'], 'partial')
         self.assertEqual(first_item['liquidity_context']['intraday']['quote_spread_points'], 100)
         self.assertEqual(first_item['liquidity_context']['intraday']['quote_balance_rank'], 5)
+        self.assertEqual(first_item['decider_data_quality_context']['status'], 'partial')
+        self.assertEqual(
+            first_item['decider_data_quality_context']['blocks']['liquidity_turnover']['status'],
+            'available',
+        )
+        self.assertEqual(
+            first_item['decider_data_quality_context']['blocks']['liquidity_turnover']['turnover']['status'],
+            'available',
+        )
+        self.assertEqual(
+            first_item['decider_data_quality_context']['blocks']['intraday_realtime']['status'],
+            'partial',
+        )
         self.assertEqual(first_item['intraday_execution_context']['status'], 'partial')
         self.assertEqual(first_item['intraday_execution_context']['quote']['spread_points'], 100)
         self.assertAlmostEqual(first_item['intraday_execution_context']['orderbook']['imbalance'], 0.076923, places=6)
@@ -1076,6 +1089,10 @@ class AgentContextReadServiceTests(unittest.TestCase):
             'dart',
         )
         self.assertEqual(first_item['fundamentals']['freshness_provenance']['freshness_status'], 'available_but_old')
+        self.assertIn(
+            'operating_cash_flow',
+            first_item['decider_data_quality_context']['blocks']['financials_cashflow']['available_core_fields'],
+        )
         self.assertEqual(first_item['recent_disclosures']['count'], 2)
         self.assertEqual(first_item['recent_disclosures']['freshness_provenance']['freshness_status'], 'available_but_old')
         self.assertEqual(first_item['recent_disclosures']['items'][0]['is_correction'], True)
@@ -1100,6 +1117,18 @@ class AgentContextReadServiceTests(unittest.TestCase):
         self.assertEqual(
             first_item['context_provenance']['intraday_execution_context']['requested_symbol_coverage']['partial_rows'],
             1,
+        )
+        self.assertEqual(
+            first_item['decider_data_quality_context']['blocks']['technical_evidence']['support_price'],
+            68000.0,
+        )
+        self.assertEqual(
+            first_item['decider_data_quality_context']['blocks']['technical_evidence']['resistance_price'],
+            70800.0,
+        )
+        self.assertEqual(
+            first_item['decider_data_quality_context']['blocks']['factor_score_coverage']['required_scores']['quality']['status'],
+            'available',
         )
         self.assertTrue(first_item['availability']['quote_context'])
         self.assertTrue(first_item['availability']['price_context'])
@@ -1130,6 +1159,14 @@ class AgentContextReadServiceTests(unittest.TestCase):
         self.assertEqual(second_item['context_provenance']['signal_features']['freshness_status'], 'missing')
         self.assertEqual(second_item['context_provenance']['intraday_execution_context']['freshness_status'], 'missing')
         self.assertEqual(second_item['recent_disclosures']['count'], 0)
+        self.assertEqual(
+            second_item['decider_data_quality_context']['blocks']['intraday_realtime']['status'],
+            'unavailable',
+        )
+        self.assertEqual(
+            second_item['decider_data_quality_context']['blocks']['factor_score_coverage']['status'],
+            'unavailable',
+        )
         self.assertFalse(second_item['availability']['quote_context'])
         self.assertFalse(second_item['availability']['price_context'])
         self.assertFalse(second_item['availability']['intraday_execution_context'])
@@ -1517,6 +1554,8 @@ class AgentContextReadServiceTests(unittest.TestCase):
         self.assertEqual(item['liquidity_context']['ranking']['liquidity_rank'], 17)
         self.assertEqual(item['liquidity_context']['ranking']['liquidity_percentile'], 0.82)
         self.assertTrue(item['liquidity_context']['ranking']['passes_liquidity_floor'])
+        self.assertEqual(item['decider_data_quality_context']['blocks']['liquidity_turnover']['status'], 'stale')
+        self.assertEqual(item['decider_data_quality_context']['blocks']['intraday_realtime']['status'], 'stale')
         self.assertIsNone(item['signal_features'])
         self.assertEqual(item['context_provenance']['signal_features']['freshness_status'], 'stale')
         self.assertEqual(item['context_provenance']['signal_features']['latest_available_market_date'], '2026-04-07')
