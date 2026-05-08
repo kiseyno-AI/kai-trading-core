@@ -1292,7 +1292,6 @@ async def list_agent_feedback(
     symbols: list[str] | None = Query(default=None),
     agent_name: str | None = Query(default=None),
     limit: int = Query(default=50, ge=1, le=200),
-    compact: bool = Query(default=False),
 ) -> dict:
     try:
         return agent_context_feedback_service.list_feedback(
@@ -1300,7 +1299,6 @@ async def list_agent_feedback(
             symbols=symbols,
             agent_name=agent_name,
             limit=limit,
-            compact=compact,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
