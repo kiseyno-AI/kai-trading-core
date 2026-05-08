@@ -19,10 +19,18 @@ class FakeKISRiskClient:
     def __init__(self, responses: dict[str, dict], errors: dict[str, Exception] | None = None):
         self.responses = responses
         self.errors = errors or {}
+        self.calls: list[str] = []
 
     async def fetch_domestic_quote_risk_status(self, symbol: str, market_code: str = 'J') -> dict:
-        if symbol in self.errors:
-            raise self.errors[symbol]
+        self.calls.append(symbol)
+        error = self.errors.get(symbol)
+        if isinstance(error, list):
+            if error:
+                next_error = error.pop(0)
+                if next_error is not None:
+                    raise next_error
+        elif error is not None:
+            raise error
         return self.responses[symbol]
 
 
@@ -122,6 +130,40 @@ class DailyMarketRiskSnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(upsert.call_count, 2)
         persisted_symbols = {call.args[0]['symbol'] for call in upsert.call_args_list}
         self.assertEqual(persisted_symbols, {'005930', '000660'})
+
+    async def test_collect_for_market_date_retries_kis_rate_limit_errors(self) -> None:
+        client = FakeKISRiskClient(
+            responses={
+                '005930': {
+                    'output': {
+                        'mrkt_warn_cls_code': '00',
+                        'mang_issu_yn': 'N',
+                        'invt_caful_yn': 'N',
+                        'short_over_yn': 'N',
+                        'ssts_hot_yn': 'N',
+                        'vi_cls_code': '00',
+                        'insn_pbnt_yn': 'N',
+                        'trht_yn': 'N',
+                    }
+                }
+            },
+            errors={'005930': [RuntimeError('초당 거래건수를 초과하였습니다.'), None]},
+        )
+        service = DailyMarketRiskSnapshotService(client=client)
+        inputs = [MarketRiskSymbolInput(symbol='005930', name_ko='삼성전자', market='KOSPI')]
+
+        with (
+            patch.object(service, '_load_symbol_rows', return_value=(inputs, ['005930'], [])),
+            patch('app.signals.market_risk_snapshot.asyncio.sleep', return_value=None) as sleep,
+            patch('app.signals.market_risk_snapshot.upsert_daily_market_risk_snapshot') as upsert,
+        ):
+            result = await service.collect_for_market_date(market_date='2026-04-14')
+
+        self.assertEqual(client.calls, ['005930', '005930'])
+        self.assertEqual(result['snapshots_persisted'], 1)
+        self.assertEqual(result['snapshots_failed'], 0)
+        self.assertEqual(upsert.call_count, 1)
+        self.assertTrue(any(call.args[0] == 1.0 for call in sleep.call_args_list))
 
     def test_inspect_resolves_latest_on_or_before_requested_market_date(self) -> None:
         service = DailyMarketRiskSnapshotService()

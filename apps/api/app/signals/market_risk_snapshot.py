@@ -16,7 +16,9 @@ from app.market_data_store import (
 
 MARKET_RISK_SNAPSHOT_SOURCE = 'kis_quote2_snapshot_v1'
 DEFAULT_MARKET_CODE = 'J'
-DEFAULT_FETCH_CONCURRENCY = 8
+DEFAULT_FETCH_CONCURRENCY = 1
+DEFAULT_FETCH_THROTTLE_SECONDS = 0.25
+RATE_LIMIT_RETRY_DELAYS_SECONDS = (1.0, 2.0, 4.0)
 LATEST_FALLBACK_POLICY = 'latest_on_or_before_requested_market_date'
 INACTIVE_VI_CODES = frozenset({'', '0', '00'})
 
@@ -231,32 +233,56 @@ class DailyMarketRiskSnapshotService:
             }
 
         semaphore = asyncio.Semaphore(max(int(fetch_concurrency or self.fetch_concurrency), 1))
+        throttle_lock = asyncio.Lock()
+        last_request_at = 0.0
+
+        async def _wait_for_request_slot() -> None:
+            nonlocal last_request_at
+            async with throttle_lock:
+                now = asyncio.get_running_loop().time()
+                wait_seconds = DEFAULT_FETCH_THROTTLE_SECONDS - (now - last_request_at)
+                if wait_seconds > 0:
+                    await asyncio.sleep(wait_seconds)
+                    now = asyncio.get_running_loop().time()
+                last_request_at = now
+
+        def _is_rate_limit_error(exc: Exception) -> bool:
+            message = str(exc)
+            return '초당 거래건수' in message or 'rate limit' in message.lower()
 
         async def _fetch_symbol(item: MarketRiskSymbolInput) -> dict[str, Any]:
             async with semaphore:
-                try:
-                    response = await self.client.fetch_domestic_quote_risk_status(
-                        item.symbol,
-                        market_code=normalized_market_code,
-                    )
-                    return {
-                        'symbol': item.symbol,
-                        'item': build_market_risk_snapshot(
-                            symbol=item.symbol,
-                            name_ko=item.name_ko,
-                            market=item.market,
-                            market_date=normalized_market_date,
-                            quote_response=response,
-                            source=source,
+                attempts = len(RATE_LIMIT_RETRY_DELAYS_SECONDS) + 1
+                last_error: Exception | None = None
+                for attempt_index in range(attempts):
+                    try:
+                        await _wait_for_request_slot()
+                        response = await self.client.fetch_domestic_quote_risk_status(
+                            item.symbol,
                             market_code=normalized_market_code,
-                            eod_run_id=run_id,
-                        ),
-                    }
-                except Exception as exc:
-                    return {
-                        'symbol': item.symbol,
-                        'error': str(exc),
-                    }
+                        )
+                        return {
+                            'symbol': item.symbol,
+                            'item': build_market_risk_snapshot(
+                                symbol=item.symbol,
+                                name_ko=item.name_ko,
+                                market=item.market,
+                                market_date=normalized_market_date,
+                                quote_response=response,
+                                source=source,
+                                market_code=normalized_market_code,
+                                eod_run_id=run_id,
+                            ),
+                        }
+                    except Exception as exc:
+                        last_error = exc
+                        if not _is_rate_limit_error(exc) or attempt_index >= len(RATE_LIMIT_RETRY_DELAYS_SECONDS):
+                            break
+                        await asyncio.sleep(RATE_LIMIT_RETRY_DELAYS_SECONDS[attempt_index])
+                return {
+                    'symbol': item.symbol,
+                    'error': str(last_error) if last_error is not None else 'unknown KIS market-risk fetch failure',
+                }
 
         fetch_results = await asyncio.gather(*[_fetch_symbol(item) for item in symbol_rows])
 
