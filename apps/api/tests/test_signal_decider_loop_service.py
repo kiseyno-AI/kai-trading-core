@@ -455,6 +455,8 @@ class FakeSignalDeciderLoopRepository:
             stored['first_target_hit_trade_date'] = diagnostics.get('first_target_hit_trade_date')
             stored['first_stop_loss_hit_trade_date'] = diagnostics.get('first_stop_loss_hit_trade_date')
             stored['price_path'] = stored.get('price_path_payload')
+            stored['coverage'] = dict(diagnostics.get('coverage') or {})
+            stored['status_reason'] = stored['coverage'].get('status_reason')
             stored['diagnostics'] = diagnostics
             self.outcomes[key] = stored
             persisted.append(stored)
@@ -472,6 +474,8 @@ class FakeSignalDeciderLoopRepository:
             stored['evaluated_at'] = stored['evaluated_at'].isoformat()
             stored['rationale'] = dict(stored.get('rationale_payload') or {})
             stored['diagnostics'] = dict(stored.get('diagnostics_payload') or {})
+            stored['coverage'] = dict(stored['rationale'].get('coverage') or stored['diagnostics'].get('coverage') or {})
+            stored['status_reason'] = stored['coverage'].get('status_reason')
             self.evaluations[key] = stored
             persisted.append(stored)
         return persisted
@@ -842,8 +846,10 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
                 {
                     'evaluation_version': DEFAULT_SIGNAL_DECIDER_EVALUATION_VERSION,
                     'evaluated': False,
+                    'stored_horizon_count': 0,
                     'graded_horizon_count': 0,
                     'pending_horizon_count': 0,
+                    'status_reason_counts': {},
                     'has_missed_opportunity': False,
                     'verdict_counts': {},
                     'latest_graded': None,
@@ -897,26 +903,26 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
             '005930': [
                 {'trade_date': '2026-04-23', 'open_price': 100, 'high_price': 101, 'low_price': 99, 'close_price': 100, 'volume': 1000},
                 {'trade_date': '2026-04-24', 'open_price': 100, 'high_price': 103, 'low_price': 99, 'close_price': 102, 'volume': 1000},
-                {'trade_date': '2026-04-25', 'open_price': 102, 'high_price': 106, 'low_price': 101, 'close_price': 105, 'volume': 1000},
-                {'trade_date': '2026-04-26', 'open_price': 105, 'high_price': 108, 'low_price': 104, 'close_price': 107, 'volume': 1000},
-                {'trade_date': '2026-04-27', 'open_price': 107, 'high_price': 109, 'low_price': 106, 'close_price': 108, 'volume': 1000},
-                {'trade_date': '2026-04-28', 'open_price': 108, 'high_price': 111, 'low_price': 107, 'close_price': 110, 'volume': 1000},
+                {'trade_date': '2026-04-27', 'open_price': 102, 'high_price': 106, 'low_price': 101, 'close_price': 105, 'volume': 1000},
+                {'trade_date': '2026-04-28', 'open_price': 105, 'high_price': 108, 'low_price': 104, 'close_price': 107, 'volume': 1000},
+                {'trade_date': '2026-04-29', 'open_price': 107, 'high_price': 109, 'low_price': 106, 'close_price': 108, 'volume': 1000},
+                {'trade_date': '2026-04-30', 'open_price': 108, 'high_price': 111, 'low_price': 107, 'close_price': 110, 'volume': 1000},
             ],
             '000660': [
                 {'trade_date': '2026-04-23', 'open_price': 100, 'high_price': 101, 'low_price': 99, 'close_price': 100, 'volume': 1000},
                 {'trade_date': '2026-04-24', 'open_price': 100, 'high_price': 101, 'low_price': 97, 'close_price': 98, 'volume': 1000},
-                {'trade_date': '2026-04-25', 'open_price': 98, 'high_price': 99, 'low_price': 94, 'close_price': 95, 'volume': 1000},
-                {'trade_date': '2026-04-26', 'open_price': 95, 'high_price': 96, 'low_price': 93, 'close_price': 94, 'volume': 1000},
-                {'trade_date': '2026-04-27', 'open_price': 94, 'high_price': 95, 'low_price': 92, 'close_price': 93, 'volume': 1000},
-                {'trade_date': '2026-04-28', 'open_price': 93, 'high_price': 94, 'low_price': 91, 'close_price': 92, 'volume': 1000},
+                {'trade_date': '2026-04-27', 'open_price': 98, 'high_price': 99, 'low_price': 94, 'close_price': 95, 'volume': 1000},
+                {'trade_date': '2026-04-28', 'open_price': 95, 'high_price': 96, 'low_price': 93, 'close_price': 94, 'volume': 1000},
+                {'trade_date': '2026-04-29', 'open_price': 94, 'high_price': 95, 'low_price': 92, 'close_price': 93, 'volume': 1000},
+                {'trade_date': '2026-04-30', 'open_price': 93, 'high_price': 94, 'low_price': 91, 'close_price': 92, 'volume': 1000},
             ],
             '035420': [
                 {'trade_date': '2026-04-22', 'open_price': 80, 'high_price': 81, 'low_price': 79, 'close_price': 80, 'volume': 1000},
                 {'trade_date': '2026-04-23', 'open_price': 80, 'high_price': 83, 'low_price': 79, 'close_price': 82, 'volume': 1000},
                 {'trade_date': '2026-04-24', 'open_price': 82, 'high_price': 86, 'low_price': 81, 'close_price': 85, 'volume': 1000},
-                {'trade_date': '2026-04-25', 'open_price': 85, 'high_price': 87, 'low_price': 84, 'close_price': 86, 'volume': 1000},
-                {'trade_date': '2026-04-26', 'open_price': 86, 'high_price': 89, 'low_price': 85, 'close_price': 88, 'volume': 1000},
-                {'trade_date': '2026-04-27', 'open_price': 88, 'high_price': 91, 'low_price': 87, 'close_price': 90, 'volume': 1000},
+                {'trade_date': '2026-04-27', 'open_price': 85, 'high_price': 87, 'low_price': 84, 'close_price': 86, 'volume': 1000},
+                {'trade_date': '2026-04-28', 'open_price': 86, 'high_price': 89, 'low_price': 85, 'close_price': 88, 'volume': 1000},
+                {'trade_date': '2026-04-29', 'open_price': 88, 'high_price': 91, 'low_price': 87, 'close_price': 90, 'volume': 1000},
             ],
         }
 
@@ -1001,18 +1007,18 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
             '005930': [
                 {'trade_date': '2026-04-23', 'open_price': 100, 'high_price': 101, 'low_price': 99, 'close_price': 100, 'volume': 1000},
                 {'trade_date': '2026-04-24', 'open_price': 100, 'high_price': 103, 'low_price': 99, 'close_price': 102, 'volume': 1000},
-                {'trade_date': '2026-04-25', 'open_price': 102, 'high_price': 106, 'low_price': 101, 'close_price': 105, 'volume': 1000},
-                {'trade_date': '2026-04-26', 'open_price': 105, 'high_price': 108, 'low_price': 104, 'close_price': 107, 'volume': 1000},
-                {'trade_date': '2026-04-27', 'open_price': 107, 'high_price': 109, 'low_price': 106, 'close_price': 108, 'volume': 1000},
-                {'trade_date': '2026-04-28', 'open_price': 108, 'high_price': 111, 'low_price': 107, 'close_price': 110, 'volume': 1000},
+                {'trade_date': '2026-04-27', 'open_price': 102, 'high_price': 106, 'low_price': 101, 'close_price': 105, 'volume': 1000},
+                {'trade_date': '2026-04-28', 'open_price': 105, 'high_price': 108, 'low_price': 104, 'close_price': 107, 'volume': 1000},
+                {'trade_date': '2026-04-29', 'open_price': 107, 'high_price': 109, 'low_price': 106, 'close_price': 108, 'volume': 1000},
+                {'trade_date': '2026-04-30', 'open_price': 108, 'high_price': 111, 'low_price': 107, 'close_price': 110, 'volume': 1000},
             ],
             '000660': [
                 {'trade_date': '2026-04-23', 'open_price': 100, 'high_price': 101, 'low_price': 99, 'close_price': 100, 'volume': 1000},
                 {'trade_date': '2026-04-24', 'open_price': 100, 'high_price': 101, 'low_price': 97, 'close_price': 98, 'volume': 1000},
-                {'trade_date': '2026-04-25', 'open_price': 98, 'high_price': 99, 'low_price': 94, 'close_price': 95, 'volume': 1000},
-                {'trade_date': '2026-04-26', 'open_price': 95, 'high_price': 96, 'low_price': 93, 'close_price': 94, 'volume': 1000},
-                {'trade_date': '2026-04-27', 'open_price': 94, 'high_price': 95, 'low_price': 92, 'close_price': 93, 'volume': 1000},
-                {'trade_date': '2026-04-28', 'open_price': 93, 'high_price': 94, 'low_price': 91, 'close_price': 92, 'volume': 1000},
+                {'trade_date': '2026-04-27', 'open_price': 98, 'high_price': 99, 'low_price': 94, 'close_price': 95, 'volume': 1000},
+                {'trade_date': '2026-04-28', 'open_price': 95, 'high_price': 96, 'low_price': 93, 'close_price': 94, 'volume': 1000},
+                {'trade_date': '2026-04-29', 'open_price': 94, 'high_price': 95, 'low_price': 92, 'close_price': 93, 'volume': 1000},
+                {'trade_date': '2026-04-30', 'open_price': 93, 'high_price': 94, 'low_price': 91, 'close_price': 92, 'volume': 1000},
             ],
         }
 
@@ -1086,10 +1092,10 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
         bars = [
             {'trade_date': '2026-04-23', 'open_price': 98, 'high_price': 99, 'low_price': 97, 'close_price': 98, 'volume': 1000},
             {'trade_date': '2026-04-24', 'open_price': 100, 'high_price': 104, 'low_price': 99, 'close_price': 103, 'volume': 1000},
-            {'trade_date': '2026-04-25', 'open_price': 103, 'high_price': 106, 'low_price': 102, 'close_price': 105, 'volume': 1000},
-            {'trade_date': '2026-04-26', 'open_price': 105, 'high_price': 108, 'low_price': 104, 'close_price': 107, 'volume': 1000},
-            {'trade_date': '2026-04-27', 'open_price': 107, 'high_price': 109, 'low_price': 106, 'close_price': 108, 'volume': 1000},
-            {'trade_date': '2026-04-28', 'open_price': 108, 'high_price': 112, 'low_price': 107, 'close_price': 111, 'volume': 1000},
+            {'trade_date': '2026-04-27', 'open_price': 103, 'high_price': 106, 'low_price': 102, 'close_price': 105, 'volume': 1000},
+            {'trade_date': '2026-04-28', 'open_price': 105, 'high_price': 108, 'low_price': 104, 'close_price': 107, 'volume': 1000},
+            {'trade_date': '2026-04-29', 'open_price': 107, 'high_price': 109, 'low_price': 106, 'close_price': 108, 'volume': 1000},
+            {'trade_date': '2026-04-30', 'open_price': 108, 'high_price': 112, 'low_price': 107, 'close_price': 111, 'volume': 1000},
         ]
 
         with patch(
@@ -1217,7 +1223,7 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
                 {'trade_date': '2026-04-22', 'open_price': 104, 'high_price': 107, 'low_price': 103, 'close_price': 105, 'volume': 1000},
                 {'trade_date': '2026-04-23', 'open_price': 105, 'high_price': 108, 'low_price': 104, 'close_price': 107, 'volume': 1000},
                 {'trade_date': '2026-04-24', 'open_price': 107, 'high_price': 109, 'low_price': 106, 'close_price': 108, 'volume': 1000},
-                {'trade_date': '2026-04-25', 'open_price': 108, 'high_price': 110, 'low_price': 107, 'close_price': 109, 'volume': 1000},
+                {'trade_date': '2026-04-27', 'open_price': 108, 'high_price': 110, 'low_price': 107, 'close_price': 109, 'volume': 1000},
             ],
             '000660': [
                 {'trade_date': '2026-04-20', 'open_price': 50, 'high_price': 50, 'low_price': 49, 'close_price': 50, 'volume': 900},
@@ -1225,7 +1231,7 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
                 {'trade_date': '2026-04-22', 'open_price': 55, 'high_price': 57, 'low_price': 54, 'close_price': 56, 'volume': 900},
                 {'trade_date': '2026-04-23', 'open_price': 56, 'high_price': 58, 'low_price': 55, 'close_price': 57, 'volume': 900},
                 {'trade_date': '2026-04-24', 'open_price': 57, 'high_price': 59, 'low_price': 56, 'close_price': 58, 'volume': 900},
-                {'trade_date': '2026-04-25', 'open_price': 58, 'high_price': 60, 'low_price': 57, 'close_price': 59, 'volume': 900},
+                {'trade_date': '2026-04-27', 'open_price': 58, 'high_price': 60, 'low_price': 57, 'close_price': 59, 'volume': 900},
             ],
             '035420': [
                 {'trade_date': '2026-04-20', 'open_price': 60, 'high_price': 61, 'low_price': 59, 'close_price': 60, 'volume': 850},
@@ -1233,7 +1239,7 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
                 {'trade_date': '2026-04-22', 'open_price': 59, 'high_price': 60, 'low_price': 57, 'close_price': 58, 'volume': 850},
                 {'trade_date': '2026-04-23', 'open_price': 58, 'high_price': 59, 'low_price': 56, 'close_price': 57, 'volume': 850},
                 {'trade_date': '2026-04-24', 'open_price': 57, 'high_price': 58, 'low_price': 55, 'close_price': 56, 'volume': 850},
-                {'trade_date': '2026-04-25', 'open_price': 56, 'high_price': 57, 'low_price': 54, 'close_price': 55, 'volume': 850},
+                {'trade_date': '2026-04-27', 'open_price': 56, 'high_price': 57, 'low_price': 54, 'close_price': 55, 'volume': 850},
             ],
             '051910': [
                 {'trade_date': '2026-04-29', 'open_price': 200, 'high_price': 201, 'low_price': 198, 'close_price': 200, 'volume': 700},
@@ -1326,7 +1332,7 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
                 {'trade_date': '2026-04-22', 'open_price': 104, 'high_price': 107, 'low_price': 103, 'close_price': 105, 'volume': 1000},
                 {'trade_date': '2026-04-23', 'open_price': 105, 'high_price': 108, 'low_price': 104, 'close_price': 107, 'volume': 1000},
                 {'trade_date': '2026-04-24', 'open_price': 107, 'high_price': 109, 'low_price': 106, 'close_price': 108, 'volume': 1000},
-                {'trade_date': '2026-04-25', 'open_price': 108, 'high_price': 110, 'low_price': 107, 'close_price': 109, 'volume': 1000},
+                {'trade_date': '2026-04-27', 'open_price': 108, 'high_price': 110, 'low_price': 107, 'close_price': 109, 'volume': 1000},
             ],
             '000660': [
                 {'trade_date': '2026-04-20', 'open_price': 50, 'high_price': 50, 'low_price': 49, 'close_price': 50, 'volume': 900},
@@ -1334,7 +1340,7 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
                 {'trade_date': '2026-04-22', 'open_price': 55, 'high_price': 57, 'low_price': 54, 'close_price': 56, 'volume': 900},
                 {'trade_date': '2026-04-23', 'open_price': 56, 'high_price': 58, 'low_price': 55, 'close_price': 57, 'volume': 900},
                 {'trade_date': '2026-04-24', 'open_price': 57, 'high_price': 59, 'low_price': 56, 'close_price': 58, 'volume': 900},
-                {'trade_date': '2026-04-25', 'open_price': 58, 'high_price': 60, 'low_price': 57, 'close_price': 59, 'volume': 900},
+                {'trade_date': '2026-04-27', 'open_price': 58, 'high_price': 60, 'low_price': 57, 'close_price': 59, 'volume': 900},
             ],
             '035420': [
                 {'trade_date': '2026-04-20', 'open_price': 60, 'high_price': 61, 'low_price': 59, 'close_price': 60, 'volume': 850},
@@ -1342,7 +1348,7 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
                 {'trade_date': '2026-04-22', 'open_price': 59, 'high_price': 60, 'low_price': 57, 'close_price': 58, 'volume': 850},
                 {'trade_date': '2026-04-23', 'open_price': 58, 'high_price': 59, 'low_price': 56, 'close_price': 57, 'volume': 850},
                 {'trade_date': '2026-04-24', 'open_price': 57, 'high_price': 58, 'low_price': 55, 'close_price': 56, 'volume': 850},
-                {'trade_date': '2026-04-25', 'open_price': 56, 'high_price': 57, 'low_price': 54, 'close_price': 55, 'volume': 850},
+                {'trade_date': '2026-04-27', 'open_price': 56, 'high_price': 57, 'low_price': 54, 'close_price': 55, 'volume': 850},
             ],
         }
 
@@ -1412,7 +1418,7 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
             {'trade_date': '2026-04-22', 'open_price': 101, 'high_price': 104, 'low_price': 99, 'close_price': 102, 'volume': 1000},
             {'trade_date': '2026-04-23', 'open_price': 102, 'high_price': 103, 'low_price': 100, 'close_price': 101, 'volume': 1000},
             {'trade_date': '2026-04-24', 'open_price': 101, 'high_price': 102, 'low_price': 99, 'close_price': 100, 'volume': 1000},
-            {'trade_date': '2026-04-25', 'open_price': 100, 'high_price': 101, 'low_price': 98, 'close_price': 99, 'volume': 1000},
+            {'trade_date': '2026-04-27', 'open_price': 100, 'high_price': 101, 'low_price': 98, 'close_price': 99, 'volume': 1000},
         ]
 
         with patch(
@@ -1478,7 +1484,7 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
             {'trade_date': '2026-04-22', 'open_price': 97, 'high_price': 111, 'low_price': 96, 'close_price': 109, 'volume': 1000},
             {'trade_date': '2026-04-23', 'open_price': 109, 'high_price': 112, 'low_price': 107, 'close_price': 111, 'volume': 1000},
             {'trade_date': '2026-04-24', 'open_price': 111, 'high_price': 113, 'low_price': 109, 'close_price': 112, 'volume': 1000},
-            {'trade_date': '2026-04-25', 'open_price': 112, 'high_price': 114, 'low_price': 110, 'close_price': 113, 'volume': 1000},
+            {'trade_date': '2026-04-27', 'open_price': 112, 'high_price': 114, 'low_price': 110, 'close_price': 113, 'volume': 1000},
         ]
 
         with patch(
@@ -1535,7 +1541,7 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
             {'trade_date': '2026-04-22', 'open_price': 51, 'high_price': 53, 'low_price': 50, 'close_price': 52, 'volume': 900},
             {'trade_date': '2026-04-23', 'open_price': 52, 'high_price': 53, 'low_price': 51, 'close_price': 52, 'volume': 900},
             {'trade_date': '2026-04-24', 'open_price': 52, 'high_price': 54, 'low_price': 51, 'close_price': 53, 'volume': 900},
-            {'trade_date': '2026-04-25', 'open_price': 53, 'high_price': 54, 'low_price': 52, 'close_price': 53, 'volume': 900},
+            {'trade_date': '2026-04-27', 'open_price': 53, 'high_price': 54, 'low_price': 52, 'close_price': 53, 'volume': 900},
         ]
 
         with patch(
@@ -1590,7 +1596,7 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
             {'trade_date': '2026-04-22', 'open_price': 99, 'high_price': 101, 'low_price': 98, 'close_price': 98, 'volume': 1000},
             {'trade_date': '2026-04-23', 'open_price': 98, 'high_price': 100, 'low_price': 97, 'close_price': 98, 'volume': 1000},
             {'trade_date': '2026-04-24', 'open_price': 98, 'high_price': 99, 'low_price': 97, 'close_price': 97, 'volume': 1000},
-            {'trade_date': '2026-04-25', 'open_price': 97, 'high_price': 98, 'low_price': 97, 'close_price': 97, 'volume': 1000},
+            {'trade_date': '2026-04-27', 'open_price': 97, 'high_price': 98, 'low_price': 97, 'close_price': 97, 'volume': 1000},
         ]
 
         with patch(
@@ -1662,7 +1668,13 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
         item = result['items'][0]
         self.assertEqual(item['review']['status'], 'pending')
         self.assertEqual(item['review']['insight']['code'], 'evaluation_pending')
-        self.assertEqual(item['review']['narrative']['supporting_reasons'][0]['code'], 'pending_horizon_data')
+        self.assertEqual(item['review']['status_reason'], 'pending_maturity')
+        self.assertEqual(item['review']['coverage']['earliest_computable_date'], '2026-05-08')
+        self.assertEqual(item['review']['narrative']['supporting_reasons'][0]['code'], 'pending_maturity')
+        self.assertEqual(
+            result['summary']['evaluation_coverage']['status_reason_counts'],
+            {'pending_maturity': 1},
+        )
 
     def test_get_diagnostics_batches_outcomes_and_evaluations(self):
         repository = FakeSignalDeciderLoopRepository(
@@ -1797,12 +1809,9 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
         def fake_load(symbol, **kwargs):
             self.assertEqual(symbol, '005930')
             captured_kwargs.append(kwargs)
-            limit = kwargs.get('limit')
-            if limit is None:
-                return future_bars
-            if kwargs.get('prefer_recent_limit', True):
-                return future_bars[-limit:]
-            return future_bars[:limit]
+            if kwargs.get('limit') == 1 and kwargs.get('prefer_recent_limit', True):
+                return future_bars[-1:]
+            return future_bars
 
         with patch(
             'app.agent_context.signal_decider_loop_service.load_daily_bars_for_symbol_range',
@@ -1815,11 +1824,147 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
                 evaluation_version='signal_decider_eval_test',
             )
 
-        self.assertEqual(captured_kwargs[0]['prefer_recent_limit'], False)
+        self.assertEqual(len(captured_kwargs), 2)
+        self.assertFalse(captured_kwargs[0]['prefer_recent_limit'])
+        self.assertEqual(captured_kwargs[0]['start_date'], date.fromisoformat('2026-04-20'))
+        self.assertEqual(captured_kwargs[0]['end_date'], date.fromisoformat('2026-04-27'))
+        self.assertEqual(captured_kwargs[1]['start_date'], date.fromisoformat('2026-04-20'))
+        self.assertEqual(captured_kwargs[1]['limit'], 1)
+        self.assertTrue(captured_kwargs[1]['prefer_recent_limit'])
         outcome = result['items'][0]['outcomes'][0]
+        evaluation = result['items'][0]['evaluations'][0]
         self.assertEqual(outcome['entry_trade_date'], '2026-04-21')
         self.assertEqual(outcome['exit_trade_date'], '2026-04-27')
         self.assertEqual(outcome['bars_observed'], 5)
+        self.assertEqual(outcome['status_reason'], 'computed')
+        self.assertEqual(outcome['coverage']['status_reason'], 'computed')
+        self.assertEqual(evaluation['status_reason'], 'computed')
+        self.assertEqual(result['summary']['coverage']['computed_count'], 1)
+
+    def test_list_evaluations_exposes_pending_maturity_coverage_for_latest_immature_horizon(self):
+        repository = FakeSignalDeciderLoopRepository(
+            [
+                _feedback_row(
+                    feedback_id=1,
+                    snapshot_id=101,
+                    market_date='2026-04-29',
+                    symbol='051910',
+                    action='buy',
+                    target_price=210,
+                    stop_loss_price=190,
+                )
+            ]
+        )
+        service = SignalDeciderLoopService(repository=repository)
+
+        bars = [
+            {'trade_date': '2026-04-29', 'open_price': 200, 'high_price': 201, 'low_price': 198, 'close_price': 200, 'volume': 700},
+            {'trade_date': '2026-04-30', 'open_price': 201, 'high_price': 204, 'low_price': 199, 'close_price': 203, 'volume': 700},
+        ]
+
+        with patch(
+            'app.agent_context.signal_decider_loop_service.load_daily_bars_for_symbol_range',
+            return_value=bars,
+        ):
+            service.compute_evaluations(
+                market_date_from='2026-04-29',
+                market_date_to='2026-04-29',
+                horizons=[5],
+                evaluation_version='signal_decider_eval_test',
+            )
+            result = service.list_evaluations(
+                market_date='2026-04-29',
+                horizons=[5],
+                evaluation_version='signal_decider_eval_test',
+            )
+
+        self.assertEqual(result['summary']['count'], 1)
+        self.assertEqual(result['summary']['evaluated_count'], 0)
+        self.assertEqual(result['summary']['stored_evaluation_count'], 1)
+        self.assertEqual(result['summary']['coverage']['pending_maturity_count'], 1)
+        self.assertEqual(result['summary']['coverage']['status_reason_counts'], {'pending_maturity': 1})
+        item = result['items'][0]
+        self.assertEqual(item['coverage_summary']['computed_count'], 0)
+        coverage = item['coverage'][0]
+        self.assertEqual(coverage['status_reason'], 'pending_maturity')
+        self.assertEqual(coverage['decision_market_date'], '2026-04-29')
+        self.assertEqual(coverage['entry_trade_date'], '2026-04-30')
+        self.assertEqual(coverage['observed_bars_count'], 1)
+        self.assertEqual(coverage['required_bars_count'], 5)
+        self.assertEqual(coverage['earliest_computable_date'], '2026-05-08')
+        self.assertEqual(item['evaluations'][0]['status_reason'], 'pending_maturity')
+        self.assertEqual(item['evaluations'][0]['evaluation_status'], 'pending')
+
+    def test_compute_evaluations_marks_mature_gap_as_insufficient_price_data(self):
+        repository = FakeSignalDeciderLoopRepository(
+            [
+                _feedback_row(
+                    feedback_id=1,
+                    snapshot_id=101,
+                    market_date='2026-04-20',
+                    symbol='005930',
+                    action='buy',
+                    target_price=110,
+                    stop_loss_price=95,
+                )
+            ]
+        )
+        service = SignalDeciderLoopService(repository=repository)
+
+        future_bars = [
+            {'trade_date': '2026-04-20', 'open_price': 98, 'high_price': 99, 'low_price': 97, 'close_price': 98, 'volume': 1000},
+            {'trade_date': '2026-04-21', 'open_price': 100, 'high_price': 104, 'low_price': 99, 'close_price': 103, 'volume': 1000},
+            {'trade_date': '2026-04-22', 'open_price': 103, 'high_price': 106, 'low_price': 102, 'close_price': 105, 'volume': 1000},
+            {'trade_date': '2026-04-24', 'open_price': 107, 'high_price': 109, 'low_price': 106, 'close_price': 108, 'volume': 1000},
+            {'trade_date': '2026-04-27', 'open_price': 108, 'high_price': 112, 'low_price': 107, 'close_price': 111, 'volume': 1000},
+        ]
+        latest_bar = [
+            {'trade_date': '2026-04-28', 'open_price': 111, 'high_price': 114, 'low_price': 110, 'close_price': 113, 'volume': 1000}
+        ]
+
+        def fake_load(symbol, **kwargs):
+            self.assertEqual(symbol, '005930')
+            if kwargs.get('limit') == 1 and kwargs.get('prefer_recent_limit', True):
+                return latest_bar
+            return future_bars
+
+        with patch(
+            'app.agent_context.signal_decider_loop_service.load_daily_bars_for_symbol_range',
+            side_effect=fake_load,
+        ):
+            result = service.compute_evaluations(
+                market_date_from='2026-04-20',
+                market_date_to='2026-04-20',
+                horizons=[5],
+                evaluation_version='signal_decider_eval_test',
+            )
+            review_result = service.get_review_date(
+                market_date='2026-04-20',
+                horizons=[5],
+                primary_horizon_days=5,
+                evaluation_version='signal_decider_eval_test',
+            )
+
+        outcome = result['items'][0]['outcomes'][0]
+        evaluation = result['items'][0]['evaluations'][0]
+        self.assertEqual(outcome['status_reason'], 'insufficient_price_data')
+        self.assertTrue(outcome['coverage']['matured'])
+        self.assertEqual(outcome['coverage']['missing_trade_dates'], ['2026-04-23'])
+        self.assertEqual(evaluation['status_reason'], 'insufficient_price_data')
+        self.assertEqual(evaluation['evaluation_status'], 'pending')
+        self.assertEqual(result['summary']['coverage']['insufficient_price_data_count'], 1)
+        self.assertEqual(result['summary']['coverage']['status_reason_counts'], {'insufficient_price_data': 1})
+        review_item = review_result['items'][0]
+        self.assertEqual(review_result['summary']['evaluation_coverage']['pending_count'], 1)
+        self.assertEqual(review_result['summary']['evaluation_coverage']['insufficient_price_data_count'], 1)
+        self.assertEqual(review_result['summary']['horizon_coverage'][0]['insufficient_price_data_count'], 1)
+        self.assertEqual(review_item['review']['status'], 'pending')
+        self.assertEqual(review_item['review']['status_reason'], 'insufficient_price_data')
+        self.assertEqual(review_item['review']['coverage']['status_reason'], 'insufficient_price_data')
+        self.assertEqual(
+            review_item['review']['narrative']['supporting_reasons'][0]['code'],
+            'insufficient_price_data',
+        )
 
     def test_compute_evaluations_marks_severe_drawdown_recovery_buy_as_bad_buy(self):
         repository = FakeSignalDeciderLoopRepository(

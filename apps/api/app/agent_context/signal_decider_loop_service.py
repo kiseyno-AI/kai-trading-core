@@ -4,7 +4,9 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from decimal import Decimal
+import exchange_calendars as xcals
 import hashlib
+import pandas as pd
 from typing import Any, Sequence
 
 from sqlalchemy import case, select
@@ -61,6 +63,12 @@ NEGATIVE_SIGNAL_DECIDER_GRADE_LABELS: tuple[str, ...] = (
     'bad_buy',
     'missed_opportunity_after_wait',
     'missed_opportunity_after_reject',
+)
+SIGNAL_DECIDER_EVALUATION_COVERAGE_REASONS: tuple[str, ...] = (
+    'computed',
+    'pending_maturity',
+    'insufficient_price_data',
+    'not_computed',
 )
 POLICY_VERSION_AUDIT_METADATA_KEYS: tuple[str, ...] = (
     'activation_history',
@@ -157,6 +165,7 @@ SIGNAL_DECIDER_REPLAY_INSIGHT_TAXONOMY: dict[str, dict[str, Any]] = {
         'outcome_tone': 'ambiguous',
     },
 }
+KRX_EXCHANGE_CALENDAR = xcals.get_calendar('XKRX')
 
 
 @dataclass(frozen=True)
@@ -433,6 +442,17 @@ def _to_int(value: Any) -> int | None:
         except ValueError:
             return None
     return None
+
+
+def _bar_has_complete_ohlc(bar: dict[str, Any]) -> bool:
+    open_price = _to_int(bar.get('open_price'))
+    high_price = _to_int(bar.get('high_price'))
+    low_price = _to_int(bar.get('low_price'))
+    close_price = _to_int(bar.get('close_price'))
+    return all(
+        value is not None and value > 0
+        for value in (open_price, high_price, low_price, close_price)
+    )
 
 
 def _normalize_text_list(value: Any) -> list[str]:
@@ -929,6 +949,7 @@ def build_short_term_decider_traceability_snapshot(
 
 def _serialize_outcome_row(row: SignalDeciderRealizedOutcome) -> dict[str, Any]:
     diagnostics = _maybe_dict(row.diagnostics_payload)
+    coverage = _maybe_dict(diagnostics.get('coverage'))
     return {
         'id': row.id,
         'decision_snapshot_id': row.decision_snapshot_id,
@@ -960,6 +981,8 @@ def _serialize_outcome_row(row: SignalDeciderRealizedOutcome) -> dict[str, Any]:
         'first_target_hit_trade_date': diagnostics.get('first_target_hit_trade_date'),
         'first_stop_loss_hit_trade_date': diagnostics.get('first_stop_loss_hit_trade_date'),
         'price_path': row.price_path_payload,
+        'coverage': coverage,
+        'status_reason': coverage.get('status_reason'),
         'diagnostics': diagnostics,
         'computed_at': row.computed_at.isoformat() if row.computed_at else None,
     }
@@ -1005,6 +1028,9 @@ def _serialize_decision_snapshot_row(
 
 
 def _serialize_evaluation_row(row: SignalDeciderEvaluation) -> dict[str, Any]:
+    rationale = _maybe_dict(row.rationale_payload)
+    diagnostics = _maybe_dict(row.diagnostics_payload)
+    coverage = _maybe_dict(rationale.get('coverage')) or _maybe_dict(diagnostics.get('coverage'))
     return {
         'id': row.id,
         'decision_snapshot_id': row.decision_snapshot_id,
@@ -1021,8 +1047,10 @@ def _serialize_evaluation_row(row: SignalDeciderEvaluation) -> dict[str, Any]:
         'grade_score': _to_float(row.grade_score),
         'missed_opportunity': row.missed_opportunity,
         'counterfactual_action': row.counterfactual_action,
-        'rationale': row.rationale_payload,
-        'diagnostics': row.diagnostics_payload,
+        'status_reason': coverage.get('status_reason'),
+        'coverage': coverage,
+        'rationale': rationale,
+        'diagnostics': diagnostics,
         'evaluated_at': row.evaluated_at.isoformat() if row.evaluated_at else None,
     }
 
@@ -2385,9 +2413,10 @@ class SignalDeciderLoopService:
                 'evaluation_version': resolved_evaluation_version,
             },
             'summary': {
-                'evaluated_count': len(detail_item['evaluations']),
+                'evaluated_count': int(_maybe_dict(detail_item.get('coverage_summary')).get('computed_count') or 0),
                 'outcome_count': len(detail_item['outcomes']),
                 'actual_execution_outcome_count': len(detail_item['actual_execution_outcomes']),
+                'coverage': detail_item.get('coverage_summary'),
             },
             'item': detail_item,
         }
@@ -2526,6 +2555,7 @@ class SignalDeciderLoopService:
                 'market_date': normalized_market_date.isoformat(),
                 'symbol': detail_item['symbol'],
                 'review_status': detail_item['review']['status'],
+                'status_reason': detail_item['review'].get('status_reason'),
                 'insight_code': detail_item['review']['insight']['code'],
                 'insight_priority': detail_item['review']['narrative']['insight_priority'],
                 'headline': detail_item['review']['narrative']['headline'],
@@ -2568,8 +2598,19 @@ class SignalDeciderLoopService:
             },
             'summary': {
                 'count': len(items),
-                'evaluated_count': sum(1 for item in items if item['evaluations']),
+                'evaluated_count': sum(
+                    int(_maybe_dict(item.get('coverage_summary')).get('computed_count') or 0) > 0
+                    for item in items
+                ),
                 'actual_execution_outcome_count': sum(len(item['actual_execution_outcomes']) for item in items),
+                'coverage': self._build_coverage_summary(
+                    coverage_items=[
+                        coverage
+                        for item in items
+                        for coverage in list(item.get('coverage') or [])
+                        if isinstance(coverage, dict)
+                    ]
+                ),
             },
             'items': items,
         }
@@ -2687,6 +2728,7 @@ class SignalDeciderLoopService:
                     'evaluations_upserted': 0,
                     'graded_count': 0,
                     'pending_count': 0,
+                    'coverage': self._build_coverage_summary(coverage_items=[]),
                 },
                 'items': [],
             }
@@ -2702,12 +2744,17 @@ class SignalDeciderLoopService:
                 market_date=row.market_date,
                 max_horizon=max_horizon,
             )
+            latest_available_trade_date = self._load_latest_available_trade_date(
+                symbol=row.symbol,
+                market_date=row.market_date,
+            )
             for horizon_days in normalized_horizons:
                 outcome_items.append(
                     self._build_realized_outcome_item(
                         snapshot_row=row,
                         decision=decision,
                         future_bars=future_bars,
+                        latest_available_trade_date=latest_available_trade_date,
                         horizon_days=horizon_days,
                     )
                 )
@@ -2749,6 +2796,13 @@ class SignalDeciderLoopService:
         pending_count = sum(
             1 for item in persisted_evaluations if item.get('evaluation_status') != 'graded'
         )
+        coverage_summary = self._build_coverage_summary(
+            coverage_items=[
+                _maybe_dict(item.get('coverage'))
+                for item in persisted_evaluations
+                if isinstance(item, dict)
+            ]
+        )
         return {
             'request': {
                 'market_date_from': normalized_from.isoformat(),
@@ -2765,6 +2819,7 @@ class SignalDeciderLoopService:
                 'evaluations_upserted': len(persisted_evaluations),
                 'graded_count': graded_count,
                 'pending_count': pending_count,
+                'coverage': coverage_summary,
             },
             'items': items,
         }
@@ -2831,14 +2886,49 @@ class SignalDeciderLoopService:
                 evaluation_version=resolved_version,
             )
         )
-        items = [
-            {
-                **self._build_decision_snapshot(row),
-                'outcomes': outcomes_by_snapshot.get(row.id, []),
-                'evaluations': evaluations_by_snapshot.get(row.id, []),
+        items = []
+        all_coverage_items: list[dict[str, Any]] = []
+        for row in rows:
+            resolved_outcomes = outcomes_by_snapshot.get(row.id, [])
+            resolved_evaluations = evaluations_by_snapshot.get(row.id, [])
+            future_bars = self._load_future_price_bars(
+                symbol=row.symbol,
+                market_date=row.market_date,
+                max_horizon=max(normalized_horizons),
+            )
+            latest_available_trade_date = self._load_latest_available_trade_date(
+                symbol=row.symbol,
+                market_date=row.market_date,
+            )
+            outcomes_by_horizon = {
+                int(item.get('horizon_days') or 0): item
+                for item in resolved_outcomes
             }
-            for row in rows
-        ]
+            evaluations_by_horizon = {
+                int(item.get('horizon_days') or 0): item
+                for item in resolved_evaluations
+            }
+            coverage = [
+                self._build_horizon_coverage(
+                    snapshot_row=row,
+                    future_bars=future_bars,
+                    latest_available_trade_date=latest_available_trade_date,
+                    horizon_days=horizon_days,
+                    outcome=outcomes_by_horizon.get(horizon_days),
+                    evaluation=evaluations_by_horizon.get(horizon_days),
+                )
+                for horizon_days in normalized_horizons
+            ]
+            all_coverage_items.extend(coverage)
+            items.append(
+                {
+                    **self._build_decision_snapshot(row),
+                    'outcomes': resolved_outcomes,
+                    'evaluations': resolved_evaluations,
+                    'coverage': coverage,
+                    'coverage_summary': self._build_coverage_summary(coverage_items=coverage),
+                }
+            )
         return {
             'request': {
                 'market_date': normalized_market_date.isoformat(),
@@ -2849,7 +2939,16 @@ class SignalDeciderLoopService:
             },
             'summary': {
                 'count': len(items),
-                'evaluated_count': sum(1 for item in items if item['evaluations']),
+                'evaluated_count': sum(
+                    1
+                    for item in items
+                    if any(
+                        str(coverage.get('status_reason') or '') == 'computed'
+                        for coverage in list(item.get('coverage') or [])
+                    )
+                ),
+                'stored_evaluation_count': sum(len(list(item.get('evaluations') or [])) for item in items),
+                'coverage': self._build_coverage_summary(coverage_items=all_coverage_items),
             },
             'items': items,
         }
@@ -3205,6 +3304,35 @@ class SignalDeciderLoopService:
         )
         decision = self._build_decision_snapshot(row)
         request_payload = _maybe_dict(row.request_payload)
+        resolved_horizons = _normalize_horizons(horizons)
+        future_bars = self._load_future_price_bars(
+            symbol=row.symbol,
+            market_date=row.market_date,
+            max_horizon=max(resolved_horizons),
+        )
+        latest_available_trade_date = self._load_latest_available_trade_date(
+            symbol=row.symbol,
+            market_date=row.market_date,
+        )
+        outcomes_by_horizon = {
+            int(item.get('horizon_days') or 0): item
+            for item in resolved_outcomes
+        }
+        evaluations_by_horizon = {
+            int(item.get('horizon_days') or 0): item
+            for item in resolved_evaluations
+        }
+        coverage = [
+            self._build_horizon_coverage(
+                snapshot_row=row,
+                future_bars=future_bars,
+                latest_available_trade_date=latest_available_trade_date,
+                horizon_days=horizon_days,
+                outcome=outcomes_by_horizon.get(horizon_days),
+                evaluation=evaluations_by_horizon.get(horizon_days),
+            )
+            for horizon_days in resolved_horizons
+        ]
         return {
             **decision,
             'explanation': self._build_decision_explanation(
@@ -3223,6 +3351,8 @@ class SignalDeciderLoopService:
             'upstream_traceability': request_payload.get('upstream_traceability'),
             'outcomes': resolved_outcomes,
             'evaluations': resolved_evaluations,
+            'coverage': coverage,
+            'coverage_summary': self._build_coverage_summary(coverage_items=coverage),
             'actual_execution_summary': signal_decider_execution_outcome_service.build_summary(
                 items=resolved_actual_execution_outcomes,
             ),
@@ -3294,6 +3424,7 @@ class SignalDeciderLoopService:
     ) -> dict[str, Any]:
         sorted_evaluations = sorted(evaluations, key=lambda item: int(item.get('horizon_days') or 0))
         verdict_counts: Counter[str] = Counter()
+        status_reason_counts: Counter[str] = Counter()
         graded_count = 0
         pending_count = 0
         latest_graded: dict[str, Any] | None = None
@@ -3302,14 +3433,20 @@ class SignalDeciderLoopService:
             evaluation_status = str(evaluation.get('evaluation_status') or '')
             grade_label = str(evaluation.get('grade_label') or '')
             horizon_days = int(evaluation.get('horizon_days') or 0)
+            status_reason = _normalize_optional_text(
+                str(evaluation.get('status_reason')) if evaluation.get('status_reason') is not None else None
+            )
             projection = {
                 'horizon_days': horizon_days,
                 'evaluation_status': evaluation_status,
+                'status_reason': status_reason,
                 'grade_label': grade_label,
                 'missed_opportunity': evaluation.get('missed_opportunity'),
                 'grade_score': _to_float(evaluation.get('grade_score')),
             }
             horizons.append(projection)
+            if status_reason:
+                status_reason_counts[status_reason] += 1
             if evaluation_status == 'graded':
                 graded_count += 1
                 if grade_label:
@@ -3319,9 +3456,11 @@ class SignalDeciderLoopService:
                 pending_count += 1
         return {
             'evaluation_version': evaluation_version,
-            'evaluated': bool(sorted_evaluations),
+            'evaluated': graded_count > 0,
+            'stored_horizon_count': len(sorted_evaluations),
             'graded_horizon_count': graded_count,
             'pending_horizon_count': pending_count,
+            'status_reason_counts': dict(sorted(status_reason_counts.items())),
             'has_missed_opportunity': any(item.get('missed_opportunity') is True for item in sorted_evaluations),
             'verdict_counts': dict(sorted(verdict_counts.items())),
             'latest_graded': latest_graded,
@@ -4014,8 +4153,20 @@ class SignalDeciderLoopService:
         decision = self._build_decision_snapshot(row)
         outcomes_by_horizon = {int(item.get('horizon_days') or 0): item for item in outcomes}
         evaluations_by_horizon = {int(item.get('horizon_days') or 0): item for item in evaluations}
+        future_bars = self._load_future_price_bars(
+            symbol=row.symbol,
+            market_date=row.market_date,
+            max_horizon=max(horizons),
+        )
+        latest_available_trade_date = self._load_latest_available_trade_date(
+            symbol=row.symbol,
+            market_date=row.market_date,
+        )
         horizon_items = [
             self._build_horizon_review_projection(
+                snapshot_row=row,
+                future_bars=future_bars,
+                latest_available_trade_date=latest_available_trade_date,
                 horizon_days=horizon_days,
                 outcome=outcomes_by_horizon.get(horizon_days),
                 evaluation=evaluations_by_horizon.get(horizon_days),
@@ -4029,6 +4180,9 @@ class SignalDeciderLoopService:
                 if int(item.get('horizon_days') or 0) == int(primary_horizon_days)
             ),
             self._build_horizon_review_projection(
+                snapshot_row=row,
+                future_bars=future_bars,
+                latest_available_trade_date=latest_available_trade_date,
                 horizon_days=primary_horizon_days,
                 outcome=None,
                 evaluation=None,
@@ -4062,9 +4216,11 @@ class SignalDeciderLoopService:
             'rule_evaluation': insight['rule_basis'],
             'horizons': horizon_items,
             'outcome_horizons': horizon_items,
+            'status_reason': primary_horizon.get('status_reason'),
+            'coverage': primary_horizon.get('coverage'),
             'quality_verdict': insight['code'],
-            'quality_reason_code': primary_reason.get('code'),
-            'quality_reason': primary_reason.get('message'),
+            'quality_reason_code': primary_reason.get('code') or primary_horizon.get('status_reason'),
+            'quality_reason': primary_reason.get('message') or _maybe_dict(primary_horizon.get('coverage')).get('status_message'),
             'review_conclusion': narrative.get('headline'),
             'review_conclusion_text': narrative.get('summary_text'),
             'path_outcome': path_analysis.get('path_marker'),
@@ -4143,6 +4299,11 @@ class SignalDeciderLoopService:
             for item in items
             if _maybe_dict(_maybe_dict(item.get('review')).get('path_analysis')).get('path_marker')
         )
+        status_reason_counts = Counter(
+            str(_maybe_dict(item.get('review')).get('status_reason') or '')
+            for item in items
+            if _maybe_dict(item.get('review')).get('status_reason')
+        )
         complete_count = sum(1 for item in items if _maybe_dict(item.get('review')).get('status') == 'complete')
         total_count = len(items)
         if total_count == 0:
@@ -4164,12 +4325,22 @@ class SignalDeciderLoopService:
             graded_count = sum(1 for horizon in horizon_rows if horizon.get('evaluation_status') == 'graded')
             pending_count = sum(1 for horizon in horizon_rows if horizon.get('evaluation_status') == 'pending')
             missing_count = sum(1 for horizon in horizon_rows if horizon.get('evaluation_status') == 'missing')
+            horizon_status_reason_counts = Counter(
+                str(horizon.get('status_reason') or '')
+                for horizon in horizon_rows
+                if horizon.get('status_reason')
+            )
             horizon_coverage.append(
                 {
                     'horizon_days': horizon_days,
                     'graded_count': graded_count,
                     'pending_count': pending_count,
                     'missing_count': missing_count,
+                    'computed_count': int(horizon_status_reason_counts.get('computed', 0)),
+                    'pending_maturity_count': int(horizon_status_reason_counts.get('pending_maturity', 0)),
+                    'insufficient_price_data_count': int(horizon_status_reason_counts.get('insufficient_price_data', 0)),
+                    'not_computed_count': int(horizon_status_reason_counts.get('not_computed', 0)),
+                    'status_reason_counts': dict(sorted(horizon_status_reason_counts.items())),
                 }
             )
         return {
@@ -4184,6 +4355,11 @@ class SignalDeciderLoopService:
                 'evaluation_version': evaluation_version,
                 'complete_count': complete_count,
                 'pending_count': total_count - complete_count,
+                'computed_count': complete_count,
+                'pending_maturity_count': int(status_reason_counts.get('pending_maturity', 0)),
+                'insufficient_price_data_count': int(status_reason_counts.get('insufficient_price_data', 0)),
+                'not_computed_count': int(status_reason_counts.get('not_computed', 0)),
+                'status_reason_counts': dict(sorted(status_reason_counts.items())),
                 'coverage_ratio': round(complete_count / total_count, 6) if total_count else None,
                 'status': coverage_status,
             },
@@ -4213,18 +4389,31 @@ class SignalDeciderLoopService:
     def _build_horizon_review_projection(
         self,
         *,
+        snapshot_row: SignalDeciderDecisionSnapshotRow,
+        future_bars: Sequence[dict[str, Any]],
+        latest_available_trade_date: date | None,
         horizon_days: int,
         outcome: dict[str, Any] | None,
         evaluation: dict[str, Any] | None,
     ) -> dict[str, Any]:
+        coverage = self._build_horizon_coverage(
+            snapshot_row=snapshot_row,
+            future_bars=future_bars,
+            latest_available_trade_date=latest_available_trade_date,
+            horizon_days=horizon_days,
+            outcome=outcome,
+            evaluation=evaluation,
+        )
         path_analysis = self._build_path_analysis(
             outcome=outcome,
             horizon_days=horizon_days,
+            coverage=coverage,
         )
         return {
             'horizon_days': horizon_days,
             'outcome_status': str((outcome or {}).get('outcome_status') or 'missing'),
             'evaluation_status': str((evaluation or {}).get('evaluation_status') or 'missing'),
+            'status_reason': coverage.get('status_reason'),
             'grade_label': (evaluation or {}).get('grade_label'),
             'grade_score': _to_float((evaluation or {}).get('grade_score')),
             'missed_opportunity': (evaluation or {}).get('missed_opportunity'),
@@ -4237,6 +4426,7 @@ class SignalDeciderLoopService:
             'target_hit': bool((outcome or {}).get('target_hit')),
             'stop_loss_hit': bool((outcome or {}).get('stop_loss_hit')),
             'target_stop_collision': bool((outcome or {}).get('target_stop_collision')),
+            'coverage': coverage,
             'path_analysis': path_analysis,
         }
 
@@ -4245,32 +4435,42 @@ class SignalDeciderLoopService:
         *,
         outcome: dict[str, Any] | None,
         horizon_days: int,
+        coverage: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        if not outcome:
+        coverage_payload = _maybe_dict(coverage)
+        if not outcome or str(outcome.get('outcome_status') or '') != 'complete':
+            status_reason = str(coverage_payload.get('status_reason') or 'pending_maturity')
+            target_price = _to_int((outcome or {}).get('target_price'))
+            stop_loss_price = _to_int((outcome or {}).get('stop_loss_price'))
             return {
                 'horizon_days': horizon_days,
                 'path_marker': 'pending',
                 'first_trigger': None,
                 'trigger_sequence': 'pending',
-                'thresholds_configured': False,
-                'bars_observed': 0,
+                'thresholds_configured': target_price is not None and stop_loss_price is not None,
+                'bars_observed': int(coverage_payload.get('observed_bars_count') or 0),
+                'status_reason': status_reason,
+                'coverage': coverage_payload,
                 'checkpoints': {
-                    'entry_trade_date': None,
+                    'entry_trade_date': coverage_payload.get('entry_trade_date'),
                     'exit_trade_date': None,
                     'best_exit_trade_date': None,
                     'worst_drawdown_trade_date': None,
                     'first_target_hit_trade_date': None,
                     'first_stop_loss_hit_trade_date': None,
-                    'observed_trade_dates': [],
+                    'observed_trade_dates': list(coverage_payload.get('observed_trade_dates') or []),
                 },
                 'returns': {
                     'close_return_pct': None,
                     'max_upside_return_pct': None,
                     'max_drawdown_return_pct': None,
                 },
-                'target_price': None,
-                'stop_loss_price': None,
-                'path_explanation': 'Replay coverage is not available for this horizon yet.',
+                'target_price': target_price,
+                'stop_loss_price': stop_loss_price,
+                'path_explanation': self._coverage_status_message(
+                    status_reason=status_reason,
+                    horizon_days=horizon_days,
+                ),
             }
         diagnostics = _maybe_dict(outcome.get('diagnostics'))
         outcome_status = str(outcome.get('outcome_status') or '')
@@ -4348,6 +4548,8 @@ class SignalDeciderLoopService:
             'trigger_sequence': trigger_sequence,
             'thresholds_configured': thresholds_configured,
             'bars_observed': int(outcome.get('bars_observed') or 0),
+            'status_reason': str(coverage_payload.get('status_reason') or 'computed'),
+            'coverage': coverage_payload,
             'checkpoints': {
                 'entry_trade_date': outcome.get('entry_trade_date'),
                 'exit_trade_date': outcome.get('exit_trade_date'),
@@ -4409,6 +4611,7 @@ class SignalDeciderLoopService:
         path_marker = str(path_analysis.get('path_marker') or 'pending')
         trigger_sequence = str(path_analysis.get('trigger_sequence') or 'pending')
         thresholds_configured = bool(path_analysis.get('thresholds_configured'))
+        status_reason = str(path_analysis.get('status_reason') or 'pending_maturity')
         evaluation_diagnostics = _maybe_dict((evaluation or {}).get('diagnostics'))
         severe_drawdown_before_target = bool(evaluation_diagnostics.get('severe_drawdown_before_target'))
         review_status = 'complete'
@@ -4469,6 +4672,7 @@ class SignalDeciderLoopService:
                 'path_marker': path_marker,
                 'trigger_sequence': trigger_sequence,
                 'thresholds_configured': thresholds_configured,
+                'status_reason': status_reason,
                 'review_rule': code,
                 'generated_reason_codes': [
                     str(reason.get('code'))
@@ -4558,10 +4762,44 @@ class SignalDeciderLoopService:
         returns = _maybe_dict(path_analysis.get('returns'))
         close_return_pct = _to_float(returns.get('close_return_pct'))
         evaluation_status = str((evaluation or {}).get('evaluation_status') or 'missing')
+        status_reason = str(path_analysis.get('status_reason') or 'pending_maturity')
         evaluation_diagnostics = _maybe_dict((evaluation or {}).get('diagnostics'))
         severe_drawdown_before_target = bool(evaluation_diagnostics.get('severe_drawdown_before_target'))
 
         if evaluation_status != 'graded' or path_marker == 'pending':
+            if status_reason == 'insufficient_price_data':
+                reasons.append(
+                    self._review_reason(
+                        code='insufficient_price_data',
+                        message=(
+                            f'The requested {primary_horizon_days}-day replay window is mature, but one or more '
+                            'required stored price bars are missing or incomplete.'
+                        ),
+                    )
+                )
+                return reasons
+            if status_reason == 'not_computed':
+                reasons.append(
+                    self._review_reason(
+                        code='not_computed',
+                        message=(
+                            f'The requested {primary_horizon_days}-day replay window is mature and price bars are '
+                            'present, but evaluation rows have not been computed or stored yet.'
+                        ),
+                    )
+                )
+                return reasons
+            if status_reason == 'pending_maturity':
+                reasons.append(
+                    self._review_reason(
+                        code='pending_maturity',
+                        message=(
+                            f'The requested {primary_horizon_days}-day replay window is not fully observed yet, '
+                            'so the review remains provisional.'
+                        ),
+                    )
+                )
+                return reasons
             reasons.append(
                 self._review_reason(
                     code='pending_horizon_data',
@@ -4705,6 +4943,219 @@ class SignalDeciderLoopService:
             'message_key': f'signal_decider.review.reason.{code}',
         }
 
+    def _next_trading_session_after(self, *, market_date: date):
+        session = KRX_EXCHANGE_CALENDAR.date_to_session(
+            pd.Timestamp(market_date.isoformat()),
+            direction='next',
+        )
+        if session.date() <= market_date:
+            session = KRX_EXCHANGE_CALENDAR.next_session(session)
+        return session
+
+    def _expected_horizon_trade_dates(
+        self,
+        *,
+        market_date: date,
+        horizon_days: int,
+    ) -> list[date]:
+        if horizon_days < 1:
+            return []
+        session = self._next_trading_session_after(market_date=market_date)
+        trade_dates = [session.date()]
+        while len(trade_dates) < horizon_days:
+            session = KRX_EXCHANGE_CALENDAR.next_session(session)
+            trade_dates.append(session.date())
+        return trade_dates
+
+    def _coverage_status_message(
+        self,
+        *,
+        status_reason: str,
+        horizon_days: int,
+    ) -> str:
+        if status_reason == 'computed':
+            return f'The {horizon_days}-day replay window was computed from stored price bars.'
+        if status_reason == 'pending_maturity':
+            return f'The {horizon_days}-day replay window is not mature yet.'
+        if status_reason == 'insufficient_price_data':
+            return (
+                f'The {horizon_days}-day replay window is mature, but one or more required stored price bars '
+                'are missing or incomplete.'
+            )
+        if status_reason == 'not_computed':
+            return (
+                f'The {horizon_days}-day replay window is mature and price bars are present, but the evaluation '
+                'has not been computed or stored yet.'
+            )
+        return f'The {horizon_days}-day replay coverage is unavailable.'
+
+    def _extract_coverage_status_reason(
+        self,
+        *,
+        outcome: dict[str, Any] | None,
+        evaluation: dict[str, Any] | None,
+    ) -> str | None:
+        coverage_candidates = (
+            _maybe_dict(_maybe_dict(evaluation).get('coverage')),
+            _maybe_dict(_maybe_dict(_maybe_dict(evaluation).get('rationale')).get('coverage')),
+            _maybe_dict(_maybe_dict(_maybe_dict(evaluation).get('diagnostics')).get('coverage')),
+            _maybe_dict(_maybe_dict(outcome).get('coverage')),
+            _maybe_dict(_maybe_dict(_maybe_dict(outcome).get('diagnostics')).get('coverage')),
+        )
+        for coverage in coverage_candidates:
+            status_reason = _normalize_optional_text(
+                str(coverage.get('status_reason')) if coverage.get('status_reason') is not None else None
+            )
+            if status_reason in SIGNAL_DECIDER_EVALUATION_COVERAGE_REASONS:
+                return status_reason
+        return None
+
+    def _load_latest_available_trade_date(
+        self,
+        *,
+        symbol: str,
+        market_date: date,
+    ) -> date | None:
+        bars = load_daily_bars_for_symbol_range(
+            symbol,
+            start_date=market_date,
+            limit=1,
+            prefer_recent_limit=True,
+        )
+        if not bars:
+            return None
+        latest_trade_date = date.fromisoformat(str(bars[-1].get('trade_date')))
+        return latest_trade_date
+
+    def _build_horizon_coverage(
+        self,
+        *,
+        snapshot_row: SignalDeciderDecisionSnapshotRow,
+        future_bars: Sequence[dict[str, Any]],
+        latest_available_trade_date: date | None,
+        horizon_days: int,
+        outcome: dict[str, Any] | None,
+        evaluation: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        expected_trade_dates = self._expected_horizon_trade_dates(
+            market_date=snapshot_row.market_date,
+            horizon_days=horizon_days,
+        )
+        expected_trade_date_strings = [trade_date.isoformat() for trade_date in expected_trade_dates]
+        bars_by_trade_date = {
+            str(bar.get('trade_date') or ''): bar
+            for bar in future_bars
+            if str(bar.get('trade_date') or '')
+        }
+        observed_trade_dates = [
+            trade_date
+            for trade_date in expected_trade_date_strings
+            if trade_date in bars_by_trade_date
+        ]
+        incomplete_trade_dates = [
+            trade_date
+            for trade_date in observed_trade_dates
+            if not _bar_has_complete_ohlc(bars_by_trade_date[trade_date])
+        ]
+        usable_trade_dates = [
+            trade_date
+            for trade_date in observed_trade_dates
+            if trade_date not in set(incomplete_trade_dates)
+        ]
+        missing_trade_dates = [
+            trade_date
+            for trade_date in expected_trade_date_strings
+            if trade_date not in bars_by_trade_date
+        ]
+        earliest_computable_date = expected_trade_date_strings[-1] if expected_trade_date_strings else None
+        matured = bool(
+            latest_available_trade_date is not None
+            and expected_trade_dates
+            and latest_available_trade_date >= expected_trade_dates[-1]
+        )
+        explicit_status_reason = self._extract_coverage_status_reason(
+            outcome=outcome,
+            evaluation=evaluation,
+        )
+        outcome_status = str((outcome or {}).get('outcome_status') or 'missing')
+        evaluation_status = str((evaluation or {}).get('evaluation_status') or 'missing')
+        if explicit_status_reason == 'computed' and (
+            outcome_status != 'complete' or evaluation_status != 'graded'
+        ):
+            explicit_status_reason = None
+        if explicit_status_reason is not None:
+            status_reason = explicit_status_reason
+        elif (
+            outcome_status == 'complete'
+            and evaluation_status == 'graded'
+            and not missing_trade_dates
+            and not incomplete_trade_dates
+        ):
+            status_reason = 'computed'
+        elif not matured:
+            status_reason = 'pending_maturity'
+        elif missing_trade_dates or incomplete_trade_dates:
+            status_reason = 'insufficient_price_data'
+        else:
+            status_reason = 'not_computed'
+        entry_trade_date = _normalize_optional_text(
+            str((outcome or {}).get('entry_trade_date'))
+            if (outcome or {}).get('entry_trade_date') is not None
+            else None
+        )
+        if entry_trade_date is None and usable_trade_dates:
+            entry_trade_date = usable_trade_dates[0]
+        return {
+            'horizon_days': horizon_days,
+            'status_reason': status_reason,
+            'status_message': self._coverage_status_message(
+                status_reason=status_reason,
+                horizon_days=horizon_days,
+            ),
+            'decision_market_date': snapshot_row.market_date.isoformat(),
+            'entry_trade_date': entry_trade_date,
+            'expected_entry_trade_date': expected_trade_date_strings[0] if expected_trade_date_strings else None,
+            'observed_bars_count': len(observed_trade_dates),
+            'usable_bars_count': len(usable_trade_dates),
+            'required_bars_count': horizon_days,
+            'earliest_computable_date': earliest_computable_date,
+            'latest_available_trade_date': (
+                latest_available_trade_date.isoformat()
+                if latest_available_trade_date is not None
+                else None
+            ),
+            'matured': matured,
+            'observed_trade_dates': observed_trade_dates,
+            'missing_trade_dates': missing_trade_dates,
+            'incomplete_trade_dates': incomplete_trade_dates,
+            'stored_outcome': outcome is not None,
+            'stored_evaluation': evaluation is not None,
+            'outcome_status': outcome_status,
+            'evaluation_status': evaluation_status,
+        }
+
+    def _build_coverage_summary(
+        self,
+        *,
+        coverage_items: Sequence[dict[str, Any]],
+    ) -> dict[str, Any]:
+        status_reason_counts = Counter(
+            str(item.get('status_reason') or '')
+            for item in coverage_items
+            if item.get('status_reason')
+        )
+        total_count = len(coverage_items)
+        computed_count = int(status_reason_counts.get('computed', 0))
+        return {
+            'count': total_count,
+            'computed_count': computed_count,
+            'pending_maturity_count': int(status_reason_counts.get('pending_maturity', 0)),
+            'insufficient_price_data_count': int(status_reason_counts.get('insufficient_price_data', 0)),
+            'not_computed_count': int(status_reason_counts.get('not_computed', 0)),
+            'status_reason_counts': dict(sorted(status_reason_counts.items())),
+            'coverage_ratio': round(computed_count / total_count, 6) if total_count else None,
+        }
+
     def _load_future_price_bars(
         self,
         *,
@@ -4712,10 +5163,16 @@ class SignalDeciderLoopService:
         market_date: date,
         max_horizon: int,
     ) -> list[dict[str, Any]]:
+        expected_trade_dates = self._expected_horizon_trade_dates(
+            market_date=market_date,
+            horizon_days=max_horizon,
+        )
+        if not expected_trade_dates:
+            return []
         bars = load_daily_bars_for_symbol_range(
             symbol,
             start_date=market_date,
-            limit=max_horizon + 2,
+            end_date=expected_trade_dates[-1],
             prefer_recent_limit=False,
         )
         return [
@@ -4730,17 +5187,82 @@ class SignalDeciderLoopService:
         snapshot_row: SignalDeciderDecisionSnapshotRow,
         decision: dict[str, Any],
         future_bars: list[dict[str, Any]],
+        latest_available_trade_date: date | None = None,
         horizon_days: int,
     ) -> dict[str, Any]:
         now = self._utcnow()
         decision_fields = _maybe_dict(decision.get('decision'))
-        entry_bar = future_bars[0] if future_bars else None
-        observed_bars = future_bars[:horizon_days]
-        outcome_status = 'complete' if len(observed_bars) >= horizon_days and entry_bar is not None else 'pending'
-        if entry_bar is None:
+        expected_trade_dates = self._expected_horizon_trade_dates(
+            market_date=snapshot_row.market_date,
+            horizon_days=horizon_days,
+        )
+        expected_trade_date_strings = [trade_date.isoformat() for trade_date in expected_trade_dates]
+        future_bars_by_trade_date = {
+            str(bar.get('trade_date') or ''): bar
+            for bar in future_bars
+            if str(bar.get('trade_date') or '')
+        }
+        observed_trade_dates = [
+            trade_date
+            for trade_date in expected_trade_date_strings
+            if trade_date in future_bars_by_trade_date
+        ]
+        observed_bars = [future_bars_by_trade_date[trade_date] for trade_date in observed_trade_dates]
+        incomplete_trade_dates = [
+            trade_date
+            for trade_date in observed_trade_dates
+            if not _bar_has_complete_ohlc(future_bars_by_trade_date[trade_date])
+        ]
+        usable_trade_dates = [
+            trade_date
+            for trade_date in observed_trade_dates
+            if trade_date not in set(incomplete_trade_dates)
+        ]
+        usable_bars = [future_bars_by_trade_date[trade_date] for trade_date in usable_trade_dates]
+        missing_trade_dates = [
+            trade_date
+            for trade_date in expected_trade_date_strings
+            if trade_date not in future_bars_by_trade_date
+        ]
+        resolved_latest_available_trade_date = latest_available_trade_date or self._load_latest_available_trade_date(
+            symbol=snapshot_row.symbol,
+            market_date=snapshot_row.market_date,
+        )
+        coverage = self._build_horizon_coverage(
+            snapshot_row=snapshot_row,
+            future_bars=future_bars,
+            latest_available_trade_date=resolved_latest_available_trade_date,
+            horizon_days=horizon_days,
+            outcome=None,
+            evaluation=None,
+        )
+        if (
+            coverage.get('status_reason') == 'not_computed'
+            and bool(coverage.get('matured'))
+            and not list(coverage.get('missing_trade_dates') or [])
+            and not list(coverage.get('incomplete_trade_dates') or [])
+        ):
+            coverage = {
+                **coverage,
+                'status_reason': 'computed',
+                'status_message': self._coverage_status_message(
+                    status_reason='computed',
+                    horizon_days=horizon_days,
+                ),
+                'outcome_status': 'complete',
+            }
+        outcome_status = 'complete' if coverage['status_reason'] == 'computed' else 'pending'
+        target_price = decision_fields.get('target_price')
+        stop_loss_price = decision_fields.get('stop_loss_price')
+        if coverage['status_reason'] != 'computed':
             diagnostics = {
-                'reason': 'missing_future_price_bars',
+                'reason': coverage['status_reason'],
                 'required_horizon_days': horizon_days,
+                'observed_trade_dates': observed_trade_dates,
+                'missing_trade_dates': missing_trade_dates,
+                'incomplete_trade_dates': incomplete_trade_dates,
+                'expected_trade_dates': expected_trade_date_strings,
+                'coverage': coverage,
             }
             return {
                 'decision_snapshot_id': snapshot_row.id,
@@ -4750,10 +5272,10 @@ class SignalDeciderLoopService:
                 'policy_version': decision['policy_version'],
                 'decision_action': decision_fields.get('action') or 'wait',
                 'horizon_days': horizon_days,
-                'outcome_status': 'pending',
-                'entry_trade_date': None,
+                'outcome_status': outcome_status,
+                'entry_trade_date': self._maybe_date(coverage.get('entry_trade_date')),
                 'exit_trade_date': None,
-                'bars_observed': 0,
+                'bars_observed': int(coverage.get('observed_bars_count') or 0),
                 'entry_price': None,
                 'exit_price': None,
                 'max_high_price': None,
@@ -4761,53 +5283,54 @@ class SignalDeciderLoopService:
                 'close_return_pct': None,
                 'max_upside_return_pct': None,
                 'max_drawdown_return_pct': None,
-                'target_price': decision_fields.get('target_price'),
-                'stop_loss_price': decision_fields.get('stop_loss_price'),
+                'target_price': target_price,
+                'stop_loss_price': stop_loss_price,
                 'expected_return_pct': decision_fields.get('expected_return_pct'),
                 'target_hit': False,
                 'stop_loss_hit': False,
                 'target_stop_collision': False,
-                'price_path_payload': [],
+                'price_path_payload': [
+                    {
+                        'trade_date': bar.get('trade_date'),
+                        'open_price': _to_int(bar.get('open_price')),
+                        'high_price': _to_int(bar.get('high_price')),
+                        'low_price': _to_int(bar.get('low_price')),
+                        'close_price': _to_int(bar.get('close_price')),
+                        'volume': _to_int(bar.get('volume')),
+                    }
+                    for bar in observed_bars
+                ],
                 'diagnostics_payload': diagnostics,
                 'computed_at': now,
                 'created_at': now,
                 'updated_at': now,
             }
 
+        entry_bar = usable_bars[0]
         entry_price = _to_int(entry_bar.get('open_price'))
-        exit_bar = observed_bars[-1] if observed_bars else entry_bar
+        exit_bar = usable_bars[-1]
         exit_price = _to_int(exit_bar.get('close_price'))
-        max_high_price = max((_to_int(bar.get('high_price')) or 0) for bar in observed_bars) if observed_bars else None
-        min_low_price = min((_to_int(bar.get('low_price')) or 0) for bar in observed_bars) if observed_bars else None
-        best_exit_bar = (
-            max(
-                observed_bars,
-                key=lambda bar: (_to_int(bar.get('high_price')) or 0, str(bar.get('trade_date') or '')),
-            )
-            if observed_bars
-            else None
+        max_high_price = max((_to_int(bar.get('high_price')) or 0) for bar in usable_bars)
+        min_low_price = min((_to_int(bar.get('low_price')) or 0) for bar in usable_bars)
+        best_exit_bar = max(
+            usable_bars,
+            key=lambda bar: (_to_int(bar.get('high_price')) or 0, str(bar.get('trade_date') or '')),
         )
-        worst_drawdown_bar = (
-            min(
-                observed_bars,
-                key=lambda bar: (_to_int(bar.get('low_price')) or 10**18, str(bar.get('trade_date') or '')),
-            )
-            if observed_bars
-            else None
+        worst_drawdown_bar = min(
+            usable_bars,
+            key=lambda bar: (_to_int(bar.get('low_price')) or 10**18, str(bar.get('trade_date') or '')),
         )
         close_return_pct = self._return_pct(exit_price, entry_price)
         max_upside_return_pct = self._return_pct(max_high_price, entry_price)
         max_drawdown_return_pct = self._return_pct(min_low_price, entry_price)
-        target_price = decision_fields.get('target_price')
-        stop_loss_price = decision_fields.get('stop_loss_price')
         target_hits = [
             str(bar.get('trade_date'))
-            for bar in observed_bars
+            for bar in usable_bars
             if target_price is not None and (_to_int(bar.get('high_price')) or 0) >= target_price
         ]
         stop_hits = [
             str(bar.get('trade_date'))
-            for bar in observed_bars
+            for bar in usable_bars
             if stop_loss_price is not None and (_to_int(bar.get('low_price')) or 0) <= stop_loss_price
         ]
         target_stop_collision = bool(set(target_hits) & set(stop_hits))
@@ -4818,12 +5341,16 @@ class SignalDeciderLoopService:
             'worst_drawdown_trade_date': worst_drawdown_bar.get('trade_date') if worst_drawdown_bar else None,
             'first_target_hit_trade_date': target_hits[0] if target_hits else None,
             'first_stop_loss_hit_trade_date': stop_hits[0] if stop_hits else None,
-            'observed_trade_dates': [bar.get('trade_date') for bar in observed_bars],
+            'observed_trade_dates': usable_trade_dates,
+            'expected_trade_dates': expected_trade_date_strings,
+            'missing_trade_dates': missing_trade_dates,
+            'incomplete_trade_dates': incomplete_trade_dates,
             'target_hit_trade_dates': target_hits,
             'stop_loss_hit_trade_dates': stop_hits,
             'target_stop_collision': target_stop_collision,
             'expected_horizon_days': horizon_days,
-            'bars_observed': len(observed_bars),
+            'bars_observed': len(usable_bars),
+            'coverage': coverage,
         }
         return {
             'decision_snapshot_id': snapshot_row.id,
@@ -4836,7 +5363,7 @@ class SignalDeciderLoopService:
             'outcome_status': outcome_status,
             'entry_trade_date': self._maybe_date(entry_bar.get('trade_date')),
             'exit_trade_date': self._maybe_date(exit_bar.get('trade_date')),
-            'bars_observed': len(observed_bars),
+            'bars_observed': len(usable_bars),
             'entry_price': entry_price,
             'exit_price': exit_price,
             'max_high_price': max_high_price,
@@ -4859,7 +5386,7 @@ class SignalDeciderLoopService:
                     'close_price': _to_int(bar.get('close_price')),
                     'volume': _to_int(bar.get('volume')),
                 }
-                for bar in observed_bars
+                for bar in usable_bars
             ],
             'diagnostics_payload': diagnostics,
             'computed_at': now,
@@ -4882,6 +5409,8 @@ class SignalDeciderLoopService:
         thresholds = HORIZON_THRESHOLDS[horizon_days]
         decision_action = _normalize_action(decision_fields.get('action'))
         outcome_diagnostics = _maybe_dict(outcome.get('diagnostics'))
+        coverage = _maybe_dict(outcome.get('coverage')) or _maybe_dict(outcome_diagnostics.get('coverage'))
+        coverage_status_reason = str(coverage.get('status_reason') or '')
         close_return_pct = _to_float(outcome.get('close_return_pct'))
         max_upside_return_pct = _to_float(outcome.get('max_upside_return_pct'))
         max_drawdown_return_pct = _to_float(outcome.get('max_drawdown_return_pct'))
@@ -4932,7 +5461,8 @@ class SignalDeciderLoopService:
             evaluation_status = 'pending'
             rationale = {
                 'status': 'pending_horizon',
-                'reason': 'insufficient_price_history',
+                'reason': coverage_status_reason or 'pending_maturity',
+                'coverage': coverage,
                 'evaluation_profile': self._evaluation_profile_payload(
                     evaluation_profile=evaluation_profile,
                     horizon_days=horizon_days,
@@ -4969,6 +5499,7 @@ class SignalDeciderLoopService:
                 'positive_signals': positive_signals,
                 'negative_signals': negative_signals,
                 'severe_drawdown_before_target': severe_drawdown_before_target,
+                'coverage': coverage,
                 'evaluation_profile': self._evaluation_profile_payload(
                     evaluation_profile=evaluation_profile,
                     horizon_days=horizon_days,
@@ -4995,6 +5526,7 @@ class SignalDeciderLoopService:
                 'status': 'graded',
                 'missed_opportunity': missed,
                 'counterfactual_action': counterfactual_action,
+                'coverage': coverage,
                 'evaluation_profile': self._evaluation_profile_payload(
                     evaluation_profile=evaluation_profile,
                     horizon_days=horizon_days,
@@ -5016,6 +5548,7 @@ class SignalDeciderLoopService:
             'severe_drawdown_before_target': severe_drawdown_before_target if decision_action == 'buy' else None,
             'expected_return_pct': decision_fields.get('expected_return_pct'),
             'feature_snapshot': decision.get('feature_snapshot'),
+            'coverage': coverage,
         }
         return {
             'decision_snapshot_id': snapshot_row.id,
