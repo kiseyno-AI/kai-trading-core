@@ -8,8 +8,10 @@ from sqlalchemy.exc import SQLAlchemyError
 from app.agent_context.read_service import (
     AgentContextReadService,
     PERSISTED_FACTOR_FAMILIES,
+    _build_compact_liquidity_context,
     _build_factor_summary_entry,
     _build_price_context,
+    _load_latest_symbol_day_block_history,
     _build_recent_dart_events_context,
     _build_recent_disclosures_freshness_provenance,
 )
@@ -974,6 +976,14 @@ class AgentContextReadServiceTests(unittest.TestCase):
         self.assertEqual(first_item['price_context']['candle']['wick_bias'], 'upper')
         self.assertEqual(first_item['price_context']['freshness_provenance']['freshness_status'], 'fresh')
         self.assertEqual(first_item['price_context']['freshness_provenance']['provenance_status'], 'derived_from_provider_data')
+        self.assertEqual(first_item['liquidity_context']['status'], 'available')
+        self.assertEqual(first_item['liquidity_context']['turnover']['turnover_krw'], 8800000000)
+        self.assertEqual(first_item['liquidity_context']['turnover']['turnover_source'], 'provider')
+        self.assertEqual(first_item['liquidity_context']['ranking']['liquidity_percentile'], 0.91)
+        self.assertEqual(first_item['liquidity_context']['ranking']['liquidity_rank'], None)
+        self.assertEqual(first_item['liquidity_context']['intraday']['status'], 'partial')
+        self.assertEqual(first_item['liquidity_context']['intraday']['quote_spread_points'], 100)
+        self.assertEqual(first_item['liquidity_context']['intraday']['quote_balance_rank'], 5)
         self.assertEqual(first_item['intraday_execution_context']['status'], 'partial')
         self.assertEqual(first_item['intraday_execution_context']['quote']['spread_points'], 100)
         self.assertAlmostEqual(first_item['intraday_execution_context']['orderbook']['imbalance'], 0.076923, places=6)
@@ -1167,6 +1177,181 @@ class AgentContextReadServiceTests(unittest.TestCase):
         self.assertTrue(context['gap']['filled_intraday'])
         self.assertEqual(context['session_range']['close_position_label'], 'lower_half')
 
+    def test_build_compact_liquidity_context_marks_derived_turnover_from_close_and_volume(self):
+        context = _build_compact_liquidity_context(
+            requested_market_date=date.fromisoformat('2026-04-08'),
+            quote_context=None,
+            quote_freshness_provenance={},
+            price_context={
+                'trade_date': '2026-04-08',
+                'source': 'pykrx',
+                'captured_at': '2026-04-08T15:30:00+09:00',
+                'close_price': 71000,
+                'volume': 120000,
+                'turnover': 0,
+                'liquidity': {
+                    'turnover_krw': 8520000000,
+                    'turnover_source': 'estimated',
+                    'turnover_is_estimated': True,
+                    'provider_turnover_krw': None,
+                    'estimated_turnover_krw': 8520000000,
+                },
+                'price_bar_quality': {
+                    'issue_codes': ['turnover_missing_or_zero'],
+                },
+            },
+            price_context_history=[],
+            price_context_freshness_provenance={
+                'freshness_status': 'fresh',
+                'provenance_status': 'provider_plus_fallback',
+                'source_tables': ['daily_price_contexts', 'daily_price_bars'],
+            },
+            price_context_storage_unavailable=False,
+            low_risk_row=None,
+            latest_prior_low_risk_row=None,
+            low_risk_freshness_provenance={},
+            low_risk_storage_unavailable=False,
+            low_risk_prior_storage_unavailable=False,
+            intraday_execution_context=None,
+            intraday_execution_freshness_provenance={},
+        )
+
+        self.assertEqual(context['status'], 'derived')
+        self.assertEqual(context['turnover']['status'], 'derived')
+        self.assertEqual(context['turnover']['turnover_krw'], 8520000000)
+        self.assertEqual(context['turnover']['turnover_source'], 'derived')
+        self.assertEqual(context['turnover']['reason'], 'derived_from_close_price_x_volume')
+
+    def test_build_compact_liquidity_context_marks_missing_price_or_volume_when_turnover_not_derivable(self):
+        context = _build_compact_liquidity_context(
+            requested_market_date=date.fromisoformat('2026-04-08'),
+            quote_context=None,
+            quote_freshness_provenance={},
+            price_context={
+                'trade_date': '2026-04-08',
+                'source': 'pykrx',
+                'captured_at': '2026-04-08T15:30:00+09:00',
+                'close_price': 71000,
+                'volume': 0,
+                'turnover': 0,
+                'liquidity': {
+                    'turnover_source': 'missing',
+                    'turnover_is_estimated': False,
+                    'provider_turnover_krw': None,
+                    'estimated_turnover_krw': None,
+                },
+                'price_bar_quality': {
+                    'issue_codes': ['turnover_missing_or_zero', 'volume_zero'],
+                },
+            },
+            price_context_history=[],
+            price_context_freshness_provenance={
+                'freshness_status': 'fresh',
+                'provenance_status': 'derived_from_provider_data',
+                'source_tables': ['daily_price_contexts', 'daily_price_bars'],
+            },
+            price_context_storage_unavailable=False,
+            low_risk_row=None,
+            latest_prior_low_risk_row=None,
+            low_risk_freshness_provenance={},
+            low_risk_storage_unavailable=False,
+            low_risk_prior_storage_unavailable=False,
+            intraday_execution_context=None,
+            intraday_execution_freshness_provenance={},
+        )
+
+        self.assertEqual(context['status'], 'missing_price_or_volume')
+        self.assertEqual(context['turnover']['status'], 'missing_price_or_volume')
+        self.assertEqual(context['turnover']['reason'], 'volume_missing_or_zero')
+
+    def test_get_symbol_day_context_marks_liquidity_context_storage_unavailable_when_price_context_store_fails(self):
+        class EmptyFundamentalsRepository:
+            def list_stored_fundamentals_summary(self, *, stock_codes, fs_div=None):
+                return []
+
+        class EmptyDisclosureRepository:
+            def list_recent_events_by_stock_codes(self, *, stock_codes, receipt_date_to=None, limit_per_symbol=5):
+                return {symbol: [] for symbol in stock_codes}
+
+        service = AgentContextReadService(
+            fundamentals_repository=EmptyFundamentalsRepository(),
+            disclosure_repository=EmptyDisclosureRepository(),
+        )
+
+        with (
+            patch(
+                'app.agent_context.read_service.load_symbols',
+                return_value=[
+                    {
+                        'id': 1,
+                        'symbol': '005930',
+                        'standard_code': 'KR7005930003',
+                        'name_ko': '삼성전자',
+                        'market': 'KOSPI',
+                        'instrument_type': 'equity',
+                        'source': 'pykrx',
+                        'is_active': True,
+                        'last_refreshed_at': None,
+                    }
+                ],
+            ),
+            patch('app.agent_context.read_service.load_daily_technical_snapshots', return_value=[]),
+            patch('app.agent_context.read_service.load_daily_action_summaries', return_value=[]),
+            patch('app.agent_context.read_service.load_daily_signal_features', return_value=[]),
+            patch('app.agent_context.read_service.load_daily_value_factor_results', return_value=[]),
+            patch('app.agent_context.read_service.load_daily_unified_value_factor_results', return_value=[]),
+            patch('app.agent_context.read_service.load_daily_quality_factor_results', return_value=[]),
+            patch('app.agent_context.read_service.load_daily_momentum_factor_results', return_value=[]),
+            patch('app.agent_context.read_service.load_daily_advanced_value_factor_results', return_value=[]),
+            patch('app.agent_context.read_service.load_daily_low_risk_factor_results', return_value=[]),
+            patch('app.agent_context.read_service.load_daily_beta_factor_results', return_value=[]),
+            patch('app.agent_context.read_service.load_daily_composite_factor_results', return_value=[]),
+            patch(
+                'app.agent_context.read_service.load_current_quotes',
+                return_value=[
+                    {
+                        'symbol': '005930',
+                        'source': 'kis',
+                        'market_state': 'OPEN',
+                        'is_live': True,
+                        'fallback': False,
+                        'available': True,
+                        'price': 71550,
+                        'change': 50,
+                        'change_pct': 0.07,
+                        'volume': 150000,
+                        'turnover': 9000000000,
+                        'trade_date': '2026-04-08',
+                        'cached_at': '2026-04-08T09:57:00+09:00',
+                        'captured_at': '2026-04-08T09:57:00+09:00',
+                    }
+                ],
+            ),
+            patch('app.agent_context.read_service.load_current_kis_intraday_snapshots', return_value=[]),
+            patch(
+                'app.agent_context.read_service.load_daily_price_contexts',
+                side_effect=SQLAlchemyError('daily price contexts unavailable'),
+            ),
+            patch('app.agent_context.read_service.load_daily_price_context_history', return_value=[]),
+            patch('app.agent_context.read_service.load_daily_market_relative_contexts', return_value=[]),
+            patch(
+                'app.agent_context.read_service._load_latest_symbol_day_block_history',
+                return_value=EMPTY_LATEST_PRIOR_ROWS,
+            ),
+        ):
+            result = service.get_symbol_day_context(
+                market_date='2026-04-08',
+                symbols=['005930'],
+                fs_div='CFS',
+                disclosures_limit=3,
+            )
+
+        item = result['items'][0]
+        self.assertEqual(item['liquidity_context']['status'], 'storage_unavailable')
+        self.assertEqual(item['liquidity_context']['turnover']['status'], 'storage_unavailable')
+        self.assertEqual(item['liquidity_context']['turnover']['reason'], 'daily_price_context_storage_unavailable')
+        self.assertEqual(item['context_provenance']['price_context']['reason'], 'daily_price_context_storage_unavailable')
+
     def test_get_symbol_day_context_marks_stale_and_available_but_old_blocks_without_silently_omitting_them(self):
         latest_prior_rows = {
             'factor_rows': {
@@ -1179,6 +1364,18 @@ class AgentContextReadServiceTests(unittest.TestCase):
                         }
                     }
                     if family == 'unified_value'
+                    else {
+                        '005930': {
+                            'market_date': '2026-04-07',
+                            'captured_at': '2026-04-07T15:00:00+09:00',
+                            'source': 'low_risk_v1',
+                            'avg_trading_value_20d': 6400000000.0,
+                            'liquidity_rank': 17,
+                            'liquidity_percentile': 0.82,
+                            'passes_liquidity_floor': True,
+                        }
+                    }
+                    if family == 'low_risk'
                     else {}
                 )
                 for family in PERSISTED_FACTOR_FAMILIES
@@ -1304,6 +1501,22 @@ class AgentContextReadServiceTests(unittest.TestCase):
         self.assertIsNone(item['price_context'])
         self.assertEqual(item['context_provenance']['price_context']['freshness_status'], 'stale')
         self.assertEqual(item['context_provenance']['price_context']['latest_available_market_date'], '2026-04-07')
+        self.assertEqual(item['liquidity_context']['status'], 'stale')
+        self.assertEqual(item['liquidity_context']['turnover']['trade_date'], '2026-04-07')
+        self.assertEqual(
+            item['liquidity_context']['turnover']['reason'],
+            'latest_price_context_before_requested_market_date',
+        )
+        self.assertEqual(item['liquidity_context']['ranking']['status'], 'stale')
+        self.assertEqual(
+            item['liquidity_context']['ranking']['reason'],
+            'latest_prior_low_risk_liquidity_row_available',
+        )
+        self.assertEqual(item['liquidity_context']['ranking']['as_of_market_date'], '2026-04-07')
+        self.assertEqual(item['liquidity_context']['ranking']['avg_trading_value_20d'], 6400000000.0)
+        self.assertEqual(item['liquidity_context']['ranking']['liquidity_rank'], 17)
+        self.assertEqual(item['liquidity_context']['ranking']['liquidity_percentile'], 0.82)
+        self.assertTrue(item['liquidity_context']['ranking']['passes_liquidity_floor'])
         self.assertIsNone(item['signal_features'])
         self.assertEqual(item['context_provenance']['signal_features']['freshness_status'], 'stale')
         self.assertEqual(item['context_provenance']['signal_features']['latest_available_market_date'], '2026-04-07')
@@ -1529,8 +1742,35 @@ class AgentContextReadServiceTests(unittest.TestCase):
         self.assertEqual(summary['beta']['status'], 'not_computed_for_market_date')
         self.assertEqual(summary['beta']['source_status'], 'missing_market_date_bar')
         self.assertEqual(summary['composite']['status'], 'not_eligible')
+        self.assertEqual(item['liquidity_context']['ranking']['status'], 'missing')
+        self.assertEqual(item['liquidity_context']['ranking']['reason'], 'low_risk_liquidity_fields_missing')
         self.assertEqual(item['context_completeness']['factor_rows']['value']['row_status'], 'storage_unavailable')
         self.assertEqual(item['factor_summary']['signal_features']['status'], 'missing_source_row')
+
+    def test_load_latest_symbol_day_block_history_only_requests_low_risk_liquidity_fields(self):
+        with patch('app.agent_context.read_service._load_latest_prior_rows_for_model', return_value={}) as load_prior_rows_mock:
+            _load_latest_symbol_day_block_history(
+                market_date=date(2026, 4, 8),
+                symbols=['005930'],
+            )
+
+        self.assertEqual(load_prior_rows_mock.call_count, len(PERSISTED_FACTOR_FAMILIES) + 1)
+        extra_fields_by_model = {
+            call.kwargs['model'].__name__: call.kwargs.get('extra_fields', ())
+            for call in load_prior_rows_mock.call_args_list
+        }
+        self.assertEqual(
+            extra_fields_by_model['DailyLowRiskFactorResult'],
+            (
+                'avg_trading_value_20d',
+                'liquidity_rank',
+                'liquidity_percentile',
+                'passes_liquidity_floor',
+            ),
+        )
+        for model_name, extra_fields in extra_fields_by_model.items():
+            if model_name != 'DailyLowRiskFactorResult':
+                self.assertEqual(extra_fields, ())
 
     def test_build_factor_summary_entry_marks_unscored_value_families_not_eligible(self):
         cases = (

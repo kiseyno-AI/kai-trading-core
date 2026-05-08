@@ -65,6 +65,11 @@ PROVENANCE_STATUS_PROVIDER_SOURCED = 'provider_sourced'
 PROVENANCE_STATUS_DERIVED = 'derived_from_provider_data'
 PROVENANCE_STATUS_FALLBACK = 'fallback_from_owned_data'
 PROVENANCE_STATUS_PROVIDER_PLUS_FALLBACK = 'provider_plus_fallback'
+LIQUIDITY_TURNOVER_STATUS_AVAILABLE = 'available'
+LIQUIDITY_TURNOVER_STATUS_DERIVED = 'derived'
+LIQUIDITY_TURNOVER_STATUS_STALE = 'stale'
+LIQUIDITY_TURNOVER_STATUS_MISSING_PRICE_OR_VOLUME = 'missing_price_or_volume'
+LIQUIDITY_TURNOVER_STATUS_STORAGE_UNAVAILABLE = 'storage_unavailable'
 PERSISTED_FACTOR_FAMILIES: tuple[str, ...] = (
     'value',
     'unified_value',
@@ -325,6 +330,14 @@ FACTOR_ROW_MODELS: dict[str, type[Any]] = {
     'low_risk': DailyLowRiskFactorResult,
     'beta': DailyBetaFactorResult,
     'composite': DailyCompositeFactorResult,
+}
+PRIOR_FACTOR_ROW_EXTRA_FIELDS: dict[str, tuple[str, ...]] = {
+    'low_risk': (
+        'avg_trading_value_20d',
+        'liquidity_rank',
+        'liquidity_percentile',
+        'passes_liquidity_floor',
+    ),
 }
 FACTOR_ROW_SOURCE_PROVIDERS: dict[str, str] = {
     'value': 'internal_factor_pipeline',
@@ -756,6 +769,14 @@ def _to_float(value: Any) -> float | None:
     return None
 
 
+def _serialize_prior_row_value(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
+    return str(value)
+
+
 def _maybe_dict(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
         return value
@@ -792,6 +813,293 @@ def _trade_date_relation_to_request(*, as_of_market_date: str | None, requested_
     if parsed_as_of < requested_market_date:
         return 'before_market_date'
     return 'after_market_date'
+
+
+def _resolve_turnover_candidate(price_context: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(price_context, dict):
+        return None
+
+    liquidity = _maybe_dict(price_context.get('liquidity'))
+    price_bar_quality = _maybe_dict(price_context.get('price_bar_quality'))
+    close_price = _to_int(price_context.get('close_price'))
+    volume = _to_int(price_context.get('volume'))
+    raw_turnover = _to_int(price_context.get('turnover'))
+    provider_turnover_krw = _to_int(liquidity.get('provider_turnover_krw'))
+    if provider_turnover_krw in (None, 0) and raw_turnover not in (None, 0):
+        provider_turnover_krw = raw_turnover
+    derived_turnover_krw = _to_int(liquidity.get('estimated_turnover_krw'))
+    if derived_turnover_krw is None and close_price not in (None, 0) and volume not in (None, 0):
+        derived_turnover_krw = close_price * volume
+    turnover_krw = _to_int(liquidity.get('turnover_krw'))
+    if turnover_krw in (None, 0):
+        turnover_krw = provider_turnover_krw or derived_turnover_krw
+
+    if provider_turnover_krw not in (None, 0):
+        status = LIQUIDITY_TURNOVER_STATUS_AVAILABLE
+        reason = None
+        turnover_source = 'provider'
+    elif derived_turnover_krw not in (None, 0):
+        status = LIQUIDITY_TURNOVER_STATUS_DERIVED
+        reason = 'derived_from_close_price_x_volume'
+        turnover_source = 'derived'
+    else:
+        status = LIQUIDITY_TURNOVER_STATUS_MISSING_PRICE_OR_VOLUME
+        turnover_source = None
+        if close_price in (None, 0) and volume in (None, 0):
+            reason = 'close_price_and_volume_missing_or_zero'
+        elif close_price in (None, 0):
+            reason = 'close_price_missing_or_zero'
+        elif volume in (None, 0):
+            reason = 'volume_missing_or_zero'
+        else:
+            reason = 'turnover_missing_without_derivable_close_volume'
+
+    return {
+        'trade_date': price_context.get('trade_date'),
+        'source': price_context.get('source'),
+        'captured_at': price_context.get('captured_at'),
+        'close_price': close_price,
+        'volume': volume,
+        'turnover': raw_turnover,
+        'turnover_krw': turnover_krw,
+        'provider_turnover_krw': provider_turnover_krw,
+        'derived_turnover_krw': derived_turnover_krw,
+        'turnover_source': turnover_source,
+        'status': status,
+        'reason': reason,
+        'price_bar_issue_codes': list(price_bar_quality.get('issue_codes') or []),
+    }
+
+
+def _build_turnover_context(
+    *,
+    requested_market_date: date,
+    price_context: dict[str, Any] | None,
+    price_context_history: Sequence[dict[str, Any]],
+    freshness_provenance: dict[str, Any],
+    storage_unavailable: bool = False,
+) -> dict[str, Any]:
+    if storage_unavailable:
+        return {
+            'status': LIQUIDITY_TURNOVER_STATUS_STORAGE_UNAVAILABLE,
+            'reason': 'daily_price_context_storage_unavailable',
+            'provenance': _compact_provenance_summary(freshness_provenance),
+        }
+
+    current_candidate = _resolve_turnover_candidate(price_context)
+    if current_candidate is not None:
+        return {
+            'status': current_candidate['status'],
+            'reason': current_candidate['reason'],
+            'trade_date': current_candidate['trade_date'],
+            'trade_date_relation_to_request': _trade_date_relation_to_request(
+                as_of_market_date=current_candidate['trade_date'],
+                requested_market_date=requested_market_date,
+            ),
+            'freshness_status': freshness_provenance.get('freshness_status'),
+            'source': current_candidate['source'],
+            'captured_at': current_candidate['captured_at'],
+            'close_price': current_candidate['close_price'],
+            'volume': current_candidate['volume'],
+            'turnover': current_candidate['turnover'],
+            'turnover_krw': current_candidate['turnover_krw'],
+            'turnover_source': current_candidate['turnover_source'],
+            'provider_turnover_krw': current_candidate['provider_turnover_krw'],
+            'derived_turnover_krw': current_candidate['derived_turnover_krw'],
+            'price_bar_issue_codes': current_candidate['price_bar_issue_codes'],
+            'provenance': _compact_provenance_summary(freshness_provenance),
+        }
+
+    latest_history_row = price_context_history[-1] if price_context_history else None
+    stale_candidate = _resolve_turnover_candidate(
+        latest_history_row.get('price_context') if isinstance(latest_history_row, dict) else None
+    )
+    if stale_candidate is not None:
+        return {
+            'status': LIQUIDITY_TURNOVER_STATUS_STALE,
+            'reason': 'latest_price_context_before_requested_market_date',
+            'trade_date': stale_candidate['trade_date'],
+            'trade_date_relation_to_request': _trade_date_relation_to_request(
+                as_of_market_date=stale_candidate['trade_date'],
+                requested_market_date=requested_market_date,
+            ),
+            'freshness_status': FRESHNESS_STATUS_STALE,
+            'source': stale_candidate['source'],
+            'captured_at': stale_candidate['captured_at'],
+            'close_price': stale_candidate['close_price'],
+            'volume': stale_candidate['volume'],
+            'turnover': stale_candidate['turnover'],
+            'turnover_krw': stale_candidate['turnover_krw'],
+            'turnover_source': stale_candidate['turnover_source'],
+            'provider_turnover_krw': stale_candidate['provider_turnover_krw'],
+            'derived_turnover_krw': stale_candidate['derived_turnover_krw'],
+            'stale_from_status': stale_candidate['status'],
+            'price_bar_issue_codes': stale_candidate['price_bar_issue_codes'],
+            'provenance': _compact_provenance_summary(freshness_provenance),
+        }
+
+    return {
+        'status': LIQUIDITY_TURNOVER_STATUS_MISSING_PRICE_OR_VOLUME,
+        'reason': 'no_price_context_available_for_requested_market_date',
+        'freshness_status': freshness_provenance.get('freshness_status'),
+        'provenance': _compact_provenance_summary(freshness_provenance),
+    }
+
+
+def _build_liquidity_ranking_context(
+    *,
+    row: dict[str, Any] | None,
+    latest_prior_row: dict[str, Any] | None,
+    freshness_provenance: dict[str, Any],
+    current_storage_unavailable: bool = False,
+    prior_storage_unavailable: bool = False,
+) -> dict[str, Any]:
+    if current_storage_unavailable or (row is None and prior_storage_unavailable):
+        return {
+            'status': LIQUIDITY_TURNOVER_STATUS_STORAGE_UNAVAILABLE,
+            'reason': 'low_risk_factor_storage_unavailable',
+            'provenance': _compact_provenance_summary(freshness_provenance),
+        }
+
+    source_row = row if row is not None else latest_prior_row
+    if source_row is None:
+        return {
+            'status': 'missing',
+            'reason': 'no_low_risk_liquidity_row_for_or_before_request_date',
+            'provenance': _compact_provenance_summary(freshness_provenance),
+        }
+
+    avg_trading_value_20d = _to_float(source_row.get('avg_trading_value_20d'))
+    liquidity_rank = _to_int(source_row.get('liquidity_rank'))
+    liquidity_percentile = _to_float(source_row.get('liquidity_percentile'))
+    passes_liquidity_floor = source_row.get('passes_liquidity_floor')
+    if all(value is None for value in (avg_trading_value_20d, liquidity_rank, liquidity_percentile, passes_liquidity_floor)):
+        return {
+            'status': 'missing',
+            'reason': 'low_risk_liquidity_fields_missing',
+            'as_of_market_date': source_row.get('market_date'),
+            'freshness_status': freshness_provenance.get('freshness_status'),
+            'source': source_row.get('source'),
+            'captured_at': source_row.get('captured_at'),
+            'provenance': _compact_provenance_summary(freshness_provenance),
+        }
+
+    status = 'available' if row is not None else LIQUIDITY_TURNOVER_STATUS_STALE
+    reason = None if row is not None else 'latest_prior_low_risk_liquidity_row_available'
+    return {
+        'status': status,
+        'reason': reason,
+        'as_of_market_date': source_row.get('market_date'),
+        'freshness_status': freshness_provenance.get('freshness_status'),
+        'source': source_row.get('source'),
+        'captured_at': source_row.get('captured_at'),
+        'avg_trading_value_20d': avg_trading_value_20d,
+        'liquidity_rank': liquidity_rank,
+        'liquidity_percentile': liquidity_percentile,
+        'passes_liquidity_floor': passes_liquidity_floor,
+        'ranking_basis': 'avg_trading_value_20d',
+        'provenance': _compact_provenance_summary(freshness_provenance),
+    }
+
+
+def _build_intraday_liquidity_context(
+    *,
+    quote_context: dict[str, Any] | None,
+    quote_freshness_provenance: dict[str, Any],
+    intraday_execution_context: dict[str, Any] | None,
+    intraday_execution_provenance: dict[str, Any],
+) -> dict[str, Any]:
+    if intraday_execution_context is None and quote_context is None:
+        return {
+            'status': 'unavailable',
+            'reason': 'no_intraday_or_quote_context_available',
+            'provenance': {
+                'quote': _compact_provenance_summary(quote_freshness_provenance),
+                'intraday_execution_context': _compact_provenance_summary(intraday_execution_provenance),
+            },
+        }
+
+    intraday_status = (
+        str(intraday_execution_context.get('status') or 'available')
+        if isinstance(intraday_execution_context, dict)
+        else 'unavailable'
+    )
+    spread = _maybe_dict((quote_context or {}).get('spread'))
+    intraday_quote = _maybe_dict((intraday_execution_context or {}).get('quote'))
+    intraday_orderbook = _maybe_dict((intraday_execution_context or {}).get('orderbook'))
+    intraday_liquidity = _maybe_dict((intraday_execution_context or {}).get('liquidity'))
+    quote_spread_points = _to_int(spread.get('spread_points'))
+    if quote_spread_points is None:
+        quote_spread_points = _to_int(intraday_quote.get('spread_points'))
+    return {
+        'status': intraday_status if intraday_execution_context is not None else ('available' if quote_context is not None else 'unavailable'),
+        'reason': intraday_execution_provenance.get('reason') if intraday_execution_context is not None else quote_freshness_provenance.get('reason'),
+        'freshness_status': (
+            intraday_execution_provenance.get('freshness_status')
+            if intraday_execution_context is not None
+            else quote_freshness_provenance.get('freshness_status')
+        ),
+        'quote_freshness_status': quote_freshness_provenance.get('freshness_status'),
+        'quote_trade_date': (quote_context or {}).get('trade_date'),
+        'as_of_market_date': (intraday_execution_context or {}).get('as_of_market_date'),
+        'as_of_timestamp': (intraday_execution_context or {}).get('as_of_timestamp'),
+        'quote_spread_points': quote_spread_points,
+        'quote_spread_bps_of_price': _to_float(spread.get('spread_bps_of_price')),
+        'orderbook_imbalance': _to_float(intraday_orderbook.get('imbalance')),
+        'volume_power_rank': _to_int(intraday_liquidity.get('volume_power_rank')),
+        'volume_rank': _to_int(intraday_liquidity.get('volume_rank')),
+        'quote_balance_rank': _to_int(intraday_liquidity.get('quote_balance_rank')),
+        'provenance': {
+            'quote': _compact_provenance_summary(quote_freshness_provenance),
+            'intraday_execution_context': _compact_provenance_summary(intraday_execution_provenance),
+        },
+    }
+
+
+def _build_compact_liquidity_context(
+    *,
+    requested_market_date: date,
+    quote_context: dict[str, Any] | None,
+    quote_freshness_provenance: dict[str, Any],
+    price_context: dict[str, Any] | None,
+    price_context_history: Sequence[dict[str, Any]],
+    price_context_freshness_provenance: dict[str, Any],
+    price_context_storage_unavailable: bool,
+    low_risk_row: dict[str, Any] | None,
+    latest_prior_low_risk_row: dict[str, Any] | None,
+    low_risk_freshness_provenance: dict[str, Any],
+    low_risk_storage_unavailable: bool,
+    low_risk_prior_storage_unavailable: bool,
+    intraday_execution_context: dict[str, Any] | None,
+    intraday_execution_freshness_provenance: dict[str, Any],
+) -> dict[str, Any]:
+    turnover_context = _build_turnover_context(
+        requested_market_date=requested_market_date,
+        price_context=price_context,
+        price_context_history=price_context_history,
+        freshness_provenance=price_context_freshness_provenance,
+        storage_unavailable=price_context_storage_unavailable,
+    )
+    ranking_context = _build_liquidity_ranking_context(
+        row=low_risk_row,
+        latest_prior_row=latest_prior_low_risk_row,
+        freshness_provenance=low_risk_freshness_provenance,
+        current_storage_unavailable=low_risk_storage_unavailable,
+        prior_storage_unavailable=low_risk_prior_storage_unavailable,
+    )
+    intraday_context = _build_intraday_liquidity_context(
+        quote_context=quote_context,
+        quote_freshness_provenance=quote_freshness_provenance,
+        intraday_execution_context=intraday_execution_context,
+        intraday_execution_provenance=intraday_execution_freshness_provenance,
+    )
+    return {
+        'status': turnover_context.get('status'),
+        'reason': turnover_context.get('reason'),
+        'turnover': turnover_context,
+        'ranking': ranking_context,
+        'intraday': intraday_context,
+    }
 
 
 def _issue_types_for_metadata(*, freshness_status: str, provenance_status: str) -> list[str]:
@@ -869,18 +1177,26 @@ def _load_latest_prior_rows_for_model(
     model: type[Any],
     market_date: date,
     symbols: Sequence[str],
+    extra_fields: Sequence[str] = (),
 ) -> dict[str, dict[str, Any]]:
     normalized_symbols = list(dict.fromkeys(symbols))
     if not normalized_symbols:
         return {}
+    normalized_extra_fields = tuple(dict.fromkeys(extra_fields))
+
+    select_columns = [
+        Symbol.symbol.label('symbol'),
+        model.market_date.label('market_date'),
+        model.captured_at.label('captured_at'),
+        model.source.label('source'),
+    ]
+    for field in normalized_extra_fields:
+        select_columns.append(getattr(model, field).label(field))
 
     with session_scope() as session:
         ranked = (
             select(
-                Symbol.symbol.label('symbol'),
-                model.market_date.label('market_date'),
-                model.captured_at.label('captured_at'),
-                model.source.label('source'),
+                *select_columns,
                 func.row_number()
                 .over(
                     partition_by=model.symbol_id,
@@ -898,11 +1214,17 @@ def _load_latest_prior_rows_for_model(
         rows = session.execute(select(ranked).where(ranked.c.row_rank == 1)).all()
 
     return {
-        row.symbol: {
-            'market_date': row.market_date.isoformat() if row.market_date else None,
-            'captured_at': row.captured_at.isoformat() if row.captured_at else None,
-            'source': row.source,
-        }
+        row.symbol: (
+            {
+                'market_date': row.market_date.isoformat() if row.market_date else None,
+                'captured_at': row.captured_at.isoformat() if row.captured_at else None,
+                'source': row.source,
+            }
+            | {
+                field: _serialize_prior_row_value(getattr(row, field, None))
+                for field in normalized_extra_fields
+            }
+        )
         for row in rows
     }
 
@@ -920,6 +1242,7 @@ def _load_latest_symbol_day_block_history(
                 model=model,
                 market_date=market_date,
                 symbols=symbols,
+                extra_fields=PRIOR_FACTOR_ROW_EXTRA_FIELDS.get(family, ()),
             )
             factor_storage_unavailable[family] = False
         except SQLAlchemyError:
@@ -1067,7 +1390,20 @@ def _build_price_context_freshness_provenance(
     price_context: dict[str, Any] | None,
     price_context_history: list[dict[str, Any]],
     requested_market_date: date,
+    storage_unavailable: bool = False,
 ) -> dict[str, Any]:
+    if storage_unavailable:
+        return _build_freshness_provenance(
+            requested_market_date=requested_market_date,
+            freshness_status=FRESHNESS_STATUS_MISSING,
+            provenance_status=PROVENANCE_STATUS_DERIVED,
+            source_tables=('daily_price_contexts', 'daily_price_bars'),
+            source_provider='pykrx',
+            row_count=0,
+            history_row_count=0,
+            reason='daily_price_context_storage_unavailable',
+        )
+
     latest_history = price_context_history[-1] if price_context_history else None
     liquidity = price_context.get('liquidity') if isinstance(price_context, dict) else None
     price_bar_quality = price_context.get('price_bar_quality') if isinstance(price_context, dict) else None
@@ -2308,16 +2644,25 @@ class AgentContextReadService:
             symbols=normalized_symbols,
             limit=max(len(normalized_symbols), 1000),
         )
-        price_context_rows = load_daily_price_contexts(
-            market_date=normalized_market_date,
-            symbols=normalized_symbols,
-            limit=max(len(normalized_symbols), 1000),
-        )
-        price_context_history_rows = load_daily_price_context_history(
-            market_date=normalized_market_date,
-            symbols=normalized_symbols,
-            history_days=PRICE_CONTEXT_HISTORY_DAYS,
-        )
+        price_context_storage_unavailable = False
+        try:
+            price_context_rows = load_daily_price_contexts(
+                market_date=normalized_market_date,
+                symbols=normalized_symbols,
+                limit=max(len(normalized_symbols), 1000),
+            )
+        except SQLAlchemyError:
+            price_context_storage_unavailable = True
+            price_context_rows = []
+        try:
+            price_context_history_rows = load_daily_price_context_history(
+                market_date=normalized_market_date,
+                symbols=normalized_symbols,
+                history_days=PRICE_CONTEXT_HISTORY_DAYS,
+            )
+        except SQLAlchemyError:
+            price_context_storage_unavailable = True
+            price_context_history_rows = []
         market_relative_rows = load_daily_market_relative_contexts(
             market_date=normalized_market_date,
             symbols=normalized_symbols,
@@ -2417,6 +2762,7 @@ class AgentContextReadService:
             action_summary = action_map.get(symbol)
             signal_features = signal_feature_map.get(symbol)
             market_relative_context = market_relative_map.get(symbol)
+            latest_prior_low_risk_row = ((latest_prior_rows.get('factor_rows') or {}).get('low_risk') or {}).get(symbol)
             company_row = symbol_map.get(symbol)
             company_market = str(company_row.get('market') or '').strip().upper() if company_row else ''
             symbol_enrichment_rows = dict(pykrx_enrichment_by_symbol.get(symbol) or {})
@@ -2584,6 +2930,7 @@ class AgentContextReadService:
                 price_context=price_context,
                 price_context_history=price_context_history,
                 requested_market_date=normalized_market_date,
+                storage_unavailable=price_context_storage_unavailable,
             )
             signal_features_provenance = _build_signal_features_freshness_provenance(
                 signal_features=signal_features,
@@ -2737,6 +3084,22 @@ class AgentContextReadService:
                 signal_features_storage_unavailable=signal_features_storage_unavailable,
                 signal_features_prior_storage_unavailable=signal_features_prior_storage_unavailable,
             )
+            liquidity_context = _build_compact_liquidity_context(
+                requested_market_date=normalized_market_date,
+                quote_context=quote_context,
+                quote_freshness_provenance=quote_context_provenance,
+                price_context=price_context,
+                price_context_history=price_context_history,
+                price_context_freshness_provenance=price_context_provenance,
+                price_context_storage_unavailable=price_context_storage_unavailable,
+                low_risk_row=current_factor_rows['low_risk'],
+                latest_prior_low_risk_row=latest_prior_low_risk_row,
+                low_risk_freshness_provenance=factor_row_provenance['low_risk'],
+                low_risk_storage_unavailable=bool(factor_storage_unavailable.get('low_risk')),
+                low_risk_prior_storage_unavailable=bool(factor_prior_storage_unavailable.get('low_risk')),
+                intraday_execution_context=intraday_execution_context,
+                intraday_execution_freshness_provenance=intraday_execution_provenance,
+            )
 
             fundamentals_entries = fundamentals_map.get(symbol) or []
             latest_disclosure = recent_disclosures[0] if recent_disclosures else None
@@ -2802,6 +3165,7 @@ class AgentContextReadService:
                     'company': company,
                     'quote_context': quote_context,
                     'price_context': price_context,
+                    'liquidity_context': liquidity_context,
                     'intraday_execution_context': intraday_execution_context,
                     'price_context_history': price_context_history,
                     'technical_snapshot': technical_snapshot,

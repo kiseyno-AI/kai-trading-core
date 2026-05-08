@@ -134,6 +134,18 @@ class RepairJsonTailTests(unittest.TestCase):
                         'fallback_groups_present': ['price_action', 'factor_scores'],
                     },
                 },
+                'liquidity_context': {
+                    'status': 'derived',
+                    'turnover': {
+                        'status': 'derived',
+                        'turnover_krw': 8520000000,
+                        'turnover_source': 'derived',
+                    },
+                    'intraday': {
+                        'status': 'partial',
+                        'quote_spread_points': 100,
+                    },
+                },
                 'persisted_factor_rows': {
                     'value': {'value_score': 0.92, 'value_status': 'scored'},
                 },
@@ -143,6 +155,8 @@ class RepairJsonTailTests(unittest.TestCase):
         self.assertEqual(trimmed['factor_summary']['factor_scores']['value']['status'], 'available')
         self.assertEqual(trimmed['factor_summary']['factor_scores']['beta']['status'], 'not_eligible')
         self.assertEqual(trimmed['factor_summary']['signal_features']['row_kind'], 'direct_plus_fallback')
+        self.assertEqual(trimmed['liquidity_context']['turnover']['status'], 'derived')
+        self.assertEqual(trimmed['liquidity_context']['intraday']['quote_spread_points'], 100)
 
 
 class FakeFuture:
@@ -223,6 +237,23 @@ class DeciderReadyAgentContextReadService:
                     'symbol': symbol,
                     'market_date': kwargs['market_date'].isoformat(),
                     'price_context': {'close_price': 85700},
+                    'liquidity_context': {
+                        'status': 'available',
+                        'turnover': {
+                            'status': 'available',
+                            'turnover_krw': 8800000000,
+                            'turnover_source': 'provider',
+                        },
+                        'ranking': {
+                            'status': 'available',
+                            'liquidity_percentile': 0.91,
+                        },
+                        'intraday': {
+                            'status': 'partial',
+                            'quote_spread_points': 100,
+                            'quote_balance_rank': 5,
+                        },
+                    },
                     'technical_snapshot': {'trend_state': 'uptrend'},
                     'action_summary': {'action_label': 'watch_long'},
                     'market_relative_context': {
@@ -1244,11 +1275,14 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertEqual(decider_payload['factor_summary']['factor_scores']['value']['status'], 'available')
         self.assertEqual(decider_payload['factor_summary']['factor_scores']['low_risk']['status'], 'not_eligible')
         self.assertEqual(decider_payload['factor_summary']['signal_features']['status'], 'missing_source_row')
+        self.assertEqual(decider_payload['liquidity_context']['turnover']['status'], 'available')
+        self.assertEqual(decider_payload['liquidity_context']['intraday']['quote_balance_rank'], 5)
         self.assertEqual(decider_payload['market_context']['status'], 'ready')
         self.assertEqual(decider_payload['market_context']['summary']['market_bias'], 'risk_on')
         self.assertEqual(decider_payload['market_context']['indices']['kospi']['level'], 2642.07)
         self.assertNotIn('scores', decider_payload['symbol_day_context'])
         self.assertNotIn('factor_summary', decider_payload['symbol_day_context'])
+        self.assertNotIn('liquidity_context', decider_payload['symbol_day_context'])
         self.assertEqual(decider_payload['symbol_day_context']['market_relative_context']['relative_strength']['return_percentile'], 0.95)
         self.assertEqual(decider_payload['symbol_day_context']['persisted_factor_rows']['advanced_value']['advanced_value_classification'], 'eligible')
         self.assertEqual(decider_payload['symbol_day_context']['context_completeness']['sector_peer_mapping']['status'], 'unavailable')
