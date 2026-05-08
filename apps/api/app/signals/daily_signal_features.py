@@ -23,6 +23,7 @@ from app.market_data_store import (
     load_daily_signal_feature_context_rows,
     load_daily_signal_features,
     load_daily_unified_value_factor_results,
+    load_daily_value_factor_results,
     load_recent_price_bars_by_symbol,
     load_symbols,
     upsert_daily_signal_feature,
@@ -48,6 +49,12 @@ OVERTIME_FLUCTUATION = 'overtime-fluctuation'
 SUPPORTED_SIGNAL_SOURCES = (VOLUME_POWER, OVERTIME_VOLUME, OVERTIME_FLUCTUATION)
 
 FACTOR_SCORE_FIELD_SPECS: dict[str, dict[str, str | None]] = {
+    'value': {
+        'score': 'value_score',
+        'rank': 'value_rank',
+        'percentile': 'value_percentile',
+        'status': 'value_status',
+    },
     'unified_value': {
         'score': 'unified_value_score',
         'rank': 'unified_value_rank',
@@ -93,6 +100,7 @@ FACTOR_SCORE_FIELD_SPECS: dict[str, dict[str, str | None]] = {
 }
 
 FACTOR_METRIC_GROUPS: dict[str, tuple[str, ...]] = {
+    'value': ('per', 'pbr', 'dividend_yield'),
     'unified_value': ('per', 'pbr', 'dividend_yield', 'fcf_yield', 'ev_to_ebitda'),
     'quality': (
         'roe',
@@ -264,6 +272,7 @@ def _maybe_factor_metric_group(row: dict[str, Any] | None, *, family: str) -> di
 
 def _build_factor_score_features(
     *,
+    value_row: dict[str, Any] | None,
     unified_value_row: dict[str, Any] | None,
     quality_row: dict[str, Any] | None,
     momentum_row: dict[str, Any] | None,
@@ -273,6 +282,7 @@ def _build_factor_score_features(
     composite_row: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
     row_map = {
+        'value': value_row,
         'unified_value': unified_value_row,
         'quality': quality_row,
         'momentum': momentum_row,
@@ -637,6 +647,7 @@ def _load_support_maps(
             'symbol_map': {},
             'quote_map': {},
             'price_bars_by_symbol': {},
+            'value_map': {},
             'unified_value_map': {},
             'quality_map': {},
             'momentum_map': {},
@@ -652,6 +663,11 @@ def _load_support_maps(
         market_date=market_date,
         symbols=ordered_symbols,
         history_days=2,
+    )
+    value_rows = load_daily_value_factor_results(
+        market_date=market_date,
+        symbols=ordered_symbols,
+        limit=None,
     )
     unified_value_rows = load_daily_unified_value_factor_results(
         market_date=market_date,
@@ -692,6 +708,7 @@ def _load_support_maps(
         'symbol_map': {item['symbol']: item for item in symbol_rows},
         'quote_map': {item['symbol']: item for item in quote_rows},
         'price_bars_by_symbol': price_bars_by_symbol,
+        'value_map': {item['symbol']: item for item in value_rows},
         'unified_value_map': {item['symbol']: item for item in unified_value_rows},
         'quality_map': {item['symbol']: item for item in quality_rows},
         'momentum_map': {item['symbol']: item for item in momentum_rows},
@@ -734,6 +751,7 @@ def _merge_owned_fallback_features(
     symbol_metadata = (support_maps.get('symbol_map') or {}).get(symbol)
     quote_row = (support_maps.get('quote_map') or {}).get(symbol)
     price_bars = (support_maps.get('price_bars_by_symbol') or {}).get(symbol, [])
+    value_row = (support_maps.get('value_map') or {}).get(symbol)
     unified_value_row = (support_maps.get('unified_value_map') or {}).get(symbol)
     quality_row = (support_maps.get('quality_map') or {}).get(symbol)
     momentum_row = (support_maps.get('momentum_map') or {}).get(symbol)
@@ -743,6 +761,7 @@ def _merge_owned_fallback_features(
     composite_row = (support_maps.get('composite_map') or {}).get(symbol)
 
     factor_score_features = _build_factor_score_features(
+        value_row=value_row,
         unified_value_row=unified_value_row,
         quality_row=quality_row,
         momentum_row=momentum_row,
@@ -786,6 +805,7 @@ def _merge_owned_fallback_features(
     factor_captured_at_values = [
         (row or {}).get('captured_at')
         for row in (
+            value_row,
             unified_value_row,
             quality_row,
             momentum_row,
@@ -846,6 +866,7 @@ def _merge_owned_fallback_features(
         symbol_metadata=symbol_metadata,
         quote_row=quote_row,
         fallback_rows=(
+            value_row,
             unified_value_row,
             quality_row,
             momentum_row,

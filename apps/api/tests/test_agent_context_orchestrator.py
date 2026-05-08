@@ -9,7 +9,12 @@ from unittest.mock import patch
 
 from app.agent_context import orchestrator as orchestrator_module
 from app.agent_context.orchestrator import AgentFeedbackOrchestrator, OpenClawAgentClient
-from app.agent_context.orchestrator_helpers import coerce_decoded_batch_response, correlate_decoded_batch_response, repair_json_tail
+from app.agent_context.orchestrator_helpers import (
+    coerce_decoded_batch_response,
+    correlate_decoded_batch_response,
+    repair_json_tail,
+    trim_batch_item_for_prompt,
+)
 from app.agent_context.prerequisite_service import FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER
 from app.agent_context.runtime_state import RuntimeFeedbackRunState, RuntimeFeedbackStateStore
 
@@ -112,6 +117,32 @@ class RepairJsonTailTests(unittest.TestCase):
         malformed = '{"items":[{"symbol":"014190" "feedback":{}}]}'
         repaired = repair_json_tail(malformed)
         self.assertIsNone(repaired)
+
+    def test_trim_batch_item_for_prompt_preserves_compact_factor_summary(self):
+        trimmed = trim_batch_item_for_prompt(
+            {
+                'symbol': '005930',
+                'factor_summary': {
+                    'requested_market_date': '2026-04-14',
+                    'factor_scores': {
+                        'value': {'status': 'available', 'score': 0.92},
+                        'beta': {'status': 'not_eligible', 'source_status': 'watchlist'},
+                    },
+                    'signal_features': {
+                        'status': 'available',
+                        'row_kind': 'direct_plus_fallback',
+                        'fallback_groups_present': ['price_action', 'factor_scores'],
+                    },
+                },
+                'persisted_factor_rows': {
+                    'value': {'value_score': 0.92, 'value_status': 'scored'},
+                },
+            }
+        )
+
+        self.assertEqual(trimmed['factor_summary']['factor_scores']['value']['status'], 'available')
+        self.assertEqual(trimmed['factor_summary']['factor_scores']['beta']['status'], 'not_eligible')
+        self.assertEqual(trimmed['factor_summary']['signal_features']['row_kind'], 'direct_plus_fallback')
 
 
 class FakeFuture:
@@ -235,7 +266,57 @@ class DeciderReadyAgentContextReadService:
                             'as_of_market_date': kwargs['market_date'].isoformat(),
                         },
                     },
+                    'factor_summary': {
+                        'requested_market_date': kwargs['market_date'].isoformat(),
+                        'factor_scores': {
+                            'value': {
+                                'status': 'available',
+                                'source_status': 'scored',
+                                'score': 0.82,
+                            },
+                            'unified_value': {
+                                'status': 'available',
+                                'source_status': 'scored',
+                                'score': 0.87,
+                            },
+                            'quality': {
+                                'status': 'available',
+                                'source_status': 'scored_partial',
+                                'score': 0.74,
+                            },
+                            'momentum': {
+                                'status': 'available',
+                                'source_status': 'eligible',
+                                'score': 0.91,
+                            },
+                            'advanced_value': {
+                                'status': 'available',
+                                'source_status': 'eligible',
+                                'score': 0.81,
+                            },
+                            'low_risk': {
+                                'status': 'not_eligible',
+                                'source_status': 'watchlist',
+                                'score': 0.67,
+                            },
+                            'beta': {
+                                'status': 'available',
+                                'source_status': 'eligible',
+                                'score': 0.58,
+                            },
+                            'composite': {
+                                'status': 'available',
+                                'source_status': 'eligible',
+                                'score': 0.73,
+                            },
+                        },
+                        'signal_features': {
+                            'status': 'missing_source_row',
+                            'row_kind': 'missing',
+                        },
+                    },
                     'persisted_factor_rows': {
+                        'value': {'value_score': 0.82, 'value_status': 'scored'},
                         'unified_value': {'unified_value_score': 0.87, 'unified_value_status': 'scored'},
                         'quality': {'quality_score': 0.74, 'quality_status': 'scored_partial', 'accruals_ratio': None},
                         'momentum': {'momentum_percentile': 0.91},
@@ -1160,10 +1241,14 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertEqual(decider_payload['scores']['unified_value']['status'], 'available')
         self.assertEqual(decider_payload['scores']['quality']['status'], 'partial')
         self.assertEqual(decider_payload['scores']['momentum']['score'], 0.91)
+        self.assertEqual(decider_payload['factor_summary']['factor_scores']['value']['status'], 'available')
+        self.assertEqual(decider_payload['factor_summary']['factor_scores']['low_risk']['status'], 'not_eligible')
+        self.assertEqual(decider_payload['factor_summary']['signal_features']['status'], 'missing_source_row')
         self.assertEqual(decider_payload['market_context']['status'], 'ready')
         self.assertEqual(decider_payload['market_context']['summary']['market_bias'], 'risk_on')
         self.assertEqual(decider_payload['market_context']['indices']['kospi']['level'], 2642.07)
         self.assertNotIn('scores', decider_payload['symbol_day_context'])
+        self.assertNotIn('factor_summary', decider_payload['symbol_day_context'])
         self.assertEqual(decider_payload['symbol_day_context']['market_relative_context']['relative_strength']['return_percentile'], 0.95)
         self.assertEqual(decider_payload['symbol_day_context']['persisted_factor_rows']['advanced_value']['advanced_value_classification'], 'eligible')
         self.assertEqual(decider_payload['symbol_day_context']['context_completeness']['sector_peer_mapping']['status'], 'unavailable')

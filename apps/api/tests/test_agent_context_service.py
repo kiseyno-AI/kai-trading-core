@@ -3,9 +3,12 @@ from datetime import date
 import unittest
 from unittest.mock import patch
 
+from sqlalchemy.exc import SQLAlchemyError
+
 from app.agent_context.read_service import (
     AgentContextReadService,
     PERSISTED_FACTOR_FAMILIES,
+    _build_factor_summary_entry,
     _build_price_context,
     _build_recent_dart_events_context,
     _build_recent_disclosures_freshness_provenance,
@@ -377,6 +380,7 @@ class AgentContextReadServiceTests(unittest.TestCase):
     @patch('app.agent_context.read_service.load_daily_momentum_factor_results')
     @patch('app.agent_context.read_service.load_daily_quality_factor_results')
     @patch('app.agent_context.read_service.load_daily_unified_value_factor_results')
+    @patch('app.agent_context.read_service.load_daily_value_factor_results')
     @patch('app.agent_context.read_service.load_current_quotes')
     @patch('app.agent_context.read_service.load_current_kis_intraday_snapshots')
     @patch('app.agent_context.read_service.load_daily_price_context_history')
@@ -395,6 +399,7 @@ class AgentContextReadServiceTests(unittest.TestCase):
         load_price_context_history_mock,
         load_current_kis_intraday_snapshots_mock,
         load_current_quotes_mock,
+        load_value_mock,
         load_unified_value_mock,
         load_quality_mock,
         load_momentum_mock,
@@ -490,6 +495,35 @@ class AgentContextReadServiceTests(unittest.TestCase):
                         'direct_signal_source_count': 2,
                         'fallback_groups_present': ['price_action', 'factor_scores'],
                     },
+                },
+                'captured_at': '2026-04-08T15:00:00+09:00',
+            }
+        ]
+        load_value_mock.return_value = [
+            {
+                'symbol': '005930',
+                'market_date': '2026-04-08',
+                'source': 'value_factor_v1',
+                'feature_version': 'value_factor_v1',
+                'per': 10.1,
+                'pbr': 1.2,
+                'dividend_yield': 2.1,
+                'per_status': 'available',
+                'per_rank': 15,
+                'pbr_rank': 22,
+                'dividend_yield_rank': 31,
+                'per_percentile': 0.97,
+                'pbr_percentile': 0.92,
+                'dividend_yield_percentile': 0.88,
+                'value_score': 0.923333,
+                'value_rank': 9,
+                'value_percentile': 0.95,
+                'value_status': 'scored',
+                'factor_payload': {
+                    'availability': {
+                        'valid_component_keys': ['per', 'pbr', 'dividend_yield'],
+                        'missing_component_keys': [],
+                    }
                 },
                 'captured_at': '2026-04-08T15:00:00+09:00',
             }
@@ -964,6 +998,13 @@ class AgentContextReadServiceTests(unittest.TestCase):
         self.assertEqual(first_item['scores']['unified_value']['status'], 'available')
         self.assertEqual(first_item['scores']['unified_value']['score'], 0.84)
         self.assertEqual(first_item['scores']['unified_value']['freshness_provenance']['freshness_status'], 'fresh')
+        self.assertEqual(first_item['factor_summary']['factor_scores']['value']['status'], 'available')
+        self.assertEqual(first_item['factor_summary']['factor_scores']['value']['source_status'], 'scored')
+        self.assertAlmostEqual(first_item['factor_summary']['factor_scores']['value']['score'], 0.923333)
+        self.assertEqual(
+            first_item['factor_summary']['factor_scores']['value']['provenance']['freshness_status'],
+            'fresh',
+        )
         self.assertEqual(first_item['scores']['quality']['status'], 'partial')
         self.assertEqual(first_item['scores']['quality']['components_used'], 5)
         self.assertEqual(first_item['scores']['quality']['components_possible'], 6)
@@ -971,6 +1012,12 @@ class AgentContextReadServiceTests(unittest.TestCase):
         self.assertEqual(first_item['scores']['momentum']['status'], 'available')
         self.assertEqual(first_item['scores']['momentum']['score'], 0.91)
         self.assertEqual(first_item['scores']['momentum']['components_possible'], 3)
+        self.assertEqual(first_item['factor_summary']['factor_scores']['advanced_value']['status'], 'available')
+        self.assertEqual(first_item['factor_summary']['factor_scores']['low_risk']['status'], 'not_eligible')
+        self.assertEqual(first_item['factor_summary']['factor_scores']['beta']['status'], 'available')
+        self.assertEqual(first_item['factor_summary']['factor_scores']['composite']['status'], 'available')
+        self.assertEqual(first_item['factor_summary']['signal_features']['status'], 'available')
+        self.assertEqual(first_item['factor_summary']['signal_features']['row_kind'], 'direct_plus_fallback')
         self.assertEqual(first_item['persisted_factor_rows']['advanced_value']['advanced_value_classification'], 'eligible')
         self.assertEqual(
             first_item['persisted_factor_rows']['advanced_value']['freshness_provenance']['freshness_status'],
@@ -1061,6 +1108,9 @@ class AgentContextReadServiceTests(unittest.TestCase):
         self.assertEqual(second_item['scores']['quality']['status'], 'unavailable')
         self.assertEqual(second_item['scores']['momentum']['status'], 'unavailable')
         self.assertEqual(second_item['scores']['unified_value']['freshness_provenance']['freshness_status'], 'missing')
+        self.assertEqual(second_item['factor_summary']['factor_scores']['value']['status'], 'missing_source_row')
+        self.assertEqual(second_item['factor_summary']['factor_scores']['unified_value']['status'], 'missing_source_row')
+        self.assertEqual(second_item['factor_summary']['signal_features']['status'], 'missing_source_row')
         self.assertEqual(second_item['context_completeness']['signal_features']['row_status'], 'missing')
         self.assertEqual(second_item['context_completeness']['signal_features']['row_kind'], 'missing')
         self.assertEqual(second_item['context_completeness']['intraday_execution_context']['status'], 'unavailable')
@@ -1175,6 +1225,7 @@ class AgentContextReadServiceTests(unittest.TestCase):
             patch('app.agent_context.read_service.load_daily_technical_snapshots', return_value=[]),
             patch('app.agent_context.read_service.load_daily_action_summaries', return_value=[]),
             patch('app.agent_context.read_service.load_daily_signal_features', return_value=[]),
+            patch('app.agent_context.read_service.load_daily_value_factor_results', return_value=[]),
             patch('app.agent_context.read_service.load_daily_unified_value_factor_results', return_value=[]),
             patch('app.agent_context.read_service.load_daily_quality_factor_results', return_value=[]),
             patch('app.agent_context.read_service.load_daily_momentum_factor_results', return_value=[]),
@@ -1262,6 +1313,334 @@ class AgentContextReadServiceTests(unittest.TestCase):
         self.assertIsNone(item['persisted_factor_rows']['unified_value'])
         self.assertEqual(item['context_provenance']['factor_rows']['unified_value']['freshness_status'], 'available_but_old')
         self.assertEqual(item['scores']['unified_value']['freshness_provenance']['freshness_status'], 'available_but_old')
+        self.assertEqual(item['factor_summary']['factor_scores']['value']['status'], 'missing_source_row')
+        self.assertEqual(item['factor_summary']['factor_scores']['unified_value']['status'], 'not_computed_for_market_date')
+        self.assertEqual(item['factor_summary']['signal_features']['status'], 'not_computed_for_market_date')
+
+    def test_get_symbol_day_context_factor_summary_distinguishes_storage_missing_non_eligible_and_history_states(self):
+        class EmptyFundamentalsRepository:
+            def list_stored_fundamentals_summary(self, *, stock_codes, fs_div=None):
+                return []
+
+        class EmptyDisclosureRepository:
+            def list_recent_events_by_stock_codes(self, *, stock_codes, receipt_date_to=None, limit_per_symbol=5):
+                return {symbol: [] for symbol in stock_codes}
+
+        service = AgentContextReadService(
+            fundamentals_repository=EmptyFundamentalsRepository(),
+            disclosure_repository=EmptyDisclosureRepository(),
+        )
+        latest_prior_rows = {
+            'factor_rows': {family: {} for family in PERSISTED_FACTOR_FAMILIES},
+            'factor_storage_unavailable': {family: False for family in PERSISTED_FACTOR_FAMILIES},
+            'signal_features': {},
+            'signal_features_storage_unavailable': False,
+        }
+
+        with (
+            patch(
+                'app.agent_context.read_service.load_symbols',
+                return_value=[
+                    {
+                        'id': 1,
+                        'symbol': '005930',
+                        'standard_code': 'KR7005930003',
+                        'name_ko': '삼성전자',
+                        'market': 'KOSPI',
+                        'instrument_type': 'equity',
+                        'source': 'pykrx',
+                        'is_active': True,
+                        'last_refreshed_at': None,
+                    }
+                ],
+            ),
+            patch('app.agent_context.read_service.load_daily_technical_snapshots', return_value=[]),
+            patch('app.agent_context.read_service.load_daily_action_summaries', return_value=[]),
+            patch('app.agent_context.read_service.load_daily_signal_features', return_value=[]),
+            patch(
+                'app.agent_context.read_service.load_daily_value_factor_results',
+                side_effect=SQLAlchemyError('value table unavailable'),
+            ),
+            patch('app.agent_context.read_service.load_daily_unified_value_factor_results', return_value=[]),
+            patch('app.agent_context.read_service.load_daily_quality_factor_results', return_value=[]),
+            patch(
+                'app.agent_context.read_service.load_daily_momentum_factor_results',
+                return_value=[
+                    {
+                        'symbol': '005930',
+                        'market_date': '2026-04-08',
+                        'source': 'daily_price_bars',
+                        'feature_version': 'price_momentum_v1',
+                        'close_price': 71500,
+                        'ma_60': 68500.0,
+                        'ma_120': 70000.0,
+                        'momentum_12_1': 0.25,
+                        'return_5d': 0.012,
+                        'has_sufficient_history': True,
+                        'is_price_above_ma120': True,
+                        'is_ma60_above_ma120': False,
+                        'is_recent_overheated': False,
+                        'momentum_rank': 64,
+                        'momentum_percentile': 0.62,
+                        'momentum_percentile_threshold': 0.8,
+                        'passes_momentum_top_percentile': False,
+                        'is_momentum_eligible': False,
+                        'factor_payload': {
+                            'eligibility': {
+                                'passes_trend_confirmation': False,
+                                'passes_momentum_top_percentile': False,
+                                'momentum_eligibility_status': 'trend_not_confirmed',
+                                'is_momentum_eligible': False,
+                            },
+                            'ranking': {'momentum_percentile_threshold': 0.8},
+                            'overheat': {
+                                'has_sufficient_cross_sectional_context': True,
+                                'is_recent_overheated': False,
+                            },
+                        },
+                        'captured_at': '2026-04-08T15:00:00+09:00',
+                    }
+                ],
+            ),
+            patch(
+                'app.agent_context.read_service.load_daily_advanced_value_factor_results',
+                return_value=[
+                    {
+                        'symbol': '005930',
+                        'market_date': '2026-04-08',
+                        'source': 'advanced_value_v1',
+                        'feature_version': 'advanced_value_v1',
+                        'advanced_value_score': 0.54,
+                        'advanced_value_rank': 90,
+                        'advanced_value_percentile': 0.43,
+                        'advanced_value_components_used': 2,
+                        'advanced_value_classification': 'watchlist',
+                        'is_advanced_value_eligible': False,
+                        'market_cap_proxy': 10.0,
+                        'enterprise_value': 12.0,
+                        'ebitda': 3.0,
+                        'free_cash_flow': 2.0,
+                        'fcf_yield': 0.05,
+                        'ev_to_ebitda': 4.0,
+                        'fcf_yield_status': 'available',
+                        'ev_to_ebitda_status': 'available',
+                        'captured_at': '2026-04-08T15:00:00+09:00',
+                    }
+                ],
+            ),
+            patch(
+                'app.agent_context.read_service.load_daily_low_risk_factor_results',
+                return_value=[
+                    {
+                        'symbol': '005930',
+                        'market_date': '2026-04-08',
+                        'source': 'low_risk_v1',
+                        'feature_version': 'low_risk_v1',
+                        'low_risk_score': None,
+                        'low_risk_classification': 'insufficient_history',
+                        'is_low_risk_eligible': False,
+                        'volatility_60d': None,
+                        'volatility_120d': None,
+                        'max_drawdown_120d': None,
+                        'avg_trading_value_20d': None,
+                        'volatility_60d_percentile': None,
+                        'volatility_120d_percentile': None,
+                        'max_drawdown_120d_percentile': None,
+                        'liquidity_percentile': None,
+                        'passes_liquidity_floor': None,
+                        'captured_at': '2026-04-08T15:00:00+09:00',
+                    }
+                ],
+            ),
+            patch(
+                'app.agent_context.read_service.load_daily_beta_factor_results',
+                return_value=[
+                    {
+                        'symbol': '005930',
+                        'market_date': '2026-04-08',
+                        'source': 'beta_v1',
+                        'feature_version': 'beta_v1',
+                        'low_beta_score': None,
+                        'low_beta_classification': 'missing_market_date_bar',
+                        'is_low_beta_eligible': False,
+                        'benchmark_id': 'KOSPI_EQW',
+                        'benchmark_market': 'KOSPI',
+                        'beta_60d': None,
+                        'beta_120d': None,
+                        'beta_60d_percentile': None,
+                        'beta_120d_percentile': None,
+                        'history_days_available': 0,
+                        'captured_at': '2026-04-08T15:00:00+09:00',
+                    }
+                ],
+            ),
+            patch(
+                'app.agent_context.read_service.load_daily_composite_factor_results',
+                return_value=[
+                    {
+                        'symbol': '005930',
+                        'market_date': '2026-04-08',
+                        'source': 'composite_v1',
+                        'feature_version': 'composite_v1',
+                        'composite_score': 0.31,
+                        'composite_rank': 155,
+                        'composite_percentile': 0.18,
+                        'composite_classification': 'hard_excluded',
+                        'is_composite_eligible': False,
+                        'valid_factor_count': 3,
+                        'available_base_weight': 0.65,
+                        'has_required_inputs': True,
+                        'is_hard_excluded': True,
+                        'momentum_input': 0.62,
+                        'value_input': 0.71,
+                        'advanced_value_input': 0.54,
+                        'low_risk_input': None,
+                        'low_beta_input': None,
+                        'captured_at': '2026-04-08T15:00:00+09:00',
+                    }
+                ],
+            ),
+            patch('app.agent_context.read_service.load_current_quotes', return_value=[]),
+            patch('app.agent_context.read_service.load_current_kis_intraday_snapshots', return_value=[]),
+            patch('app.agent_context.read_service.load_daily_price_contexts', return_value=[]),
+            patch('app.agent_context.read_service.load_daily_price_context_history', return_value=[]),
+            patch('app.agent_context.read_service.load_daily_market_relative_contexts', return_value=[]),
+            patch(
+                'app.agent_context.read_service._load_latest_symbol_day_block_history',
+                return_value=latest_prior_rows,
+            ),
+        ):
+            result = service.get_symbol_day_context(
+                market_date='2026-04-08',
+                symbols=['005930'],
+                fs_div='CFS',
+                disclosures_limit=3,
+            )
+
+        item = result['items'][0]
+        summary = item['factor_summary']['factor_scores']
+        self.assertEqual(summary['value']['status'], 'storage_unavailable')
+        self.assertEqual(summary['unified_value']['status'], 'missing_source_row')
+        self.assertEqual(summary['momentum']['status'], 'not_eligible')
+        self.assertEqual(summary['momentum']['source_status'], 'trend_not_confirmed')
+        self.assertEqual(summary['advanced_value']['status'], 'not_eligible')
+        self.assertEqual(summary['advanced_value']['source_status'], 'watchlist')
+        self.assertEqual(summary['low_risk']['status'], 'insufficient_history')
+        self.assertEqual(summary['beta']['status'], 'not_computed_for_market_date')
+        self.assertEqual(summary['beta']['source_status'], 'missing_market_date_bar')
+        self.assertEqual(summary['composite']['status'], 'not_eligible')
+        self.assertEqual(item['context_completeness']['factor_rows']['value']['row_status'], 'storage_unavailable')
+        self.assertEqual(item['factor_summary']['signal_features']['status'], 'missing_source_row')
+
+    def test_build_factor_summary_entry_marks_unscored_value_families_not_eligible(self):
+        cases = (
+            (
+                'value',
+                {
+                    'market_date': '2026-04-08',
+                    'source': 'value_factor_v1',
+                    'feature_version': 'value_factor_v1',
+                    'value_status': 'missing_metric',
+                    'value_score': None,
+                    'captured_at': '2026-04-08T15:00:00+09:00',
+                },
+                'missing_metric',
+            ),
+            (
+                'unified_value',
+                {
+                    'market_date': '2026-04-08',
+                    'source': 'unified_value_v1',
+                    'feature_version': 'unified_value_v1',
+                    'unified_value_status': 'insufficient_components',
+                    'unified_value_score': None,
+                    'captured_at': '2026-04-08T15:00:00+09:00',
+                },
+                'insufficient_components',
+            ),
+            (
+                'quality',
+                {
+                    'market_date': '2026-04-08',
+                    'source': 'quality_v1',
+                    'feature_version': 'quality_v1',
+                    'quality_status': 'insufficient_components',
+                    'quality_score': None,
+                    'captured_at': '2026-04-08T15:00:00+09:00',
+                },
+                'insufficient_components',
+            ),
+        )
+
+        for family, row, expected_source_status in cases:
+            with self.subTest(family=family, source_status=expected_source_status):
+                entry = _build_factor_summary_entry(
+                    family=family,
+                    row=row,
+                    score_context={},
+                    freshness_provenance={'freshness_status': 'fresh'},
+                    current_storage_unavailable=False,
+                    prior_storage_unavailable=False,
+                )
+                self.assertEqual(entry['status'], 'not_eligible')
+                self.assertEqual(entry['source_status'], expected_source_status)
+                self.assertFalse(entry['score_available'])
+
+    def test_build_factor_summary_entry_preserves_available_for_scored_value_families(self):
+        cases = (
+            (
+                'value',
+                {
+                    'market_date': '2026-04-08',
+                    'source': 'value_factor_v1',
+                    'feature_version': 'value_factor_v1',
+                    'value_status': 'scored',
+                    'value_score': 0.91,
+                    'value_rank': 8,
+                    'value_percentile': 0.92,
+                    'captured_at': '2026-04-08T15:00:00+09:00',
+                },
+            ),
+            (
+                'unified_value',
+                {
+                    'market_date': '2026-04-08',
+                    'source': 'unified_value_v1',
+                    'feature_version': 'unified_value_v1',
+                    'unified_value_status': 'scored',
+                    'unified_value_score': 0.84,
+                    'unified_value_rank': 15,
+                    'unified_value_percentile': 0.79,
+                    'captured_at': '2026-04-08T15:00:00+09:00',
+                },
+            ),
+            (
+                'quality',
+                {
+                    'market_date': '2026-04-08',
+                    'source': 'quality_v1',
+                    'feature_version': 'quality_v1',
+                    'quality_status': 'scored_partial',
+                    'quality_score': 0.67,
+                    'quality_rank': 22,
+                    'quality_percentile': 0.58,
+                    'captured_at': '2026-04-08T15:00:00+09:00',
+                },
+            ),
+        )
+
+        for family, row in cases:
+            with self.subTest(family=family):
+                entry = _build_factor_summary_entry(
+                    family=family,
+                    row=row,
+                    score_context={},
+                    freshness_provenance={'freshness_status': 'fresh'},
+                    current_storage_unavailable=False,
+                    prior_storage_unavailable=False,
+                )
+                self.assertEqual(entry['status'], 'available')
+                self.assertTrue(entry['score_available'])
 
     @patch('app.agent_context.read_service.load_daily_market_relative_contexts', return_value=[])
     @patch('app.agent_context.read_service.load_daily_composite_factor_results', return_value=[])
@@ -1271,6 +1650,7 @@ class AgentContextReadServiceTests(unittest.TestCase):
     @patch('app.agent_context.read_service.load_daily_momentum_factor_results')
     @patch('app.agent_context.read_service.load_daily_quality_factor_results')
     @patch('app.agent_context.read_service.load_daily_unified_value_factor_results')
+    @patch('app.agent_context.read_service.load_daily_value_factor_results')
     @patch('app.agent_context.read_service.load_current_quotes', return_value=[])
     @patch('app.agent_context.read_service.load_current_kis_intraday_snapshots', return_value=[])
     @patch('app.agent_context.read_service.load_daily_price_context_history', return_value=[])
@@ -1289,6 +1669,7 @@ class AgentContextReadServiceTests(unittest.TestCase):
         _load_price_context_history_mock,
         _load_current_kis_intraday_snapshots_mock,
         _load_current_quotes_mock,
+        load_value_mock,
         load_unified_value_mock,
         load_quality_mock,
         load_momentum_mock,
@@ -1325,6 +1706,31 @@ class AgentContextReadServiceTests(unittest.TestCase):
                 'captured_at': '2026-05-06T15:00:00+09:00',
             }
             for offset, symbol in enumerate(symbols[:2], start=1)
+        ]
+        load_value_mock.return_value = [
+            {
+                'symbol': symbol,
+                'market_date': '2026-05-06',
+                'source': 'value_factor_v1',
+                'feature_version': 'value_factor_v1',
+                'per': 10.0,
+                'pbr': 1.0,
+                'dividend_yield': 2.0,
+                'per_status': 'available',
+                'per_rank': index,
+                'pbr_rank': index,
+                'dividend_yield_rank': index,
+                'per_percentile': 1.0,
+                'pbr_percentile': 1.0,
+                'dividend_yield_percentile': 1.0,
+                'value_score': 0.82,
+                'value_rank': index,
+                'value_percentile': 1.0,
+                'value_status': 'scored',
+                'factor_payload': {},
+                'captured_at': '2026-05-06T15:00:00+09:00',
+            }
+            for index, symbol in enumerate(symbols, start=1)
         ]
         load_unified_value_mock.return_value = [
             {
@@ -1424,9 +1830,11 @@ class AgentContextReadServiceTests(unittest.TestCase):
             )
 
         coverage = result['summary']['context_completeness']
+        self.assertEqual(coverage['factor_rows']['value']['present_rows'], 76)
         self.assertEqual(coverage['factor_rows']['unified_value']['present_rows'], 76)
         self.assertEqual(coverage['factor_rows']['quality']['present_rows'], 76)
         self.assertEqual(coverage['factor_rows']['momentum']['present_rows'], 76)
+        self.assertEqual(coverage['factor_rows']['value']['coverage_status'], 'complete')
         self.assertEqual(coverage['factor_rows']['unified_value']['coverage_status'], 'complete')
         self.assertEqual(coverage['signal_features']['present_rows'], 2)
         self.assertEqual(coverage['signal_features']['missing_rows'], 74)
@@ -1487,6 +1895,7 @@ class AgentContextReadServiceTests(unittest.TestCase):
             stack.enter_context(patch('app.agent_context.read_service.load_daily_price_context_history', return_value=[]))
             stack.enter_context(patch('app.agent_context.read_service.load_current_quotes', return_value=[]))
             stack.enter_context(patch('app.agent_context.read_service.load_current_kis_intraday_snapshots', return_value=[]))
+            stack.enter_context(patch('app.agent_context.read_service.load_daily_value_factor_results', return_value=[]))
             stack.enter_context(patch('app.agent_context.read_service.load_daily_unified_value_factor_results', return_value=[]))
             stack.enter_context(patch('app.agent_context.read_service.load_daily_quality_factor_results', return_value=[]))
             stack.enter_context(patch('app.agent_context.read_service.load_daily_momentum_factor_results', return_value=[]))

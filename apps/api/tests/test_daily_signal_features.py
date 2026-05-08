@@ -310,6 +310,24 @@ class DailySignalFeatureServiceTests(unittest.IsolatedAsyncioTestCase):
                     }
                 ],
             ),
+            patch(
+                'app.signals.daily_signal_features.load_daily_value_factor_results',
+                return_value=[
+                    {
+                        'symbol': '005930',
+                        'source': 'value_factor_v1',
+                        'feature_version': 'value_factor_v1',
+                        'value_score': 0.79,
+                        'value_rank': 18,
+                        'value_percentile': 0.94,
+                        'value_status': 'scored',
+                        'per': 10.1,
+                        'pbr': 1.2,
+                        'dividend_yield': 2.1,
+                        'captured_at': '2026-05-06T15:38:00+09:00',
+                    }
+                ],
+            ),
             patch('app.signals.daily_signal_features.load_daily_quality_factor_results', return_value=[]),
             patch(
                 'app.signals.daily_signal_features.load_daily_momentum_factor_results',
@@ -371,6 +389,10 @@ class DailySignalFeatureServiceTests(unittest.IsolatedAsyncioTestCase):
             samsung['feature_payload']['fallback_features']['factor_scores']['unified_value']['score'],
             0.83,
         )
+        self.assertEqual(
+            samsung['feature_payload']['fallback_features']['factor_scores']['value']['score'],
+            0.79,
+        )
 
     async def test_collect_features_records_source_errors_and_still_builds_fallback_rows(self):
         service = DailySignalFeatureService(client=FailingKISRankingClient())
@@ -414,6 +436,7 @@ class DailySignalFeatureServiceTests(unittest.IsolatedAsyncioTestCase):
                     ]
                 },
             ),
+            patch('app.signals.daily_signal_features.load_daily_value_factor_results', return_value=[]),
             patch('app.signals.daily_signal_features.load_daily_unified_value_factor_results', return_value=[]),
             patch('app.signals.daily_signal_features.load_daily_quality_factor_results', return_value=[]),
             patch('app.signals.daily_signal_features.load_daily_momentum_factor_results', return_value=[]),
