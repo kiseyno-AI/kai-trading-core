@@ -10,7 +10,9 @@ from app.agent_context.read_service import (
     PERSISTED_FACTOR_FAMILIES,
     _build_compact_liquidity_context,
     _build_decider_data_quality_context,
+    _build_decider_intraday_quality_context,
     _build_factor_summary_entry,
+    _build_intraday_execution_context,
     _build_price_context,
     _build_recent_dart_events_context,
     _build_recent_disclosures_freshness_provenance,
@@ -1007,6 +1009,12 @@ class AgentContextReadServiceTests(unittest.TestCase):
             first_item['decider_data_quality_context']['blocks']['intraday_realtime']['status'],
             'partial',
         )
+        intraday_quality = first_item['decider_data_quality_context']['blocks']['intraday_realtime']['intraday_snapshot']
+        self.assertTrue(intraday_quality['quote_available'])
+        self.assertTrue(intraday_quality['orderbook_available'])
+        self.assertTrue(intraday_quality['liquidity_available'])
+        self.assertTrue(intraday_quality['investor_program_activity_available'])
+        self.assertTrue(intraday_quality['news_hints_available'])
         self.assertEqual(first_item['intraday_execution_context']['status'], 'partial')
         self.assertEqual(first_item['intraday_execution_context']['quote']['spread_points'], 100)
         self.assertAlmostEqual(first_item['intraday_execution_context']['orderbook']['imbalance'], 0.076923, places=6)
@@ -1157,13 +1165,33 @@ class AgentContextReadServiceTests(unittest.TestCase):
 
         second_item = result['items'][1]
         self.assertEqual(second_item['symbol'], '000660')
-        self.assertIsNone(second_item['quote_context'])
+        self.assertEqual(second_item['quote_context']['status'], 'unavailable')
+        self.assertEqual(second_item['quote_context']['reason'], 'no_current_quote_cache_row')
+        self.assertEqual(second_item['quote_context']['freshness']['status'], 'missing')
+        self.assertEqual(second_item['quote_context']['spread']['status'], 'unavailable')
         self.assertIsNone(second_item['price_context'])
-        self.assertIsNone(second_item['intraday_execution_context'])
+        self.assertEqual(second_item['intraday_execution_context']['status'], 'unavailable')
+        self.assertEqual(
+            second_item['intraday_execution_context']['reason'],
+            'no_current_kis_intraday_snapshot_cache_row',
+        )
+        self.assertEqual(second_item['intraday_execution_context']['quote']['status'], 'unavailable')
+        self.assertEqual(second_item['intraday_execution_context']['orderbook']['status'], 'unavailable')
+        self.assertEqual(second_item['intraday_execution_context']['liquidity']['status'], 'unavailable')
+        self.assertEqual(
+            second_item['intraday_execution_context']['investor_program_activity']['status'],
+            'unavailable',
+        )
+        self.assertEqual(second_item['intraday_execution_context']['news_hints']['status'], 'unavailable')
         self.assertEqual(second_item['price_context_history'], [])
         self.assertIsNone(second_item['technical_snapshot'])
         self.assertIsNone(second_item['signal_features'])
-        self.assertIsNone(second_item['market_relative_context'])
+        self.assertEqual(second_item['market_relative_context']['status'], 'unavailable')
+        self.assertEqual(second_item['sector_peer_context']['status'], 'unavailable')
+        self.assertEqual(second_item['market_breadth_context']['status'], 'unavailable')
+        self.assertEqual(second_item['investor_flow_context']['status'], 'unavailable')
+        self.assertEqual(second_item['short_selling_context']['status'], 'unavailable')
+        self.assertEqual(second_item['valuation_context']['status'], 'unavailable')
         self.assertEqual(second_item['scores']['unified_value']['status'], 'unavailable')
         self.assertEqual(second_item['scores']['quality']['status'], 'unavailable')
         self.assertEqual(second_item['scores']['momentum']['status'], 'unavailable')
@@ -1179,11 +1207,18 @@ class AgentContextReadServiceTests(unittest.TestCase):
         self.assertIsNone(second_item['fundamentals']['latest_snapshot'])
         self.assertEqual(second_item['context_provenance']['signal_features']['freshness_status'], 'missing')
         self.assertEqual(second_item['context_provenance']['intraday_execution_context']['freshness_status'], 'missing')
+        self.assertEqual(second_item['context_provenance']['market_relative_context']['freshness_status'], 'missing')
         self.assertEqual(second_item['recent_disclosures']['count'], 0)
         self.assertEqual(
             second_item['decider_data_quality_context']['blocks']['intraday_realtime']['status'],
             'unavailable',
         )
+        missing_intraday_quality = second_item['decider_data_quality_context']['blocks']['intraday_realtime']['intraday_snapshot']
+        self.assertFalse(missing_intraday_quality['quote_available'])
+        self.assertFalse(missing_intraday_quality['orderbook_available'])
+        self.assertFalse(missing_intraday_quality['liquidity_available'])
+        self.assertFalse(missing_intraday_quality['investor_program_activity_available'])
+        self.assertFalse(missing_intraday_quality['news_hints_available'])
         self.assertEqual(
             second_item['decider_data_quality_context']['blocks']['factor_score_coverage']['status'],
             'unavailable',
@@ -1191,6 +1226,12 @@ class AgentContextReadServiceTests(unittest.TestCase):
         self.assertFalse(second_item['availability']['quote_context'])
         self.assertFalse(second_item['availability']['price_context'])
         self.assertFalse(second_item['availability']['intraday_execution_context'])
+        self.assertFalse(second_item['availability']['market_relative_context'])
+        self.assertFalse(second_item['availability']['sector_peer_context'])
+        self.assertFalse(second_item['availability']['market_breadth_context'])
+        self.assertFalse(second_item['availability']['investor_flow_context'])
+        self.assertFalse(second_item['availability']['short_selling_context'])
+        self.assertFalse(second_item['availability']['valuation_context'])
 
     def test_get_symbol_day_context_requires_at_least_one_symbol(self):
         service = AgentContextReadService(
@@ -1855,6 +1896,50 @@ class AgentContextReadServiceTests(unittest.TestCase):
         self.assertEqual(factor_score_block['required_scores']['unified_value']['status'], 'provider_error')
         self.assertEqual(result['block_status_counts']['provider_error'], 1)
         self.assertEqual(result['block_status_counts']['unavailable'], 7)
+
+    def test_build_decider_intraday_quality_context_keeps_structured_unavailable_blocks_false(self):
+        intraday_execution_context = _build_intraday_execution_context(None)
+
+        result = _build_decider_intraday_quality_context(
+            quote_context=None,
+            quote_provenance={'freshness_status': 'missing', 'provenance_status': 'provider_sourced'},
+            intraday_execution_context=intraday_execution_context,
+            intraday_execution_provenance={
+                'freshness_status': 'missing',
+                'provenance_status': 'provider_sourced',
+                'reason': 'no_current_kis_intraday_snapshot_cache_row',
+            },
+            intraday_execution_completeness=intraday_execution_context['coverage'],
+        )
+
+        intraday_snapshot = result['intraday_snapshot']
+        self.assertEqual(result['status'], 'unavailable')
+        self.assertEqual(intraday_snapshot['status'], 'unavailable')
+        self.assertFalse(intraday_snapshot['quote_available'])
+        self.assertFalse(intraday_snapshot['orderbook_available'])
+        self.assertFalse(intraday_snapshot['liquidity_available'])
+        self.assertFalse(intraday_snapshot['investor_program_activity_available'])
+        self.assertFalse(intraday_snapshot['news_hints_available'])
+
+    def test_build_decider_intraday_quality_context_uses_status_fallback_when_block_availability_is_missing(self):
+        intraday_execution_context = _build_intraday_execution_context(_make_intraday_execution_row())
+        intraday_execution_context.pop('availability', None)
+        intraday_execution_context['quote']['status'] = 'derived'
+
+        result = _build_decider_intraday_quality_context(
+            quote_context={'status': 'available', 'trade_date': '2026-04-08'},
+            quote_provenance={'freshness_status': 'fresh', 'provenance_status': 'provider_sourced'},
+            intraday_execution_context=intraday_execution_context,
+            intraday_execution_provenance={'freshness_status': 'fresh', 'provenance_status': 'provider_sourced'},
+            intraday_execution_completeness=intraday_execution_context['coverage'],
+        )
+
+        intraday_snapshot = result['intraday_snapshot']
+        self.assertTrue(intraday_snapshot['quote_available'])
+        self.assertTrue(intraday_snapshot['orderbook_available'])
+        self.assertTrue(intraday_snapshot['liquidity_available'])
+        self.assertTrue(intraday_snapshot['investor_program_activity_available'])
+        self.assertTrue(intraday_snapshot['news_hints_available'])
 
     def test_build_decider_data_quality_context_marks_factor_score_provider_error_for_signal_feature_storage_failure(self):
         result = _build_decider_data_quality_context(
