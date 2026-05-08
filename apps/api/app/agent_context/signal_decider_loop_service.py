@@ -308,6 +308,32 @@ def _normalize_horizons(horizons: Sequence[int] | None) -> list[int]:
     return normalized
 
 
+def _decision_snapshot_feedback_dedupe_key(row: SignalDeciderDecisionSnapshotRow) -> tuple[Any, ...]:
+    feedback_id = getattr(row, 'feedback_id', None)
+    if feedback_id is not None:
+        return ('feedback', int(feedback_id))
+    return (
+        'fallback',
+        getattr(row, 'market_date'),
+        str(getattr(row, 'symbol')),
+        str(getattr(row, 'agent_name')),
+    )
+
+
+def _dedupe_decision_snapshot_rows(
+    rows: Sequence[SignalDeciderDecisionSnapshotRow],
+) -> list[SignalDeciderDecisionSnapshotRow]:
+    deduped: list[SignalDeciderDecisionSnapshotRow] = []
+    seen_keys: set[tuple[Any, ...]] = set()
+    for row in rows:
+        dedupe_key = _decision_snapshot_feedback_dedupe_key(row)
+        if dedupe_key in seen_keys:
+            continue
+        seen_keys.add(dedupe_key)
+        deduped.append(row)
+    return deduped
+
+
 def _resolve_review_horizons(
     horizons: Sequence[int] | None,
     *,
@@ -1110,10 +1136,115 @@ class SignalDeciderLoopRepository:
     ) -> list[SignalDeciderDecisionSnapshot]:
         if not items:
             return []
-        rows = [SignalDeciderDecisionSnapshot(**item) for item in items]
-        session.add_all(rows)
-        session.flush()
-        return rows
+        return_order: list[tuple[str, int]] = []
+        null_feedback_items: list[dict[str, Any]] = []
+        deduped_feedback_items: list[tuple[int, dict[str, Any]]] = []
+        seen_feedback_ids: set[int] = set()
+        for item in reversed(list(items)):
+            feedback_id = item.get('feedback_id')
+            if feedback_id is None:
+                continue
+            normalized_feedback_id = int(feedback_id)
+            if normalized_feedback_id in seen_feedback_ids:
+                continue
+            seen_feedback_ids.add(normalized_feedback_id)
+            deduped_feedback_items.append((normalized_feedback_id, item))
+        deduped_feedback_items.reverse()
+
+        null_item_index = 0
+        for item in items:
+            feedback_id = item.get('feedback_id')
+            if feedback_id is None:
+                null_feedback_items.append(item)
+                return_order.append(('null', null_item_index))
+                null_item_index += 1
+                continue
+            return_order.append(('feedback', int(feedback_id)))
+
+        rows_by_feedback_id: dict[int, SignalDeciderDecisionSnapshot] = {}
+        rows_by_null_index: dict[int, SignalDeciderDecisionSnapshot] = {}
+        if deduped_feedback_items:
+            if session.bind is not None and session.bind.dialect.name == 'postgresql':
+                stmt = insert(SignalDeciderDecisionSnapshot).values(
+                    [dict(item) for _, item in deduped_feedback_items]
+                )
+                excluded = stmt.excluded
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=[SignalDeciderDecisionSnapshot.feedback_id],
+                    index_where=SignalDeciderDecisionSnapshot.feedback_id.is_not(None),
+                    set_={
+                        'market_date': excluded.market_date,
+                        'symbol': excluded.symbol,
+                        'agent_name': excluded.agent_name,
+                        'agent_version': excluded.agent_version,
+                        'decision_run_id': excluded.decision_run_id,
+                        'feedback_received_at': excluded.feedback_received_at,
+                        'policy_version': excluded.policy_version,
+                        'decision_action': excluded.decision_action,
+                        'preferred_action': excluded.preferred_action,
+                        'next_day_open_action': excluded.next_day_open_action,
+                        'entry_price_basis': excluded.entry_price_basis,
+                        'target_price': excluded.target_price,
+                        'expected_return_pct': excluded.expected_return_pct,
+                        'stop_loss_price': excluded.stop_loss_price,
+                        'suggested_holding_period': excluded.suggested_holding_period,
+                        'confidence_score_10': excluded.confidence_score_10,
+                        'conviction_score_10': excluded.conviction_score_10,
+                        'thesis_summary': excluded.thesis_summary,
+                        'supporting_evidence_payload': excluded.supporting_evidence_payload,
+                        'decision_risks_payload': excluded.decision_risks_payload,
+                        'invalidation_conditions_payload': excluded.invalidation_conditions_payload,
+                        'data_quality_warnings_payload': excluded.data_quality_warnings_payload,
+                        'specialist_disagreement_payload': excluded.specialist_disagreement_payload,
+                        'traceability_payload': excluded.traceability_payload,
+                        'input_feature_snapshot_payload': excluded.input_feature_snapshot_payload,
+                        'request_payload': excluded.request_payload,
+                        'response_payload': excluded.response_payload,
+                        'response_summary_payload': excluded.response_summary_payload,
+                        'created_at': excluded.created_at,
+                        'updated_at': excluded.updated_at,
+                    },
+                ).returning(SignalDeciderDecisionSnapshot.id)
+                ids = session.execute(stmt).scalars().all()
+                rows = session.execute(
+                    select(SignalDeciderDecisionSnapshot)
+                    .where(SignalDeciderDecisionSnapshot.id.in_(ids))
+                    .order_by(SignalDeciderDecisionSnapshot.id.asc())
+                ).scalars().all()
+                rows_by_feedback_id = {
+                    int(row.feedback_id): row
+                    for row in rows
+                    if row.feedback_id is not None
+                }
+            else:
+                for feedback_id, item in deduped_feedback_items:
+                    row = session.execute(
+                        select(SignalDeciderDecisionSnapshot).where(
+                            SignalDeciderDecisionSnapshot.feedback_id == feedback_id
+                        )
+                    ).scalar_one_or_none()
+                    if row is None:
+                        row = SignalDeciderDecisionSnapshot(**item)
+                        session.add(row)
+                    else:
+                        for key, value in item.items():
+                            setattr(row, key, value)
+                    session.flush()
+                    rows_by_feedback_id[feedback_id] = row
+
+        if null_feedback_items:
+            null_rows = [SignalDeciderDecisionSnapshot(**item) for item in null_feedback_items]
+            session.add_all(null_rows)
+            session.flush()
+            rows_by_null_index = {
+                index: row
+                for index, row in enumerate(null_rows)
+            }
+
+        return [
+            rows_by_null_index[key] if kind == 'null' else rows_by_feedback_id[key]
+            for kind, key in return_order
+        ]
 
     def list_decision_snapshots(
         self,
@@ -1124,6 +1255,7 @@ class SignalDeciderLoopRepository:
         symbols: Sequence[str] | None = None,
         decision_actions: Sequence[str] | None = None,
         policy_versions: Sequence[str] | None = None,
+        dedupe_feedback_results: bool = False,
         limit: int | None = None,
         offset: int = 0,
     ) -> list[SignalDeciderDecisionSnapshotRecord]:
@@ -1159,11 +1291,18 @@ class SignalDeciderLoopRepository:
                 SignalDeciderDecisionSnapshot.created_at.desc(),
                 SignalDeciderDecisionSnapshot.id.desc(),
             )
-            if offset > 0:
-                stmt = stmt.offset(offset)
-            if limit is not None:
-                stmt = stmt.limit(limit)
+            if not dedupe_feedback_results:
+                if offset > 0:
+                    stmt = stmt.offset(offset)
+                if limit is not None:
+                    stmt = stmt.limit(limit)
             rows = session.execute(stmt).scalars().all()
+            if dedupe_feedback_results:
+                rows = _dedupe_decision_snapshot_rows(rows)
+                if offset > 0:
+                    rows = rows[offset:]
+                if limit is not None:
+                    rows = rows[:limit]
             return [_serialize_decision_snapshot_row(row) for row in rows]
 
     def get_decision_snapshot(self, *, snapshot_id: int) -> SignalDeciderDecisionSnapshotRecord | None:
@@ -2441,6 +2580,7 @@ class SignalDeciderLoopService:
         rows = self.repository.list_decision_snapshots(
             market_date_from=market_date_from,
             market_date_to=market_date_to,
+            dedupe_feedback_results=True,
         )
         items, summary = self._build_calendar_summary_items(
             rows=rows,
@@ -2480,7 +2620,10 @@ class SignalDeciderLoopService:
             _normalize_optional_text(evaluation_version, default=DEFAULT_SIGNAL_DECIDER_EVALUATION_VERSION)
             or DEFAULT_SIGNAL_DECIDER_EVALUATION_VERSION
         )
-        rows = self.repository.list_decision_snapshots(market_date=normalized_market_date)
+        rows = self.repository.list_decision_snapshots(
+            market_date=normalized_market_date,
+            dedupe_feedback_results=True,
+        )
         items = self._build_review_items(
             rows=rows,
             horizons=resolved_horizons,
@@ -2647,6 +2790,7 @@ class SignalDeciderLoopService:
             symbols=normalized_symbols or None,
             decision_actions=[normalized_action] if normalized_action else None,
             policy_versions=[normalized_policy_version] if normalized_policy_version else None,
+            dedupe_feedback_results=True,
         )
         snapshot_ids = [row.id for row in rows]
         evaluations = self.repository.list_evaluations(
@@ -2748,6 +2892,7 @@ class SignalDeciderLoopService:
             market_date_from=normalized_from,
             market_date_to=normalized_to,
             symbols=normalized_symbols or None,
+            dedupe_feedback_results=True,
         )
         if not rows:
             return {
@@ -2908,6 +3053,7 @@ class SignalDeciderLoopService:
         rows = self.repository.list_decision_snapshots(
             market_date=normalized_market_date,
             symbols=[normalized_symbol] if normalized_symbol else None,
+            dedupe_feedback_results=True,
             limit=_normalize_limit(limit, default=50),
         )
         snapshot_ids = [row.id for row in rows]
@@ -3025,6 +3171,7 @@ class SignalDeciderLoopService:
             market_date_from=normalized_from,
             market_date_to=normalized_to,
             symbols=normalized_symbols or None,
+            dedupe_feedback_results=True,
         )
         snapshots_by_id = {row.id: row for row in snapshot_rows}
         evaluations = self.repository.list_evaluations_by_range(

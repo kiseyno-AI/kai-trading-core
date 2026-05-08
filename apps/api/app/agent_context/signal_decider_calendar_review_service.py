@@ -485,6 +485,7 @@ class SignalDeciderCalendarReviewService:
                 market_date_from=normalized_from,
                 market_date_to=normalized_to,
                 symbols=normalized_symbols or None,
+                dedupe_feedback_results=True,
             )
             upsert_items: list[dict[str, Any]] = []
             for primary_horizon_days in normalized_primary_horizons:
