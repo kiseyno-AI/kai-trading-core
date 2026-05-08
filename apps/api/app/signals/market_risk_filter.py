@@ -147,6 +147,7 @@ class DailyMarketRiskFilterService:
         )
         matched_symbols = [item['symbol'] for item in items]
         matched_symbol_set = set(matched_symbols)
+        response_matched_symbols = [] if summary_only and not normalized_symbol else matched_symbols
         requested_market_date = (
             normalized_requested_market_date.isoformat() if normalized_requested_market_date is not None else None
         )
@@ -158,7 +159,7 @@ class DailyMarketRiskFilterService:
         summary = {
             'entries': len(items),
             'requested_symbol': normalized_symbol,
-            'matched_symbols': matched_symbols,
+            'matched_symbols': response_matched_symbols,
             'missing_symbols': [value for value in requested_symbols if value not in matched_symbol_set],
             'passed_count': sum(1 for item in items if item.get('passed_filter')),
             'watchlist_count': sum(1 for item in items if item.get('watchlist_flagged')),
