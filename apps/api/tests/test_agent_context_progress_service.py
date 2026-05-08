@@ -216,6 +216,107 @@ class AgentContextProgressServiceTests(unittest.TestCase):
             {'requested_count': 2, 'completed_count': 1, 'error_count': 1},
         )
 
+    def test_feedback_progress_self_heals_stale_running_summary_when_outputs_are_complete(self):
+        fake_session = FakeProgressSession()
+        fake_session.failure_rows = []
+        fake_session.feedback_rows = [
+            SimpleNamespace(
+                symbol=symbol,
+                agent_name=agent_name,
+                run_id='stale-running-run',
+                received_at=datetime(2026, 4, 14, 1, index, tzinfo=timezone.utc),
+                id=index,
+            )
+            for index, (symbol, agent_name) in enumerate(
+                [
+                    ('005930', 'eod-summarizer'),
+                    ('000660', 'eod-summarizer'),
+                    ('005930', 'technical-summarizer'),
+                    ('000660', 'technical-summarizer'),
+                ],
+                start=1,
+            )
+        ]
+        stale_run_snapshot = {
+            'run_id': 'stale-running-run',
+            'status': 'running',
+            'symbols_total': 2,
+            'completed_count': 4,
+            'failed_count': 0,
+            'started_at': datetime(2026, 4, 14, 1, 0, tzinfo=timezone.utc),
+            'completed_at': None,
+            'request_payload': {
+                'mode': 'daily_retry_cycle_role_sequenced',
+                'symbols': ['005930', '000660'],
+                'requested_symbols': ['005930', '000660'],
+                'roles': ['eod-summarizer', 'technical-summarizer'],
+            },
+            'summary_payload': {
+                'progress_summary': {
+                    'run_id': 'stale-running-run',
+                    'run_status': 'running',
+                    'run_table_status': 'running',
+                    'is_live': True,
+                    'current_role': 'technical-summarizer',
+                    'total_symbols': 2,
+                    'processed_symbols': 2,
+                    'completed_symbols': 2,
+                    'in_progress_symbols': 0,
+                    'pending_symbols': 0,
+                    'failed_items': 0,
+                    'completed_feedback_count': 4,
+                    'expected_feedback_count': 4,
+                    'progress_percent': 100.0,
+                    'role_progress': {
+                        'eod-summarizer': {
+                            'role': 'eod-summarizer',
+                            'status': 'completed',
+                            'total_symbols': 2,
+                            'completed_symbols': 2,
+                            'failed_items': 0,
+                        },
+                        'technical-summarizer': {
+                            'role': 'technical-summarizer',
+                            'status': 'incomplete',
+                            'total_symbols': 2,
+                            'completed_symbols': 2,
+                            'failed_items': 0,
+                            'pending_symbols': 0,
+                            'in_progress_symbols': 0,
+                        },
+                    },
+                }
+            },
+        }
+
+        @contextmanager
+        def fake_session_scope():
+            yield fake_session
+
+        with patch('app.agent_context.progress_service.session_scope', fake_session_scope):
+            with patch('app.agent_context.progress_service.runtime_feedback_state_store.get_run', return_value=None):
+                with patch(
+                    'app.agent_context.progress_service.agent_context_feedback_run_state_service.find_latest_run',
+                    return_value=stale_run_snapshot,
+                ):
+                    result = AgentContextProgressService().get_feedback_progress(
+                        market_date='2026-04-14',
+                        symbols=None,
+                        expected_agents=['eod-summarizer', 'technical-summarizer'],
+                    )
+
+        summary = result['summary']
+        self.assertEqual(summary['run_status'], 'completed')
+        self.assertEqual(summary['run_table_status'], 'completed')
+        self.assertFalse(summary['is_live'])
+        self.assertIsNone(summary['current_role'])
+        self.assertEqual(summary['completed_feedback_count'], 4)
+        self.assertEqual(summary['expected_feedback_count'], 4)
+        self.assertEqual(summary['progress_percent'], 100.0)
+        self.assertEqual(summary['completed_roles'], ['eod-summarizer', 'technical-summarizer'])
+        self.assertEqual(summary['remaining_roles'], [])
+        self.assertEqual(summary['role_progress']['technical-summarizer']['status'], 'completed')
+
     def test_feedback_progress_runtime_summary_tracks_whole_cycle_completion_not_symbol_boundary(self):
         fake_session = FakeProgressSession()
         state = RuntimeFeedbackRunState(
@@ -1066,7 +1167,16 @@ class AgentContextProgressServiceTests(unittest.TestCase):
                 return value if tz is not None else value.replace(tzinfo=None)
 
         with patch('app.agent_context.progress_service.datetime', FixedDateTime):
-            result = self._call_service(fake_session, symbols=['005930'])
+            result = self._call_service(
+                fake_session,
+                symbols=['005930'],
+                expected_agents=[
+                    'eod-summarizer',
+                    'technical-summarizer',
+                    'fundamental-summarizer',
+                    'signal-decider',
+                ],
+            )
 
         summary = result['summary']
         self.assertEqual(summary['run_status'], 'completed')

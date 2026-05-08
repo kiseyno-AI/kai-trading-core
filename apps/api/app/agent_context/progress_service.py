@@ -38,6 +38,10 @@ class AgentContextProgressService:
             expected_agents=expected_agent_names,
             run_id=run_id,
         )
+        if expected_agents is None and resolved_run is not None:
+            run_expected_agents = self._resolve_run_requested_agents(resolved_run)
+            if run_expected_agents:
+                expected_agent_names = self._normalize_expected_agents(run_expected_agents)
         state = None
         if run_id is not None:
             state = runtime_feedback_state_store.get_run(normalized_market_date, run_id=run_id)
@@ -133,6 +137,10 @@ class AgentContextProgressService:
                 'prerequisites_ready': False,
                 'missing_prerequisites': prerequisites['missing_prerequisites'],
             }
+        summary_payload = self._self_heal_completed_summary(
+            summary=summary_payload,
+            fallback_summary=persisted_progress['summary'],
+        )
         summary_payload = self._normalize_summary_progress_fields(summary_payload)
 
         return {
@@ -184,6 +192,27 @@ class AgentContextProgressService:
             mode = summary_payload.get('mode')
         return str(mode).strip() if mode is not None else None
 
+    @staticmethod
+    def _resolve_run_requested_agents(run_snapshot: dict[str, Any]) -> list[str] | None:
+        payloads: list[dict[str, Any]] = []
+        request_payload = run_snapshot.get('request_payload') if isinstance(run_snapshot.get('request_payload'), dict) else None
+        summary_payload = run_snapshot.get('summary_payload') if isinstance(run_snapshot.get('summary_payload'), dict) else None
+        if request_payload is not None:
+            payloads.append(request_payload)
+        if summary_payload is not None:
+            payloads.append(summary_payload)
+            progress_summary = summary_payload.get('progress_summary')
+            if isinstance(progress_summary, dict):
+                payloads.append(progress_summary)
+        for payload in payloads:
+            roles = payload.get('roles') or payload.get('requested_roles') or payload.get('expected_agents')
+            if not isinstance(roles, Sequence) or isinstance(roles, (str, bytes)):
+                continue
+            normalized = [str(role).strip() for role in roles if str(role).strip()]
+            if normalized:
+                return normalized
+        return None
+
     def _merge_live_retry_summary_with_persisted_progress(
         self,
         *,
@@ -207,6 +236,7 @@ class AgentContextProgressService:
             'cycle_status',
             'parallel_per_role',
             'seconds_since_last_feedback',
+            'expected_feedback_count',
             'buffered_feedback_count',
             'buffered_failure_count',
             'pending_feedback_count',
@@ -258,6 +288,7 @@ class AgentContextProgressService:
             'cycle_status',
             'parallel_per_role',
             'seconds_since_last_feedback',
+            'expected_feedback_count',
             'buffered_feedback_count',
             'buffered_failure_count',
             'pending_feedback_count',
@@ -588,7 +619,8 @@ class AgentContextProgressService:
         ):
             if key in payload and key not in summary:
                 summary[key] = payload[key]
-        return self._merge_run_table_metadata(summary=summary, run_snapshot=run_snapshot)
+        merged = self._merge_run_table_metadata(summary=summary, run_snapshot=run_snapshot)
+        return self._self_heal_completed_summary(summary=merged, fallback_summary=fallback_summary)
 
     @staticmethod
     def _merge_run_table_metadata(*, summary: dict[str, Any], run_snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -601,6 +633,68 @@ class AgentContextProgressService:
         merged['is_live'] = merged.get('is_live') if merged.get('is_live') is not None else run_snapshot.get('status') == 'running'
         merged['run_started_at'] = merged.get('run_started_at') or (started_at.isoformat() if started_at else None)
         merged['run_completed_at'] = merged.get('run_completed_at') or (completed_at.isoformat() if completed_at else None)
+        return merged
+
+    @staticmethod
+    def _self_heal_completed_summary(*, summary: dict[str, Any], fallback_summary: dict[str, Any]) -> dict[str, Any]:
+        merged = dict(summary)
+        completed_feedback_count = int(
+            merged.get('completed_feedback_count') or fallback_summary.get('completed_feedback_count') or 0
+        )
+        expected_feedback_count = int(
+            merged.get('expected_feedback_count') or fallback_summary.get('expected_feedback_count') or 0
+        )
+        failed_items = int(merged.get('failed_items') or fallback_summary.get('failed_items') or 0)
+        all_feedback_completed = expected_feedback_count > 0 and completed_feedback_count >= expected_feedback_count and failed_items == 0
+        no_work_remaining = (
+            int(merged.get('pending_symbols') or 0) == 0
+            and int(merged.get('in_progress_symbols') or 0) == 0
+        )
+        if not all_feedback_completed or not no_work_remaining:
+            return merged
+
+        merged['run_status'] = 'completed'
+        merged['run_table_status'] = 'completed'
+        merged['is_live'] = False
+        merged['current_role'] = None
+        merged['completed_feedback_count'] = completed_feedback_count
+        merged['expected_feedback_count'] = expected_feedback_count
+        merged['failed_items'] = 0
+        merged['progress_ratio'] = 1.0
+        merged['progress_percent'] = 100.0
+        if no_work_remaining:
+            merged['processed_symbols'] = merged.get('total_symbols')
+            merged['completed_symbols'] = merged.get('total_symbols')
+        role_progress = merged.get('role_progress')
+        if isinstance(role_progress, dict):
+            for role_summary in role_progress.values():
+                if not isinstance(role_summary, dict):
+                    continue
+                total_symbols = int(role_summary.get('total_symbols') or 0)
+                completed_symbols = int(role_summary.get('completed_symbols') or 0)
+                failed_for_role = int(role_summary.get('failed_items') or 0)
+                if total_symbols > 0 and completed_symbols >= total_symbols and failed_for_role == 0:
+                    role_summary['status'] = 'completed'
+                    role_summary['boundary_status'] = 'completed'
+                    role_summary['processed_symbols'] = total_symbols
+                    role_summary['completed_symbols'] = total_symbols
+                    role_summary['pending_symbols'] = 0
+                    role_summary['in_progress_symbols'] = 0
+                    role_summary['progress_ratio'] = 1.0
+                    role_summary['progress_percent'] = 100.0
+        if isinstance(merged.get('role_progress'), dict):
+            completed_roles = [
+                role
+                for role, role_summary in merged['role_progress'].items()
+                if isinstance(role_summary, dict) and role_summary.get('status') == 'completed'
+            ]
+            remaining_roles = [
+                role
+                for role, role_summary in merged['role_progress'].items()
+                if not (isinstance(role_summary, dict) and role_summary.get('status') == 'completed')
+            ]
+            merged['completed_roles'] = completed_roles
+            merged['remaining_roles'] = remaining_roles
         return merged
 
     @staticmethod
