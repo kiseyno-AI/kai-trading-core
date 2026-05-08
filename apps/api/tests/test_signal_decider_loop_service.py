@@ -13,6 +13,7 @@ from app.agent_context.signal_decider_loop_service import (
     DEFAULT_SIGNAL_DECIDER_POLICY_VERSION,
     SignalDeciderLoopService,
     SignalDeciderLoopRepository,
+    _dedupe_decision_snapshot_rows,
     _merge_policy_metadata_preserving_audit,
     build_signal_decider_feature_snapshot,
 )
@@ -299,6 +300,7 @@ class FakeSignalDeciderLoopRepository:
         symbols=None,
         decision_actions=None,
         policy_versions=None,
+        dedupe_feedback_results=False,
         limit=None,
         offset=0,
     ):
@@ -310,6 +312,7 @@ class FakeSignalDeciderLoopRepository:
                 'symbols': list(symbols or []),
                 'decision_actions': list(decision_actions or []),
                 'policy_versions': list(policy_versions or []),
+                'dedupe_feedback_results': dedupe_feedback_results,
                 'limit': limit,
                 'offset': offset,
             }
@@ -331,6 +334,8 @@ class FakeSignalDeciderLoopRepository:
         if normalized_policy_versions:
             rows = [row for row in rows if row.policy_version in normalized_policy_versions]
         rows.sort(key=lambda row: (row.market_date, row.created_at, row.id), reverse=True)
+        if dedupe_feedback_results:
+            rows = _dedupe_decision_snapshot_rows(rows)
         if offset:
             rows = rows[offset:]
         return rows[:limit] if limit is not None else rows
@@ -867,6 +872,251 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
                 ],
             )
             engine.dispose()
+
+    def test_insert_decision_snapshots_upserts_non_null_feedback_id(self):
+        engine = create_engine('sqlite+pysqlite:///:memory:')
+        event.listen(engine, 'connect', _enable_sqlite_foreign_keys)
+        Base.metadata.create_all(
+            engine,
+            tables=[
+                AgentContextFeedback.__table__,
+                SignalDeciderDecisionSnapshot.__table__,
+            ],
+        )
+        TestSessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+        repository = SignalDeciderLoopRepository()
+
+        try:
+            with TestSessionLocal() as session:
+                feedback = AgentContextFeedback(
+                    market_date=date(2026, 4, 23),
+                    symbol='005930',
+                    agent_name='signal-decider',
+                    agent_version='openclaw-v1',
+                    run_id='signal-run-feedback-1',
+                    summary_payload={'summary': 'wait setup'},
+                    feedback_payload={'preferred_action': 'wait'},
+                    normalized_feedback_payload={'preferred_action': 'wait'},
+                    context_payload={'signal_decider_trace': {'policy_version': DEFAULT_SIGNAL_DECIDER_POLICY_VERSION}},
+                    received_at=datetime(2026, 4, 23, 6, 0, tzinfo=timezone.utc),
+                )
+                session.add(feedback)
+                session.commit()
+                feedback_id = feedback.id
+
+            base_row = _feedback_row(
+                feedback_id=feedback_id,
+                snapshot_id=101,
+                market_date='2026-04-23',
+                symbol='005930',
+                action='wait',
+            )
+            first_item = {
+                key: value
+                for key, value in vars(base_row).items()
+                if key != 'id'
+            }
+            first_item['updated_at'] = first_item['created_at']
+
+            with TestSessionLocal() as session:
+                first_rows = repository.insert_decision_snapshots(session=session, items=[first_item])
+                first_snapshot_id = first_rows[0].id
+                session.commit()
+
+            second_item = dict(first_item)
+            second_item.update(
+                {
+                    'decision_run_id': 'signal-run-101-replayed',
+                    'decision_action': 'buy',
+                    'preferred_action': 'buy',
+                    'next_day_open_action': 'buy',
+                    'thesis_summary': 'buy decision for 005930 after replay',
+                    'created_at': datetime(2026, 4, 23, 7, 0, tzinfo=timezone.utc),
+                    'updated_at': datetime(2026, 4, 23, 7, 0, tzinfo=timezone.utc),
+                }
+            )
+
+            with TestSessionLocal() as session:
+                second_rows = repository.insert_decision_snapshots(session=session, items=[second_item])
+                second_snapshot_id = second_rows[0].id
+                session.commit()
+
+            with TestSessionLocal() as session:
+                stored_rows = session.query(SignalDeciderDecisionSnapshot).all()
+
+            self.assertEqual(first_snapshot_id, second_snapshot_id)
+            self.assertEqual(len(stored_rows), 1)
+            self.assertEqual(stored_rows[0].decision_run_id, 'signal-run-101-replayed')
+            self.assertEqual(stored_rows[0].decision_action, 'buy')
+            self.assertEqual(stored_rows[0].thesis_summary, 'buy decision for 005930 after replay')
+        finally:
+            Base.metadata.drop_all(
+                engine,
+                tables=[
+                    SignalDeciderDecisionSnapshot.__table__,
+                    AgentContextFeedback.__table__,
+                ],
+            )
+            engine.dispose()
+
+    def test_insert_decision_snapshots_keeps_null_feedback_rows_distinct(self):
+        engine = create_engine('sqlite+pysqlite:///:memory:')
+        event.listen(engine, 'connect', _enable_sqlite_foreign_keys)
+        Base.metadata.create_all(
+            engine,
+            tables=[
+                AgentContextFeedback.__table__,
+                SignalDeciderDecisionSnapshot.__table__,
+            ],
+        )
+        TestSessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+        repository = SignalDeciderLoopRepository()
+
+        try:
+            first_row = _feedback_row(
+                feedback_id=None,
+                snapshot_id=201,
+                market_date='2026-04-23',
+                symbol='005930',
+                action='wait',
+            )
+            second_row = _feedback_row(
+                feedback_id=None,
+                snapshot_id=202,
+                market_date='2026-04-23',
+                symbol='005930',
+                action='buy',
+            )
+            first_item = {key: value for key, value in vars(first_row).items() if key != 'id'}
+            first_item['updated_at'] = first_item['created_at']
+            second_item = {key: value for key, value in vars(second_row).items() if key != 'id'}
+            second_item['updated_at'] = second_item['created_at']
+
+            with TestSessionLocal() as session:
+                inserted_rows = repository.insert_decision_snapshots(
+                    session=session,
+                    items=[first_item, second_item],
+                )
+                session.commit()
+
+            with TestSessionLocal() as session:
+                stored_rows = session.query(SignalDeciderDecisionSnapshot).order_by(
+                    SignalDeciderDecisionSnapshot.id.asc()
+                ).all()
+
+            self.assertEqual(len(inserted_rows), 2)
+            self.assertEqual(len(stored_rows), 2)
+            self.assertNotEqual(stored_rows[0].id, stored_rows[1].id)
+            self.assertEqual([row.decision_action for row in stored_rows], ['wait', 'buy'])
+        finally:
+            Base.metadata.drop_all(
+                engine,
+                tables=[
+                    SignalDeciderDecisionSnapshot.__table__,
+                    AgentContextFeedback.__table__,
+                ],
+            )
+            engine.dispose()
+
+    def test_dedupe_decision_snapshot_rows_prefers_latest_feedback_and_symbol_fallback(self):
+        duplicate_feedback_old = _feedback_row(
+            feedback_id=41,
+            snapshot_id=101,
+            market_date='2026-05-08',
+            symbol='005930',
+            action='wait',
+        )
+        duplicate_feedback_new = _feedback_row(
+            feedback_id=41,
+            snapshot_id=102,
+            market_date='2026-05-08',
+            symbol='005930',
+            action='buy',
+            policy_version='signal_decider_policy_v2',
+        )
+        null_feedback_old = _feedback_row(
+            feedback_id=None,
+            snapshot_id=201,
+            market_date='2026-05-08',
+            symbol='000660',
+            action='wait',
+        )
+        null_feedback_new = _feedback_row(
+            feedback_id=None,
+            snapshot_id=202,
+            market_date='2026-05-08',
+            symbol='000660',
+            action='buy',
+        )
+        distinct_row = _feedback_row(
+            feedback_id=55,
+            snapshot_id=301,
+            market_date='2026-05-08',
+            symbol='035420',
+            action='reject',
+        )
+
+        deduped_rows = _dedupe_decision_snapshot_rows(
+            [
+                duplicate_feedback_new,
+                duplicate_feedback_old,
+                null_feedback_new,
+                null_feedback_old,
+                distinct_row,
+            ]
+        )
+
+        self.assertEqual([row.id for row in deduped_rows], [102, 202, 301])
+
+    def test_get_review_date_counts_distinct_feedback_snapshots(self):
+        repository = FakeSignalDeciderLoopRepository(
+            [
+                _feedback_row(
+                    feedback_id=41,
+                    snapshot_id=101,
+                    market_date='2026-05-08',
+                    symbol='005930',
+                    action='wait',
+                ),
+                _feedback_row(
+                    feedback_id=41,
+                    snapshot_id=102,
+                    market_date='2026-05-08',
+                    symbol='005930',
+                    action='buy',
+                ),
+                _feedback_row(
+                    feedback_id=55,
+                    snapshot_id=103,
+                    market_date='2026-05-08',
+                    symbol='000660',
+                    action='reject',
+                ),
+            ]
+        )
+        service = SignalDeciderLoopService(repository=repository)
+        service._build_review_items = lambda **kwargs: [  # type: ignore[method-assign]
+            {
+                'snapshot_id': row.id,
+                'market_date': row.market_date.isoformat(),
+                'symbol': row.symbol,
+                'decision': {'action': row.decision_action},
+                'review': {'status': 'pending', 'insight': {}, 'path_analysis': {}},
+            }
+            for row in kwargs['rows']
+        ]
+        service._build_review_items_summary = lambda **kwargs: {  # type: ignore[method-assign]
+            'count': len(kwargs['items']),
+            'symbol_count': len({item['symbol'] for item in kwargs['items']}),
+            'decision_actions': {},
+            'review_status_counts': {},
+            'evaluation_coverage': {},
+        }
+
+        result = service.get_review_date(market_date='2026-05-08')
+
+        self.assertEqual(result['summary']['count'], 2)
+        self.assertTrue(repository.list_decision_snapshots_calls[0]['dedupe_feedback_results'])
 
     def test_list_decisions_filters_by_verdict_and_policy_version(self):
         repository = FakeSignalDeciderLoopRepository(

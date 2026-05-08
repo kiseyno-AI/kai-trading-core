@@ -4,6 +4,7 @@ from datetime import date, datetime, timezone
 import unittest
 
 from sqlalchemy import create_engine, event, inspect
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.db_models import (
@@ -228,3 +229,30 @@ class SignalDeciderSchemaTests(unittest.TestCase):
             self.assertEqual(reloaded.parent_policy_version, 'signal_decider_policy_v1')
             self.assertEqual(reloaded.activated_by, 'human.reviewer')
             self.assertEqual(reloaded.metadata_payload['activation_mode'], 'manual_only')
+
+    def test_snapshot_feedback_id_is_unique_only_when_non_null(self) -> None:
+        with Session(self.engine) as session:
+            feedback = _feedback_row()
+            session.add(feedback)
+            session.flush()
+
+            session.add(_snapshot_row(feedback.id))
+            session.flush()
+
+            with self.assertRaises(IntegrityError):
+                session.add(_snapshot_row(feedback.id))
+                session.flush()
+
+            session.rollback()
+
+        with Session(self.engine) as session:
+            first_snapshot = _snapshot_row(1)
+            first_snapshot.feedback_id = None
+            second_snapshot = _snapshot_row(1)
+            second_snapshot.feedback_id = None
+            session.add(first_snapshot)
+            session.add(second_snapshot)
+            session.commit()
+
+            stored_rows = session.query(SignalDeciderDecisionSnapshot).all()
+            self.assertEqual(len(stored_rows), 2)

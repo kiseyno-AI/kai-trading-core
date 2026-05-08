@@ -243,6 +243,7 @@ Internal ops commands from `apps/api`:
 - `python3.11 -m app.internal.ops agent-signal-decider-evaluations-compute --market-date 2026-04-30 --horizons 1,3,5,10`
 - `python3.11 -m app.internal.ops agent-signal-decider-evaluations-repair --market-date-from 2026-04-01 --market-date-to 2026-04-30 --horizons 1,3,5,10 --primary-horizons 5`
 - `python3.11 -m app.internal.ops agent-signal-decider-calendar-refresh --market-date 2026-04-30 --lookback-days 30 --horizons 1,3,5,10 --primary-horizons 1,3,5,10`
+- If historical duplicate `signal_decider_decision_snapshots.feedback_id` rows were repaired during a deploy or manual schema recovery, rerun `agent-signal-decider-evaluations-repair` for the affected date range and then `agent-signal-decider-calendar-refresh` so persisted review coverage and calendar items realign to the canonical deduplicated snapshots.
 - `python3.11 -m app.internal.ops kis-daily-signal-features-collect --market-date 2026-04-14`
 - `python3.11 -m app.internal.ops kis-intraday-snapshots-collect --symbols 005930 --include-news true`
 - `python3.11 -m app.internal.ops agent-derived-contexts-backfill-recent`

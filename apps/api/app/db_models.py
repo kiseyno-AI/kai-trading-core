@@ -14,6 +14,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.ext.mutable import MutableDict
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -1168,6 +1169,13 @@ class SignalDeciderDecisionSnapshot(Base, TimestampMixin):
             'policy_version',
             'decision_action',
             'created_at',
+        ),
+        Index(
+            'uq_signal_decider_decision_snapshots_feedback_id_not_null',
+            'feedback_id',
+            unique=True,
+            postgresql_where=text('feedback_id IS NOT NULL'),
+            sqlite_where=text('feedback_id IS NOT NULL'),
         ),
     )
 
