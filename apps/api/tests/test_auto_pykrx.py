@@ -533,6 +533,10 @@ class PykrxBackfillServiceTests(TestCase):
                 return_value={'triggered': True, 'status': 'completed', 'stages': {}},
             ) as factor_followup,
             patch(
+                'app.eod.pykrx_pipeline_runner._run_daily_external_news_followup',
+                return_value={'triggered': True, 'status': 'disabled', 'reason': 'naver_search_credentials_missing'},
+            ) as external_news_followup,
+            patch(
                 'app.eod.pykrx_pipeline_runner._run_daily_feedback_followup',
                 return_value={'triggered': True, 'status': 'completed'},
             ) as feedback_followup,
@@ -559,10 +563,15 @@ class PykrxBackfillServiceTests(TestCase):
             run_feedback_followup=False,
         )
         factor_followup.assert_called_once_with(market_date='2026-04-03')
+        external_news_followup.assert_called_once_with(market_date='2026-04-03', enabled=True)
         feedback_followup.assert_called_once_with(market_date='2026-04-03', enabled=False)
         self.assertEqual(
             result['factor_scoring_followup'],
             {'triggered': True, 'status': 'completed', 'stages': {}},
+        )
+        self.assertEqual(
+            result['external_news_followup'],
+            {'triggered': True, 'status': 'disabled', 'reason': 'naver_search_credentials_missing'},
         )
         self.assertEqual(
             result['feedback_followup'],
@@ -723,6 +732,7 @@ class PykrxBackfillServiceTests(TestCase):
                 'market_date': '2026-04-03',
             },
         )
+        self.assertIn('external_news_followup', result)
         fundamentals_refresh.assert_not_called()
 
     def test_run_market_data_pipeline_keeps_retryable_status_when_snapshot_persistence_has_failures(self) -> None:

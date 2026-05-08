@@ -19,6 +19,7 @@ from app.eod.master import refresh_master_if_due
 from app.eod.pykrx_backfill import DEFAULT_MARKETS, PYKRX_BACKFILL_SERVICE
 from app.eod.pykrx_enrichment import pykrx_enrichment_service
 from app.eod.technical_snapshots import daily_technical_snapshot_service
+from app.external_news.service import external_news_service
 from app.market.clock import get_market_state
 from app.market_data_store import compute_and_persist_daily_trending_ranks
 from app.signals.advanced_value_factor import (
@@ -74,6 +75,7 @@ DAILY_STAGE_ORDER: tuple[str, ...] = (
     'fundamentals_daily_refresh',
     'piotroski_filter',
     *FACTOR_STAGE_ORDER,
+    'external_news_collect',
     'agent_feedback_summaries',
     'signal_decider',
     'signal_decider_evaluations',
@@ -87,6 +89,7 @@ DEFAULT_DAILY_STAGE_ORDER: tuple[str, ...] = (
     'fundamentals_daily_refresh',
     'piotroski_filter',
     *FACTOR_STAGE_ORDER,
+    'external_news_collect',
     'agent_feedback_summaries',
     'signal_decider',
     'signal_decider_evaluations',
@@ -356,12 +359,24 @@ STAGE_DEFINITIONS: dict[str, DailyStageDefinition] = {
         output_tables=('daily_composite_factor_results',),
         default_selected=True,
     ),
+    'external_news_collect': DailyStageDefinition(
+        id='external_news_collect',
+        label='external news collect',
+        group='external_data',
+        description='Collect recent external news for the active pre-filter intersection before summarizer/decider dispatch.',
+        depends_on=('market_risk_filter', 'piotroski_filter', *FACTOR_STAGE_ORDER),
+        supports_symbols=True,
+        supports_symbol_limit=True,
+        inspect_routes=('/external/news/health', '/external/news'),
+        output_tables=('external_news_items',),
+        default_selected=True,
+    ),
     'agent_feedback_summaries': DailyStageDefinition(
         id='agent_feedback_summaries',
         label='agent feedback summarizer dispatch',
         group='agent_feedback',
         description='Run the persisted symbol-level summarizer stages over the symbol universe that passes both active pre-filters.',
-        depends_on=('market_risk_filter', 'piotroski_filter', *FACTOR_STAGE_ORDER),
+        depends_on=('market_risk_filter', 'piotroski_filter', *FACTOR_STAGE_ORDER, 'external_news_collect'),
         supports_symbols=True,
         supports_capture_limit=True,
         inspect_routes=('/agent-context/feedback/progress', '/agent-context/feedback/status'),
@@ -634,6 +649,15 @@ class DailyPipelineStageService:
                 market_date=market_date,
                 symbols=symbols,
                 source=COMPOSITE_FACTOR_SOURCE,
+            )
+        if stage_id == 'external_news_collect':
+            return asyncio.run(
+                external_news_service.collect_for_agent_feedback_candidates(
+                    market_date=market_date,
+                    symbols=symbols,
+                    display=settings.external_news_default_display,
+                    symbol_limit=symbol_limit,
+                )
             )
         if stage_id in {'agent_feedback_summaries', 'signal_decider'}:
             prerequisites = agent_feedback_prerequisite_service.inspect_feedback_prerequisites(

@@ -5,9 +5,11 @@ from datetime import date, datetime
 from typing import Any, Sequence
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.agent_context.derived_contexts import DEFAULT_DERIVED_CONTEXT_HISTORY_DAYS, build_price_context
 from app.agent_context.score_context import build_signal_decider_scores
+from app.core.settings import settings
 from app.db import session_scope
 from app.db_models import (
     DailyAdvancedValueFactorResult,
@@ -29,6 +31,8 @@ from app.dart.service import (
 )
 from app.dart.store import DartSyncRepository, dart_sync_repository
 from app.eod.pykrx_enrichment import pykrx_enrichment_service
+from app.external_news.provider import NAVER_NEWS_PROVIDER, NaverNewsSearchProvider
+from app.external_news.store import list_recent_external_news_for_symbols
 from app.market_data_store import (
     load_current_kis_intraday_snapshots,
     load_daily_advanced_value_factor_results,
@@ -1643,6 +1647,73 @@ def _build_valuation_context(
     }
 
 
+def _external_news_provider_status() -> dict[str, Any]:
+    return NaverNewsSearchProvider().status().as_dict()
+
+
+def _build_recent_external_news_context(items: list[dict[str, Any]], *, provider_status: dict[str, Any]) -> dict[str, Any]:
+    provider_enabled = bool(provider_status.get('enabled'))
+    if not provider_enabled:
+        status = 'unavailable'
+        reason = provider_status.get('reason') or 'external_news_provider_disabled'
+    elif items:
+        status = 'available'
+        reason = None
+    else:
+        status = 'empty'
+        reason = 'no_recent_external_news_found'
+    return {
+        'status': status,
+        'reason': reason,
+        'provider': provider_status,
+        'lookback_days': settings.external_news_context_lookback_days,
+        'item_count': len(items),
+        'items': [
+            {
+                'provider': item.get('provider'),
+                'title': item.get('title'),
+                'description': item.get('description'),
+                'url': item.get('url'),
+                'published_at': item.get('published_at'),
+                'collected_at': item.get('collected_at'),
+            }
+            for item in items[: settings.external_news_context_limit]
+        ],
+    }
+
+
+def _build_external_news_freshness_provenance(
+    *,
+    context: dict[str, Any],
+    requested_market_date: date,
+) -> dict[str, Any]:
+    status = str(context.get('status') or 'unavailable')
+    if status == 'available':
+        freshness_status = FRESHNESS_STATUS_FRESH
+        provenance_status = PROVENANCE_STATUS_PROVIDER_SOURCED
+    elif status == 'empty':
+        freshness_status = FRESHNESS_STATUS_MISSING
+        provenance_status = PROVENANCE_STATUS_PROVIDER_SOURCED
+    else:
+        freshness_status = FRESHNESS_STATUS_MISSING
+        provenance_status = 'external_provider_unavailable'
+    items = context.get('items') if isinstance(context.get('items'), list) else []
+    return _build_freshness_provenance(
+        requested_market_date=requested_market_date,
+        freshness_status=freshness_status,
+        provenance_status=provenance_status,
+        source_tables=('external_news_items',),
+        source_provider=str((context.get('provider') or {}).get('provider') or NAVER_NEWS_PROVIDER),
+        reason=context.get('reason'),
+        latest_available_timestamp=items[0].get('published_at') if items else None,
+        history_row_count=int(context.get('item_count') or 0),
+        extra={
+            'provider_status': context.get('provider'),
+            'lookback_days': context.get('lookback_days'),
+        },
+    )
+
+
 def _build_symbol_block_coverage(
     *,
     available_count: int,
@@ -1777,6 +1848,22 @@ class AgentContextReadService:
             receipt_date_to=normalized_market_date,
             limit_per_symbol=disclosures_limit,
         )
+        external_news_provider_status = _external_news_provider_status()
+        external_news_by_symbol: dict[str, list[dict[str, Any]]] = {}
+        if external_news_provider_status.get('enabled'):
+            try:
+                external_news_by_symbol = list_recent_external_news_for_symbols(
+                    symbols=normalized_symbols,
+                    limit_per_symbol=settings.external_news_context_limit,
+                    lookback_days=settings.external_news_context_lookback_days,
+                )
+            except SQLAlchemyError:
+                external_news_provider_status = {
+                    **external_news_provider_status,
+                    'enabled': False,
+                    'status': 'storage_unavailable',
+                    'reason': 'external_news_storage_unavailable',
+                }
 
         symbol_map = {item['symbol']: item for item in symbol_rows}
         technical_map = {item['symbol']: item for item in technical_rows}
@@ -1902,6 +1989,10 @@ class AgentContextReadService:
             for family, row in persisted_factor_rows.items():
                 if row is not None:
                     factor_row_counts[family] += 1
+            recent_external_news = _build_recent_external_news_context(
+                external_news_by_symbol.get(symbol, []),
+                provider_status=external_news_provider_status,
+            )
             context_completeness = {
                 'factor_rows': {
                     family: _build_factor_row_completeness(family=family, row=row)
@@ -1930,6 +2021,11 @@ class AgentContextReadService:
                     valuation_context,
                     unavailable_reason='No persisted PyKRX valuation or foreign ownership row is available for the requested date.',
                 ),
+                'recent_external_news': {
+                    'status': recent_external_news.get('status'),
+                    'missing_fields': [] if recent_external_news.get('status') == 'available' else ['items'],
+                    'unavailable_reason': recent_external_news.get('reason'),
+                },
             }
             fundamentals = _build_fundamentals_summary(
                 fundamentals_map.get(symbol, []),
@@ -1968,6 +2064,10 @@ class AgentContextReadService:
                 disclosures=recent_disclosures,
                 requested_market_date=normalized_market_date,
                 disclosures_limit=disclosures_limit,
+            )
+            recent_external_news_provenance = _build_external_news_freshness_provenance(
+                context=recent_external_news,
+                requested_market_date=normalized_market_date,
             )
             sector_peer_context_provenance = _build_pykrx_block_freshness_provenance(
                 requested_market_date=normalized_market_date,
@@ -2134,6 +2234,7 @@ class AgentContextReadService:
                 'persisted_factor_rows': any(row is not None for row in persisted_factor_rows.values()),
                 'fundamentals': fundamentals['latest_snapshot'] is not None,
                 'recent_disclosures': bool(recent_disclosures),
+                'recent_external_news': recent_external_news.get('status') == 'available',
             }
             if any(availability.values()):
                 matched_symbols.append(symbol)
@@ -2166,6 +2267,10 @@ class AgentContextReadService:
                         'items': recent_disclosures,
                         'freshness_provenance': recent_disclosures_provenance,
                     },
+                    'recent_external_news': {
+                        **recent_external_news,
+                        'freshness_provenance': recent_external_news_provenance,
+                    },
                     'context_completeness': context_completeness,
                     'context_provenance': {
                         'quote_context': quote_context_provenance,
@@ -2179,6 +2284,7 @@ class AgentContextReadService:
                         'valuation_context': valuation_context_provenance,
                         'fundamentals': fundamentals_provenance,
                         'recent_disclosures': recent_disclosures_provenance,
+                        'recent_external_news': recent_external_news_provenance,
                         'factor_rows': factor_row_provenance,
                     },
                     'availability': availability,
@@ -2269,6 +2375,11 @@ class AgentContextReadService:
             for item in items
             if str((item.get('valuation_context') or {}).get('status') or 'unavailable') == 'partial'
         )
+        external_news_available_count = sum(
+            1
+            for item in items
+            if str((item.get('recent_external_news') or {}).get('status') or 'unavailable') == 'available'
+        )
         requested_symbol_coverage = {
             'requested_symbol_count': requested_symbol_count,
             'factor_rows': factor_row_coverage,
@@ -2328,6 +2439,20 @@ class AgentContextReadService:
                 partial_count=valuation_partial_count,
                 requested_count=requested_symbol_count,
             ),
+            'recent_external_news': {
+                'available_rows': external_news_available_count,
+                'partial_rows': 0,
+                'unavailable_rows': requested_symbol_count - external_news_available_count,
+                'coverage_ratio': _ratio(external_news_available_count, requested_symbol_count),
+                'coverage_status': (
+                    'complete'
+                    if external_news_available_count == requested_symbol_count and requested_symbol_count > 0
+                    else 'partial'
+                    if external_news_available_count > 0
+                    else 'missing'
+                ),
+                'provider_status': external_news_provider_status,
+            },
         }
         for item in items:
             item['context_completeness']['requested_symbol_coverage'] = requested_symbol_coverage
@@ -2338,6 +2463,7 @@ class AgentContextReadService:
             item['context_provenance']['investor_flow_context']['requested_symbol_coverage'] = requested_symbol_coverage['investor_flow_context']
             item['context_provenance']['short_selling_context']['requested_symbol_coverage'] = requested_symbol_coverage['short_selling_context']
             item['context_provenance']['valuation_context']['requested_symbol_coverage'] = requested_symbol_coverage['valuation_context']
+            item['context_provenance']['recent_external_news']['requested_symbol_coverage'] = requested_symbol_coverage['recent_external_news']
             for family in PERSISTED_FACTOR_FAMILIES:
                 item['context_provenance']['factor_rows'][family]['requested_symbol_coverage'] = factor_row_coverage[family]
 
@@ -2371,6 +2497,10 @@ class AgentContextReadService:
                 'recent_disclosure_symbol_count': sum(
                     1 for item in items if item['recent_disclosures']['count'] > 0
                 ),
+                'recent_external_news_symbol_count': sum(
+                    1 for item in items if item['recent_external_news']['status'] == 'available'
+                ),
+                'external_news_provider': external_news_provider_status,
                 'factor_row_counts': factor_row_counts,
                 'context_completeness': requested_symbol_coverage,
             },

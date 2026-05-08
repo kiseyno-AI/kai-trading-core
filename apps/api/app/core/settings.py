@@ -91,6 +91,15 @@ class Settings(BaseSettings):
     koreaexim_base_url: str = 'https://oapi.koreaexim.go.kr/site/program/financial/exchangeJSON'
     koreaexim_fallback_days: int = 2
 
+    naver_search_client_id: str = ''
+    naver_search_client_secret: str = ''
+    naver_search_base_url: str = 'https://openapi.naver.com/v1/search/news.json'
+    external_news_default_display: int = 10
+    external_news_request_timeout_seconds: float = 10.0
+    external_news_context_limit: int = 3
+    external_news_context_lookback_days: int = 14
+    external_news_collect_throttle_seconds: float = 0.15
+
     dart_api_key: str = ''
     dart_base_url: str = 'https://opendart.fss.or.kr/api'
     dart_corp_code_cache_ttl_seconds: int = 86400

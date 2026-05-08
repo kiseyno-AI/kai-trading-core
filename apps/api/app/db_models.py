@@ -158,6 +158,29 @@ class CurrentKISIntradaySnapshotCache(Base, TimestampMixin):
     captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
+class ExternalNewsItem(Base, TimestampMixin):
+    __tablename__ = 'external_news_items'
+    __table_args__ = (
+        UniqueConstraint('provider', 'url', name='uq_external_news_items_provider_url'),
+        UniqueConstraint('provider', 'provider_item_id', name='uq_external_news_items_provider_item_id'),
+        Index('ix_external_news_items_symbol_published', 'symbol_id', 'published_at'),
+        Index('ix_external_news_items_provider_collected', 'provider', 'collected_at'),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol_id: Mapped[int] = mapped_column(ForeignKey('symbols.id', ondelete='CASCADE'), nullable=False, index=True)
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    provider_item_id: Mapped[str | None] = mapped_column(String(128))
+    source: Mapped[str] = mapped_column(String(64), nullable=False)
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    description: Mapped[str | None] = mapped_column(Text)
+    url: Mapped[str] = mapped_column(String(2048), nullable=False)
+    source_url: Mapped[str | None] = mapped_column(String(2048))
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    collected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+    payload: Mapped[dict | None] = mapped_column(JSON)
+
+
 class MarketStatusSnapshot(Base):
     __tablename__ = 'market_status_snapshots'
 

@@ -131,6 +131,29 @@ def _run_daily_factor_followup(*, market_date: str) -> dict[str, Any]:
     }
 
 
+def _run_daily_external_news_followup(*, market_date: str, enabled: bool) -> dict[str, Any]:
+    if not enabled:
+        return {
+            'triggered': False,
+            'reason': 'followup_disabled',
+            'market_date': market_date,
+        }
+
+    from app.core.settings import settings
+    from app.external_news.service import external_news_service
+
+    result = asyncio.run(
+        external_news_service.collect_for_agent_feedback_candidates(
+            market_date=market_date,
+            display=settings.external_news_default_display,
+        )
+    )
+    return {
+        'triggered': True,
+        **result,
+    }
+
+
 def _run_daily_feedback_followup(*, market_date: str, enabled: bool) -> dict[str, Any]:
     if not enabled:
         return {
@@ -885,10 +908,20 @@ def run_market_data_pipeline(
         fundamentals_status = str(result['fundamentals_followup'].get('status') or '').strip().lower()
         if fundamentals_status in {'completed', 'partial'}:
             result['factor_scoring_followup'] = _run_daily_factor_followup(market_date=latest_trade_date)
+            result['external_news_followup'] = _run_daily_external_news_followup(
+                market_date=latest_trade_date,
+                enabled=True,
+            )
         else:
             result['factor_scoring_followup'] = {
                 'triggered': False,
                 'reason': 'fundamentals_followup_incomplete',
+                'market_date': latest_trade_date,
+                'fundamentals_status': fundamentals_status or None,
+            }
+            result['external_news_followup'] = {
+                'triggered': False,
+                'reason': 'factor_scoring_followup_incomplete',
                 'market_date': latest_trade_date,
                 'fundamentals_status': fundamentals_status or None,
             }
@@ -907,6 +940,10 @@ def run_market_data_pipeline(
             'reason': 'dart_api_key_not_configured',
             'market_date': latest_trade_date,
         }
+        result['external_news_followup'] = _run_daily_external_news_followup(
+            market_date=latest_trade_date,
+            enabled=True,
+        )
         result['feedback_followup'] = _run_daily_feedback_followup(
             market_date=latest_trade_date,
             enabled=bool(dependencies.settings.openclaw_feedback_trigger_after_fundamentals_refresh),

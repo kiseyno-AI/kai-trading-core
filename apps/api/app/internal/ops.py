@@ -34,6 +34,7 @@ from app.eod.pykrx_backfill import DEFAULT_MARKETS, PYKRX_BACKFILL_SERVICE
 from app.eod.pykrx_enrichment import pykrx_enrichment_service
 from app.eod.state import job_state
 from app.eod.technical_snapshots import daily_technical_snapshot_service
+from app.external_news.service import external_news_service
 from app.market.clock import get_market_state
 from app.market.kis_intraday_snapshots import KIS_INTRADAY_SNAPSHOT_SOURCE, kis_intraday_snapshot_service
 from app.market_data_store import (
@@ -252,6 +253,24 @@ def collect_kis_intraday_snapshots(
             include_news=include_news,
         )
     )
+
+
+def collect_external_news(
+    *,
+    symbols: str,
+    display: int | None = None,
+) -> dict[str, Any]:
+    bootstrap_runtime()
+    return asyncio.run(external_news_service.collect_for_symbols(symbols=symbols, display=display))
+
+
+def list_external_news(
+    *,
+    symbols: str | None = None,
+    limit: int = 100,
+) -> dict[str, Any]:
+    bootstrap_runtime()
+    return external_news_service.list_news(symbols=symbols, limit=limit)
 
 
 def collect_daily_piotroski_filter_results(
@@ -829,6 +848,20 @@ def _build_parser() -> argparse.ArgumentParser:
     intraday_snapshot_parser.add_argument('--max-news-items', type=int)
     intraday_snapshot_parser.add_argument('--include-news', choices=('true', 'false'), default='true')
 
+    external_news_collect_parser = subparsers.add_parser(
+        'external-news-collect',
+        help='Collect optional external news items for symbols via configured provider credentials',
+    )
+    external_news_collect_parser.add_argument('--symbols', required=True)
+    external_news_collect_parser.add_argument('--display', type=int)
+
+    external_news_list_parser = subparsers.add_parser(
+        'external-news-list',
+        help='List persisted external news items for symbols',
+    )
+    external_news_list_parser.add_argument('--symbols')
+    external_news_list_parser.add_argument('--limit', type=int, default=100)
+
     piotroski_filter_parser = subparsers.add_parser(
         'eod-piotroski-filter-collect',
         help='Compute and persist daily Piotroski filter results directly',
@@ -1133,6 +1166,10 @@ def main(argv: Iterable[str] | None = None) -> int:
             max_news_items=args.max_news_items,
             include_news=args.include_news == 'true',
         )
+    elif args.command == 'external-news-collect':
+        payload = collect_external_news(symbols=args.symbols, display=args.display)
+    elif args.command == 'external-news-list':
+        payload = list_external_news(symbols=args.symbols, limit=args.limit)
     elif args.command == 'eod-piotroski-filter-collect':
         payload = collect_daily_piotroski_filter_results(market_date=args.market_date)
     elif args.command == 'eod-market-risk-filters-compute':

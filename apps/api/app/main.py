@@ -13,6 +13,7 @@ from app.api.routes_agent_context import router as agent_context_router
 from app.api.routes_execution_runtime import router as execution_runtime_router
 from app.api.routes_eod import router as eod_router
 from app.api.routes_dart import router as dart_router
+from app.api.routes_external_news import router as external_news_router
 from app.api.routes_kis import router as kis_router
 from app.api.routes_macro import router as macro_router
 from app.api.routes_fx import router as fx_router
@@ -147,6 +148,7 @@ app.include_router(trading_accounts_router)
 app.include_router(execution_runtime_router)
 app.include_router(eod_router)
 app.include_router(dart_router)
+app.include_router(external_news_router)
 app.include_router(agent_context_router)
 
 
