@@ -16,6 +16,9 @@ class AgentContextResponseContractTests(unittest.TestCase):
         self.assertIn('JSON is parseable', suffix)
         self.assertIn('Immediately before sending, validate the final raw JSON text again', suffix)
         self.assertIn('Operator-facing free-text fields must be written in Korean', suffix)
+        self.assertIn('Empty recent news means no captured recent news and is neutral', suffix)
+        self.assertIn('Do not classify a symbol as untradeable solely because auxiliary news or financial detail is absent.', suffix)
+        self.assertIn('If only auxiliary context is absent, a buy decision may still be valid', suffix)
         self.assertIn(
             'Do not translate or localize machine-readable enum fields such as preferred_action, next_day_open_action, or entry_price_basis.',
             suffix,
@@ -27,6 +30,8 @@ class AgentContextResponseContractTests(unittest.TestCase):
         self.assertIn('scalp_buy_candidate, watch_for_trigger, avoid_chase, wait, reject', suffix)
         self.assertIn('trigger_price, chase_limit_price', suffix)
         self.assertIn('agent_name should equal short-term-decider', suffix)
+        self.assertIn('Empty recent news means no captured recent news and is neutral', suffix)
+        self.assertIn('If only auxiliary context is absent, a structured scalp_buy_candidate or watch_for_trigger decision may still be valid', suffix)
 
         output_text = json.dumps(
             {

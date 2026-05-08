@@ -1,7 +1,7 @@
 # POST /agent-context/feedback
 
 ## Summary
-Stores externally produced agent feedback into `agent_context_feedback`. When the submitted `context` includes symbol-day freshness/provenance metadata, Core uses it to enrich normalized missing-data categories so later reporting can distinguish `missing`, `stale`, `available_but_old`, and `derived_or_fallback` complaints.
+Stores externally produced agent feedback into `agent_context_feedback`. When the submitted `context` includes symbol-day freshness/provenance metadata, Core uses it to enrich normalized missing-data categories so later reporting can distinguish `missing`, `stale`, `available_but_old`, and `derived_or_fallback` complaints. Those stored categories now also expose decision-tier and severity semantics so downstream tooling can separate core execution blockers from auxiliary confidence-only gaps.
 
 ## Example request
 ```http
@@ -43,3 +43,4 @@ Content-Type: application/json
 ## Notes
 - `summary` and `feedback` remain free-form JSON objects.
 - The route does not require `context`, but provenance-aware missing-data normalization only happens when the submitted `context` includes the relevant symbol-day metadata.
+- Persisted `missing_data_categories` now carry `decision_tier`, `severity`, `default_decider_effect`, and `blocking_by_default` fields in addition to the existing taxonomy status.

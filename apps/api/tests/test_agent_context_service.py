@@ -995,6 +995,15 @@ class AgentContextReadServiceTests(unittest.TestCase):
             'available',
         )
         self.assertEqual(
+            first_item['decider_data_quality_context']['decision_priority']['core_execution']['status'],
+            'partial',
+        )
+        self.assertIn(
+            'intraday_realtime',
+            first_item['decider_data_quality_context']['decision_priority']['core_execution']['degraded_block_names'],
+        )
+        self.assertFalse(first_item['decider_data_quality_context']['decision_priority']['auxiliary_context']['blocking_by_default'])
+        self.assertEqual(
             first_item['decider_data_quality_context']['blocks']['intraday_realtime']['status'],
             'partial',
         )
@@ -1093,6 +1102,17 @@ class AgentContextReadServiceTests(unittest.TestCase):
         self.assertIn(
             'operating_cash_flow',
             first_item['decider_data_quality_context']['blocks']['financials_cashflow']['available_core_fields'],
+        )
+        self.assertEqual(
+            first_item['decider_data_quality_context']['blocks']['financials_cashflow']['report_period_type'],
+            'annual',
+        )
+        self.assertTrue(
+            first_item['decider_data_quality_context']['blocks']['financials_cashflow']['annual_only_context']
+        )
+        self.assertEqual(
+            first_item['decider_data_quality_context']['blocks']['financials_cashflow']['decision_guidance']['decision_tier'],
+            'auxiliary_context',
         )
         self.assertEqual(first_item['recent_disclosures']['count'], 2)
         self.assertEqual(first_item['recent_disclosures']['freshness_provenance']['freshness_status'], 'available_but_old')
@@ -1883,8 +1903,116 @@ class AgentContextReadServiceTests(unittest.TestCase):
         self.assertEqual(factor_score_block['status'], 'provider_error')
         self.assertEqual(factor_score_block['signal_features']['status'], 'provider_error')
         self.assertEqual(factor_score_block['signal_features']['source_status'], 'storage_unavailable')
-        self.assertEqual(result['block_status_counts']['provider_error'], 1)
-        self.assertEqual(result['block_status_counts']['unavailable'], 7)
+
+    def test_build_decider_data_quality_context_marks_empty_news_and_annual_financials_as_auxiliary(self):
+        result = _build_decider_data_quality_context(
+            market_date=date(2026, 4, 8),
+            scores={
+                'unified_value': {'status': 'available'},
+                'quality': {'status': 'available'},
+                'momentum': {'status': 'available'},
+            },
+            factor_summary={
+                'signal_features': {'status': 'available'},
+            },
+            liquidity_context={
+                'turnover': {'status': 'available', 'provenance': {'freshness_status': 'fresh', 'provenance_status': 'provider_sourced'}},
+                'ranking': {'status': 'available', 'provenance': {'freshness_status': 'fresh', 'provenance_status': 'provider_sourced'}},
+                'intraday': {
+                    'status': 'available',
+                    'provenance': {
+                        'intraday_execution_context': {
+                            'freshness_status': 'fresh',
+                            'provenance_status': 'provider_sourced',
+                        }
+                    },
+                },
+            },
+            quote_context={'trade_date': '2026-04-08'},
+            quote_context_provenance={'freshness_status': 'fresh', 'provenance_status': 'provider_sourced'},
+            intraday_execution_context={'status': 'available'},
+            intraday_execution_provenance={'freshness_status': 'fresh', 'provenance_status': 'provider_sourced'},
+            intraday_execution_completeness={'status': 'available'},
+            fundamentals={
+                'latest_snapshot': {
+                    'filing': {'receipt_date': '2025-03-12', 'report_name': '사업보고서 (2024.12)'},
+                    'period': {'period_end_date': '2024-12-31', 'business_year': 2024, 'report_code': '11011'},
+                    'statement': {'source_status': 'available'},
+                    'fundamental_context': {
+                        'normalized_facts': {
+                            'income_statement': {
+                                'gross_profit': {'status': 'available'},
+                            },
+                            'balance_sheet': {
+                                'current_assets': {'status': 'available'},
+                                'current_liabilities': {'status': 'available'},
+                                'cash_and_cash_equivalents': {'status': 'available'},
+                            },
+                            'cash_flow_statement': {
+                                'operating_cash_flow': {'status': 'available'},
+                                'investing_cash_flow': {'status': 'missing'},
+                                'financing_cash_flow': {'status': 'missing'},
+                            },
+                        }
+                    },
+                }
+            },
+            fundamentals_provenance={'freshness_status': 'available_but_old', 'provenance_status': 'provider_sourced'},
+            recent_dart_events={'status': 'empty', 'reason': 'no_recent_disclosures', 'summary': {}, 'item_count': 0},
+            recent_disclosures_provenance={
+                'freshness_status': 'missing',
+                'provenance_status': 'provider_sourced',
+                'reason': 'no_recent_disclosures_up_to_request_date',
+            },
+            recent_external_news={
+                'status': 'empty',
+                'reason': 'no_recent_external_news_found',
+                'item_count': 0,
+                'provider': {'provider': 'naver_news_search', 'enabled': True, 'status': 'available', 'reason': None},
+            },
+            recent_external_news_provenance={
+                'freshness_status': 'missing',
+                'provenance_status': 'provider_sourced',
+                'reason': 'no_recent_external_news_found',
+            },
+            investor_flow_context={'status': 'available', 'symbol_flow': {}, 'market_flow': {}},
+            investor_flow_provenance={'freshness_status': 'fresh', 'provenance_status': 'provider_sourced'},
+            short_selling_context={'status': 'available', 'short_volume': {}, 'short_balance': {}},
+            short_selling_provenance={'freshness_status': 'fresh', 'provenance_status': 'provider_sourced'},
+            market_relative_context={'status': 'available', 'relative_strength': {}, 'breadth': {}},
+            market_relative_provenance={'freshness_status': 'fresh', 'provenance_status': 'provider_sourced'},
+            sector_peer_context={'status': 'available', 'sector_name': 'Semiconductor', 'peer_count': 5, 'same_sector_symbol_count': 6},
+            sector_peer_provenance={'freshness_status': 'fresh', 'provenance_status': 'provider_sourced'},
+            market_breadth_context={'status': 'available', 'market_symbol_count': 900, 'up_count': 500, 'down_count': 300, 'flat_count': 100},
+            market_breadth_provenance={'freshness_status': 'fresh', 'provenance_status': 'provider_sourced'},
+            technical_snapshot={'trend_state': 'uptrend'},
+            action_summary={'support_price': 68000, 'resistance_price': 70800, 'invalidation_price': 66500},
+            unified_value_row=None,
+            advanced_value_row=None,
+        )
+
+        self.assertEqual(result['decision_priority']['core_execution']['status'], 'available')
+        self.assertFalse(result['decision_priority']['auxiliary_context']['blocking_by_default'])
+        self.assertTrue(result['blocks']['disclosures_news']['empty_news_is_neutral'])
+        self.assertTrue(
+            result['blocks']['disclosures_news']['decision_guidance']['empty_is_neutral_by_default']
+        )
+        self.assertIn(
+            'neutral unless separate risk evidence',
+            result['blocks']['disclosures_news']['decision_guidance']['interpretation'],
+        )
+        self.assertEqual(result['blocks']['financials_cashflow']['report_period_type'], 'annual')
+        self.assertTrue(result['blocks']['financials_cashflow']['annual_only_context'])
+        self.assertEqual(
+            result['blocks']['financials_cashflow']['decision_guidance']['default_missing_effect'],
+            'confidence_reducer',
+        )
+        self.assertIn(
+            'Annual fundamentals are still usable context',
+            result['blocks']['financials_cashflow']['decision_guidance']['interpretation'],
+        )
+        self.assertEqual(result['block_status_counts']['provider_error'], 0)
+        self.assertEqual(result['block_status_counts']['empty'], 1)
 
     def test_load_latest_symbol_day_block_history_only_requests_low_risk_liquidity_fields(self):
         with patch('app.agent_context.read_service._load_latest_prior_rows_for_model', return_value={}) as load_prior_rows_mock:

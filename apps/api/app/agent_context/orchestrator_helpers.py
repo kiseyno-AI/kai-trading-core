@@ -810,6 +810,20 @@ def build_signal_decider_payload(
             'allow_position_sizing': False,
             'allow_leverage_guidance': False,
             'avoid_fake_precision': True,
+            'missing_context_policy': {
+                'core_execution_blocks': ['liquidity_turnover', 'intraday_realtime'],
+                'supporting_context_blocks': [
+                    'factor_score_coverage',
+                    'technical_evidence',
+                    'flows_short_selling',
+                    'sector_relative_strength',
+                ],
+                'auxiliary_context_blocks': ['disclosures_news', 'financials_cashflow'],
+                'auxiliary_context_absence_not_tradeability_blocker': True,
+                'empty_recent_news_is_neutral': True,
+                'quarterly_financial_detail_confidence_only_unless_thesis_depends_on_it': True,
+                'forbid_untradeable_from_auxiliary_absence_only': True,
+            },
         },
         'signal_decider_policy': resolved_signal_decider_policy,
         'output_contract': {

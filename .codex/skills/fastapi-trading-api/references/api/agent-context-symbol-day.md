@@ -7,7 +7,7 @@ The response also includes a compact `factor_summary` block per symbol/day. This
 
 The response now also includes a compact `liquidity_context` block per symbol/day. It keeps the daily turnover state explicit with `available`, `derived`, `stale`, `missing_price_or_volume`, and `storage_unavailable` statuses, plus low-risk liquidity ranking fields and intraday quote/orderbook freshness where those rows exist.
 
-The response also includes a compact `decider_data_quality_context` block per symbol/day. This is the decider-facing availability and provenance summary over factor-score coverage, liquidity/turnover, intraday freshness, financial/cash-flow detail, disclosures/news, investor flow and short-selling, sector/relative-strength context, and technical evidence. It keeps `available`, `partial`, `stale`, `empty`, `unavailable`, and `provider_error` semantics explicit so downstream deciders can distinguish no recent items from provider/storage failures.
+The response also includes a compact `decider_data_quality_context` block per symbol/day. This is the decider-facing availability and provenance summary over factor-score coverage, liquidity/turnover, intraday freshness, financial/cash-flow detail, disclosures/news, investor flow and short-selling, sector/relative-strength context, and technical evidence. It keeps `available`, `partial`, `stale`, `empty`, `unavailable`, and `provider_error` semantics explicit so downstream deciders can distinguish no recent items from provider/storage failures, and it now adds `decision_priority` plus per-block `decision_guidance` so deciders can separate core execution blockers from auxiliary confidence-only gaps.
 
 ## Example request
 ```http
@@ -246,6 +246,19 @@ GET /agent-context/symbol-day?market_date=2026-04-15&symbols=005930&fs_div=CFS&d
       },
       "decider_data_quality_context": {
         "status": "partial",
+        "decision_priority": {
+          "core_execution": {
+            "status": "available",
+            "blocking_by_default": true,
+            "degraded_block_names": []
+          },
+          "auxiliary_context": {
+            "status": "partial",
+            "blocking_by_default": false,
+            "empty_is_neutral_by_default": true,
+            "degraded_block_names": ["disclosures_news", "financials_cashflow"]
+          }
+        },
         "block_status_counts": {
           "available": 2,
           "partial": 3,
@@ -275,6 +288,12 @@ GET /agent-context/symbol-day?market_date=2026-04-15&symbols=005930&fs_div=CFS&d
           },
           "disclosures_news": {
             "status": "provider_error",
+            "decision_guidance": {
+              "decision_tier": "auxiliary_context",
+              "severity": "low",
+              "default_missing_effect": "confidence_reducer",
+              "empty_is_neutral_by_default": true
+            },
             "providers": {
               "dart_recent_events": {
                 "status": "empty",
@@ -288,6 +307,10 @@ GET /agent-context/symbol-day?market_date=2026-04-15&symbols=005930&fs_div=CFS&d
           },
           "technical_evidence": {
             "status": "available",
+            "decision_guidance": {
+              "decision_tier": "supporting_context",
+              "severity": "medium"
+            },
             "support_price": 68000,
             "resistance_price": 70800,
             "breakout_20d": true
@@ -305,6 +328,8 @@ GET /agent-context/symbol-day?market_date=2026-04-15&symbols=005930&fs_div=CFS&d
 - `fundamentals.disclosure_context` summarizes recent corrections and ownership or large-holder changes from the existing DART disclosure event stream; it does not require a separate ownership-only endpoint.
 - `factor_summary.factor_scores` covers the persisted factor families `value`, `unified_value`, `quality`, `momentum`, `advanced_value`, `low_risk`, `beta`, and `composite`.
 - `liquidity_context.turnover` is the prompt-trim-safe turnover summary. `status="derived"` means provider turnover was missing or zero but `close_price * volume` was safely derivable from the stored daily bar. `status="stale"` means Core only had a prior stored price-context row for that symbol.
-- `decider_data_quality_context` is the compact prompt-safe quality overlay that both deciders can read without re-parsing the heavier raw context blocks. It surfaces source-specific `empty` vs `provider_error` semantics for DART and external news, and it keeps stale or derived liquidity/intraday inputs explicit.
+- `decider_data_quality_context` is the compact prompt-safe quality overlay that both deciders can read without re-parsing the heavier raw context blocks. It surfaces source-specific `empty` vs `provider_error` semantics for DART and external news, keeps stale or derived liquidity/intraday inputs explicit, and now marks which gaps are `core_execution`, `supporting_context`, or `auxiliary_context`.
+- `decision_priority.auxiliary_context` is intentionally non-blocking by default. Empty recent news means no captured recent optional context, not automatic event risk.
+- `blocks.financials_cashflow.decision_guidance` marks annual-only or missing detailed quarterly/cash-flow detail as confidence-reducing by default unless the trading thesis explicitly depends on those fields.
 - `factor_summary` status values are canonical and machine-readable: `available`, `not_eligible`, `insufficient_history`, `missing_source_row`, `storage_unavailable`, and `not_computed_for_market_date`.
 - `factor_summary.signal_features` gives the same compact status/provenance treatment to the persisted `daily_signal_features` row.

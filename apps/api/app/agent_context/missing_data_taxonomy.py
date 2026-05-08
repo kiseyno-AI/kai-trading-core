@@ -10,6 +10,21 @@ MISSING_DATA_CATEGORY_STATUSES = (
     'external_data_required',
     'data_quality_issue',
 )
+MISSING_DATA_CATEGORY_DECISION_TIERS = (
+    'core_execution',
+    'supporting_context',
+    'auxiliary_context',
+)
+MISSING_DATA_CATEGORY_SEVERITIES = (
+    'high',
+    'medium',
+    'low',
+)
+MISSING_DATA_CATEGORY_DECIDER_EFFECTS = (
+    'core_blocker',
+    'supporting_gap',
+    'confidence_reducer',
+)
 MAX_MISSING_DATA_NOTE_LENGTH = 240
 
 
@@ -18,6 +33,10 @@ class MissingDataCategoryDefinition:
     key: str
     label: str
     status: str
+    decision_tier: str
+    severity: str
+    default_decider_effect: str
+    empty_is_neutral_by_default: bool
     internal_tables: tuple[str, ...]
     external_providers: tuple[str, ...]
     operator_hint: str
@@ -29,6 +48,10 @@ CATEGORY_DEFINITIONS: tuple[MissingDataCategoryDefinition, ...] = (
         key='liquidity_turnover_slippage',
         label='liquidity / turnover / slippage',
         status='partially_available',
+        decision_tier='core_execution',
+        severity='high',
+        default_decider_effect='core_blocker',
+        empty_is_neutral_by_default=False,
         internal_tables=('daily_price_bars', 'daily_price_contexts', 'quote_snapshots', 'current_quote_cache'),
         external_providers=('KIS quote/orderbook',),
         operator_hint=(
@@ -57,6 +80,10 @@ CATEGORY_DEFINITIONS: tuple[MissingDataCategoryDefinition, ...] = (
         key='financial_detail_quarter_cashflow',
         label='financial detail / quarter / cashflow',
         status='partially_available',
+        decision_tier='auxiliary_context',
+        severity='low',
+        default_decider_effect='confidence_reducer',
+        empty_is_neutral_by_default=False,
         internal_tables=('dart_fundamentals_snapshots', 'dart_fundamentals_rows', 'dart_disclosure_events'),
         external_providers=('DART filings/XBRL',),
         operator_hint=(
@@ -82,6 +109,10 @@ CATEGORY_DEFINITIONS: tuple[MissingDataCategoryDefinition, ...] = (
         key='market_sector_peer_relative',
         label='market / sector / peer relative comparison',
         status='partially_available',
+        decision_tier='supporting_context',
+        severity='medium',
+        default_decider_effect='supporting_gap',
+        empty_is_neutral_by_default=False,
         internal_tables=(
             'daily_market_relative_contexts',
             'daily_market_participation_contexts',
@@ -112,6 +143,10 @@ CATEGORY_DEFINITIONS: tuple[MissingDataCategoryDefinition, ...] = (
         key='factor_score_coverage',
         label='factor / score coverage',
         status='available_but_not_wired',
+        decision_tier='supporting_context',
+        severity='medium',
+        default_decider_effect='supporting_gap',
+        empty_is_neutral_by_default=False,
         internal_tables=(
             'daily_unified_value_factor_results',
             'daily_quality_factor_results',
@@ -144,6 +179,10 @@ CATEGORY_DEFINITIONS: tuple[MissingDataCategoryDefinition, ...] = (
         key='technical_evidence_support_resistance',
         label='support / resistance / technical evidence',
         status='partially_available',
+        decision_tier='supporting_context',
+        severity='medium',
+        default_decider_effect='supporting_gap',
+        empty_is_neutral_by_default=False,
         internal_tables=('daily_technical_snapshots', 'daily_action_summaries', 'daily_price_contexts', 'daily_price_bars'),
         external_providers=(),
         operator_hint=(
@@ -168,6 +207,10 @@ CATEGORY_DEFINITIONS: tuple[MissingDataCategoryDefinition, ...] = (
         key='investor_flows_short_selling',
         label='investor flows / short-selling',
         status='partially_available',
+        decision_tier='supporting_context',
+        severity='medium',
+        default_decider_effect='supporting_gap',
+        empty_is_neutral_by_default=False,
         internal_tables=('daily_pykrx_enrichment_rows',),
         external_providers=('PyKRX EOD investor flow and short-selling statistics',),
         operator_hint=(
@@ -192,6 +235,10 @@ CATEGORY_DEFINITIONS: tuple[MissingDataCategoryDefinition, ...] = (
         key='disclosures_news_events',
         label='disclosures / news / events',
         status='partially_available',
+        decision_tier='auxiliary_context',
+        severity='low',
+        default_decider_effect='confidence_reducer',
+        empty_is_neutral_by_default=True,
         internal_tables=('dart_disclosure_events', 'dart_fundamentals_snapshots'),
         external_providers=('DART filings/XBRL', 'news/event feed'),
         operator_hint=(
@@ -215,6 +262,10 @@ CATEGORY_DEFINITIONS: tuple[MissingDataCategoryDefinition, ...] = (
         key='after_hours_intraday_realtime',
         label='after-hours / intraday / realtime',
         status='partially_available',
+        decision_tier='core_execution',
+        severity='high',
+        default_decider_effect='core_blocker',
+        empty_is_neutral_by_default=False,
         internal_tables=(
             'quote_snapshots',
             'current_quote_cache',
@@ -247,6 +298,10 @@ CATEGORY_DEFINITIONS: tuple[MissingDataCategoryDefinition, ...] = (
         key='price_bar_quality_session_state',
         label='price-bar quality / session state',
         status='data_quality_issue',
+        decision_tier='core_execution',
+        severity='high',
+        default_decider_effect='core_blocker',
+        empty_is_neutral_by_default=False,
         internal_tables=('daily_price_bars', 'daily_price_contexts'),
         external_providers=(),
         operator_hint=(
@@ -274,6 +329,10 @@ CATEGORY_DEFINITIONS: tuple[MissingDataCategoryDefinition, ...] = (
         key='consensus_guidance',
         label='consensus / guidance',
         status='external_data_required',
+        decision_tier='auxiliary_context',
+        severity='low',
+        default_decider_effect='confidence_reducer',
+        empty_is_neutral_by_default=False,
         internal_tables=(),
         external_providers=('analyst consensus provider', 'management guidance feed'),
         operator_hint='Analyst consensus and structured management-guidance series are not currently stored as a first-class dataset.',
@@ -508,6 +567,11 @@ def build_missing_data_classification(
         categories.append(
             {
                 'category': definition.key,
+                'decision_tier': definition.decision_tier,
+                'severity': definition.severity,
+                'default_decider_effect': definition.default_decider_effect,
+                'empty_is_neutral_by_default': definition.empty_is_neutral_by_default,
+                'blocking_by_default': definition.default_decider_effect == 'core_blocker',
                 'note_count': len(notes),
                 'notes': notes,
                 'sources': sorted(bucket['sources']),
@@ -598,6 +662,11 @@ def enrich_missing_data_categories(raw_categories: Any) -> list[dict[str, Any]]:
                 'category': definition.key,
                 'label': definition.label,
                 'status': definition.status,
+                'decision_tier': definition.decision_tier,
+                'severity': definition.severity,
+                'default_decider_effect': definition.default_decider_effect,
+                'empty_is_neutral_by_default': definition.empty_is_neutral_by_default,
+                'blocking_by_default': definition.default_decider_effect == 'core_blocker',
                 'internal_tables': list(definition.internal_tables),
                 'external_providers': list(definition.external_providers),
                 'operator_hint': definition.operator_hint,

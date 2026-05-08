@@ -130,6 +130,7 @@ DISPATCH_SPECS: tuple[AgentDispatchSpec, ...] = (
             'Synthesize the specialist summaries, market context, flow context, momentum, volume, price-action, and data-quality inputs into short-term tactical decision support only, '
             'classifying each symbol as scalp_buy_candidate, watch_for_trigger, avoid_chase, wait, or reject for a 1-2 trading day horizon. '
             'Prioritize liquidity, fresh participation, clean trigger/invalidation levels, and chase-risk control. '
+            'Treat missing news/disclosure detail and missing detailed quarterly/cash-flow detail as auxiliary by default, not standalone blockers, unless the setup explicitly depends on them. '
             'Write all operator-facing feedback in Korean while staying JSON-only, and avoid execution logic, leverage, sizing, or fake precision.'
         ),
     ),
@@ -140,6 +141,7 @@ DISPATCH_SPECS: tuple[AgentDispatchSpec, ...] = (
             'Synthesize the three specialist summaries into conservative next-trading-day decision support only, '
             'choosing buy, wait, or reject while surfacing evidence, disagreement, invalidation, data-quality warnings, '
             'and explicit realistic target and stop-loss levels for every symbol. '
+            'Treat missing news/disclosure detail and missing detailed quarterly/cash-flow detail as auxiliary by default, not standalone blockers, unless the thesis explicitly depends on them. '
             'Write all operator-facing feedback in Korean while staying JSON-only, and avoid execution logic, leverage, sizing, or fake precision.'
         ),
     ),
@@ -721,6 +723,9 @@ class OpenClawAgentClient:
             "If some inputs are weak or missing, still return conservative structured feedback for that symbol instead of prose or placeholders.\n"
             "All operator-facing natural-language fields inside the JSON must be written in Korean.\n"
             "For decision-support outputs, provide explicit target_price and stop_loss_price levels for each symbol whenever possible; short-term-decider must also provide trigger_price and chase_limit_price. If a level is genuinely not supportable, keep the key and explain the limitation in data_quality_warnings.\n"
+            "Interpret decider_data_quality_context.decision_priority literally: core_execution gaps can justify conservative wait/reject, while auxiliary_context gaps are confidence reducers only by default.\n"
+            "Empty recent news means no captured recent news and is neutral unless separate risk evidence exists.\n"
+            "Missing detailed quarterly/cash-flow context should usually reduce confidence only, not make the symbol untradeable on its own.\n"
             f"{signal_decider_batch_rules}"
             "Do not mention subagents, children, spawning, waiting, or internal orchestration.\n"
             "Do not output tool_code, python, print(...), json.dumps(...), markdown fences, code blocks, intent tags, analysis, reasoning, or explanatory prose.\n"
@@ -751,6 +756,9 @@ class OpenClawAgentClient:
                 "Immediately before sending, re-check the final JSON formatting one last time and fix any extra or missing closing braces/brackets.\n"
                 "All operator-facing natural-language fields inside the JSON must be written in Korean.\n"
                 "For decision-support outputs, provide explicit target_price and stop_loss_price levels for each symbol whenever possible; short-term-decider must also provide trigger_price and chase_limit_price. If a level is genuinely not supportable, keep the key and explain the limitation in data_quality_warnings.\n"
+                "Interpret decider_data_quality_context.decision_priority literally: core_execution gaps can justify conservative wait/reject, while auxiliary_context gaps are confidence reducers only by default.\n"
+                "Empty recent news means no captured recent news and is neutral unless separate risk evidence exists.\n"
+                "Missing detailed quarterly/cash-flow context should usually reduce confidence only, not make the symbol untradeable on its own.\n"
                 f"{build_contract_prompt_suffix(role=spec.role)}\n"
                 f"Market date: {market_date.isoformat()}\n"
                 f"Assigned batch payload:\n{json.dumps(list(prepared_items), ensure_ascii=False)}"
@@ -772,6 +780,9 @@ class OpenClawAgentClient:
             "No tool_code, no print(json.dumps(...)), no markdown fences, no intent tags, no prose, no request restatement, raw JSON object only.\n"
             "All operator-facing natural-language fields inside the JSON must be written in Korean.\n"
             "For decision-support outputs, provide explicit target_price and stop_loss_price levels for the assigned symbol whenever possible; short-term-decider must also provide trigger_price and chase_limit_price. If a level is genuinely not supportable, keep the key and explain the limitation in data_quality_warnings.\n"
+            "Interpret decider_data_quality_context.decision_priority literally: core_execution gaps can justify conservative wait/reject, while auxiliary_context gaps are confidence reducers only by default.\n"
+            "Empty recent news means no captured recent news and is neutral unless separate risk evidence exists.\n"
+            "Missing detailed quarterly/cash-flow context should usually reduce confidence only, not make the symbol untradeable on its own.\n"
             f"{build_contract_prompt_suffix(role=spec.role)}\n"
             f"Market date: {market_date.isoformat()}\n"
             f"Assigned batch payload:\n{json.dumps([fallback_item], ensure_ascii=False)}"

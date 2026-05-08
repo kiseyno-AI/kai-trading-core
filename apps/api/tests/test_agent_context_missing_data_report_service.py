@@ -226,8 +226,12 @@ class AgentContextMissingDataReportServiceTests(unittest.TestCase):
         investor_row = next(item for item in result['categories'] if item['category'] == 'investor_flows_short_selling')
         consensus_row = next(item for item in result['categories'] if item['category'] == 'consensus_guidance')
         self.assertEqual(investor_row['status'], 'partially_available')
+        self.assertEqual(investor_row['decision_tier'], 'supporting_context')
+        self.assertEqual(investor_row['severity'], 'medium')
         self.assertIn('PyKRX EOD investor flow and short-selling statistics', investor_row['external_providers'])
         self.assertEqual(consensus_row['status'], 'external_data_required')
+        self.assertEqual(consensus_row['decision_tier'], 'auxiliary_context')
+        self.assertEqual(consensus_row['severity'], 'low')
         self.assertEqual(consensus_row['counts']['roles'], 1)
 
     def test_summary_aggregates_context_issue_type_counts_when_metadata_is_present(self):
