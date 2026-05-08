@@ -16,6 +16,9 @@ from app.agent_context.orchestrator import agent_feedback_orchestrator
 from app.agent_context.prerequisite_service import agent_feedback_prerequisite_service
 from app.agent_context.retry_service import EXPECTED_ROLES, FeedbackRetryCycleConfig, agent_feedback_retry_service
 from app.agent_context.session_cleanup_service import agent_feedback_session_cleanup_service
+from app.agent_context.signal_decider_evaluation_maintenance_service import (
+    signal_decider_evaluation_maintenance_service,
+)
 from app.agent_context.signal_decider_calendar_review_service import signal_decider_calendar_review_service
 from app.agent_context.signal_decider_loop_service import (
     DEFAULT_SIGNAL_DECIDER_EVALUATION_LOOKBACK_DAYS,
@@ -397,6 +400,40 @@ def refresh_signal_decider_calendar_reviews(
         primary_horizons=parsed_primary_horizons,
         evaluation_version=evaluation_version,
         force_recompute=force_recompute,
+        trigger='internal_ops_cli',
+    )
+
+
+def repair_signal_decider_evaluation_coverage(
+    *,
+    market_date_from: str,
+    market_date_to: str,
+    symbols: str | None = None,
+    horizons: str | None = None,
+    primary_horizons: str | None = None,
+    evaluation_version: str | None = None,
+    force_recompute: bool = True,
+    refresh_calendar: bool = True,
+    fail_on_mature_gaps: bool = True,
+) -> dict[str, Any]:
+    bootstrap_runtime()
+    parsed_symbols = [item.strip() for item in symbols.split(',') if item.strip()] if symbols else None
+    parsed_horizons = [int(item.strip()) for item in horizons.split(',') if item.strip()] if horizons else None
+    parsed_primary_horizons = (
+        [int(item.strip()) for item in primary_horizons.split(',') if item.strip()]
+        if primary_horizons
+        else None
+    )
+    return signal_decider_evaluation_maintenance_service.repair_coverage_range(
+        market_date_from=market_date_from,
+        market_date_to=market_date_to,
+        symbols=parsed_symbols,
+        horizons=parsed_horizons,
+        primary_horizons=parsed_primary_horizons,
+        evaluation_version=evaluation_version,
+        force_recompute=force_recompute,
+        refresh_calendar=refresh_calendar,
+        fail_on_mature_gaps=fail_on_mature_gaps,
         trigger='internal_ops_cli',
     )
 
@@ -1025,6 +1062,20 @@ def _build_parser() -> argparse.ArgumentParser:
     signal_decider_calendar_parser.add_argument('--evaluation-version')
     signal_decider_calendar_parser.add_argument('--force-recompute', action='store_true')
 
+    signal_decider_repair_parser = subparsers.add_parser(
+        'agent-signal-decider-evaluations-repair',
+        help='Repair signal-decider evaluation coverage over an explicit market-date range',
+    )
+    signal_decider_repair_parser.add_argument('--market-date-from', required=True)
+    signal_decider_repair_parser.add_argument('--market-date-to', required=True)
+    signal_decider_repair_parser.add_argument('--symbols')
+    signal_decider_repair_parser.add_argument('--horizons')
+    signal_decider_repair_parser.add_argument('--primary-horizons')
+    signal_decider_repair_parser.add_argument('--evaluation-version')
+    signal_decider_repair_parser.add_argument('--force-recompute', choices=('true', 'false'), default='true')
+    signal_decider_repair_parser.add_argument('--refresh-calendar', choices=('true', 'false'), default='true')
+    signal_decider_repair_parser.add_argument('--fail-on-mature-gaps', choices=('true', 'false'), default='true')
+
     feedback_smoke_parser = subparsers.add_parser(
         'agent-feedback-symbol-cleanup-smoke',
         help='Dispatch symbol feedback, store rows, attempt immediate session deletion, then retry failed deletions once',
@@ -1246,6 +1297,18 @@ def main(argv: Iterable[str] | None = None) -> int:
             primary_horizons=args.primary_horizons,
             evaluation_version=args.evaluation_version,
             force_recompute=args.force_recompute,
+        )
+    elif args.command == 'agent-signal-decider-evaluations-repair':
+        payload = repair_signal_decider_evaluation_coverage(
+            market_date_from=args.market_date_from,
+            market_date_to=args.market_date_to,
+            symbols=args.symbols,
+            horizons=args.horizons,
+            primary_horizons=args.primary_horizons,
+            evaluation_version=args.evaluation_version,
+            force_recompute=args.force_recompute == 'true',
+            refresh_calendar=args.refresh_calendar == 'true',
+            fail_on_mature_gaps=args.fail_on_mature_gaps == 'true',
         )
     elif args.command == 'agent-feedback-symbol-cleanup-smoke':
         payload = run_agent_feedback_symbol_cleanup_smoke(

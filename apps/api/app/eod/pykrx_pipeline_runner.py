@@ -194,7 +194,6 @@ def _run_daily_feedback_followup(*, market_date: str, enabled: bool) -> dict[str
         **result,
     }
 
-
 def _run_daily_signal_decider_evaluation_followup(*, market_date: str, enabled: bool) -> dict[str, Any]:
     if not enabled:
         return {
@@ -203,20 +202,15 @@ def _run_daily_signal_decider_evaluation_followup(*, market_date: str, enabled: 
             'market_date': market_date,
         }
 
-    from app.agent_context.signal_decider_loop_service import (
-        DEFAULT_SIGNAL_DECIDER_EVALUATION_LOOKBACK_DAYS,
-        signal_decider_loop_service,
+    from app.agent_context.signal_decider_evaluation_maintenance_service import (
+        signal_decider_evaluation_maintenance_service,
     )
 
-    result = signal_decider_loop_service.compute_recent_evaluations(
+    return signal_decider_evaluation_maintenance_service.refresh_recent_coverage(
         as_of_market_date=market_date,
-        lookback_days=DEFAULT_SIGNAL_DECIDER_EVALUATION_LOOKBACK_DAYS,
-        force_recompute=False,
+        refresh_calendar=True,
+        trigger='eod_pykrx_followup',
     )
-    return {
-        'triggered': True,
-        **result,
-    }
 
 
 def run_market_data_pipeline(

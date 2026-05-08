@@ -2706,6 +2706,44 @@ class SignalDeciderLoopService:
             or DEFAULT_SIGNAL_DECIDER_EVALUATION_VERSION
         )
         evaluation_profile = self._resolve_evaluation_profile(resolved_version)
+
+        def build_summary(
+            *,
+            decisions_considered: int,
+            outcomes_upserted: int,
+            evaluations_upserted: int,
+            graded_count: int,
+            pending_count: int,
+            coverage_summary: dict[str, Any],
+        ) -> dict[str, Any]:
+            not_computed_count = int(coverage_summary.get('not_computed_count') or 0)
+            warning_message = None
+            status = 'completed'
+            if not_computed_count > 0:
+                warning_message = (
+                    f'{not_computed_count} mature signal-decider horizon(s) remain '
+                    'not_computed after evaluation refresh.'
+                )
+                if force_recompute:
+                    status = 'failed'
+            return {
+                'status': status,
+                'decisions_considered': decisions_considered,
+                'outcomes_upserted': outcomes_upserted,
+                'evaluations_upserted': evaluations_upserted,
+                'graded_count': graded_count,
+                'pending_count': pending_count,
+                'coverage': coverage_summary,
+                'computed_count': int(coverage_summary.get('computed_count') or 0),
+                'pending_maturity_count': int(coverage_summary.get('pending_maturity_count') or 0),
+                'insufficient_price_data_count': int(
+                    coverage_summary.get('insufficient_price_data_count') or 0
+                ),
+                'not_computed_count': not_computed_count,
+                'warning_count': 1 if warning_message is not None else 0,
+                'warnings': [warning_message] if warning_message is not None else [],
+            }
+
         rows = self.repository.list_decision_snapshots(
             market_date_from=normalized_from,
             market_date_to=normalized_to,
@@ -2722,14 +2760,14 @@ class SignalDeciderLoopService:
                     'evaluation_rule_set_version': evaluation_profile.rule_set_version,
                     'force_recompute': force_recompute,
                 },
-                'summary': {
-                    'decisions_considered': 0,
-                    'outcomes_upserted': 0,
-                    'evaluations_upserted': 0,
-                    'graded_count': 0,
-                    'pending_count': 0,
-                    'coverage': self._build_coverage_summary(coverage_items=[]),
-                },
+                'summary': build_summary(
+                    decisions_considered=0,
+                    outcomes_upserted=0,
+                    evaluations_upserted=0,
+                    graded_count=0,
+                    pending_count=0,
+                    coverage_summary=self._build_coverage_summary(coverage_items=[]),
+                ),
                 'items': [],
             }
 
@@ -2813,14 +2851,14 @@ class SignalDeciderLoopService:
                 'evaluation_rule_set_version': evaluation_profile.rule_set_version,
                 'force_recompute': force_recompute,
             },
-            'summary': {
-                'decisions_considered': len(rows),
-                'outcomes_upserted': len(persisted_outcomes),
-                'evaluations_upserted': len(persisted_evaluations),
-                'graded_count': graded_count,
-                'pending_count': pending_count,
-                'coverage': coverage_summary,
-            },
+            'summary': build_summary(
+                decisions_considered=len(rows),
+                outcomes_upserted=len(persisted_outcomes),
+                evaluations_upserted=len(persisted_evaluations),
+                graded_count=graded_count,
+                pending_count=pending_count,
+                coverage_summary=coverage_summary,
+            ),
             'items': items,
         }
 
