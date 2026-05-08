@@ -1073,6 +1073,28 @@ def _trade_date_relation_to_request(*, as_of_market_date: str | None, requested_
     return 'after_market_date'
 
 
+def _context_block_status(context: dict[str, Any] | None, *, default: str = DECIDER_QUALITY_STATUS_UNAVAILABLE) -> str:
+    payload = _maybe_dict(context)
+    if not payload:
+        return default
+    status = str(payload.get('status') or '').strip()
+    return status or default
+
+
+def _context_block_has_signal(context: dict[str, Any] | None, *, include_empty: bool = False) -> bool:
+    payload = _maybe_dict(context)
+    if not payload:
+        return False
+    status = _context_block_status(payload, default='')
+    if not status:
+        return True
+    if status in {DECIDER_QUALITY_STATUS_UNAVAILABLE, DECIDER_QUALITY_STATUS_PROVIDER_ERROR}:
+        return False
+    if not include_empty and status == DECIDER_QUALITY_STATUS_EMPTY:
+        return False
+    return True
+
+
 def _resolve_turnover_candidate(price_context: dict[str, Any] | None) -> dict[str, Any] | None:
     if not isinstance(price_context, dict):
         return None
@@ -1267,7 +1289,11 @@ def _build_intraday_liquidity_context(
     intraday_execution_context: dict[str, Any] | None,
     intraday_execution_provenance: dict[str, Any],
 ) -> dict[str, Any]:
-    if intraday_execution_context is None and quote_context is None:
+    intraday_status = _context_block_status(intraday_execution_context)
+    quote_status = _context_block_status(quote_context)
+    intraday_available = _context_block_has_signal(intraday_execution_context)
+    quote_available = _context_block_has_signal(quote_context)
+    if not intraday_available and not quote_available:
         return {
             'status': 'unavailable',
             'reason': 'no_intraday_or_quote_context_available',
@@ -1277,11 +1303,6 @@ def _build_intraday_liquidity_context(
             },
         }
 
-    intraday_status = (
-        str(intraday_execution_context.get('status') or 'available')
-        if isinstance(intraday_execution_context, dict)
-        else 'unavailable'
-    )
     spread = _maybe_dict((quote_context or {}).get('spread'))
     intraday_quote = _maybe_dict((intraday_execution_context or {}).get('quote'))
     intraday_orderbook = _maybe_dict((intraday_execution_context or {}).get('orderbook'))
@@ -1290,11 +1311,11 @@ def _build_intraday_liquidity_context(
     if quote_spread_points is None:
         quote_spread_points = _to_int(intraday_quote.get('spread_points'))
     return {
-        'status': intraday_status if intraday_execution_context is not None else ('available' if quote_context is not None else 'unavailable'),
-        'reason': intraday_execution_provenance.get('reason') if intraday_execution_context is not None else quote_freshness_provenance.get('reason'),
+        'status': intraday_status if intraday_available else quote_status,
+        'reason': intraday_execution_provenance.get('reason') if intraday_available else quote_freshness_provenance.get('reason'),
         'freshness_status': (
             intraday_execution_provenance.get('freshness_status')
-            if intraday_execution_context is not None
+            if intraday_available
             else quote_freshness_provenance.get('freshness_status')
         ),
         'quote_freshness_status': quote_freshness_provenance.get('freshness_status'),
@@ -1627,6 +1648,13 @@ def _build_quote_freshness_provenance(
         if bool(row.get('fallback'))
         else PROVENANCE_STATUS_PROVIDER_SOURCED
     )
+    reason = None
+    if trade_date_relation == 'before_market_date':
+        reason = 'quote_trade_date_before_requested_market_date'
+    elif trade_date_relation == 'after_market_date':
+        reason = 'quote_trade_date_after_requested_market_date'
+    elif bool(row.get('fallback')):
+        reason = 'quote_fallback_used'
     return _build_freshness_provenance(
         requested_market_date=requested_market_date,
         freshness_status=freshness_status,
@@ -1639,7 +1667,7 @@ def _build_quote_freshness_provenance(
         latest_available_timestamp=row.get('captured_at') or row.get('cached_at'),
         row_count=1,
         trade_date_relation_to_request=trade_date_relation,
-        reason='quote_fallback_used' if bool(row.get('fallback')) else None,
+        reason=reason,
     )
 
 
@@ -1805,26 +1833,134 @@ def _build_signal_features_freshness_provenance(
     )
 
 
-def _build_intraday_execution_context(row: dict[str, Any] | None) -> dict[str, Any] | None:
-    if row is None:
-        return None
+def _build_intraday_block_payload(
+    *,
+    payload: dict[str, Any] | None,
+    status: str,
+    reason: str,
+) -> dict[str, Any]:
+    result = dict(_maybe_dict(payload))
+    result['status'] = str(result.get('status') or status or DECIDER_QUALITY_STATUS_UNAVAILABLE)
+    if result.get('reason') is None and result['status'] == DECIDER_QUALITY_STATUS_UNAVAILABLE:
+        result['reason'] = reason
+    return result
 
+
+def _build_intraday_execution_context(row: dict[str, Any] | None) -> dict[str, Any]:
+    block_names = ('quote', 'orderbook', 'liquidity', 'investor_program_activity', 'news_hints')
+    if row is None:
+        unavailable_reason = 'no_current_kis_intraday_snapshot_cache_row'
+        return {
+            'status': DECIDER_QUALITY_STATUS_UNAVAILABLE,
+            'reason': unavailable_reason,
+            'market_state': None,
+            'market_code': None,
+            'source': 'kis',
+            'feature_version': None,
+            'as_of_market_date': None,
+            'as_of_timestamp': None,
+            'coverage': {
+                'status': DECIDER_QUALITY_STATUS_UNAVAILABLE,
+                'available_blocks': 0,
+                'partial_blocks': 0,
+                'total_blocks': len(block_names),
+                'block_statuses': {block_name: DECIDER_QUALITY_STATUS_UNAVAILABLE for block_name in block_names},
+            },
+            'availability': {block_name: False for block_name in block_names},
+            'freshness': {
+                'market_date': None,
+                'status': FRESHNESS_STATUS_MISSING,
+            },
+            'quote': _build_intraday_block_payload(
+                payload=None,
+                status=DECIDER_QUALITY_STATUS_UNAVAILABLE,
+                reason=unavailable_reason,
+            ),
+            'orderbook': _build_intraday_block_payload(
+                payload=None,
+                status=DECIDER_QUALITY_STATUS_UNAVAILABLE,
+                reason=unavailable_reason,
+            ),
+            'liquidity': _build_intraday_block_payload(
+                payload=None,
+                status=DECIDER_QUALITY_STATUS_UNAVAILABLE,
+                reason=unavailable_reason,
+            ),
+            'investor_program_activity': _build_intraday_block_payload(
+                payload=None,
+                status=DECIDER_QUALITY_STATUS_UNAVAILABLE,
+                reason=unavailable_reason,
+            ),
+            'news_hints': _build_intraday_block_payload(
+                payload=None,
+                status=DECIDER_QUALITY_STATUS_UNAVAILABLE,
+                reason=unavailable_reason,
+            ),
+        }
+
+    coverage = _maybe_dict(row.get('coverage'))
+    availability = _maybe_dict(row.get('availability'))
+    block_statuses = {
+        block_name: str(
+            coverage.get('block_statuses', {}).get(block_name)
+            if isinstance(coverage.get('block_statuses'), dict)
+            else ''
+        )
+        or (DECIDER_QUALITY_STATUS_AVAILABLE if availability.get(block_name) else DECIDER_QUALITY_STATUS_UNAVAILABLE)
+        for block_name in block_names
+    }
+    availability_map = {
+        block_name: bool(availability.get(block_name))
+        if block_name in availability
+        else block_statuses[block_name] not in {DECIDER_QUALITY_STATUS_UNAVAILABLE, DECIDER_QUALITY_STATUS_PROVIDER_ERROR}
+        for block_name in block_names
+    }
     return {
-        'status': str(row.get('availability_status') or 'available'),
+        'status': str(row.get('availability_status') or coverage.get('status') or DECIDER_QUALITY_STATUS_AVAILABLE),
+        'reason': 'intraday_snapshot_partial' if str(row.get('availability_status') or '') == 'partial' else None,
         'market_state': row.get('market_state'),
         'market_code': row.get('market_code'),
         'source': row.get('source'),
         'feature_version': row.get('feature_version'),
         'as_of_market_date': row.get('as_of_market_date'),
         'as_of_timestamp': row.get('as_of_timestamp'),
-        'coverage': row.get('coverage'),
-        'availability': row.get('availability'),
-        'freshness': row.get('freshness'),
-        'quote': row.get('quote'),
-        'orderbook': row.get('orderbook'),
-        'liquidity': row.get('liquidity'),
-        'investor_program_activity': row.get('investor_program_activity'),
-        'news_hints': row.get('news_hints'),
+        'coverage': {
+            'status': str(coverage.get('status') or row.get('availability_status') or DECIDER_QUALITY_STATUS_AVAILABLE),
+            'available_blocks': int(coverage.get('available_blocks') or 0),
+            'partial_blocks': int(coverage.get('partial_blocks') or 0),
+            'total_blocks': int(coverage.get('total_blocks') or len(block_names)),
+            'block_statuses': block_statuses,
+        },
+        'availability': availability_map,
+        'freshness': {
+            **_maybe_dict(row.get('freshness')),
+            'status': str(_maybe_dict(row.get('freshness')).get('status') or row.get('freshness_status') or FRESHNESS_STATUS_FRESH),
+        },
+        'quote': _build_intraday_block_payload(
+            payload=_maybe_dict(row.get('quote')) or None,
+            status=block_statuses['quote'],
+            reason='intraday_quote_not_collected_in_snapshot',
+        ),
+        'orderbook': _build_intraday_block_payload(
+            payload=_maybe_dict(row.get('orderbook')) or None,
+            status=block_statuses['orderbook'],
+            reason='intraday_orderbook_not_collected_in_snapshot',
+        ),
+        'liquidity': _build_intraday_block_payload(
+            payload=_maybe_dict(row.get('liquidity')) or None,
+            status=block_statuses['liquidity'],
+            reason='intraday_liquidity_not_collected_in_snapshot',
+        ),
+        'investor_program_activity': _build_intraday_block_payload(
+            payload=_maybe_dict(row.get('investor_program_activity')) or None,
+            status=block_statuses['investor_program_activity'],
+            reason='intraday_investor_program_activity_not_collected_in_snapshot',
+        ),
+        'news_hints': _build_intraday_block_payload(
+            payload=_maybe_dict(row.get('news_hints')) or None,
+            status=block_statuses['news_hints'],
+            reason='intraday_news_hints_not_collected_in_snapshot',
+        ),
     }
 
 
@@ -1858,6 +1994,13 @@ def _build_intraday_execution_freshness_provenance(
         if trade_date_relation in {None, 'same_market_date'}
         else FRESHNESS_STATUS_STALE
     )
+    reason = None
+    if str(row.get('availability_status') or '') == 'partial':
+        reason = 'intraday_snapshot_partial'
+    elif trade_date_relation == 'before_market_date':
+        reason = 'intraday_snapshot_before_requested_market_date'
+    elif trade_date_relation == 'after_market_date':
+        reason = 'intraday_snapshot_after_requested_market_date'
     return _build_freshness_provenance(
         requested_market_date=requested_market_date,
         freshness_status=freshness_status,
@@ -1870,7 +2013,7 @@ def _build_intraday_execution_freshness_provenance(
         latest_available_timestamp=row.get('captured_at'),
         row_count=1,
         trade_date_relation_to_request=trade_date_relation,
-        reason='intraday_snapshot_partial' if str(row.get('availability_status') or '') == 'partial' else None,
+        reason=reason,
         extra={
             'availability_status': row.get('availability_status'),
             'coverage_status': ((row.get('coverage') or {}).get('status') if isinstance(row.get('coverage'), dict) else None),
@@ -2036,9 +2179,45 @@ def _build_recent_dart_events_context(
     }
 
 
-def _build_quote_context(row: dict[str, Any] | None, *, market_date: date) -> dict[str, Any] | None:
+def _build_quote_context(row: dict[str, Any] | None, *, market_date: date) -> dict[str, Any]:
     if row is None:
-        return None
+        return {
+            'status': DECIDER_QUALITY_STATUS_UNAVAILABLE,
+            'reason': 'no_current_quote_cache_row',
+            'available': False,
+            'source': 'kis',
+            'market_state': None,
+            'is_live': None,
+            'fallback': False,
+            'price': None,
+            'change': None,
+            'change_pct': None,
+            'volume': None,
+            'turnover': None,
+            'as_of': None,
+            'trade_date': None,
+            'cached_at': None,
+            'captured_at': None,
+            'freshness': {
+                'status': FRESHNESS_STATUS_MISSING,
+                'reason': 'no_current_quote_cache_row',
+                'trade_date_relation_to_request': None,
+                'same_market_date_as_request': False,
+                'cached_at': None,
+                'captured_at': None,
+                'quote_trade_date': None,
+                'has_cached_timestamp': False,
+            },
+            'spread': {
+                'status': DECIDER_QUALITY_STATUS_UNAVAILABLE,
+                'available': False,
+                'bid_price': None,
+                'ask_price': None,
+                'spread_points': None,
+                'spread_bps_of_price': None,
+                'reason': 'quote_unavailable',
+            },
+        }
 
     price = _to_int(row.get('price'))
     bid_price = _to_int(row.get('bid_price'))
@@ -2070,8 +2249,24 @@ def _build_quote_context(row: dict[str, Any] | None, *, market_date: date) -> di
         else:
             relation = 'before_market_date'
 
+    available = bool(row.get('available')) if row.get('available') is not None else price is not None
+    status = DECIDER_QUALITY_STATUS_AVAILABLE
+    reason = None
+    if not available:
+        status = DECIDER_QUALITY_STATUS_UNAVAILABLE
+        reason = 'quote_row_missing_last_price'
+    elif relation in {'before_market_date', 'after_market_date'}:
+        status = DECIDER_QUALITY_STATUS_STALE
+        reason = (
+            'quote_trade_date_before_requested_market_date'
+            if relation == 'before_market_date'
+            else 'quote_trade_date_after_requested_market_date'
+        )
+
     return {
-        'available': bool(row.get('available')) if row.get('available') is not None else price is not None,
+        'status': status,
+        'reason': reason,
+        'available': available,
         'source': row.get('source'),
         'market_state': row.get('market_state'),
         'is_live': row.get('is_live'),
@@ -2086,6 +2281,7 @@ def _build_quote_context(row: dict[str, Any] | None, *, market_date: date) -> di
         'cached_at': row.get('cached_at'),
         'captured_at': row.get('captured_at'),
         'freshness': {
+            'status': FRESHNESS_STATUS_FRESH if relation in {None, 'same_market_date'} else FRESHNESS_STATUS_STALE,
             'trade_date_relation_to_request': relation,
             'same_market_date_as_request': relation == 'same_market_date',
             'cached_at': row.get('cached_at'),
@@ -2094,6 +2290,7 @@ def _build_quote_context(row: dict[str, Any] | None, *, market_date: date) -> di
             'has_cached_timestamp': _parse_iso_datetime(row.get('cached_at')) is not None,
         },
         'spread': {
+            'status': DECIDER_QUALITY_STATUS_AVAILABLE if spread_available else DECIDER_QUALITY_STATUS_UNAVAILABLE,
             'available': spread_available,
             'bid_price': bid_price,
             'ask_price': ask_price,
@@ -2406,6 +2603,13 @@ def _build_intraday_execution_completeness(row: dict[str, Any] | None) -> dict[s
             'available_blocks': 0,
             'partial_blocks': 0,
             'total_blocks': 5,
+            'block_statuses': {
+                'quote': 'unavailable',
+                'orderbook': 'unavailable',
+                'liquidity': 'unavailable',
+                'investor_program_activity': 'unavailable',
+                'news_hints': 'unavailable',
+            },
         }
 
     coverage = row.get('coverage') if isinstance(row.get('coverage'), dict) else {}
@@ -2420,15 +2624,16 @@ def _build_intraday_execution_completeness(row: dict[str, Any] | None) -> dict[s
 
 
 def _build_market_relative_completeness(row: dict[str, Any] | None) -> dict[str, Any]:
-    if row is None:
+    payload = _maybe_dict(row)
+    if not payload:
         return {
             'status': 'unavailable',
             'missing_fields': ['breadth', 'relative_strength'],
         }
 
     missing_fields: list[str] = []
-    breadth = row.get('breadth') if isinstance(row.get('breadth'), dict) else None
-    relative_strength = row.get('relative_strength') if isinstance(row.get('relative_strength'), dict) else None
+    breadth = payload.get('breadth') if isinstance(payload.get('breadth'), dict) else None
+    relative_strength = payload.get('relative_strength') if isinstance(payload.get('relative_strength'), dict) else None
     if breadth is None:
         missing_fields.append('breadth')
     if relative_strength is None:
@@ -2438,9 +2643,55 @@ def _build_market_relative_completeness(row: dict[str, Any] | None) -> dict[str,
     if relative_strength is None or relative_strength.get('volume_percentile') is None:
         missing_fields.append('relative_strength.volume_percentile')
     return {
-        'status': row.get('status') or ('partial' if missing_fields else 'available'),
+        'status': payload.get('status') or ('partial' if missing_fields else 'available'),
         'missing_fields': missing_fields,
     }
+
+
+def _build_market_relative_freshness_provenance(
+    *,
+    row: dict[str, Any] | None,
+    requested_market_date: date,
+) -> dict[str, Any]:
+    if row is None:
+        return _build_freshness_provenance(
+            requested_market_date=requested_market_date,
+            freshness_status=FRESHNESS_STATUS_MISSING,
+            provenance_status=PROVENANCE_STATUS_DERIVED,
+            source_tables=('daily_market_relative_contexts',),
+            source_provider='pykrx_derived',
+            row_count=0,
+            reason='no_stored_market_relative_context_row_for_request_date',
+        )
+
+    as_of_market_date = str(row.get('market_date') or requested_market_date.isoformat())
+    trade_date_relation = _trade_date_relation_to_request(
+        as_of_market_date=as_of_market_date,
+        requested_market_date=requested_market_date,
+    )
+    freshness_status = (
+        FRESHNESS_STATUS_FRESH
+        if trade_date_relation in {None, 'same_market_date'}
+        else FRESHNESS_STATUS_STALE
+    )
+    return _build_freshness_provenance(
+        requested_market_date=requested_market_date,
+        freshness_status=freshness_status,
+        provenance_status=PROVENANCE_STATUS_DERIVED,
+        source_tables=('daily_market_relative_contexts',),
+        source_provider=str(row.get('source') or 'pykrx_derived'),
+        as_of_market_date=as_of_market_date,
+        latest_available_market_date=as_of_market_date,
+        row_count=1,
+        trade_date_relation_to_request=trade_date_relation,
+        reason=(
+            'market_relative_context_before_requested_market_date'
+            if trade_date_relation == 'before_market_date'
+            else 'market_relative_context_after_requested_market_date'
+            if trade_date_relation == 'after_market_date'
+            else None
+        ),
+    )
 
 
 def _latest_captured_at(rows: Sequence[dict[str, Any] | None]) -> str | None:
@@ -2686,10 +2937,9 @@ def _build_decider_intraday_quality_context(
     intraday_execution_provenance: dict[str, Any],
     intraday_execution_completeness: dict[str, Any],
 ) -> dict[str, Any]:
-    quote_state = (
-        _normalize_decider_quality_status('available', freshness_provenance=quote_provenance)
-        if isinstance(quote_context, dict)
-        else _normalize_decider_quality_status('unavailable', freshness_provenance=quote_provenance)
+    quote_state = _normalize_decider_quality_status(
+        _context_block_status(quote_context),
+        freshness_provenance=quote_provenance,
     )
     intraday_state = _normalize_decider_quality_status(
         _maybe_dict(intraday_execution_context).get('status') or intraday_execution_completeness.get('status'),
@@ -3161,14 +3411,62 @@ def _build_decider_data_quality_context(
     }
 
 
+def _build_market_relative_context(row: dict[str, Any] | None) -> dict[str, Any]:
+    if row is None:
+        return {
+            'status': DECIDER_QUALITY_STATUS_UNAVAILABLE,
+            'reason': 'no_stored_market_relative_context_row_for_request_date',
+            'market_date': None,
+            'market': None,
+            'breadth': None,
+            'relative_strength': None,
+            'missing_fields': ['breadth', 'relative_strength'],
+        }
+
+    breadth = row.get('breadth') if isinstance(row.get('breadth'), dict) else None
+    relative_strength = row.get('relative_strength') if isinstance(row.get('relative_strength'), dict) else None
+    missing_fields: list[str] = []
+    if breadth is None:
+        missing_fields.append('breadth')
+    if relative_strength is None:
+        missing_fields.append('relative_strength')
+    return {
+        'status': str(row.get('status') or ('partial' if missing_fields else 'available')),
+        'reason': row.get('reason'),
+        'market_date': row.get('market_date'),
+        'market': row.get('market'),
+        'breadth': breadth,
+        'relative_strength': relative_strength,
+        'missing_fields': missing_fields,
+    }
+
+
 def _build_sector_peer_context(
     *,
     symbol: str,
     sector_row: dict[str, Any] | None,
     sector_rows_for_market: Sequence[dict[str, Any]],
-) -> dict[str, Any] | None:
+) -> dict[str, Any]:
     if sector_row is None:
-        return None
+        return {
+            'status': DECIDER_QUALITY_STATUS_UNAVAILABLE,
+            'reason': 'no_stored_pykrx_sector_classification_row_for_request_date',
+            'market': None,
+            'sector_name': None,
+            'close_price': None,
+            'market_cap': None,
+            'change_pct': None,
+            'same_sector_symbol_count': 0,
+            'peer_count': 0,
+            'peers': [],
+            'self': {
+                'symbol': symbol,
+                'name_ko': None,
+                'market_cap': None,
+                'change_pct': None,
+            },
+            'missing_fields': ['sector_name', 'peers'],
+        }
 
     payload = _maybe_dict(sector_row.get('payload'))
     sector_name = payload.get('sector_name')
@@ -3221,9 +3519,17 @@ def _build_sector_peer_context(
 
 def _build_market_breadth_context(
     market_row: dict[str, Any] | None,
-) -> dict[str, Any] | None:
+) -> dict[str, Any]:
     if market_row is None:
-        return None
+        return {
+            'status': DECIDER_QUALITY_STATUS_UNAVAILABLE,
+            'reason': 'no_stored_pykrx_market_breadth_row_for_request_date',
+            'market_symbol_count': None,
+            'up_count': None,
+            'down_count': None,
+            'flat_count': None,
+            'missing_fields': ['market_symbol_count', 'up_count', 'down_count', 'flat_count'],
+        }
 
     payload = _maybe_dict(market_row.get('payload'))
     required_fields = ('market_symbol_count', 'up_count', 'down_count', 'flat_count')
@@ -3239,9 +3545,16 @@ def _build_investor_flow_context(
     *,
     symbol_row: dict[str, Any] | None,
     market_row: dict[str, Any] | None,
-) -> dict[str, Any] | None:
+) -> dict[str, Any]:
     if symbol_row is None and market_row is None:
-        return None
+        return {
+            'status': DECIDER_QUALITY_STATUS_UNAVAILABLE,
+            'reason': 'no_stored_pykrx_investor_flow_rows_for_request_date',
+            'market': None,
+            'symbol_flow': None,
+            'market_flow': None,
+            'missing_fields': ['symbol_flow', 'market_flow'],
+        }
 
     symbol_payload = _maybe_dict(symbol_row.get('payload')) if symbol_row is not None else None
     market_payload = _maybe_dict(market_row.get('payload')) if market_row is not None else None
@@ -3267,9 +3580,15 @@ def _build_investor_flow_context(
 
 def _build_short_selling_context(
     short_row: dict[str, Any] | None,
-) -> dict[str, Any] | None:
+) -> dict[str, Any]:
     if short_row is None:
-        return None
+        return {
+            'status': DECIDER_QUALITY_STATUS_UNAVAILABLE,
+            'reason': 'no_stored_pykrx_short_selling_row_for_request_date',
+            'short_volume': None,
+            'short_balance': None,
+            'missing_fields': ['short_volume', 'short_balance'],
+        }
 
     payload = _maybe_dict(short_row.get('payload'))
     missing_fields: list[str] = []
@@ -3288,9 +3607,16 @@ def _build_valuation_context(
     *,
     valuation_row: dict[str, Any] | None,
     foreign_ownership_row: dict[str, Any] | None,
-) -> dict[str, Any] | None:
+) -> dict[str, Any]:
     if valuation_row is None and foreign_ownership_row is None:
-        return None
+        return {
+            'status': DECIDER_QUALITY_STATUS_UNAVAILABLE,
+            'reason': 'no_stored_pykrx_valuation_or_foreign_ownership_rows_for_request_date',
+            'market': None,
+            'valuation_snapshot': None,
+            'foreign_ownership': None,
+            'missing_fields': ['valuation_snapshot', 'foreign_ownership'],
+        }
 
     valuation_payload = _maybe_dict(valuation_row.get('payload')) if valuation_row is not None else None
     foreign_payload = _maybe_dict(foreign_ownership_row.get('payload')) if foreign_ownership_row is not None else None
@@ -3669,7 +3995,7 @@ class AgentContextReadService:
             technical_snapshot = technical_map.get(symbol)
             action_summary = action_map.get(symbol)
             signal_features = signal_feature_map.get(symbol)
-            market_relative_context = market_relative_map.get(symbol)
+            market_relative_context = _build_market_relative_context(market_relative_map.get(symbol))
             latest_prior_low_risk_row = ((latest_prior_rows.get('factor_rows') or {}).get('low_risk') or {}).get(symbol)
             company_row = symbol_map.get(symbol)
             company_market = str(company_row.get('market') or '').strip().upper() if company_row else ''
@@ -3851,6 +4177,10 @@ class AgentContextReadService:
                 row=intraday_execution_row,
                 requested_market_date=normalized_market_date,
             )
+            market_relative_context_provenance = _build_market_relative_freshness_provenance(
+                row=market_relative_map.get(symbol),
+                requested_market_date=normalized_market_date,
+            )
             fundamentals_provenance = _build_fundamentals_freshness_provenance(
                 fundamentals=fundamentals,
                 requested_market_date=normalized_market_date,
@@ -3907,11 +4237,10 @@ class AgentContextReadService:
                 provenance_status=PROVENANCE_STATUS_PROVIDER_SOURCED,
                 extra={'categories': ['valuation_snapshot', 'foreign_ownership']},
             )
-            if quote_context is not None:
-                quote_context = {
-                    **quote_context,
-                    'freshness_provenance': quote_context_provenance,
-                }
+            quote_context = {
+                **quote_context,
+                'freshness_provenance': quote_context_provenance,
+            }
             if price_context is not None:
                 price_context = {
                     **price_context,
@@ -3922,36 +4251,34 @@ class AgentContextReadService:
                     **signal_features,
                     'freshness_provenance': signal_features_provenance,
                 }
-            if intraday_execution_context is not None:
-                intraday_execution_context = {
-                    **intraday_execution_context,
-                    'freshness_provenance': intraday_execution_provenance,
-                }
-            if sector_peer_context is not None:
-                sector_peer_context = {
-                    **sector_peer_context,
-                    'freshness_provenance': sector_peer_context_provenance,
-                }
-            if market_breadth_context is not None:
-                market_breadth_context = {
-                    **market_breadth_context,
-                    'freshness_provenance': market_breadth_context_provenance,
-                }
-            if investor_flow_context is not None:
-                investor_flow_context = {
-                    **investor_flow_context,
-                    'freshness_provenance': investor_flow_context_provenance,
-                }
-            if short_selling_context is not None:
-                short_selling_context = {
-                    **short_selling_context,
-                    'freshness_provenance': short_selling_context_provenance,
-                }
-            if valuation_context is not None:
-                valuation_context = {
-                    **valuation_context,
-                    'freshness_provenance': valuation_context_provenance,
-                }
+            intraday_execution_context = {
+                **intraday_execution_context,
+                'freshness_provenance': intraday_execution_provenance,
+            }
+            market_relative_context = {
+                **market_relative_context,
+                'freshness_provenance': market_relative_context_provenance,
+            }
+            sector_peer_context = {
+                **sector_peer_context,
+                'freshness_provenance': sector_peer_context_provenance,
+            }
+            market_breadth_context = {
+                **market_breadth_context,
+                'freshness_provenance': market_breadth_context_provenance,
+            }
+            investor_flow_context = {
+                **investor_flow_context,
+                'freshness_provenance': investor_flow_context_provenance,
+            }
+            short_selling_context = {
+                **short_selling_context,
+                'freshness_provenance': short_selling_context_provenance,
+            }
+            valuation_context = {
+                **valuation_context,
+                'freshness_provenance': valuation_context_provenance,
+            }
             fundamentals = {
                 **fundamentals,
                 'disclosure_context': disclosure_context,
@@ -4030,7 +4357,7 @@ class AgentContextReadService:
                 short_selling_context=short_selling_context,
                 short_selling_provenance=short_selling_context_provenance,
                 market_relative_context=market_relative_context,
-                market_relative_provenance=None,
+                market_relative_provenance=market_relative_context_provenance,
                 sector_peer_context=sector_peer_context,
                 sector_peer_provenance=sector_peer_context_provenance,
                 market_breadth_context=market_breadth_context,
@@ -4072,21 +4399,18 @@ class AgentContextReadService:
 
             availability = {
                 'company': company_row is not None,
-                'quote_context': quote_context is not None,
+                'quote_context': _context_block_has_signal(quote_context),
                 'price_context': price_context is not None,
-                'intraday_execution_context': intraday_execution_context is not None,
+                'intraday_execution_context': _context_block_has_signal(intraday_execution_context),
                 'technical_snapshot': technical_snapshot is not None,
                 'action_summary': action_summary is not None,
                 'signal_features': signal_features is not None,
-                'market_relative_context': (
-                    isinstance(market_relative_context, dict)
-                    and str(market_relative_context.get('status') or 'unavailable') != 'unavailable'
-                ),
-                'sector_peer_context': sector_peer_context is not None,
-                'market_breadth_context': market_breadth_context is not None,
-                'investor_flow_context': investor_flow_context is not None,
-                'short_selling_context': short_selling_context is not None,
-                'valuation_context': valuation_context is not None,
+                'market_relative_context': _context_block_has_signal(market_relative_context),
+                'sector_peer_context': _context_block_has_signal(sector_peer_context),
+                'market_breadth_context': _context_block_has_signal(market_breadth_context),
+                'investor_flow_context': _context_block_has_signal(investor_flow_context),
+                'short_selling_context': _context_block_has_signal(short_selling_context),
+                'valuation_context': _context_block_has_signal(valuation_context),
                 'persisted_factor_rows': any(row is not None for row in persisted_factor_rows.values()),
                 'fundamentals': fundamentals['latest_snapshot'] is not None,
                 'recent_disclosures': bool(recent_disclosures),
@@ -4140,6 +4464,7 @@ class AgentContextReadService:
                         'quote_context': quote_context_provenance,
                         'price_context': price_context_provenance,
                         'intraday_execution_context': intraday_execution_provenance,
+                        'market_relative_context': market_relative_context_provenance,
                         'signal_features': signal_features_provenance,
                         'sector_peer_context': sector_peer_context_provenance,
                         'market_breadth_context': market_breadth_context_provenance,
@@ -4349,6 +4674,7 @@ class AgentContextReadService:
             item['context_completeness']['requested_symbol_coverage'] = requested_symbol_coverage
             item['context_provenance']['signal_features']['requested_symbol_coverage'] = requested_symbol_coverage['signal_features']
             item['context_provenance']['intraday_execution_context']['requested_symbol_coverage'] = requested_symbol_coverage['intraday_execution_context']
+            item['context_provenance']['market_relative_context']['requested_symbol_coverage'] = requested_symbol_coverage['market_relative_context']
             item['context_provenance']['sector_peer_context']['requested_symbol_coverage'] = requested_symbol_coverage['sector_peer_mapping']
             item['context_provenance']['market_breadth_context']['requested_symbol_coverage'] = requested_symbol_coverage['market_breadth_context']
             item['context_provenance']['investor_flow_context']['requested_symbol_coverage'] = requested_symbol_coverage['investor_flow_context']
@@ -4371,18 +4697,32 @@ class AgentContextReadService:
                 'requested_symbol_count': len(normalized_symbols),
                 'matched_symbol_count': len(matched_symbols),
                 'missing_symbols': missing_symbols,
-                'quote_context_count': sum(1 for item in items if item['quote_context'] is not None),
+                'quote_context_count': sum(1 for item in items if _context_block_has_signal(item['quote_context'])),
                 'price_context_count': sum(1 for item in items if item['price_context'] is not None),
-                'intraday_execution_context_count': sum(1 for item in items if item['intraday_execution_context'] is not None),
+                'intraday_execution_context_count': sum(
+                    1 for item in items if _context_block_has_signal(item['intraday_execution_context'])
+                ),
                 'technical_snapshot_count': sum(1 for item in items if item['technical_snapshot'] is not None),
                 'action_summary_count': sum(1 for item in items if item['action_summary'] is not None),
                 'signal_feature_count': sum(1 for item in items if item['signal_features'] is not None),
-                'market_relative_context_count': sum(1 for item in items if item['market_relative_context'] is not None),
-                'sector_peer_context_count': sum(1 for item in items if item['sector_peer_context'] is not None),
-                'market_breadth_context_count': sum(1 for item in items if item['market_breadth_context'] is not None),
-                'investor_flow_context_count': sum(1 for item in items if item['investor_flow_context'] is not None),
-                'short_selling_context_count': sum(1 for item in items if item['short_selling_context'] is not None),
-                'valuation_context_count': sum(1 for item in items if item['valuation_context'] is not None),
+                'market_relative_context_count': sum(
+                    1 for item in items if _context_block_has_signal(item['market_relative_context'])
+                ),
+                'sector_peer_context_count': sum(
+                    1 for item in items if _context_block_has_signal(item['sector_peer_context'])
+                ),
+                'market_breadth_context_count': sum(
+                    1 for item in items if _context_block_has_signal(item['market_breadth_context'])
+                ),
+                'investor_flow_context_count': sum(
+                    1 for item in items if _context_block_has_signal(item['investor_flow_context'])
+                ),
+                'short_selling_context_count': sum(
+                    1 for item in items if _context_block_has_signal(item['short_selling_context'])
+                ),
+                'valuation_context_count': sum(
+                    1 for item in items if _context_block_has_signal(item['valuation_context'])
+                ),
                 'fundamentals_count': sum(
                     1 for item in items if item['fundamentals']['latest_snapshot'] is not None
                 ),

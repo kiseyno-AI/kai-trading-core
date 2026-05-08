@@ -1299,22 +1299,26 @@ It is a composed read payload intended for:
 - summary card generation,
 - low-roundtrip consumers.
 
-`quote_context` is the latest `current_quote_cache` view when one exists, so the payload can distinguish true quote absence from stale-or-spread-less rows without making agents guess from missing prose.
+`quote_context` is now always a structured object. When `current_quote_cache` has no requested-date row, the payload returns `status="unavailable"`, `reason`, missing freshness metadata, and an unavailable `spread` sub-object instead of a raw `null`.
 `price_context` is read from persisted `daily_price_contexts`, which the EOD pipeline derives from stored `daily_price_bars` for the same market date. It now includes derived liquidity (`turnover_source`, provider vs estimated turnover) plus `price_bar_quality` flags for zero opens, zero turnover, and unreliable gap semantics. `price_context_history` carries up to the latest seven persisted rows ending at the requested `market_date`.
 `signal_features` may be a direct KIS row, a direct-plus-fallback row, or a fallback-only row assembled from owned data. Fallback values are intentionally marked so downstream agents do not treat them as live external ranking truth.
-Major blocks now also expose `freshness_provenance`, and the top-level `context_provenance` mirror remains available even when a current block payload is `null`. Consumers should interpret `stale` and `available_but_old` as "stored evidence exists but predates the requested market date", not as a missing-data case.
+`intraday_execution_context` and the provider-backed optional PyKRX blocks (`market_relative_context`, `sector_peer_context`, `market_breadth_context`, `investor_flow_context`, `short_selling_context`, and `valuation_context`) also stay object-shaped when requested-date data is missing. Missingness is represented with explicit `status`, `reason`, nested unavailable sub-blocks where relevant, and `freshness_provenance`.
+Major blocks now also expose `freshness_provenance`, and the top-level `context_provenance` mirror remains available alongside the current block payload. Consumers should interpret `stale` and `available_but_old` as "stored evidence exists but predates the requested market date", not as a missing-data case.
 `persisted_factor_rows` keeps compact snapshots of stored factor families, `market_relative_context` derives same-market breadth and return/volume percentiles from stored `daily_price_bars`, and `context_completeness` separates present rows, genuinely missing rows, null submetrics, sparse signal-feature coverage, and the currently unavailable sector/industry peer-mapping lane.
 
-### Important nullability
-Each subsection can be absent independently.
+### Important availability semantics
+Expected decider-facing context blocks are status-first objects, not raw `null`, even when requested-date data is missing.
 For example, a company may have:
 - technical snapshot present,
 - action summary present,
+- `quote_context.status = "unavailable"`,
+- `intraday_execution_context.status = "unavailable"`,
+- `market_relative_context.status = "unavailable"`,
 - `signal_features` absent,
 - `fundamentals.latest_snapshot` absent,
 - `recent_disclosures.items` empty.
 
-Clients must not assume all sub-sections are always populated.
+Clients must not assume every nested fact field is populated just because the wrapper object exists. Use each block's `status`, `reason`, `missing_fields`, and `freshness_provenance` before interpreting absent inner values.
 
 ---
 

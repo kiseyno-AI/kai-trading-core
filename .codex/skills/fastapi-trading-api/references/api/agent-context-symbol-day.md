@@ -7,6 +7,8 @@ The response also includes a compact `factor_summary` block per symbol/day. This
 
 The response now also includes a compact `liquidity_context` block per symbol/day. It keeps the daily turnover state explicit with `available`, `derived`, `stale`, `missing_price_or_volume`, and `storage_unavailable` statuses, plus low-risk liquidity ranking fields and intraday quote/orderbook freshness where those rows exist.
 
+Expected decider-facing context blocks are status-first even when the requested-date source row is missing. `quote_context`, `intraday_execution_context`, and the provider-backed optional PyKRX blocks stay object-shaped with explicit `status`, `reason`, and `freshness_provenance` instead of collapsing to raw `null`.
+
 The response also includes a compact `decider_data_quality_context` block per symbol/day. This is the decider-facing availability and provenance summary over factor-score coverage, liquidity/turnover, intraday freshness, financial/cash-flow detail, disclosures/news, investor flow and short-selling, sector/relative-strength context, and technical evidence. It keeps `available`, `partial`, `stale`, `empty`, `unavailable`, and `provider_error` semantics explicit so downstream deciders can distinguish no recent items from provider/storage failures, and it now adds `decision_priority` plus per-block `decision_guidance` so deciders can separate core execution blockers from auxiliary confidence-only gaps.
 
 ## Example request
@@ -36,6 +38,50 @@ GET /agent-context/symbol-day?market_date=2026-04-15&symbols=005930&fs_div=CFS&d
         "name_ko": "삼성전자",
         "dart": {
           "corp_code": "00126380"
+        }
+      },
+      "quote_context": {
+        "status": "available",
+        "available": true,
+        "source": "kis",
+        "trade_date": "2026-04-15",
+        "price": 71550,
+        "spread": {
+          "status": "available",
+          "spread_points": 100
+        },
+        "freshness_provenance": {
+          "freshness_status": "fresh",
+          "provenance_status": "provider_sourced"
+        }
+      },
+      "intraday_execution_context": {
+        "status": "partial",
+        "market_state": "OPEN",
+        "coverage": {
+          "status": "partial",
+          "available_blocks": 4,
+          "partial_blocks": 1,
+          "total_blocks": 5
+        },
+        "quote": {
+          "status": "available",
+          "spread_points": 100
+        },
+        "orderbook": {
+          "status": "available",
+          "imbalance": 0.076923
+        },
+        "investor_program_activity": {
+          "status": "partial"
+        },
+        "news_hints": {
+          "status": "available",
+          "item_count": 1
+        },
+        "freshness_provenance": {
+          "freshness_status": "fresh",
+          "provenance_status": "provider_sourced"
         }
       },
       "fundamentals": {
@@ -319,6 +365,33 @@ GET /agent-context/symbol-day?market_date=2026-04-15&symbols=005930&fs_div=CFS&d
       }
     }
   ]
+}
+```
+
+## Missing-data example
+```json
+{
+  "quote_context": {
+    "status": "unavailable",
+    "reason": "no_current_quote_cache_row",
+    "freshness_provenance": {
+      "freshness_status": "missing",
+      "provenance_status": "provider_sourced"
+    }
+  },
+  "intraday_execution_context": {
+    "status": "unavailable",
+    "reason": "no_current_kis_intraday_snapshot_cache_row",
+    "quote": {"status": "unavailable"},
+    "orderbook": {"status": "unavailable"},
+    "liquidity": {"status": "unavailable"},
+    "investor_program_activity": {"status": "unavailable"},
+    "news_hints": {"status": "unavailable"}
+  },
+  "market_relative_context": {
+    "status": "unavailable",
+    "reason": "no_stored_market_relative_context_row_for_request_date"
+  }
 }
 ```
 

@@ -1157,13 +1157,33 @@ class AgentContextReadServiceTests(unittest.TestCase):
 
         second_item = result['items'][1]
         self.assertEqual(second_item['symbol'], '000660')
-        self.assertIsNone(second_item['quote_context'])
+        self.assertEqual(second_item['quote_context']['status'], 'unavailable')
+        self.assertEqual(second_item['quote_context']['reason'], 'no_current_quote_cache_row')
+        self.assertEqual(second_item['quote_context']['freshness']['status'], 'missing')
+        self.assertEqual(second_item['quote_context']['spread']['status'], 'unavailable')
         self.assertIsNone(second_item['price_context'])
-        self.assertIsNone(second_item['intraday_execution_context'])
+        self.assertEqual(second_item['intraday_execution_context']['status'], 'unavailable')
+        self.assertEqual(
+            second_item['intraday_execution_context']['reason'],
+            'no_current_kis_intraday_snapshot_cache_row',
+        )
+        self.assertEqual(second_item['intraday_execution_context']['quote']['status'], 'unavailable')
+        self.assertEqual(second_item['intraday_execution_context']['orderbook']['status'], 'unavailable')
+        self.assertEqual(second_item['intraday_execution_context']['liquidity']['status'], 'unavailable')
+        self.assertEqual(
+            second_item['intraday_execution_context']['investor_program_activity']['status'],
+            'unavailable',
+        )
+        self.assertEqual(second_item['intraday_execution_context']['news_hints']['status'], 'unavailable')
         self.assertEqual(second_item['price_context_history'], [])
         self.assertIsNone(second_item['technical_snapshot'])
         self.assertIsNone(second_item['signal_features'])
-        self.assertIsNone(second_item['market_relative_context'])
+        self.assertEqual(second_item['market_relative_context']['status'], 'unavailable')
+        self.assertEqual(second_item['sector_peer_context']['status'], 'unavailable')
+        self.assertEqual(second_item['market_breadth_context']['status'], 'unavailable')
+        self.assertEqual(second_item['investor_flow_context']['status'], 'unavailable')
+        self.assertEqual(second_item['short_selling_context']['status'], 'unavailable')
+        self.assertEqual(second_item['valuation_context']['status'], 'unavailable')
         self.assertEqual(second_item['scores']['unified_value']['status'], 'unavailable')
         self.assertEqual(second_item['scores']['quality']['status'], 'unavailable')
         self.assertEqual(second_item['scores']['momentum']['status'], 'unavailable')
@@ -1179,6 +1199,7 @@ class AgentContextReadServiceTests(unittest.TestCase):
         self.assertIsNone(second_item['fundamentals']['latest_snapshot'])
         self.assertEqual(second_item['context_provenance']['signal_features']['freshness_status'], 'missing')
         self.assertEqual(second_item['context_provenance']['intraday_execution_context']['freshness_status'], 'missing')
+        self.assertEqual(second_item['context_provenance']['market_relative_context']['freshness_status'], 'missing')
         self.assertEqual(second_item['recent_disclosures']['count'], 0)
         self.assertEqual(
             second_item['decider_data_quality_context']['blocks']['intraday_realtime']['status'],
@@ -1191,6 +1212,12 @@ class AgentContextReadServiceTests(unittest.TestCase):
         self.assertFalse(second_item['availability']['quote_context'])
         self.assertFalse(second_item['availability']['price_context'])
         self.assertFalse(second_item['availability']['intraday_execution_context'])
+        self.assertFalse(second_item['availability']['market_relative_context'])
+        self.assertFalse(second_item['availability']['sector_peer_context'])
+        self.assertFalse(second_item['availability']['market_breadth_context'])
+        self.assertFalse(second_item['availability']['investor_flow_context'])
+        self.assertFalse(second_item['availability']['short_selling_context'])
+        self.assertFalse(second_item['availability']['valuation_context'])
 
     def test_get_symbol_day_context_requires_at_least_one_symbol(self):
         service = AgentContextReadService(
