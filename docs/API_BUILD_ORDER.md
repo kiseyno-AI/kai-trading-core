@@ -184,6 +184,11 @@
 - `POST /agent-context/signal-decider/policy-candidates/generate`
 - `GET /agent-context/signal-decider/policy-candidates?status=generated&evaluation_version=signal_decider_eval_v1`
 
+## Agent context notes
+- `GET /agent-context/symbol-day` now includes a compact `factor_summary` block plus a compact `liquidity_context` block for prompt-safe decider use.
+- `liquidity_context.turnover.status` distinguishes `available`, `derived`, `stale`, `missing_price_or_volume`, and `storage_unavailable` so deciders can tell current-day turnover, safe close×volume fallback, stale prior-day context, and true storage failures apart.
+- `liquidity_context` also carries low-risk liquidity ranking fields when available and intraday KIS quote/orderbook freshness hints without requiring deciders to parse the full rich `price_context` and `intraday_execution_context` blocks.
+
 ## Market snapshot notes
 - `GET /market/snapshot` is now a cache/read-model endpoint. Web reads return the latest persisted Core market snapshot instead of triggering live KIS or Korea Exim calls in the request path.
 - The background/runtime refresh cadence is explicit and configurable through `MARKET_SNAPSHOT_REFRESH_INTERVAL_SECONDS` (default `3600` seconds). Startup primes the cache when possible, and the background runner refreshes it when due.

@@ -5,6 +5,8 @@ Returns compact symbol/day analysis context for downstream agents. The payload c
 
 The response also includes a compact `factor_summary` block per symbol/day. This is the prompt-trim-safe status-first summary for persisted factor families and stored signal features. It complements the richer `scores` and `persisted_factor_rows` blocks rather than replacing them.
 
+The response now also includes a compact `liquidity_context` block per symbol/day. It keeps the daily turnover state explicit with `available`, `derived`, `stale`, `missing_price_or_volume`, and `storage_unavailable` statuses, plus low-risk liquidity ranking fields and intraday quote/orderbook freshness where those rows exist.
+
 ## Example request
 ```http
 GET /agent-context/symbol-day?market_date=2026-04-15&symbols=005930&fs_div=CFS&disclosures_limit=5
@@ -207,6 +209,38 @@ GET /agent-context/symbol-day?market_date=2026-04-15&symbols=005930&fs_div=CFS&d
             "source_tables": ["daily_signal_features"]
           }
         }
+      },
+      "liquidity_context": {
+        "status": "derived",
+        "reason": "derived_from_close_price_x_volume",
+        "turnover": {
+          "status": "derived",
+          "trade_date": "2026-04-15",
+          "turnover_krw": 8520000000,
+          "turnover_source": "derived",
+          "provider_turnover_krw": null,
+          "derived_turnover_krw": 8520000000,
+          "volume": 120000,
+          "close_price": 71000,
+          "provenance": {
+            "freshness_status": "fresh",
+            "provenance_status": "provider_plus_fallback"
+          }
+        },
+        "ranking": {
+          "status": "available",
+          "avg_trading_value_20d": 1200000000,
+          "liquidity_percentile": 0.91,
+          "passes_liquidity_floor": true
+        },
+        "intraday": {
+          "status": "partial",
+          "freshness_status": "fresh",
+          "quote_spread_points": 100,
+          "orderbook_imbalance": 0.076923,
+          "volume_power_rank": 3,
+          "quote_balance_rank": 5
+        }
       }
     }
   ]
@@ -218,5 +252,6 @@ GET /agent-context/symbol-day?market_date=2026-04-15&symbols=005930&fs_div=CFS&d
 - Missing DART facts are explicit with `status="missing"` instead of being silently omitted.
 - `fundamentals.disclosure_context` summarizes recent corrections and ownership or large-holder changes from the existing DART disclosure event stream; it does not require a separate ownership-only endpoint.
 - `factor_summary.factor_scores` covers the persisted factor families `value`, `unified_value`, `quality`, `momentum`, `advanced_value`, `low_risk`, `beta`, and `composite`.
+- `liquidity_context.turnover` is the prompt-trim-safe turnover summary. `status="derived"` means provider turnover was missing or zero but `close_price * volume` was safely derivable from the stored daily bar. `status="stale"` means Core only had a prior stored price-context row for that symbol.
 - `factor_summary` status values are canonical and machine-readable: `available`, `not_eligible`, `insufficient_history`, `missing_source_row`, `storage_unavailable`, and `not_computed_for_market_date`.
 - `factor_summary.signal_features` gives the same compact status/provenance treatment to the persisted `daily_signal_features` row.
