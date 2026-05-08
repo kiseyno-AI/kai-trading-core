@@ -127,6 +127,7 @@ class DailyMarketRiskFilterService:
         market_date: str | None = None,
         symbol: str | None = None,
         limit: int | None = None,
+        summary_only: bool = False,
     ) -> dict[str, Any]:
         normalized_requested_market_date = normalize_optional_market_date(market_date)
         normalized_symbol = normalize_symbol(symbol) if symbol is not None else None
@@ -175,6 +176,8 @@ class DailyMarketRiskFilterService:
         }
         if normalized_symbol:
             payload['item'] = items[0] if items else None
+        elif summary_only:
+            payload['items'] = []
         else:
             payload['items'] = items
         return payload

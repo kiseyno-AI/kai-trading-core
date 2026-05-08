@@ -228,6 +228,7 @@ class DailyPiotroskiFilterService:
         market_date: str | date | None = None,
         symbol: str | None = None,
         limit: int | None = None,
+        summary_only: bool = False,
     ) -> dict[str, Any]:
         normalized_requested_market_date = self._normalize_market_date(market_date)
         normalized_symbol = self._normalize_symbol(symbol)
@@ -274,6 +275,8 @@ class DailyPiotroskiFilterService:
         }
         if normalized_symbol:
             payload['item'] = items[0] if items else None
+        elif summary_only:
+            payload['items'] = []
         else:
             payload['items'] = items
         return payload

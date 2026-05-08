@@ -469,14 +469,13 @@ async def inspect_daily_market_risk_filters(
     market_date: str | None = None,
     symbol: str | None = None,
     limit: int | None = Query(default=None, ge=1, le=20000),
+    summary_only: bool = False,
 ) -> dict:
     try:
-        return await asyncio.to_thread(
-            daily_market_risk_filter_service.inspect,
-            market_date=market_date,
-            symbol=symbol,
-            limit=limit,
-        )
+        kwargs = {'market_date': market_date, 'symbol': symbol, 'limit': limit}
+        if summary_only:
+            kwargs['summary_only'] = True
+        return await asyncio.to_thread(daily_market_risk_filter_service.inspect, **kwargs)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
@@ -799,14 +798,13 @@ async def inspect_daily_piotroski_filter_results(
     market_date: str | None = None,
     symbol: str | None = None,
     limit: int | None = Query(default=None, ge=1, le=20000),
+    summary_only: bool = False,
 ) -> dict:
     try:
-        return await asyncio.to_thread(
-            daily_piotroski_filter_service.inspect,
-            market_date=market_date,
-            symbol=symbol,
-            limit=limit,
-        )
+        kwargs = {'market_date': market_date, 'symbol': symbol, 'limit': limit}
+        if summary_only:
+            kwargs['summary_only'] = True
+        return await asyncio.to_thread(daily_piotroski_filter_service.inspect, **kwargs)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
