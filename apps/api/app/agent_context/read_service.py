@@ -1095,6 +1095,22 @@ def _context_block_has_signal(context: dict[str, Any] | None, *, include_empty: 
     return True
 
 
+def _intraday_block_has_signal(
+    intraday_execution_context: dict[str, Any] | None,
+    *,
+    block_name: str,
+    block_payload: dict[str, Any] | None = None,
+) -> bool:
+    availability = _maybe_dict(_maybe_dict(intraday_execution_context).get('availability'))
+    if block_name in availability:
+        return bool(availability.get(block_name))
+    return _context_block_has_signal(
+        block_payload
+        if block_payload is not None
+        else _maybe_dict(_maybe_dict(intraday_execution_context).get(block_name))
+    )
+
+
 def _resolve_turnover_candidate(price_context: dict[str, Any] | None) -> dict[str, Any] | None:
     if not isinstance(price_context, dict):
         return None
@@ -2980,11 +2996,31 @@ def _build_decider_intraday_quality_context(
             'available_blocks': intraday_execution_completeness.get('available_blocks'),
             'partial_blocks': intraday_execution_completeness.get('partial_blocks'),
             'total_blocks': intraday_execution_completeness.get('total_blocks'),
-            'quote_available': bool(intraday_quote),
-            'orderbook_available': bool(intraday_orderbook),
-            'liquidity_available': bool(intraday_liquidity),
-            'investor_program_activity_available': bool(investor_program_activity),
-            'news_hints_available': bool(news_hints),
+            'quote_available': _intraday_block_has_signal(
+                intraday_execution_context,
+                block_name='quote',
+                block_payload=intraday_quote,
+            ),
+            'orderbook_available': _intraday_block_has_signal(
+                intraday_execution_context,
+                block_name='orderbook',
+                block_payload=intraday_orderbook,
+            ),
+            'liquidity_available': _intraday_block_has_signal(
+                intraday_execution_context,
+                block_name='liquidity',
+                block_payload=intraday_liquidity,
+            ),
+            'investor_program_activity_available': _intraday_block_has_signal(
+                intraday_execution_context,
+                block_name='investor_program_activity',
+                block_payload=investor_program_activity,
+            ),
+            'news_hints_available': _intraday_block_has_signal(
+                intraday_execution_context,
+                block_name='news_hints',
+                block_payload=news_hints,
+            ),
             'orderbook_imbalance': intraday_orderbook.get('imbalance'),
             'volume_power_rank': intraday_liquidity.get('volume_power_rank'),
             'quote_balance_rank': intraday_liquidity.get('quote_balance_rank'),
