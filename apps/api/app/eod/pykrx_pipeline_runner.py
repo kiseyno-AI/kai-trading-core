@@ -195,6 +195,30 @@ def _run_daily_feedback_followup(*, market_date: str, enabled: bool) -> dict[str
     }
 
 
+def _run_daily_signal_decider_evaluation_followup(*, market_date: str, enabled: bool) -> dict[str, Any]:
+    if not enabled:
+        return {
+            'triggered': False,
+            'reason': 'followup_disabled',
+            'market_date': market_date,
+        }
+
+    from app.agent_context.signal_decider_loop_service import (
+        DEFAULT_SIGNAL_DECIDER_EVALUATION_LOOKBACK_DAYS,
+        signal_decider_loop_service,
+    )
+
+    result = signal_decider_loop_service.compute_recent_evaluations(
+        as_of_market_date=market_date,
+        lookback_days=DEFAULT_SIGNAL_DECIDER_EVALUATION_LOOKBACK_DAYS,
+        force_recompute=False,
+    )
+    return {
+        'triggered': True,
+        **result,
+    }
+
+
 def run_market_data_pipeline(
     service,
     *,
@@ -929,6 +953,10 @@ def run_market_data_pipeline(
             market_date=latest_trade_date,
             enabled=bool(dependencies.settings.openclaw_feedback_trigger_after_fundamentals_refresh),
         )
+        result['signal_decider_evaluation_followup'] = _run_daily_signal_decider_evaluation_followup(
+            market_date=latest_trade_date,
+            enabled=True,
+        )
     elif chain_fundamentals_followup and mode == 'daily_auto' and status in {'completed', 'completed_with_errors'}:
         result['fundamentals_followup'] = {
             'triggered': False,
@@ -947,6 +975,10 @@ def run_market_data_pipeline(
         result['feedback_followup'] = _run_daily_feedback_followup(
             market_date=latest_trade_date,
             enabled=bool(dependencies.settings.openclaw_feedback_trigger_after_fundamentals_refresh),
+        )
+        result['signal_decider_evaluation_followup'] = _run_daily_signal_decider_evaluation_followup(
+            market_date=latest_trade_date,
+            enabled=True,
         )
     if retry_context is not None:
         result['retry'] = retry_context

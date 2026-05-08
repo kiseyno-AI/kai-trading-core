@@ -475,7 +475,12 @@ class PykrxBackfillServiceTests(TestCase):
             run_metadata=ANY,
         )
 
-    def test_run_collection_always_chains_fundamentals_for_daily_auto(self) -> None:
+    @patch('app.eod.pykrx_backfill.settings.openclaw_feedback_trigger_after_fundamentals_refresh', False)
+    @patch(
+        'app.eod.pykrx_pipeline_runner._run_daily_signal_decider_evaluation_followup',
+        return_value={'triggered': True, 'summary': {'not_computed_count': 0}},
+    )
+    def test_run_collection_always_chains_fundamentals_for_daily_auto(self, evaluation_followup) -> None:
         service = PykrxBackfillService()
 
         with (
@@ -565,6 +570,7 @@ class PykrxBackfillServiceTests(TestCase):
         factor_followup.assert_called_once_with(market_date='2026-04-03')
         external_news_followup.assert_called_once_with(market_date='2026-04-03', enabled=True)
         feedback_followup.assert_called_once_with(market_date='2026-04-03', enabled=False)
+        evaluation_followup.assert_called_once_with(market_date='2026-04-03', enabled=True)
         self.assertEqual(
             result['factor_scoring_followup'],
             {'triggered': True, 'status': 'completed', 'stages': {}},
@@ -576,6 +582,10 @@ class PykrxBackfillServiceTests(TestCase):
         self.assertEqual(
             result['feedback_followup'],
             {'triggered': True, 'status': 'completed'},
+        )
+        self.assertEqual(
+            result['signal_decider_evaluation_followup'],
+            {'triggered': True, 'summary': {'not_computed_count': 0}},
         )
 
     def test_run_collection_daily_auto_rebuilds_price_contexts_when_selected_stages_are_explicit(self) -> None:
@@ -652,7 +662,11 @@ class PykrxBackfillServiceTests(TestCase):
             run_id=12,
         )
 
-    def test_run_collection_skips_fundamentals_followup_when_dart_is_not_configured(self) -> None:
+    @patch(
+        'app.eod.pykrx_pipeline_runner._run_daily_signal_decider_evaluation_followup',
+        return_value={'triggered': True, 'summary': {'not_computed_count': 0}},
+    )
+    def test_run_collection_skips_fundamentals_followup_when_dart_is_not_configured(self, evaluation_followup) -> None:
         service = PykrxBackfillService()
 
         with (
@@ -733,6 +747,11 @@ class PykrxBackfillServiceTests(TestCase):
             },
         )
         self.assertIn('external_news_followup', result)
+        evaluation_followup.assert_called_once_with(market_date='2026-04-03', enabled=True)
+        self.assertEqual(
+            result['signal_decider_evaluation_followup'],
+            {'triggered': True, 'summary': {'not_computed_count': 0}},
+        )
         fundamentals_refresh.assert_not_called()
 
     def test_run_market_data_pipeline_keeps_retryable_status_when_snapshot_persistence_has_failures(self) -> None:
