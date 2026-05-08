@@ -1,7 +1,7 @@
 # GET /agent-context/signal-decider/calendar
 
 ## Summary
-Month-level replay review calendar over the persisted `signal_decider_calendar_review_items` read model. The response groups decisions by market date, reports buy or wait or reject counts, highlights primary-horizon evaluation coverage, and keeps replay scorecards separate from actual execution outcomes.
+Month-level replay review calendar over the persisted `signal_decider_calendar_review_items` read model. The response groups decisions by market date, reports buy or wait or reject counts, highlights primary-horizon evaluation coverage with explicit status-reason counts, and keeps replay scorecards separate from actual execution outcomes.
 
 ## Example request
 ```http
@@ -39,7 +39,14 @@ GET /agent-context/signal-decider/calendar?month=2026-04&horizons=1&horizons=3&h
     "evaluation_coverage": {
       "status": "partial",
       "complete_count": 3,
-      "pending_count": 1
+      "pending_count": 1,
+      "pending_maturity_count": 1,
+      "insufficient_price_data_count": 0,
+      "not_computed_count": 0,
+      "status_reason_counts": {
+        "computed": 3,
+        "pending_maturity": 1
+      }
     },
     "scorecard": {
       "target_hit_count": 2,
@@ -79,7 +86,7 @@ GET /agent-context/signal-decider/calendar?month=2026-04&horizons=1&horizons=3&h
 # GET /agent-context/signal-decider/calendar/{market_date}
 
 ## Summary
-Selected-date replay review for all `signal-decider` decisions emitted on one market date, read from the persisted calendar-review artifacts. Each item keeps the original decision fields, adds D+1 or D+3 or D+5 replay summaries, and exposes both the structured replay narrative and direct calendar-facing aliases such as `quality_verdict`, `quality_reason`, `review_conclusion`, `path_outcome`, and `intraday_path_result`.
+Selected-date replay review for all `signal-decider` decisions emitted on one market date, read from the persisted calendar-review artifacts. Each item keeps the original decision fields, adds D+1 or D+3 or D+5 replay summaries, and exposes both the structured replay narrative and direct calendar-facing aliases such as `quality_verdict`, `quality_reason`, `review_conclusion`, `path_outcome`, and `intraday_path_result`. Per-horizon coverage metadata makes immature windows and price-data gaps explicit.
 
 ## Example request
 ```http
@@ -116,6 +123,16 @@ GET /agent-context/signal-decider/calendar/2026-04-20?horizons=1&horizons=3&hori
       "summary": "Breakout quality stayed constructive.",
       "review": {
         "status": "complete",
+        "status_reason": "computed",
+        "coverage": {
+          "horizon_days": 5,
+          "status_reason": "computed",
+          "decision_market_date": "2026-04-20",
+          "entry_trade_date": "2026-04-21",
+          "observed_bars_count": 5,
+          "required_bars_count": 5,
+          "earliest_computable_date": "2026-04-27"
+        },
         "quality_verdict": "buy_should_have_taken",
         "quality_reason": "Target was touched and the stop-loss was never touched inside the review window.",
         "review_conclusion": "Buy held up on replay.",
@@ -153,6 +170,7 @@ GET /agent-context/signal-decider/calendar/2026-04-20?horizons=1&horizons=3&hori
           {
             "horizon_days": 1,
             "grade_label": "good_buy",
+            "status_reason": "computed",
             "path_analysis": {
               "path_marker": "target_hit"
             }
@@ -160,6 +178,7 @@ GET /agent-context/signal-decider/calendar/2026-04-20?horizons=1&horizons=3&hori
           {
             "horizon_days": 5,
             "grade_label": "good_buy",
+            "status_reason": "computed",
             "path_analysis": {
               "path_marker": "target_hit"
             }
@@ -215,6 +234,7 @@ GET /agent-context/signal-decider/calendar/2026-04-20/snapshots/84?horizons=1&ho
     "symbol": "005930",
     "review": {
       "status": "complete",
+      "status_reason": "computed",
       "quality_verdict": "buy_should_have_taken",
       "quality_reason": "Target was touched and the stop-loss was never touched inside the review window.",
       "review_conclusion": "Buy held up on replay.",

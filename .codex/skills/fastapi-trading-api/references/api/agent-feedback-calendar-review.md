@@ -3,6 +3,8 @@
 ## Summary
 Compact month-summary compatibility route for trading-web signal review calendar reads. It prefers the persisted `signal_decider_calendar_review_items` projection, falls back to snapshot/evaluation-backed signal-decider replay rows when that projection is empty, and returns per-date decision counts plus review-visible counts without 404ing on a supported path.
 
+Compatibility responses preserve replay coverage diagnostics instead of flattening every incomplete horizon into a generic failure. Review summaries now surface `pending_maturity`, `insufficient_price_data`, and `not_computed` where applicable.
+
 ## Example request
 ```http
 GET /agent-context/feedback/calendar?month=2026-05&horizons=1&horizons=5&primary_horizon_days=5&evaluation_version=signal_decider_eval_v1
@@ -22,6 +24,13 @@ GET /agent-context/feedback/calendar?month=2026-05&horizons=1&horizons=5&primary
     "decision_count": 90,
     "reviewed_count": 90,
     "status": "reviewed",
+    "pending_review_count": 0,
+    "evaluation_coverage": {
+      "status": "reviewed",
+      "status_reason_counts": {
+        "computed": 90
+      }
+    },
     "source": "persisted_review_projection"
   },
   "items": [
@@ -40,6 +49,12 @@ GET /agent-context/feedback/calendar?month=2026-05&horizons=1&horizons=5&primary
       },
       "reviewed_count": 90,
       "pending_review_count": 0,
+      "evaluation_coverage": {
+        "status": "complete",
+        "status_reason_counts": {
+          "computed": 90
+        }
+      },
       "source": "persisted_review_projection"
     }
   ],
@@ -74,8 +89,19 @@ GET /agent-context/feedback/review?market_date=2026-05-07&horizons=1&horizons=5&
   "summary": {
     "count": 2,
     "reviewed_count": 2,
+    "pending_review_count": 0,
     "review_status_counts": {
       "reviewed": 2
+    },
+    "evaluation_coverage": {
+      "status": "complete",
+      "computed_count": 2,
+      "pending_maturity_count": 0,
+      "insufficient_price_data_count": 0,
+      "not_computed_count": 0,
+      "status_reason_counts": {
+        "computed": 2
+      }
     },
     "status": "reviewed",
     "source": "persisted_review_projection"
@@ -102,25 +128,47 @@ GET /agent-context/feedback/review?market_date=2026-05-07&horizons=1&horizons=5&
           "quality_verdict": "good_buy",
           "quality_reason": "Target was touched and the stop-loss was never touched inside the review window.",
           "review_conclusion": "Buy held up on replay.",
+          "status_reason": "computed",
+          "coverage": {
+            "horizon_days": 5,
+            "status_reason": "computed",
+            "decision_market_date": "2026-05-07",
+            "entry_trade_date": "2026-05-08",
+            "observed_bars_count": 5,
+            "required_bars_count": 5,
+            "earliest_computable_date": "2026-05-14"
+          },
           "target_stop_result": "target_hit_first"
         }
       },
       "review": {
         "status": "complete",
+        "status_reason": "computed",
         "quality_verdict": "good_buy",
         "quality_reason": "Target was touched and the stop-loss was never touched inside the review window.",
         "review_conclusion": "Buy held up on replay.",
+        "coverage": {
+          "horizon_days": 5,
+          "status_reason": "computed",
+          "decision_market_date": "2026-05-07",
+          "entry_trade_date": "2026-05-08",
+          "observed_bars_count": 5,
+          "required_bars_count": 5,
+          "earliest_computable_date": "2026-05-14"
+        },
         "intraday_path_result": "target_hit_first",
         "outcome_horizons": [
           {
             "horizon_days": 1,
             "close_return_pct": 0.82,
-            "grade_label": "good_buy"
+            "grade_label": "good_buy",
+            "status_reason": "computed"
           },
           {
             "horizon_days": 5,
             "close_return_pct": 3.14,
-            "grade_label": "good_buy"
+            "grade_label": "good_buy",
+            "status_reason": "computed"
           }
         ]
       },

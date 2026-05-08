@@ -301,6 +301,21 @@ def _extract_reviewed_count(payload: dict[str, Any] | None) -> int:
     return 0
 
 
+def _normalize_review_status_counts(payload: dict[str, Any] | None) -> dict[str, int]:
+    raw_counts = payload.get('review_status_counts') if isinstance(payload, dict) else None
+    if not isinstance(raw_counts, dict):
+        return {}
+    normalized_counts: dict[str, int] = {}
+    for raw_key, raw_value in raw_counts.items():
+        normalized_key = str(raw_key or '').strip().lower()
+        if not normalized_key:
+            continue
+        if normalized_key == 'complete':
+            normalized_key = 'reviewed'
+        normalized_counts[normalized_key] = normalized_counts.get(normalized_key, 0) + _to_non_negative_int(raw_value)
+    return dict(sorted(normalized_counts.items()))
+
+
 def _has_review_rows(payload: dict[str, Any]) -> bool:
     items = payload.get('items')
     if isinstance(items, list) and len(items) > 0:
@@ -351,6 +366,7 @@ def _build_feedback_review_availability(metadata: dict[str, Any]) -> dict[str, A
 def _build_feedback_calendar_summary_item(raw_item: dict[str, Any], *, source: str) -> dict[str, Any]:
     decision_count = _to_non_negative_int(raw_item.get('decision_count'))
     reviewed_count = _extract_reviewed_count(raw_item)
+    review_status_counts = _normalize_review_status_counts(raw_item)
     action_counts = {'buy': 0, 'wait': 0, 'reject': 0, 'unknown': 0}
     raw_action_counts = raw_item.get('decision_actions')
     if isinstance(raw_action_counts, dict):
@@ -365,9 +381,12 @@ def _build_feedback_calendar_summary_item(raw_item: dict[str, Any], *, source: s
         ),
         'decision_count': decision_count,
         'decision_actions': action_counts,
-        'review_status_counts': {'reviewed': reviewed_count} if reviewed_count > 0 else {},
+        'review_status_counts': review_status_counts or ({'reviewed': reviewed_count} if reviewed_count > 0 else {}),
         'reviewed_count': reviewed_count,
-        'pending_review_count': max(decision_count - reviewed_count, 0),
+        'pending_review_count': _to_non_negative_int(raw_item.get('pending_review_count'))
+        or max(decision_count - reviewed_count, 0),
+        'evaluation_coverage': raw_item.get('evaluation_coverage'),
+        'scorecard': raw_item.get('scorecard'),
         'source': source,
     }
 
@@ -381,6 +400,7 @@ def _build_feedback_calendar_response(
     summary_payload = dict(review_payload.get('summary') or {})
     decision_count = _to_non_negative_int(summary_payload.get('decision_count', summary_payload.get('count')))
     reviewed_count = _extract_reviewed_count(summary_payload)
+    review_status_counts = _normalize_review_status_counts(summary_payload)
     items = [
         _build_feedback_calendar_summary_item(item, source=metadata['source'])
         for item in list(review_payload.get('items') or [])
@@ -401,6 +421,12 @@ def _build_feedback_calendar_response(
                 decision_count=decision_count,
                 reviewed_count=reviewed_count,
             ),
+            'pending_review_count': _to_non_negative_int(summary_payload.get('pending_review_count'))
+            or max(decision_count - reviewed_count, 0),
+            'review_status_counts': review_status_counts or ({'reviewed': reviewed_count} if reviewed_count > 0 else {}),
+            'evaluation_coverage': summary_payload.get('evaluation_coverage'),
+            'horizon_coverage': summary_payload.get('horizon_coverage'),
+            'scorecard': summary_payload.get('scorecard'),
             'source': metadata['source'],
             'request': {
                 'month': request_payload.get('month'),
@@ -428,6 +454,8 @@ def _build_review_realized_results(review_payload: dict[str, Any]) -> dict[str, 
             'realized_return_pct': horizon_item.get('close_return_pct'),
             'verdict': horizon_item.get('grade_label'),
             'close_price': horizon_item.get('realized_price') or horizon_item.get('close_price'),
+            'status_reason': horizon_item.get('status_reason'),
+            'coverage': horizon_item.get('coverage'),
             'notes': (
                 horizon_item.get('path_analysis', {}).get('path_explanation')
                 if isinstance(horizon_item.get('path_analysis'), dict)
@@ -475,6 +503,8 @@ def _build_feedback_review_decision_payload(raw_item: dict[str, Any]) -> dict[st
         'quality_verdict': review_payload.get('quality_verdict'),
         'quality_reason': review_payload.get('quality_reason'),
         'review_conclusion': review_payload.get('review_conclusion'),
+        'status_reason': review_payload.get('status_reason'),
+        'coverage': review_payload.get('coverage'),
         'target_stop_result': review_payload.get('target_stop_result'),
         'intraday_path_result': review_payload.get('intraday_path_result'),
         'outcome_horizons': review_payload.get('outcome_horizons'),
@@ -558,6 +588,7 @@ def _build_feedback_review_response(
     if decision_count <= 0 and items:
         decision_count = len(items)
     reviewed_count = _extract_reviewed_count(summary_payload)
+    review_status_counts = _normalize_review_status_counts(summary_payload)
     if reviewed_count <= 0:
         reviewed_count = sum(
             1
@@ -578,7 +609,13 @@ def _build_feedback_review_response(
         'summary': {
             'count': decision_count,
             'reviewed_count': reviewed_count,
-            'review_status_counts': {'reviewed': reviewed_count} if reviewed_count > 0 else {},
+            'pending_review_count': _to_non_negative_int(summary_payload.get('pending_review_count'))
+            or max(decision_count - reviewed_count, 0),
+            'review_status_counts': review_status_counts or ({'reviewed': reviewed_count} if reviewed_count > 0 else {}),
+            'evaluation_coverage': summary_payload.get('evaluation_coverage'),
+            'horizon_coverage': summary_payload.get('horizon_coverage'),
+            'insight_counts': summary_payload.get('insight_counts'),
+            'path_marker_counts': summary_payload.get('path_marker_counts'),
             'status': status,
             'source': metadata['source'],
         },

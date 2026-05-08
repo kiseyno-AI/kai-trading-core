@@ -593,8 +593,58 @@ class FakeSignalDeciderLoopService:
                 'horizons': kwargs['horizons'],
                 'evaluation_version': kwargs['evaluation_version'],
             },
-            'summary': {'count': 1},
-            'items': [{'feedback_id': 11, 'symbol': kwargs['symbol'] or '005930', 'evaluations': [{'horizon_days': 5}]}],
+            'summary': {
+                'count': 1,
+                'evaluated_count': 0,
+                'stored_evaluation_count': 1,
+                'coverage': {
+                    'count': 1,
+                    'computed_count': 0,
+                    'pending_maturity_count': 1,
+                    'insufficient_price_data_count': 0,
+                    'not_computed_count': 0,
+                    'status_reason_counts': {'pending_maturity': 1},
+                    'coverage_ratio': 0.0,
+                },
+            },
+            'items': [
+                {
+                    'feedback_id': 11,
+                    'symbol': kwargs['symbol'] or '005930',
+                    'coverage': [
+                        {
+                            'horizon_days': 5,
+                            'status_reason': 'pending_maturity',
+                            'decision_market_date': kwargs['market_date'].isoformat(),
+                            'entry_trade_date': '2026-05-08',
+                            'observed_bars_count': 1,
+                            'required_bars_count': 5,
+                            'earliest_computable_date': '2026-05-08',
+                        }
+                    ],
+                    'coverage_summary': {
+                        'count': 1,
+                        'computed_count': 0,
+                        'pending_maturity_count': 1,
+                        'insufficient_price_data_count': 0,
+                        'not_computed_count': 0,
+                        'status_reason_counts': {'pending_maturity': 1},
+                        'coverage_ratio': 0.0,
+                    },
+                    'evaluations': [
+                        {
+                            'horizon_days': 5,
+                            'evaluation_status': 'pending',
+                            'status_reason': 'pending_maturity',
+                            'coverage': {
+                                'horizon_days': 5,
+                                'status_reason': 'pending_maturity',
+                                'earliest_computable_date': '2026-05-08',
+                            },
+                        }
+                    ],
+                }
+            ],
         }
 
     def generate_policy_candidates(self, **kwargs):
@@ -722,7 +772,47 @@ class FakeSignalDeciderCalendarReviewService:
                 'artifact_source': 'signal_decider_calendar_review_items',
             },
             'taxonomy': {'version': 'signal_decider_replay_review_v1'},
-            'summary': {'count': 1, 'evaluation_coverage': {'status': 'complete', 'complete_count': 1}},
+            'summary': {
+                'count': 1,
+                'pending_review_count': 0,
+                'review_status_counts': {'complete': 1},
+                'evaluation_coverage': {
+                    'status': 'complete',
+                    'complete_count': 1,
+                    'pending_count': 0,
+                    'computed_count': 1,
+                    'pending_maturity_count': 0,
+                    'insufficient_price_data_count': 0,
+                    'not_computed_count': 0,
+                    'status_reason_counts': {'computed': 1},
+                },
+                'horizon_coverage': [
+                    {
+                        'horizon_days': 1,
+                        'graded_count': 1,
+                        'pending_count': 0,
+                        'missing_count': 0,
+                        'computed_count': 1,
+                        'pending_maturity_count': 0,
+                        'insufficient_price_data_count': 0,
+                        'not_computed_count': 0,
+                        'status_reason_counts': {'computed': 1},
+                    },
+                    {
+                        'horizon_days': 5,
+                        'graded_count': 1,
+                        'pending_count': 0,
+                        'missing_count': 0,
+                        'computed_count': 1,
+                        'pending_maturity_count': 0,
+                        'insufficient_price_data_count': 0,
+                        'not_computed_count': 0,
+                        'status_reason_counts': {'computed': 1},
+                    },
+                ],
+                'insight_counts': {'buy_should_have_taken': 1},
+                'path_marker_counts': {'target_hit': 1},
+            },
             'items': [
                 {
                     'snapshot_id': 84,
@@ -748,6 +838,16 @@ class FakeSignalDeciderCalendarReviewService:
                     'received_at': '2026-04-23T07:45:00+00:00',
                     'review': {
                         'status': 'complete',
+                        'status_reason': 'computed',
+                        'coverage': {
+                            'horizon_days': 5,
+                            'status_reason': 'computed',
+                            'decision_market_date': kwargs['market_date'].isoformat(),
+                            'entry_trade_date': '2026-04-24',
+                            'observed_bars_count': 5,
+                            'required_bars_count': 5,
+                            'earliest_computable_date': '2026-04-30',
+                        },
                         'insight': {'code': 'buy_should_have_taken', 'priority': 'low'},
                         'quality_verdict': 'buy_should_have_taken',
                         'quality_reason': 'Target was touched and the stop-loss was never touched inside the review window.',
@@ -772,8 +872,24 @@ class FakeSignalDeciderCalendarReviewService:
                         'narrative_text': 'Buy held up on replay. Target was touched and the stop-loss was never touched inside the review window.',
                         'path_analysis': {'path_marker': 'target_hit', 'trigger_sequence': 'target_hit_first'},
                         'outcome_horizons': [
-                            {'horizon_days': 1, 'close_return_pct': 0.82, 'grade_label': 'good_buy'},
-                            {'horizon_days': 5, 'close_return_pct': 3.14, 'grade_label': 'good_buy'},
+                            {
+                                'horizon_days': 1,
+                                'close_return_pct': 0.82,
+                                'grade_label': 'good_buy',
+                                'status_reason': 'computed',
+                                'coverage': {'horizon_days': 1, 'status_reason': 'computed'},
+                            },
+                            {
+                                'horizon_days': 5,
+                                'close_return_pct': 3.14,
+                                'grade_label': 'good_buy',
+                                'status_reason': 'computed',
+                                'coverage': {
+                                    'horizon_days': 5,
+                                    'status_reason': 'computed',
+                                    'earliest_computable_date': '2026-04-30',
+                                },
+                            },
                         ],
                     },
                 }
@@ -1213,9 +1329,13 @@ class AgentContextRouteTests(unittest.TestCase):
         self.assertEqual(payload['summary']['reviewed_count'], 1)
         self.assertEqual(payload['summary']['source'], 'persisted_review_projection')
         self.assertEqual(payload['availability']['status'], 'ready')
+        self.assertEqual(payload['summary']['evaluation_coverage']['status_reason_counts'], {'computed': 1})
         self.assertEqual(payload['items'][0]['decision']['next_day_open_action'], 'buy')
+        self.assertEqual(payload['items'][0]['decision']['evaluation']['status_reason'], 'computed')
         self.assertEqual(payload['items'][0]['decision']['evaluation']['target_stop_result'], 'target_hit_first')
         self.assertEqual(payload['items'][0]['review']['quality_reason'], 'Target was touched and the stop-loss was never touched inside the review window.')
+        self.assertEqual(payload['items'][0]['review']['coverage']['status_reason'], 'computed')
+        self.assertEqual(payload['items'][0]['review']['outcome_horizons'][1]['status_reason'], 'computed')
         self.assertEqual(len(payload['items'][0]['review']['outcome_horizons']), 2)
 
     def test_feedback_review_route_falls_back_when_projection_is_empty(self):
@@ -1794,6 +1914,37 @@ class AgentContextRouteTests(unittest.TestCase):
         self.assertEqual(fake_service.compute_args['horizons'], [1, 5])
         self.assertTrue(fake_service.compute_args['force_recompute'])
         self.assertEqual(response.json()['summary']['evaluations_upserted'], 4)
+
+    def test_signal_decider_evaluations_route_preserves_coverage_metadata(self):
+        fake_service = FakeSignalDeciderLoopService()
+        original_service = routes_agent_context.signal_decider_loop_service
+        routes_agent_context.signal_decider_loop_service = fake_service
+        try:
+            client = TestClient(self.app)
+            response = client.get(
+                '/agent-context/signal-decider/evaluations',
+                params=[
+                    ('market_date', '2026-04-29'),
+                    ('symbol', '051910'),
+                    ('horizons', '5'),
+                    ('evaluation_version', 'signal_decider_eval_v1'),
+                    ('limit', '25'),
+                ],
+            )
+        finally:
+            routes_agent_context.signal_decider_loop_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(fake_service.evaluation_args['market_date'], date.fromisoformat('2026-04-29'))
+        self.assertEqual(fake_service.evaluation_args['symbol'], '051910')
+        self.assertEqual(fake_service.evaluation_args['horizons'], [5])
+        self.assertEqual(fake_service.evaluation_args['evaluation_version'], 'signal_decider_eval_v1')
+        self.assertEqual(fake_service.evaluation_args['limit'], 25)
+        payload = response.json()
+        self.assertEqual(payload['summary']['coverage']['pending_maturity_count'], 1)
+        self.assertEqual(payload['items'][0]['coverage'][0]['status_reason'], 'pending_maturity')
+        self.assertEqual(payload['items'][0]['coverage'][0]['earliest_computable_date'], '2026-05-08')
+        self.assertEqual(payload['items'][0]['evaluations'][0]['status_reason'], 'pending_maturity')
 
     def test_signal_decider_policy_candidate_generation_route_calls_service(self):
         fake_service = FakeSignalDeciderLoopService()
