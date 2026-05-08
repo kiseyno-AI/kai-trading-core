@@ -408,7 +408,7 @@ FACTOR_SUMMARY_NOT_ELIGIBLE_RAW_STATUSES = frozenset(
         'insufficient_fundamentals',
     }
 )
-FACTOR_SUMMARY_EXPLICIT_STATUS_FAMILIES = frozenset({'momentum', 'advanced_value', 'low_risk', 'beta', 'composite'})
+FACTOR_SUMMARY_SCORE_REQUIRED_FAMILIES = frozenset({'value', 'unified_value', 'quality'})
 
 
 def _compact_provenance_summary(metadata: dict[str, Any] | None) -> dict[str, Any]:
@@ -1561,11 +1561,15 @@ def _resolve_factor_summary_status(
         return FACTOR_SUMMARY_STATUS_MISSING_SOURCE_ROW
 
     source_status = _factor_summary_source_status(family=family, row=row)
+    score_field = FACTOR_SUMMARY_SCORE_FIELDS[family]
+    score_available = _to_float(row.get(score_field)) is not None if score_field else False
     if source_status in FACTOR_SUMMARY_NOT_COMPUTED_RAW_STATUSES:
         return FACTOR_SUMMARY_STATUS_NOT_COMPUTED_FOR_MARKET_DATE
     if source_status in FACTOR_SUMMARY_INSUFFICIENT_HISTORY_RAW_STATUSES:
         return FACTOR_SUMMARY_STATUS_INSUFFICIENT_HISTORY
-    if family in FACTOR_SUMMARY_EXPLICIT_STATUS_FAMILIES and source_status in FACTOR_SUMMARY_NOT_ELIGIBLE_RAW_STATUSES:
+    if source_status in FACTOR_SUMMARY_NOT_ELIGIBLE_RAW_STATUSES:
+        return FACTOR_SUMMARY_STATUS_NOT_ELIGIBLE
+    if family in FACTOR_SUMMARY_SCORE_REQUIRED_FAMILIES and not score_available:
         return FACTOR_SUMMARY_STATUS_NOT_ELIGIBLE
     return FACTOR_SUMMARY_STATUS_AVAILABLE
 

@@ -8,6 +8,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from app.agent_context.read_service import (
     AgentContextReadService,
     PERSISTED_FACTOR_FAMILIES,
+    _build_factor_summary_entry,
     _build_price_context,
     _build_recent_dart_events_context,
     _build_recent_disclosures_freshness_provenance,
@@ -1530,6 +1531,116 @@ class AgentContextReadServiceTests(unittest.TestCase):
         self.assertEqual(summary['composite']['status'], 'not_eligible')
         self.assertEqual(item['context_completeness']['factor_rows']['value']['row_status'], 'storage_unavailable')
         self.assertEqual(item['factor_summary']['signal_features']['status'], 'missing_source_row')
+
+    def test_build_factor_summary_entry_marks_unscored_value_families_not_eligible(self):
+        cases = (
+            (
+                'value',
+                {
+                    'market_date': '2026-04-08',
+                    'source': 'value_factor_v1',
+                    'feature_version': 'value_factor_v1',
+                    'value_status': 'missing_metric',
+                    'value_score': None,
+                    'captured_at': '2026-04-08T15:00:00+09:00',
+                },
+                'missing_metric',
+            ),
+            (
+                'unified_value',
+                {
+                    'market_date': '2026-04-08',
+                    'source': 'unified_value_v1',
+                    'feature_version': 'unified_value_v1',
+                    'unified_value_status': 'insufficient_components',
+                    'unified_value_score': None,
+                    'captured_at': '2026-04-08T15:00:00+09:00',
+                },
+                'insufficient_components',
+            ),
+            (
+                'quality',
+                {
+                    'market_date': '2026-04-08',
+                    'source': 'quality_v1',
+                    'feature_version': 'quality_v1',
+                    'quality_status': 'insufficient_components',
+                    'quality_score': None,
+                    'captured_at': '2026-04-08T15:00:00+09:00',
+                },
+                'insufficient_components',
+            ),
+        )
+
+        for family, row, expected_source_status in cases:
+            with self.subTest(family=family, source_status=expected_source_status):
+                entry = _build_factor_summary_entry(
+                    family=family,
+                    row=row,
+                    score_context={},
+                    freshness_provenance={'freshness_status': 'fresh'},
+                    current_storage_unavailable=False,
+                    prior_storage_unavailable=False,
+                )
+                self.assertEqual(entry['status'], 'not_eligible')
+                self.assertEqual(entry['source_status'], expected_source_status)
+                self.assertFalse(entry['score_available'])
+
+    def test_build_factor_summary_entry_preserves_available_for_scored_value_families(self):
+        cases = (
+            (
+                'value',
+                {
+                    'market_date': '2026-04-08',
+                    'source': 'value_factor_v1',
+                    'feature_version': 'value_factor_v1',
+                    'value_status': 'scored',
+                    'value_score': 0.91,
+                    'value_rank': 8,
+                    'value_percentile': 0.92,
+                    'captured_at': '2026-04-08T15:00:00+09:00',
+                },
+            ),
+            (
+                'unified_value',
+                {
+                    'market_date': '2026-04-08',
+                    'source': 'unified_value_v1',
+                    'feature_version': 'unified_value_v1',
+                    'unified_value_status': 'scored',
+                    'unified_value_score': 0.84,
+                    'unified_value_rank': 15,
+                    'unified_value_percentile': 0.79,
+                    'captured_at': '2026-04-08T15:00:00+09:00',
+                },
+            ),
+            (
+                'quality',
+                {
+                    'market_date': '2026-04-08',
+                    'source': 'quality_v1',
+                    'feature_version': 'quality_v1',
+                    'quality_status': 'scored_partial',
+                    'quality_score': 0.67,
+                    'quality_rank': 22,
+                    'quality_percentile': 0.58,
+                    'captured_at': '2026-04-08T15:00:00+09:00',
+                },
+            ),
+        )
+
+        for family, row in cases:
+            with self.subTest(family=family):
+                entry = _build_factor_summary_entry(
+                    family=family,
+                    row=row,
+                    score_context={},
+                    freshness_provenance={'freshness_status': 'fresh'},
+                    current_storage_unavailable=False,
+                    prior_storage_unavailable=False,
+                )
+                self.assertEqual(entry['status'], 'available')
+                self.assertTrue(entry['score_available'])
 
     @patch('app.agent_context.read_service.load_daily_market_relative_contexts', return_value=[])
     @patch('app.agent_context.read_service.load_daily_composite_factor_results', return_value=[])
