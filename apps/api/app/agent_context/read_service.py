@@ -2410,10 +2410,13 @@ def _build_decider_factor_score_quality_context(
         signal_features_summary.get('status'),
         freshness_provenance=_maybe_dict(signal_features_summary.get('provenance')),
     )
+    all_states = [*score_states, signal_features_state]
     status = (
         DECIDER_QUALITY_STATUS_AVAILABLE
-        if all(state == DECIDER_QUALITY_STATUS_AVAILABLE for state in score_states)
-        and signal_features_state == DECIDER_QUALITY_STATUS_AVAILABLE
+        if all(state == DECIDER_QUALITY_STATUS_AVAILABLE for state in all_states)
+        else DECIDER_QUALITY_STATUS_PROVIDER_ERROR
+        if DECIDER_QUALITY_STATUS_PROVIDER_ERROR in all_states
+        and DECIDER_QUALITY_STATUS_AVAILABLE not in all_states
         else DECIDER_QUALITY_STATUS_PARTIAL
         if any(state == DECIDER_QUALITY_STATUS_AVAILABLE for state in score_states)
         or signal_features_state == DECIDER_QUALITY_STATUS_AVAILABLE

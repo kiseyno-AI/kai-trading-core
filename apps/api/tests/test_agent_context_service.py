@@ -9,11 +9,12 @@ from app.agent_context.read_service import (
     AgentContextReadService,
     PERSISTED_FACTOR_FAMILIES,
     _build_compact_liquidity_context,
+    _build_decider_data_quality_context,
     _build_factor_summary_entry,
     _build_price_context,
-    _load_latest_symbol_day_block_history,
     _build_recent_dart_events_context,
     _build_recent_disclosures_freshness_provenance,
+    _load_latest_symbol_day_block_history,
 )
 
 EMPTY_LATEST_PRIOR_ROWS = {
@@ -1785,6 +1786,105 @@ class AgentContextReadServiceTests(unittest.TestCase):
         self.assertEqual(item['liquidity_context']['ranking']['reason'], 'low_risk_liquidity_fields_missing')
         self.assertEqual(item['context_completeness']['factor_rows']['value']['row_status'], 'storage_unavailable')
         self.assertEqual(item['factor_summary']['signal_features']['status'], 'missing_source_row')
+
+    def test_build_decider_data_quality_context_marks_factor_score_provider_error_for_factor_storage_failure(self):
+        result = _build_decider_data_quality_context(
+            market_date=date(2026, 4, 8),
+            scores={
+                'unified_value': {
+                    'status': 'unavailable',
+                    'freshness_provenance': {'provenance_status': 'storage_unavailable'},
+                },
+                'quality': {'status': 'unavailable'},
+                'momentum': {'status': 'unavailable'},
+            },
+            factor_summary={
+                'signal_features': {'status': 'missing_source_row'},
+            },
+            liquidity_context={},
+            quote_context=None,
+            quote_context_provenance={},
+            intraday_execution_context=None,
+            intraday_execution_provenance={},
+            intraday_execution_completeness={'status': 'unavailable'},
+            fundamentals={},
+            fundamentals_provenance={},
+            recent_dart_events={},
+            recent_disclosures_provenance={},
+            recent_external_news={},
+            recent_external_news_provenance={},
+            investor_flow_context=None,
+            investor_flow_provenance={},
+            short_selling_context=None,
+            short_selling_provenance={},
+            market_relative_context=None,
+            market_relative_provenance=None,
+            sector_peer_context=None,
+            sector_peer_provenance=None,
+            market_breadth_context=None,
+            market_breadth_provenance=None,
+            technical_snapshot=None,
+            action_summary=None,
+            unified_value_row=None,
+            advanced_value_row=None,
+        )
+
+        factor_score_block = result['blocks']['factor_score_coverage']
+        self.assertEqual(result['status'], 'provider_error')
+        self.assertEqual(factor_score_block['status'], 'provider_error')
+        self.assertEqual(factor_score_block['required_scores']['unified_value']['status'], 'provider_error')
+        self.assertEqual(result['block_status_counts']['provider_error'], 1)
+        self.assertEqual(result['block_status_counts']['unavailable'], 7)
+
+    def test_build_decider_data_quality_context_marks_factor_score_provider_error_for_signal_feature_storage_failure(self):
+        result = _build_decider_data_quality_context(
+            market_date=date(2026, 4, 8),
+            scores={
+                'unified_value': {'status': 'unavailable'},
+                'quality': {'status': 'unavailable'},
+                'momentum': {'status': 'unavailable'},
+            },
+            factor_summary={
+                'signal_features': {
+                    'status': 'storage_unavailable',
+                    'provenance': {'provenance_status': 'storage_unavailable'},
+                }
+            },
+            liquidity_context={},
+            quote_context=None,
+            quote_context_provenance={},
+            intraday_execution_context=None,
+            intraday_execution_provenance={},
+            intraday_execution_completeness={'status': 'unavailable'},
+            fundamentals={},
+            fundamentals_provenance={},
+            recent_dart_events={},
+            recent_disclosures_provenance={},
+            recent_external_news={},
+            recent_external_news_provenance={},
+            investor_flow_context=None,
+            investor_flow_provenance={},
+            short_selling_context=None,
+            short_selling_provenance={},
+            market_relative_context=None,
+            market_relative_provenance=None,
+            sector_peer_context=None,
+            sector_peer_provenance=None,
+            market_breadth_context=None,
+            market_breadth_provenance=None,
+            technical_snapshot=None,
+            action_summary=None,
+            unified_value_row=None,
+            advanced_value_row=None,
+        )
+
+        factor_score_block = result['blocks']['factor_score_coverage']
+        self.assertEqual(result['status'], 'provider_error')
+        self.assertEqual(factor_score_block['status'], 'provider_error')
+        self.assertEqual(factor_score_block['signal_features']['status'], 'provider_error')
+        self.assertEqual(factor_score_block['signal_features']['source_status'], 'storage_unavailable')
+        self.assertEqual(result['block_status_counts']['provider_error'], 1)
+        self.assertEqual(result['block_status_counts']['unavailable'], 7)
 
     def test_load_latest_symbol_day_block_history_only_requests_low_risk_liquidity_fields(self):
         with patch('app.agent_context.read_service._load_latest_prior_rows_for_model', return_value={}) as load_prior_rows_mock:
