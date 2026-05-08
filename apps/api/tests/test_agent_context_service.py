@@ -11,6 +11,7 @@ from app.agent_context.read_service import (
     _build_compact_liquidity_context,
     _build_factor_summary_entry,
     _build_price_context,
+    _load_latest_symbol_day_block_history,
     _build_recent_dart_events_context,
     _build_recent_disclosures_freshness_provenance,
 )
@@ -1363,6 +1364,18 @@ class AgentContextReadServiceTests(unittest.TestCase):
                         }
                     }
                     if family == 'unified_value'
+                    else {
+                        '005930': {
+                            'market_date': '2026-04-07',
+                            'captured_at': '2026-04-07T15:00:00+09:00',
+                            'source': 'low_risk_v1',
+                            'avg_trading_value_20d': 6400000000.0,
+                            'liquidity_rank': 17,
+                            'liquidity_percentile': 0.82,
+                            'passes_liquidity_floor': True,
+                        }
+                    }
+                    if family == 'low_risk'
                     else {}
                 )
                 for family in PERSISTED_FACTOR_FAMILIES
@@ -1494,6 +1507,16 @@ class AgentContextReadServiceTests(unittest.TestCase):
             item['liquidity_context']['turnover']['reason'],
             'latest_price_context_before_requested_market_date',
         )
+        self.assertEqual(item['liquidity_context']['ranking']['status'], 'stale')
+        self.assertEqual(
+            item['liquidity_context']['ranking']['reason'],
+            'latest_prior_low_risk_liquidity_row_available',
+        )
+        self.assertEqual(item['liquidity_context']['ranking']['as_of_market_date'], '2026-04-07')
+        self.assertEqual(item['liquidity_context']['ranking']['avg_trading_value_20d'], 6400000000.0)
+        self.assertEqual(item['liquidity_context']['ranking']['liquidity_rank'], 17)
+        self.assertEqual(item['liquidity_context']['ranking']['liquidity_percentile'], 0.82)
+        self.assertTrue(item['liquidity_context']['ranking']['passes_liquidity_floor'])
         self.assertIsNone(item['signal_features'])
         self.assertEqual(item['context_provenance']['signal_features']['freshness_status'], 'stale')
         self.assertEqual(item['context_provenance']['signal_features']['latest_available_market_date'], '2026-04-07')
@@ -1723,6 +1746,31 @@ class AgentContextReadServiceTests(unittest.TestCase):
         self.assertEqual(item['liquidity_context']['ranking']['reason'], 'low_risk_liquidity_fields_missing')
         self.assertEqual(item['context_completeness']['factor_rows']['value']['row_status'], 'storage_unavailable')
         self.assertEqual(item['factor_summary']['signal_features']['status'], 'missing_source_row')
+
+    def test_load_latest_symbol_day_block_history_only_requests_low_risk_liquidity_fields(self):
+        with patch('app.agent_context.read_service._load_latest_prior_rows_for_model', return_value={}) as load_prior_rows_mock:
+            _load_latest_symbol_day_block_history(
+                market_date=date(2026, 4, 8),
+                symbols=['005930'],
+            )
+
+        self.assertEqual(load_prior_rows_mock.call_count, len(PERSISTED_FACTOR_FAMILIES) + 1)
+        extra_fields_by_model = {
+            call.kwargs['model'].__name__: call.kwargs.get('extra_fields', ())
+            for call in load_prior_rows_mock.call_args_list
+        }
+        self.assertEqual(
+            extra_fields_by_model['DailyLowRiskFactorResult'],
+            (
+                'avg_trading_value_20d',
+                'liquidity_rank',
+                'liquidity_percentile',
+                'passes_liquidity_floor',
+            ),
+        )
+        for model_name, extra_fields in extra_fields_by_model.items():
+            if model_name != 'DailyLowRiskFactorResult':
+                self.assertEqual(extra_fields, ())
 
     def test_build_factor_summary_entry_marks_unscored_value_families_not_eligible(self):
         cases = (

@@ -331,6 +331,14 @@ FACTOR_ROW_MODELS: dict[str, type[Any]] = {
     'beta': DailyBetaFactorResult,
     'composite': DailyCompositeFactorResult,
 }
+PRIOR_FACTOR_ROW_EXTRA_FIELDS: dict[str, tuple[str, ...]] = {
+    'low_risk': (
+        'avg_trading_value_20d',
+        'liquidity_rank',
+        'liquidity_percentile',
+        'passes_liquidity_floor',
+    ),
+}
 FACTOR_ROW_SOURCE_PROVIDERS: dict[str, str] = {
     'value': 'internal_factor_pipeline',
     'unified_value': 'internal_factor_pipeline',
@@ -761,6 +769,14 @@ def _to_float(value: Any) -> float | None:
     return None
 
 
+def _serialize_prior_row_value(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
+    return str(value)
+
+
 def _maybe_dict(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
         return value
@@ -1161,18 +1177,26 @@ def _load_latest_prior_rows_for_model(
     model: type[Any],
     market_date: date,
     symbols: Sequence[str],
+    extra_fields: Sequence[str] = (),
 ) -> dict[str, dict[str, Any]]:
     normalized_symbols = list(dict.fromkeys(symbols))
     if not normalized_symbols:
         return {}
+    normalized_extra_fields = tuple(dict.fromkeys(extra_fields))
+
+    select_columns = [
+        Symbol.symbol.label('symbol'),
+        model.market_date.label('market_date'),
+        model.captured_at.label('captured_at'),
+        model.source.label('source'),
+    ]
+    for field in normalized_extra_fields:
+        select_columns.append(getattr(model, field).label(field))
 
     with session_scope() as session:
         ranked = (
             select(
-                Symbol.symbol.label('symbol'),
-                model.market_date.label('market_date'),
-                model.captured_at.label('captured_at'),
-                model.source.label('source'),
+                *select_columns,
                 func.row_number()
                 .over(
                     partition_by=model.symbol_id,
@@ -1190,11 +1214,17 @@ def _load_latest_prior_rows_for_model(
         rows = session.execute(select(ranked).where(ranked.c.row_rank == 1)).all()
 
     return {
-        row.symbol: {
-            'market_date': row.market_date.isoformat() if row.market_date else None,
-            'captured_at': row.captured_at.isoformat() if row.captured_at else None,
-            'source': row.source,
-        }
+        row.symbol: (
+            {
+                'market_date': row.market_date.isoformat() if row.market_date else None,
+                'captured_at': row.captured_at.isoformat() if row.captured_at else None,
+                'source': row.source,
+            }
+            | {
+                field: _serialize_prior_row_value(getattr(row, field, None))
+                for field in normalized_extra_fields
+            }
+        )
         for row in rows
     }
 
@@ -1212,6 +1242,7 @@ def _load_latest_symbol_day_block_history(
                 model=model,
                 market_date=market_date,
                 symbols=symbols,
+                extra_fields=PRIOR_FACTOR_ROW_EXTRA_FIELDS.get(family, ()),
             )
             factor_storage_unavailable[family] = False
         except SQLAlchemyError:
