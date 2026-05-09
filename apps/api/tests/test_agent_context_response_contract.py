@@ -219,6 +219,74 @@ class AgentContextResponseContractTests(unittest.TestCase):
         self.assertNotIn('news', result['wait_reason']['summary'].lower())
         self.assertEqual(result['details']['decision_support']['wait_reason']['code'], 'stale_quote_orderbook')
 
+    def test_normalize_signal_decider_response_ignores_positive_liquidity_support_when_trend_is_actual_blocker(self):
+        output_text = json.dumps(
+            {
+                'role': 'signal-decider',
+                'agent_name': 'signal-decider',
+                'symbol': '005930',
+                'market_date': '2026-04-23',
+                'preferred_action': 'wait',
+                'next_day_open_action': 'wait',
+                'entry_price_basis': 'next_open',
+                'thesis_summary': 'Need more confirmation before entry.',
+                'supporting_evidence': ['Liquidity is strong enough for execution.'],
+                'decision_risks': ['Weak trend remains the main blocker.'],
+                'invalidation_conditions': ['Skip the setup if trend confirmation keeps fading.'],
+                'data_quality_warnings': [],
+                'specialist_disagreement': [],
+                'improvement_notes': [],
+            }
+        )
+
+        result = normalize_agent_response(
+            role='signal-decider',
+            output_text=output_text,
+            raw_response={'id': 'resp-wait-strong-liquidity'},
+            market_date='2026-04-23',
+            symbol='005930',
+            agent_name='signal-decider',
+        )
+
+        self.assertEqual(result['wait_reason']['code'], 'weak_trend_relative_strength')
+        self.assertEqual(result['wait_reason']['summary'], 'Weak trend remains the main blocker.')
+        self.assertNotEqual(result['wait_reason']['code'], 'insufficient_liquidity')
+
+    def test_normalize_signal_decider_response_keeps_negative_liquidity_gaps_mapped_to_liquidity_wait_reason(self):
+        output_text = json.dumps(
+            {
+                'role': 'signal-decider',
+                'agent_name': 'signal-decider',
+                'symbol': '005930',
+                'market_date': '2026-04-23',
+                'preferred_action': 'wait',
+                'next_day_open_action': 'wait',
+                'entry_price_basis': 'next_open',
+                'thesis_summary': 'Need more confirmation before entry.',
+                'supporting_evidence': ['Price is still above support.'],
+                'decision_risks': ['Turnover is too low and spread is too wide for reliable execution.'],
+                'invalidation_conditions': ['Skip the setup if execution quality does not improve.'],
+                'data_quality_warnings': [],
+                'specialist_disagreement': [],
+                'improvement_notes': [],
+            }
+        )
+
+        result = normalize_agent_response(
+            role='signal-decider',
+            output_text=output_text,
+            raw_response={'id': 'resp-wait-liquidity-gap'},
+            market_date='2026-04-23',
+            symbol='005930',
+            agent_name='signal-decider',
+        )
+
+        self.assertEqual(result['wait_reason']['code'], 'insufficient_liquidity')
+        self.assertEqual(
+            result['wait_reason']['summary'],
+            'Turnover is too low and spread is too wide for reliable execution.',
+        )
+
     def test_normalize_signal_decider_response_flags_generic_wait_reason_without_specific_blocker(self):
         output_text = json.dumps(
             {

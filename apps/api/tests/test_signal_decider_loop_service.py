@@ -786,6 +786,34 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
             'stale_quote_orderbook',
         )
 
+    def test_prepare_snapshot_persistence_item_uses_actual_blocker_when_liquidity_support_is_positive(self):
+        service = SignalDeciderLoopService(repository=FakeSignalDeciderLoopRepository([]))
+        snapshot_item = service.prepare_snapshot_persistence_item(
+            feedback_id=14,
+            market_date='2026-04-23',
+            symbol='005930',
+            agent_name='signal-decider',
+            agent_version='openclaw-v1',
+            run_id='signal-run-14',
+            summary_payload={'model': 'openclaw/signal-decider'},
+            feedback_payload={
+                'preferred_action': 'wait',
+                'next_day_open_action': 'wait',
+                'thesis_summary': 'Need more confirmation before entry.',
+                'supporting_evidence': ['Liquidity is strong enough for execution.'],
+                'decision_risks': ['Weak trend remains the main blocker.'],
+                'traceability': {'symbol': '005930', 'market_date': '2026-04-23'},
+            },
+            context_payload={'symbol_day_context': {}, 'scores': {}},
+            received_at='2026-04-23T06:00:00+00:00',
+        )
+
+        self.assertEqual(snapshot_item['response_payload']['wait_reason']['code'], 'weak_trend_relative_strength')
+        self.assertEqual(
+            snapshot_item['traceability_payload']['final_action_rationale']['wait_reason']['code'],
+            'weak_trend_relative_strength',
+        )
+
     def test_list_decisions_preserves_multiple_snapshots_for_one_symbol_date(self):
         repository = FakeSignalDeciderLoopRepository(
             [

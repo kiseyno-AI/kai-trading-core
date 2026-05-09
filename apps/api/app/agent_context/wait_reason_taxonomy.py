@@ -14,6 +14,22 @@ WAIT_REASON_BUCKET_DATA_GAP = 'data_gap'
 WAIT_REASON_ISSUE_MISSING = 'wait_reason_missing_for_wait_action'
 WAIT_REASON_ISSUE_GENERIC = 'generic_wait_reason_missing_specific_blocker'
 
+INSUFFICIENT_LIQUIDITY_PATTERNS = (
+    re.compile(r'\billiquid\b'),
+    re.compile(r'\b(?:low|poor|weak|thin|insufficient)\s+(?:liquidity|turnover|volume)\b'),
+    re.compile(r'\b(?:liquidity|turnover)\b(?:\s+\w+){0,3}\s+(?:too\s+)?(?:low|poor|weak|thin|insufficient)\b'),
+    re.compile(r'\b(?:high|elevated|large|excessive)\s+slippage\b'),
+    re.compile(r'\bslippage\b(?:\s+\w+){0,3}\s+(?:too\s+)?(?:high|elevated|large|excessive)\b'),
+    re.compile(r'\b(?:wide|too\s+wide)\s+spread\b'),
+    re.compile(r'\bspread\b(?:\s+\w+){0,3}\s+(?:too\s+)?wide\b'),
+    re.compile(r'\b(?:execution\s+)?liquidity gap\b'),
+    re.compile(r'유동성 부족'),
+    re.compile(r'유동성이\s*(?:약|낮|부족)'),
+    re.compile(r'거래대금(?:이)?\s*(?:약|낮|부족)'),
+    re.compile(r'슬리피지(?:가)?\s*(?:크|높)'),
+    re.compile(r'호가 공백'),
+)
+
 
 @dataclass(frozen=True)
 class WaitReasonDefinition:
@@ -80,16 +96,27 @@ WAIT_REASON_DEFINITIONS: tuple[WaitReasonDefinition, ...] = (
         default_summary='Liquidity and turnover are too weak for reliable execution.',
         keywords=(
             'illiquid',
-            'liquidity',
-            'turnover',
+            'low liquidity',
+            'poor liquidity',
+            'weak liquidity',
+            'thin liquidity',
+            'insufficient liquidity',
+            'low turnover',
+            'poor turnover',
+            'weak turnover',
+            'thin turnover',
+            'insufficient turnover',
             'thin volume',
             'low volume',
-            'slippage',
+            'high slippage',
+            'slippage is too high',
             'spread is too wide',
             'wide spread',
-            '거래대금',
-            '유동성',
-            '슬리피지',
+            'liquidity gap',
+            'execution liquidity gap',
+            '거래대금 부족',
+            '유동성 부족',
+            '슬리피지가 크다',
             '호가 공백',
         ),
         aliases=('low_liquidity', 'liquidity_turnover'),
@@ -399,7 +426,6 @@ def _collect_candidate_texts(payload: dict[str, Any] | None) -> list[str]:
         'invalidation_conditions',
         'data_quality_warnings',
         'risk_flags',
-        'supporting_evidence',
     ):
         value = payload.get(list_key)
         if isinstance(value, list):
@@ -425,12 +451,19 @@ def _collect_candidate_texts(payload: dict[str, Any] | None) -> list[str]:
     return _dedupe_texts(texts)
 
 
+def _text_matches_definition(*, definition: WaitReasonDefinition, text: str) -> bool:
+    normalized = _normalize_text(text)
+    if definition.code == 'insufficient_liquidity':
+        return any(pattern.search(normalized) for pattern in INSUFFICIENT_LIQUIDITY_PATTERNS)
+    return any(keyword in normalized for keyword in definition.keywords)
+
+
 def _infer_wait_reason_code(texts: list[str]) -> str | None:
     normalized_texts = [_normalize_text(text) for text in texts if str(text or '').strip()]
     for code in WAIT_REASON_PRIORITY:
         definition = WAIT_REASON_DEFINITIONS_BY_CODE[code]
         for text in normalized_texts:
-            if any(keyword in text for keyword in definition.keywords):
+            if _text_matches_definition(definition=definition, text=text):
                 return code
     return None
 
@@ -467,7 +500,7 @@ def derive_wait_reason(
                 text
                 for text in candidate_texts
                 if not _contains_generic_wait_phrase(text)
-                and any(keyword in _normalize_text(text) for keyword in definition.keywords)
+                and _text_matches_definition(definition=definition, text=text)
             ),
             None,
         )
