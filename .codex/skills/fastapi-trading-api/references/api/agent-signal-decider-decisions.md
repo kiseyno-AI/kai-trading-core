@@ -1,7 +1,7 @@
 # GET /agent-context/signal-decider/decisions
 
 ## Summary
-Searches immutable persisted `signal-decider` decision snapshots over one market date or a bounded date range. The route keeps the compact snapshot payload, adds a stable `explanation` block so operators can answer "why did this become buy/wait/reject?" without reading raw prompt text, and exposes `evaluation_summary` for verdict-aware list views.
+Searches immutable persisted `signal-decider` decision snapshots over one market date or a bounded date range. The route keeps the compact snapshot payload, exposes a normalized top-level `wait_reason` for wait decisions, adds a stable `explanation` block so operators can answer "why did this become buy/wait/reject?" without reading raw prompt text, and exposes `evaluation_summary` for verdict-aware list views.
 
 ## Example request
 ```http
@@ -39,13 +39,37 @@ GET /agent-context/signal-decider/decisions?market_date_from=2026-04-20&market_d
       "policy_version": "signal_decider_policy_v1",
       "decision": {
         "action": "wait",
+        "wait_reason": {
+          "code": "stale_quote_orderbook",
+          "label": "Stale quote/orderbook freshness",
+          "bucket": "data_gap",
+          "blocking_by_default": true,
+          "summary": "Realtime orderbook freshness is stale.",
+          "source": "inferred"
+        },
         "entry_price_basis": "next_open",
         "target_price": null,
         "expected_return_pct": 4.0,
         "stop_loss_price": null
       },
-      "summary": "Momentum is constructive, but confirmation is incomplete.",
+      "wait_reason": {
+        "code": "stale_quote_orderbook",
+        "label": "Stale quote/orderbook freshness",
+        "bucket": "data_gap",
+        "blocking_by_default": true,
+        "summary": "Realtime orderbook freshness is stale.",
+        "source": "inferred"
+      },
+      "summary": "Realtime orderbook freshness is stale, so the next-open entry is deferred.",
       "explanation": {
+        "wait_reason": {
+          "code": "stale_quote_orderbook",
+          "label": "Stale quote/orderbook freshness",
+          "bucket": "data_gap",
+          "blocking_by_default": true,
+          "summary": "Realtime orderbook freshness is stale.",
+          "source": "inferred"
+        },
         "supporting_evidence": ["Breadth improved into the close."],
         "decision_risks": ["Leadership remained narrow."],
         "feature_flags": [
@@ -75,7 +99,7 @@ GET /agent-context/signal-decider/decisions?market_date_from=2026-04-20&market_d
 # GET /agent-context/signal-decider/decisions/{snapshot_id}
 
 ## Summary
-Reads one immutable `signal-decider` decision snapshot by `snapshot_id`, including the stable explanation block, frozen request/response payloads, upstream references, synthetic realized outcomes, separate actual execution outcomes, and versioned evaluations in one place. The frozen request payload now preserves both the structured factor `scores` block and the compact `market_context` block exactly as the decider saw them, and the detail payload also exposes `market_context` directly for operator review.
+Reads one immutable `signal-decider` decision snapshot by `snapshot_id`, including the stable normalized `wait_reason`, frozen request/response payloads, upstream references, synthetic realized outcomes, separate actual execution outcomes, and versioned evaluations in one place. The frozen request payload now preserves both the structured factor `scores` block and the compact `market_context` block exactly as the decider saw them, and the detail payload also exposes `market_context` directly for operator review.
 
 ## Example request
 ```http
@@ -88,9 +112,25 @@ GET /agent-context/signal-decider/decisions/84?horizons=1&horizons=5&evaluation_
   "item": {
     "snapshot_id": 84,
     "symbol": "005930",
+    "wait_reason": {
+      "code": "stale_quote_orderbook",
+      "label": "Stale quote/orderbook freshness",
+      "bucket": "data_gap",
+      "blocking_by_default": true,
+      "summary": "Realtime orderbook freshness is stale.",
+      "source": "inferred"
+    },
     "explanation": {
       "decision_action": "wait",
-      "summary": "Momentum is constructive, but confirmation is incomplete.",
+      "summary": "Realtime orderbook freshness is stale, so the next-open entry is deferred.",
+      "wait_reason": {
+        "code": "stale_quote_orderbook",
+        "label": "Stale quote/orderbook freshness",
+        "bucket": "data_gap",
+        "blocking_by_default": true,
+        "summary": "Realtime orderbook freshness is stale.",
+        "source": "inferred"
+      },
       "feature_flags": [
         {"key": "technical.breakout_20d", "value": "true"}
       ]

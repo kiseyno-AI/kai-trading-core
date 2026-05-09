@@ -130,6 +130,7 @@ DISPATCH_SPECS: tuple[AgentDispatchSpec, ...] = (
             'Synthesize the specialist summaries, market context, flow context, momentum, volume, price-action, and data-quality inputs into short-term tactical decision support only, '
             'classifying each symbol as scalp_buy_candidate, watch_for_trigger, avoid_chase, wait, or reject for a 1-2 trading day horizon. '
             'Prioritize liquidity, fresh participation, clean trigger/invalidation levels, and chase-risk control. '
+            'Every watch_for_trigger, avoid_chase, or wait decision must name one primary wait_reason taxonomy blocker plus a concise actionable explanation. '
             'Treat missing news/disclosure detail and missing detailed quarterly/cash-flow detail as auxiliary by default, not standalone blockers, unless the setup explicitly depends on them. '
             'Write all operator-facing feedback in Korean while staying JSON-only, and avoid execution logic, leverage, sizing, or fake precision.'
         ),
@@ -141,6 +142,7 @@ DISPATCH_SPECS: tuple[AgentDispatchSpec, ...] = (
             'Synthesize the three specialist summaries into conservative next-trading-day decision support only, '
             'choosing buy, wait, or reject while surfacing evidence, disagreement, invalidation, data-quality warnings, '
             'and explicit realistic target and stop-loss levels for every symbol. '
+            'Every wait decision must name one primary wait_reason taxonomy blocker plus a concise actionable explanation. '
             'Treat missing news/disclosure detail and missing detailed quarterly/cash-flow detail as auxiliary by default, not standalone blockers, unless the thesis explicitly depends on them. '
             'Write all operator-facing feedback in Korean while staying JSON-only, and avoid execution logic, leverage, sizing, or fake precision.'
         ),
@@ -605,6 +607,7 @@ class OpenClawAgentClient:
                 "- One-symbol requests still require the same batch envelope with exactly one item; never collapse the response to a single feedback object.\n"
                 "- All operator-facing natural-language fields must be written in Korean, while the overall output remains raw JSON only.\n"
                 "- Every signal-decider item must include explicit target_price and stop_loss_price values; do not leave them unspecified unless the payload makes a justified level impossible, and in that rare case explain the limitation in data_quality_warnings.\n"
+                "- Every wait-like conservative action must include a wait_reason object that names the primary normalized blocker instead of vague missing-information text.\n"
                 "- If context is weak, missing, conflicting, or truncated, emit a complete conservative wait or reject item instead of prose, placeholders, omissions, or malformed JSON.\n"
                 "- Self-check before final answer: JSON parses; top-level object has items; item count matches assigned symbols; assigned symbols are exact and unique; no assigned symbol is missing; no unexpected symbol appears; required feedback fields exist.\n"
                 "- Immediately before sending, validate the final raw JSON text again and fix any extra or missing closing braces/brackets so the response begins with {, ends with }, and parses successfully with no trailing prose.\n"
@@ -617,6 +620,10 @@ class OpenClawAgentClient:
                 'symbol': example_symbol,
                 'market_date': market_date.isoformat(),
                 'tactical_action': 'watch_for_trigger',
+                'wait_reason': {
+                    'code': 'unsuitable_execution_timing',
+                    'summary': '돌파 트리거 확인 전이라 진입 시점이 아직 이릅니다.',
+                },
                 'trigger_price': 10300,
                 'chase_limit_price': 10500,
                 'target_price': 10900,
@@ -656,6 +663,10 @@ class OpenClawAgentClient:
                 'market_date': market_date.isoformat(),
                 'preferred_action': 'wait',
                 'next_day_open_action': 'wait',
+                'wait_reason': {
+                    'code': 'stale_quote_orderbook',
+                    'summary': '실시간 호가 신선도가 떨어져 진입 가격 신뢰가 부족합니다.',
+                },
                 'entry_price_basis': 'next_open',
                 'target_price': 10500,
                 'expected_return_pct': None,

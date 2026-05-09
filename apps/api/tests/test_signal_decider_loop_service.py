@@ -40,6 +40,12 @@ def _feedback_row(
     stop_loss_price: int | None = None,
     expected_return_pct: float = 4.0,
     market_context: dict[str, object] | None = None,
+    thesis_summary: str | None = None,
+    supporting_evidence: list[str] | None = None,
+    decision_risks: list[str] | None = None,
+    invalidation_conditions: list[str] | None = None,
+    data_quality_warnings: list[str] | None = None,
+    wait_reason: dict[str, object] | None = None,
 ) -> SimpleNamespace:
     resolved_target_price = 105 if action == 'buy' and target_price is None else target_price
     resolved_stop_loss_price = 96 if action == 'buy' and stop_loss_price is None else stop_loss_price
@@ -121,17 +127,18 @@ def _feedback_row(
         'preferred_action': action,
         'next_day_open_action': action,
         'entry_price_basis': 'next_open',
+        'wait_reason': wait_reason,
         'target_price': resolved_target_price,
         'expected_return_pct': expected_return_pct,
         'stop_loss_price': resolved_stop_loss_price,
         'suggested_holding_period': '3-10 trading days',
         'confidence_score_10': 7,
         'conviction_score_10': 6,
-        'thesis_summary': f'{action} decision for {symbol}',
-        'supporting_evidence': ['Breadth improved into the close.'],
-        'decision_risks': ['Leadership remained narrow.'],
-        'invalidation_conditions': ['이탈 종가가 반복되면 보수적으로 본다.'],
-        'data_quality_warnings': [],
+        'thesis_summary': thesis_summary or f'{action} decision for {symbol}',
+        'supporting_evidence': supporting_evidence or ['Breadth improved into the close.'],
+        'decision_risks': decision_risks or ['Leadership remained narrow.'],
+        'invalidation_conditions': invalidation_conditions or ['이탈 종가가 반복되면 보수적으로 본다.'],
+        'data_quality_warnings': data_quality_warnings or [],
         'specialist_disagreement': [],
         'traceability': {'agent_name': 'signal-decider', 'symbol': symbol, 'market_date': market_date},
     }
@@ -147,7 +154,11 @@ def _feedback_row(
         'upstream_references': {},
         'gate_checks': {'required_upstream_roles': [], 'available_upstream_roles': []},
         'factor_contributions': {'feature_flags': [{'key': 'technical.breakout_20d', 'value': str(breakout_20d).lower()}]},
-        'final_action_rationale': {'decision_action': action, 'summary': f'{action} decision for {symbol}'},
+        'final_action_rationale': {
+            'decision_action': action,
+            'summary': thesis_summary or f'{action} decision for {symbol}',
+            'wait_reason': wait_reason,
+        },
         'raw_traceability': response_payload['traceability'],
     }
     snapshot_key = snapshot_id or feedback_id
@@ -171,11 +182,11 @@ def _feedback_row(
         suggested_holding_period='3-10 trading days',
         confidence_score_10=7,
         conviction_score_10=6,
-        thesis_summary=f'{action} decision for {symbol}',
-        supporting_evidence_payload=['Breadth improved into the close.'],
-        decision_risks_payload=['Leadership remained narrow.'],
-        invalidation_conditions_payload=['이탈 종가가 반복되면 보수적으로 본다.'],
-        data_quality_warnings_payload=[],
+        thesis_summary=thesis_summary or f'{action} decision for {symbol}',
+        supporting_evidence_payload=supporting_evidence or ['Breadth improved into the close.'],
+        decision_risks_payload=decision_risks or ['Leadership remained narrow.'],
+        invalidation_conditions_payload=invalidation_conditions or ['이탈 종가가 반복되면 보수적으로 본다.'],
+        data_quality_warnings_payload=data_quality_warnings or [],
         specialist_disagreement_payload=[],
         traceability_payload=traceability_payload,
         input_feature_snapshot_payload={
@@ -742,6 +753,38 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
         self.assertEqual(snapshot_item['traceability_payload']['schema_version'], 'short_term_decider_trace_v1')
         self.assertEqual(snapshot_item['traceability_payload']['tactical_context']['trigger_price'], 81200)
         self.assertEqual(snapshot_item['traceability_payload']['upstream_references']['technical-summarizer']['feedback_id'], 8)
+
+    def test_prepare_snapshot_persistence_item_infers_specific_wait_reason_from_core_blocker(self):
+        service = SignalDeciderLoopService(repository=FakeSignalDeciderLoopRepository([]))
+        snapshot_item = service.prepare_snapshot_persistence_item(
+            feedback_id=13,
+            market_date='2026-04-23',
+            symbol='005930',
+            agent_name='signal-decider',
+            agent_version='openclaw-v1',
+            run_id='signal-run-13',
+            summary_payload={'model': 'openclaw/signal-decider'},
+            feedback_payload={
+                'preferred_action': 'wait',
+                'next_day_open_action': 'wait',
+                'thesis_summary': 'Need more data before entry.',
+                'supporting_evidence': ['Momentum is still constructive.'],
+                'decision_risks': ['Bid/ask spread is stale into the open.'],
+                'data_quality_warnings': [
+                    'No recent news/disclosures were captured.',
+                    'Realtime orderbook freshness is stale.',
+                ],
+                'traceability': {'symbol': '005930', 'market_date': '2026-04-23'},
+            },
+            context_payload={'symbol_day_context': {}, 'scores': {}},
+            received_at='2026-04-23T06:00:00+00:00',
+        )
+
+        self.assertEqual(snapshot_item['response_payload']['wait_reason']['code'], 'stale_quote_orderbook')
+        self.assertEqual(
+            snapshot_item['traceability_payload']['final_action_rationale']['wait_reason']['code'],
+            'stale_quote_orderbook',
+        )
 
     def test_list_decisions_preserves_multiple_snapshots_for_one_symbol_date(self):
         repository = FakeSignalDeciderLoopRepository(
@@ -1374,6 +1417,36 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
         self.assertEqual(result['item']['request_payload']['market_context']['flows']['foreign']['value'], 746146)
         self.assertEqual(result['item']['outcomes'][0]['horizon_days'], 5)
         self.assertEqual(result['item']['evaluations'][0]['horizon_days'], 5)
+
+    def test_get_decision_detail_surfaces_normalized_wait_reason(self):
+        repository = FakeSignalDeciderLoopRepository(
+            [
+                _feedback_row(
+                    feedback_id=42,
+                    snapshot_id=102,
+                    market_date='2026-04-23',
+                    symbol='005930',
+                    action='wait',
+                    thesis_summary='Need more data before entry.',
+                    decision_risks=['Bid/ask spread is stale into the open.'],
+                    data_quality_warnings=[
+                        'No recent news/disclosures were captured.',
+                        'Realtime orderbook freshness is stale.',
+                    ],
+                )
+            ]
+        )
+        service = SignalDeciderLoopService(repository=repository)
+
+        result = service.get_decision_detail(
+            snapshot_id=102,
+            horizons=[5],
+            evaluation_version='signal_decider_eval_test',
+        )
+
+        self.assertEqual(result['item']['wait_reason']['code'], 'stale_quote_orderbook')
+        self.assertEqual(result['item']['decision']['wait_reason']['code'], 'stale_quote_orderbook')
+        self.assertEqual(result['item']['explanation']['wait_reason']['code'], 'stale_quote_orderbook')
 
     def test_get_decision_detail_includes_actual_execution_outcomes_separately(self):
         repository = FakeSignalDeciderLoopRepository(

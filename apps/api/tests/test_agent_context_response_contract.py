@@ -19,6 +19,9 @@ class AgentContextResponseContractTests(unittest.TestCase):
         self.assertIn('Empty recent news means no captured recent news and is neutral', suffix)
         self.assertIn('Do not classify a symbol as untradeable solely because auxiliary news or financial detail is absent.', suffix)
         self.assertIn('If only auxiliary context is absent, a buy decision may still be valid', suffix)
+        self.assertIn('wait_reason must be an object with code and summary when preferred_action/next_day_open_action is wait; otherwise use null.', suffix)
+        self.assertIn('stale_quote_orderbook', suffix)
+        self.assertIn('Do not use vague wait text such as insufficient information, need more data, or wait for more confirmation', suffix)
         self.assertIn(
             'Do not translate or localize machine-readable enum fields such as preferred_action, next_day_open_action, or entry_price_basis.',
             suffix,
@@ -32,6 +35,7 @@ class AgentContextResponseContractTests(unittest.TestCase):
         self.assertIn('agent_name should equal short-term-decider', suffix)
         self.assertIn('Empty recent news means no captured recent news and is neutral', suffix)
         self.assertIn('If only auxiliary context is absent, a structured scalp_buy_candidate or watch_for_trigger decision may still be valid', suffix)
+        self.assertIn('wait_reason must be an object with code and summary when tactical_action/preferred_action is watch_for_trigger, avoid_chase, or wait; otherwise use null.', suffix)
 
         output_text = json.dumps(
             {
@@ -40,6 +44,10 @@ class AgentContextResponseContractTests(unittest.TestCase):
                 'symbol': '005930',
                 'market_date': '2026-05-06',
                 'tactical_action': 'avoid_chase',
+                'wait_reason': {
+                    'code': 'extended_entry_price',
+                    'summary': '추격 구간이라 진입 가격 메리트가 부족합니다.',
+                },
                 'trigger_price': 81200,
                 'chase_limit_price': 82400,
                 'target_price': 84600,
@@ -72,6 +80,7 @@ class AgentContextResponseContractTests(unittest.TestCase):
         self.assertEqual(result['chase_limit_price'], 82400.0)
         self.assertEqual(result['target_price'], 84600.0)
         self.assertEqual(result['stop_loss_price'], 79200.0)
+        self.assertEqual(result['wait_reason']['code'], 'extended_entry_price')
         self.assertEqual(result['confidence'], 0.6)
         self.assertEqual(result['traceability']['agent_name'], 'short-term-decider')
         self.assertEqual(result['traceability']['symbol'], '005930')
@@ -172,6 +181,79 @@ class AgentContextResponseContractTests(unittest.TestCase):
         self.assertEqual(
             result['details']['decision_support']['supporting_evidence'],
             ['Breadth improved into the close.', 'Breakout level held above support.'],
+        )
+
+    def test_normalize_signal_decider_response_infers_specific_wait_reason_from_core_blocker(self):
+        output_text = json.dumps(
+            {
+                'role': 'signal-decider',
+                'agent_name': 'signal-decider',
+                'symbol': '005930',
+                'market_date': '2026-04-23',
+                'preferred_action': 'wait',
+                'next_day_open_action': 'wait',
+                'entry_price_basis': 'next_open',
+                'thesis_summary': 'Need more data before entry.',
+                'supporting_evidence': ['Momentum is still constructive.'],
+                'decision_risks': ['Bid/ask spread is stale into the open.'],
+                'invalidation_conditions': ['Skip the setup if the stale book persists.'],
+                'data_quality_warnings': [
+                    'No recent news/disclosures were captured.',
+                    'Realtime orderbook freshness is stale.',
+                ],
+                'specialist_disagreement': [],
+                'improvement_notes': ['Premarket depth would help.'],
+            }
+        )
+
+        result = normalize_agent_response(
+            role='signal-decider',
+            output_text=output_text,
+            raw_response={'id': 'resp-wait-1'},
+            market_date='2026-04-23',
+            symbol='005930',
+            agent_name='signal-decider',
+        )
+
+        self.assertEqual(result['wait_reason']['code'], 'stale_quote_orderbook')
+        self.assertNotIn('news', result['wait_reason']['summary'].lower())
+        self.assertEqual(result['details']['decision_support']['wait_reason']['code'], 'stale_quote_orderbook')
+
+    def test_normalize_signal_decider_response_flags_generic_wait_reason_without_specific_blocker(self):
+        output_text = json.dumps(
+            {
+                'role': 'signal-decider',
+                'agent_name': 'signal-decider',
+                'symbol': '005930',
+                'market_date': '2026-04-23',
+                'preferred_action': 'wait',
+                'next_day_open_action': 'wait',
+                'entry_price_basis': 'next_open',
+                'thesis_summary': 'Need more data before entry.',
+                'supporting_evidence': ['Momentum is still constructive.'],
+                'decision_risks': ['Wait for more confirmation.'],
+                'invalidation_conditions': ['No clear invalidation was supplied.'],
+                'data_quality_warnings': ['No recent news/disclosures were captured.'],
+                'specialist_disagreement': [],
+                'improvement_notes': [],
+            }
+        )
+
+        result = normalize_agent_response(
+            role='signal-decider',
+            output_text=output_text,
+            raw_response={'id': 'resp-wait-2'},
+            market_date='2026-04-23',
+            symbol='005930',
+            agent_name='signal-decider',
+        )
+
+        self.assertIsNone(result['wait_reason'])
+        self.assertIn('wait_reason_missing_for_wait_action', result['risk_flags'])
+        self.assertIn('generic_wait_reason_missing_specific_blocker', result['risk_flags'])
+        self.assertIn(
+            'Wait decisions must include a concrete wait_reason code and blocker summary.',
+            result['improvement_notes'],
         )
 
     def test_normalize_signal_decider_response_falls_back_conservatively_for_unstructured_output(self):

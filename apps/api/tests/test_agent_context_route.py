@@ -389,6 +389,16 @@ class FakeSignalDeciderLoopService:
                     'feedback_id': 11,
                     'symbol': kwargs['symbol'] or '005930',
                     'policy_version': 'signal_decider_policy_v1',
+                    'wait_reason': {
+                        'code': 'stale_quote_orderbook',
+                        'summary': 'Realtime orderbook freshness is stale.',
+                    },
+                    'explanation': {
+                        'wait_reason': {
+                            'code': 'stale_quote_orderbook',
+                            'summary': 'Realtime orderbook freshness is stale.',
+                        }
+                    },
                     'evaluation_summary': {'evaluated': True},
                 }
             ],
@@ -399,7 +409,20 @@ class FakeSignalDeciderLoopService:
         return {
             'request': {'snapshot_id': kwargs['snapshot_id']},
             'summary': {'evaluated_count': 1},
-            'item': {'snapshot_id': kwargs['snapshot_id'], 'evaluation_summary': {'evaluated': True}},
+            'item': {
+                'snapshot_id': kwargs['snapshot_id'],
+                'wait_reason': {
+                    'code': 'stale_quote_orderbook',
+                    'summary': 'Realtime orderbook freshness is stale.',
+                },
+                'explanation': {
+                    'wait_reason': {
+                        'code': 'stale_quote_orderbook',
+                        'summary': 'Realtime orderbook freshness is stale.',
+                    }
+                },
+                'evaluation_summary': {'evaluated': True},
+            },
         }
 
     def get_review_calendar(self, **kwargs):
@@ -1642,6 +1665,7 @@ class AgentContextRouteTests(unittest.TestCase):
         self.assertEqual(fake_service.decision_args['symbol'], '005930')
         self.assertEqual(fake_service.decision_args['limit'], 10)
         self.assertEqual(response.json()['items'][0]['policy_version'], 'signal_decider_policy_v1')
+        self.assertEqual(response.json()['items'][0]['wait_reason']['code'], 'stale_quote_orderbook')
 
     def test_signal_decider_decisions_route_accepts_search_filters(self):
         fake_service = FakeSignalDeciderLoopService()
@@ -1695,6 +1719,7 @@ class AgentContextRouteTests(unittest.TestCase):
         self.assertEqual(fake_service.detail_args['horizons'], [1, 5])
         self.assertEqual(fake_service.detail_args['evaluation_version'], 'signal_decider_eval_v1')
         self.assertEqual(response.json()['item']['snapshot_id'], 84)
+        self.assertEqual(response.json()['item']['explanation']['wait_reason']['code'], 'stale_quote_orderbook')
 
     def test_signal_decider_review_calendar_route_calls_service(self):
         fake_service = FakeSignalDeciderCalendarReviewService()
