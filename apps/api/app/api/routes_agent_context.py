@@ -12,6 +12,7 @@ from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.agent_context.decider_evaluation_service import decider_post_decision_evaluation_service
+from app.agent_context.decider_coverage_report_service import decider_coverage_report_service
 from app.agent_context.eod_summaries_service import agent_context_eod_summaries_service
 from app.agent_context.eligibility import (
     AGENT_FEEDBACK_ELIGIBILITY_FILTERS,
@@ -1092,6 +1093,26 @@ async def get_agent_feedback_data_gap_summary(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f'Agent feedback data-gap summary failed: {exc}') from exc
+
+
+@router.get('/feedback/decider-coverage')
+async def get_agent_feedback_decider_coverage(
+    market_date: date = Query(...),
+    run_id: str | None = Query(default=None),
+    symbols: list[str] | None = Query(default=None),
+    agent_names: list[str] | None = Query(default=None),
+) -> dict:
+    try:
+        return decider_coverage_report_service.get_report(
+            market_date=market_date,
+            run_id=run_id,
+            symbols=symbols,
+            agent_names=agent_names,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'Decider coverage summary failed: {exc}') from exc
 
 
 @router.get('/feedback/requests')

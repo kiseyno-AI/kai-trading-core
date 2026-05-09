@@ -46,6 +46,7 @@ What it does:
 - `GET /fx/koreaexim/rates?search_date=20260406&currency=USD`
 - `GET /scanner/trending-stocks?period=5d&direction=both&limit=20`
 - `GET /eod/status`
+- `GET /agent-context/feedback/decider-coverage?market_date=2026-05-08`
 - `GET /eod/pipeline/status`
 - `GET /eod/pipeline/stages`
 - `POST /eod/master/refresh-if-due`

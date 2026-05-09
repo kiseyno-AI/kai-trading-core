@@ -1422,6 +1422,68 @@ Authorization: Bearer <token>
 
 ---
 
+## 4.4 `GET /agent-context/feedback/decider-coverage`
+Builds a daily operator report from persisted decider request payloads so dashboards and ops checks can inspect what the deciders actually received without reading raw prompt payloads.
+
+### Example request
+```http
+GET /agent-context/feedback/decider-coverage?market_date=2026-05-08&agent_names=signal-decider&agent_names=short-term-decider
+Authorization: Bearer <token>
+```
+
+### Example response
+```json
+{
+  "request": {
+    "market_date": "2026-05-08",
+    "run_id": null,
+    "symbols": null,
+    "agent_names": ["short-term-decider", "signal-decider"]
+  },
+  "summary": {
+    "symbols_evaluated": 111,
+    "core_blocks": {
+      "counts": {
+        "available": 82,
+        "missing": 19,
+        "stale": 7,
+        "derived": 3,
+        "provider_error": 0
+      }
+    },
+    "optional_blocks": {
+      "counts": {
+        "available": 403,
+        "empty": 28,
+        "unavailable": 51,
+        "provider_error": 2
+      }
+    },
+    "contract_regressions": {
+      "status": "alert",
+      "raw_null_count": 4,
+      "unexpected_missing_core_block_count": 19
+    }
+  },
+  "per_agent": {
+    "signal-decider": {
+      "feedback_rows": 111
+    },
+    "short-term-decider": {
+      "feedback_rows": 111
+    }
+  }
+}
+```
+
+### Notes
+- `run_id` is optional and limits the report to rows that still carry that persisted feedback run id.
+- `symbols` accepts repeated query parameters or comma-separated values for focused inspection.
+- Core block counts are rolled up to `available`, `missing`, `stale`, `derived`, and `provider_error`; optional block counts are rolled up to `available`, `empty`, `unavailable`, and `provider_error`.
+- The report also surfaces gap-effect buckets (`decision_affected`, `confidence_reducer`, `neutral_auxiliary`) plus raw-null contract regressions for expected object-style decider context paths.
+
+---
+
 # 5. Consumer Notes for UX / Web / Agent Layers
 
 ## 5.1 Freshness is not globally uniform
