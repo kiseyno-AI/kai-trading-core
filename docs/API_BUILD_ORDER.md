@@ -176,6 +176,7 @@
 - `GET /agent-context/signal-decider/diagnostics/summary?market_date_from=YYYY-MM-DD&market_date_to=YYYY-MM-DD&symbols=005930&symbols=000660&horizons=5&evaluation_version=signal_decider_eval_v1&contributor_limit=20`
 - `POST /agent-context/signal-decider/evaluations/compute`
 - `GET /agent-context/signal-decider/evaluations?market_date=YYYY-MM-DD&symbol=005930&horizons=1&horizons=5`
+- `GET /agent-context/signal-decider/calibration?market_date_from=YYYY-MM-DD&market_date_to=YYYY-MM-DD&symbols=005930&policy_version=signal_decider_policy_v1&horizon_days=5&evaluation_version=signal_decider_eval_v1&min_sample_size=3&cluster_limit=10`
 - `GET /agent-context/signal-decider/decision-policies?status=active&limit=20`
 - `GET /agent-context/signal-decider/decision-policies/signal_decider_policy_v1`
 - `POST /agent-context/signal-decider/decision-policies/signal_decider_policy_v2/activate`

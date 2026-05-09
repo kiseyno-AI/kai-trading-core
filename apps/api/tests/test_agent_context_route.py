@@ -1047,6 +1047,62 @@ class FakeSignalDeciderExecutionOutcomeService:
         }
 
 
+class FakeSignalDeciderCalibrationService:
+    def __init__(self):
+        self.report_args = None
+
+    def build_report(self, **kwargs):
+        self.report_args = kwargs
+        return {
+            'request': {
+                'market_date_from': kwargs['market_date_from'].isoformat(),
+                'market_date_to': kwargs['market_date_to'].isoformat(),
+                'symbols': kwargs['symbols'],
+                'policy_version': kwargs['policy_version'],
+                'horizon_days': kwargs['horizon_days'],
+                'evaluation_version': kwargs['evaluation_version'],
+                'min_sample_size': kwargs['min_sample_size'],
+                'cluster_limit': kwargs['cluster_limit'],
+            },
+            'review_boundary': {
+                'report_version': 'signal_decider_calibration_report_v1',
+                'manual_review_only': True,
+                'auto_apply_prompt_changes': False,
+            },
+            'summary': {
+                'status': 'ready',
+                'snapshots_considered': 4,
+                'mature_computed_count': 3,
+                'excluded_count': 1,
+            },
+            'exclusions': {
+                'status_reason_counts': {'pending_maturity': 1},
+                'items': [{'snapshot_id': 91, 'status_reason': 'pending_maturity'}],
+            },
+            'group_summaries': {
+                'decision_actions': {
+                    'label': 'Decision action buckets',
+                    'items': [{'bucket_value': 'buy', 'sample_count': 2}],
+                }
+            },
+            'condition_clusters': {
+                'positive': [{'cluster_key': 'decision.confidence_bucket=high', 'sample_count': 2}],
+                'negative': [{'cluster_key': 'wait_reason.code=stale_quote_orderbook', 'sample_count': 1}],
+            },
+            'calibration_hints': {
+                'prompt_guidance': [],
+                'scoring_guidance': [
+                    {
+                        'kind': 'scoring_guidance',
+                        'manual_review_only': True,
+                        'auto_apply': False,
+                    }
+                ],
+                'operator_review': [],
+            },
+        }
+
+
 class AgentContextRouteTests(unittest.TestCase):
     def setUp(self):
         self.app = FastAPI()
@@ -1970,6 +2026,44 @@ class AgentContextRouteTests(unittest.TestCase):
         self.assertEqual(payload['items'][0]['coverage'][0]['status_reason'], 'pending_maturity')
         self.assertEqual(payload['items'][0]['coverage'][0]['earliest_computable_date'], '2026-05-08')
         self.assertEqual(payload['items'][0]['evaluations'][0]['status_reason'], 'pending_maturity')
+
+    def test_signal_decider_calibration_route_calls_service(self):
+        fake_service = FakeSignalDeciderCalibrationService()
+        original_service = routes_agent_context.signal_decider_calibration_service
+        routes_agent_context.signal_decider_calibration_service = fake_service
+        try:
+            client = TestClient(self.app)
+            response = client.get(
+                '/agent-context/signal-decider/calibration',
+                params=[
+                    ('market_date_from', '2026-04-20'),
+                    ('market_date_to', '2026-04-29'),
+                    ('symbols', '005930'),
+                    ('symbols', '000660'),
+                    ('policy_version', 'signal_decider_policy_v1'),
+                    ('horizon_days', '5'),
+                    ('evaluation_version', 'signal_decider_eval_v1'),
+                    ('min_sample_size', '2'),
+                    ('cluster_limit', '5'),
+                ],
+            )
+        finally:
+            routes_agent_context.signal_decider_calibration_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(fake_service.report_args['market_date_from'], date.fromisoformat('2026-04-20'))
+        self.assertEqual(fake_service.report_args['market_date_to'], date.fromisoformat('2026-04-29'))
+        self.assertEqual(fake_service.report_args['symbols'], ['005930', '000660'])
+        self.assertEqual(fake_service.report_args['policy_version'], 'signal_decider_policy_v1')
+        self.assertEqual(fake_service.report_args['horizon_days'], 5)
+        self.assertEqual(fake_service.report_args['evaluation_version'], 'signal_decider_eval_v1')
+        self.assertEqual(fake_service.report_args['min_sample_size'], 2)
+        self.assertEqual(fake_service.report_args['cluster_limit'], 5)
+        payload = response.json()
+        self.assertEqual(payload['summary']['status'], 'ready')
+        self.assertEqual(payload['exclusions']['status_reason_counts']['pending_maturity'], 1)
+        self.assertEqual(payload['condition_clusters']['positive'][0]['cluster_key'], 'decision.confidence_bucket=high')
+        self.assertEqual(payload['calibration_hints']['scoring_guidance'][0]['manual_review_only'], True)
 
     def test_signal_decider_policy_candidate_generation_route_calls_service(self):
         fake_service = FakeSignalDeciderLoopService()
