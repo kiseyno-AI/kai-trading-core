@@ -128,6 +128,29 @@ class FakeAgentContextMissingDataReportService:
         }
 
 
+class FakeDeciderCoverageReportService:
+    def __init__(self):
+        self.last_args = None
+
+    def get_report(self, **kwargs):
+        self.last_args = kwargs
+        return {
+            'request': {
+                'market_date': kwargs['market_date'].isoformat(),
+                'run_id': kwargs['run_id'],
+                'symbols': kwargs['symbols'],
+                'agent_names': kwargs['agent_names'],
+            },
+            'summary': {
+                'symbols_evaluated': 2,
+                'contract_regressions': {'status': 'alert', 'raw_null_count': 1},
+            },
+            'per_agent': {
+                'signal-decider': {'feedback_rows': 2},
+            },
+        }
+
+
 class FakeAgentContextEodSummariesService:
     def __init__(self):
         self.inspect_args = None
@@ -1585,6 +1608,32 @@ class AgentContextRouteTests(unittest.TestCase):
         self.assertEqual(fake_service.last_args['agent_name'], 'technical-summarizer')
         self.assertEqual(fake_service.last_args['categories'], ['factor_score_coverage'])
         self.assertEqual(response.json()['summary']['feedback_rows_matched'], 2)
+
+    def test_agent_feedback_decider_coverage_route_calls_service(self):
+        fake_service = FakeDeciderCoverageReportService()
+        original_service = routes_agent_context.decider_coverage_report_service
+        routes_agent_context.decider_coverage_report_service = fake_service
+        try:
+            client = TestClient(self.app)
+            response = client.get(
+                '/agent-context/feedback/decider-coverage',
+                params=[
+                    ('market_date', '2026-05-08'),
+                    ('run_id', 'symbol-run-2026-05-08-abc123'),
+                    ('symbols', '005930,000660'),
+                    ('agent_names', 'signal-decider'),
+                    ('agent_names', 'short-term-decider'),
+                ],
+            )
+        finally:
+            routes_agent_context.decider_coverage_report_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(fake_service.last_args['market_date'], date.fromisoformat('2026-05-08'))
+        self.assertEqual(fake_service.last_args['run_id'], 'symbol-run-2026-05-08-abc123')
+        self.assertEqual(fake_service.last_args['symbols'], ['005930,000660'])
+        self.assertEqual(fake_service.last_args['agent_names'], ['signal-decider', 'short-term-decider'])
+        self.assertEqual(response.json()['summary']['contract_regressions']['status'], 'alert')
 
     def test_compute_decider_evaluations_route_calls_service(self):
         fake_service = FakeDeciderEvaluationService()
