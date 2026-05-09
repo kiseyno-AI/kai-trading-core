@@ -5,6 +5,12 @@ from datetime import date
 from typing import Any
 
 from app.agent_context.roles import SHORT_TERM_DECIDER_AGENT_NAME, SIGNAL_DECIDER_AGENT_NAME
+from app.agent_context.wait_reason_taxonomy import (
+    WAIT_REASON_ISSUE_GENERIC,
+    WAIT_REASON_ISSUE_MISSING,
+    derive_wait_reason,
+    wait_reason_taxonomy_codes,
+)
 
 
 REQUIRED_RESPONSE_KEYS = ('role', 'summary', 'confidence', 'risk_flags', 'details', 'improvement_notes')
@@ -109,6 +115,7 @@ def _build_signal_decider_details(
     *,
     parsed_details: dict[str, Any],
     next_day_open_action: str,
+    wait_reason: dict[str, Any] | None,
     entry_price_basis: str,
     target_price: float | None,
     expected_return_pct: float | None,
@@ -127,6 +134,7 @@ def _build_signal_decider_details(
         **parsed_details,
         'decision_support': {
             'next_day_open_action': next_day_open_action,
+            'wait_reason': wait_reason,
             'entry_price_basis': entry_price_basis,
             'target_price': target_price,
             'expected_return_pct': expected_return_pct,
@@ -174,6 +182,22 @@ def _normalize_signal_decider_response(
     specialist_disagreement = _normalize_text_list(payload.get('specialist_disagreement'))
     improvement_notes = _normalize_text_list(payload.get('improvement_notes'))
     risk_flags = _normalize_text_list(payload.get('risk_flags'))
+    wait_reason, wait_reason_issues = derive_wait_reason(
+        role=role,
+        action=next_day_open_action,
+        payload=payload,
+    )
+    if wait_reason_issues:
+        risk_flags = list(dict.fromkeys([*risk_flags, *wait_reason_issues]))
+        if WAIT_REASON_ISSUE_MISSING in wait_reason_issues or WAIT_REASON_ISSUE_GENERIC in wait_reason_issues:
+            improvement_notes = list(
+                dict.fromkeys(
+                    [
+                        *improvement_notes,
+                        'Wait decisions must include a concrete wait_reason code and blocker summary.',
+                    ]
+                )
+            )
     reported_role = payload.get('role')
     reported_symbol = str(payload.get('symbol')).strip() if payload.get('symbol') is not None else None
     reported_market_date = _normalize_iso_date(payload.get('market_date'))
@@ -187,8 +211,9 @@ def _normalize_signal_decider_response(
         risk_flags = list(dict.fromkeys([*risk_flags, 'unstructured_response']))
         if not data_quality_warnings:
             data_quality_warnings = ['unstructured_response']
-        if not improvement_notes:
-            improvement_notes = ['Return the full structured decision-support contract in JSON.']
+        improvement_notes = list(
+            dict.fromkeys([*improvement_notes, 'Return the full structured decision-support contract in JSON.'])
+        )
         if output_text:
             traceability = {**traceability, 'raw_output_text': output_text}
     if reported_role and reported_role != role:
@@ -224,6 +249,7 @@ def _normalize_signal_decider_response(
         'market_date': normalized_market_date,
         'preferred_action': next_day_open_action,
         'next_day_open_action': next_day_open_action,
+        'wait_reason': wait_reason,
         'entry_price_basis': entry_price_basis,
         'target_price': target_price,
         'expected_return_pct': expected_return_pct,
@@ -244,6 +270,7 @@ def _normalize_signal_decider_response(
         'details': _build_signal_decider_details(
             parsed_details=parsed_details,
             next_day_open_action=next_day_open_action,
+            wait_reason=wait_reason,
             entry_price_basis=entry_price_basis,
             target_price=target_price,
             expected_return_pct=expected_return_pct,
@@ -267,6 +294,7 @@ def _build_short_term_decider_details(
     *,
     parsed_details: dict[str, Any],
     tactical_action: str,
+    wait_reason: dict[str, Any] | None,
     trigger_price: float | None,
     chase_limit_price: float | None,
     target_price: float | None,
@@ -285,6 +313,7 @@ def _build_short_term_decider_details(
         **parsed_details,
         'tactical_decision_support': {
             'tactical_action': tactical_action,
+            'wait_reason': wait_reason,
             'trigger_price': trigger_price,
             'chase_limit_price': chase_limit_price,
             'target_price': target_price,
@@ -330,6 +359,22 @@ def _normalize_short_term_decider_response(
     data_quality_warnings = _normalize_text_list(payload.get('data_quality_warnings'))
     improvement_notes = _normalize_text_list(payload.get('improvement_notes'))
     risk_flags = _normalize_text_list(payload.get('risk_flags'))
+    wait_reason, wait_reason_issues = derive_wait_reason(
+        role=role,
+        action=tactical_action,
+        payload=payload,
+    )
+    if wait_reason_issues:
+        risk_flags = list(dict.fromkeys([*risk_flags, *wait_reason_issues]))
+        if WAIT_REASON_ISSUE_MISSING in wait_reason_issues or WAIT_REASON_ISSUE_GENERIC in wait_reason_issues:
+            improvement_notes = list(
+                dict.fromkeys(
+                    [
+                        *improvement_notes,
+                        'Wait-like tactical actions must include a concrete wait_reason code and blocker summary.',
+                    ]
+                )
+            )
     reported_role = payload.get('role')
     reported_symbol = str(payload.get('symbol')).strip() if payload.get('symbol') is not None else None
     reported_market_date = _normalize_iso_date(payload.get('market_date'))
@@ -343,8 +388,9 @@ def _normalize_short_term_decider_response(
         risk_flags = list(dict.fromkeys([*risk_flags, 'unstructured_response']))
         if not data_quality_warnings:
             data_quality_warnings = ['unstructured_response']
-        if not improvement_notes:
-            improvement_notes = ['Return the full structured short-term decision-support contract in JSON.']
+        improvement_notes = list(
+            dict.fromkeys([*improvement_notes, 'Return the full structured short-term decision-support contract in JSON.'])
+        )
         if output_text:
             traceability = {**traceability, 'raw_output_text': output_text}
     if reported_role and reported_role != role:
@@ -380,6 +426,7 @@ def _normalize_short_term_decider_response(
         'market_date': normalized_market_date,
         'tactical_action': tactical_action,
         'preferred_action': tactical_action,
+        'wait_reason': wait_reason,
         'trigger_price': trigger_price,
         'chase_limit_price': chase_limit_price,
         'target_price': target_price,
@@ -400,6 +447,7 @@ def _normalize_short_term_decider_response(
         'details': _build_short_term_decider_details(
             parsed_details=parsed_details,
             tactical_action=tactical_action,
+            wait_reason=wait_reason,
             trigger_price=trigger_price,
             chase_limit_price=chase_limit_price,
             target_price=target_price,
@@ -419,11 +467,12 @@ def _normalize_short_term_decider_response(
 
 
 def build_contract_prompt_suffix(*, role: str | None = None) -> str:
+    wait_reason_codes = ', '.join(wait_reason_taxonomy_codes())
     if role == SHORT_TERM_DECIDER_AGENT_NAME:
         return (
             'Return JSON only. Do not wrap in markdown. '
             'For every short-term-decider feedback object, required keys are: role, agent_name, symbol, market_date, tactical_action, preferred_action, '
-            'trigger_price, chase_limit_price, target_price, stop_loss_price, expected_holding_period, confidence_score_10, conviction_score_10, '
+            'wait_reason, trigger_price, chase_limit_price, target_price, stop_loss_price, expected_holding_period, confidence_score_10, conviction_score_10, '
             'thesis_summary, trigger_conditions, supporting_evidence, tactical_risks, invalidation_conditions, data_quality_warnings, traceability, '
             'summary, confidence, risk_flags, details, improvement_notes. '
             'Operator-facing free-text fields must be written in Korean while keeping the outer response as raw JSON only. '
@@ -434,6 +483,9 @@ def build_contract_prompt_suffix(*, role: str | None = None) -> str:
             'traceability.symbol must exactly match symbol, and both must match the assigned item symbol. '
             'tactical_action and preferred_action must be one of scalp_buy_candidate, watch_for_trigger, avoid_chase, wait, reject exactly as written. '
             'Use scalp_buy_candidate only when momentum, participation, liquidity, and trigger/risk levels are all supportable; otherwise prefer watch_for_trigger, avoid_chase, wait, or reject. '
+            f'wait_reason must be an object with code and summary when tactical_action/preferred_action is watch_for_trigger, avoid_chase, or wait; otherwise use null. Valid wait_reason.code values are: {wait_reason_codes}. '
+            'wait_reason.summary must be a concise Korean explanation that names the concrete blocker. '
+            'Do not use vague wait text such as insufficient information, need more data, or wait for more confirmation unless the same summary explicitly names the concrete blocker. '
             'trigger_price, chase_limit_price, target_price, and stop_loss_price must be included for every item and should be explicit conservative numeric levels whenever the inputs support them; use null rather than fake precision when unsupported and explain why in data_quality_warnings. '
             'expected_holding_period should normally be 1-2 trading days or 1-3 trading days depending on the setup and evidence. '
             'confidence_score_10 and conviction_score_10 must be numbers from 1 to 10 when provided. '
@@ -445,6 +497,7 @@ def build_contract_prompt_suffix(*, role: str | None = None) -> str:
             'Empty recent news means no captured recent news and is neutral unless other risk evidence exists. '
             'Missing detailed quarterly/cash-flow fields should usually reduce confidence only. '
             'Do not classify a symbol as untradeable solely because auxiliary news or financial detail is absent. '
+            'Optional news/disclosure or quarterly/cash-flow gaps must not become the primary wait_reason when price, liquidity, trend, or execution blockers already explain the conservative action. '
             'If core execution evidence is missing, stale, weak, conflicting, or chase risk is elevated, still return a complete structured conservative feedback object with avoid_chase, wait, or reject, null unsupported numeric fields, and explicit risk/data-quality warnings. '
             'If only auxiliary context is absent, a structured scalp_buy_candidate or watch_for_trigger decision may still be valid when price, liquidity, trigger, and risk evidence are otherwise strong. '
             'Before finalizing, self-check that the JSON is parseable, all required keys are present, role and agent_name are correct, symbol and traceability.symbol exactly match the assigned symbol, operator-facing free-text fields are in Korean, and arrays are arrays of strings. '
@@ -454,7 +507,7 @@ def build_contract_prompt_suffix(*, role: str | None = None) -> str:
         return (
             'Return JSON only. Do not wrap in markdown. '
             'For every signal-decider feedback object, required keys are: role, agent_name, symbol, market_date, preferred_action, next_day_open_action, '
-            'entry_price_basis, target_price, expected_return_pct, stop_loss_price, suggested_holding_period, '
+            'wait_reason, entry_price_basis, target_price, expected_return_pct, stop_loss_price, suggested_holding_period, '
             'confidence_score_10, conviction_score_10, thesis_summary, supporting_evidence, decision_risks, '
             'invalidation_conditions, data_quality_warnings, specialist_disagreement, traceability, summary, confidence, '
             'risk_flags, details, improvement_notes. '
@@ -466,6 +519,9 @@ def build_contract_prompt_suffix(*, role: str | None = None) -> str:
             'Do not omit, alias, translate, normalize away leading zeroes, reorder, infer, or substitute symbols. '
             'traceability.symbol must exactly match symbol, and both must match the assigned item symbol. '
             'next_day_open_action and preferred_action must be one of buy, wait, reject exactly as written. '
+            f'wait_reason must be an object with code and summary when preferred_action/next_day_open_action is wait; otherwise use null. Valid wait_reason.code values are: {wait_reason_codes}. '
+            'wait_reason.summary must be a concise Korean explanation that names the concrete blocker. '
+            'Do not use vague wait text such as insufficient information, need more data, or wait for more confirmation unless the same summary explicitly names the concrete blocker. '
             'entry_price_basis should be next_open unless the supplied inputs justify a different explicit basis. '
             'target_price and stop_loss_price must be included for every item and should be explicit conservative numeric levels whenever the inputs support them; if a concrete level is genuinely not supportable, keep the keys and explain the limitation in data_quality_warnings instead of omitting them. '
             'Use null rather than fake precision when a numeric field is not well-supported by the inputs. '
@@ -479,6 +535,7 @@ def build_contract_prompt_suffix(*, role: str | None = None) -> str:
             'Empty recent news means no captured recent news and is neutral unless other risk evidence exists. '
             'Missing detailed quarterly/cash-flow fields should usually reduce confidence only. '
             'Do not classify a symbol as untradeable solely because auxiliary news or financial detail is absent. '
+            'Optional news/disclosure or quarterly/cash-flow gaps must not become the primary wait_reason when price, liquidity, trend, execution timing, or volatility blockers already explain the wait. '
             'If core execution evidence is missing, weak, conflicting, or truncated, still return a complete structured conservative feedback object with wait or reject, null unsupported numeric fields, and explicit risk/data-quality warnings. '
             'If only auxiliary context is absent, a buy decision may still be valid when price, liquidity, trend, execution risk, and invalidation evidence are otherwise strong. '
             'Before finalizing, self-check that the JSON is parseable, all required keys are present, role and agent_name are correct, symbol and traceability.symbol exactly match the assigned symbol, operator-facing free-text fields are in Korean, and arrays are arrays of strings. '

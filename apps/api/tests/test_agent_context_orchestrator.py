@@ -1330,6 +1330,7 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         short_term_payload = next(payload for payload in client.decider_payloads if payload['role'] == 'short-term-decider')
         self.assertEqual(short_term_payload['orchestration']['request_model'], 'openclaw/short-term-decider')
         self.assertIn('trigger_price', short_term_payload['output_contract']['required_feedback_fields'])
+        self.assertIn('wait_reason', short_term_payload['output_contract']['required_feedback_fields'])
         self.assertTrue(
             short_term_payload['decision_support_constraints']['missing_context_policy'][
                 'auxiliary_context_absence_not_tradeability_blocker'
@@ -1397,6 +1398,7 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertEqual(decider_payload['output_contract']['assigned_symbol'], '005930')
         self.assertTrue(decider_payload['output_contract']['batch_envelope_required'])
         self.assertTrue(decider_payload['output_contract']['symbol_identity']['exact_match_required'])
+        self.assertIn('wait_reason', decider_payload['output_contract']['required_feedback_fields'])
         self.assertIn(
             'item_symbol_feedback_symbol_and_traceability_symbol_match_assigned_symbol',
             decider_payload['output_contract']['self_check_before_final_output'],

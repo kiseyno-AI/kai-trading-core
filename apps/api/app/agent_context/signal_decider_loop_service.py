@@ -14,6 +14,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.agent_context.roles import SHORT_TERM_DECIDER_AGENT_NAME, SIGNAL_DECIDER_AGENT_NAME
+from app.agent_context.wait_reason_taxonomy import derive_wait_reason
 from app.db import session_scope
 from app.db_models import (
     AgentContextFeedback,
@@ -680,6 +681,7 @@ def build_signal_decider_traceability_snapshot(
     policy_version: str,
     decision_action: str,
     thesis_summary: str,
+    wait_reason: dict[str, Any] | None,
     summary_payload: dict[str, Any],
     feedback_payload: dict[str, Any],
     context_payload: dict[str, Any] | None,
@@ -804,6 +806,7 @@ def build_signal_decider_traceability_snapshot(
         'final_action_rationale': {
             'decision_action': decision_action,
             'summary': thesis_summary,
+            'wait_reason': wait_reason,
             'confidence_score_10': _to_float(
                 feedback_payload.get('confidence_score_10') or decision_support.get('confidence_score_10')
             ),
@@ -833,6 +836,7 @@ def build_short_term_decider_traceability_snapshot(
     policy_version: str,
     tactical_action: str,
     thesis_summary: str,
+    wait_reason: dict[str, Any] | None,
     summary_payload: dict[str, Any],
     feedback_payload: dict[str, Any],
     context_payload: dict[str, Any] | None,
@@ -954,6 +958,7 @@ def build_short_term_decider_traceability_snapshot(
         'final_action_rationale': {
             'decision_action': tactical_action,
             'summary': thesis_summary,
+            'wait_reason': wait_reason,
             'confidence_score_10': _to_float(
                 feedback_payload.get('confidence_score_10') or tactical_support.get('confidence_score_10')
             ),
@@ -2257,6 +2262,16 @@ class SignalDeciderLoopService:
                 or summary_payload.get('summary')
                 or ''
             ).strip()
+            wait_reason, _wait_reason_issues = derive_wait_reason(
+                role=agent_name,
+                action=decision_action,
+                payload=response_payload,
+            )
+            if wait_reason is not None:
+                response_payload = {
+                    **response_payload,
+                    'wait_reason': wait_reason,
+                }
             traceability_payload = _maybe_dict(request_payload.get('signal_decider_trace')).get('traceability')
             if not isinstance(traceability_payload, dict) or not traceability_payload.get('schema_version'):
                 traceability_payload = build_signal_decider_traceability_snapshot(
@@ -2269,6 +2284,7 @@ class SignalDeciderLoopService:
                     policy_version=policy_version,
                     decision_action=decision_action,
                     thesis_summary=thesis_summary,
+                    wait_reason=wait_reason,
                     summary_payload=summary_payload,
                     feedback_payload=response_payload,
                     context_payload=request_payload,
@@ -2341,6 +2357,16 @@ class SignalDeciderLoopService:
                 or summary_payload.get('summary')
                 or ''
             ).strip()
+            wait_reason, _wait_reason_issues = derive_wait_reason(
+                role=agent_name,
+                action=tactical_action,
+                payload=response_payload,
+            )
+            if wait_reason is not None:
+                response_payload = {
+                    **response_payload,
+                    'wait_reason': wait_reason,
+                }
             traceability_payload = _maybe_dict(response_payload.get('traceability'))
             if not isinstance(traceability_payload, dict) or not traceability_payload.get('schema_version'):
                 traceability_payload = build_short_term_decider_traceability_snapshot(
@@ -2353,6 +2379,7 @@ class SignalDeciderLoopService:
                     policy_version=policy_version,
                     tactical_action=tactical_action,
                     thesis_summary=thesis_summary,
+                    wait_reason=wait_reason,
                     summary_payload=summary_payload,
                     feedback_payload=response_payload,
                     context_payload=request_payload,
@@ -3575,6 +3602,7 @@ class SignalDeciderLoopService:
         return {
             'decision_action': _maybe_dict(decision.get('decision')).get('action'),
             'summary': decision.get('summary'),
+            'wait_reason': _maybe_dict(decision.get('wait_reason')) or None,
             'supporting_evidence': list(decision.get('supporting_evidence') or []),
             'decision_risks': list(decision.get('decision_risks') or []),
             'invalidation_conditions': list(decision.get('invalidation_conditions') or []),
@@ -4028,6 +4056,11 @@ class SignalDeciderLoopService:
             or summary_payload.get('summary')
             or ''
         ).strip()
+        wait_reason, _wait_reason_issues = derive_wait_reason(
+            role=row.agent_name,
+            action=decision_action,
+            payload=feedback_payload,
+        )
         traceability = _maybe_dict(row.traceability_payload)
         if not traceability.get('schema_version'):
             traceability = build_signal_decider_traceability_snapshot(
@@ -4040,6 +4073,7 @@ class SignalDeciderLoopService:
                 policy_version=policy_version or DEFAULT_SIGNAL_DECIDER_POLICY_VERSION,
                 decision_action=decision_action,
                 thesis_summary=thesis_summary,
+                wait_reason=wait_reason,
                 summary_payload=summary_payload,
                 feedback_payload=feedback_payload,
                 context_payload=request_payload,
@@ -4058,6 +4092,7 @@ class SignalDeciderLoopService:
                 'next_day_open_action': _normalize_action(
                     row.next_day_open_action or feedback_payload.get('next_day_open_action')
                 ),
+                'wait_reason': wait_reason,
                 'entry_price_basis': row.entry_price_basis,
                 'target_price': _to_int(row.target_price),
                 'expected_return_pct': _to_float(row.expected_return_pct),
@@ -4067,6 +4102,7 @@ class SignalDeciderLoopService:
                 'conviction_score_10': _to_float(row.conviction_score_10),
             },
             'summary': thesis_summary,
+            'wait_reason': wait_reason,
             'supporting_evidence': _normalize_text_list(row.supporting_evidence_payload),
             'decision_risks': _normalize_text_list(row.decision_risks_payload),
             'invalidation_conditions': _normalize_text_list(row.invalidation_conditions_payload),
