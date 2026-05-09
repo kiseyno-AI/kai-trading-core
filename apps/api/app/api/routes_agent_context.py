@@ -27,6 +27,7 @@ from app.agent_context.reuse_service import agent_context_reuse_service
 from app.agent_context.read_service import agent_context_read_service
 from app.agent_context.run_state_service import agent_context_feedback_run_state_service
 from app.agent_context.session_cleanup_service import agent_feedback_session_cleanup_service
+from app.agent_context.signal_decider_calibration_service import signal_decider_calibration_service
 from app.agent_context.signal_decider_calendar_review_service import signal_decider_calendar_review_service
 from app.agent_context.signal_decider_loop_service import signal_decider_loop_service
 from app.agent_context.retry_service import (
@@ -1643,6 +1644,35 @@ async def list_signal_decider_evaluations(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f'Signal-decider evaluation read failed: {exc}') from exc
+
+
+@router.get('/signal-decider/calibration')
+async def get_signal_decider_calibration_report(
+    market_date_from: date = Query(...),
+    market_date_to: date = Query(...),
+    symbols: list[str] | None = Query(default=None),
+    policy_version: str | None = Query(default=None),
+    horizon_days: int = Query(default=5),
+    evaluation_version: str | None = Query(default=None),
+    min_sample_size: int = Query(default=3, ge=1, le=1000),
+    cluster_limit: int = Query(default=10, ge=1, le=50),
+) -> dict:
+    try:
+        return await run_in_threadpool(
+            signal_decider_calibration_service.build_report,
+            market_date_from=market_date_from,
+            market_date_to=market_date_to,
+            symbols=symbols,
+            policy_version=policy_version,
+            horizon_days=horizon_days,
+            evaluation_version=evaluation_version,
+            min_sample_size=min_sample_size,
+            cluster_limit=cluster_limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'Signal-decider calibration report failed: {exc}') from exc
 
 
 @router.post('/signal-decider/policy-candidates/generate')

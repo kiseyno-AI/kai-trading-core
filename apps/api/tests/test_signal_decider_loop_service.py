@@ -7,6 +7,7 @@ from unittest.mock import patch
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 
+from app.agent_context.signal_decider_calibration_service import SignalDeciderCalibrationService
 from app.agent_context.signal_decider_loop_service import (
     DEFAULT_SIGNAL_DECIDER_EVALUATION_LOOKBACK_DAYS,
     DEFAULT_SIGNAL_DECIDER_EVALUATION_VERSION,
@@ -571,6 +572,298 @@ class FakeSignalDeciderLoopRepository:
             self.candidates[candidate_version]['status'] = 'activated'
             self.candidates[candidate_version]['activated_at'] = activated_at_text
         return target
+
+
+def _apply_calibration_context(
+    row,
+    *,
+    confidence_score_10: float,
+    signal_score: float,
+    close_location_ratio: float,
+    unified_value_score: float,
+    momentum_score: float,
+    quality_score: float,
+    liquidity_percentile: float,
+    passes_liquidity_floor: bool,
+    signal_feature_row_kind: str = 'direct_plus_fallback',
+) -> None:
+    signal_score_bucket = 'high' if signal_score >= 70 else 'medium' if signal_score >= 40 else 'low'
+    row.confidence_score_10 = confidence_score_10
+    row.response_payload['confidence_score_10'] = confidence_score_10
+    row.input_feature_snapshot_payload['action_summary']['signal_score'] = signal_score
+    row.input_feature_snapshot_payload['action_summary']['signal_score_bucket'] = signal_score_bucket
+    row.input_feature_snapshot_payload['price_context']['close_location_ratio'] = close_location_ratio
+    row.request_payload['scores'] = {
+        'unified_value': {
+            'status': 'available',
+            'score': unified_value_score,
+            'components_used': 5,
+            'components_possible': 5,
+            'coverage_notes': [],
+            'as_of_market_date': row.market_date.isoformat(),
+        },
+        'momentum': {
+            'status': 'available',
+            'score': momentum_score,
+            'components_used': 3,
+            'components_possible': 3,
+            'coverage_notes': [],
+            'as_of_market_date': row.market_date.isoformat(),
+        },
+        'quality': {
+            'status': 'available',
+            'score': quality_score,
+            'components_used': 6,
+            'components_possible': 6,
+            'coverage_notes': [],
+            'as_of_market_date': row.market_date.isoformat(),
+        },
+    }
+    row.request_payload['factor_summary'] = {
+        'requested_market_date': row.market_date.isoformat(),
+        'factor_scores': {
+            'unified_value': {'status': 'available', 'score': unified_value_score},
+            'momentum': {'status': 'available', 'score': momentum_score},
+            'quality': {'status': 'available', 'score': quality_score},
+        },
+        'signal_features': {
+            'status': 'available',
+            'row_kind': signal_feature_row_kind,
+            'fallback_groups_present': ['price_action', 'factor_scores'],
+        },
+    }
+    row.request_payload['liquidity_context'] = {
+        'status': 'available',
+        'turnover': {
+            'status': 'available',
+            'turnover_source': 'provider',
+            'turnover_krw': 8_800_000_000,
+            'trade_date': row.market_date.isoformat(),
+        },
+        'ranking': {
+            'status': 'available',
+            'liquidity_percentile': liquidity_percentile,
+            'passes_liquidity_floor': passes_liquidity_floor,
+            'as_of_market_date': row.market_date.isoformat(),
+        },
+        'intraday': {
+            'status': 'partial',
+            'quote_spread_points': 100,
+            'quote_balance_rank': 5,
+        },
+    }
+    row.input_feature_snapshot_payload['scores'] = row.request_payload['scores']
+
+
+def _build_signal_decider_calibration_fixture():
+    rows = [
+        _feedback_row(
+            feedback_id=1,
+            snapshot_id=101,
+            market_date='2026-04-20',
+            symbol='005930',
+            action='buy',
+        ),
+        _feedback_row(
+            feedback_id=2,
+            snapshot_id=102,
+            market_date='2026-04-20',
+            symbol='000660',
+            action='buy',
+        ),
+        _feedback_row(
+            feedback_id=3,
+            snapshot_id=103,
+            market_date='2026-04-20',
+            symbol='035420',
+            action='wait',
+            target_price=55,
+            stop_loss_price=47,
+            wait_reason={
+                'code': 'stale_quote_orderbook',
+                'label': 'Stale quote/orderbook freshness',
+                'bucket': 'data_gap',
+                'blocking_by_default': True,
+                'summary': 'Realtime orderbook freshness is stale.',
+                'source': 'provided',
+            },
+        ),
+        _feedback_row(
+            feedback_id=4,
+            snapshot_id=104,
+            market_date='2026-04-20',
+            symbol='051910',
+            action='wait',
+            target_price=55,
+            stop_loss_price=47,
+            wait_reason={
+                'code': 'stale_quote_orderbook',
+                'label': 'Stale quote/orderbook freshness',
+                'bucket': 'data_gap',
+                'blocking_by_default': True,
+                'summary': 'Realtime orderbook freshness is stale.',
+                'source': 'provided',
+            },
+        ),
+        _feedback_row(
+            feedback_id=5,
+            snapshot_id=105,
+            market_date='2026-04-21',
+            symbol='068270',
+            action='buy',
+        ),
+        _feedback_row(
+            feedback_id=6,
+            snapshot_id=106,
+            market_date='2026-04-21',
+            symbol='105560',
+            action='buy',
+        ),
+        _feedback_row(
+            feedback_id=7,
+            snapshot_id=107,
+            market_date='2026-04-29',
+            symbol='207940',
+            action='buy',
+        ),
+    ]
+
+    _apply_calibration_context(
+        rows[0],
+        confidence_score_10=9.0,
+        signal_score=88.0,
+        close_location_ratio=0.46,
+        unified_value_score=0.91,
+        momentum_score=0.92,
+        quality_score=0.82,
+        liquidity_percentile=0.93,
+        passes_liquidity_floor=True,
+    )
+    _apply_calibration_context(
+        rows[1],
+        confidence_score_10=8.5,
+        signal_score=84.0,
+        close_location_ratio=0.52,
+        unified_value_score=0.87,
+        momentum_score=0.89,
+        quality_score=0.79,
+        liquidity_percentile=0.88,
+        passes_liquidity_floor=True,
+    )
+    _apply_calibration_context(
+        rows[2],
+        confidence_score_10=4.0,
+        signal_score=62.0,
+        close_location_ratio=0.83,
+        unified_value_score=0.74,
+        momentum_score=0.81,
+        quality_score=0.69,
+        liquidity_percentile=0.86,
+        passes_liquidity_floor=True,
+    )
+    _apply_calibration_context(
+        rows[3],
+        confidence_score_10=4.5,
+        signal_score=66.0,
+        close_location_ratio=0.79,
+        unified_value_score=0.71,
+        momentum_score=0.78,
+        quality_score=0.67,
+        liquidity_percentile=0.81,
+        passes_liquidity_floor=True,
+    )
+    _apply_calibration_context(
+        rows[4],
+        confidence_score_10=7.2,
+        signal_score=73.0,
+        close_location_ratio=0.61,
+        unified_value_score=0.76,
+        momentum_score=0.74,
+        quality_score=0.72,
+        liquidity_percentile=0.67,
+        passes_liquidity_floor=True,
+    )
+    _apply_calibration_context(
+        rows[5],
+        confidence_score_10=6.8,
+        signal_score=58.0,
+        close_location_ratio=0.55,
+        unified_value_score=0.63,
+        momentum_score=0.61,
+        quality_score=0.64,
+        liquidity_percentile=0.41,
+        passes_liquidity_floor=False,
+    )
+    _apply_calibration_context(
+        rows[6],
+        confidence_score_10=7.5,
+        signal_score=71.0,
+        close_location_ratio=0.72,
+        unified_value_score=0.79,
+        momentum_score=0.77,
+        quality_score=0.74,
+        liquidity_percentile=0.72,
+        passes_liquidity_floor=True,
+    )
+
+    bars_by_symbol = {
+        '005930': [
+            {'trade_date': '2026-04-20', 'open_price': 99, 'high_price': 100, 'low_price': 98, 'close_price': 99, 'volume': 1000},
+            {'trade_date': '2026-04-21', 'open_price': 100, 'high_price': 106, 'low_price': 99, 'close_price': 104, 'volume': 1000},
+            {'trade_date': '2026-04-22', 'open_price': 104, 'high_price': 107, 'low_price': 103, 'close_price': 105, 'volume': 1000},
+            {'trade_date': '2026-04-23', 'open_price': 105, 'high_price': 108, 'low_price': 104, 'close_price': 107, 'volume': 1000},
+            {'trade_date': '2026-04-24', 'open_price': 107, 'high_price': 109, 'low_price': 106, 'close_price': 108, 'volume': 1000},
+            {'trade_date': '2026-04-27', 'open_price': 108, 'high_price': 111, 'low_price': 107, 'close_price': 110, 'volume': 1000},
+        ],
+        '000660': [
+            {'trade_date': '2026-04-20', 'open_price': 98, 'high_price': 99, 'low_price': 97, 'close_price': 98, 'volume': 1000},
+            {'trade_date': '2026-04-21', 'open_price': 100, 'high_price': 107, 'low_price': 99, 'close_price': 105, 'volume': 1000},
+            {'trade_date': '2026-04-22', 'open_price': 105, 'high_price': 108, 'low_price': 104, 'close_price': 106, 'volume': 1000},
+            {'trade_date': '2026-04-23', 'open_price': 106, 'high_price': 109, 'low_price': 105, 'close_price': 108, 'volume': 1000},
+            {'trade_date': '2026-04-24', 'open_price': 108, 'high_price': 110, 'low_price': 107, 'close_price': 109, 'volume': 1000},
+            {'trade_date': '2026-04-27', 'open_price': 109, 'high_price': 112, 'low_price': 108, 'close_price': 111, 'volume': 1000},
+        ],
+        '035420': [
+            {'trade_date': '2026-04-20', 'open_price': 49, 'high_price': 50, 'low_price': 48, 'close_price': 49, 'volume': 900},
+            {'trade_date': '2026-04-21', 'open_price': 50, 'high_price': 56, 'low_price': 49, 'close_price': 55, 'volume': 900},
+            {'trade_date': '2026-04-22', 'open_price': 55, 'high_price': 57, 'low_price': 54, 'close_price': 56, 'volume': 900},
+            {'trade_date': '2026-04-23', 'open_price': 56, 'high_price': 58, 'low_price': 55, 'close_price': 57, 'volume': 900},
+            {'trade_date': '2026-04-24', 'open_price': 57, 'high_price': 59, 'low_price': 56, 'close_price': 58, 'volume': 900},
+            {'trade_date': '2026-04-27', 'open_price': 58, 'high_price': 60, 'low_price': 57, 'close_price': 59, 'volume': 900},
+        ],
+        '051910': [
+            {'trade_date': '2026-04-20', 'open_price': 49, 'high_price': 50, 'low_price': 48, 'close_price': 49, 'volume': 900},
+            {'trade_date': '2026-04-21', 'open_price': 50, 'high_price': 56, 'low_price': 49, 'close_price': 55, 'volume': 900},
+            {'trade_date': '2026-04-22', 'open_price': 55, 'high_price': 57, 'low_price': 54, 'close_price': 56, 'volume': 900},
+            {'trade_date': '2026-04-23', 'open_price': 56, 'high_price': 58, 'low_price': 55, 'close_price': 57, 'volume': 900},
+            {'trade_date': '2026-04-24', 'open_price': 57, 'high_price': 59, 'low_price': 56, 'close_price': 58, 'volume': 900},
+            {'trade_date': '2026-04-27', 'open_price': 58, 'high_price': 60, 'low_price': 57, 'close_price': 59, 'volume': 900},
+        ],
+        '068270': [
+            {'trade_date': '2026-04-21', 'open_price': 99, 'high_price': 100, 'low_price': 98, 'close_price': 99, 'volume': 800},
+            {'trade_date': '2026-04-22', 'open_price': 100, 'high_price': 104, 'low_price': 99, 'close_price': 103, 'volume': 800},
+            {'trade_date': '2026-04-23', 'open_price': 103, 'high_price': 106, 'low_price': 102, 'close_price': 105, 'volume': 800},
+            {'trade_date': '2026-04-24', 'open_price': 105, 'high_price': 108, 'low_price': 104, 'close_price': 107, 'volume': 800},
+            {'trade_date': '2026-04-27', 'open_price': 107, 'high_price': 109, 'low_price': 106, 'close_price': 108, 'volume': 800},
+            {'trade_date': '2026-04-28', 'open_price': 108, 'high_price': 111, 'low_price': 107, 'close_price': 110, 'volume': 800},
+        ],
+        '105560': [
+            {'trade_date': '2026-04-21', 'open_price': 99, 'high_price': 100, 'low_price': 98, 'close_price': 99, 'volume': 800},
+            {'trade_date': '2026-04-22', 'open_price': 100, 'high_price': 103, 'low_price': 99, 'close_price': 102, 'volume': 800},
+            {'trade_date': '2026-04-23', 'open_price': 102, 'high_price': 105, 'low_price': 101, 'close_price': 104, 'volume': 800},
+            {'trade_date': '2026-04-24', 'open_price': 104, 'high_price': 106, 'low_price': 103, 'close_price': None, 'volume': 800},
+            {'trade_date': '2026-04-27', 'open_price': 106, 'high_price': 107, 'low_price': 105, 'close_price': 106, 'volume': 800},
+            {'trade_date': '2026-04-28', 'open_price': 106, 'high_price': 108, 'low_price': 105, 'close_price': 107, 'volume': 800},
+        ],
+        '207940': [
+            {'trade_date': '2026-04-29', 'open_price': 200, 'high_price': 201, 'low_price': 198, 'close_price': 200, 'volume': 700},
+            {'trade_date': '2026-04-30', 'open_price': 201, 'high_price': 204, 'low_price': 199, 'close_price': 203, 'volume': 700},
+        ],
+    }
+    repository = FakeSignalDeciderLoopRepository(rows)
+    loop_service = SignalDeciderLoopService(repository=repository)
+    calibration_service = SignalDeciderCalibrationService(loop_service=loop_service)
+    return loop_service, calibration_service, bars_by_symbol
 
 
 class SignalDeciderLoopServiceTests(unittest.TestCase):
@@ -2859,6 +3152,114 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
         self.assertEqual(result['item']['status'], 'active')
         self.assertEqual(repository.policy_versions[DEFAULT_SIGNAL_DECIDER_POLICY_VERSION]['status'], 'retired')
         self.assertEqual(repository.candidates['signal_decider_policy_v2']['status'], 'activated')
+
+    def test_signal_decider_calibration_report_groups_computed_rows_and_reports_exclusions(self):
+        loop_service, calibration_service, bars_by_symbol = _build_signal_decider_calibration_fixture()
+
+        with patch(
+            'app.agent_context.signal_decider_loop_service.load_daily_bars_for_symbol_range',
+            side_effect=lambda symbol, **kwargs: bars_by_symbol[symbol],
+        ):
+            loop_service.compute_evaluations(
+                market_date_from='2026-04-20',
+                market_date_to='2026-04-20',
+                horizons=[5],
+                evaluation_version='signal_decider_eval_test',
+            )
+            result = calibration_service.build_report(
+                market_date_from='2026-04-20',
+                market_date_to='2026-04-29',
+                horizon_days=5,
+                evaluation_version='signal_decider_eval_test',
+                min_sample_size=2,
+                cluster_limit=5,
+            )
+
+        self.assertEqual(result['summary']['status'], 'ready')
+        self.assertEqual(result['summary']['snapshots_considered'], 7)
+        self.assertEqual(result['summary']['mature_computed_count'], 4)
+        self.assertEqual(
+            result['exclusions']['status_reason_counts'],
+            {
+                'insufficient_price_data': 1,
+                'not_computed': 1,
+                'pending_maturity': 1,
+            },
+        )
+        decision_groups = {
+            item['bucket_value']: item
+            for item in result['group_summaries']['decision_actions']['items']
+        }
+        self.assertEqual(decision_groups['buy']['sample_count'], 2)
+        self.assertEqual(decision_groups['wait']['sample_count'], 2)
+        confidence_groups = {
+            item['bucket_value']: item
+            for item in result['group_summaries']['confidence_buckets']['items']
+        }
+        self.assertEqual(confidence_groups['high']['sample_count'], 2)
+        self.assertEqual(confidence_groups['low']['sample_count'], 2)
+        wait_reason_groups = {
+            item['bucket_value']: item
+            for item in result['group_summaries']['wait_reason_taxonomy']['items']
+        }
+        self.assertEqual(wait_reason_groups['stale_quote_orderbook']['sample_count'], 2)
+        self.assertEqual(wait_reason_groups['stale_quote_orderbook']['negative_rate'], 1.0)
+        self.assertTrue(result['summary']['ready_for_operator_review'])
+        self.assertEqual(result['review_boundary']['manual_review_only'], True)
+        self.assertEqual(result['review_boundary']['auto_apply_prompt_changes'], False)
+
+    def test_signal_decider_calibration_report_identifies_condition_clusters_and_hints(self):
+        loop_service, calibration_service, bars_by_symbol = _build_signal_decider_calibration_fixture()
+
+        with patch(
+            'app.agent_context.signal_decider_loop_service.load_daily_bars_for_symbol_range',
+            side_effect=lambda symbol, **kwargs: bars_by_symbol[symbol],
+        ):
+            loop_service.compute_evaluations(
+                market_date_from='2026-04-20',
+                market_date_to='2026-04-20',
+                horizons=[5],
+                evaluation_version='signal_decider_eval_test',
+            )
+            result = calibration_service.build_report(
+                market_date_from='2026-04-20',
+                market_date_to='2026-04-29',
+                horizon_days=5,
+                evaluation_version='signal_decider_eval_test',
+                min_sample_size=2,
+                cluster_limit=5,
+            )
+
+        positive_clusters = list(result['condition_clusters']['positive'])
+        negative_clusters = list(result['condition_clusters']['negative'])
+        self.assertTrue(
+            any(
+                any(
+                    token['key'] == 'decision.confidence_bucket' and token['value'] == 'high'
+                    for token in cluster['tokens']
+                )
+                for cluster in positive_clusters
+            )
+        )
+        self.assertTrue(
+            any(
+                any(
+                    token['key'] == 'wait_reason.code' and token['value'] == 'stale_quote_orderbook'
+                    for token in cluster['tokens']
+                )
+                for cluster in negative_clusters
+            )
+        )
+        self.assertGreaterEqual(len(result['calibration_hints']['scoring_guidance']), 1)
+        self.assertGreaterEqual(len(result['calibration_hints']['operator_review']), 1)
+        all_hints = (
+            list(result['calibration_hints']['prompt_guidance'])
+            + list(result['calibration_hints']['scoring_guidance'])
+            + list(result['calibration_hints']['operator_review'])
+        )
+        self.assertTrue(all_hints)
+        self.assertTrue(all(hint['manual_review_only'] is True for hint in all_hints))
+        self.assertTrue(all(hint['auto_apply'] is False for hint in all_hints))
 
 
 if __name__ == '__main__':
