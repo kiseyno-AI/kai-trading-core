@@ -706,6 +706,7 @@ def build_signal_decider_payload(
     upstream_traceability: dict[str, dict[str, Any]],
     signal_decider_agent_name: str,
     signal_decider_policy: dict[str, Any] | None = None,
+    previous_decision_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     symbol_day_context = jsonable_encoder(strip_runtime_session_fields(item))
     score_context = symbol_day_context.pop('scores', {}) if isinstance(symbol_day_context.get('scores'), dict) else {}
@@ -753,6 +754,7 @@ def build_signal_decider_payload(
         'thesis_summary',
         'supporting_evidence',
         'decision_risks',
+        'decision_delta',
         'invalidation_conditions',
         'data_quality_warnings',
         'specialist_disagreement',
@@ -783,6 +785,7 @@ def build_signal_decider_payload(
             'trigger_conditions',
             'supporting_evidence',
             'tactical_risks',
+            'decision_delta',
             'invalidation_conditions',
             'data_quality_warnings',
             'traceability',
@@ -806,12 +809,35 @@ def build_signal_decider_payload(
         'market_context': jsonable_encoder(market_context or {}),
         'upstream_summaries': jsonable_encoder(upstream_summaries),
         'upstream_traceability': jsonable_encoder(upstream_traceability),
+        'previous_decision_context': jsonable_encoder(previous_decision_context or {}),
         'decision_support_constraints': {
             'decision_support_only': True,
             'allow_execution_logic': False,
             'allow_position_sizing': False,
             'allow_leverage_guidance': False,
             'avoid_fake_precision': True,
+            'decision_history_guidance': {
+                'use_previous_decision_context_when_available': True,
+                'repeat_wait_requires_delta_summary': True,
+                'forbid_copy_paste_repeat_wait_explanations': True,
+                'required_transition_coverage': ['wait_to_wait', 'wait_to_buy_or_watch', 'buy_or_watch_to_wait'],
+                'required_delta_fields': [
+                    'previous_market_date',
+                    'previous_recommendation',
+                    'previous_recommendation_class',
+                    'previous_wait_reason',
+                    'current_recommendation',
+                    'current_recommendation_class',
+                    'current_wait_reason',
+                    'transition',
+                    'persistence_trend',
+                    'changed_fields',
+                    'stable_fields',
+                    'what_changed',
+                    'what_stayed_same',
+                    'upgrade_trigger',
+                ],
+            },
             'missing_context_policy': {
                 'core_execution_blocks': ['liquidity_turnover', 'intraday_realtime'],
                 'supporting_context_blocks': [

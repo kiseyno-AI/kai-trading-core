@@ -535,6 +535,7 @@ def _build_feedback_review_decision_payload(raw_item: dict[str, Any]) -> dict[st
         'supporting_evidence': supporting_evidence,
         'risk_flags': decision_risks,
         'decision_risks': decision_risks,
+        'decision_delta': raw_item.get('decision_delta'),
         'policy_version': raw_item.get('policy_version'),
         'evaluation': evaluation_payload or None,
     }

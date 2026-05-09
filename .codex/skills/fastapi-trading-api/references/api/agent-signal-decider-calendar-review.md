@@ -86,7 +86,7 @@ GET /agent-context/signal-decider/calendar?month=2026-04&horizons=1&horizons=3&h
 # GET /agent-context/signal-decider/calendar/{market_date}
 
 ## Summary
-Selected-date replay review for all `signal-decider` decisions emitted on one market date, read from the persisted calendar-review artifacts. Each item keeps the original decision fields, adds D+1 or D+3 or D+5 replay summaries, and exposes both the structured replay narrative and direct calendar-facing aliases such as `quality_verdict`, `quality_reason`, `review_conclusion`, `path_outcome`, and `intraday_path_result`. Per-horizon coverage metadata makes immature windows and price-data gaps explicit.
+Selected-date replay review for all `signal-decider` decisions emitted on one market date, read from the persisted calendar-review artifacts. Each item keeps the original decision fields, the persisted `decision_delta`, adds D+1 or D+3 or D+5 replay summaries, and exposes both the structured replay narrative and direct calendar-facing aliases such as `quality_verdict`, `quality_reason`, `review_conclusion`, `path_outcome`, and `intraday_path_result`. Per-horizon coverage metadata makes immature windows and price-data gaps explicit.
 
 ## Example request
 ```http
@@ -119,6 +119,13 @@ GET /agent-context/signal-decider/calendar/2026-04-20?horizons=1&horizons=3&hori
         "action": "buy",
         "target_price": 105,
         "stop_loss_price": 96
+      },
+      "decision_delta": {
+        "has_previous_decision": true,
+        "previous_recommendation": "wait",
+        "current_recommendation": "buy",
+        "transition": "wait_to_buy",
+        "persistence_trend": "improving"
       },
       "summary": "Breakout quality stayed constructive.",
       "review": {
@@ -210,7 +217,7 @@ GET /agent-context/signal-decider/calendar/2026-04-20?horizons=1&horizons=3&hori
 # GET /agent-context/signal-decider/calendar/{market_date}/snapshots/{snapshot_id}
 
 ## Summary
-Replay-only drilldown for one immutable decision snapshot on the selected date, backed by the persisted calendar-review detail payload. It returns the replay insight, the primary-horizon trigger checkpoints, and the observed price path used by the synthetic review model. Actual fills and broker P&L stay on `GET /agent-context/signal-decider/execution-outcomes`.
+Replay-only drilldown for one immutable decision snapshot on the selected date, backed by the persisted calendar-review detail payload. It returns the replay insight, the persisted `decision_delta`, the primary-horizon trigger checkpoints, and the observed price path used by the synthetic review model. Actual fills and broker P&L stay on `GET /agent-context/signal-decider/execution-outcomes`.
 
 ## Example request
 ```http

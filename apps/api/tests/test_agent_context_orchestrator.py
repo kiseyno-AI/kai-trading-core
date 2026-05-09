@@ -1280,7 +1280,79 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         feedback_service = FakeFeedbackService()
         cleanup_service = FakeSessionCleanupService()
         fake_settings = SimpleNamespace(openclaw_agent_symbol_chunk_size=1, openclaw_agent_parallel_subtasks=2)
-        reuse_service = SimpleNamespace(build_latest_decisions=lambda **kwargs: {})
+        def build_latest_decisions(**kwargs):
+            roles = tuple(kwargs['roles'])
+            if set(roles) == set(orchestrator_module.UPSTREAM_SUMMARY_ROLES):
+                return {}
+            return {
+                '005930': {
+                    'short-term-decider': SimpleNamespace(
+                        should_dispatch=True,
+                        latest_feedback={
+                            'id': 81,
+                            'market_date': '2026-04-13',
+                            'symbol': '005930',
+                            'agent_name': 'short-term-decider',
+                            'run_id': 'short-prev-81',
+                            'received_at': '2026-04-13T06:00:00+00:00',
+                            'feedback_payload': {
+                                'role': 'short-term-decider',
+                                'symbol': '005930',
+                                'market_date': '2026-04-13',
+                                'tactical_action': 'watch_for_trigger',
+                                'preferred_action': 'watch_for_trigger',
+                                'trigger_price': 86800,
+                                'chase_limit_price': 88100,
+                                'target_price': 91200,
+                                'stop_loss_price': 82900,
+                                'confidence_score_10': 6,
+                                'conviction_score_10': 5,
+                                'thesis_summary': '이전에는 돌파 확인이 더 필요했다.',
+                                'trigger_conditions': ['86800원 돌파와 거래량 동반'],
+                                'supporting_evidence': ['Momentum remained constructive.'],
+                                'tactical_risks': ['Opening volatility remained elevated.'],
+                                'invalidation_conditions': ['Breakout fails back under 82900.'],
+                                'data_quality_warnings': [],
+                            },
+                        },
+                    ),
+                    'signal-decider': SimpleNamespace(
+                        should_dispatch=True,
+                        latest_feedback={
+                            'id': 82,
+                            'market_date': '2026-04-13',
+                            'symbol': '005930',
+                            'agent_name': 'signal-decider',
+                            'run_id': 'signal-prev-82',
+                            'received_at': '2026-04-13T06:05:00+00:00',
+                            'feedback_payload': {
+                                'role': 'signal-decider',
+                                'symbol': '005930',
+                                'market_date': '2026-04-13',
+                                'preferred_action': 'wait',
+                                'next_day_open_action': 'wait',
+                                'wait_reason': {
+                                    'code': 'stale_quote_orderbook',
+                                    'summary': '호가 신선도 부족으로 대기했다.',
+                                },
+                                'target_price': None,
+                                'expected_return_pct': None,
+                                'stop_loss_price': None,
+                                'confidence_score_10': 5,
+                                'conviction_score_10': 4,
+                                'thesis_summary': '이전에는 호가 신선도 부족으로 대기했다.',
+                                'supporting_evidence': ['Breadth improved.'],
+                                'decision_risks': ['Orderbook freshness remained stale.'],
+                                'invalidation_conditions': ['Fresh realtime quote required.'],
+                                'data_quality_warnings': ['Realtime orderbook freshness is stale.'],
+                                'specialist_disagreement': [],
+                            },
+                        },
+                    ),
+                }
+            }
+
+        reuse_service = SimpleNamespace(build_latest_decisions=build_latest_decisions)
         market_context_builder = FakeMarketContextBuilder(
             {
                 'status': 'ready',
@@ -1319,7 +1391,7 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
                                     result = service.dispatch_for_symbols(
                                         market_date='2026-04-14',
                                         symbols=['005930'],
-                                        reuse_existing=False,
+                                        reuse_existing=True,
                                     )
 
         self.assertEqual(
@@ -1331,9 +1403,17 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertEqual(short_term_payload['orchestration']['request_model'], 'openclaw/short-term-decider')
         self.assertIn('trigger_price', short_term_payload['output_contract']['required_feedback_fields'])
         self.assertIn('wait_reason', short_term_payload['output_contract']['required_feedback_fields'])
+        self.assertIn('decision_delta', short_term_payload['output_contract']['required_feedback_fields'])
+        self.assertTrue(short_term_payload['previous_decision_context']['available'])
+        self.assertEqual(short_term_payload['previous_decision_context']['recommendation'], 'watch_for_trigger')
         self.assertTrue(
             short_term_payload['decision_support_constraints']['missing_context_policy'][
                 'auxiliary_context_absence_not_tradeability_blocker'
+            ]
+        )
+        self.assertTrue(
+            short_term_payload['decision_support_constraints']['decision_history_guidance'][
+                'repeat_wait_requires_delta_summary'
             ]
         )
         self.assertEqual(short_term_payload['decider_data_quality_context']['status'], 'partial')
@@ -1387,6 +1467,8 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
             decider_payload['orchestration']['required_upstream_roles'],
             ['eod-summarizer', 'technical-summarizer', 'fundamental-summarizer'],
         )
+        self.assertTrue(decider_payload['previous_decision_context']['available'])
+        self.assertEqual(decider_payload['previous_decision_context']['recommendation'], 'wait')
         self.assertTrue(
             decider_payload['decision_support_constraints']['missing_context_policy']['empty_recent_news_is_neutral']
         )
@@ -1399,6 +1481,7 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertTrue(decider_payload['output_contract']['batch_envelope_required'])
         self.assertTrue(decider_payload['output_contract']['symbol_identity']['exact_match_required'])
         self.assertIn('wait_reason', decider_payload['output_contract']['required_feedback_fields'])
+        self.assertIn('decision_delta', decider_payload['output_contract']['required_feedback_fields'])
         self.assertIn(
             'item_symbol_feedback_symbol_and_traceability_symbol_match_assigned_symbol',
             decider_payload['output_contract']['self_check_before_final_output'],

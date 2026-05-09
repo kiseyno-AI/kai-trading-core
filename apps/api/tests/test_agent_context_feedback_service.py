@@ -79,6 +79,13 @@ class FakeSignalDeciderLoopService:
         summary_payload = dict(kwargs['summary_payload'])
         feedback_payload = dict(kwargs['feedback_payload'])
         context_payload = dict(kwargs['context_payload'] or {}) if kwargs['context_payload'] is not None else None
+        if kwargs['agent_name'] in {'signal-decider', 'short-term-decider'}:
+            feedback_payload['decision_delta'] = {
+                'has_previous_decision': bool((context_payload or {}).get('previous_decision_context')),
+                'transition': 'wait_to_wait',
+                'persistence_trend': 'persistent',
+                'current_recommendation': feedback_payload.get('next_day_open_action') or feedback_payload.get('preferred_action') or feedback_payload.get('tactical_action') or 'wait',
+            }
         if kwargs['agent_name'] == 'signal-decider':
             summary_payload['policy_version'] = 'signal_decider_policy_v1'
             feedback_payload['policy_version'] = 'signal_decider_policy_v1'
@@ -206,12 +213,43 @@ class AgentContextFeedbackServiceTests(unittest.TestCase):
             repository.created['context_payload']['signal_decider_trace']['feature_snapshot']['technical']['breakout_20d'],
             True,
         )
+        self.assertIn('decision_delta', repository.created['feedback_payload'])
+        self.assertFalse(repository.created['feedback_payload']['decision_delta']['has_previous_decision'])
         self.assertEqual(
             repository.created['context_payload']['upstream_summaries']['technical']['details']['support_resistance']['support_levels'],
             [80000],
         )
         self.assertEqual(repository.created['feedback_payload']['specialist_disagreement'][0], 'Fundamentals were constructive but not decisive.')
         self.assertTrue(result['accepted'])
+
+    def test_submit_feedback_preserves_previous_decision_context_for_delta_enrichment(self):
+        repository = FakeFeedbackRepository()
+        loop_service = FakeSignalDeciderLoopService()
+        service = AgentContextFeedbackService(repository=repository, decision_loop_service=loop_service)
+
+        service.submit_feedback(
+            market_date='2026-04-24',
+            symbol='005930',
+            agent_name='signal-decider',
+            feedback={
+                'role': 'signal-decider',
+                'preferred_action': 'wait',
+                'next_day_open_action': 'wait',
+                'entry_price_basis': 'next_open',
+                'details': {'decision_support': {'decision_support_only': True}},
+            },
+            context={
+                'previous_decision_context': {
+                    'available': True,
+                    'recommendation': 'wait',
+                    'recommendation_class': 'wait',
+                    'market_date': '2026-04-23',
+                }
+            },
+        )
+
+        self.assertTrue(repository.created['feedback_payload']['decision_delta']['has_previous_decision'])
+        self.assertEqual(repository.created['context_payload']['previous_decision_context']['market_date'], '2026-04-23')
 
     def test_submit_feedback_derives_missing_data_categories_from_feedback_notes(self):
         repository = FakeFeedbackRepository()

@@ -3,7 +3,7 @@
 ## Summary
 Returns the latest reusable feedback bundle per symbol and role for decision-agent consumption.
 
-Each role item includes `latest_feedback.run_id` when stored feedback exists, so operators can trace a reusable symbol summary back to the durable run that wrote it.
+Each role item includes `latest_feedback.run_id` when stored feedback exists, so operators can trace a reusable symbol summary back to the durable run that wrote it. Decision-support roles also carry their persisted `decision_delta` inside `latest_feedback.feedback_payload` so the next decider run can hydrate prior WAIT or WATCH state directly from this bundle.
 
 ## Example request
 ```http

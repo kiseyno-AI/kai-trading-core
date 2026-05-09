@@ -13,6 +13,7 @@ from sqlalchemy import case, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import SQLAlchemyError
 
+from app.agent_context.decision_delta import build_decision_delta
 from app.agent_context.roles import SHORT_TERM_DECIDER_AGENT_NAME, SIGNAL_DECIDER_AGENT_NAME
 from app.agent_context.wait_reason_taxonomy import derive_wait_reason
 from app.db import session_scope
@@ -505,6 +506,43 @@ def _maybe_dict(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
         return value
     return {}
+
+
+def _decision_delta_details_key(agent_name: str) -> str | None:
+    if agent_name == SIGNAL_DECIDER_AGENT_NAME:
+        return 'decision_support'
+    if agent_name == SHORT_TERM_DECIDER_AGENT_NAME:
+        return 'tactical_decision_support'
+    return None
+
+
+def _attach_decision_delta_to_payload(
+    *,
+    agent_name: str,
+    payload: dict[str, Any],
+    decision_delta: dict[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        payload = {}
+    details = _maybe_dict(payload.get('details'))
+    details_key = _decision_delta_details_key(agent_name)
+    if details_key is None:
+        return {
+            **payload,
+            'decision_delta': decision_delta,
+        }
+    details_block = _maybe_dict(details.get(details_key))
+    return {
+        **payload,
+        'decision_delta': decision_delta,
+        'details': {
+            **details,
+            details_key: {
+                **details_block,
+                'decision_delta': decision_delta,
+            },
+        },
+    }
 
 
 def _merge_policy_metadata_preserving_audit(
@@ -2180,18 +2218,10 @@ class SignalDeciderLoopService:
         feedback_payload: dict[str, Any],
         context_payload: dict[str, Any] | None,
     ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any] | None]:
-        if agent_name != SIGNAL_DECIDER_AGENT_NAME:
+        if agent_name not in {SIGNAL_DECIDER_AGENT_NAME, SHORT_TERM_DECIDER_AGENT_NAME}:
             return summary_payload, feedback_payload, context_payload
 
         context = dict(context_payload or {})
-        default_policy_context = self.get_active_policy_context()
-        policy_version = _policy_version_from_payloads(
-            summary_payload=summary_payload,
-            feedback_payload=feedback_payload,
-            context_payload=context,
-            default_policy_version=default_policy_context.get('current_version'),
-        )
-        policy_context = self.get_policy_prompt_context(policy_version=policy_version)
         feature_snapshot = build_signal_decider_feature_snapshot(
             symbol_day_context=_maybe_dict(context.get('symbol_day_context')),
             feedback_payload=feedback_payload,
@@ -2199,17 +2229,47 @@ class SignalDeciderLoopService:
         )
         enriched_summary = dict(summary_payload)
         enriched_feedback = dict(feedback_payload)
-        enriched_summary.setdefault('policy_version', policy_version)
-        enriched_feedback.setdefault('policy_version', policy_version)
-        context['signal_decider_policy'] = policy_context
-        context['signal_decider_trace'] = {
-            'policy_version': policy_version,
-            'decision_action': _normalize_action(
-                feedback_payload.get('next_day_open_action') or feedback_payload.get('preferred_action')
+        if agent_name == SIGNAL_DECIDER_AGENT_NAME:
+            default_policy_context = self.get_active_policy_context()
+            policy_version = _policy_version_from_payloads(
+                summary_payload=summary_payload,
+                feedback_payload=feedback_payload,
+                context_payload=context,
+                default_policy_version=default_policy_context.get('current_version'),
+            )
+            policy_context = self.get_policy_prompt_context(policy_version=policy_version)
+            enriched_summary.setdefault('policy_version', policy_version)
+            enriched_feedback.setdefault('policy_version', policy_version)
+            context['signal_decider_policy'] = policy_context
+            context['signal_decider_trace'] = {
+                'policy_version': policy_version,
+                'decision_action': _normalize_action(
+                    feedback_payload.get('next_day_open_action') or feedback_payload.get('preferred_action')
+                ),
+                'feature_snapshot': feature_snapshot,
+                'traceability': _maybe_dict(feedback_payload.get('traceability')),
+            }
+
+        decision_delta = build_decision_delta(
+            role=agent_name,
+            payload=enriched_feedback,
+            market_date=(
+                feedback_payload.get('market_date')
+                or summary_payload.get('market_date')
+                or context.get('market_date')
             ),
-            'feature_snapshot': feature_snapshot,
-            'traceability': _maybe_dict(feedback_payload.get('traceability')),
-        }
+            symbol=(
+                feedback_payload.get('symbol')
+                or summary_payload.get('symbol')
+                or _maybe_dict(context.get('symbol_day_context')).get('symbol')
+            ),
+            previous_decision_context=_maybe_dict(context.get('previous_decision_context')) or None,
+        )
+        enriched_feedback = _attach_decision_delta_to_payload(
+            agent_name=agent_name,
+            payload=enriched_feedback,
+            decision_delta=decision_delta,
+        )
         return enriched_summary, enriched_feedback, context
 
     def prepare_snapshot_persistence_item(
@@ -2272,6 +2332,20 @@ class SignalDeciderLoopService:
                     **response_payload,
                     'wait_reason': wait_reason,
                 }
+            decision_delta = build_decision_delta(
+                role=agent_name,
+                payload=response_payload,
+                market_date=normalized_market_date,
+                symbol=symbol,
+                previous_decision_context=_maybe_dict(request_payload.get('previous_decision_context')) or None,
+                feedback_id=feedback_id,
+                received_at=received_at.isoformat() if isinstance(received_at, datetime) else received_at,
+            )
+            response_payload = _attach_decision_delta_to_payload(
+                agent_name=agent_name,
+                payload=response_payload,
+                decision_delta=decision_delta,
+            )
             traceability_payload = _maybe_dict(request_payload.get('signal_decider_trace')).get('traceability')
             if not isinstance(traceability_payload, dict) or not traceability_payload.get('schema_version'):
                 traceability_payload = build_signal_decider_traceability_snapshot(
@@ -2290,6 +2364,13 @@ class SignalDeciderLoopService:
                     context_payload=request_payload,
                     feature_snapshot=feature_snapshot,
                 )
+            traceability_payload = {
+                **_maybe_dict(traceability_payload),
+                'final_action_rationale': {
+                    **_maybe_dict(_maybe_dict(traceability_payload).get('final_action_rationale')),
+                    'decision_delta': decision_delta,
+                },
+            }
             return {
                 'feedback_id': feedback_id,
                 'market_date': normalized_market_date,
@@ -2367,6 +2448,20 @@ class SignalDeciderLoopService:
                     **response_payload,
                     'wait_reason': wait_reason,
                 }
+            decision_delta = build_decision_delta(
+                role=agent_name,
+                payload=response_payload,
+                market_date=normalized_market_date,
+                symbol=symbol,
+                previous_decision_context=_maybe_dict(request_payload.get('previous_decision_context')) or None,
+                feedback_id=feedback_id,
+                received_at=received_at.isoformat() if isinstance(received_at, datetime) else received_at,
+            )
+            response_payload = _attach_decision_delta_to_payload(
+                agent_name=agent_name,
+                payload=response_payload,
+                decision_delta=decision_delta,
+            )
             traceability_payload = _maybe_dict(response_payload.get('traceability'))
             if not isinstance(traceability_payload, dict) or not traceability_payload.get('schema_version'):
                 traceability_payload = build_short_term_decider_traceability_snapshot(
@@ -2384,6 +2479,13 @@ class SignalDeciderLoopService:
                     feedback_payload=response_payload,
                     context_payload=request_payload,
                 )
+            traceability_payload = {
+                **_maybe_dict(traceability_payload),
+                'final_action_rationale': {
+                    **_maybe_dict(_maybe_dict(traceability_payload).get('final_action_rationale')),
+                    'decision_delta': decision_delta,
+                },
+            }
             feature_snapshot = {
                 'symbol_day_context': _maybe_dict(request_payload.get('symbol_day_context')),
                 'scores': _maybe_dict(request_payload.get('scores')),
@@ -3603,6 +3705,7 @@ class SignalDeciderLoopService:
             'decision_action': _maybe_dict(decision.get('decision')).get('action'),
             'summary': decision.get('summary'),
             'wait_reason': _maybe_dict(decision.get('wait_reason')) or None,
+            'decision_delta': _maybe_dict(decision.get('decision_delta')) or None,
             'supporting_evidence': list(decision.get('supporting_evidence') or []),
             'decision_risks': list(decision.get('decision_risks') or []),
             'invalidation_conditions': list(decision.get('invalidation_conditions') or []),
@@ -4061,6 +4164,15 @@ class SignalDeciderLoopService:
             action=decision_action,
             payload=feedback_payload,
         )
+        decision_delta = build_decision_delta(
+            role=row.agent_name,
+            payload=feedback_payload,
+            market_date=row.market_date,
+            symbol=row.symbol,
+            previous_decision_context=_maybe_dict(request_payload.get('previous_decision_context')) or None,
+            feedback_id=row.feedback_id,
+            received_at=row.feedback_received_at.isoformat() if row.feedback_received_at else None,
+        )
         traceability = _maybe_dict(row.traceability_payload)
         if not traceability.get('schema_version'):
             traceability = build_signal_decider_traceability_snapshot(
@@ -4079,6 +4191,13 @@ class SignalDeciderLoopService:
                 context_payload=request_payload,
                 feature_snapshot=feature_snapshot,
             )
+        traceability = {
+            **traceability,
+            'final_action_rationale': {
+                **_maybe_dict(traceability.get('final_action_rationale')),
+                'decision_delta': decision_delta,
+            },
+        }
         return {
             'snapshot_id': row.id,
             'feedback_id': row.feedback_id,
@@ -4103,6 +4222,7 @@ class SignalDeciderLoopService:
             },
             'summary': thesis_summary,
             'wait_reason': wait_reason,
+            'decision_delta': decision_delta,
             'supporting_evidence': _normalize_text_list(row.supporting_evidence_payload),
             'decision_risks': _normalize_text_list(row.decision_risks_payload),
             'invalidation_conditions': _normalize_text_list(row.invalidation_conditions_payload),
@@ -4455,6 +4575,7 @@ class SignalDeciderLoopService:
             'symbol': decision['symbol'],
             'policy_version': decision['policy_version'],
             'decision': decision['decision'],
+            'decision_delta': decision.get('decision_delta'),
             'summary': decision['summary'],
             'supporting_evidence': decision['supporting_evidence'],
             'decision_risks': decision['decision_risks'],

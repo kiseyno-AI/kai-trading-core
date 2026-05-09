@@ -123,7 +123,7 @@ def _serialize_feedback(record: AgentContextFeedback) -> dict[str, Any]:
         },
         'summary': {},
         'feedback': record.feedback_payload,
-        'normalized_feedback': None,
+        'normalized_feedback': record.normalized_feedback_payload,
         'details': record.details_payload,
         'data_gaps': record.data_gaps_payload,
         'improvement_notes': record.improvement_notes_payload,

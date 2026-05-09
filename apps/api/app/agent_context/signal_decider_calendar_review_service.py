@@ -283,6 +283,7 @@ class SignalDeciderCalendarReviewService:
                 'symbol',
                 'policy_version',
                 'decision',
+                'decision_delta',
                 'summary',
                 'supporting_evidence',
                 'decision_risks',
