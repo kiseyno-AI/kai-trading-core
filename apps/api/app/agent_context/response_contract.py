@@ -4,6 +4,7 @@ import json
 from datetime import date
 from typing import Any
 
+from app.agent_context.decision_delta import build_decision_delta
 from app.agent_context.roles import SHORT_TERM_DECIDER_AGENT_NAME, SIGNAL_DECIDER_AGENT_NAME
 from app.agent_context.wait_reason_taxonomy import (
     WAIT_REASON_ISSUE_GENERIC,
@@ -114,6 +115,7 @@ def _normalize_short_term_decider_action(value: Any) -> str:
 def _build_signal_decider_details(
     *,
     parsed_details: dict[str, Any],
+    decision_delta: dict[str, Any],
     next_day_open_action: str,
     wait_reason: dict[str, Any] | None,
     entry_price_basis: str,
@@ -135,6 +137,7 @@ def _build_signal_decider_details(
         'decision_support': {
             'next_day_open_action': next_day_open_action,
             'wait_reason': wait_reason,
+            'decision_delta': decision_delta,
             'entry_price_basis': entry_price_basis,
             'target_price': target_price,
             'expected_return_pct': expected_return_pct,
@@ -242,6 +245,14 @@ def _normalize_signal_decider_response(
     if confidence is None and confidence_score_10 is not None:
         confidence = round(confidence_score_10 / 10, 4)
 
+    decision_delta = build_decision_delta(
+        role=role,
+        payload=payload,
+        market_date=normalized_market_date,
+        symbol=normalized_symbol,
+        previous_decision_context=payload.get('previous_decision_context'),
+    )
+
     normalized = {
         'role': role,
         'agent_name': resolved_agent_name,
@@ -263,12 +274,14 @@ def _normalize_signal_decider_response(
         'invalidation_conditions': invalidation_conditions,
         'data_quality_warnings': data_quality_warnings,
         'specialist_disagreement': specialist_disagreement,
+        'decision_delta': decision_delta,
         'traceability': traceability,
         'summary': thesis_summary,
         'confidence': confidence,
         'risk_flags': risk_flags,
         'details': _build_signal_decider_details(
             parsed_details=parsed_details,
+            decision_delta=decision_delta,
             next_day_open_action=next_day_open_action,
             wait_reason=wait_reason,
             entry_price_basis=entry_price_basis,
@@ -293,6 +306,7 @@ def _normalize_signal_decider_response(
 def _build_short_term_decider_details(
     *,
     parsed_details: dict[str, Any],
+    decision_delta: dict[str, Any],
     tactical_action: str,
     wait_reason: dict[str, Any] | None,
     trigger_price: float | None,
@@ -314,6 +328,7 @@ def _build_short_term_decider_details(
         'tactical_decision_support': {
             'tactical_action': tactical_action,
             'wait_reason': wait_reason,
+            'decision_delta': decision_delta,
             'trigger_price': trigger_price,
             'chase_limit_price': chase_limit_price,
             'target_price': target_price,
@@ -419,6 +434,14 @@ def _normalize_short_term_decider_response(
     if confidence is None and confidence_score_10 is not None:
         confidence = round(confidence_score_10 / 10, 4)
 
+    decision_delta = build_decision_delta(
+        role=role,
+        payload=payload,
+        market_date=normalized_market_date,
+        symbol=normalized_symbol,
+        previous_decision_context=payload.get('previous_decision_context'),
+    )
+
     return {
         'role': role,
         'agent_name': resolved_agent_name,
@@ -440,12 +463,14 @@ def _normalize_short_term_decider_response(
         'tactical_risks': tactical_risks,
         'invalidation_conditions': invalidation_conditions,
         'data_quality_warnings': data_quality_warnings,
+        'decision_delta': decision_delta,
         'traceability': traceability,
         'summary': thesis_summary,
         'confidence': confidence,
         'risk_flags': risk_flags,
         'details': _build_short_term_decider_details(
             parsed_details=parsed_details,
+            decision_delta=decision_delta,
             tactical_action=tactical_action,
             wait_reason=wait_reason,
             trigger_price=trigger_price,
@@ -473,7 +498,7 @@ def build_contract_prompt_suffix(*, role: str | None = None) -> str:
             'Return JSON only. Do not wrap in markdown. '
             'For every short-term-decider feedback object, required keys are: role, agent_name, symbol, market_date, tactical_action, preferred_action, '
             'wait_reason, trigger_price, chase_limit_price, target_price, stop_loss_price, expected_holding_period, confidence_score_10, conviction_score_10, '
-            'thesis_summary, trigger_conditions, supporting_evidence, tactical_risks, invalidation_conditions, data_quality_warnings, traceability, '
+            'thesis_summary, trigger_conditions, supporting_evidence, tactical_risks, invalidation_conditions, data_quality_warnings, decision_delta, traceability, '
             'summary, confidence, risk_flags, details, improvement_notes. '
             'Operator-facing free-text fields must be written in Korean while keeping the outer response as raw JSON only. '
             'Do not translate or localize machine-readable enum fields such as tactical_action or preferred_action. '
@@ -486,6 +511,9 @@ def build_contract_prompt_suffix(*, role: str | None = None) -> str:
             f'wait_reason must be an object with code and summary when tactical_action/preferred_action is watch_for_trigger, avoid_chase, or wait; otherwise use null. Valid wait_reason.code values are: {wait_reason_codes}. '
             'wait_reason.summary must be a concise Korean explanation that names the concrete blocker. '
             'Do not use vague wait text such as insufficient information, need more data, or wait for more confirmation unless the same summary explicitly names the concrete blocker. '
+            'decision_delta must be an object, not prose, and should summarize prior-vs-current change metadata when previous_decision_context is available in the request. '
+            'decision_delta should include previous_market_date, previous_recommendation, previous_recommendation_class, previous_wait_reason, current_recommendation, current_recommendation_class, current_wait_reason, transition, persistence_trend, changed_fields, stable_fields, what_changed, what_stayed_same, and upgrade_trigger. '
+            'When a wait-like recommendation repeats, do not copy-paste the earlier explanation. Summarize what changed, what stayed the same, whether the setup is persistent or improving or worsening, and the concrete trigger that upgrades the setup to scalp_buy_candidate or watch_for_trigger. '
             'trigger_price, chase_limit_price, target_price, and stop_loss_price must be included for every item and should be explicit conservative numeric levels whenever the inputs support them; use null rather than fake precision when unsupported and explain why in data_quality_warnings. '
             'expected_holding_period should normally be 1-2 trading days or 1-3 trading days depending on the setup and evidence. '
             'confidence_score_10 and conviction_score_10 must be numbers from 1 to 10 when provided. '
@@ -509,6 +537,7 @@ def build_contract_prompt_suffix(*, role: str | None = None) -> str:
             'For every signal-decider feedback object, required keys are: role, agent_name, symbol, market_date, preferred_action, next_day_open_action, '
             'wait_reason, entry_price_basis, target_price, expected_return_pct, stop_loss_price, suggested_holding_period, '
             'confidence_score_10, conviction_score_10, thesis_summary, supporting_evidence, decision_risks, '
+            'decision_delta, '
             'invalidation_conditions, data_quality_warnings, specialist_disagreement, traceability, summary, confidence, '
             'risk_flags, details, improvement_notes. '
             'Operator-facing free-text fields must be written in Korean while keeping the outer response as raw JSON only. '
@@ -522,6 +551,9 @@ def build_contract_prompt_suffix(*, role: str | None = None) -> str:
             f'wait_reason must be an object with code and summary when preferred_action/next_day_open_action is wait; otherwise use null. Valid wait_reason.code values are: {wait_reason_codes}. '
             'wait_reason.summary must be a concise Korean explanation that names the concrete blocker. '
             'Do not use vague wait text such as insufficient information, need more data, or wait for more confirmation unless the same summary explicitly names the concrete blocker. '
+            'decision_delta must be an object, not prose, and should summarize prior-vs-current change metadata when previous_decision_context is available in the request. '
+            'decision_delta should include previous_market_date, previous_recommendation, previous_recommendation_class, previous_wait_reason, current_recommendation, current_recommendation_class, current_wait_reason, transition, persistence_trend, changed_fields, stable_fields, what_changed, what_stayed_same, and upgrade_trigger. '
+            'When wait repeats, do not copy-paste the earlier explanation. Summarize what changed, what stayed the same, whether the setup is persistent or improving or worsening, and the concrete trigger that would upgrade the setup to buy. '
             'entry_price_basis should be next_open unless the supplied inputs justify a different explicit basis. '
             'target_price and stop_loss_price must be included for every item and should be explicit conservative numeric levels whenever the inputs support them; if a concrete level is genuinely not supportable, keep the keys and explain the limitation in data_quality_warnings instead of omitting them. '
             'Use null rather than fake precision when a numeric field is not well-supported by the inputs. '

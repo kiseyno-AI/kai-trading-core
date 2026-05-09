@@ -17,6 +17,7 @@ import httpx
 from fastapi.encoders import jsonable_encoder
 from sqlalchemy import select
 
+from app.agent_context.decision_delta import build_previous_decision_context
 from app.agent_context.feedback_service import agent_context_feedback_service
 from app.agent_context.prerequisite_service import agent_feedback_prerequisite_service
 from app.agent_context.eligibility import (
@@ -131,6 +132,7 @@ DISPATCH_SPECS: tuple[AgentDispatchSpec, ...] = (
             'classifying each symbol as scalp_buy_candidate, watch_for_trigger, avoid_chase, wait, or reject for a 1-2 trading day horizon. '
             'Prioritize liquidity, fresh participation, clean trigger/invalidation levels, and chase-risk control. '
             'Every watch_for_trigger, avoid_chase, or wait decision must name one primary wait_reason taxonomy blocker plus a concise actionable explanation. '
+            'If previous_decision_context is supplied, summarize the delta instead of repeating the earlier wait explanation: state what changed, what stayed the same, whether the setup is persistent or improving or worsening, and the concrete trigger that upgrades the setup. '
             'Treat missing news/disclosure detail and missing detailed quarterly/cash-flow detail as auxiliary by default, not standalone blockers, unless the setup explicitly depends on them. '
             'Write all operator-facing feedback in Korean while staying JSON-only, and avoid execution logic, leverage, sizing, or fake precision.'
         ),
@@ -143,6 +145,7 @@ DISPATCH_SPECS: tuple[AgentDispatchSpec, ...] = (
             'choosing buy, wait, or reject while surfacing evidence, disagreement, invalidation, data-quality warnings, '
             'and explicit realistic target and stop-loss levels for every symbol. '
             'Every wait decision must name one primary wait_reason taxonomy blocker plus a concise actionable explanation. '
+            'If previous_decision_context is supplied, summarize the delta instead of repeating the earlier wait explanation: state what changed, what stayed the same, whether the setup is persistent or improving or worsening, and the concrete trigger that upgrades the setup to buy. '
             'Treat missing news/disclosure detail and missing detailed quarterly/cash-flow detail as auxiliary by default, not standalone blockers, unless the thesis explicitly depends on them. '
             'Write all operator-facing feedback in Korean while staying JSON-only, and avoid execution logic, leverage, sizing, or fake precision.'
         ),
@@ -608,6 +611,7 @@ class OpenClawAgentClient:
                 "- All operator-facing natural-language fields must be written in Korean, while the overall output remains raw JSON only.\n"
                 "- Every signal-decider item must include explicit target_price and stop_loss_price values; do not leave them unspecified unless the payload makes a justified level impossible, and in that rare case explain the limitation in data_quality_warnings.\n"
                 "- Every wait-like conservative action must include a wait_reason object that names the primary normalized blocker instead of vague missing-information text.\n"
+                "- If previous_decision_context is present for a symbol, every decision-support item must include decision_delta with prior-vs-current metadata, summarize changes instead of repeating the old wait explanation, and name the concrete upgrade trigger.\n"
                 "- If context is weak, missing, conflicting, or truncated, emit a complete conservative wait or reject item instead of prose, placeholders, omissions, or malformed JSON.\n"
                 "- Self-check before final answer: JSON parses; top-level object has items; item count matches assigned symbols; assigned symbols are exact and unique; no assigned symbol is missing; no unexpected symbol appears; required feedback fields exist.\n"
                 "- Immediately before sending, validate the final raw JSON text again and fix any extra or missing closing braces/brackets so the response begins with {, ends with }, and parses successfully with no trailing prose.\n"
@@ -635,6 +639,12 @@ class OpenClawAgentClient:
                 'trigger_conditions': ['example trigger condition'],
                 'supporting_evidence': ['example evidence'],
                 'tactical_risks': ['example chase or reversal risk'],
+                'decision_delta': {
+                    'has_previous_decision': False,
+                    'transition': None,
+                    'persistence_trend': 'new',
+                    'upgrade_trigger': None,
+                },
                 'invalidation_conditions': ['example invalidation'],
                 'data_quality_warnings': ['example warning'],
                 'traceability': {
@@ -677,6 +687,12 @@ class OpenClawAgentClient:
                 'thesis_summary': 'brief conservative decision-support thesis',
                 'supporting_evidence': ['example evidence'],
                 'decision_risks': ['example decision risk'],
+                'decision_delta': {
+                    'has_previous_decision': False,
+                    'transition': None,
+                    'persistence_trend': 'new',
+                    'upgrade_trigger': None,
+                },
                 'invalidation_conditions': ['example invalidation'],
                 'data_quality_warnings': ['example warning'],
                 'specialist_disagreement': ['example disagreement'],
@@ -734,6 +750,7 @@ class OpenClawAgentClient:
             "If some inputs are weak or missing, still return conservative structured feedback for that symbol instead of prose or placeholders.\n"
             "All operator-facing natural-language fields inside the JSON must be written in Korean.\n"
             "For decision-support outputs, provide explicit target_price and stop_loss_price levels for each symbol whenever possible; short-term-decider must also provide trigger_price and chase_limit_price. If a level is genuinely not supportable, keep the key and explain the limitation in data_quality_warnings.\n"
+            "If previous_decision_context is present, use it to populate decision_delta, avoid copy-pasting the prior wait narrative, and explain both the stable blockers and the concrete upgrade trigger.\n"
             "Interpret decider_data_quality_context.decision_priority literally: core_execution gaps can justify conservative wait/reject, while auxiliary_context gaps are confidence reducers only by default.\n"
             "Empty recent news means no captured recent news and is neutral unless separate risk evidence exists.\n"
             "Missing detailed quarterly/cash-flow context should usually reduce confidence only, not make the symbol untradeable on its own.\n"
@@ -1518,6 +1535,7 @@ class AgentFeedbackOrchestrator:
         upstream_traceability: dict[str, dict[str, Any]],
         signal_decider_policy: dict[str, Any] | None = None,
         agent_name: str = SIGNAL_DECIDER_AGENT_NAME,
+        previous_decision_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         payload = _build_signal_decider_payload_helper(
             item=item,
@@ -1528,6 +1546,7 @@ class AgentFeedbackOrchestrator:
             upstream_traceability=upstream_traceability,
             signal_decider_agent_name=agent_name,
             signal_decider_policy=signal_decider_policy,
+            previous_decision_context=previous_decision_context,
         )
         payload['orchestration']['required_upstream_roles'] = list(UPSTREAM_SUMMARY_ROLES)
         return payload
@@ -1614,6 +1633,10 @@ class AgentFeedbackOrchestrator:
                 continue
             if market_context is None:
                 market_context = signal_decider_market_context_builder.build(market_date=market_date)
+            previous_decision_context = build_previous_decision_context(
+                role=role,
+                latest_feedback=getattr(decision, 'latest_feedback', None) if decision is not None else None,
+            )
             dispatch_items.append(
                 self._build_signal_decider_payload(
                     item=item,
@@ -1624,6 +1647,7 @@ class AgentFeedbackOrchestrator:
                     upstream_traceability=upstream_traceability,
                     signal_decider_policy=active_signal_decider_policy,
                     agent_name=role,
+                    previous_decision_context=previous_decision_context,
                 )
             )
         return dispatch_items

@@ -389,6 +389,15 @@ class FakeSignalDeciderLoopService:
                     'feedback_id': 11,
                     'symbol': kwargs['symbol'] or '005930',
                     'policy_version': 'signal_decider_policy_v1',
+                    'decision_delta': {
+                        'has_previous_decision': True,
+                        'transition': 'wait_to_wait',
+                        'persistence_trend': 'persistent',
+                        'current_wait_reason': {
+                            'code': 'stale_quote_orderbook',
+                            'summary': 'Realtime orderbook freshness is stale.',
+                        },
+                    },
                     'wait_reason': {
                         'code': 'stale_quote_orderbook',
                         'summary': 'Realtime orderbook freshness is stale.',
@@ -411,6 +420,15 @@ class FakeSignalDeciderLoopService:
             'summary': {'evaluated_count': 1},
             'item': {
                 'snapshot_id': kwargs['snapshot_id'],
+                'decision_delta': {
+                    'has_previous_decision': True,
+                    'transition': 'wait_to_wait',
+                    'persistence_trend': 'persistent',
+                    'current_wait_reason': {
+                        'code': 'stale_quote_orderbook',
+                        'summary': 'Realtime orderbook freshness is stale.',
+                    },
+                },
                 'wait_reason': {
                     'code': 'stale_quote_orderbook',
                     'summary': 'Realtime orderbook freshness is stale.',
@@ -477,6 +495,13 @@ class FakeSignalDeciderLoopService:
                         'suggested_holding_period': '3d',
                         'confidence_score_10': 8,
                         'conviction_score_10': 7,
+                    },
+                    'decision_delta': {
+                        'has_previous_decision': True,
+                        'transition': 'wait_to_buy',
+                        'persistence_trend': 'improving',
+                        'previous_recommendation': 'wait',
+                        'current_recommendation': 'buy',
                     },
                     'summary': 'Momentum and fundamentals align for a tactical next-day setup.',
                     'supporting_evidence': ['Relative strength remained constructive.'],
@@ -854,6 +879,13 @@ class FakeSignalDeciderCalendarReviewService:
                         'suggested_holding_period': '3d',
                         'confidence_score_10': 8,
                         'conviction_score_10': 7,
+                    },
+                    'decision_delta': {
+                        'has_previous_decision': True,
+                        'transition': 'wait_to_buy',
+                        'persistence_trend': 'improving',
+                        'previous_recommendation': 'wait',
+                        'current_recommendation': 'buy',
                     },
                     'summary': 'Momentum and fundamentals align for a tactical next-day setup.',
                     'supporting_evidence': ['Relative strength remained constructive.'],
@@ -1410,6 +1442,7 @@ class AgentContextRouteTests(unittest.TestCase):
         self.assertEqual(payload['availability']['status'], 'ready')
         self.assertEqual(payload['summary']['evaluation_coverage']['status_reason_counts'], {'computed': 1})
         self.assertEqual(payload['items'][0]['decision']['next_day_open_action'], 'buy')
+        self.assertEqual(payload['items'][0]['decision']['decision_delta']['transition'], 'wait_to_buy')
         self.assertEqual(payload['items'][0]['decision']['evaluation']['status_reason'], 'computed')
         self.assertEqual(payload['items'][0]['decision']['evaluation']['target_stop_result'], 'target_hit_first')
         self.assertEqual(payload['items'][0]['review']['quality_reason'], 'Target was touched and the stop-loss was never touched inside the review window.')
@@ -1722,6 +1755,7 @@ class AgentContextRouteTests(unittest.TestCase):
         self.assertEqual(fake_service.decision_args['limit'], 10)
         self.assertEqual(response.json()['items'][0]['policy_version'], 'signal_decider_policy_v1')
         self.assertEqual(response.json()['items'][0]['wait_reason']['code'], 'stale_quote_orderbook')
+        self.assertEqual(response.json()['items'][0]['decision_delta']['transition'], 'wait_to_wait')
 
     def test_signal_decider_decisions_route_accepts_search_filters(self):
         fake_service = FakeSignalDeciderLoopService()
@@ -1776,6 +1810,7 @@ class AgentContextRouteTests(unittest.TestCase):
         self.assertEqual(fake_service.detail_args['evaluation_version'], 'signal_decider_eval_v1')
         self.assertEqual(response.json()['item']['snapshot_id'], 84)
         self.assertEqual(response.json()['item']['explanation']['wait_reason']['code'], 'stale_quote_orderbook')
+        self.assertEqual(response.json()['item']['decision_delta']['transition'], 'wait_to_wait')
 
     def test_signal_decider_review_calendar_route_calls_service(self):
         fake_service = FakeSignalDeciderCalendarReviewService()
@@ -1861,6 +1896,7 @@ class AgentContextRouteTests(unittest.TestCase):
         self.assertEqual(fake_service.review_date_args['primary_horizon_days'], 5)
         self.assertEqual(fake_service.review_date_args['evaluation_version'], 'signal_decider_eval_v1')
         self.assertEqual(response.json()['items'][0]['review']['insight']['code'], 'buy_should_have_taken')
+        self.assertEqual(response.json()['items'][0]['decision_delta']['transition'], 'wait_to_buy')
         self.assertEqual(response.json()['items'][0]['review']['quality_verdict'], 'buy_should_have_taken')
         self.assertEqual(response.json()['items'][0]['review']['narrative']['headline'], 'Buy held up on replay.')
 

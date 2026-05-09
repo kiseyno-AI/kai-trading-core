@@ -70,7 +70,7 @@ GET /agent-context/feedback/calendar?month=2026-05&horizons=1&horizons=5&primary
 # GET /agent-context/feedback/review
 
 ## Summary
-Selected-date compatibility route for trading-web signal review detail reads. It returns lightweight `decision` and `review` rows for one `market_date`, prefers the persisted replay projection, and falls back to the snapshot/evaluation-backed signal-decider review builder when the compact projection is empty.
+Selected-date compatibility route for trading-web signal review detail reads. It returns lightweight `decision` and `review` rows for one `market_date`, preserves the persisted `decision_delta` block for recommendation-card diffs, prefers the persisted replay projection, and falls back to the snapshot/evaluation-backed signal-decider review builder when the compact projection is empty.
 
 ## Example request
 ```http
@@ -123,6 +123,13 @@ GET /agent-context/feedback/review?market_date=2026-05-07&horizons=1&horizons=5&
         "stop_loss_price": 73500,
         "expected_return_pct": 4.2,
         "thesis_summary": "Momentum and fundamentals align for a tactical next-day setup.",
+        "decision_delta": {
+          "has_previous_decision": true,
+          "previous_recommendation": "wait",
+          "current_recommendation": "buy",
+          "transition": "wait_to_buy",
+          "persistence_trend": "improving"
+        },
         "policy_version": "signal_decider_policy_v1",
         "evaluation": {
           "quality_verdict": "good_buy",

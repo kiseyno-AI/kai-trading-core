@@ -1,7 +1,7 @@
 # GET /agent-context/signal-decider/decisions
 
 ## Summary
-Searches immutable persisted `signal-decider` decision snapshots over one market date or a bounded date range. The route keeps the compact snapshot payload, exposes a normalized top-level `wait_reason` for wait decisions, adds a stable `explanation` block so operators can answer "why did this become buy/wait/reject?" without reading raw prompt text, and exposes `evaluation_summary` for verdict-aware list views.
+Searches immutable persisted `signal-decider` decision snapshots over one market date or a bounded date range. The route keeps the compact snapshot payload, exposes a normalized top-level `wait_reason` for wait decisions, adds a stable machine-readable `decision_delta` for repeated WAIT or transition analysis, adds a stable `explanation` block so operators can answer "why did this become buy/wait/reject?" without reading raw prompt text, and exposes `evaluation_summary` for verdict-aware list views.
 
 ## Example request
 ```http
@@ -60,6 +60,25 @@ GET /agent-context/signal-decider/decisions?market_date_from=2026-04-20&market_d
         "summary": "Realtime orderbook freshness is stale.",
         "source": "inferred"
       },
+      "decision_delta": {
+        "has_previous_decision": true,
+        "previous_market_date": "2026-04-22",
+        "previous_recommendation": "wait",
+        "previous_recommendation_class": "wait",
+        "current_recommendation": "wait",
+        "current_recommendation_class": "wait",
+        "transition": "wait_to_wait",
+        "persistence_trend": "persistent",
+        "changed_fields": ["summary", "supporting_evidence"],
+        "stable_fields": ["recommendation", "recommendation_class", "wait_reason"],
+        "upgrade_trigger": {
+          "target_action": "buy",
+          "summary": "Fresh realtime quote and orderbook evidence is needed before upgrading.",
+          "conditions": [],
+          "trigger_price": null,
+          "chase_limit_price": null
+        }
+      },
       "summary": "Realtime orderbook freshness is stale, so the next-open entry is deferred.",
       "explanation": {
         "wait_reason": {
@@ -69,6 +88,10 @@ GET /agent-context/signal-decider/decisions?market_date_from=2026-04-20&market_d
           "blocking_by_default": true,
           "summary": "Realtime orderbook freshness is stale.",
           "source": "inferred"
+        },
+        "decision_delta": {
+          "transition": "wait_to_wait",
+          "persistence_trend": "persistent"
         },
         "supporting_evidence": ["Breadth improved into the close."],
         "decision_risks": ["Leadership remained narrow."],
@@ -99,7 +122,7 @@ GET /agent-context/signal-decider/decisions?market_date_from=2026-04-20&market_d
 # GET /agent-context/signal-decider/decisions/{snapshot_id}
 
 ## Summary
-Reads one immutable `signal-decider` decision snapshot by `snapshot_id`, including the stable normalized `wait_reason`, frozen request/response payloads, upstream references, synthetic realized outcomes, separate actual execution outcomes, and versioned evaluations in one place. The frozen request payload now preserves both the structured factor `scores` block and the compact `market_context` block exactly as the decider saw them, and the detail payload also exposes `market_context` directly for operator review.
+Reads one immutable `signal-decider` decision snapshot by `snapshot_id`, including the stable normalized `wait_reason`, persisted `decision_delta`, frozen request/response payloads, upstream references, synthetic realized outcomes, separate actual execution outcomes, and versioned evaluations in one place. The frozen request payload now preserves both the structured factor `scores` block and the compact `market_context` block exactly as the decider saw them, and the detail payload also exposes `market_context` directly for operator review.
 
 ## Example request
 ```http
@@ -120,6 +143,18 @@ GET /agent-context/signal-decider/decisions/84?horizons=1&horizons=5&evaluation_
       "summary": "Realtime orderbook freshness is stale.",
       "source": "inferred"
     },
+    "decision_delta": {
+      "has_previous_decision": true,
+      "previous_market_date": "2026-04-22",
+      "previous_recommendation": "wait",
+      "current_recommendation": "wait",
+      "transition": "wait_to_wait",
+      "persistence_trend": "persistent",
+      "upgrade_trigger": {
+        "target_action": "buy",
+        "summary": "Fresh realtime quote and orderbook evidence is needed before upgrading."
+      }
+    },
     "explanation": {
       "decision_action": "wait",
       "summary": "Realtime orderbook freshness is stale, so the next-open entry is deferred.",
@@ -130,6 +165,10 @@ GET /agent-context/signal-decider/decisions/84?horizons=1&horizons=5&evaluation_
         "blocking_by_default": true,
         "summary": "Realtime orderbook freshness is stale.",
         "source": "inferred"
+      },
+      "decision_delta": {
+        "transition": "wait_to_wait",
+        "persistence_trend": "persistent"
       },
       "feature_flags": [
         {"key": "technical.breakout_20d", "value": "true"}

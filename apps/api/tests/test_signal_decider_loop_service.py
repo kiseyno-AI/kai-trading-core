@@ -928,6 +928,8 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
             0.83,
         )
         self.assertTrue(context['signal_decider_trace']['feature_snapshot']['meta']['has_score_context'])
+        self.assertIn('decision_delta', feedback)
+        self.assertFalse(feedback['decision_delta']['has_previous_decision'])
 
     def test_prepare_snapshot_persistence_item_builds_structured_traceability(self):
         service = SignalDeciderLoopService(repository=FakeSignalDeciderLoopRepository([]))
@@ -994,6 +996,11 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
         self.assertEqual(snapshot_item['request_payload']['scores']['quality']['status'], 'partial')
         self.assertEqual(snapshot_item['request_payload']['market_context']['status'], 'partial')
         self.assertEqual(snapshot_item['input_feature_snapshot_payload']['scores']['quality']['components_possible'], 6)
+        self.assertIn('decision_delta', snapshot_item['response_payload'])
+        self.assertEqual(
+            snapshot_item['traceability_payload']['final_action_rationale']['decision_delta']['current_recommendation'],
+            'wait',
+        )
 
     def test_prepare_snapshot_persistence_item_supports_short_term_decider(self):
         service = SignalDeciderLoopService(repository=FakeSignalDeciderLoopRepository([]))
@@ -1046,6 +1053,211 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
         self.assertEqual(snapshot_item['traceability_payload']['schema_version'], 'short_term_decider_trace_v1')
         self.assertEqual(snapshot_item['traceability_payload']['tactical_context']['trigger_price'], 81200)
         self.assertEqual(snapshot_item['traceability_payload']['upstream_references']['technical-summarizer']['feedback_id'], 8)
+
+    def test_prepare_snapshot_persistence_item_builds_wait_to_wait_decision_delta(self):
+        service = SignalDeciderLoopService(repository=FakeSignalDeciderLoopRepository([]))
+        snapshot_item = service.prepare_snapshot_persistence_item(
+            feedback_id=21,
+            market_date='2026-04-24',
+            symbol='005930',
+            agent_name='signal-decider',
+            agent_version='openclaw-v1',
+            run_id='signal-run-21',
+            summary_payload={'model': 'openclaw/signal-decider'},
+            feedback_payload={
+                'preferred_action': 'wait',
+                'next_day_open_action': 'wait',
+                'wait_reason': {
+                    'code': 'stale_quote_orderbook',
+                    'summary': '호가 신선도가 아직 부족합니다.',
+                },
+                'thesis_summary': '전일 대비 시도는 유지되지만 호가 신선도 부족으로 대기합니다.',
+                'supporting_evidence': ['장 마감 수급은 유지됐다.'],
+                'decision_risks': ['실시간 호가 반영이 늦다.'],
+                'invalidation_conditions': ['호가 공백이 해소되지 않으면 보수적으로 유지한다.'],
+                'data_quality_warnings': ['Realtime orderbook freshness is stale.'],
+                'traceability': {'symbol': '005930', 'market_date': '2026-04-24'},
+            },
+            context_payload={
+                'previous_decision_context': {
+                    'available': True,
+                    'feedback_id': 20,
+                    'market_date': '2026-04-23',
+                    'received_at': '2026-04-23T06:00:00+00:00',
+                    'symbol': '005930',
+                    'recommendation': 'wait',
+                    'recommendation_class': 'wait',
+                    'wait_reason': {
+                        'code': 'stale_quote_orderbook',
+                        'summary': '호가 신선도가 부족합니다.',
+                    },
+                    'summary': '호가 신선도 부족으로 대기합니다.',
+                    'confidence_score_10': 5.0,
+                    'conviction_score_10': 4.0,
+                    'supporting_evidence': ['장 마감 수급은 중립이었다.'],
+                    'decision_risks': ['실시간 호가가 늦다.'],
+                    'invalidation_conditions': ['호가 공백 지속'],
+                    'data_quality_warnings': ['Realtime orderbook freshness is stale.'],
+                    'upgrade_trigger': None,
+                    'source': 'persisted_feedback',
+                }
+            },
+            received_at='2026-04-24T06:00:00+00:00',
+        )
+
+        decision_delta = snapshot_item['response_payload']['decision_delta']
+        self.assertTrue(decision_delta['has_previous_decision'])
+        self.assertEqual(decision_delta['transition'], 'wait_to_wait')
+        self.assertTrue(decision_delta['repeat_wait'])
+        self.assertEqual(decision_delta['previous_market_date'], '2026-04-23')
+        self.assertEqual(decision_delta['previous_wait_reason']['code'], 'stale_quote_orderbook')
+        self.assertEqual(decision_delta['current_wait_reason']['code'], 'stale_quote_orderbook')
+        self.assertEqual(decision_delta['persistence_trend'], 'persistent')
+        self.assertIn('wait_reason', decision_delta['stable_fields'])
+        self.assertEqual(decision_delta['upgrade_trigger']['target_action'], 'buy')
+        self.assertEqual(
+            snapshot_item['traceability_payload']['final_action_rationale']['decision_delta']['transition'],
+            'wait_to_wait',
+        )
+
+    def test_prepare_snapshot_persistence_item_builds_wait_to_buy_decision_delta(self):
+        service = SignalDeciderLoopService(repository=FakeSignalDeciderLoopRepository([]))
+        snapshot_item = service.prepare_snapshot_persistence_item(
+            feedback_id=22,
+            market_date='2026-04-24',
+            symbol='005930',
+            agent_name='signal-decider',
+            agent_version='openclaw-v1',
+            run_id='signal-run-22',
+            summary_payload={'model': 'openclaw/signal-decider'},
+            feedback_payload={
+                'preferred_action': 'buy',
+                'next_day_open_action': 'buy',
+                'entry_price_basis': 'next_open',
+                'target_price': 84000,
+                'expected_return_pct': 4.8,
+                'stop_loss_price': 79800,
+                'suggested_holding_period': '3-10 trading days',
+                'confidence_score_10': 7.0,
+                'conviction_score_10': 6.0,
+                'thesis_summary': '호가 신선도가 회복돼 보수적 매수로 상향한다.',
+                'supporting_evidence': ['실시간 호가와 수급이 회복됐다.'],
+                'decision_risks': ['갭 시초가 변동성'],
+                'invalidation_conditions': ['79800원 이탈 종가'],
+                'data_quality_warnings': [],
+                'traceability': {'symbol': '005930', 'market_date': '2026-04-24'},
+            },
+            context_payload={
+                'previous_decision_context': {
+                    'available': True,
+                    'feedback_id': 20,
+                    'market_date': '2026-04-23',
+                    'received_at': '2026-04-23T06:00:00+00:00',
+                    'symbol': '005930',
+                    'recommendation': 'wait',
+                    'recommendation_class': 'wait',
+                    'wait_reason': {
+                        'code': 'stale_quote_orderbook',
+                        'summary': '호가 신선도가 부족합니다.',
+                    },
+                    'summary': '호가 신선도 부족으로 대기합니다.',
+                    'confidence_score_10': 5.0,
+                    'conviction_score_10': 4.0,
+                    'supporting_evidence': ['장 마감 수급은 중립이었다.'],
+                    'decision_risks': ['실시간 호가가 늦다.'],
+                    'invalidation_conditions': ['호가 공백 지속'],
+                    'data_quality_warnings': ['Realtime orderbook freshness is stale.'],
+                    'upgrade_trigger': None,
+                    'source': 'persisted_feedback',
+                }
+            },
+            received_at='2026-04-24T06:00:00+00:00',
+        )
+
+        decision_delta = snapshot_item['response_payload']['decision_delta']
+        self.assertEqual(decision_delta['transition'], 'wait_to_buy')
+        self.assertEqual(decision_delta['persistence_trend'], 'improving')
+        self.assertEqual(decision_delta['previous_recommendation'], 'wait')
+        self.assertEqual(decision_delta['current_recommendation'], 'buy')
+        self.assertIsNone(decision_delta['upgrade_trigger'])
+
+    def test_prepare_snapshot_persistence_item_builds_watch_to_wait_decision_delta_for_short_term(self):
+        service = SignalDeciderLoopService(repository=FakeSignalDeciderLoopRepository([]))
+        snapshot_item = service.prepare_snapshot_persistence_item(
+            feedback_id=23,
+            market_date='2026-04-24',
+            symbol='005930',
+            agent_name='short-term-decider',
+            agent_version='openclaw-v1',
+            run_id='short-run-23',
+            summary_payload={'model': 'openclaw/short-term-decider'},
+            feedback_payload={
+                'tactical_action': 'wait',
+                'preferred_action': 'wait',
+                'target_price': 84800,
+                'stop_loss_price': 79200,
+                'expected_holding_period': '1-2 trading days',
+                'confidence_score_10': 5.5,
+                'conviction_score_10': 4.5,
+                'wait_reason': {
+                    'code': 'unsuitable_execution_timing',
+                    'summary': '돌파 재시도가 약해져 대기로 낮춘다.',
+                },
+                'thesis_summary': '추격 트리거가 약화돼 일단 대기한다.',
+                'supporting_evidence': ['체결 강도가 둔화됐다.'],
+                'tactical_risks': ['개장 직후 변동성'],
+                'invalidation_conditions': ['장 초반 추세 이탈'],
+                'data_quality_warnings': [],
+                'traceability': {
+                    'agent_name': 'short-term-decider',
+                    'symbol': '005930',
+                    'market_date': '2026-04-24',
+                },
+            },
+            context_payload={
+                'previous_decision_context': {
+                    'available': True,
+                    'feedback_id': 22,
+                    'market_date': '2026-04-23',
+                    'received_at': '2026-04-23T06:00:00+00:00',
+                    'symbol': '005930',
+                    'recommendation': 'watch_for_trigger',
+                    'recommendation_class': 'watch',
+                    'wait_reason': {
+                        'code': 'unsuitable_execution_timing',
+                        'summary': '돌파 확인이 더 필요합니다.',
+                    },
+                    'summary': '돌파 확인 뒤 추격 범위를 제한한다.',
+                    'confidence_score_10': 7.2,
+                    'conviction_score_10': 6.4,
+                    'target_price': 84800,
+                    'stop_loss_price': 79200,
+                    'trigger_price': 81200,
+                    'chase_limit_price': 82400,
+                    'supporting_evidence': ['거래대금이 재유입되고 있다.'],
+                    'decision_risks': ['개장 직후 변동성이 확대될 수 있다.'],
+                    'invalidation_conditions': ['트리거 재돌파 실패 시 무효화한다.'],
+                    'data_quality_warnings': [],
+                    'trigger_conditions': ['81200원 돌파와 거래량 동반'],
+                    'upgrade_trigger': {
+                        'target_action': 'watch_for_trigger',
+                        'summary': '81200원 돌파와 거래량 동반',
+                        'conditions': ['81200원 돌파와 거래량 동반'],
+                        'trigger_price': 81200,
+                        'chase_limit_price': 82400,
+                    },
+                    'source': 'persisted_feedback',
+                }
+            },
+            received_at='2026-04-24T06:00:00+00:00',
+        )
+
+        decision_delta = snapshot_item['response_payload']['decision_delta']
+        self.assertEqual(decision_delta['transition'], 'watch_to_wait')
+        self.assertEqual(decision_delta['persistence_trend'], 'worsening')
+        self.assertEqual(decision_delta['previous_recommendation'], 'watch_for_trigger')
+        self.assertEqual(decision_delta['current_recommendation'], 'wait')
+        self.assertEqual(decision_delta['upgrade_trigger']['target_action'], 'watch_for_trigger')
 
     def test_prepare_snapshot_persistence_item_infers_specific_wait_reason_from_core_blocker(self):
         service = SignalDeciderLoopService(repository=FakeSignalDeciderLoopRepository([]))
@@ -1768,6 +1980,8 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
         self.assertEqual(result['item']['wait_reason']['code'], 'stale_quote_orderbook')
         self.assertEqual(result['item']['decision']['wait_reason']['code'], 'stale_quote_orderbook')
         self.assertEqual(result['item']['explanation']['wait_reason']['code'], 'stale_quote_orderbook')
+        self.assertEqual(result['item']['decision_delta']['current_wait_reason']['code'], 'stale_quote_orderbook')
+        self.assertEqual(result['item']['explanation']['decision_delta']['current_wait_reason']['code'], 'stale_quote_orderbook')
 
     def test_get_decision_detail_includes_actual_execution_outcomes_separately(self):
         repository = FakeSignalDeciderLoopRepository(
