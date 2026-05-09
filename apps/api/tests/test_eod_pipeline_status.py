@@ -16,15 +16,21 @@ class _FakeMarketState:
     is_open = False
     reason = None
     server_time = '2026-04-21T18:15:00+09:00'
+    current_calendar_date = '2026-04-21'
+    latest_valid_trading_date = '2026-04-21'
+    market_session = 'closed'
 
 
 class _FakeBreakDayMarketState:
     market = 'KRX'
-    state = 'CLOSED'
+    state = 'HOLIDAY'
     is_trading_day = False
     is_open = False
     reason = 'holiday'
-    server_time = '2026-04-14T12:15:00+09:00'
+    server_time = '2026-05-05T12:15:00+09:00'
+    current_calendar_date = '2026-05-05'
+    latest_valid_trading_date = '2026-05-04'
+    market_session = 'holiday'
 
 
 def _full_factor_stage_counts(*, total: int, updated_at: str) -> dict[str, dict]:
@@ -164,22 +170,28 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
 
         result = service.read()
 
-        self.assertEqual(result['market_date'], '2026-04-14')
+        self.assertEqual(result['market_date'], '2026-05-05')
         self.assertEqual(
             result['market'],
             {
                 'market': 'KRX',
-                'state': 'CLOSED',
+                'state': 'HOLIDAY',
                 'is_trading_day': False,
                 'is_open': False,
                 'reason': 'holiday',
-                'server_time': '2026-04-14T12:15:00+09:00',
+                'server_time': '2026-05-05T12:15:00+09:00',
+                'current_calendar_date': '2026-05-05',
+                'latest_valid_trading_date': '2026-05-04',
+                'market_session': 'holiday',
             },
         )
+        self.assertEqual(result['market_session']['status'], 'holiday')
+        self.assertEqual(result['market_session']['latest_valid_trading_date'], '2026-05-04')
+        self.assertFalse(result['market_session']['intraday_data_expected'])
         self.assertEqual(result['status'], 'pending')
-        self.assertEqual(result['stages']['price_collection']['market_date'], '2026-04-14')
+        self.assertEqual(result['stages']['price_collection']['market_date'], '2026-05-05')
         self.assertEqual(result['stages']['price_collection']['status'], 'pending')
-        self.assertEqual(result['stages']['fundamentals_daily_refresh']['market_date'], '2026-04-14')
+        self.assertEqual(result['stages']['fundamentals_daily_refresh']['market_date'], '2026-05-05')
         self.assertEqual(result['stages']['fundamentals_daily_refresh']['status'], 'pending')
 
     def test_read_reports_live_stage_progress_for_pykrx_and_fundamentals(self):

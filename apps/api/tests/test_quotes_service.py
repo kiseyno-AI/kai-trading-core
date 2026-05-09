@@ -164,6 +164,49 @@ class QuoteServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['change_pct'], None)
         resolve_company_name.assert_not_called()
 
+    async def test_get_quote_uses_recent_previous_daily_bar_for_holiday(self) -> None:
+        service = QuoteService()
+        market_state = MarketState(
+            market='KRX',
+            state='HOLIDAY',
+            is_trading_day=False,
+            is_open=False,
+            server_time='2026-05-05T12:00:00+09:00',
+            session_open_at=None,
+            session_close_at=None,
+            reason='holiday',
+            current_calendar_date='2026-05-05',
+            latest_valid_trading_date='2026-05-04',
+            market_session='holiday',
+        )
+
+        resolve_company_name = AsyncMock(return_value='Samsung Electronics')
+
+        with (
+            patch('app.quotes.service.get_market_state', return_value=market_state),
+            patch.object(service, '_resolve_company_name', new=resolve_company_name),
+            patch('app.quotes.service.load_daily_bars_for_symbol', return_value=[
+                {
+                    'trade_date': '2026-05-04',
+                    'open_price': 60500,
+                    'high_price': 62000,
+                    'low_price': 60400,
+                    'close_price': 61500,
+                    'volume': 2000,
+                    'turnover': 200000,
+                },
+            ]),
+        ):
+            result = await service.get_quote('005930')
+
+        self.assertEqual(result['source'], 'daily_price_bar')
+        self.assertEqual(result['trade_date'], '2026-05-04')
+        self.assertEqual(result['fallback_reason'], 'daily_price_bar_recent_previous_trade_date')
+        self.assertTrue(result['available'])
+        self.assertEqual(result['change'], None)
+        self.assertEqual(result['change_pct'], None)
+        resolve_company_name.assert_not_called()
+
     async def test_get_quote_resolves_company_name_for_selected_live_quote(self) -> None:
         service = QuoteService()
         market_state = MarketState(

@@ -323,6 +323,64 @@ class DeciderCoverageReportServiceTests(unittest.TestCase):
             1,
         )
 
+    def test_get_report_treats_closed_market_intraday_not_applicable_as_neutral(self):
+        repository = FakeDeciderCoverageReportRepository(
+            [
+                {
+                    'id': 1,
+                    'market_date': date(2026, 5, 9),
+                    'symbol': '005930',
+                    'agent_name': 'signal-decider',
+                    'run_id': 'symbol-run-2026-05-09-abc123',
+                    'context_payload': {
+                        'symbol_day_context': {
+                            **_base_symbol_day_context(),
+                            'intraday_execution_context': {'status': 'not_applicable'},
+                        },
+                        'liquidity_context': {
+                            'turnover': {'status': 'available'},
+                            'ranking': {'status': 'available'},
+                            'intraday': {'status': 'not_applicable'},
+                        },
+                        'decider_data_quality_context': {
+                            'blocks': {
+                                'liquidity_turnover': {
+                                    'status': 'available',
+                                    'decision_guidance': _decision_guidance(
+                                        category='liquidity_turnover_slippage',
+                                        decision_tier='core_execution',
+                                        severity='high',
+                                        default_missing_effect='core_blocker',
+                                        blocking_by_default=True,
+                                    ),
+                                },
+                                'intraday_realtime': {
+                                    'status': 'not_applicable',
+                                    'decision_guidance': _decision_guidance(
+                                        category='after_hours_intraday_realtime',
+                                        decision_tier='core_execution',
+                                        severity='high',
+                                        default_missing_effect='core_blocker',
+                                        blocking_by_default=True,
+                                    ),
+                                },
+                            },
+                        },
+                    },
+                }
+            ]
+        )
+        service = DeciderCoverageReportService(repository=repository)
+
+        result = service.get_report(market_date='2026-05-09', agent_names=['signal-decider'])
+
+        summary = result['summary']
+        self.assertEqual(summary['core_blocks']['counts']['available'], 2)
+        self.assertEqual(summary['core_blocks']['counts']['missing'], 0)
+        self.assertEqual(summary['core_blocks']['raw_status_counts']['not_applicable'], 1)
+        self.assertEqual(summary['gap_effects']['decision_affected']['occurrences'], 0)
+        self.assertEqual(summary['top_missing_categories'], [])
+
     def test_get_report_normalizes_filters_and_returns_empty_summary(self):
         repository = FakeDeciderCoverageReportRepository([])
         service = DeciderCoverageReportService(repository=repository)

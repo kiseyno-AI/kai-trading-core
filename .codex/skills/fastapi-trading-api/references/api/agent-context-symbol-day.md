@@ -9,6 +9,10 @@ The response now also includes a compact `liquidity_context` block per symbol/da
 
 Expected decider-facing context blocks are status-first even when the requested-date source row is missing. `quote_context`, `intraday_execution_context`, and the provider-backed optional PyKRX blocks stay object-shaped with explicit `status`, `reason`, and `freshness_provenance` instead of collapsing to raw `null`.
 
+The payload now also includes `market_session` metadata at the top level, under `summary.market_session`, and under each item. It keeps `requested_date`, `current_calendar_date`, `latest_valid_trading_date`, `status`, `is_trading_day`, `intraday_data_expected`, `quote_data_expected`, and `recommendation_basis` explicit so downstream agents can tell an actual trading-data gap from a weekend, holiday, or after-close read.
+
+When live quote or intraday data is not expected for the requested date, `quote_context`, `intraday_execution_context`, liquidity intraday rollups, and decider intraday quality blocks now use `status="not_applicable"` with `reason="closed_market"` and repeat the relevant market-session fields instead of presenting a misleading unavailable or missing status.
+
 The response also includes a compact `decider_data_quality_context` block per symbol/day. This is the decider-facing availability and provenance summary over factor-score coverage, liquidity/turnover, intraday freshness, financial/cash-flow detail, disclosures/news, investor flow and short-selling, sector/relative-strength context, and technical evidence. It keeps `available`, `partial`, `stale`, `empty`, `unavailable`, and `provider_error` semantics explicit so downstream deciders can distinguish no recent items from provider/storage failures, and it now adds `decision_priority` plus per-block `decision_guidance` so deciders can separate core execution blockers from auxiliary confidence-only gaps.
 
 ## Example request
@@ -16,9 +20,54 @@ The response also includes a compact `decider_data_quality_context` block per sy
 GET /agent-context/symbol-day?market_date=2026-04-15&symbols=005930&fs_div=CFS&disclosures_limit=5
 ```
 
+## Closed-market example
+```json
+{
+  "market_session": {
+    "requested_date": "2026-04-11",
+    "current_calendar_date": "2026-04-11",
+    "latest_valid_trading_date": "2026-04-10",
+    "status": "weekend",
+    "is_trading_day": false,
+    "intraday_data_expected": false,
+    "quote_data_expected": false,
+    "recommendation_basis": "latest_completed_eod"
+  },
+  "items": [
+    {
+      "market_session": {
+        "requested_date": "2026-04-11",
+        "latest_valid_trading_date": "2026-04-10",
+        "status": "weekend"
+      },
+      "quote_context": {
+        "status": "not_applicable",
+        "reason": "closed_market",
+        "market_session_status": "weekend"
+      },
+      "intraday_execution_context": {
+        "status": "not_applicable",
+        "reason": "closed_market",
+        "market_session_status": "weekend"
+      }
+    }
+  ]
+}
+```
+
 ## Example response
 ```json
 {
+  "market_session": {
+    "requested_date": "2026-04-15",
+    "current_calendar_date": "2026-04-15",
+    "latest_valid_trading_date": "2026-04-15",
+    "status": "open",
+    "is_trading_day": true,
+    "intraday_data_expected": true,
+    "quote_data_expected": true,
+    "recommendation_basis": "live_intraday"
+  },
   "request": {
     "market_date": "2026-04-15",
     "symbols": ["005930"],
@@ -29,11 +78,21 @@ GET /agent-context/symbol-day?market_date=2026-04-15&symbols=005930&fs_div=CFS&d
     "requested_symbol_count": 1,
     "matched_symbol_count": 1,
     "fundamentals_count": 1,
-    "quote_context_count": 1
+    "quote_context_count": 1,
+    "market_session": {
+      "requested_date": "2026-04-15",
+      "latest_valid_trading_date": "2026-04-15",
+      "status": "open"
+    }
   },
   "items": [
     {
       "symbol": "005930",
+      "market_session": {
+        "requested_date": "2026-04-15",
+        "latest_valid_trading_date": "2026-04-15",
+        "status": "open"
+      },
       "company": {
         "name_ko": "삼성전자",
         "dart": {

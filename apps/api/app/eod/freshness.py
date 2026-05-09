@@ -12,6 +12,7 @@ from app.eod.freshness_repository import (
     _load_today_fundamentals_refresh_run,
 )
 from app.market.clock import get_market_state
+from app.market.session import build_market_session_metadata
 from app.market_data_store import (
     count_daily_action_summaries_for_live_symbols,
     count_daily_price_bars_for_date,
@@ -79,7 +80,12 @@ class EODFreshnessService:
     def read(self) -> dict:
         # Keep "today" bound to the current Seoul calendar date.
         # Weekend and break-day fallback lives under latest.*, not by backshifting today.trade_date.
-        trade_date = self.market_state_loader().server_time[:10]
+        market_state = self.market_state_loader()
+        trade_date = market_state.server_time[:10]
+        market_session = build_market_session_metadata(
+            requested_date=trade_date,
+            current_state=market_state,
+        )
         latest_price_trade_date = self.latest_price_trade_date_loader()
         price_bar_count = self.daily_price_bar_count_loader(trade_date)
         technical_snapshot_count = self.daily_technical_snapshot_count_loader(trade_date)
@@ -119,6 +125,7 @@ class EODFreshnessService:
             live_symbols_total = int(self.live_symbol_count_loader() or 0)
 
         return {
+            'market_session': market_session,
             'today': {
                 'trade_date': trade_date,
                 'price': self._build_live_symbol_stage(

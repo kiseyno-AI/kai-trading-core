@@ -6,6 +6,8 @@ import logging
 import threading
 from typing import Any
 
+from app.market.clock import get_market_state
+from app.market.session import build_market_session_metadata
 from app.market.snapshot import market_snapshot_service, normalize_market_snapshot_payload
 
 logger = logging.getLogger(__name__)
@@ -106,18 +108,29 @@ def _run_coroutine(coro) -> Any:
 
 
 class SignalDeciderMarketContextBuilder:
-    def __init__(self, *, snapshot_service=None) -> None:
+    def __init__(self, *, snapshot_service=None, market_state_loader=None) -> None:
         self.snapshot_service = snapshot_service or market_snapshot_service
+        self.market_state_loader = market_state_loader or get_market_state
 
     def build(self, *, market_date: date) -> dict[str, Any]:
+        market_session = build_market_session_metadata(
+            requested_date=market_date,
+            current_state=self.market_state_loader(),
+        )
         try:
             snapshot = _run_coroutine(self.snapshot_service.get_market_snapshot())
         except Exception as exc:  # Market context should degrade the payload, not block signal-decider dispatch.
             logger.warning('Signal-decider market context unavailable: %s', exc)
-            return self._unavailable_payload(market_date=market_date)
-        return self._build_payload(snapshot=snapshot, market_date=market_date)
+            return self._unavailable_payload(market_date=market_date, market_session=market_session)
+        return self._build_payload(snapshot=snapshot, market_date=market_date, market_session=market_session)
 
-    def _build_payload(self, *, snapshot: dict[str, Any], market_date: date) -> dict[str, Any]:
+    def _build_payload(
+        self,
+        *,
+        snapshot: dict[str, Any],
+        market_date: date,
+        market_session: dict[str, Any],
+    ) -> dict[str, Any]:
         snapshot = normalize_market_snapshot_payload(snapshot)
         market_date_text = market_date.isoformat()
         missing_fields: list[str] = []
@@ -170,6 +183,7 @@ class SignalDeciderMarketContextBuilder:
         return {
             'status': status,
             'market_date': market_date_text,
+            'market_session': market_session,
             'as_of': as_of_text,
             'summary': summary,
             'indices': indices,
@@ -407,10 +421,11 @@ class SignalDeciderMarketContextBuilder:
             return None
         return '; '.join(parts)
 
-    def _unavailable_payload(self, *, market_date: date) -> dict[str, Any]:
+    def _unavailable_payload(self, *, market_date: date, market_session: dict[str, Any]) -> dict[str, Any]:
         return {
             'status': 'unavailable',
             'market_date': market_date.isoformat(),
+            'market_session': market_session,
             'as_of': None,
             'summary': {
                 'market_bias': 'unknown',

@@ -36,6 +36,8 @@ from app.dart.store import DartSyncRepository, dart_sync_repository
 from app.eod.pykrx_enrichment import pykrx_enrichment_service
 from app.external_news.provider import NAVER_NEWS_PROVIDER, NaverNewsSearchProvider
 from app.external_news.store import list_recent_external_news_for_symbols
+from app.market.clock import get_market_state
+from app.market.session import build_market_session_metadata
 from app.market_data_store import (
     load_current_kis_intraday_snapshots,
     load_daily_advanced_value_factor_results,
@@ -62,10 +64,12 @@ FRESHNESS_STATUS_FRESH = 'fresh'
 FRESHNESS_STATUS_STALE = 'stale'
 FRESHNESS_STATUS_AVAILABLE_BUT_OLD = 'available_but_old'
 FRESHNESS_STATUS_MISSING = 'missing'
+FRESHNESS_STATUS_NOT_APPLICABLE = 'not_applicable'
 PROVENANCE_STATUS_PROVIDER_SOURCED = 'provider_sourced'
 PROVENANCE_STATUS_DERIVED = 'derived_from_provider_data'
 PROVENANCE_STATUS_FALLBACK = 'fallback_from_owned_data'
 PROVENANCE_STATUS_PROVIDER_PLUS_FALLBACK = 'provider_plus_fallback'
+PROVENANCE_STATUS_NOT_APPLICABLE = 'not_applicable'
 LIQUIDITY_TURNOVER_STATUS_AVAILABLE = 'available'
 LIQUIDITY_TURNOVER_STATUS_DERIVED = 'derived'
 LIQUIDITY_TURNOVER_STATUS_STALE = 'stale'
@@ -429,6 +433,7 @@ DECIDER_QUALITY_STATUS_EMPTY = 'empty'
 DECIDER_QUALITY_STATUS_STALE = 'stale'
 DECIDER_QUALITY_STATUS_PARTIAL = 'partial'
 DECIDER_QUALITY_STATUS_AVAILABLE = 'available'
+DECIDER_QUALITY_STATUS_NOT_APPLICABLE = 'not_applicable'
 DECIDER_DECISION_TIER_CORE_EXECUTION = 'core_execution'
 DECIDER_DECISION_TIER_SUPPORTING_CONTEXT = 'supporting_context'
 DECIDER_DECISION_TIER_AUXILIARY_CONTEXT = 'auxiliary_context'
@@ -516,6 +521,10 @@ def _normalize_decider_quality_status(
     freshness_status = str(provenance.get('freshness_status') or '').strip().lower()
     provenance_status = str(provenance.get('provenance_status') or '').strip().lower()
 
+    if status == DECIDER_QUALITY_STATUS_NOT_APPLICABLE or freshness_status == FRESHNESS_STATUS_NOT_APPLICABLE:
+        return DECIDER_QUALITY_STATUS_NOT_APPLICABLE
+    if provenance_status == PROVENANCE_STATUS_NOT_APPLICABLE:
+        return DECIDER_QUALITY_STATUS_NOT_APPLICABLE
     if status == FACTOR_SUMMARY_STATUS_STORAGE_UNAVAILABLE or provenance_status in {
         FACTOR_SUMMARY_STATUS_STORAGE_UNAVAILABLE,
         'external_provider_unavailable',
@@ -542,6 +551,13 @@ def _normalize_decider_quality_status(
     if status:
         return DECIDER_QUALITY_STATUS_AVAILABLE
     return DECIDER_QUALITY_STATUS_UNAVAILABLE
+
+
+def _effective_decider_quality_status(status: str) -> str:
+    normalized = str(status or '').strip().lower()
+    if normalized == DECIDER_QUALITY_STATUS_NOT_APPLICABLE:
+        return DECIDER_QUALITY_STATUS_AVAILABLE
+    return normalized
 
 
 def _max_iso_timestamp(*values: Any) -> str | None:
@@ -574,6 +590,7 @@ def _quality_status_counts(blocks: dict[str, dict[str, Any]]) -> dict[str, int]:
         DECIDER_QUALITY_STATUS_EMPTY: 0,
         DECIDER_QUALITY_STATUS_UNAVAILABLE: 0,
         DECIDER_QUALITY_STATUS_PROVIDER_ERROR: 0,
+        DECIDER_QUALITY_STATUS_NOT_APPLICABLE: 0,
     }
     for block in blocks.values():
         status = str((block or {}).get('status') or DECIDER_QUALITY_STATUS_UNAVAILABLE)
@@ -585,7 +602,7 @@ def _quality_status_counts(blocks: dict[str, dict[str, Any]]) -> dict[str, int]:
 
 
 def _summarize_overall_decider_quality_status(statuses: Sequence[str]) -> str:
-    normalized = [status for status in statuses if status]
+    normalized = [_effective_decider_quality_status(status) for status in statuses if status]
     if not normalized:
         return DECIDER_QUALITY_STATUS_UNAVAILABLE
     unique = set(normalized)
@@ -1073,6 +1090,72 @@ def _trade_date_relation_to_request(*, as_of_market_date: str | None, requested_
     return 'after_market_date'
 
 
+def _market_session_data_expected(
+    market_session: dict[str, Any] | None,
+    *,
+    key: str,
+) -> bool:
+    market_session_payload = _maybe_dict(market_session)
+    if key not in market_session_payload:
+        return True
+    return bool(market_session_payload.get(key))
+
+
+def _closed_market_not_applicable_reason(market_session: dict[str, Any] | None) -> str:
+    return 'closed_market'
+
+
+def _market_session_context_fields(
+    market_session: dict[str, Any] | None,
+    *,
+    expected_key: str,
+) -> dict[str, Any]:
+    market_session_payload = _maybe_dict(market_session)
+    return {
+        'market_session_status': market_session_payload.get('status'),
+        'data_expected': (
+            bool(market_session_payload.get(expected_key))
+            if expected_key in market_session_payload
+            else None
+        ),
+        'latest_valid_trading_date': market_session_payload.get('latest_valid_trading_date'),
+        'current_calendar_date': market_session_payload.get('current_calendar_date'),
+        'recommendation_basis': market_session_payload.get('recommendation_basis'),
+    }
+
+
+def _build_not_applicable_freshness_provenance(
+    *,
+    requested_market_date: date,
+    market_session: dict[str, Any] | None,
+    source_tables: Sequence[str],
+    source_provider: str,
+    reason: str,
+) -> dict[str, Any]:
+    market_session_payload = _maybe_dict(market_session)
+    latest_valid_trading_date = market_session_payload.get('latest_valid_trading_date')
+    return _build_freshness_provenance(
+        requested_market_date=requested_market_date,
+        freshness_status=FRESHNESS_STATUS_NOT_APPLICABLE,
+        provenance_status=PROVENANCE_STATUS_NOT_APPLICABLE,
+        source_tables=source_tables,
+        source_provider=source_provider,
+        latest_available_market_date=latest_valid_trading_date,
+        row_count=0,
+        trade_date_relation_to_request=_trade_date_relation_to_request(
+            as_of_market_date=latest_valid_trading_date,
+            requested_market_date=requested_market_date,
+        ),
+        reason=reason,
+        extra={
+            'market_session_status': market_session_payload.get('status'),
+            'current_calendar_date': market_session_payload.get('current_calendar_date'),
+            'latest_valid_trading_date': latest_valid_trading_date,
+            'recommendation_basis': market_session_payload.get('recommendation_basis'),
+        },
+    )
+
+
 def _context_block_status(context: dict[str, Any] | None, *, default: str = DECIDER_QUALITY_STATUS_UNAVAILABLE) -> str:
     payload = _maybe_dict(context)
     if not payload:
@@ -1088,7 +1171,11 @@ def _context_block_has_signal(context: dict[str, Any] | None, *, include_empty: 
     status = _context_block_status(payload, default='')
     if not status:
         return True
-    if status in {DECIDER_QUALITY_STATUS_UNAVAILABLE, DECIDER_QUALITY_STATUS_PROVIDER_ERROR}:
+    if status in {
+        DECIDER_QUALITY_STATUS_UNAVAILABLE,
+        DECIDER_QUALITY_STATUS_PROVIDER_ERROR,
+        DECIDER_QUALITY_STATUS_NOT_APPLICABLE,
+    }:
         return False
     if not include_empty and status == DECIDER_QUALITY_STATUS_EMPTY:
         return False
@@ -1307,6 +1394,29 @@ def _build_intraday_liquidity_context(
 ) -> dict[str, Any]:
     intraday_status = _context_block_status(intraday_execution_context)
     quote_status = _context_block_status(quote_context)
+    if intraday_status == DECIDER_QUALITY_STATUS_NOT_APPLICABLE and quote_status == DECIDER_QUALITY_STATUS_NOT_APPLICABLE:
+        return {
+            'status': DECIDER_QUALITY_STATUS_NOT_APPLICABLE,
+            'reason': _maybe_dict(intraday_execution_context).get('reason')
+            or _maybe_dict(quote_context).get('reason')
+            or 'closed_market',
+            'freshness_status': FRESHNESS_STATUS_NOT_APPLICABLE,
+            'quote_freshness_status': FRESHNESS_STATUS_NOT_APPLICABLE,
+            'market_session_status': _maybe_dict(intraday_execution_context).get('market_session_status')
+            or _maybe_dict(quote_context).get('market_session_status'),
+            'data_expected': False,
+            'recommendation_basis': _maybe_dict(intraday_execution_context).get('recommendation_basis')
+            or _maybe_dict(quote_context).get('recommendation_basis'),
+            'latest_valid_trading_date': _maybe_dict(intraday_execution_context).get('latest_valid_trading_date')
+            or _maybe_dict(quote_context).get('latest_valid_trading_date'),
+            'quote_trade_date': (quote_context or {}).get('trade_date'),
+            'as_of_market_date': (intraday_execution_context or {}).get('as_of_market_date'),
+            'as_of_timestamp': (intraday_execution_context or {}).get('as_of_timestamp'),
+            'provenance': {
+                'quote': _compact_provenance_summary(quote_freshness_provenance),
+                'intraday_execution_context': _compact_provenance_summary(intraday_execution_provenance),
+            },
+        }
     intraday_available = _context_block_has_signal(intraday_execution_context)
     quote_available = _context_block_has_signal(quote_context)
     if not intraday_available and not quote_available:
@@ -1449,6 +1559,7 @@ def _build_freshness_provenance(
         'is_missing': freshness_status == FRESHNESS_STATUS_MISSING,
         'is_stale': freshness_status == FRESHNESS_STATUS_STALE,
         'is_available_but_old': freshness_status == FRESHNESS_STATUS_AVAILABLE_BUT_OLD,
+        'is_not_applicable': freshness_status == FRESHNESS_STATUS_NOT_APPLICABLE,
         'is_provider_sourced': provenance_status == PROVENANCE_STATUS_PROVIDER_SOURCED,
         'is_derived': provenance_status in {
             PROVENANCE_STATUS_DERIVED,
@@ -1637,7 +1748,16 @@ def _build_quote_freshness_provenance(
     *,
     row: dict[str, Any] | None,
     requested_market_date: date,
+    market_session: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    if not _market_session_data_expected(market_session, key='quote_data_expected'):
+        return _build_not_applicable_freshness_provenance(
+            requested_market_date=requested_market_date,
+            market_session=market_session,
+            source_tables=('current_quote_cache', 'quote_snapshots'),
+            source_provider='kis',
+            reason=_closed_market_not_applicable_reason(market_session),
+        )
     if row is None:
         return _build_freshness_provenance(
             requested_market_date=requested_market_date,
@@ -1857,13 +1977,77 @@ def _build_intraday_block_payload(
 ) -> dict[str, Any]:
     result = dict(_maybe_dict(payload))
     result['status'] = str(result.get('status') or status or DECIDER_QUALITY_STATUS_UNAVAILABLE)
-    if result.get('reason') is None and result['status'] == DECIDER_QUALITY_STATUS_UNAVAILABLE:
+    if result.get('reason') is None and result['status'] in {
+        DECIDER_QUALITY_STATUS_UNAVAILABLE,
+        DECIDER_QUALITY_STATUS_NOT_APPLICABLE,
+    }:
         result['reason'] = reason
     return result
 
 
-def _build_intraday_execution_context(row: dict[str, Any] | None) -> dict[str, Any]:
+def _build_intraday_execution_context(
+    row: dict[str, Any] | None,
+    *,
+    market_session: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     block_names = ('quote', 'orderbook', 'liquidity', 'investor_program_activity', 'news_hints')
+    market_session_fields = _market_session_context_fields(
+        market_session,
+        expected_key='intraday_data_expected',
+    )
+    if not _market_session_data_expected(market_session, key='intraday_data_expected'):
+        not_applicable_reason = _closed_market_not_applicable_reason(market_session)
+        return {
+            'status': DECIDER_QUALITY_STATUS_NOT_APPLICABLE,
+            'reason': not_applicable_reason,
+            'market_state': _maybe_dict(market_session).get('current_market_state'),
+            'market_code': None,
+            'source': 'kis',
+            'feature_version': None,
+            'as_of_market_date': None,
+            'as_of_timestamp': None,
+            'coverage': {
+                'status': DECIDER_QUALITY_STATUS_NOT_APPLICABLE,
+                'available_blocks': 0,
+                'partial_blocks': 0,
+                'total_blocks': len(block_names),
+                'block_statuses': {
+                    block_name: DECIDER_QUALITY_STATUS_NOT_APPLICABLE for block_name in block_names
+                },
+            },
+            'availability': {block_name: False for block_name in block_names},
+            'freshness': {
+                'market_date': None,
+                'status': FRESHNESS_STATUS_NOT_APPLICABLE,
+                'reason': not_applicable_reason,
+            },
+            'quote': _build_intraday_block_payload(
+                payload=None,
+                status=DECIDER_QUALITY_STATUS_NOT_APPLICABLE,
+                reason=not_applicable_reason,
+            ),
+            'orderbook': _build_intraday_block_payload(
+                payload=None,
+                status=DECIDER_QUALITY_STATUS_NOT_APPLICABLE,
+                reason=not_applicable_reason,
+            ),
+            'liquidity': _build_intraday_block_payload(
+                payload=None,
+                status=DECIDER_QUALITY_STATUS_NOT_APPLICABLE,
+                reason=not_applicable_reason,
+            ),
+            'investor_program_activity': _build_intraday_block_payload(
+                payload=None,
+                status=DECIDER_QUALITY_STATUS_NOT_APPLICABLE,
+                reason=not_applicable_reason,
+            ),
+            'news_hints': _build_intraday_block_payload(
+                payload=None,
+                status=DECIDER_QUALITY_STATUS_NOT_APPLICABLE,
+                reason=not_applicable_reason,
+            ),
+            **market_session_fields,
+        }
     if row is None:
         unavailable_reason = 'no_current_kis_intraday_snapshot_cache_row'
         return {
@@ -1912,6 +2096,7 @@ def _build_intraday_execution_context(row: dict[str, Any] | None) -> dict[str, A
                 status=DECIDER_QUALITY_STATUS_UNAVAILABLE,
                 reason=unavailable_reason,
             ),
+            **market_session_fields,
         }
 
     coverage = _maybe_dict(row.get('coverage'))
@@ -1977,6 +2162,7 @@ def _build_intraday_execution_context(row: dict[str, Any] | None) -> dict[str, A
             status=block_statuses['news_hints'],
             reason='intraday_news_hints_not_collected_in_snapshot',
         ),
+        **market_session_fields,
     }
 
 
@@ -1984,7 +2170,16 @@ def _build_intraday_execution_freshness_provenance(
     *,
     row: dict[str, Any] | None,
     requested_market_date: date,
+    market_session: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    if not _market_session_data_expected(market_session, key='intraday_data_expected'):
+        return _build_not_applicable_freshness_provenance(
+            requested_market_date=requested_market_date,
+            market_session=market_session,
+            source_tables=('current_kis_intraday_snapshot_cache', 'kis_intraday_snapshots'),
+            source_provider='kis',
+            reason=_closed_market_not_applicable_reason(market_session),
+        )
     if row is None:
         return _build_freshness_provenance(
             requested_market_date=requested_market_date,
@@ -2195,7 +2390,61 @@ def _build_recent_dart_events_context(
     }
 
 
-def _build_quote_context(row: dict[str, Any] | None, *, market_date: date) -> dict[str, Any]:
+def _build_quote_context(
+    row: dict[str, Any] | None,
+    *,
+    market_date: date,
+    market_session: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    market_session_fields = _market_session_context_fields(
+        market_session,
+        expected_key='quote_data_expected',
+    )
+    if not _market_session_data_expected(market_session, key='quote_data_expected'):
+        not_applicable_reason = _closed_market_not_applicable_reason(market_session)
+        latest_valid_trading_date = _maybe_dict(market_session).get('latest_valid_trading_date')
+        return {
+            'status': DECIDER_QUALITY_STATUS_NOT_APPLICABLE,
+            'reason': not_applicable_reason,
+            'available': False,
+            'source': 'kis',
+            'market_state': _maybe_dict(market_session).get('current_market_state'),
+            'is_live': None,
+            'fallback': False,
+            'price': None,
+            'change': None,
+            'change_pct': None,
+            'volume': None,
+            'turnover': None,
+            'as_of': None,
+            'trade_date': None,
+            'cached_at': None,
+            'captured_at': None,
+            'freshness': {
+                'status': FRESHNESS_STATUS_NOT_APPLICABLE,
+                'reason': not_applicable_reason,
+                'trade_date_relation_to_request': _trade_date_relation_to_request(
+                    as_of_market_date=latest_valid_trading_date,
+                    requested_market_date=market_date,
+                ),
+                'same_market_date_as_request': False,
+                'cached_at': None,
+                'captured_at': None,
+                'quote_trade_date': None,
+                'latest_valid_trading_date': latest_valid_trading_date,
+                'has_cached_timestamp': False,
+            },
+            'spread': {
+                'status': DECIDER_QUALITY_STATUS_NOT_APPLICABLE,
+                'available': False,
+                'bid_price': None,
+                'ask_price': None,
+                'spread_points': None,
+                'spread_bps_of_price': None,
+                'reason': not_applicable_reason,
+            },
+            **market_session_fields,
+        }
     if row is None:
         return {
             'status': DECIDER_QUALITY_STATUS_UNAVAILABLE,
@@ -2233,6 +2482,7 @@ def _build_quote_context(row: dict[str, Any] | None, *, market_date: date) -> di
                 'spread_bps_of_price': None,
                 'reason': 'quote_unavailable',
             },
+            **market_session_fields,
         }
 
     price = _to_int(row.get('price'))
@@ -2316,6 +2566,7 @@ def _build_quote_context(row: dict[str, Any] | None, *, market_date: date) -> di
             else None,
             'reason': spread_reason,
         },
+        **market_session_fields,
     }
 
 
@@ -2611,7 +2862,26 @@ def _build_signal_feature_completeness(
     }
 
 
-def _build_intraday_execution_completeness(row: dict[str, Any] | None) -> dict[str, Any]:
+def _build_intraday_execution_completeness(
+    row: dict[str, Any] | None,
+    *,
+    market_session: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if not _market_session_data_expected(market_session, key='intraday_data_expected'):
+        return {
+            'status': DECIDER_QUALITY_STATUS_NOT_APPLICABLE,
+            'reason': _closed_market_not_applicable_reason(market_session),
+            'available_blocks': 0,
+            'partial_blocks': 0,
+            'total_blocks': 5,
+            'block_statuses': {
+                'quote': DECIDER_QUALITY_STATUS_NOT_APPLICABLE,
+                'orderbook': DECIDER_QUALITY_STATUS_NOT_APPLICABLE,
+                'liquidity': DECIDER_QUALITY_STATUS_NOT_APPLICABLE,
+                'investor_program_activity': DECIDER_QUALITY_STATUS_NOT_APPLICABLE,
+                'news_hints': DECIDER_QUALITY_STATUS_NOT_APPLICABLE,
+            },
+        }
     if row is None:
         return {
             'status': 'unavailable',
@@ -2878,7 +3148,11 @@ def _build_decider_liquidity_turnover_quality_context(
     elif turnover_state == DECIDER_QUALITY_STATUS_AVAILABLE and ranking_state == DECIDER_QUALITY_STATUS_AVAILABLE:
         status = (
             DECIDER_QUALITY_STATUS_AVAILABLE
-            if intraday_state in {DECIDER_QUALITY_STATUS_AVAILABLE, DECIDER_QUALITY_STATUS_PARTIAL}
+            if intraday_state in {
+                DECIDER_QUALITY_STATUS_AVAILABLE,
+                DECIDER_QUALITY_STATUS_PARTIAL,
+                DECIDER_QUALITY_STATUS_NOT_APPLICABLE,
+            }
             else DECIDER_QUALITY_STATUS_PARTIAL
         )
     elif any(
@@ -2893,7 +3167,12 @@ def _build_decider_liquidity_turnover_quality_context(
         [
             turnover.get('reason') if turnover_state != DECIDER_QUALITY_STATUS_AVAILABLE else None,
             ranking.get('reason') if ranking_state != DECIDER_QUALITY_STATUS_AVAILABLE else None,
-            intraday.get('reason') if intraday_state != DECIDER_QUALITY_STATUS_AVAILABLE else None,
+            intraday.get('reason')
+            if intraday_state not in {
+                DECIDER_QUALITY_STATUS_AVAILABLE,
+                DECIDER_QUALITY_STATUS_NOT_APPLICABLE,
+            }
+            else None,
         ]
     )
     return {
@@ -2928,6 +3207,9 @@ def _build_decider_liquidity_turnover_quality_context(
             'reason': intraday.get('reason'),
             'freshness_status': intraday.get('freshness_status'),
             'quote_freshness_status': intraday.get('quote_freshness_status'),
+            'market_session_status': intraday.get('market_session_status'),
+            'recommendation_basis': intraday.get('recommendation_basis'),
+            'latest_valid_trading_date': intraday.get('latest_valid_trading_date'),
             'quote_trade_date': intraday.get('quote_trade_date'),
             'as_of_market_date': intraday.get('as_of_market_date'),
             'as_of_timestamp': intraday.get('as_of_timestamp'),
@@ -2961,7 +3243,9 @@ def _build_decider_intraday_quality_context(
         _maybe_dict(intraday_execution_context).get('status') or intraday_execution_completeness.get('status'),
         freshness_provenance=intraday_execution_provenance,
     )
-    if intraday_state == DECIDER_QUALITY_STATUS_STALE or quote_state == DECIDER_QUALITY_STATUS_STALE:
+    if intraday_state == DECIDER_QUALITY_STATUS_NOT_APPLICABLE and quote_state == DECIDER_QUALITY_STATUS_NOT_APPLICABLE:
+        status = DECIDER_QUALITY_STATUS_NOT_APPLICABLE
+    elif intraday_state == DECIDER_QUALITY_STATUS_STALE or quote_state == DECIDER_QUALITY_STATUS_STALE:
         status = DECIDER_QUALITY_STATUS_STALE
     elif intraday_state == DECIDER_QUALITY_STATUS_AVAILABLE:
         status = DECIDER_QUALITY_STATUS_AVAILABLE
@@ -2978,11 +3262,20 @@ def _build_decider_intraday_quality_context(
     spread = _maybe_dict(_maybe_dict(quote_context).get('spread'))
     return {
         'status': status,
+        'market_session_status': _maybe_dict(intraday_execution_context).get('market_session_status')
+        or _maybe_dict(quote_context).get('market_session_status'),
+        'recommendation_basis': _maybe_dict(intraday_execution_context).get('recommendation_basis')
+        or _maybe_dict(quote_context).get('recommendation_basis'),
+        'latest_valid_trading_date': _maybe_dict(intraday_execution_context).get('latest_valid_trading_date')
+        or _maybe_dict(quote_context).get('latest_valid_trading_date'),
         'quote': {
             'status': quote_state,
+            'source_status': _maybe_dict(quote_context).get('status'),
+            'reason': _maybe_dict(quote_context).get('reason'),
             'trade_date': _maybe_dict(quote_context).get('trade_date'),
             'captured_at': _maybe_dict(quote_context).get('captured_at'),
             'market_state': _maybe_dict(quote_context).get('market_state'),
+            'market_session_status': _maybe_dict(quote_context).get('market_session_status'),
             'quote_spread_points': spread.get('spread_points') or intraday_quote.get('spread_points'),
             'freshness': _compact_provenance_summary(quote_provenance),
         },
@@ -2991,6 +3284,9 @@ def _build_decider_intraday_quality_context(
             'source_status': _maybe_dict(intraday_execution_context).get('status') or intraday_execution_completeness.get('status'),
             'reason': intraday_execution_provenance.get('reason'),
             'market_state': _maybe_dict(intraday_execution_context).get('market_state'),
+            'market_session_status': _maybe_dict(intraday_execution_context).get('market_session_status'),
+            'recommendation_basis': _maybe_dict(intraday_execution_context).get('recommendation_basis'),
+            'latest_valid_trading_date': _maybe_dict(intraday_execution_context).get('latest_valid_trading_date'),
             'as_of_market_date': _maybe_dict(intraday_execution_context).get('as_of_market_date'),
             'as_of_timestamp': _maybe_dict(intraday_execution_context).get('as_of_timestamp'),
             'available_blocks': intraday_execution_completeness.get('available_blocks'),
@@ -3773,15 +4069,19 @@ def _build_symbol_block_coverage(
     available_count: int,
     partial_count: int,
     requested_count: int,
+    not_applicable_count: int = 0,
 ) -> dict[str, Any]:
     return {
         'available_rows': available_count,
         'partial_rows': partial_count,
-        'unavailable_rows': requested_count - available_count - partial_count,
+        'not_applicable_rows': not_applicable_count,
+        'unavailable_rows': requested_count - available_count - partial_count - not_applicable_count,
         'coverage_ratio': _ratio(available_count + partial_count, requested_count),
         'coverage_status': (
             'complete'
             if available_count == requested_count and requested_count > 0
+            else DECIDER_QUALITY_STATUS_NOT_APPLICABLE
+            if not_applicable_count == requested_count and requested_count > 0
             else 'partial'
             if (available_count + partial_count) > 0
             else 'missing'
@@ -3810,6 +4110,11 @@ class AgentContextReadService:
         normalized_symbols = _normalize_symbols(symbols)
         normalized_market_date = market_date if isinstance(market_date, date) else date.fromisoformat(market_date)
         normalized_fs_div = _normalize_fs_div(fs_div)
+        current_market_state = get_market_state()
+        request_market_session = build_market_session_metadata(
+            requested_date=normalized_market_date,
+            current_state=current_market_state,
+        )
 
         symbol_rows = load_symbols(symbols=normalized_symbols, limit=max(len(normalized_symbols), 1000))
         technical_rows = load_daily_technical_snapshots(
@@ -4023,9 +4328,16 @@ class AgentContextReadService:
 
         for symbol in normalized_symbols:
             raw_quote_row = quote_map.get(symbol)
-            quote_context = _build_quote_context(raw_quote_row, market_date=normalized_market_date)
+            quote_context = _build_quote_context(
+                raw_quote_row,
+                market_date=normalized_market_date,
+                market_session=request_market_session,
+            )
             intraday_execution_row = intraday_execution_map.get(symbol)
-            intraday_execution_context = _build_intraday_execution_context(intraday_execution_row)
+            intraday_execution_context = _build_intraday_execution_context(
+                intraday_execution_row,
+                market_session=request_market_session,
+            )
             price_context = price_context_map.get(symbol)
             price_context_history = price_context_history_map.get(symbol, [])
             technical_snapshot = technical_map.get(symbol)
@@ -4155,7 +4467,10 @@ class AgentContextReadService:
                     signal_features,
                     storage_unavailable=signal_features_storage_unavailable,
                 ),
-                'intraday_execution_context': _build_intraday_execution_completeness(intraday_execution_row),
+                'intraday_execution_context': _build_intraday_execution_completeness(
+                    intraday_execution_row,
+                    market_session=request_market_session,
+                ),
                 'market_relative_context': _build_market_relative_completeness(market_relative_context),
                 'sector_peer_mapping': _build_context_block_completeness(
                     sector_peer_context,
@@ -4195,6 +4510,7 @@ class AgentContextReadService:
             quote_context_provenance = _build_quote_freshness_provenance(
                 row=raw_quote_row,
                 requested_market_date=normalized_market_date,
+                market_session=request_market_session,
             )
             price_context_provenance = _build_price_context_freshness_provenance(
                 price_context=price_context,
@@ -4212,6 +4528,7 @@ class AgentContextReadService:
             intraday_execution_provenance = _build_intraday_execution_freshness_provenance(
                 row=intraday_execution_row,
                 requested_market_date=normalized_market_date,
+                market_session=request_market_session,
             )
             market_relative_context_provenance = _build_market_relative_freshness_provenance(
                 row=market_relative_map.get(symbol),
@@ -4462,6 +4779,7 @@ class AgentContextReadService:
                 {
                     'symbol': symbol,
                     'market_date': normalized_market_date.isoformat(),
+                    'market_session': request_market_session,
                     'company': company,
                     'quote_context': quote_context,
                     'price_context': price_context,
@@ -4540,6 +4858,12 @@ class AgentContextReadService:
             1
             for item in items
             if str((item.get('intraday_execution_context') or {}).get('status') or 'unavailable') == 'partial'
+        )
+        intraday_execution_not_applicable_count = sum(
+            1
+            for item in items
+            if str((item.get('intraday_execution_context') or {}).get('status') or 'unavailable')
+            == DECIDER_QUALITY_STATUS_NOT_APPLICABLE
         )
         market_relative_available_count = sum(
             1
@@ -4633,6 +4957,7 @@ class AgentContextReadService:
                 available_count=intraday_execution_available_count,
                 partial_count=intraday_execution_partial_count,
                 requested_count=requested_symbol_count,
+                not_applicable_count=intraday_execution_not_applicable_count,
             ),
             'market_relative_context': {
                 'available_rows': market_relative_available_count,
@@ -4729,10 +5054,12 @@ class AgentContextReadService:
                 'fs_label': FS_DIV_TO_STATEMENT_TYPE.get(normalized_fs_div) if normalized_fs_div else None,
                 'disclosures_limit': disclosures_limit,
             },
+            'market_session': request_market_session,
             'summary': {
                 'requested_symbol_count': len(normalized_symbols),
                 'matched_symbol_count': len(matched_symbols),
                 'missing_symbols': missing_symbols,
+                'market_session': request_market_session,
                 'quote_context_count': sum(1 for item in items if _context_block_has_signal(item['quote_context'])),
                 'price_context_count': sum(1 for item in items if item['price_context'] is not None),
                 'intraday_execution_context_count': sum(

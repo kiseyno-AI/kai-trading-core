@@ -42,6 +42,7 @@ from app.eod.run_stage_support import (
     select_preferred_eod_run,
 )
 from app.market.clock import get_market_state
+from app.market.session import build_market_session_metadata
 from app.market_data_store import (
     DAY_BASED_TRENDING_PERIODS,
     count_daily_price_bars_for_date,
@@ -209,6 +210,10 @@ class EODPipelineStatusService:
         # The default operator view stays on the current Seoul calendar date.
         # Callers must pass market_date explicitly when they want a previous trade date on weekends or break-days.
         resolved_market_date = date.fromisoformat(market_date or str(market_state.server_time)[:10]).isoformat()
+        market_session = build_market_session_metadata(
+            requested_date=resolved_market_date,
+            current_state=market_state,
+        )
         resolved_fs_div = (fs_div or settings.dart_fundamentals_default_fs_div).strip().upper()
         pykrx_run = self.pykrx_run_loader(trade_date=resolved_market_date)
         live_symbols_total = int(self.live_symbol_count_loader() or 0)
@@ -279,7 +284,11 @@ class EODPipelineStatusService:
                 'is_open': getattr(market_state, 'is_open', None),
                 'reason': getattr(market_state, 'reason', None),
                 'server_time': getattr(market_state, 'server_time', None),
+                'current_calendar_date': getattr(market_state, 'current_calendar_date', None),
+                'latest_valid_trading_date': getattr(market_state, 'latest_valid_trading_date', None),
+                'market_session': getattr(market_state, 'market_session', None),
             },
+            'market_session': market_session,
             'fs_div': resolved_fs_div,
             'status': self._resolve_overall_status(stages),
             'stage_order': list(PIPELINE_STAGE_ORDER),

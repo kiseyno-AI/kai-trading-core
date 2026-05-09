@@ -3,6 +3,8 @@
 ## Summary
 Builds the operator-facing daily decider coverage report from persisted decider request payloads. The response rolls up core execution block availability (`available`, `missing`, `stale`, `derived`, `provider_error`), optional block availability (`available`, `empty`, `unavailable`, `provider_error`), top degraded categories, default gap-effect buckets (`decision_affected`, `confidence_reducer`, `neutral_auxiliary`), raw-null contract regressions for expected object-style context paths, and per-agent summaries when both deciders are present.
 
+Closed-market intraday or quote blocks now preserve raw `status="not_applicable"` counts in `raw_status_counts`, but the rollups treat them as neutral availability rather than as missing-data alarms. This keeps weekend and holiday decider payloads from inflating gap-effect summaries.
+
 ## Example request
 ```http
 GET /agent-context/feedback/decider-coverage?market_date=2026-05-08&run_id=symbol-run-2026-05-08-abc123&agent_names=signal-decider&agent_names=short-term-decider
