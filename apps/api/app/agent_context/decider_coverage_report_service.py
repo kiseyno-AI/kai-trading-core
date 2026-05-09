@@ -10,6 +10,7 @@ from app.agent_context.read_service import (
     DECIDER_QUALITY_BLOCK_CATEGORY_KEYS,
     DECIDER_QUALITY_STATUS_AVAILABLE,
     DECIDER_QUALITY_STATUS_EMPTY,
+    DECIDER_QUALITY_STATUS_NOT_APPLICABLE,
     DECIDER_QUALITY_STATUS_PROVIDER_ERROR,
     DECIDER_QUALITY_STATUS_STALE,
     DECIDER_QUALITY_STATUS_UNAVAILABLE,
@@ -50,6 +51,7 @@ RAW_STATUS_KEYS: tuple[str, ...] = (
     DECIDER_QUALITY_STATUS_EMPTY,
     DECIDER_QUALITY_STATUS_UNAVAILABLE,
     DECIDER_QUALITY_STATUS_PROVIDER_ERROR,
+    DECIDER_QUALITY_STATUS_NOT_APPLICABLE,
 )
 EXPECTED_CONTEXT_OBJECT_PATHS: tuple[str, ...] = (
     'symbol_day_context.quote_context',
@@ -277,6 +279,8 @@ def _raw_status(block: dict[str, Any]) -> str:
 
 def _core_bucket_for_block(block_name: str, block: dict[str, Any]) -> str:
     raw_status = _raw_status(block)
+    if raw_status == DECIDER_QUALITY_STATUS_NOT_APPLICABLE:
+        return DECIDER_QUALITY_STATUS_AVAILABLE
     if raw_status == DECIDER_QUALITY_STATUS_PROVIDER_ERROR:
         return DECIDER_QUALITY_STATUS_PROVIDER_ERROR
     if raw_status == DECIDER_QUALITY_STATUS_STALE:
@@ -293,6 +297,8 @@ def _core_bucket_for_block(block_name: str, block: dict[str, Any]) -> str:
 
 def _optional_bucket_for_block(block: dict[str, Any]) -> str:
     raw_status = _raw_status(block)
+    if raw_status == DECIDER_QUALITY_STATUS_NOT_APPLICABLE:
+        return DECIDER_QUALITY_STATUS_AVAILABLE
     if raw_status == DECIDER_QUALITY_STATUS_PROVIDER_ERROR:
         return DECIDER_QUALITY_STATUS_PROVIDER_ERROR
     if raw_status == DECIDER_QUALITY_STATUS_EMPTY:
@@ -304,7 +310,10 @@ def _optional_bucket_for_block(block: dict[str, Any]) -> str:
 
 def _effect_bucket_for_block(block: dict[str, Any]) -> str | None:
     raw_status = _raw_status(block)
-    if raw_status == DECIDER_QUALITY_STATUS_AVAILABLE:
+    if raw_status in {
+        DECIDER_QUALITY_STATUS_AVAILABLE,
+        DECIDER_QUALITY_STATUS_NOT_APPLICABLE,
+    }:
         return None
     decision_guidance = _maybe_dict(block.get('decision_guidance'))
     if raw_status == DECIDER_QUALITY_STATUS_EMPTY and bool(

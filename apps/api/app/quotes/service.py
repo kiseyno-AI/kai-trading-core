@@ -189,7 +189,7 @@ class QuoteService:
 
         if latest_trade_date == market_date:
             fallback_reason = 'daily_price_bar_current_trade_date'
-        elif market_state in {'PREOPEN', 'WEEKEND'} and 0 <= age_days <= MAX_RECENT_DAILY_BAR_AGE_DAYS:
+        elif market_state in {'PREOPEN', 'WEEKEND', 'HOLIDAY'} and 0 <= age_days <= MAX_RECENT_DAILY_BAR_AGE_DAYS:
             fallback_reason = 'daily_price_bar_recent_previous_trade_date'
         else:
             logger.warning(

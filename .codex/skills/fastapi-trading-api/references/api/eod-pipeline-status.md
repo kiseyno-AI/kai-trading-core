@@ -11,6 +11,8 @@ The same payload now also reports the default-selected filtering and factor/scor
 
 The default `market_date` is the current Seoul calendar date from `server_time[:10]`. On weekends, holidays, or other break-days, callers must pass `market_date` explicitly if they want the previous trading day's pipeline view instead of the current calendar date.
 
+The response now also includes `market` and `market_session` blocks. `market` is the current exchange-clock state, and `market_session` describes the semantics of the requested `market_date`, including the latest valid trading date and whether live quote or intraday data is expected for that date.
+
 ## Example request
 ```http
 GET /eod/pipeline/status?market_date=2026-04-21&fs_div=CFS
@@ -20,6 +22,27 @@ GET /eod/pipeline/status?market_date=2026-04-21&fs_div=CFS
 ```json
 {
   "market_date": "2026-04-21",
+  "market": {
+    "market": "KRX",
+    "state": "OPEN",
+    "is_trading_day": true,
+    "is_open": true,
+    "reason": null,
+    "server_time": "2026-04-21T14:12:00+09:00",
+    "current_calendar_date": "2026-04-21",
+    "latest_valid_trading_date": "2026-04-21",
+    "market_session": "open"
+  },
+  "market_session": {
+    "requested_date": "2026-04-21",
+    "current_calendar_date": "2026-04-21",
+    "latest_valid_trading_date": "2026-04-21",
+    "status": "open",
+    "is_trading_day": true,
+    "intraday_data_expected": true,
+    "quote_data_expected": true,
+    "recommendation_basis": "live_intraday"
+  },
   "fs_div": "CFS",
   "status": "running",
   "stage_order": [

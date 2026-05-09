@@ -17,6 +17,17 @@ class ErrorSnapshotService:
         raise RuntimeError('snapshot unavailable')
 
 
+class FakeWeekendMarketState:
+    state = 'WEEKEND'
+    is_trading_day = False
+    is_open = False
+    reason = 'weekend'
+    server_time = '2026-05-09T12:00:00+09:00'
+    current_calendar_date = '2026-05-09'
+    latest_valid_trading_date = '2026-05-08'
+    market_session = 'weekend'
+
+
 def _snapshot_payload(
     *,
     fallback_applied: bool = False,
@@ -177,6 +188,20 @@ class SignalDeciderMarketContextBuilderTests(unittest.TestCase):
         self.assertEqual(result['flows'], {})
         self.assertIn('indices.kospi', result['missing_fields'])
         self.assertIn('fx.usdkrw', result['missing_fields'])
+
+    def test_build_includes_market_session_metadata_for_closed_market_dates(self) -> None:
+        builder = SignalDeciderMarketContextBuilder(
+            snapshot_service=ErrorSnapshotService(),
+            market_state_loader=lambda: FakeWeekendMarketState(),
+        )
+
+        result = builder.build(market_date=date(2026, 5, 9))
+
+        self.assertEqual(result['market_session']['requested_date'], '2026-05-09')
+        self.assertEqual(result['market_session']['status'], 'weekend')
+        self.assertEqual(result['market_session']['latest_valid_trading_date'], '2026-05-08')
+        self.assertFalse(result['market_session']['intraday_data_expected'])
+        self.assertEqual(result['market_session']['recommendation_basis'], 'latest_completed_eod')
 
 
 if __name__ == '__main__':

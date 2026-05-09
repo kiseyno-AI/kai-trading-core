@@ -18,6 +18,7 @@ from app.eod.service import EOD_SERVICE
 from app.eod.state import job_state
 from app.eod.technical_snapshots import daily_technical_snapshot_service
 from app.market.clock import get_market_state
+from app.market.session import build_market_session_metadata
 from app.signals.advanced_value_factor import (
     ADVANCED_VALUE_FACTOR_SOURCE,
     daily_advanced_value_factor_service,
@@ -65,10 +66,16 @@ class EODPipelineRunRequest(BaseModel):
 
 @router.get('/status')
 async def get_eod_status() -> dict:
+    market_state = get_market_state()
     return {
         'job': job_state.snapshot(),
         'master': master_refresh_state.snapshot(),
         'pykrx_auto': auto_pykrx_eod_scheduler.snapshot(),
+        'market': market_state.__dict__,
+        'market_session': build_market_session_metadata(
+            requested_date=(market_state.current_calendar_date or market_state.server_time[:10]),
+            current_state=market_state,
+        ),
     }
 
 

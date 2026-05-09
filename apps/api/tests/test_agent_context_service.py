@@ -13,7 +13,10 @@ from app.agent_context.read_service import (
     _build_decider_intraday_quality_context,
     _build_factor_summary_entry,
     _build_intraday_execution_context,
+    _build_intraday_execution_freshness_provenance,
     _build_price_context,
+    _build_quote_context,
+    _build_quote_freshness_provenance,
     _build_recent_dart_events_context,
     _build_recent_disclosures_freshness_provenance,
     _load_latest_symbol_day_block_history,
@@ -23,6 +26,18 @@ EMPTY_LATEST_PRIOR_ROWS = {
     'factor_rows': {family: {} for family in PERSISTED_FACTOR_FAMILIES},
     'signal_features': {},
 }
+
+
+def _closed_market_session() -> dict[str, object]:
+    return {
+        'status': 'weekend',
+        'current_market_state': 'WEEKEND',
+        'current_calendar_date': '2026-04-11',
+        'latest_valid_trading_date': '2026-04-10',
+        'recommendation_basis': 'latest_completed_eod',
+        'quote_data_expected': False,
+        'intraday_data_expected': False,
+    }
 
 
 def _make_intraday_execution_row(
@@ -939,6 +954,9 @@ class AgentContextReadServiceTests(unittest.TestCase):
 
         self.assertEqual(load_technical_mock.call_args.kwargs['fallback_window_days'], 0)
 
+        self.assertEqual(result['market_session']['requested_date'], '2026-04-08')
+        self.assertEqual(result['market_session']['latest_valid_trading_date'], '2026-04-08')
+        self.assertEqual(result['summary']['market_session']['requested_date'], '2026-04-08')
         self.assertEqual(result['summary']['requested_symbol_count'], 2)
         self.assertEqual(result['summary']['matched_symbol_count'], 1)
         self.assertEqual(result['summary']['quote_context_count'], 1)
@@ -962,6 +980,8 @@ class AgentContextReadServiceTests(unittest.TestCase):
         self.assertEqual(first_item['quote_context']['source'], 'kis')
         self.assertEqual(first_item['quote_context']['spread']['spread_points'], 100)
         self.assertEqual(first_item['quote_context']['spread']['spread_bps_of_price'], 13.9762)
+        self.assertEqual(first_item['market_session']['requested_date'], '2026-04-08')
+        self.assertEqual(first_item['market_session']['latest_valid_trading_date'], '2026-04-08')
         self.assertEqual(
             first_item['quote_context']['freshness']['trade_date_relation_to_request'],
             'same_market_date',
@@ -1940,6 +1960,85 @@ class AgentContextReadServiceTests(unittest.TestCase):
         self.assertTrue(intraday_snapshot['liquidity_available'])
         self.assertTrue(intraday_snapshot['investor_program_activity_available'])
         self.assertTrue(intraday_snapshot['news_hints_available'])
+
+    def test_closed_market_quote_and_intraday_contexts_are_not_applicable(self):
+        market_session = _closed_market_session()
+
+        quote_context = _build_quote_context(
+            None,
+            market_date=date(2026, 4, 11),
+            market_session=market_session,
+        )
+        quote_provenance = _build_quote_freshness_provenance(
+            row=None,
+            requested_market_date=date(2026, 4, 11),
+            market_session=market_session,
+        )
+        intraday_execution_context = _build_intraday_execution_context(
+            None,
+            market_session=market_session,
+        )
+        intraday_execution_provenance = _build_intraday_execution_freshness_provenance(
+            row=None,
+            requested_market_date=date(2026, 4, 11),
+            market_session=market_session,
+        )
+
+        self.assertEqual(quote_context['status'], 'not_applicable')
+        self.assertEqual(quote_context['reason'], 'closed_market')
+        self.assertEqual(quote_context['market_session_status'], 'weekend')
+        self.assertEqual(quote_context['latest_valid_trading_date'], '2026-04-10')
+        self.assertFalse(quote_context['data_expected'])
+        self.assertEqual(quote_provenance['freshness_status'], 'not_applicable')
+        self.assertEqual(quote_provenance['provenance_status'], 'not_applicable')
+        self.assertEqual(intraday_execution_context['status'], 'not_applicable')
+        self.assertEqual(intraday_execution_context['coverage']['status'], 'not_applicable')
+        self.assertEqual(
+            intraday_execution_context['coverage']['block_statuses']['quote'],
+            'not_applicable',
+        )
+        self.assertEqual(intraday_execution_provenance['freshness_status'], 'not_applicable')
+        self.assertEqual(intraday_execution_provenance['provenance_status'], 'not_applicable')
+
+    def test_build_decider_intraday_quality_context_marks_closed_market_as_not_applicable(self):
+        market_session = _closed_market_session()
+        quote_context = _build_quote_context(
+            None,
+            market_date=date(2026, 4, 11),
+            market_session=market_session,
+        )
+        intraday_execution_context = _build_intraday_execution_context(
+            None,
+            market_session=market_session,
+        )
+
+        result = _build_decider_intraday_quality_context(
+            quote_context=quote_context,
+            quote_provenance=_build_quote_freshness_provenance(
+                row=None,
+                requested_market_date=date(2026, 4, 11),
+                market_session=market_session,
+            ),
+            intraday_execution_context=intraday_execution_context,
+            intraday_execution_provenance=_build_intraday_execution_freshness_provenance(
+                row=None,
+                requested_market_date=date(2026, 4, 11),
+                market_session=market_session,
+            ),
+            intraday_execution_completeness=intraday_execution_context['coverage'],
+        )
+
+        self.assertEqual(result['status'], 'not_applicable')
+        self.assertEqual(result['market_session_status'], 'weekend')
+        self.assertEqual(result['recommendation_basis'], 'latest_completed_eod')
+        self.assertEqual(result['latest_valid_trading_date'], '2026-04-10')
+        self.assertEqual(result['quote']['status'], 'not_applicable')
+        self.assertEqual(result['intraday_snapshot']['status'], 'not_applicable')
+        self.assertFalse(result['intraday_snapshot']['quote_available'])
+        self.assertFalse(result['intraday_snapshot']['orderbook_available'])
+        self.assertFalse(result['intraday_snapshot']['liquidity_available'])
+        self.assertFalse(result['intraday_snapshot']['investor_program_activity_available'])
+        self.assertFalse(result['intraday_snapshot']['news_hints_available'])
 
     def test_build_decider_data_quality_context_marks_factor_score_provider_error_for_signal_feature_storage_failure(self):
         result = _build_decider_data_quality_context(

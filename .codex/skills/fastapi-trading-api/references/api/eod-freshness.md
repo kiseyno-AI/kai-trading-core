@@ -11,6 +11,8 @@ The `latest` block keeps the latest stored price date, preserves the legacy `pri
 
 `latest.summary.basis` names the count basis. `latest_eod_run_symbol_universe` means the summary comes from the selected latest `eod_collection_runs` row for that trade date. `stored_price_bars_for_latest_trade_date` is the fallback when stored bars exist but no matching EOD run row is available.
 
+The response now also includes a top-level `market_session` block with the requested/current calendar date, latest valid trading date, session status, data-expected flags, and `recommendation_basis`. On weekends and holidays, it makes the latest completed trading session explicit without backshifting `today.trade_date`.
+
 ## Example request
 ```http
 GET /eod/freshness
@@ -19,6 +21,16 @@ GET /eod/freshness
 ## Example response
 ```json
 {
+  "market_session": {
+    "requested_date": "2026-04-16",
+    "current_calendar_date": "2026-04-16",
+    "latest_valid_trading_date": "2026-04-16",
+    "status": "closed",
+    "is_trading_day": true,
+    "intraday_data_expected": false,
+    "quote_data_expected": false,
+    "recommendation_basis": "latest_completed_eod"
+  },
   "today": {
     "trade_date": "2026-04-16",
     "price": {

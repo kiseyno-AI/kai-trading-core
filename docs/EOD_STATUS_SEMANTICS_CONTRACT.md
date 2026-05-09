@@ -27,6 +27,17 @@ It freezes the behavior currently shipped on `main` so future web work, core ref
 - Historical backfill rows must not outrank the daily pipeline row when both exist for the same trade date.
   The preferred EOD run is the first non-`historical_backfill` row for that trade date. Historical rows are only used when no daily row exists.
 
+## Shared market-session metadata
+
+- Both routes now include a top-level `market_session` block.
+- `market_session.requested_date` is the freshness or pipeline date being described. `market_session.current_calendar_date` is the current Seoul calendar date from the market clock.
+- `market_session.latest_valid_trading_date` is the latest exchange trading date on or before `requested_date`.
+- `market_session.status` distinguishes requested-date market semantics with `open`, `closed`, `weekend`, and `holiday`.
+- `market_session.is_trading_day` is true only when `requested_date` is an exchange trading session.
+- `market_session.intraday_data_expected` and `market_session.quote_data_expected` are false on weekends, holidays, and same-day closed sessions where live intraday or quote rows are not expected.
+- `market_session.recommendation_basis` is `live_intraday` only for the current open trading session; otherwise it is `latest_completed_eod`.
+- On weekends, holidays, and other non-trading days, consumers must use `latest_valid_trading_date` and `recommendation_basis=latest_completed_eod` when describing freshness to operators instead of implying a missing current-cycle intraday feed.
+
 ## `GET /eod/freshness`
 
 ### `today`
@@ -124,11 +135,11 @@ It freezes the behavior currently shipped on `main` so future web work, core ref
 ## Non-trading-day behavior
 
 - Weekend behavior:
-  `today.trade_date` and default pipeline `market_date` stay on the weekend calendar date; prior availability remains visible only through `latest.*` or an explicit query date.
+  `today.trade_date` and default pipeline `market_date` stay on the weekend calendar date; prior availability remains visible only through `latest.*` or an explicit query date. `market_session.status=weekend`, `latest_valid_trading_date` points at the prior session, and intraday or quote data is marked not expected for that requested date.
 - Market-closed same-day behavior:
-  After the market closes, `today` still refers to that same Seoul calendar date. If same-day EOD persistence is not finished yet, `today` can remain `missing` while `latest` still points to the previous stored trade date.
+  After the market closes, `today` still refers to that same Seoul calendar date. If same-day EOD persistence is not finished yet, `today` can remain `missing` while `latest` still points to the previous stored trade date. `market_session.status=closed` and `recommendation_basis=latest_completed_eod` make that same-day closed state explicit.
 - Break-day behavior:
-  Current implementation treats exchange holidays and other non-trading break-days the same as weekends for default date selection. The routes do not auto-resolve a previous trading date into `today` or the default pipeline `market_date`.
+  Exchange holidays and other non-trading break-days still keep the requested calendar date as the default route date, but `market_session.status=holiday` now distinguishes them from a weekend. The routes do not auto-resolve a previous trading date into `today` or the default pipeline `market_date`; consumers should read `latest_valid_trading_date` when they need the last completed trading session.
 
 ## Test anchors
 

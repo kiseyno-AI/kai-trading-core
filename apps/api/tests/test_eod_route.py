@@ -1,5 +1,6 @@
 
 import unittest
+from unittest.mock import patch
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -1055,6 +1056,32 @@ class EODRouteTests(unittest.TestCase):
     def setUp(self):
         self.app = FastAPI()
         self.app.include_router(routes_eod.router)
+
+    def test_get_eod_status_route_includes_market_session_metadata(self):
+        class _FakeMarketState:
+            def __init__(self) -> None:
+                self.market = 'KRX'
+                self.state = 'HOLIDAY'
+                self.is_trading_day = False
+                self.is_open = False
+                self.reason = 'holiday'
+                self.server_time = '2026-05-05T12:15:00+09:00'
+                self.current_calendar_date = '2026-05-05'
+                self.latest_valid_trading_date = '2026-05-04'
+                self.market_session = 'holiday'
+
+        client = TestClient(self.app)
+        with patch('app.api.routes_eod.get_market_state', return_value=_FakeMarketState()):
+            response = client.get('/eod/status')
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload['market']['state'], 'HOLIDAY')
+        self.assertEqual(payload['market']['latest_valid_trading_date'], '2026-05-04')
+        self.assertEqual(payload['market_session']['requested_date'], '2026-05-05')
+        self.assertEqual(payload['market_session']['status'], 'holiday')
+        self.assertEqual(payload['market_session']['latest_valid_trading_date'], '2026-05-04')
+        self.assertFalse(payload['market_session']['intraday_data_expected'])
 
     def test_get_eod_freshness_route_returns_service_payload(self):
         fake_service = FakeFreshnessService()
