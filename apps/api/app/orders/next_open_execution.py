@@ -270,7 +270,8 @@ class SignalDeciderNextOpenExecutionService:
         resolved_target_date = self._resolve_target_trade_date(target_trade_date)
         source_market_date = _previous_trading_day(resolved_target_date)
         runtime = self.runtime_status()
-        account_targets, _account_target_errors = self._parse_account_targets()
+        account_targets, account_target_errors = self._parse_account_targets()
+        account_targets_setting_configured = bool(settings.signal_decider_next_open_account_targets.strip())
         snapshots = self._load_latest_snapshots(source_market_date=source_market_date)
         existing_rows = self._load_plan_rows(target_trade_date=resolved_target_date, account_reference=None)
         policy_cache: dict[str, dict[str, Any]] = {}
@@ -307,6 +308,7 @@ class SignalDeciderNextOpenExecutionService:
                     )
                     continue
 
+                account_target_blocking_reasons: list[dict[str, str]] = []
                 if not account_targets:
                     if decision_agent_name != SHORT_TERM_DECIDER_AGENT_NAME:
                         continue
@@ -317,6 +319,21 @@ class SignalDeciderNextOpenExecutionService:
                             budget_krw=UNSPECIFIED_ROUTE_ACCOUNT_BUDGET_KRW,
                         )
                     ]
+                    if account_target_errors:
+                        account_target_blocking_reasons.append(
+                            _reason(
+                                'account_targets_invalid',
+                                'SIGNAL_DECIDER_NEXT_OPEN_ACCOUNT_TARGETS is invalid; fix configured account '
+                                f'targets before dispatching short-term candidates: {"; ".join(account_target_errors)}',
+                            )
+                        )
+                    elif account_targets_setting_configured:
+                        account_target_blocking_reasons.append(
+                            _reason(
+                                'account_targets_empty',
+                                'SIGNAL_DECIDER_NEXT_OPEN_ACCOUNT_TARGETS is configured but contains no valid account targets.',
+                            )
+                        )
                 else:
                     account_targets_for_row = account_targets
 
@@ -359,6 +376,11 @@ class SignalDeciderNextOpenExecutionService:
                         policy_context=policy_context,
                         price_cache=price_cache,
                     )
+                    if account_target_blocking_reasons:
+                        validation['blocking_reasons'] = [
+                            *(validation.get('blocking_reasons') or []),
+                            *account_target_blocking_reasons,
+                        ]
                     self._apply_plan_row(
                         row=row,
                         snapshot=snapshot,

@@ -429,6 +429,30 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(item['planned_quantity'])
         self.assertEqual(item['eligibility_status'], ELIGIBILITY_ELIGIBLE)
 
+    def test_refresh_plan_items_blocks_short_term_rows_with_invalid_account_targets(self) -> None:
+        self._seed_short_term_snapshot(symbol='005930')
+        settings.signal_decider_next_open_account_targets = 'Main=not-a-kis-account@1500000'
+        service = self._service(state='PREOPEN', server_time='2026-04-30T08:40:00+09:00')
+
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[{'trade_date': '2026-04-29', 'close_price': 50000}],
+        ):
+            result = service.refresh_plan_items(target_trade_date=self.target_trade_date, trigger='test')
+
+        self.assertEqual(result['summary']['items_total'], 1)
+        self.assertEqual(result['summary']['eligible_count'], 0)
+        self.assertEqual(result['summary']['blocked_count'], 1)
+        item = result['items'][0]
+        self.assertEqual(item['decision_agent_name'], 'short-term-decider')
+        self.assertEqual(item['account_reference'], 'KIS:00000000-00')
+        self.assertEqual(item['account_label'], 'UNSPECIFIED_ROUTE')
+        self.assertEqual(item['eligibility_status'], ELIGIBILITY_BLOCKED)
+        self.assertIn(
+            'account_targets_invalid',
+            {reason['code'] for reason in item['validation']['blocking_reasons']},
+        )
+
     def test_refresh_plan_items_skips_non_actionable_short_term_decisions(self) -> None:
         self._seed_short_term_snapshot(symbol='035420', tactical_action='wait')
         service = self._service(state='PREOPEN', server_time='2026-04-30T08:40:00+09:00')
