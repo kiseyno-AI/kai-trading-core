@@ -45,7 +45,9 @@ from app.market.clock import get_market_state
 from app.market.session import build_market_session_metadata
 from app.market_data_store import (
     DAY_BASED_TRENDING_PERIODS,
+    count_daily_action_summaries_for_live_symbols,
     count_daily_price_bars_for_date,
+    count_daily_technical_snapshots_for_live_symbols,
     count_live_symbols,
     load_eod_run_stage_counts,
 )
@@ -129,7 +131,7 @@ def _noop_row_count_stage_counts_loader(*, market_date: str) -> dict[str, dict[s
     return {}
 
 
-def _noop_price_bar_count_loader(*, market_date: str) -> int:
+def _noop_price_bar_count_loader(*args, market_date: str | None = None, **kwargs) -> int:
     return 0
 
 
@@ -198,6 +200,8 @@ class EODPipelineStatusService:
     factor_stage_counts_loader: Callable = _noop_factor_stage_counts_loader
     row_count_stage_counts_loader: Callable = _noop_row_count_stage_counts_loader
     price_bar_count_loader: Callable = _noop_price_bar_count_loader
+    technical_snapshot_count_loader: Callable = _noop_price_bar_count_loader
+    action_summary_count_loader: Callable = _noop_price_bar_count_loader
     pykrx_enrichment_loader: Callable = _load_pykrx_enrichment_coverage
 
     def read(
@@ -248,6 +252,32 @@ class EODPipelineStatusService:
         stored_price_rows = int(self.price_bar_count_loader(market_date=resolved_market_date) or 0)
         if stored_price_rows <= 0:
             stored_price_rows = int(dict(pykrx_stage_counts.get('price_collection') or {}).get('persisted') or 0)
+        stored_technical_rows = max(
+            int(self.technical_snapshot_count_loader(resolved_market_date) or 0),
+            int(dict(pykrx_stage_counts.get('technical_snapshots') or {}).get('persisted') or 0),
+        )
+        stored_action_rows = max(
+            int(self.action_summary_count_loader(resolved_market_date) or 0),
+            int(dict(pykrx_stage_counts.get('action_summaries') or {}).get('persisted') or 0),
+        )
+        pykrx_stages = {
+            **pykrx_stages,
+            'price_collection': self._normalize_stored_pykrx_coverage_stage(
+                pykrx_stages['price_collection'],
+                persisted=stored_price_rows,
+                expected_total=stored_price_rows,
+            ),
+            'technical_snapshots': self._normalize_stored_pykrx_coverage_stage(
+                pykrx_stages['technical_snapshots'],
+                persisted=stored_technical_rows,
+                expected_total=stored_price_rows,
+            ),
+            'action_summaries': self._normalize_stored_pykrx_coverage_stage(
+                pykrx_stages['action_summaries'],
+                persisted=stored_action_rows,
+                expected_total=stored_price_rows,
+            ),
+        }
         stages = {
             **pykrx_stages,
             'pykrx_enrichment': pykrx_enrichment_stage,
@@ -786,6 +816,40 @@ class EODPipelineStatusService:
         }
 
     @staticmethod
+    def _normalize_stored_pykrx_coverage_stage(
+        stage: dict[str, Any],
+        *,
+        persisted: int,
+        expected_total: int,
+    ) -> dict[str, Any]:
+        if persisted <= 0 or str(stage.get('status') or '') == 'running':
+            return stage
+        normalized_total = max(int(expected_total or 0), persisted)
+        counts = build_stage_counts(
+            total=normalized_total,
+            succeeded=persisted,
+            failed=max(normalized_total - persisted, 0),
+            processed=persisted,
+        )
+        status = 'completed' if counts.failed == 0 and counts.succeeded >= counts.total else 'partial'
+        details = dict(stage.get('details') or {})
+        details['stored_rows_present'] = persisted
+        details['stored_rows_coverage_override'] = True
+        return {
+            **stage,
+            'status': status,
+            'source_status': stage.get('source_status') or 'stored_rows_present',
+            'processed': counts.processed,
+            'total': counts.total,
+            'succeeded': counts.succeeded,
+            'failed': counts.failed,
+            'remaining': counts.remaining,
+            'completed_at': stage.get('completed_at') or stage.get('updated_at'),
+            'current_activity': _default_activity(str(stage.get('label') or stage.get('task') or ''), status),
+            'details': details,
+        }
+
+    @staticmethod
     def _resolve_factor_expected_total(
         *,
         price_stage: dict[str, Any],
@@ -851,4 +915,6 @@ eod_pipeline_status_service = EODPipelineStatusService(
     factor_stage_counts_loader=_load_factor_stage_counts,
     row_count_stage_counts_loader=_load_row_count_stage_counts,
     price_bar_count_loader=lambda *, market_date: count_daily_price_bars_for_date(market_date),
+    technical_snapshot_count_loader=lambda market_date: count_daily_technical_snapshots_for_live_symbols(market_date),
+    action_summary_count_loader=lambda market_date: count_daily_action_summaries_for_live_symbols(market_date),
 )

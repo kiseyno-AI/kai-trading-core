@@ -748,7 +748,7 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
         )
         self.assertEqual(
             result['stages']['momentum_factors']['details']['price_stage_expected_rows'],
-            2811,
+            2810,
         )
 
     def test_read_prefers_date_scoped_price_bars_over_limited_retry_run_counts_for_factor_progress(self):
@@ -848,8 +848,62 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
         )
         self.assertEqual(
             result['stages']['momentum_factors']['details']['price_stage_expected_rows'],
-            100,
+            2810,
         )
+
+    def test_read_treats_stored_full_coverage_as_completed_after_scoped_retry_run(self):
+        pykrx_run = {
+            'id': 401,
+            'market': 'KRX',
+            'trade_date': '2026-04-21',
+            'source': 'pykrx',
+            'trigger': 'auto_close_scheduler',
+            'status': 'completed_with_errors',
+            'symbols_total': 877,
+            'symbols_succeeded': 874,
+            'symbols_failed': 3,
+            'error_message': 'Failed symbols: 139050,217620,452980',
+            'started_at': '2026-04-21T09:50:00+00:00',
+            'completed_at': '2026-04-21T09:55:00+00:00',
+            'run_metadata': {
+                'mode': 'daily_auto',
+                'stage_progress': {
+                    'price_collection': {'status': 'partial', 'processed': 3, 'total': 3, 'succeeded': 0, 'failed': 3},
+                    'technical_snapshots': {'status': 'partial', 'processed': 3, 'total': 3, 'succeeded': 0, 'failed': 3},
+                    'action_summaries': {'status': 'partial', 'processed': 3, 'total': 3, 'succeeded': 0, 'failed': 3},
+                },
+            },
+        }
+        stage_counts = {
+            'price_collection': {'persisted': 0, 'updated_at': None},
+            'technical_snapshots': {'persisted': 0, 'updated_at': None},
+            'action_summaries': {'persisted': 0, 'updated_at': None},
+            'trending_ranks': {'persisted': 9, 'periods_persisted': 3, 'updated_at': '2026-04-21T09:55:00+00:00'},
+        }
+        service = EODPipelineStatusService(
+            market_state_loader=lambda: _FakeMarketState(),
+            pykrx_run_loader=lambda **_: pykrx_run,
+            pykrx_stage_counts_loader=lambda *_: stage_counts,
+            live_symbol_count_loader=lambda: 4458,
+            fundamentals_refresh_loader=lambda **_: None,
+            price_bar_count_loader=lambda **_: 3683,
+            technical_snapshot_count_loader=lambda _: 3683,
+            action_summary_count_loader=lambda _: 3683,
+            row_count_stage_counts_loader=lambda **_: {
+                'market_risk_filter': {'persisted': 3683, 'updated_at': '2026-04-21T10:15:00+00:00'},
+                'piotroski_filter': {'persisted': 3683, 'updated_at': '2026-04-21T10:15:00+00:00'},
+            },
+        )
+
+        result = service.read()
+
+        for stage_id in ('price_collection', 'technical_snapshots', 'action_summaries'):
+            self.assertEqual(result['stages'][stage_id]['status'], 'completed')
+            self.assertEqual(result['stages'][stage_id]['total'], 3683)
+            self.assertEqual(result['stages'][stage_id]['succeeded'], 3683)
+            self.assertEqual(result['stages'][stage_id]['failed'], 0)
+        self.assertEqual(result['stages']['market_risk_filter']['status'], 'completed')
+        self.assertEqual(result['stages']['market_risk_filter']['details']['blocking_stages'], [])
 
     def test_read_maps_completed_pipeline_stages_from_completed_run_and_aggregate_counts(self):
         pykrx_run = {

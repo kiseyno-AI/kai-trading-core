@@ -204,10 +204,14 @@ class EODFreshnessService:
         symbols_total: int,
         symbols_succeeded: int,
     ) -> dict:
+        # EOD retries can be scoped to only failed/remaining symbols, so the latest run's
+        # symbols_total may be smaller than the already persisted row count. Freshness is
+        # a stored-data coverage view; never publish impossible ratios such as 3,683 / 877.
+        normalized_total = max(int(symbols_total or 0), int(symbols_succeeded or 0))
         counts = build_stage_counts(
-            total=symbols_total,
+            total=normalized_total,
             succeeded=symbols_succeeded,
-            failed=max(symbols_total - symbols_succeeded, 0) if symbols_succeeded > 0 else 0,
+            failed=max(normalized_total - symbols_succeeded, 0) if symbols_succeeded > 0 else 0,
         )
         if symbols_succeeded > 0:
             status = 'ready'

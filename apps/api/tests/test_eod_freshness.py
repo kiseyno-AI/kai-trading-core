@@ -320,6 +320,37 @@ class EODFreshnessServiceTests(unittest.TestCase):
         self.assertEqual(requested_live_count_dates, ['2026-04-10'])
         self.assertEqual(requested_latest_count_dates, ['2026-04-10'])
 
+    def test_today_stage_total_never_drops_below_persisted_count_after_scoped_retry(self):
+        service = EODFreshnessService(
+            market_state_loader=lambda: _FakeMarketState(),
+            latest_run_loader=lambda **_: _latest_run(
+                status='completed_with_errors',
+                symbols_total=877,
+                symbols_succeeded=874,
+                symbols_failed=3,
+                completed_at='2026-04-10T07:10:00+00:00',
+            ),
+            live_symbol_count_loader=lambda: 4458,
+            daily_price_bar_count_loader=lambda _: 3683,
+            daily_technical_snapshot_count_loader=lambda _: 3683,
+            daily_action_summary_count_loader=lambda _: 3683,
+            daily_fundamentals_count_loader=lambda _: {'symbols_succeeded': 0, 'symbols_failed': 0, 'symbols_total': 0},
+            fundamentals_today_refresh_loader=lambda _: None,
+            latest_fundamentals_refresh_loader=lambda: None,
+            latest_price_trade_date_loader=lambda: '2026-04-10',
+            latest_price_bar_count_loader=lambda _: 3683,
+            latest_technical_market_date_loader=lambda: '2026-04-10',
+            latest_action_market_date_loader=lambda: '2026-04-10',
+        )
+
+        result = service.read()
+
+        for key in ('price', 'technical_analysis', 'action_summary'):
+            self.assertEqual(result['today'][key]['status'], 'ready')
+            self.assertEqual(result['today'][key]['symbols_total'], 3683)
+            self.assertEqual(result['today'][key]['symbols_succeeded'], 3683)
+            self.assertEqual(result['today'][key]['symbols_failed'], 0)
+
     def test_latest_summary_uses_same_fallback_run_selection_logic_as_today(self):
         def latest_run_loader(**_kwargs):
             return _latest_run(
