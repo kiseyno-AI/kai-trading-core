@@ -39,6 +39,12 @@ EXECUTION_STATUS_SUBMIT_FAILED = 'submit_failed'
 ORDER_SOURCE = 'signal_decider_next_open'
 SHORT_TERM_ACTIONABLE_ACTIONS = {'scalp_buy_candidate', 'watch_for_trigger'}
 KRX_EXCHANGE_CALENDAR = xcals.get_calendar('XKRX')
+UNSPECIFIED_ROUTE_ACCOUNT_REFERENCE = 'KIS:00000000-00'
+UNSPECIFIED_ROUTE_ACCOUNT_LABEL = 'UNSPECIFIED_ROUTE'
+UNSPECIFIED_ROUTE_ACCOUNT_BUDGET_KRW = Decimal('0')
+# Short-term candidates are no longer blocked when account routing is omitted.
+# They still need a concrete row shape for exec routing; this synthetic rail
+# is treated as a routing/budget placeholder and does not drive fixed sizing.
 
 
 def _utcnow() -> datetime:
@@ -91,6 +97,32 @@ def _decimal_to_text(value: Decimal | None) -> str | None:
     if value is None:
         return None
     return format(value, 'f')
+
+
+def _to_json_safe(value: Any) -> Any:
+    if isinstance(value, Decimal):
+        return _decimal_to_text(value)
+    if isinstance(value, dict):
+        return {str(key): _to_json_safe(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_to_json_safe(item) for item in value]
+    if isinstance(value, tuple):
+        return [_to_json_safe(item) for item in value]
+    return value
+
+
+def _to_int(value: Any) -> int | None:
+    if value is None or value == '':
+        return None
+    if isinstance(value, int):
+        return value
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+    if parsed != parsed.to_integral_value():
+        return None
+    return int(parsed)
 
 
 def _normalize_text_list(value: Any) -> list[str]:
@@ -276,9 +308,19 @@ class SignalDeciderNextOpenExecutionService:
                     continue
 
                 if not account_targets:
-                    continue
+                    if decision_agent_name != SHORT_TERM_DECIDER_AGENT_NAME:
+                        continue
+                    account_targets_for_row = [
+                        NextOpenAccountTarget(
+                            label=UNSPECIFIED_ROUTE_ACCOUNT_LABEL,
+                            account_reference=UNSPECIFIED_ROUTE_ACCOUNT_REFERENCE,
+                            budget_krw=UNSPECIFIED_ROUTE_ACCOUNT_BUDGET_KRW,
+                        )
+                    ]
+                else:
+                    account_targets_for_row = account_targets
 
-                for target in account_targets:
+                for target in account_targets_for_row:
                     desired_keys.add((target.account_reference, snapshot.symbol, decision_agent_name))
                     row = attached_existing.get((target.account_reference, snapshot.symbol, decision_agent_name))
                     if row is None:
@@ -802,35 +844,70 @@ class SignalDeciderNextOpenExecutionService:
                     )
                 )
 
-        if estimated_reference_price is None or estimated_reference_price <= 0:
-            blocking_reasons.append(
-                _reason(
-                    'missing_reference_price',
-                    'Could not resolve the prior close price used for next-open quantity sizing.',
-                )
-            )
-            planned_quantity = None
-            estimated_notional = None
-        else:
-            planned_quantity = (target.budget_krw / Decimal(str(estimated_reference_price))).quantize(
-                Decimal('1'),
-                rounding=ROUND_DOWN,
-            )
-            if planned_quantity < Decimal('1'):
-                blocking_reasons.append(
+        if decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME:
+            if estimated_reference_price is None or estimated_reference_price <= 0:
+                warnings.append(
                     _reason(
-                        'allocation_below_share_size',
-                        'Configured account budget does not fund one share at the prior close.',
+                        'missing_reference_price',
+                        'Could not resolve the prior close price used for optional sizing preview.',
                     )
                 )
+                planned_quantity = None
                 estimated_notional = None
             else:
-                estimated_notional = planned_quantity * Decimal(str(estimated_reference_price))
+                if target.budget_krw > Decimal('0'):
+                    planned_quantity = (target.budget_krw / Decimal(str(estimated_reference_price))).quantize(
+                        Decimal('1'),
+                        rounding=ROUND_DOWN,
+                    )
+                    if planned_quantity >= Decimal('1'):
+                        estimated_notional = planned_quantity * Decimal(str(estimated_reference_price))
+                    else:
+                        planned_quantity = None
+                        estimated_notional = None
+                else:
+                    planned_quantity = None
+                    estimated_notional = None
+            pricing_note = 'Sizing for short-term candidates is delegated to exec-agent.'
+        else:
+            if estimated_reference_price is None or estimated_reference_price <= 0:
+                blocking_reasons.append(
+                    _reason(
+                        'missing_reference_price',
+                        'Could not resolve the prior close price used for next-open quantity sizing.',
+                    )
+                )
+                planned_quantity = None
+                estimated_notional = None
+            else:
+                planned_quantity = (target.budget_krw / Decimal(str(estimated_reference_price))).quantize(
+                    Decimal('1'),
+                    rounding=ROUND_DOWN,
+                )
+                if planned_quantity < Decimal('1'):
+                    blocking_reasons.append(
+                        _reason(
+                            'allocation_below_share_size',
+                            'Configured account budget does not fund one share at the prior close.',
+                        )
+                    )
+                    estimated_notional = None
+                else:
+                    estimated_notional = planned_quantity * Decimal(str(estimated_reference_price))
+                if target.budget_krw <= Decimal('0'):
+                    blocking_reasons.append(
+                        _reason(
+                            'allocation_below_share_size',
+                            'Configured account budget does not fund one share at the prior close.',
+                        )
+                    )
+            pricing_note = 'Configured budget rail is used for local quantity preview only.'
 
         validation_payload = {
             'blocking_reasons': blocking_reasons,
             'warnings': warnings,
             'decision_agent_name': decision_agent_name,
+            'pricing_note': pricing_note,
             'policy_context': {
                 'policy_version': snapshot.policy_version,
                 'status': (policy_context or {}).get('status'),
@@ -856,6 +933,20 @@ class SignalDeciderNextOpenExecutionService:
                 'chase_limit_price': response_payload.get('chase_limit_price'),
                 'target_price': response_payload.get('target_price'),
                 'stop_loss_price': response_payload.get('stop_loss_price'),
+                'budget_krw': _decimal_to_text(target.budget_krw),
+                'budget_note': pricing_note,
+                'decision_snapshot_id': snapshot.id,
+                'decision_run_id': snapshot.decision_run_id,
+                'source_feedback_id': snapshot.feedback_id,
+                'confidence_score_10': _to_json_safe(snapshot.confidence_score_10),
+                'conviction_score_10': _to_json_safe(snapshot.conviction_score_10),
+                'thesis_summary': snapshot.thesis_summary,
+                'supporting_evidence': snapshot.supporting_evidence_payload,
+                'decision_risks': snapshot.decision_risks_payload,
+                'invalidation_conditions': snapshot.invalidation_conditions_payload,
+                'data_quality_warnings': snapshot.data_quality_warnings_payload,
+                'response_payload_summary': _to_json_safe(response_payload),
+                'response_summary': snapshot.response_summary_payload if isinstance(snapshot.response_summary_payload, dict) else None,
                 'expected_holding_period': _short_term_field_text(snapshot, 'expected_holding_period')
                 or snapshot.suggested_holding_period,
             }
@@ -919,11 +1010,17 @@ class SignalDeciderNextOpenExecutionService:
             'feedback_id': snapshot.feedback_id,
             'decision_run_id': snapshot.decision_run_id,
             'policy_version': snapshot.policy_version,
+            'symbol': snapshot.symbol,
             'target_trade_date': target_trade_date.isoformat(),
             'source_market_date': source_market_date.isoformat(),
             'account_reference': target.account_reference,
             'account_label': target.label,
             'allocation_budget_krw': _decimal_to_text(target.budget_krw),
+            'allocation_mode': (
+                'specified'
+                if target.account_reference != UNSPECIFIED_ROUTE_ACCOUNT_REFERENCE
+                else 'unspecified_route'
+            ),
             'entry_price_basis': snapshot.entry_price_basis,
             'target_price': target_price,
             'stop_loss_price': stop_loss_price,
@@ -937,6 +1034,15 @@ class SignalDeciderNextOpenExecutionService:
             'chase_limit_price': response_payload.get('chase_limit_price')
             if decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
             else None,
+            'confidence_score_10': _to_json_safe(snapshot.confidence_score_10),
+            'conviction_score_10': _to_json_safe(snapshot.conviction_score_10),
+            'thesis_summary': snapshot.thesis_summary,
+            'supporting_evidence': snapshot.supporting_evidence_payload,
+            'decision_risks': snapshot.decision_risks_payload,
+            'invalidation_conditions': snapshot.invalidation_conditions_payload,
+            'data_quality_warnings': snapshot.data_quality_warnings_payload,
+            'response_summary': snapshot.response_summary_payload if isinstance(snapshot.response_summary_payload, dict) else None,
+            'response_payload_summary': _to_json_safe(response_payload),
             'decision_traceability': snapshot.traceability_payload if isinstance(snapshot.traceability_payload, dict) else {},
             'signal_traceability': snapshot.traceability_payload if isinstance(snapshot.traceability_payload, dict) else {},
         }
