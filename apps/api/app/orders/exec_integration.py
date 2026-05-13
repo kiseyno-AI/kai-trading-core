@@ -1108,6 +1108,25 @@ class SignalDeciderExecIntegrationService:
             row_decision_agent_name = _normalize_decision_agent_name(row.decision_agent_name)
             traceability = row.traceability_payload if isinstance(row.traceability_payload, dict) else {}
             validation = row.validation_payload if isinstance(row.validation_payload, dict) else {}
+            is_short_term = row_decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
+            short_term_context = (
+                validation.get('short_term')
+                if isinstance(validation.get('short_term'), dict)
+                else {}
+            )
+            decision_traceability = traceability.get('decision_traceability') or traceability.get('signal_traceability') or {}
+            if not isinstance(decision_traceability, dict):
+                decision_traceability = {}
+            response_summary = (
+                short_term_context.get('response_summary')
+                if short_term_context.get('response_summary') is not None
+                else traceability.get('response_summary')
+            )
+            response_payload_summary = (
+                short_term_context.get('response_payload_summary')
+                if short_term_context.get('response_payload_summary') is not None
+                else traceability.get('response_payload_summary')
+            )
             quantity = _safe_decimal(row.planned_quantity)
             target_price = snapshot.target_price if snapshot is not None else traceability.get('target_price')
             stop_loss_price = snapshot.stop_loss_price if snapshot is not None else traceability.get('stop_loss_price')
@@ -1136,15 +1155,46 @@ class SignalDeciderExecIntegrationService:
                 'decision_run_id': traceability.get('decision_run_id'),
                 'target_price': target_price,
                 'stop_loss_price': stop_loss_price,
+                'allocation_budget_krw': (
+                    _decimal_to_text(_safe_decimal(traceability.get('allocation_budget_krw')))
+                    or _decimal_to_text(_safe_decimal(row.allocation_budget_krw))
+                ),
                 'suggested_holding_period': traceability.get('suggested_holding_period'),
                 'expected_holding_period': traceability.get('expected_holding_period'),
                 'tactical_action': traceability.get('tactical_action'),
                 'trigger_price': trigger_price,
                 'chase_limit_price': chase_limit_price,
+                'allocation_mode': (
+                    _normalize_optional_text(traceability.get('allocation_mode'))
+                    or (
+                        'unspecified_route'
+                        if _normalize_optional_text(traceability.get('account_reference')) == 'KIS:00000000-00'
+                        else 'specified'
+                    )
+                ),
                 'entry_execution_mode': entry_execution_mode,
                 'validation': validation,
-                'traceability': traceability.get('decision_traceability') or traceability.get('signal_traceability') or {},
+                'traceability': decision_traceability,
             }
+            if not is_short_term:
+                quantity_policy = {
+                    'type': 'fixed_quantity',
+                    'quantity': _decimal_to_text(quantity),
+                    'budget_krw': _decimal_to_text(_safe_decimal(row.allocation_budget_krw)),
+                    'estimated_reference_price': row.estimated_reference_price,
+                    'estimated_notional_krw': _decimal_to_text(_safe_decimal(row.estimated_notional_krw)),
+                }
+            else:
+                quantity_policy = {
+                    'type': 'exec_agent_sized',
+                    'budget_krw': _decimal_to_text(_safe_decimal(row.allocation_budget_krw)),
+                    'allocation_mode': traceability.get('allocation_mode') or 'specified',
+                    'account_reference': row.account_reference,
+                    'account_label': row.account_label,
+                    'estimated_reference_price': row.estimated_reference_price,
+                    'estimated_notional_krw': _decimal_to_text(_safe_decimal(row.estimated_notional_krw)),
+                    'pricing_note': (validation.get('pricing_note') if isinstance(validation.get('pricing_note'), str) else None),
+                }
             entry_item = {
                 'core_item_key': core_entry_key,
                 'agent_name': row_decision_agent_name,
@@ -1152,13 +1202,7 @@ class SignalDeciderExecIntegrationService:
                 'symbol': row.symbol,
                 'side': 'buy',
                 'intent': EXEC_INTENT_NEXT_OPEN_BUY,
-                'quantity_policy': {
-                    'type': 'fixed_quantity',
-                    'quantity': _decimal_to_text(quantity),
-                    'budget_krw': _decimal_to_text(_safe_decimal(row.allocation_budget_krw)),
-                    'estimated_reference_price': row.estimated_reference_price,
-                    'estimated_notional_krw': _decimal_to_text(_safe_decimal(row.estimated_notional_krw)),
-                },
+                'quantity_policy': quantity_policy,
                 'limit_price': (
                     _to_json_number(_safe_decimal(chase_limit_price))
                     if row_decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
@@ -1174,8 +1218,19 @@ class SignalDeciderExecIntegrationService:
                     **common_risk_context,
                     'entry_price_basis': snapshot.entry_price_basis if snapshot is not None else 'next_open',
                     'expected_return_pct': _to_json_number(_safe_decimal(snapshot.expected_return_pct if snapshot else None)),
-                    'confidence_score_10': _to_json_number(_safe_decimal(snapshot.confidence_score_10 if snapshot else None)),
-                    'conviction_score_10': _to_json_number(_safe_decimal(snapshot.conviction_score_10 if snapshot else None)),
+                    'confidence_score_10': _to_json_number(
+                        _safe_decimal(snapshot.confidence_score_10 if snapshot is not None else None)
+                    ),
+                    'conviction_score_10': _to_json_number(
+                        _safe_decimal(snapshot.conviction_score_10 if snapshot is not None else None)
+                    ),
+                    'thesis_summary': snapshot.thesis_summary if snapshot is not None else None,
+                    'supporting_evidence': snapshot.supporting_evidence_payload if snapshot is not None else [],
+                    'decision_risks': snapshot.decision_risks_payload if snapshot is not None else [],
+                    'invalidation_conditions': snapshot.invalidation_conditions_payload if snapshot is not None else [],
+                    'data_quality_warnings': snapshot.data_quality_warnings_payload if snapshot is not None else [],
+                    'response_summary': response_summary if isinstance(response_summary, dict) else None,
+                    'response_payload_summary': response_payload_summary if isinstance(response_payload_summary, dict) else None,
                 },
                 'decision_snapshot_id': str(row.decision_snapshot_id),
             }

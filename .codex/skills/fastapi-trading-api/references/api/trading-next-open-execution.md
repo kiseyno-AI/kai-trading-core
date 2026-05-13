@@ -3,6 +3,15 @@
 ## Summary
 Inspect or execute the persisted next-open buy plan derived from the latest previous-trading-day decision snapshots. The planner now includes both classic `signal-decider` next-open buys and actionable `short-term-decider` tactical candidates, stores blocked-vs-eligible validation results durably with explicit decider identity, and the submit hook either reuses the existing trading-order persistence flow or, when `SIGNAL_DECIDER_EXEC_INTEGRATION_MODE=dispatch`, translates eligible rows into normalized exec plan items and dispatches them to `kai-trading-exec`.
 
+For short-term candidates, core now sends sizing context as a candidate contract (`quantity_policy.type='exec_agent_sized'`) so exec can make final share decisions using account/feedback/context rails, budgets, confidence, and target/stop metadata.
+
+When short-term candidates are present but `SIGNAL_DECIDER_NEXT_OPEN_ACCOUNT_TARGETS` is empty, rows are still materialized with an explicit synthetic routing rail:
+- `account_reference = KIS:00000000-00`
+- `account_label = UNSPECIFIED_ROUTE`
+- `allocation_mode = unspecified_route` in traceability/risk context
+
+In that case the synthetic rail is treated as a budget/route placeholder, not a hard pre-priced share budget.
+
 ## Example request
 ```http
 GET /trading/orders/next-open-execution?target_trade_date=2026-04-30&refresh=true

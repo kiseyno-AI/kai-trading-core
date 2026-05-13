@@ -405,6 +405,54 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(by_agent['short-term-decider']['client_order_id'], 'STDE-20260430-005930')
         self.assertEqual(by_agent['short-term-decider']['eligibility_status'], ELIGIBILITY_ELIGIBLE)
 
+    def test_refresh_plan_items_short_term_rows_created_without_account_targets(self) -> None:
+        self._seed_snapshot(symbol='005930')
+        self._seed_short_term_snapshot(symbol='005930')
+        settings.signal_decider_next_open_account_targets = ''
+        service = self._service(state='PREOPEN', server_time='2026-04-30T08:40:00+09:00')
+
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[{'trade_date': '2026-04-29', 'close_price': 50000}],
+        ):
+            result = service.refresh_plan_items(target_trade_date=self.target_trade_date, trigger='test')
+
+        self.assertEqual(result['summary']['items_total'], 1)
+        self.assertEqual(result['summary']['eligible_count'], 1)
+        self.assertEqual(result['summary']['blocked_count'], 0)
+        item = result['items'][0]
+        self.assertEqual(item['decision_agent_name'], 'short-term-decider')
+        self.assertEqual(item['account_reference'], 'KIS:00000000-00')
+        self.assertEqual(item['account_label'], 'UNSPECIFIED_ROUTE')
+        self.assertEqual(item['traceability']['allocation_mode'], 'unspecified_route')
+        self.assertEqual(item['traceability']['allocation_budget_krw'], '0')
+        self.assertIsNone(item['planned_quantity'])
+        self.assertEqual(item['eligibility_status'], ELIGIBILITY_ELIGIBLE)
+
+    def test_refresh_plan_items_blocks_short_term_rows_with_invalid_account_targets(self) -> None:
+        self._seed_short_term_snapshot(symbol='005930')
+        settings.signal_decider_next_open_account_targets = 'Main=not-a-kis-account@1500000'
+        service = self._service(state='PREOPEN', server_time='2026-04-30T08:40:00+09:00')
+
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[{'trade_date': '2026-04-29', 'close_price': 50000}],
+        ):
+            result = service.refresh_plan_items(target_trade_date=self.target_trade_date, trigger='test')
+
+        self.assertEqual(result['summary']['items_total'], 1)
+        self.assertEqual(result['summary']['eligible_count'], 0)
+        self.assertEqual(result['summary']['blocked_count'], 1)
+        item = result['items'][0]
+        self.assertEqual(item['decision_agent_name'], 'short-term-decider')
+        self.assertEqual(item['account_reference'], 'KIS:00000000-00')
+        self.assertEqual(item['account_label'], 'UNSPECIFIED_ROUTE')
+        self.assertEqual(item['eligibility_status'], ELIGIBILITY_BLOCKED)
+        self.assertIn(
+            'account_targets_invalid',
+            {reason['code'] for reason in item['validation']['blocking_reasons']},
+        )
+
     def test_refresh_plan_items_skips_non_actionable_short_term_decisions(self) -> None:
         self._seed_short_term_snapshot(symbol='035420', tactical_action='wait')
         service = self._service(state='PREOPEN', server_time='2026-04-30T08:40:00+09:00')
@@ -436,6 +484,28 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(item['decision_agent_name'], 'short-term-decider')
         self.assertEqual(item['eligibility_status'], ELIGIBILITY_BLOCKED)
         self.assertEqual(item['validation']['blocking_reasons'][0]['code'], 'trigger_price_missing')
+
+    def test_refresh_plan_items_short_term_missing_target_and_stop_are_warnings(self) -> None:
+        self._seed_short_term_snapshot(
+            symbol='000660',
+            tactical_action='watch_for_trigger',
+            target_price=None,
+            stop_loss_price=None,
+        )
+        service = self._service(state='PREOPEN', server_time='2026-04-30T08:40:00+09:00')
+
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[{'trade_date': '2026-04-29', 'close_price': 250000}],
+        ):
+            result = service.refresh_plan_items(target_trade_date=self.target_trade_date, trigger='test')
+
+        item = next(item for item in result['items'] if item['symbol'] == '000660')
+        self.assertEqual(item['decision_agent_name'], 'short-term-decider')
+        self.assertEqual(item['eligibility_status'], ELIGIBILITY_ELIGIBLE)
+        warning_codes = {warning['code'] for warning in item['validation']['warnings']}
+        self.assertIn('target_price_missing', warning_codes)
+        self.assertIn('stop_loss_price_missing', warning_codes)
 
     async def test_run_market_open_execution_submits_and_prevents_duplicate_replays(self) -> None:
         self._seed_snapshot(symbol='005930')

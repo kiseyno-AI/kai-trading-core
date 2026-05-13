@@ -1,4 +1,5 @@
 from datetime import date, datetime, timezone
+from decimal import Decimal
 import unittest
 from unittest.mock import patch
 from uuid import uuid4
@@ -485,6 +486,18 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(short_entry['risk_context']['decision_agent_name'], 'short-term-decider')
         self.assertEqual(short_entry['risk_context']['entry_execution_mode'], 'pending_trigger_limit')
         self.assertIn('source_feedback_id', short_entry['risk_context'])
+        self.assertIn('target_trade_date', short_entry['risk_context'])
+        self.assertIn('source_market_date', short_entry['risk_context'])
+        self.assertEqual(short_entry['risk_context']['allocation_mode'], 'specified')
+        self.assertEqual(Decimal(str(short_entry['risk_context']['allocation_budget_krw'])), Decimal('1500000'))
+        self.assertEqual(short_entry['risk_context']['confidence_score_10'], 7.3)
+        self.assertEqual(short_entry['risk_context']['conviction_score_10'], 6.5)
+        self.assertEqual(short_entry['risk_context']['decision_run_id'], 'short-run-1')
+        self.assertEqual(short_entry['quantity_policy']['type'], 'exec_agent_sized')
+        self.assertEqual(Decimal(str(short_entry['quantity_policy']['budget_krw'])), Decimal('1500000'))
+        self.assertEqual(short_entry['quantity_policy']['allocation_mode'], 'specified')
+        self.assertEqual(short_entry['quantity_policy']['account_reference'], self.account_reference)
+        self.assertEqual(short_entry['quantity_policy']['account_label'], 'Main')
         self.assertEqual(result['summary']['translated_item_count'], 6)
         self.assertEqual(
             {group['decision_agent_name'] for group in result['dispatch']['groups']},
@@ -513,6 +526,47 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(short_payload['items']), 1)
         self.assertEqual(short_payload['items'][0]['trigger_price'], 50500)
         self.assertEqual(short_payload['items'][0]['limit_price'], 51500)
+        self.assertEqual(short_payload['items'][0]['quantity_policy']['type'], 'exec_agent_sized')
+
+    async def test_dispatch_next_open_plan_short_term_idempotent_redispatch_skips_duplicate_payload(self) -> None:
+        short_snapshot_id = self._seed_short_term_snapshot()
+        self._seed_short_term_plan_item(snapshot_id=short_snapshot_id)
+
+        first_result = await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=False,
+            dry_run=False,
+            force=False,
+            trigger='test',
+        )
+        self.assertEqual(first_result['summary']['translated_item_count'], 6)
+        self.assertEqual(first_result['summary']['dispatched_group_count'], 2)
+        first_short_group = next(
+            group for group in first_result['dispatch']['groups'] if group['decision_agent_name'] == 'short-term-decider'
+        )
+        self.assertEqual(first_short_group['dispatch_status'], 'accepted')
+        first_post_call_count = len(self.client.post_calls)
+
+        second_result = await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=False,
+            dry_run=False,
+            force=False,
+            trigger='test',
+        )
+        self.assertEqual(
+            second_result['summary']['translated_item_count'],
+            first_result['summary']['translated_item_count'],
+        )
+        self.assertEqual(second_result['summary']['dispatched_group_count'], 0)
+        self.assertEqual(second_result['summary']['failed_group_count'], 0)
+        self.assertEqual(second_result['summary']['skipped_group_count'], 2)
+        short_group = next(
+            group for group in second_result['dispatch']['groups'] if group['decision_agent_name'] == 'short-term-decider'
+        )
+        self.assertEqual(short_group['dispatch_status'], 'already_dispatched')
+        self.assertEqual(short_group['plan_id'], first_short_group['plan_id'])
+        self.assertEqual(len(self.client.post_calls), first_post_call_count)
 
     async def test_exec_overview_includes_both_deciders_without_symbol_collision(self) -> None:
         short_snapshot_id = self._seed_short_term_snapshot()
@@ -625,6 +679,73 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
             readback = row.submission_payload['exec_dispatch']['readback']
             self.assertEqual(readback['positions']['count'], 0)
+
+    async def test_exec_overview_refresh_persists_short_term_readback(self) -> None:
+        with session_scope() as session:
+            session.execute(
+                delete(
+                    SignalDeciderExecutionPlanItem,
+                ).where(
+                    SignalDeciderExecutionPlanItem.account_reference == self.account_reference,
+                    SignalDeciderExecutionPlanItem.decision_agent_name == 'signal-decider',
+                )
+            )
+
+        short_snapshot_id = self._seed_short_term_snapshot()
+        self._seed_short_term_plan_item(snapshot_id=short_snapshot_id)
+        dispatch_result = await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=False,
+            dry_run=False,
+            force=True,
+            trigger='test',
+        )
+        short_group = next(
+            group for group in dispatch_result['dispatch']['groups'] if group['decision_agent_name'] == 'short-term-decider'
+        )
+        plan_id = short_group['plan_id']
+
+        self.client.plan_response = {'items': [{'external_plan_id': plan_id, 'status': 'accepted'}]}
+        self.client.order_response = {
+            'items': [
+                {
+                    'id': 'order-1',
+                    'execution_plan_item_id': 'exec-item-1',
+                    'symbol': self.symbol,
+                    'status': 'submitted',
+                }
+            ]
+        }
+        self.client.execution_response = {
+            'items': [
+                {
+                    'broker_order_id': 'order-1',
+                    'symbol': self.symbol,
+                    'side': 'buy',
+                    'quantity': '5',
+                }
+            ]
+        }
+        self.client.position_response = {
+            'items': [{'symbol': self.symbol, 'quantity': '5', 'average_price': '50000'}]
+        }
+
+        overview = await self.service.list_signal_decider_exec_overview(
+            target_trade_date=self.target_trade_date,
+            symbol=self.symbol,
+            refresh=True,
+            trigger='test',
+        )
+
+        self.assertEqual(len(overview['items']), 1)
+        self.assertEqual(overview['summary']['remote_open_count'], 1)
+        self.assertEqual(overview['items'][0]['dispatch']['status'], 'accepted')
+        self.assertEqual(overview['items'][0]['remote_state']['derived_status'], 'open')
+        self.assertEqual(
+            len(overview['items'][0]['dispatch']['item_links']),
+            3,
+        )
+        self.assertEqual(overview['items'][0]['remote_state']['orders'], self.client.order_response['items'])
 
     async def test_dashboard_runtime_status_normalizes_exec_runtime_payload(self) -> None:
         self.client.runtime_response = {

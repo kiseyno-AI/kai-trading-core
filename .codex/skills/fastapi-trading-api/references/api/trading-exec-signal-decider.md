@@ -3,6 +3,8 @@
 ## Summary
 Read the core-owned aggregated core↔exec view for decider-driven next-open execution. The route name is legacy, but the payload now starts from persisted `signal_decider_execution_plan_items` for both `signal-decider` and actionable `short-term-decider` rows, overlays stored exec dispatch linkage and audit state, and with `refresh=true` calls the exec northbound runtime/order/execution/position APIs before persisting the latest matched readback snapshot back onto the durable plan rows.
 
+Short-term entries dispatched in `SIGNAL_DECIDER_EXEC_INTEGRATION_MODE=dispatch` now use the `exec_agent_sized` contract on core→exec translation, so they are routed as candidate entries and exec performs final sizing while preserving fixed-quantity semantics for existing signal-decider flow.
+
 ## Example request
 ```http
 GET /trading/orders/exec/signal-decider?target_trade_date=2026-04-30&symbol=005930&refresh=true
