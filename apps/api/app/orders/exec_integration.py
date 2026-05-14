@@ -1241,11 +1241,7 @@ class SignalDeciderExecIntegrationService:
             stop_loss_price = snapshot.stop_loss_price if snapshot is not None else traceability.get('stop_loss_price')
             trigger_price = traceability.get('trigger_price')
             chase_limit_price = traceability.get('chase_limit_price')
-            entry_execution_mode = (
-                'pending_trigger_limit'
-                if row_decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
-                else 'next_open_market'
-            )
+            entry_execution_mode = 'next_open_market'
             core_entry_key = f'core-plan-{row.id}:{EXEC_INTENT_NEXT_OPEN_BUY}'
             decider_handoff_context = self._build_decider_handoff_context(
                 row=row,
@@ -1279,8 +1275,8 @@ class SignalDeciderExecIntegrationService:
                 'suggested_holding_period': traceability.get('suggested_holding_period'),
                 'expected_holding_period': traceability.get('expected_holding_period'),
                 'tactical_action': traceability.get('tactical_action'),
-                'trigger_price': trigger_price,
-                'chase_limit_price': chase_limit_price,
+                'original_watch_trigger_price': trigger_price,
+                'original_watch_chase_limit_price': chase_limit_price,
                 'allocation_mode': (
                     _normalize_optional_text(traceability.get('allocation_mode'))
                     or (
@@ -1321,16 +1317,8 @@ class SignalDeciderExecIntegrationService:
                 'side': 'buy',
                 'intent': EXEC_INTENT_NEXT_OPEN_BUY,
                 'quantity_policy': quantity_policy,
-                'limit_price': (
-                    _to_json_number(_safe_decimal(chase_limit_price))
-                    if row_decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
-                    else None
-                ),
-                'trigger_price': (
-                    _to_json_number(_safe_decimal(trigger_price))
-                    if row_decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
-                    else None
-                ),
+                'limit_price': None,
+                'trigger_price': None,
                 'time_in_force': row.planned_time_in_force,
                 'risk_context': {
                     **common_risk_context,

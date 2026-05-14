@@ -506,11 +506,15 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(short_payload['strategy_run_id'], f'short-term-decider:2026-04-30:{self.account_reference.replace(":", "_").replace("-", "_")}')
         short_entry = short_payload['items'][0]
         self.assertEqual(short_entry['decision_agent_name'], 'short-term-decider')
-        self.assertEqual(short_entry['trigger_price'], 50500)
-        self.assertEqual(short_entry['limit_price'], 51500)
+        self.assertIsNone(short_entry['trigger_price'])
+        self.assertIsNone(short_entry['limit_price'])
         self.assertEqual(short_entry['risk_context']['agent_name'], 'short-term-decider')
         self.assertEqual(short_entry['risk_context']['decision_agent_name'], 'short-term-decider')
-        self.assertEqual(short_entry['risk_context']['entry_execution_mode'], 'pending_trigger_limit')
+        self.assertEqual(short_entry['risk_context']['entry_execution_mode'], 'next_open_market')
+        self.assertEqual(short_entry['risk_context']['original_watch_trigger_price'], 50500)
+        self.assertEqual(short_entry['risk_context']['original_watch_chase_limit_price'], 51500)
+        self.assertNotIn('trigger_price', short_entry['risk_context'])
+        self.assertNotIn('chase_limit_price', short_entry['risk_context'])
         self.assertIn('source_feedback_id', short_entry['risk_context'])
         self.assertIn('target_trade_date', short_entry['risk_context'])
         self.assertIn('source_market_date', short_entry['risk_context'])
@@ -569,8 +573,9 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             payload for payload in self.client.post_calls if payload['metadata']['decision_agent_name'] == 'short-term-decider'
         )
         self.assertEqual(len(short_payload['items']), 1)
-        self.assertEqual(short_payload['items'][0]['trigger_price'], 50500)
-        self.assertEqual(short_payload['items'][0]['limit_price'], 51500)
+        self.assertIsNone(short_payload['items'][0]['trigger_price'])
+        self.assertIsNone(short_payload['items'][0]['limit_price'])
+        self.assertEqual(short_payload['items'][0]['risk_context']['entry_execution_mode'], 'next_open_market')
         self.assertEqual(short_payload['items'][0]['quantity_policy']['type'], 'exec_agent_sized')
 
     async def test_dispatch_next_open_plan_short_term_idempotent_redispatch_skips_duplicate_payload(self) -> None:
