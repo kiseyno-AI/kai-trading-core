@@ -19,6 +19,7 @@ from app.db_models import (
 from app.market.clock import MarketState
 from app.orders.next_open_execution import (
     EXECUTION_STATUS_DRY_RUN,
+    EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING,
     EXECUTION_STATUS_SUBMITTED,
     ELIGIBILITY_BLOCKED,
     ELIGIBILITY_ELIGIBLE,
@@ -112,6 +113,7 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             'signal_decider_next_open_block_on_data_warnings': settings.signal_decider_next_open_block_on_data_warnings,
             'signal_decider_next_open_block_on_specialist_disagreement': settings.signal_decider_next_open_block_on_specialist_disagreement,
             'signal_decider_next_open_require_target_and_stop': settings.signal_decider_next_open_require_target_and_stop,
+            'signal_decider_exec_integration_mode': settings.signal_decider_exec_integration_mode,
         }
         settings.signal_decider_next_open_account_targets = f'Main={self.account_reference}@1500000'
         settings.signal_decider_next_open_enabled = True
@@ -122,6 +124,7 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         settings.signal_decider_next_open_block_on_data_warnings = True
         settings.signal_decider_next_open_block_on_specialist_disagreement = True
         settings.signal_decider_next_open_require_target_and_stop = True
+        settings.signal_decider_exec_integration_mode = 'disabled'
         self._seed_policy_version()
 
     def tearDown(self) -> None:
@@ -243,6 +246,7 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         stop_loss_price: int | None = 49000,
         data_warnings: list[str] | None = None,
         pre_decider_enrichment_context: dict[str, object] | None = None,
+        confidence_score_10: float = 7.1,
     ) -> int:
         generic_action = 'buy' if tactical_action in {'scalp_buy_candidate', 'watch_for_trigger'} else tactical_action
         if generic_action not in {'buy', 'wait', 'reject'}:
@@ -265,7 +269,7 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
                 expected_return_pct=None,
                 stop_loss_price=stop_loss_price,
                 suggested_holding_period='1-2 trading days',
-                confidence_score_10=7.1,
+                confidence_score_10=confidence_score_10,
                 conviction_score_10=6.4,
                 thesis_summary=f'{symbol} short-term summary',
                 supporting_evidence_payload=['Momentum stayed constructive.'],
@@ -301,7 +305,7 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
                     'target_price': target_price,
                     'stop_loss_price': stop_loss_price,
                     'expected_holding_period': '1-2 trading days',
-                    'confidence_score_10': 7.1,
+                    'confidence_score_10': confidence_score_10,
                     'conviction_score_10': 6.4,
                     'supporting_evidence': ['Momentum stayed constructive.'],
                     'tactical_risks': ['Opening range may stay volatile.'],
@@ -409,6 +413,29 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(by_agent['short-term-decider']['client_order_id'], 'STDE-20260430-005930')
         self.assertEqual(by_agent['short-term-decider']['eligibility_status'], ELIGIBILITY_ELIGIBLE)
 
+    def test_refresh_plan_items_selects_short_term_watchers_at_confidence_threshold(self) -> None:
+        self._seed_short_term_snapshot(symbol='005930', confidence_score_10=6.0)
+        self._seed_short_term_snapshot(symbol='000660', confidence_score_10=5.9)
+        service = self._service(state='PREOPEN', server_time='2026-04-30T08:40:00+09:00')
+
+        def fake_bars(symbol: str, **_kwargs):
+            if symbol == '005930':
+                return [{'trade_date': '2026-04-29', 'close_price': 50000}]
+            if symbol == '000660':
+                return [{'trade_date': '2026-04-29', 'close_price': 250000}]
+            return []
+
+        with patch('app.orders.next_open_execution.load_daily_bars_for_symbol_range', side_effect=fake_bars):
+            result = service.refresh_plan_items(target_trade_date=self.target_trade_date, trigger='test')
+
+        items_by_symbol = {item['symbol']: item for item in result['items']}
+        self.assertEqual(items_by_symbol['005930']['eligibility_status'], ELIGIBILITY_ELIGIBLE)
+        self.assertEqual(items_by_symbol['000660']['eligibility_status'], ELIGIBILITY_BLOCKED)
+        self.assertEqual(
+            items_by_symbol['000660']['validation']['blocking_reasons'][0]['code'],
+            'confidence_below_threshold',
+        )
+
     def test_refresh_plan_items_attaches_pre_decider_enrichment_to_short_term_validation(self) -> None:
         pre_decider_context = {
             'schema_version': 'pre_decider_enrichment_v1',
@@ -437,6 +464,29 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(item['validation']['pre_decider_enrichment_context'], pre_decider_context)
         self.assertEqual(item['validation']['short_term']['pre_decider_enrichment_context'], pre_decider_context)
         self.assertEqual(item['traceability']['pre_decider_enrichment_context'], pre_decider_context)
+
+    def test_refresh_plan_items_delegates_short_term_data_warning_candidates_in_dispatch_mode(self) -> None:
+        settings.signal_decider_exec_integration_mode = 'dispatch'
+        self._seed_short_term_snapshot(
+            symbol='005930',
+            data_warnings=['Opening quote snapshot stale.'],
+        )
+        service = self._service(state='PREOPEN', server_time='2026-04-30T08:40:00+09:00')
+
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[{'trade_date': '2026-04-29', 'close_price': 50000}],
+        ):
+            result = service.refresh_plan_items(target_trade_date=self.target_trade_date, trigger='test')
+
+        item = result['items'][0]
+        self.assertEqual(item['decision_agent_name'], 'short-term-decider')
+        self.assertEqual(item['eligibility_status'], ELIGIBILITY_ELIGIBLE)
+        self.assertEqual(item['execution_status'], 'planned')
+        self.assertEqual(item['traceability']['core_execution_classification'], EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING)
+        self.assertEqual(item['validation']['blocking_reasons'], [])
+        warning_codes = {warning['code'] for warning in item['validation']['warnings']}
+        self.assertIn('data_quality_warnings_present', warning_codes)
 
     def test_refresh_plan_items_short_term_rows_created_without_account_targets(self) -> None:
         self._seed_snapshot(symbol='005930')
