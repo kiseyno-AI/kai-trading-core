@@ -1,4 +1,5 @@
 from contextlib import contextmanager
+from datetime import date
 import json
 from pathlib import Path
 import tempfile
@@ -10,6 +11,7 @@ from unittest.mock import patch
 from app.agent_context import orchestrator as orchestrator_module
 from app.agent_context.orchestrator import AgentFeedbackOrchestrator, OpenClawAgentClient
 from app.agent_context.orchestrator_helpers import (
+    build_signal_decider_payload,
     coerce_decoded_batch_response,
     correlate_decoded_batch_response,
     repair_json_tail,
@@ -77,6 +79,41 @@ def _feedback_prerequisites(*, status: str = 'ready', missing_stage_ids: list[st
 
 
 class RepairJsonTailTests(unittest.TestCase):
+    def test_build_signal_decider_payload_promotes_pre_decider_enrichment_context(self):
+        pre_decider_context = {
+            'schema_version': 'pre_decider_enrichment_v1',
+            'status': 'available',
+            'quote_orderbook_snapshot': {'status': 'available', 'current_price': 71550},
+            'trading_value': {'status': 'available', 'source': 'raw', 'trading_value_krw': 9870000000},
+            'flow_short_sector_context': {'status': 'available'},
+        }
+
+        payload = build_signal_decider_payload(
+            item={
+                'symbol': '005930',
+                'market_date': '2026-04-14',
+                'pre_decider_enrichment_context': pre_decider_context,
+                'scores': {},
+                'factor_summary': {},
+                'liquidity_context': {},
+                'decider_data_quality_context': {},
+            },
+            market_date=date(2026, 4, 14),
+            request_run_id='request-run-test',
+            market_context={},
+            upstream_summaries={},
+            upstream_traceability={},
+            signal_decider_agent_name='short-term-decider',
+        )
+
+        self.assertEqual(payload['pre_decider_enrichment_context'], pre_decider_context)
+        self.assertNotIn('pre_decider_enrichment_context', payload['symbol_day_context'])
+        self.assertTrue(
+            payload['decision_support_constraints']['missing_context_policy'][
+                'pre_decider_enrichment_context_authoritative'
+            ]
+        )
+
     def test_coerce_decoded_batch_response_unwraps_batch_and_item_level_feedback(self):
         decoded = {
             'batch': {

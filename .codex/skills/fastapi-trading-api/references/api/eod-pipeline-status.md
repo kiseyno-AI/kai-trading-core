@@ -13,6 +13,8 @@ The default `market_date` is the current Seoul calendar date from `server_time[:
 
 The response now also includes `market` and `market_session` blocks. `market` is the current exchange-clock state, and `market_session` describes the semantics of the requested `market_date`, including the latest valid trading date and whether live quote or intraday data is expected for that date.
 
+The `pykrx_enrichment` stage is also the operator status source for the decider enrichment join. Completed coverage for `valuation_snapshot`, `investor_flow_symbol`, `investor_flow_market`, `short_selling`, `sector_classification`, and `market_breadth` means `GET /agent-context/symbol-day` can populate `pre_decider_enrichment_context.trading_value` and `flow_short_sector_context`. Live quote/orderbook snapshots are outside the EOD stage and appear in symbol-day context as available, unavailable, or `stale_eod` with a timestamp when the market is closed.
+
 ## Example request
 ```http
 GET /eod/pipeline/status?market_date=2026-04-21&fs_div=CFS
@@ -81,6 +83,16 @@ GET /eod/pipeline/status?market_date=2026-04-21&fs_div=CFS
       "details": {
         "categories": {
           "sector_classification": {
+            "coverage_status": "complete",
+            "present_rows": 3579,
+            "expected_rows": 3579
+          },
+          "valuation_snapshot": {
+            "coverage_status": "complete",
+            "present_rows": 3579,
+            "expected_rows": 3579
+          },
+          "investor_flow_symbol": {
             "coverage_status": "complete",
             "present_rows": 3579,
             "expected_rows": 3579

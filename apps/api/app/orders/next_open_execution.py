@@ -147,6 +147,21 @@ def _snapshot_response_payload(snapshot: SignalDeciderDecisionSnapshot) -> dict[
     return snapshot.response_payload if isinstance(snapshot.response_payload, dict) else {}
 
 
+def _snapshot_request_payload(snapshot: SignalDeciderDecisionSnapshot) -> dict[str, Any]:
+    return snapshot.request_payload if isinstance(snapshot.request_payload, dict) else {}
+
+
+def _snapshot_pre_decider_enrichment_context(snapshot: SignalDeciderDecisionSnapshot) -> dict[str, Any]:
+    request_payload = _snapshot_request_payload(snapshot)
+    context = request_payload.get('pre_decider_enrichment_context')
+    if isinstance(context, dict):
+        return context
+    symbol_day_context = request_payload.get('symbol_day_context')
+    if isinstance(symbol_day_context, dict) and isinstance(symbol_day_context.get('pre_decider_enrichment_context'), dict):
+        return symbol_day_context['pre_decider_enrichment_context']
+    return {}
+
+
 def _short_term_tactical_action(snapshot: SignalDeciderDecisionSnapshot) -> str:
     payload = _snapshot_response_payload(snapshot)
     action = _normalize_optional_text(
@@ -708,6 +723,7 @@ class SignalDeciderNextOpenExecutionService:
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         decision_agent_name = _snapshot_agent_name(snapshot)
         response_payload = _snapshot_response_payload(snapshot)
+        pre_decider_enrichment_context = _snapshot_pre_decider_enrichment_context(snapshot)
         blocking_reasons: list[dict[str, str]] = []
         warnings: list[dict[str, str]] = []
         gate_checks = (
@@ -947,6 +963,7 @@ class SignalDeciderNextOpenExecutionService:
                 'planned_quantity': _decimal_to_text(planned_quantity),
                 'estimated_notional_krw': _decimal_to_text(estimated_notional),
             },
+            'pre_decider_enrichment_context': pre_decider_enrichment_context,
         }
         if decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME:
             validation_payload['short_term'] = {
@@ -967,6 +984,7 @@ class SignalDeciderNextOpenExecutionService:
                 'decision_risks': snapshot.decision_risks_payload,
                 'invalidation_conditions': snapshot.invalidation_conditions_payload,
                 'data_quality_warnings': snapshot.data_quality_warnings_payload,
+                'pre_decider_enrichment_context': pre_decider_enrichment_context,
                 'response_payload_summary': _to_json_safe(response_payload),
                 'response_summary': snapshot.response_summary_payload if isinstance(snapshot.response_summary_payload, dict) else None,
                 'expected_holding_period': _short_term_field_text(snapshot, 'expected_holding_period')
@@ -1063,6 +1081,7 @@ class SignalDeciderNextOpenExecutionService:
             'decision_risks': snapshot.decision_risks_payload,
             'invalidation_conditions': snapshot.invalidation_conditions_payload,
             'data_quality_warnings': snapshot.data_quality_warnings_payload,
+            'pre_decider_enrichment_context': validation_payload.get('pre_decider_enrichment_context') or {},
             'response_summary': snapshot.response_summary_payload if isinstance(snapshot.response_summary_payload, dict) else None,
             'response_payload_summary': _to_json_safe(response_payload),
             'decision_traceability': snapshot.traceability_payload if isinstance(snapshot.traceability_payload, dict) else {},

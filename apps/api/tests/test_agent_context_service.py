@@ -14,6 +14,7 @@ from app.agent_context.read_service import (
     _build_factor_summary_entry,
     _build_intraday_execution_context,
     _build_intraday_execution_freshness_provenance,
+    _build_pre_decider_enrichment_context,
     _build_price_context,
     _build_quote_context,
     _build_quote_freshness_provenance,
@@ -1339,7 +1340,67 @@ class AgentContextReadServiceTests(unittest.TestCase):
         self.assertEqual(context['turnover']['status'], 'derived')
         self.assertEqual(context['turnover']['turnover_krw'], 8520000000)
         self.assertEqual(context['turnover']['turnover_source'], 'derived')
+        self.assertEqual(context['turnover']['trading_value_source'], 'estimated')
+        self.assertEqual(context['turnover']['estimated_trading_value_krw'], 8520000000)
         self.assertEqual(context['turnover']['reason'], 'derived_from_close_price_x_volume')
+
+    def test_build_compact_liquidity_context_prefers_raw_pykrx_trading_value(self):
+        context = _build_compact_liquidity_context(
+            requested_market_date=date.fromisoformat('2026-04-08'),
+            quote_context=None,
+            quote_freshness_provenance={},
+            price_context={
+                'trade_date': '2026-04-08',
+                'source': 'pykrx',
+                'captured_at': '2026-04-08T15:30:00+09:00',
+                'close_price': 71000,
+                'volume': 120000,
+                'turnover': 0,
+                'liquidity': {
+                    'provider_turnover_krw': None,
+                    'estimated_turnover_krw': 8520000000,
+                },
+                'price_bar_quality': {
+                    'issue_codes': ['turnover_missing_or_zero'],
+                },
+            },
+            price_context_history=[],
+            price_context_freshness_provenance={
+                'freshness_status': 'fresh',
+                'provenance_status': 'provider_plus_fallback',
+                'source_tables': ['daily_price_contexts', 'daily_price_bars'],
+            },
+            price_context_storage_unavailable=False,
+            low_risk_row=None,
+            latest_prior_low_risk_row=None,
+            low_risk_freshness_provenance={},
+            low_risk_storage_unavailable=False,
+            low_risk_prior_storage_unavailable=False,
+            intraday_execution_context=None,
+            intraday_execution_freshness_provenance={},
+            valuation_context={
+                'status': 'available',
+                'valuation_snapshot': {
+                    'trading_value': 9870000000,
+                    'close_price': 71000,
+                    'volume': 120000,
+                },
+            },
+            valuation_context_freshness_provenance={
+                'freshness_status': 'fresh',
+                'provenance_status': 'provider_sourced',
+                'as_of_market_date': '2026-04-08',
+                'latest_available_timestamp': '2026-04-08T15:30:00+09:00',
+                'source_tables': ['daily_pykrx_enrichment_rows'],
+            },
+        )
+
+        self.assertEqual(context['status'], 'available')
+        self.assertEqual(context['turnover']['turnover_krw'], 9870000000)
+        self.assertEqual(context['turnover']['trading_value_source'], 'raw')
+        self.assertEqual(context['turnover']['raw_trading_value_krw'], 9870000000)
+        self.assertIsNone(context['turnover']['derived_turnover_krw'])
+        self.assertEqual(context['turnover']['trading_value_source_detail'], 'pykrx_valuation_snapshot.trading_value')
 
     def test_build_compact_liquidity_context_marks_missing_price_or_volume_when_turnover_not_derivable(self):
         context = _build_compact_liquidity_context(
@@ -1381,7 +1442,54 @@ class AgentContextReadServiceTests(unittest.TestCase):
 
         self.assertEqual(context['status'], 'missing_price_or_volume')
         self.assertEqual(context['turnover']['status'], 'missing_price_or_volume')
+        self.assertEqual(context['turnover']['trading_value_source'], 'missing')
         self.assertEqual(context['turnover']['reason'], 'volume_missing_or_zero')
+
+    def test_build_pre_decider_enrichment_marks_closed_market_quote_snapshot_stale(self):
+        market_date = date.fromisoformat('2026-04-11')
+        market_session = _closed_market_session()
+        quote_context = _build_quote_context(None, market_date=market_date, market_session=market_session)
+        intraday_context = _build_intraday_execution_context(None, market_session=market_session)
+
+        context = _build_pre_decider_enrichment_context(
+            requested_market_date=market_date,
+            market_session=market_session,
+            quote_context=quote_context,
+            quote_freshness_provenance={'freshness_status': 'not_applicable'},
+            intraday_execution_context=intraday_context,
+            intraday_execution_freshness_provenance={'freshness_status': 'not_applicable'},
+            price_context={
+                'trade_date': '2026-04-10',
+                'close_price': 71000,
+                'captured_at': '2026-04-10T15:30:00+09:00',
+            },
+            liquidity_context={
+                'turnover': {
+                    'status': 'available',
+                    'trading_value_source': 'raw',
+                    'trading_value_krw': 8200000000,
+                    'raw_trading_value_krw': 8200000000,
+                    'trade_date': '2026-04-10',
+                    'freshness_status': 'fresh',
+                    'provenance': {'freshness_status': 'fresh'},
+                }
+            },
+            investor_flow_context={'status': 'unavailable'},
+            investor_flow_provenance={},
+            short_selling_context={'status': 'unavailable'},
+            short_selling_provenance={},
+            sector_peer_context={'status': 'unavailable'},
+            sector_peer_provenance={},
+            market_breadth_context={'status': 'unavailable'},
+            market_breadth_provenance={},
+        )
+
+        snapshot = context['quote_orderbook_snapshot']
+        self.assertEqual(snapshot['status'], 'stale_eod')
+        self.assertEqual(snapshot['snapshot_type'], 'eod_stale')
+        self.assertEqual(snapshot['current_price'], 71000)
+        self.assertEqual(snapshot['quote_freshness_timestamp'], '2026-04-10T15:30:00+09:00')
+        self.assertEqual(snapshot['freshness']['quote_context']['freshness_status'], 'not_applicable')
 
     def test_get_symbol_day_context_marks_liquidity_context_storage_unavailable_when_price_context_store_fails(self):
         class EmptyFundamentalsRepository:
@@ -2646,6 +2754,7 @@ class AgentContextReadServiceTests(unittest.TestCase):
                                     'captured_at': captured_at,
                                     'payload': {
                                         'market_cap': 420000000000,
+                                        'trading_value': 9870000000,
                                         'per': 11.1,
                                         'pbr': 1.3,
                                     },
@@ -2733,6 +2842,25 @@ class AgentContextReadServiceTests(unittest.TestCase):
         self.assertEqual(item['short_selling_context']['short_balance']['short_balance_ratio_pct'], 0.45)
         self.assertEqual(item['valuation_context']['valuation_snapshot']['per'], 11.1)
         self.assertEqual(item['valuation_context']['foreign_ownership']['foreign_ownership_ratio_pct'], 51.2)
+        self.assertEqual(item['liquidity_context']['turnover']['trading_value_source'], 'raw')
+        self.assertEqual(item['liquidity_context']['turnover']['turnover_krw'], 9870000000)
+        self.assertEqual(item['pre_decider_enrichment_context']['trading_value']['source'], 'raw')
+        self.assertEqual(
+            item['pre_decider_enrichment_context']['flow_short_sector_context']['investor_flow']['symbol_flow'][
+                'investor_groups'
+            ]['외국인']['net_value'],
+            1200000,
+        )
+        self.assertEqual(
+            item['pre_decider_enrichment_context']['flow_short_sector_context']['short_selling']['short_balance'][
+                'short_balance_ratio_pct'
+            ],
+            0.45,
+        )
+        self.assertEqual(
+            item['pre_decider_enrichment_context']['flow_short_sector_context']['sector_peers']['peer_count'],
+            1,
+        )
         self.assertEqual(item['context_provenance']['sector_peer_context']['freshness_status'], 'fresh')
         self.assertEqual(item['context_provenance']['market_breadth_context']['provenance_status'], 'derived_from_provider_data')
         self.assertEqual(item['context_provenance']['investor_flow_context']['source_tables'], ['daily_pykrx_enrichment_rows'])
@@ -2740,4 +2868,5 @@ class AgentContextReadServiceTests(unittest.TestCase):
         self.assertEqual(item['context_completeness']['requested_symbol_coverage']['valuation_context']['coverage_status'], 'complete')
         self.assertEqual(result['summary']['sector_peer_context_count'], 1)
         self.assertEqual(result['summary']['investor_flow_context_count'], 1)
+        self.assertEqual(result['summary']['pre_decider_enrichment_context_count'], 1)
         self.assertEqual(result['summary']['context_completeness']['market_breadth_context']['coverage_status'], 'complete')

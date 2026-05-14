@@ -242,6 +242,7 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         target_price: int | None = 54000,
         stop_loss_price: int | None = 49000,
         data_warnings: list[str] | None = None,
+        pre_decider_enrichment_context: dict[str, object] | None = None,
     ) -> int:
         generic_action = 'buy' if tactical_action in {'scalp_buy_candidate', 'watch_for_trigger'} else tactical_action
         if generic_action not in {'buy', 'wait', 'reject'}:
@@ -286,7 +287,10 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
                     },
                 },
                 input_feature_snapshot_payload={'meta': {'source_agent_name': 'short-term-decider'}},
-                request_payload={'orchestration': {'required_upstream_roles': ['technical-summarizer']}},
+                request_payload={
+                    'orchestration': {'required_upstream_roles': ['technical-summarizer']},
+                    'pre_decider_enrichment_context': pre_decider_enrichment_context or {},
+                },
                 response_payload={
                     'role': 'short-term-decider',
                     'agent_name': 'short-term-decider',
@@ -404,6 +408,35 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(by_agent['short-term-decider']['decision_snapshot_id'], short_term_snapshot_id)
         self.assertEqual(by_agent['short-term-decider']['client_order_id'], 'STDE-20260430-005930')
         self.assertEqual(by_agent['short-term-decider']['eligibility_status'], ELIGIBILITY_ELIGIBLE)
+
+    def test_refresh_plan_items_attaches_pre_decider_enrichment_to_short_term_validation(self) -> None:
+        pre_decider_context = {
+            'schema_version': 'pre_decider_enrichment_v1',
+            'quote_orderbook_snapshot': {
+                'status': 'stale_eod',
+                'snapshot_type': 'eod_stale',
+                'quote_freshness_timestamp': '2026-04-29T15:30:00+09:00',
+            },
+            'trading_value': {'status': 'available', 'source': 'raw', 'trading_value_krw': 9870000000},
+            'flow_short_sector_context': {'status': 'available'},
+        }
+        self._seed_short_term_snapshot(
+            symbol='005930',
+            pre_decider_enrichment_context=pre_decider_context,
+        )
+        service = self._service(state='PREOPEN', server_time='2026-04-30T08:40:00+09:00')
+
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[{'trade_date': '2026-04-29', 'close_price': 50000}],
+        ):
+            result = service.refresh_plan_items(target_trade_date=self.target_trade_date, trigger='test')
+
+        item = result['items'][0]
+        self.assertEqual(item['decision_agent_name'], 'short-term-decider')
+        self.assertEqual(item['validation']['pre_decider_enrichment_context'], pre_decider_context)
+        self.assertEqual(item['validation']['short_term']['pre_decider_enrichment_context'], pre_decider_context)
+        self.assertEqual(item['traceability']['pre_decider_enrichment_context'], pre_decider_context)
 
     def test_refresh_plan_items_short_term_rows_created_without_account_targets(self) -> None:
         self._seed_snapshot(symbol='005930')
