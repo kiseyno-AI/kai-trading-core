@@ -502,6 +502,142 @@ def _normalize_text_list(value: Any) -> list[str]:
     return items
 
 
+def _pre_decider_enrichment_context_from_payload(context_payload: dict[str, Any] | None) -> dict[str, Any]:
+    payload = _maybe_dict(context_payload)
+    pre_decider = _maybe_dict(payload.get('pre_decider_enrichment_context'))
+    if pre_decider:
+        return pre_decider
+    return _maybe_dict(_maybe_dict(payload.get('symbol_day_context')).get('pre_decider_enrichment_context'))
+
+
+def _pre_decider_warning_category(warning: str) -> str | None:
+    text = warning.lower()
+    if any(
+        token in text
+        for token in (
+            'quote',
+            'orderbook',
+            'order book',
+            'bid/ask',
+            'bid ask',
+            'spread',
+            'realtime',
+            'real-time',
+            '호가',
+            '스프레드',
+            '실시간',
+        )
+    ):
+        return 'quote_orderbook_snapshot'
+    if any(
+        token in text
+        for token in (
+            'turnover',
+            'trading value',
+            'raw trade value',
+            'raw trading value',
+            'price x volume',
+            'price×volume',
+            '거래대금',
+        )
+    ):
+        return 'trading_value'
+    if any(token in text for token in ('investor flow', 'net buy', 'net sell', 'foreign', 'institution', '수급', '투자자')):
+        return 'investor_flow'
+    if any(token in text for token in ('short sell', 'short-selling', 'short selling', 'short interest', '공매도')):
+        return 'short_selling'
+    if any(token in text for token in ('sector peer', 'sector', 'peer', '업종', '섹터', '피어')):
+        return 'sector_peer'
+    return None
+
+
+def _resolved_pre_decider_warning_categories(context_payload: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
+    pre_decider = _pre_decider_enrichment_context_from_payload(context_payload)
+    if not pre_decider:
+        return {}
+
+    resolved: dict[str, dict[str, Any]] = {}
+    quote_snapshot = _maybe_dict(pre_decider.get('quote_orderbook_snapshot'))
+    quote_status = str(quote_snapshot.get('status') or '').strip().lower()
+    if quote_status in {'available', 'partial', 'stale_eod', 'not_applicable'}:
+        resolved['quote_orderbook_snapshot'] = {
+            'status': quote_status,
+            'reason': quote_snapshot.get('reason'),
+            'snapshot_type': quote_snapshot.get('snapshot_type'),
+        }
+
+    trading_value = _maybe_dict(pre_decider.get('trading_value'))
+    trading_value_source = str(trading_value.get('source') or '').strip().lower()
+    if trading_value_source == 'raw':
+        resolved['trading_value'] = {
+            'status': trading_value.get('status'),
+            'source': trading_value_source,
+            'source_detail': trading_value.get('source_detail'),
+        }
+
+    flow_context = _maybe_dict(pre_decider.get('flow_short_sector_context'))
+    for category, key in (
+        ('investor_flow', 'investor_flow'),
+        ('short_selling', 'short_selling'),
+        ('sector_peer', 'sector_peers'),
+    ):
+        block = _maybe_dict(flow_context.get(key))
+        block_status = str(block.get('status') or '').strip().lower()
+        if block_status in {'available', 'partial'}:
+            resolved[category] = {
+                'status': block_status,
+                'source_status': block.get('source_status'),
+            }
+    return resolved
+
+
+def _filter_pre_decider_resolved_data_quality_warnings(
+    warnings: Any,
+    context_payload: dict[str, Any] | None,
+) -> tuple[list[str], list[dict[str, Any]]]:
+    normalized_warnings = _normalize_text_list(warnings)
+    resolved_categories = _resolved_pre_decider_warning_categories(context_payload)
+    if not normalized_warnings or not resolved_categories:
+        return normalized_warnings, []
+
+    filtered: list[str] = []
+    resolved_warnings: list[dict[str, Any]] = []
+    for warning in normalized_warnings:
+        category = _pre_decider_warning_category(warning)
+        if category is not None and category in resolved_categories:
+            resolved_warnings.append(
+                {
+                    'warning': warning,
+                    'category': category,
+                    'resolution': resolved_categories[category],
+                }
+            )
+            continue
+        filtered.append(warning)
+    return filtered, resolved_warnings
+
+
+def _attach_pre_decider_warning_resolution(
+    *,
+    request_payload: dict[str, Any],
+    resolved_warnings: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if not resolved_warnings:
+        return request_payload
+    existing = _maybe_dict(request_payload.get('pre_decider_warning_resolution'))
+    return {
+        **request_payload,
+        'pre_decider_warning_resolution': {
+            **existing,
+            'schema_version': 'pre_decider_warning_resolution_v1',
+            'resolved_warnings': [
+                *list(existing.get('resolved_warnings') or []),
+                *resolved_warnings,
+            ],
+        },
+    }
+
+
 def _maybe_dict(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
         return value
@@ -2291,6 +2427,21 @@ class SignalDeciderLoopService:
             normalized_market_date = _normalize_market_date(market_date)
             response_payload = _maybe_dict(normalized_feedback_payload) or _maybe_dict(feedback_payload)
             request_payload = dict(_maybe_dict(context_payload))
+            filtered_data_quality_warnings, resolved_data_quality_warnings = (
+                _filter_pre_decider_resolved_data_quality_warnings(
+                    response_payload.get('data_quality_warnings'),
+                    request_payload,
+                )
+            )
+            if resolved_data_quality_warnings:
+                response_payload = {
+                    **response_payload,
+                    'data_quality_warnings': filtered_data_quality_warnings,
+                }
+                request_payload = _attach_pre_decider_warning_resolution(
+                    request_payload=request_payload,
+                    resolved_warnings=resolved_data_quality_warnings,
+                )
             default_policy_context = self.get_policy_prompt_context(
                 policy_version=_maybe_dict(request_payload.get('signal_decider_policy')).get('current_version')
             )
@@ -2423,6 +2574,21 @@ class SignalDeciderLoopService:
             normalized_market_date = _normalize_market_date(market_date)
             response_payload = _maybe_dict(normalized_feedback_payload) or _maybe_dict(feedback_payload)
             request_payload = dict(_maybe_dict(context_payload))
+            filtered_data_quality_warnings, resolved_data_quality_warnings = (
+                _filter_pre_decider_resolved_data_quality_warnings(
+                    response_payload.get('data_quality_warnings'),
+                    request_payload,
+                )
+            )
+            if resolved_data_quality_warnings:
+                response_payload = {
+                    **response_payload,
+                    'data_quality_warnings': filtered_data_quality_warnings,
+                }
+                request_payload = _attach_pre_decider_warning_resolution(
+                    request_payload=request_payload,
+                    resolved_warnings=resolved_data_quality_warnings,
+                )
             tactical_action = _normalize_short_term_action(
                 response_payload.get('tactical_action') or response_payload.get('preferred_action')
             )

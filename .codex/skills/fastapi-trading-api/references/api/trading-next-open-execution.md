@@ -5,6 +5,8 @@ Inspect or execute the persisted next-open buy plan derived from the latest prev
 
 For short-term candidates, core now sends sizing context as a candidate contract (`quantity_policy.type='exec_agent_sized'`) so exec can make final share decisions using account/feedback/context rails, budgets, confidence, and target/stop metadata.
 
+Short-term validation now preserves the decider request's `pre_decider_enrichment_context` in both `validation.pre_decider_enrichment_context` and `validation.short_term.pre_decider_enrichment_context`. Operators can inspect the quote/orderbook snapshot status, raw-vs-estimated trading value provenance, investor/short-selling flow, and sector-peer context that were available before dispatch validation.
+
 When short-term candidates are present but `SIGNAL_DECIDER_NEXT_OPEN_ACCOUNT_TARGETS` is empty, rows are still materialized with an explicit synthetic routing rail:
 - `account_reference = KIS:00000000-00`
 - `account_label = UNSPECIFIED_ROUTE`
@@ -85,7 +87,23 @@ Content-Type: application/json
           "chase_limit_price": 51500,
           "target_price": 54000,
           "stop_loss_price": 49000,
-          "expected_holding_period": "1-2 trading days"
+          "expected_holding_period": "1-2 trading days",
+          "pre_decider_enrichment_context": {
+            "schema_version": "pre_decider_enrichment_v1",
+            "quote_orderbook_snapshot": {
+              "status": "stale_eod",
+              "snapshot_type": "eod_stale",
+              "quote_freshness_timestamp": "2026-04-29T15:30:00+09:00"
+            },
+            "trading_value": {
+              "status": "available",
+              "source": "raw",
+              "trading_value_krw": 9870000000
+            },
+            "flow_short_sector_context": {
+              "status": "available"
+            }
+          }
         }
       },
       "traceability": {

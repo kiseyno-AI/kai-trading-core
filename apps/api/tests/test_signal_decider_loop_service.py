@@ -1054,6 +1054,75 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
         self.assertEqual(snapshot_item['traceability_payload']['tactical_context']['trigger_price'], 81200)
         self.assertEqual(snapshot_item['traceability_payload']['upstream_references']['technical-summarizer']['feedback_id'], 8)
 
+    def test_prepare_snapshot_persistence_item_filters_resolved_pre_decider_warnings(self):
+        service = SignalDeciderLoopService(repository=FakeSignalDeciderLoopRepository([]))
+        snapshot_item = service.prepare_snapshot_persistence_item(
+            feedback_id=120,
+            market_date='2026-04-23',
+            symbol='005930',
+            agent_name='short-term-decider',
+            agent_version='openclaw-v1',
+            run_id='short-run-120',
+            summary_payload={'model': 'openclaw/short-term-decider'},
+            feedback_payload={
+                'tactical_action': 'watch_for_trigger',
+                'preferred_action': 'watch_for_trigger',
+                'trigger_price': 81200,
+                'chase_limit_price': 82400,
+                'target_price': 84800,
+                'stop_loss_price': 79200,
+                'expected_holding_period': '1-2 trading days',
+                'confidence_score_10': 7.2,
+                'conviction_score_10': 6.4,
+                'thesis_summary': '돌파 확인 뒤 추격 범위를 제한한다.',
+                'supporting_evidence': ['거래대금이 재유입되고 있다.'],
+                'tactical_risks': ['개장 직후 변동성이 확대될 수 있다.'],
+                'invalidation_conditions': ['트리거 재돌파 실패 시 무효화한다.'],
+                'data_quality_warnings': [
+                    'Realtime orderbook freshness is stale.',
+                    'Raw trading value is missing; using price x volume estimate.',
+                    'Investor flow data is missing.',
+                    'Short-selling data is missing.',
+                    'Sector peer data is missing.',
+                    'No recent news/disclosures were captured.',
+                ],
+            },
+            context_payload={
+                'pre_decider_enrichment_context': {
+                    'schema_version': 'pre_decider_enrichment_v1',
+                    'quote_orderbook_snapshot': {
+                        'status': 'stale_eod',
+                        'snapshot_type': 'eod_stale',
+                        'reason': 'closed_market_eod_snapshot',
+                    },
+                    'trading_value': {
+                        'status': 'available',
+                        'source': 'raw',
+                        'source_detail': 'pykrx_valuation_snapshot.trading_value',
+                    },
+                    'flow_short_sector_context': {
+                        'investor_flow': {'status': 'available'},
+                        'short_selling': {'status': 'available'},
+                        'sector_peers': {'status': 'partial'},
+                    },
+                },
+                'orchestration': {'required_upstream_roles': ['technical-summarizer']},
+            },
+            received_at='2026-04-23T06:00:00+00:00',
+        )
+
+        self.assertEqual(snapshot_item['data_quality_warnings_payload'], ['No recent news/disclosures were captured.'])
+        self.assertEqual(snapshot_item['response_payload']['data_quality_warnings'], ['No recent news/disclosures were captured.'])
+        resolved_warnings = snapshot_item['request_payload']['pre_decider_warning_resolution']['resolved_warnings']
+        self.assertEqual(len(resolved_warnings), 5)
+        self.assertEqual({item['category'] for item in resolved_warnings}, {
+            'quote_orderbook_snapshot',
+            'trading_value',
+            'investor_flow',
+            'short_selling',
+            'sector_peer',
+        })
+
     def test_prepare_snapshot_persistence_item_builds_wait_to_wait_decision_delta(self):
         service = SignalDeciderLoopService(repository=FakeSignalDeciderLoopRepository([]))
         snapshot_item = service.prepare_snapshot_persistence_item(

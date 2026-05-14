@@ -725,6 +725,11 @@ def build_signal_decider_payload(
         if isinstance(symbol_day_context.get('decider_data_quality_context'), dict)
         else {}
     )
+    pre_decider_enrichment_context = (
+        symbol_day_context.pop('pre_decider_enrichment_context', {})
+        if isinstance(symbol_day_context.get('pre_decider_enrichment_context'), dict)
+        else {}
+    )
     requested_at = datetime.now(timezone.utc).isoformat()
     symbol = str(item.get('symbol') or '')
     resolved_signal_decider_policy = jsonable_encoder(
@@ -805,6 +810,7 @@ def build_signal_decider_payload(
         'scores': jsonable_encoder(score_context),
         'factor_summary': jsonable_encoder(factor_summary),
         'liquidity_context': jsonable_encoder(liquidity_context),
+        'pre_decider_enrichment_context': jsonable_encoder(pre_decider_enrichment_context),
         'decider_data_quality_context': jsonable_encoder(decider_data_quality_context),
         'market_context': jsonable_encoder(market_context or {}),
         'upstream_summaries': jsonable_encoder(upstream_summaries),
@@ -851,6 +857,14 @@ def build_signal_decider_payload(
                 'empty_recent_news_is_neutral': True,
                 'quarterly_financial_detail_confidence_only_unless_thesis_depends_on_it': True,
                 'forbid_untradeable_from_auxiliary_absence_only': True,
+                'pre_decider_enrichment_context_authoritative': True,
+                'pre_decider_enrichment_blocks': [
+                    'quote_orderbook_snapshot',
+                    'trading_value',
+                    'flow_short_sector_context',
+                ],
+                'trading_value_source_values': ['raw', 'estimated', 'missing'],
+                'do_not_emit_missing_warning_when_pre_decider_block_available': True,
             },
         },
         'signal_decider_policy': resolved_signal_decider_policy,

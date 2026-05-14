@@ -7,6 +7,8 @@ The response also includes a compact `factor_summary` block per symbol/day. This
 
 The response now also includes a compact `liquidity_context` block per symbol/day. It keeps the daily turnover state explicit with `available`, `derived`, `stale`, `missing_price_or_volume`, and `storage_unavailable` statuses, plus low-risk liquidity ranking fields and intraday quote/orderbook freshness where those rows exist.
 
+The response now also includes `pre_decider_enrichment_context` per symbol/day. This is the short-term-decider handoff view for quote/spread/orderbook/execution-strength, raw-or-estimated trading value provenance, investor flow, short-selling, market breadth, and sector peer context. `trading_value.source` is `raw`, `estimated`, or `missing`; raw PyKRX/KRX `valuation_snapshot.trading_value` wins over close×volume fallback.
+
 Expected decider-facing context blocks are status-first even when the requested-date source row is missing. `quote_context`, `intraday_execution_context`, and the provider-backed optional PyKRX blocks stay object-shaped with explicit `status`, `reason`, and `freshness_provenance` instead of collapsing to raw `null`.
 
 The payload now also includes `market_session` metadata at the top level, under `summary.market_session`, and under each item. It keeps `requested_date`, `current_calendar_date`, `latest_valid_trading_date`, `status`, `is_trading_day`, `intraday_data_expected`, `quote_data_expected`, and `recommendation_basis` explicit so downstream agents can tell an actual trading-data gap from a weekend, holiday, or after-close read.
@@ -49,6 +51,13 @@ GET /agent-context/symbol-day?market_date=2026-04-15&symbols=005930&fs_div=CFS&d
         "status": "not_applicable",
         "reason": "closed_market",
         "market_session_status": "weekend"
+      },
+      "pre_decider_enrichment_context": {
+        "quote_orderbook_snapshot": {
+          "status": "stale_eod",
+          "snapshot_type": "eod_stale",
+          "quote_freshness_timestamp": "2026-04-10T15:30:00+09:00"
+        }
       }
     }
   ]
@@ -325,6 +334,8 @@ GET /agent-context/symbol-day?market_date=2026-04-15&symbols=005930&fs_div=CFS&d
           "trade_date": "2026-04-15",
           "turnover_krw": 8520000000,
           "turnover_source": "derived",
+          "trading_value_source": "estimated",
+          "trading_value_source_detail": "daily_price_context.close_x_volume_estimate",
           "provider_turnover_krw": null,
           "derived_turnover_krw": 8520000000,
           "volume": 120000,
@@ -347,6 +358,56 @@ GET /agent-context/symbol-day?market_date=2026-04-15&symbols=005930&fs_div=CFS&d
           "orderbook_imbalance": 0.076923,
           "volume_power_rank": 3,
           "quote_balance_rank": 5
+        }
+      },
+      "pre_decider_enrichment_context": {
+        "schema_version": "pre_decider_enrichment_v1",
+        "status": "available",
+        "quote_orderbook_snapshot": {
+          "status": "available",
+          "current_price": 71550,
+          "bid_price": 71500,
+          "ask_price": 71600,
+          "spread_bps": 13.9762,
+          "orderbook_depth": {
+            "ask_total_size": 14000,
+            "bid_total_size": 16300
+          },
+          "orderbook_imbalance": 0.076923,
+          "quote_freshness_timestamp": "2026-04-15T09:57:00+09:00",
+          "execution_strength": {
+            "volume_power": 155.2,
+            "volume_power_rank": 3,
+            "quote_balance_rank": 5
+          }
+        },
+        "trading_value": {
+          "status": "available",
+          "source": "raw",
+          "source_detail": "pykrx_valuation_snapshot.trading_value",
+          "trading_value_krw": 9870000000,
+          "fallback_used": false,
+          "freshness": {
+            "freshness_status": "fresh",
+            "source_tables": ["daily_pykrx_enrichment_rows"]
+          }
+        },
+        "flow_short_sector_context": {
+          "status": "available",
+          "investor_flow": {
+            "status": "available",
+            "symbol_flow": {"investor_groups": {"외국인": {"net_value": 1200000}}}
+          },
+          "short_selling": {
+            "status": "available",
+            "short_volume": {"short_volume_ratio_pct": 0.35},
+            "short_balance": {"short_balance_ratio_pct": 0.45}
+          },
+          "sector_peers": {
+            "status": "available",
+            "sector_name": "반도체",
+            "peer_count": 1
+          }
         }
       },
       "decider_data_quality_context": {
@@ -460,6 +521,9 @@ GET /agent-context/symbol-day?market_date=2026-04-15&symbols=005930&fs_div=CFS&d
 - `fundamentals.disclosure_context` summarizes recent corrections and ownership or large-holder changes from the existing DART disclosure event stream; it does not require a separate ownership-only endpoint.
 - `factor_summary.factor_scores` covers the persisted factor families `value`, `unified_value`, `quality`, `momentum`, `advanced_value`, `low_risk`, `beta`, and `composite`.
 - `liquidity_context.turnover` is the prompt-trim-safe turnover summary. `status="derived"` means provider turnover was missing or zero but `close_price * volume` was safely derivable from the stored daily bar. `status="stale"` means Core only had a prior stored price-context row for that symbol.
+- `liquidity_context.turnover.trading_value_source` and `pre_decider_enrichment_context.trading_value.source` preserve raw/estimated/missing provenance for turnover. Raw PyKRX/KRX trading value is preferred when the enrichment row exists.
+- `pre_decider_enrichment_context.quote_orderbook_snapshot.status="stale_eod"` is the expected closed-market shape when the latest completed EOD price context is available and live quote/orderbook rows are not expected.
+- `pre_decider_enrichment_context.flow_short_sector_context` is joined from PyKRX enrichment rows. If these rows exist but the block is unavailable, treat that as a pipeline join bug.
 - `decider_data_quality_context` is the compact prompt-safe quality overlay that both deciders can read without re-parsing the heavier raw context blocks. It surfaces source-specific `empty` vs `provider_error` semantics for DART and external news, keeps stale or derived liquidity/intraday inputs explicit, and now marks which gaps are `core_execution`, `supporting_context`, or `auxiliary_context`.
 - `decision_priority.auxiliary_context` is intentionally non-blocking by default. Empty recent news means no captured recent optional context, not automatic event risk.
 - `blocks.financials_cashflow.decision_guidance` marks annual-only or missing detailed quarterly/cash-flow detail as confidence-reducing by default unless the trading thesis explicitly depends on those fields.
