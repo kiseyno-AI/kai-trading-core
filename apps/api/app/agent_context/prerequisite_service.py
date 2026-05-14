@@ -20,6 +20,7 @@ FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER: tuple[str, ...] = (
 )
 PREREQUISITE_WAITING_STATUSES = {'pending', 'running'}
 PREREQUISITE_BLOCKED_STATUSES = {'failed', 'partial', 'blocked'}
+PARTIAL_PREREQUISITE_MIN_COVERAGE_RATIO = 0.99
 
 
 def _normalize_market_date(value: str | date) -> date:
@@ -49,15 +50,79 @@ class AgentFeedbackPrerequisiteService:
         status = str(stage_payload.get('status') or 'pending').strip().lower()
         details = stage_payload.get('details') if isinstance(stage_payload.get('details'), dict) else {}
         failed_blocking_stages = details.get('failed_blocking_stages')
-        if status in PREREQUISITE_BLOCKED_STATUSES:
-            return 'blocked'
         if isinstance(failed_blocking_stages, list) and failed_blocking_stages:
+            return 'blocked'
+        if status == 'partial' and AgentFeedbackPrerequisiteService._is_progressable_terminal_partial(stage_payload):
+            return 'ready'
+        if status in PREREQUISITE_BLOCKED_STATUSES:
             return 'blocked'
         if status == 'completed':
             return 'ready'
         if status in PREREQUISITE_WAITING_STATUSES:
             return 'waiting'
         return 'waiting'
+
+    @staticmethod
+    def _is_progressable_terminal_partial(stage_payload: dict[str, Any]) -> bool:
+        details = stage_payload.get('details') if isinstance(stage_payload.get('details'), dict) else {}
+        blocking_stages = details.get('blocking_stages')
+        failed_blocking_stages = details.get('failed_blocking_stages')
+        if isinstance(blocking_stages, list) and blocking_stages:
+            return False
+        if isinstance(failed_blocking_stages, list) and failed_blocking_stages:
+            return False
+
+        total = AgentFeedbackPrerequisiteService._coerce_positive_int(
+            stage_payload.get('total'),
+            details.get('expected_rows'),
+            details.get('requested_symbol_count'),
+        )
+        succeeded = AgentFeedbackPrerequisiteService._coerce_positive_int(
+            stage_payload.get('succeeded'),
+            stage_payload.get('processed'),
+            details.get('rows_persisted'),
+            details.get('stored_rows_present'),
+        )
+        if total <= 0 or succeeded <= 0:
+            return False
+        coverage_ratio = min(succeeded, total) / total
+        if coverage_ratio < PARTIAL_PREREQUISITE_MIN_COVERAGE_RATIO:
+            return False
+
+        retry_cycles_requested = AgentFeedbackPrerequisiteService._coerce_positive_int(
+            details.get('retry_cycles_requested'),
+        )
+        retry_cycles_completed = AgentFeedbackPrerequisiteService._coerce_positive_int(
+            details.get('retry_cycles_completed'),
+        )
+        remaining_retryable_events = AgentFeedbackPrerequisiteService._coerce_optional_int(
+            details.get('remaining_retryable_events'),
+        )
+        if retry_cycles_requested > 0:
+            return retry_cycles_completed >= retry_cycles_requested or remaining_retryable_events == 0
+        if remaining_retryable_events is not None:
+            return remaining_retryable_events == 0
+        return True
+
+    @staticmethod
+    def _coerce_positive_int(*values: Any) -> int:
+        for value in values:
+            try:
+                parsed = int(value or 0)
+            except (TypeError, ValueError):
+                continue
+            if parsed > 0:
+                return parsed
+        return 0
+
+    @staticmethod
+    def _coerce_optional_int(value: Any) -> int | None:
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
 
     def inspect_feedback_prerequisites(
         self,
