@@ -20,6 +20,7 @@ from app.market.clock import get_market_state
 from app.orders.next_open_execution import (
     ELIGIBILITY_BLOCKED,
     ELIGIBILITY_ELIGIBLE,
+    EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING,
     EXECUTION_STATUS_PLANNED,
     EXECUTION_STATUS_SUBMIT_FAILED,
     EXECUTION_STATUS_SUBMITTED,
@@ -1083,6 +1084,114 @@ class SignalDeciderExecIntegrationService:
             grouped[(row.account_reference, _normalize_decision_agent_name(row.decision_agent_name))].append(row)
         return grouped
 
+    def _build_decider_handoff_context(
+        self,
+        *,
+        row: SignalDeciderExecutionPlanItem,
+        snapshot: SignalDeciderDecisionSnapshot | None,
+        traceability: dict[str, Any],
+        validation: dict[str, Any],
+        decision_traceability: dict[str, Any],
+    ) -> dict[str, Any]:
+        row_decision_agent_name = _normalize_decision_agent_name(row.decision_agent_name)
+        pre_decider_enrichment_context = (
+            traceability.get('pre_decider_enrichment_context')
+            if isinstance(traceability.get('pre_decider_enrichment_context'), dict)
+            else validation.get('pre_decider_enrichment_context')
+            if isinstance(validation.get('pre_decider_enrichment_context'), dict)
+            else {}
+        )
+        request_payload = (
+            snapshot.request_payload
+            if snapshot is not None and isinstance(snapshot.request_payload, dict)
+            else {}
+        )
+        if not pre_decider_enrichment_context:
+            request_pre_decider = request_payload.get('pre_decider_enrichment_context')
+            symbol_day_context = request_payload.get('symbol_day_context')
+            if isinstance(request_pre_decider, dict):
+                pre_decider_enrichment_context = request_pre_decider
+            elif isinstance(symbol_day_context, dict) and isinstance(
+                symbol_day_context.get('pre_decider_enrichment_context'),
+                dict,
+            ):
+                pre_decider_enrichment_context = symbol_day_context['pre_decider_enrichment_context']
+        input_feature_snapshot_payload = (
+            snapshot.input_feature_snapshot_payload
+            if snapshot is not None and isinstance(snapshot.input_feature_snapshot_payload, dict)
+            else {}
+        )
+        response_payload = (
+            snapshot.response_payload
+            if snapshot is not None and isinstance(snapshot.response_payload, dict)
+            else {}
+        )
+        response_summary_payload = (
+            snapshot.response_summary_payload
+            if snapshot is not None and isinstance(snapshot.response_summary_payload, dict)
+            else {}
+        )
+        return _json_safe(
+            {
+                'schema_version': 'exec_agent_decider_handoff_v1',
+                'classification': (
+                    EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING
+                    if row_decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
+                    else 'delegated_fixed_quantity_next_open'
+                ),
+                'symbol': row.symbol,
+                'target_trade_date': row.target_trade_date.isoformat(),
+                'source_market_date': row.source_market_date.isoformat(),
+                'traceability': {
+                    'core_plan_item_id': row.id,
+                    'core_client_order_id': row.client_order_id,
+                    'decision_snapshot_id': row.decision_snapshot_id,
+                    'feedback_id': traceability.get('source_feedback_id') or traceability.get('feedback_id'),
+                    'source_feedback_id': traceability.get('source_feedback_id') or traceability.get('feedback_id'),
+                    'decision_run_id': traceability.get('decision_run_id'),
+                    'policy_version': row.policy_version,
+                    'decision_agent_name': row_decision_agent_name,
+                    'decision_traceability': decision_traceability,
+                },
+                'decider_input_context': {
+                    'request_payload': request_payload,
+                    'input_feature_snapshot_payload': input_feature_snapshot_payload,
+                    'pre_decider_enrichment_context': pre_decider_enrichment_context,
+                },
+                'decider_output': {
+                    'decision_action': snapshot.decision_action if snapshot is not None else None,
+                    'preferred_action': snapshot.preferred_action if snapshot is not None else None,
+                    'next_day_open_action': snapshot.next_day_open_action if snapshot is not None else None,
+                    'tactical_action': traceability.get('tactical_action'),
+                    'entry_price_basis': snapshot.entry_price_basis if snapshot is not None else traceability.get('entry_price_basis'),
+                    'trigger_price': traceability.get('trigger_price'),
+                    'chase_limit_price': traceability.get('chase_limit_price'),
+                    'target_price': traceability.get('target_price'),
+                    'stop_loss_price': traceability.get('stop_loss_price'),
+                    'expected_return_pct': snapshot.expected_return_pct if snapshot is not None else None,
+                    'confidence_score_10': snapshot.confidence_score_10 if snapshot is not None else traceability.get('confidence_score_10'),
+                    'conviction_score_10': snapshot.conviction_score_10 if snapshot is not None else traceability.get('conviction_score_10'),
+                    'thesis': snapshot.thesis_summary if snapshot is not None else traceability.get('thesis_summary'),
+                    'thesis_summary': snapshot.thesis_summary if snapshot is not None else traceability.get('thesis_summary'),
+                    'supporting_evidence': snapshot.supporting_evidence_payload if snapshot is not None else traceability.get('supporting_evidence') or [],
+                    'trigger_conditions': response_payload.get('trigger_conditions')
+                    or response_payload.get('trigger_conditions_payload')
+                    or traceability.get('trigger_conditions')
+                    or traceability.get('invalidation_conditions')
+                    or (snapshot.invalidation_conditions_payload if snapshot is not None else []),
+                    'risk_flags': response_payload.get('risk_flags')
+                    or response_payload.get('tactical_risks')
+                    or traceability.get('risk_flags')
+                    or traceability.get('decision_risks')
+                    or (snapshot.decision_risks_payload if snapshot is not None else []),
+                    'data_quality_warnings': snapshot.data_quality_warnings_payload if snapshot is not None else traceability.get('data_quality_warnings') or [],
+                    'response_payload': response_payload,
+                    'response_summary_payload': response_summary_payload,
+                },
+                'eod_pre_decider_enrichment_metadata': pre_decider_enrichment_context,
+            }
+        )
+
     def _build_exec_plan_payload(
         self,
         *,
@@ -1138,8 +1247,16 @@ class SignalDeciderExecIntegrationService:
                 else 'next_open_market'
             )
             core_entry_key = f'core-plan-{row.id}:{EXEC_INTENT_NEXT_OPEN_BUY}'
+            decider_handoff_context = self._build_decider_handoff_context(
+                row=row,
+                snapshot=snapshot,
+                traceability=traceability,
+                validation=validation,
+                decision_traceability=decision_traceability,
+            )
             common_risk_context = {
                 'schema_version': EXEC_SOURCE_SCHEMA_VERSION,
+                'classification': decider_handoff_context['classification'],
                 'agent_name': row_decision_agent_name,
                 'decision_agent_name': row_decision_agent_name,
                 'core_plan_item_id': row.id,
@@ -1175,6 +1292,7 @@ class SignalDeciderExecIntegrationService:
                 'entry_execution_mode': entry_execution_mode,
                 'validation': validation,
                 'traceability': decision_traceability,
+                'decider_handoff_context': decider_handoff_context,
             }
             if not is_short_term:
                 quantity_policy = {
@@ -1513,11 +1631,15 @@ class SignalDeciderExecIntegrationService:
                     'last_request_payload': _json_safe(payload),
                     'last_response_payload': _json_safe(response_payload),
                 }
-                row.execution_status = (
-                    EXECUTION_STATUS_SUBMITTED
-                    if row_dispatch_status in {EXEC_DISPATCH_STATUS_ACCEPTED, EXEC_DISPATCH_STATUS_PARTIAL}
-                    else EXECUTION_STATUS_SUBMIT_FAILED
-                )
+                row_decision_agent_name = _normalize_decision_agent_name(row.decision_agent_name)
+                if row_dispatch_status in {EXEC_DISPATCH_STATUS_ACCEPTED, EXEC_DISPATCH_STATUS_PARTIAL}:
+                    row.execution_status = (
+                        EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING
+                        if row_decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
+                        else EXECUTION_STATUS_SUBMITTED
+                    )
+                else:
+                    row.execution_status = EXECUTION_STATUS_SUBMIT_FAILED
                 row.submitted_at = row.submitted_at or now
                 row.submission_payload = {
                     **existing_submission,

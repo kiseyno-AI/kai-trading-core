@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from contextlib import suppress
+from datetime import datetime, time
 
 from app.core.settings import settings
 from app.eod.auto_pykrx import auto_pykrx_eod_scheduler
@@ -16,6 +17,20 @@ from app.orders.portfolio_summary_service import portfolio_summary_service
 from app.orders.reconciliation import trading_order_reconciliation_service
 
 logger = logging.getLogger(__name__)
+PREOPEN_EXEC_DISPATCH_TIME_KST = time(8, 0)
+
+
+def is_preopen_exec_dispatch_due(market: object) -> bool:
+    if getattr(market, 'state', None) != 'PREOPEN' or not bool(getattr(market, 'is_trading_day', False)):
+        return False
+    server_time = getattr(market, 'server_time', None)
+    if not server_time:
+        return False
+    try:
+        parsed = datetime.fromisoformat(str(server_time))
+    except ValueError:
+        return False
+    return parsed.time() >= PREOPEN_EXEC_DISPATCH_TIME_KST
 
 
 class EODBackgroundRunner:
@@ -46,7 +61,10 @@ class EODBackgroundRunner:
                 if market.state == 'PREOPEN':
                     refresh_master_if_due()
                     signal_decider_next_open_execution_service.refresh_plan_if_due()
-                    if signal_decider_exec_integration_service.should_delegate_execution():
+                    if (
+                        signal_decider_exec_integration_service.should_delegate_execution()
+                        and is_preopen_exec_dispatch_due(market)
+                    ):
                         await signal_decider_exec_integration_service.dispatch_next_open_plan(
                             target_trade_date=market.server_time[:10],
                             refresh_plan=False,

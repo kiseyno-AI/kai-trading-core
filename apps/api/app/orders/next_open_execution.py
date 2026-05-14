@@ -36,6 +36,7 @@ EXECUTION_STATUS_PLANNED = 'planned'
 EXECUTION_STATUS_DRY_RUN = 'dry_run'
 EXECUTION_STATUS_SUBMITTED = 'submitted'
 EXECUTION_STATUS_SUBMIT_FAILED = 'submit_failed'
+EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING = 'delegated_for_exec_agent_sizing'
 ORDER_SOURCE = 'signal_decider_next_open'
 SHORT_TERM_ACTIONABLE_ACTIONS = {'scalp_buy_candidate', 'watch_for_trigger'}
 KRX_EXCHANGE_CALENDAR = xcals.get_calendar('XKRX')
@@ -190,6 +191,17 @@ def _previous_trading_day(value: date) -> date:
 
 def _reason(code: str, message: str) -> dict[str, str]:
     return {'code': code, 'message': message}
+
+
+def _exec_agent_sizing_dispatch_enabled() -> bool:
+    return str(settings.signal_decider_exec_integration_mode or '').strip().lower() == 'dispatch'
+
+
+def _is_dispatch_terminal_status(value: Any) -> bool:
+    return _normalize_optional_text(value) in {
+        EXECUTION_STATUS_SUBMITTED,
+        EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING,
+    }
 
 
 @dataclass(frozen=True)
@@ -376,7 +388,7 @@ class SignalDeciderNextOpenExecutionService:
                         session.add(row)
                         attached_existing[(target.account_reference, snapshot.symbol, decision_agent_name)] = row
 
-                    if row.execution_status == EXECUTION_STATUS_SUBMITTED:
+                    if _is_dispatch_terminal_status(row.execution_status):
                         continue
                     policy_context = None
                     if decision_agent_name == SIGNAL_DECIDER_AGENT_NAME and snapshot.policy_version not in policy_cache:
@@ -410,7 +422,7 @@ class SignalDeciderNextOpenExecutionService:
             for key, row in attached_existing.items():
                 if key in desired_keys or row is None:
                     continue
-                if row.execution_status == EXECUTION_STATUS_SUBMITTED:
+                if _is_dispatch_terminal_status(row.execution_status):
                     continue
                 self._set_blocked_row(
                     row=row,
@@ -748,15 +760,22 @@ class SignalDeciderNextOpenExecutionService:
                     'Confidence score is below the next-open automation threshold.',
                 )
             )
-        if settings.signal_decider_next_open_block_on_data_warnings and _normalize_text_list(
-            snapshot.data_quality_warnings_payload
-        ):
-            blocking_reasons.append(
-                _reason(
-                    'data_quality_warnings_present',
-                    'Snapshot has data quality warnings.',
+        data_quality_warnings = _normalize_text_list(snapshot.data_quality_warnings_payload)
+        if settings.signal_decider_next_open_block_on_data_warnings and data_quality_warnings:
+            if decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME and _exec_agent_sizing_dispatch_enabled():
+                warnings.append(
+                    _reason(
+                        'data_quality_warnings_present',
+                        'Snapshot has data quality warnings; delegated to exec-agent for account-aware sizing and risk decision.',
+                    )
                 )
-            )
+            else:
+                blocking_reasons.append(
+                    _reason(
+                        'data_quality_warnings_present',
+                        'Snapshot has data quality warnings.',
+                    )
+                )
         if settings.signal_decider_next_open_block_on_specialist_disagreement and _normalize_text_list(
             snapshot.specialist_disagreement_payload
         ):
@@ -1067,6 +1086,14 @@ class SignalDeciderNextOpenExecutionService:
             'suggested_holding_period': suggested_holding_period,
             'expected_holding_period': _short_term_field_text(snapshot, 'expected_holding_period')
             or suggested_holding_period,
+            'core_execution_classification': (
+                EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING
+                if decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
+                else 'core_fixed_quantity_next_open_candidate'
+            ),
+            'entry_execution_mode': (
+                'pending_trigger_limit' if decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME else 'next_open_market'
+            ),
             'tactical_action': _short_term_tactical_action(snapshot)
             if decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
             else None,
@@ -1091,10 +1118,11 @@ class SignalDeciderNextOpenExecutionService:
         row.eligibility_status = ELIGIBILITY_BLOCKED if blocking_reasons else ELIGIBILITY_ELIGIBLE
         if row.eligibility_status == ELIGIBILITY_ELIGIBLE and row.first_ready_at is None:
             row.first_ready_at = now
-        if row.eligibility_status == ELIGIBILITY_BLOCKED and row.execution_status != EXECUTION_STATUS_SUBMITTED:
+        if row.eligibility_status == ELIGIBILITY_BLOCKED and not _is_dispatch_terminal_status(row.execution_status):
             row.execution_status = EXECUTION_STATUS_PLANNED
         elif row.eligibility_status == ELIGIBILITY_ELIGIBLE and row.execution_status not in {
             EXECUTION_STATUS_SUBMITTED,
+            EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING,
             EXECUTION_STATUS_DRY_RUN,
             EXECUTION_STATUS_SUBMIT_FAILED,
         }:
@@ -1114,7 +1142,7 @@ class SignalDeciderNextOpenExecutionService:
                 row is None
                 or key[1] != symbol
                 or key[2] != decision_agent_name
-                or row.execution_status == EXECUTION_STATUS_SUBMITTED
+                or _is_dispatch_terminal_status(row.execution_status)
             ):
                 continue
             self._set_blocked_row(row=row, reason=reason, now=now)
@@ -1128,7 +1156,7 @@ class SignalDeciderNextOpenExecutionService:
     ) -> None:
         existing = row.validation_payload if isinstance(row.validation_payload, dict) else {}
         row.eligibility_status = ELIGIBILITY_BLOCKED
-        if row.execution_status != EXECUTION_STATUS_SUBMITTED:
+        if not _is_dispatch_terminal_status(row.execution_status):
             row.execution_status = EXECUTION_STATUS_PLANNED
         row.last_evaluated_at = now
         row.validation_payload = {
@@ -1160,6 +1188,9 @@ class SignalDeciderNextOpenExecutionService:
             'planned_count': sum(1 for row in rows if row.execution_status == EXECUTION_STATUS_PLANNED),
             'dry_run_count': sum(1 for row in rows if row.execution_status == EXECUTION_STATUS_DRY_RUN),
             'submitted_count': sum(1 for row in rows if row.execution_status == EXECUTION_STATUS_SUBMITTED),
+            'delegated_for_exec_agent_sizing_count': sum(
+                1 for row in rows if row.execution_status == EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING
+            ),
             'submit_failed_count': sum(1 for row in rows if row.execution_status == EXECUTION_STATUS_SUBMIT_FAILED),
             'decision_agent_counts': dict(
                 sorted(

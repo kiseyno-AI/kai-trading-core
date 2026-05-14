@@ -5,6 +5,8 @@ Read the core-owned aggregated core↔exec view for decider-driven next-open exe
 
 Short-term entries dispatched in `SIGNAL_DECIDER_EXEC_INTEGRATION_MODE=dispatch` now use the `exec_agent_sized` contract on core→exec translation, so they are routed as candidate entries and exec performs final sizing while preserving fixed-quantity semantics for existing signal-decider flow.
 
+Each exec item also carries `risk_context.decider_handoff_context`, which preserves the decider request payload, input feature snapshot payload, pre-decider enrichment context, full response payload/summary, normalized tactical output fields, risk/data-quality warnings, and traceability ids. Accepted short-term rows remain delegated sizing candidates in core (`execution_status="delegated_for_exec_agent_sizing"`) until exec readback reports scheduled/submitted/filled/monitoring outcomes.
+
 ## Example request
 ```http
 GET /trading/orders/exec/signal-decider?target_trade_date=2026-04-30&symbol=005930&refresh=true
@@ -115,6 +117,7 @@ GET /trading/orders/exec/signal-decider?target_trade_date=2026-04-30&symbol=0059
       "agent_name": "short-term-decider",
       "decision_agent_name": "short-term-decider",
       "decision_snapshot_id": 145,
+      "execution_status": "delegated_for_exec_agent_sizing",
       "target_price": 54000,
       "stop_loss_price": 49000,
       "trigger_price": 50500,

@@ -23,7 +23,7 @@ from app.orders.exec_integration import (
     SignalDeciderExecClientError,
     SignalDeciderExecIntegrationService,
 )
-from app.orders.next_open_execution import EXECUTION_STATUS_SUBMITTED
+from app.orders.next_open_execution import EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING, EXECUTION_STATUS_SUBMITTED
 
 
 class FakeExecClient:
@@ -195,6 +195,9 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         chase_limit_price: int | None = 51500,
         target_price: int | None = 54000,
         stop_loss_price: int | None = 49200,
+        request_payload: dict | None = None,
+        input_feature_snapshot_payload: dict | None = None,
+        response_payload_extra: dict | None = None,
     ) -> int:
         generic_action = 'buy' if tactical_action in {'scalp_buy_candidate', 'watch_for_trigger'} else tactical_action
         if generic_action not in {'buy', 'wait', 'reject'}:
@@ -233,8 +236,9 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                         'allow_execution_logic': False,
                     },
                 },
-                input_feature_snapshot_payload={'meta': {'source_agent_name': 'short-term-decider'}},
-                request_payload={},
+                input_feature_snapshot_payload=input_feature_snapshot_payload
+                or {'meta': {'source_agent_name': 'short-term-decider'}},
+                request_payload=request_payload or {},
                 response_payload={
                     'role': 'short-term-decider',
                     'agent_name': 'short-term-decider',
@@ -247,6 +251,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                     'expected_holding_period': '1-2 trading days',
                     'confidence_score_10': 7.3,
                     'conviction_score_10': 6.5,
+                    **(response_payload_extra or {}),
                 },
                 response_summary_payload={'model': 'openclaw/short-term-decider'},
             )
@@ -456,7 +461,28 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.client.post_calls), 0)
 
     async def test_dispatch_next_open_plan_includes_short_term_groups_with_explicit_identity(self) -> None:
-        short_snapshot_id = self._seed_short_term_snapshot()
+        decider_request_payload = {
+            'symbol_day_context': {
+                'pre_decider_enrichment_context': {
+                    'schema_version': 'pre_decider_enrichment_v1',
+                    'quote_orderbook_snapshot': {'status': 'stale_eod'},
+                },
+                'liquidity_context': {'turnover': {'status': 'available'}},
+            },
+            'orchestration': {'run_id': 'symbol-run-1'},
+        }
+        decider_input_features = {
+            'technical': {'trend_state': 'uptrend'},
+            'snapshots': {'market_risk': {'risk_level': 'normal'}},
+        }
+        short_snapshot_id = self._seed_short_term_snapshot(
+            request_payload=decider_request_payload,
+            input_feature_snapshot_payload=decider_input_features,
+            response_payload_extra={
+                'trigger_conditions': ['Reclaim 50500 with volume.'],
+                'risk_flags': ['Opening gap risk.'],
+            },
+        )
         self._seed_short_term_plan_item(snapshot_id=short_snapshot_id)
 
         result = await self.service.dispatch_next_open_plan(
@@ -498,11 +524,30 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(short_entry['quantity_policy']['allocation_mode'], 'specified')
         self.assertEqual(short_entry['quantity_policy']['account_reference'], self.account_reference)
         self.assertEqual(short_entry['quantity_policy']['account_label'], 'Main')
+        self.assertEqual(short_entry['risk_context']['classification'], EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING)
+        handoff = short_entry['risk_context']['decider_handoff_context']
+        self.assertEqual(handoff['classification'], EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING)
+        self.assertEqual(handoff['symbol'], self.symbol)
+        self.assertEqual(handoff['target_trade_date'], '2026-04-30')
+        self.assertEqual(handoff['source_market_date'], '2026-04-29')
+        self.assertEqual(handoff['traceability']['decision_snapshot_id'], short_snapshot_id)
+        self.assertEqual(handoff['traceability']['core_plan_item_id'], short_entry['risk_context']['core_plan_item_id'])
+        self.assertEqual(handoff['decider_input_context']['request_payload'], decider_request_payload)
+        self.assertEqual(handoff['decider_input_context']['input_feature_snapshot_payload'], decider_input_features)
+        self.assertEqual(
+            handoff['decider_input_context']['pre_decider_enrichment_context'],
+            decider_request_payload['symbol_day_context']['pre_decider_enrichment_context'],
+        )
+        self.assertEqual(handoff['decider_output']['response_payload']['trigger_conditions'], ['Reclaim 50500 with volume.'])
+        self.assertEqual(handoff['decider_output']['response_payload']['risk_flags'], ['Opening gap risk.'])
         self.assertEqual(result['summary']['translated_item_count'], 6)
         self.assertEqual(
             {group['decision_agent_name'] for group in result['dispatch']['groups']},
             {'signal-decider', 'short-term-decider'},
         )
+        short_item = next(item for item in result['items'] if item['decision_agent_name'] == 'short-term-decider')
+        self.assertEqual(short_item['execution_status'], EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING)
+        self.assertEqual(result['summary']['delegated_for_exec_agent_sizing_count'], 1)
 
     async def test_dispatch_next_open_plan_short_term_missing_target_stop_dispatches_entry_only(self) -> None:
         short_snapshot_id = self._seed_short_term_snapshot(target_price=None, stop_loss_price=None)

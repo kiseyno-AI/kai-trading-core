@@ -7,6 +7,8 @@ For short-term candidates, core now sends sizing context as a candidate contract
 
 Short-term validation now preserves the decider request's `pre_decider_enrichment_context` in both `validation.pre_decider_enrichment_context` and `validation.short_term.pre_decider_enrichment_context`. Operators can inspect the quote/orderbook snapshot status, raw-vs-estimated trading value provenance, investor/short-selling flow, and sector-peer context that were available before dispatch validation.
 
+In exec-dispatch mode, watcher candidates are not blocked solely because `data_quality_warnings` are present. Core carries those warnings into the validation and exec handoff so the exec-side account-aware agent can make the final sizing/risk decision.
+
 When short-term candidates are present but `SIGNAL_DECIDER_NEXT_OPEN_ACCOUNT_TARGETS` is empty, rows are still materialized with an explicit synthetic routing rail:
 - `account_reference = KIS:00000000-00`
 - `account_label = UNSPECIFIED_ROUTE`
@@ -40,6 +42,7 @@ Content-Type: application/json
     "eligible_count": 2,
     "blocked_count": 0,
     "submitted_count": 0,
+    "delegated_for_exec_agent_sizing_count": 0,
     "decision_agent_counts": {
       "short-term-decider": 1,
       "signal-decider": 1
@@ -120,4 +123,4 @@ Content-Type: application/json
 }
 ```
 
-Signal-decider rows keep the existing market-open submit behavior. `short-term-decider` rows are only mapped when the tactical action is actionable, and in core-local mode they remain planned-only because trigger/chase semantics are not translated into live market orders locally. In exec dispatch mode those short-term entry legs are sent as `pending_trigger_limit` candidates, and the delegated linkage or audit state is stored under `submission.exec_dispatch` for each item, including decider-aware `plan_id`, remote item ids, last dispatch attempt, and the latest matched readback snapshot.
+Signal-decider rows keep the existing market-open submit behavior. `short-term-decider` rows are only mapped when the tactical action is actionable, and in core-local mode they remain planned-only because trigger/chase semantics are not translated into live market orders locally. In exec dispatch mode those short-term entry legs are sent at/after 08:00 KST as `pending_trigger_limit` candidates, accepted rows move to `execution_status="delegated_for_exec_agent_sizing"`, and the delegated linkage or audit state is stored under `submission.exec_dispatch` for each item, including decider-aware `plan_id`, remote item ids, last dispatch attempt, and the latest matched readback snapshot.
