@@ -7,6 +7,7 @@ from typing import Any, Sequence
 
 from sqlalchemy import select
 
+from app.agent_context.eligibility import load_agent_feedback_eligible_symbols
 from app.agent_context.feedback_service import _normalize_market_date, _normalize_symbols
 from app.agent_context.prerequisite_service import agent_feedback_prerequisite_service
 from app.agent_context.run_modes import DAILY_RETRY_CYCLE_MODE
@@ -55,6 +56,8 @@ class AgentContextProgressService:
             resolved_run=resolved_run,
             runtime_state=state,
         )
+        if scoped_symbols is None and prerequisites['ready']:
+            scoped_symbols = load_agent_feedback_eligible_symbols(market_date=normalized_market_date)
         persisted_progress = self._build_persisted_progress(
             market_date=normalized_market_date,
             symbols=scoped_symbols,

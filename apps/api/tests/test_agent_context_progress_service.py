@@ -906,7 +906,7 @@ class AgentContextProgressServiceTests(unittest.TestCase):
             {'requested_count', 'completed_count', 'error_count'},
         )
 
-    def test_feedback_progress_uses_market_date_symbol_universe_when_symbols_omitted(self):
+    def test_feedback_progress_uses_market_date_symbol_universe_when_symbols_omitted_before_prerequisites_ready(self):
         fake_session = FakeProgressSession()
 
         result = self._call_service(fake_session, symbols=None)
@@ -918,6 +918,43 @@ class AgentContextProgressServiceTests(unittest.TestCase):
         self.assertIn('agent_context_feedback.symbol IN', feedback_sql)
         self.assertEqual(result['summary']['total_symbols'], 2)
         self.assertEqual(result['result']['roles']['technical-summarizer']['requested_count'], 2)
+        self.assertEqual(result['result']['roles']['technical-summarizer']['completed_count'], 1)
+
+    def test_feedback_progress_uses_eligible_prefilter_symbols_when_symbols_omitted_and_prerequisites_ready(self):
+        fake_session = FakeProgressSession()
+
+        @contextmanager
+        def fake_session_scope():
+            yield fake_session
+
+        with patch('app.agent_context.progress_service.session_scope', fake_session_scope):
+            with patch('app.agent_context.progress_service.runtime_feedback_state_store.get_run', return_value=None):
+                with patch(
+                    'app.agent_context.progress_service.agent_context_feedback_run_state_service.find_latest_run',
+                    return_value=None,
+                ):
+                    with patch(
+                        'app.agent_context.progress_service.agent_context_feedback_run_state_service.get_run',
+                        return_value=None,
+                    ):
+                        with patch(
+                            'app.agent_context.progress_service.agent_feedback_prerequisite_service.inspect_feedback_prerequisites',
+                            return_value={'ready': True},
+                        ):
+                            with patch(
+                                'app.agent_context.progress_service.load_agent_feedback_eligible_symbols',
+                                return_value=['005930'],
+                            ):
+                                result = AgentContextProgressService().get_feedback_progress(
+                                    market_date='2026-04-14',
+                                    symbols=None,
+                                    expected_agents=['technical-summarizer'],
+                                )
+
+        self.assertNotIn('daily_price_bars', fake_session._compile(fake_session.statements[0]))
+        self.assertIn("IN ('005930')", fake_session._compile(fake_session.statements[0]))
+        self.assertEqual(result['summary']['total_symbols'], 1)
+        self.assertEqual(result['result']['roles']['technical-summarizer']['requested_count'], 1)
         self.assertEqual(result['result']['roles']['technical-summarizer']['completed_count'], 1)
 
     def test_feedback_progress_without_symbols_uses_latest_durable_retry_cycle_run(self):

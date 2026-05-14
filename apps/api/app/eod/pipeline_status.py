@@ -340,26 +340,41 @@ class EODPipelineStatusService:
                 latest_captured_at = candidate
         all_missing = bool(category_rows) and all(int(item.get('present_rows') or 0) <= 0 for item in category_rows.values())
         present_count = sum(1 for item in category_rows.values() if int(item.get('present_rows') or 0) > 0)
-        failed_count = sum(1 for item in category_rows.values() if str(item.get('coverage_status') or 'missing') == 'missing')
+        missing_categories = [
+            category
+            for category, item in category_rows.items()
+            if str(item.get('coverage_status') or 'missing') == 'missing'
+            or int(item.get('present_rows') or 0) <= 0
+        ]
+        coverage_warning_categories = [
+            category
+            for category, item in category_rows.items()
+            if category not in missing_categories and str(item.get('coverage_status') or '') != 'complete'
+        ]
+        failed_count = len(missing_categories)
+        source_status = None
         if not category_rows or (all_missing and latest_captured_at is None):
             counts = build_stage_counts(total=total, succeeded=0, failed=0, processed=0)
             status = 'pending'
         else:
+            soft_complete = present_count >= total and failed_count == 0
             counts = build_stage_counts(
                 total=total,
-                succeeded=present_count,
+                succeeded=total if soft_complete else present_count,
                 failed=failed_count,
-                processed=present_count + failed_count,
+                processed=total if soft_complete else present_count + failed_count,
             )
-            if all(str(item.get('coverage_status') or '') == 'complete' for item in category_rows.values()):
+            if soft_complete:
                 status = 'completed'
+                source_status = 'completed_with_coverage_warnings' if coverage_warning_categories else 'completed'
             else:
                 status = 'partial'
+                source_status = 'partial'
         return {
             'task': 'pykrx_enrichment',
             'label': STAGE_LABELS['pykrx_enrichment'],
             'status': status,
-            'source_status': status if category_rows else None,
+            'source_status': source_status if category_rows else None,
             'market_date': market_date,
             'started_at': None,
             'updated_at': latest_captured_at,
@@ -378,6 +393,8 @@ class EODPipelineStatusService:
                 'requested_symbol_count': coverage.get('requested_symbol_count'),
                 'requested_market_count': coverage.get('requested_market_count'),
                 'categories': category_rows,
+                'missing_categories': missing_categories,
+                'coverage_warning_categories': coverage_warning_categories,
             },
         }
 
