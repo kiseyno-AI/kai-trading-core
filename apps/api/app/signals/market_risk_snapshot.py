@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from datetime import date
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 from app.brokers.kis.provider import kis_client
 from app.market_data_store import (
@@ -200,6 +200,7 @@ class DailyMarketRiskSnapshotService:
         market_code: str = DEFAULT_MARKET_CODE,
         run_id: int | None = None,
         fetch_concurrency: int | None = None,
+        progress_callback: Callable[..., Any] | None = None,
     ) -> dict[str, Any]:
         normalized_market_date = normalize_market_date(market_date)
         normalized_symbols = normalize_symbols(symbols)
@@ -234,7 +235,35 @@ class DailyMarketRiskSnapshotService:
 
         semaphore = asyncio.Semaphore(max(int(fetch_concurrency or self.fetch_concurrency), 1))
         throttle_lock = asyncio.Lock()
+        progress_lock = asyncio.Lock()
         last_request_at = 0.0
+        processed_count = 0
+        succeeded_count = 0
+        failed_count = 0
+        total_count = len(symbol_rows)
+
+        async def _emit_progress(**payload: Any) -> None:
+            if progress_callback is None:
+                return
+            try:
+                progress_callback(**payload)
+            except Exception:
+                return
+
+        await _emit_progress(
+            status='running',
+            current_step='fetching_kis_market_risk_snapshots',
+            current_activity=(
+                f'Fetching KIS market-risk snapshot for {symbol_rows[0].symbol}'
+                if symbol_rows
+                else 'Fetching KIS market-risk snapshots'
+            ),
+            processed=0,
+            total=total_count,
+            succeeded=0,
+            failed=0,
+            current_symbol=symbol_rows[0].symbol if symbol_rows else None,
+        )
 
         async def _wait_for_request_slot() -> None:
             nonlocal last_request_at
@@ -251,6 +280,7 @@ class DailyMarketRiskSnapshotService:
             return '초당 거래건수' in message or 'rate limit' in message.lower()
 
         async def _fetch_symbol(item: MarketRiskSymbolInput) -> dict[str, Any]:
+            nonlocal processed_count, succeeded_count, failed_count
             async with semaphore:
                 attempts = len(RATE_LIMIT_RETRY_DELAYS_SECONDS) + 1
                 last_error: Exception | None = None
@@ -261,7 +291,7 @@ class DailyMarketRiskSnapshotService:
                             item.symbol,
                             market_code=normalized_market_code,
                         )
-                        return {
+                        payload = {
                             'symbol': item.symbol,
                             'item': build_market_risk_snapshot(
                                 symbol=item.symbol,
@@ -274,15 +304,43 @@ class DailyMarketRiskSnapshotService:
                                 eod_run_id=run_id,
                             ),
                         }
+                        async with progress_lock:
+                            processed_count += 1
+                            succeeded_count += 1
+                            await _emit_progress(
+                                status='running',
+                                current_step='fetching_kis_market_risk_snapshots',
+                                current_activity=f'Fetched KIS market-risk snapshot for {item.symbol}',
+                                processed=processed_count,
+                                total=total_count,
+                                succeeded=succeeded_count,
+                                failed=failed_count,
+                                current_symbol=item.symbol,
+                            )
+                        return payload
                     except Exception as exc:
                         last_error = exc
                         if not _is_rate_limit_error(exc) or attempt_index >= len(RATE_LIMIT_RETRY_DELAYS_SECONDS):
                             break
                         await asyncio.sleep(RATE_LIMIT_RETRY_DELAYS_SECONDS[attempt_index])
-                return {
+                payload = {
                     'symbol': item.symbol,
                     'error': str(last_error) if last_error is not None else 'unknown KIS market-risk fetch failure',
                 }
+                async with progress_lock:
+                    processed_count += 1
+                    failed_count += 1
+                    await _emit_progress(
+                        status='running',
+                        current_step='fetching_kis_market_risk_snapshots',
+                        current_activity=f'KIS market-risk snapshot failed for {item.symbol}',
+                        processed=processed_count,
+                        total=total_count,
+                        succeeded=succeeded_count,
+                        failed=failed_count,
+                        current_symbol=item.symbol,
+                    )
+                return payload
 
         fetch_results = await asyncio.gather(*[_fetch_symbol(item) for item in symbol_rows])
 

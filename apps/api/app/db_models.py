@@ -255,6 +255,56 @@ class EODCollectionRun(Base):
     run_metadata: Mapped[dict | None] = mapped_column(JSON)
 
 
+class DailyPipelineRun(Base, TimestampMixin):
+    __tablename__ = 'daily_pipeline_runs'
+    __table_args__ = (
+        Index('ix_daily_pipeline_runs_market_date_status_started', 'market_date', 'status', 'started_at'),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    market_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    trigger: Mapped[str] = mapped_column(String(64), nullable=False, default='manual')
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default='running', index=True)
+    current_stage: Mapped[str | None] = mapped_column(String(64), index=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    error_message: Mapped[str | None] = mapped_column(Text)
+    run_metadata: Mapped[dict | None] = mapped_column(MutableDict.as_mutable(JSON))
+
+
+class DailyPipelineStageRun(Base, TimestampMixin):
+    __tablename__ = 'daily_pipeline_stage_runs'
+    __table_args__ = (
+        UniqueConstraint('pipeline_run_id', 'stage_id', name='uq_daily_pipeline_stage_runs_run_stage'),
+        Index('ix_daily_pipeline_stage_runs_stage_status', 'stage_id', 'status'),
+        Index('ix_daily_pipeline_stage_runs_market_stage_status', 'market_date', 'stage_id', 'status'),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    pipeline_run_id: Mapped[int] = mapped_column(
+        ForeignKey('daily_pipeline_runs.id', ondelete='CASCADE'),
+        nullable=False,
+        index=True,
+    )
+    market_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    stage_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default='running', index=True)
+    processed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    total: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    succeeded: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    failed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    remaining: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    current_step: Mapped[str | None] = mapped_column(String(128))
+    current_activity: Mapped[str | None] = mapped_column(Text)
+    current_symbol: Mapped[str | None] = mapped_column(String(32))
+    current_period: Mapped[str | None] = mapped_column(String(32))
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    error_message: Mapped[str | None] = mapped_column(Text)
+    source_run_ids: Mapped[dict | None] = mapped_column(MutableDict.as_mutable(JSON))
+    details: Mapped[dict | None] = mapped_column(MutableDict.as_mutable(JSON))
+
+
 class OrderRequest(Base, TimestampMixin):
     __tablename__ = 'order_requests'
     __table_args__ = (

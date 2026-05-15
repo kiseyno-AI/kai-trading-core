@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from datetime import date
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 from app.agent_context.retry_service import FeedbackRetryCycleConfig, agent_feedback_retry_service
 from app.agent_context.prerequisite_service import agent_feedback_prerequisite_service
@@ -15,6 +15,7 @@ from app.agent_context.signal_decider_loop_service import (
 from app.core.settings import settings
 from app.dart.fundamentals_capture_service import dart_fundamentals_capture_service
 from app.eod.action_summaries import daily_action_summary_service
+from app.eod.daily_pipeline_state import daily_pipeline_run_state_service
 from app.eod.master import refresh_master_if_due
 from app.eod.pykrx_backfill import DEFAULT_MARKETS, PYKRX_BACKFILL_SERVICE
 from app.eod.pykrx_enrichment import pykrx_enrichment_service
@@ -432,11 +433,13 @@ class DailyPipelineStageService:
         pykrx_enrichment_service_ref=pykrx_enrichment_service,
         feedback_retry_service=agent_feedback_retry_service,
         decision_loop_service=signal_decider_loop_service,
+        run_state_service=None,
     ) -> None:
         self.pykrx_service = pykrx_service
         self.pykrx_enrichment_service = pykrx_enrichment_service_ref
         self.feedback_retry_service = feedback_retry_service
         self.decision_loop_service = decision_loop_service
+        self.run_state_service = run_state_service or daily_pipeline_run_state_service
 
     def describe(self) -> dict[str, Any]:
         return {
@@ -463,8 +466,13 @@ class DailyPipelineStageService:
         feedback_max_cycles: int = 3,
         feedback_outer_batch_size: int = 20,
         reuse_existing_feedback: bool = True,
+        resume_from_stage: str | None = None,
+        trigger: str = 'stage_orchestrator',
     ) -> dict[str, Any]:
-        requested_stages = list(stages or DEFAULT_DAILY_STAGE_ORDER)
+        requested_stages = self._resolve_requested_stages_for_resume(
+            requested_stages=list(stages or DEFAULT_DAILY_STAGE_ORDER),
+            resume_from_stage=resume_from_stage,
+        )
         resolved_stages = self._resolve_stage_ids(requested_stages)
         resolved_market_date = self._normalize_market_date(market_date)
         resolved_symbols = self._normalize_symbols(symbols)
@@ -473,33 +481,69 @@ class DailyPipelineStageService:
 
         stage_outcomes: dict[str, dict[str, Any]] = {}
         handled: set[str] = set()
+        pipeline_run = self.run_state_service.start_run(
+            market_date=resolved_market_date,
+            trigger=trigger,
+            requested_stages=requested_stages,
+            resolved_stages=resolved_stages,
+            run_metadata={
+                'entrypoint': 'daily_pipeline_stage_service.run',
+                'resume_from_stage': resume_from_stage,
+                'symbols': resolved_symbols,
+                'markets': resolved_markets,
+                'force': force,
+                'fs_div': resolved_fs_div,
+                'symbol_limit': symbol_limit,
+                'symbol_offset': symbol_offset,
+                'capture_limit': capture_limit,
+            },
+        )
+        pipeline_run_id = int(pipeline_run['id'])
 
         pykrx_requested = [stage_id for stage_id in resolved_stages if stage_id in PYKRX_PIPELINE_STAGE_ORDER]
         if 'price_collection' in pykrx_requested:
-            pykrx_result = self.pykrx_service.run_daily_pipeline_stages(
-                market_date=resolved_market_date,
-                stages=pykrx_requested,
-                markets=resolved_markets,
-                trigger='stage_orchestrator',
-                refresh_universe=(
-                    settings.eod_auto_pykrx_refresh_universe if refresh_universe is None else refresh_universe
-                ),
-                force=force,
-                symbols=resolved_symbols,
-            )
+            try:
+                pykrx_result = self.pykrx_service.run_daily_pipeline_stages(
+                    market_date=resolved_market_date,
+                    stages=pykrx_requested,
+                    markets=resolved_markets,
+                    trigger=trigger,
+                    refresh_universe=(
+                        settings.eod_auto_pykrx_refresh_universe if refresh_universe is None else refresh_universe
+                    ),
+                    force=force,
+                    symbols=resolved_symbols,
+                )
+            except Exception as exc:
+                self.run_state_service.finish_run(
+                    pipeline_run_id=pipeline_run_id,
+                    status='failed',
+                    error_message=str(exc),
+                )
+                raise
             for stage_id in pykrx_requested:
-                stage_outcomes[stage_id] = self._build_stage_outcome(
-                    stage_id,
-                    self._extract_pykrx_stage_result(stage_id, pykrx_result),
+                stage_result = self._extract_pykrx_stage_result(stage_id, pykrx_result)
+                stage_outcomes[stage_id] = self._build_stage_outcome(stage_id, stage_result)
+                self._finish_tracked_stage(
+                    pipeline_run_id=pipeline_run_id,
+                    stage_id=stage_id,
+                    market_date=resolved_market_date,
+                    outcome=stage_outcomes[stage_id],
+                    result=stage_result,
                 )
                 handled.add(stage_id)
 
         for stage_id in resolved_stages:
             if stage_id in handled:
                 continue
-            stage_outcomes[stage_id] = self._build_stage_outcome(
-                stage_id,
-                self._execute_stage(
+            self._start_tracked_stage(
+                pipeline_run_id=pipeline_run_id,
+                stage_id=stage_id,
+                market_date=resolved_market_date,
+                symbols=resolved_symbols,
+            )
+            try:
+                stage_result = self._execute_stage(
                     stage_id,
                     market_date=resolved_market_date,
                     symbols=resolved_symbols,
@@ -513,15 +557,267 @@ class DailyPipelineStageService:
                     feedback_max_cycles=feedback_max_cycles,
                     feedback_outer_batch_size=feedback_outer_batch_size,
                     reuse_existing_feedback=reuse_existing_feedback,
-                ),
-            )
+                    progress_callback=self._build_progress_callback(
+                        pipeline_run_id=pipeline_run_id,
+                        stage_id=stage_id,
+                        market_date=resolved_market_date,
+                    ),
+                )
+                stage_outcomes[stage_id] = self._build_stage_outcome(stage_id, stage_result)
+                self._finish_tracked_stage(
+                    pipeline_run_id=pipeline_run_id,
+                    stage_id=stage_id,
+                    market_date=resolved_market_date,
+                    outcome=stage_outcomes[stage_id],
+                    result=stage_result,
+                )
+            except Exception as exc:
+                self.run_state_service.finish_stage(
+                    pipeline_run_id=pipeline_run_id,
+                    stage_id=stage_id,
+                    market_date=resolved_market_date,
+                    status='failed',
+                    current_step=f'{stage_id}_failed',
+                    current_activity=f'{STAGE_DEFINITIONS[stage_id].label} failed',
+                    error_message=str(exc),
+                )
+                self.run_state_service.finish_run(
+                    pipeline_run_id=pipeline_run_id,
+                    status='failed',
+                    error_message=str(exc),
+                )
+                raise
+
+        overall_status = self._resolve_overall_status(stage_outcomes.values())
+        final_run = self.run_state_service.finish_run(
+            pipeline_run_id=pipeline_run_id,
+            status=overall_status,
+            run_metadata={
+                'stage_statuses': {
+                    stage_id: outcome.get('status')
+                    for stage_id, outcome in stage_outcomes.items()
+                },
+            },
+        )
 
         return {
+            'pipeline_run_id': pipeline_run_id,
+            'pipeline_run': final_run,
             'market_date': resolved_market_date,
             'requested_stages': requested_stages,
             'resolved_stages': resolved_stages,
-            'status': self._resolve_overall_status(stage_outcomes.values()),
+            'status': overall_status,
             'stages': stage_outcomes,
+        }
+
+    def _start_tracked_stage(
+        self,
+        *,
+        pipeline_run_id: int,
+        stage_id: str,
+        market_date: str,
+        symbols: list[str] | None,
+    ) -> None:
+        definition = STAGE_DEFINITIONS[stage_id]
+        self.run_state_service.start_stage(
+            pipeline_run_id=pipeline_run_id,
+            stage_id=stage_id,
+            market_date=market_date,
+            current_step=f'{stage_id}_started',
+            current_activity=f'Running {definition.label}',
+            processed=0,
+            total=len(symbols or []),
+            succeeded=0,
+            failed=0,
+            details={
+                'group': definition.group,
+                'depends_on': list(definition.depends_on),
+                'output_tables': list(definition.output_tables),
+                'inspect_routes': list(definition.inspect_routes),
+            },
+        )
+
+    def _build_progress_callback(
+        self,
+        *,
+        pipeline_run_id: int,
+        stage_id: str,
+        market_date: str,
+    ) -> Callable[..., None]:
+        def _checkpoint(**payload: Any) -> None:
+            self.run_state_service.update_stage(
+                pipeline_run_id=pipeline_run_id,
+                stage_id=stage_id,
+                market_date=market_date,
+                status=str(payload.get('status') or 'running'),
+                current_step=payload.get('current_step'),
+                current_activity=payload.get('current_activity'),
+                processed=payload.get('processed'),
+                total=payload.get('total'),
+                succeeded=payload.get('succeeded'),
+                failed=payload.get('failed'),
+                remaining=payload.get('remaining'),
+                current_symbol=payload.get('current_symbol'),
+                current_period=payload.get('current_period'),
+                error_message=payload.get('error_message'),
+                source_run_ids=payload.get('source_run_ids'),
+                details=payload.get('details'),
+            )
+
+        return _checkpoint
+
+    def _finish_tracked_stage(
+        self,
+        *,
+        pipeline_run_id: int,
+        stage_id: str,
+        market_date: str,
+        outcome: dict[str, Any],
+        result: dict[str, Any],
+    ) -> None:
+        counts = self._extract_stage_counts(stage_id=stage_id, result=result)
+        status = str(outcome.get('status') or 'completed')
+        self.run_state_service.finish_stage(
+            pipeline_run_id=pipeline_run_id,
+            stage_id=stage_id,
+            market_date=market_date,
+            status=status,
+            processed=counts['processed'],
+            total=counts['total'],
+            succeeded=counts['succeeded'],
+            failed=counts['failed'],
+            current_step=f'{stage_id}_{status}',
+            current_activity=f'{self._status_activity_prefix(status)} {STAGE_DEFINITIONS[stage_id].label}',
+            error_message=str(result.get('error') or result.get('error_message') or '') or None,
+            source_run_ids=self._extract_stage_source_run_ids(result),
+            details=self._build_stage_run_details(stage_id=stage_id, result=result),
+        )
+
+    @staticmethod
+    def _status_activity_prefix(status: str) -> str:
+        if status == 'completed':
+            return 'Completed'
+        if status == 'partial':
+            return 'Completed with errors'
+        if status == 'failed':
+            return 'Failed'
+        if status == 'waiting':
+            return 'Waiting on'
+        if status == 'blocked':
+            return 'Blocked'
+        if status == 'skipped':
+            return 'Skipped'
+        return status.replace('_', ' ').capitalize()
+
+    @staticmethod
+    def _extract_stage_counts(*, stage_id: str, result: dict[str, Any]) -> dict[str, int]:
+        def _int(value: Any) -> int:
+            try:
+                return int(value or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        if stage_id == 'price_collection':
+            total = _int(result.get('symbols_total'))
+            succeeded = _int(result.get('symbols_succeeded'))
+            failed = _int(result.get('symbols_failed'))
+            processed = succeeded + failed
+            return {
+                'processed': processed,
+                'total': total,
+                'succeeded': succeeded,
+                'failed': failed,
+            }
+        if stage_id == 'market_risk_filter':
+            succeeded = _int(result.get('results_persisted'))
+            failed = _int(result.get('results_failed'))
+            total = len(result.get('matched_symbols') or []) or succeeded + failed
+            return {
+                'processed': succeeded + failed,
+                'total': total,
+                'succeeded': succeeded,
+                'failed': failed,
+            }
+        if stage_id == 'market_risk_snapshots':
+            succeeded = _int(result.get('snapshots_persisted'))
+            failed = _int(result.get('snapshots_failed'))
+            total = len(result.get('matched_symbols') or []) or succeeded + failed
+            return {
+                'processed': succeeded + failed,
+                'total': total,
+                'succeeded': succeeded,
+                'failed': failed,
+            }
+
+        count_pairs = (
+            ('snapshots_persisted', 'snapshots_failed'),
+            ('action_summaries_persisted', 'action_summaries_failed'),
+            ('features_persisted', 'features_failed'),
+            ('results_persisted', 'results_failed'),
+            ('symbols_refreshed', 'symbols_failed'),
+            ('events_captured', 'events_failed'),
+            ('persisted_count', 'failed_count'),
+            ('completed_count', 'failed_count'),
+            ('evaluations_upserted', 'failed_count'),
+            ('outcomes_upserted', 'failed_count'),
+        )
+        for succeeded_key, failed_key in count_pairs:
+            if succeeded_key not in result and failed_key not in result:
+                continue
+            succeeded = _int(result.get(succeeded_key))
+            failed = _int(result.get(failed_key))
+            total = _int(result.get('total') or result.get('symbols_total') or result.get('requested_count'))
+            if total <= 0:
+                total = succeeded + failed
+            return {
+                'processed': succeeded + failed,
+                'total': total,
+                'succeeded': succeeded,
+                'failed': failed,
+            }
+
+        summary = result.get('summary') if isinstance(result.get('summary'), dict) else {}
+        if summary:
+            succeeded = _int(summary.get('completed_count') or summary.get('evaluated_count') or summary.get('passed_count'))
+            failed = _int(summary.get('failed_count'))
+            total = _int(summary.get('matched_symbol_count') or summary.get('total') or succeeded + failed)
+            return {
+                'processed': min(succeeded + failed, total) if total else succeeded + failed,
+                'total': total,
+                'succeeded': succeeded,
+                'failed': failed,
+            }
+
+        return {'processed': 0, 'total': 0, 'succeeded': 0, 'failed': 0}
+
+    @staticmethod
+    def _extract_stage_source_run_ids(result: dict[str, Any]) -> dict[str, Any]:
+        source_run_ids = result.get('source_run_ids') if isinstance(result.get('source_run_ids'), dict) else {}
+        extracted = dict(source_run_ids)
+        if result.get('run_id') is not None:
+            extracted.setdefault('run_id', result.get('run_id'))
+        if result.get('capture_run_id') is not None:
+            extracted.setdefault('capture_run_id', result.get('capture_run_id'))
+        latest_run = result.get('latest_run') if isinstance(result.get('latest_run'), dict) else None
+        if latest_run and latest_run.get('id') is not None:
+            extracted.setdefault('latest_run_id', latest_run.get('id'))
+        return extracted
+
+    @staticmethod
+    def _build_stage_run_details(*, stage_id: str, result: dict[str, Any]) -> dict[str, Any]:
+        definition = STAGE_DEFINITIONS[stage_id]
+        omitted_keys = {'items', 'rows', 'payloads'}
+        result_summary = {
+            key: value
+            for key, value in result.items()
+            if key not in omitted_keys and not key.endswith('_payload')
+        }
+        return {
+            'group': definition.group,
+            'depends_on': list(definition.depends_on),
+            'output_tables': list(definition.output_tables),
+            'inspect_routes': list(definition.inspect_routes),
+            'result_summary': result_summary,
         }
 
     def _execute_stage(
@@ -540,6 +836,7 @@ class DailyPipelineStageService:
         feedback_max_cycles: int,
         feedback_outer_batch_size: int,
         reuse_existing_feedback: bool,
+        progress_callback: Callable[..., Any] | None = None,
     ) -> dict[str, Any]:
         if stage_id == 'master_refresh':
             symbols_refreshed = refresh_master_if_due(force=force)
@@ -589,6 +886,7 @@ class DailyPipelineStageService:
                     symbols=symbols,
                     source=MARKET_RISK_SNAPSHOT_SOURCE,
                     market_code='J',
+                    progress_callback=progress_callback,
                 )
             )
         if stage_id == 'market_risk_filter':
@@ -598,6 +896,7 @@ class DailyPipelineStageService:
                     symbols=symbols,
                     source=MARKET_RISK_FILTER_SOURCE,
                     market_code='J',
+                    progress_callback=progress_callback,
                 )
             )
         if stage_id == 'fundamentals_daily_refresh':
@@ -613,6 +912,7 @@ class DailyPipelineStageService:
                     trigger='stage_orchestrator',
                     run_piotroski_followup=False,
                     run_feedback_followup=False,
+                    progress_callback=progress_callback,
                 )
             )
         if stage_id == 'piotroski_filter':
@@ -703,6 +1003,7 @@ class DailyPipelineStageService:
                     max_cycles=feedback_max_cycles,
                     outer_batch_size=feedback_outer_batch_size,
                     reuse_existing=reuse_existing_feedback,
+                    progress_callback=progress_callback,
                 ),
                 force=force,
             )
@@ -794,6 +1095,29 @@ class DailyPipelineStageService:
         if not normalized:
             raise ValueError('At least one daily stage is required.')
         return normalized
+
+    def _resolve_requested_stages_for_resume(
+        self,
+        *,
+        requested_stages: Sequence[str],
+        resume_from_stage: str | None,
+    ) -> list[str]:
+        normalized_requested = [str(stage_id or '').strip() for stage_id in requested_stages if str(stage_id or '').strip()]
+        if not resume_from_stage:
+            return normalized_requested
+
+        resume_stage = str(resume_from_stage or '').strip()
+        if resume_stage not in STAGE_DEFINITIONS:
+            raise ValueError(f'Unknown resume_from_stage: {resume_stage}')
+        resume_index = DAILY_STAGE_ORDER.index(resume_stage)
+        if not normalized_requested:
+            return list(DEFAULT_DAILY_STAGE_ORDER[DEFAULT_DAILY_STAGE_ORDER.index(resume_stage):])
+        requested_set = set(normalized_requested)
+        return [
+            stage_id
+            for stage_id in DAILY_STAGE_ORDER[resume_index:]
+            if stage_id in requested_set
+        ] or [resume_stage]
 
     @staticmethod
     def _normalize_symbols(symbols: Sequence[str] | None) -> list[str] | None:

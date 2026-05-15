@@ -1281,6 +1281,7 @@ class DartFundamentalsCaptureService:
         retry_cycles: int | None = None,
         run_piotroski_followup: bool = True,
         run_feedback_followup: bool | None = None,
+        progress_callback: Callable[..., Any] | None = None,
     ) -> dict[str, Any]:
         if symbol_offset < 0:
             raise ValueError('symbol_offset must be greater than or equal to 0')
@@ -1438,6 +1439,65 @@ class DartFundamentalsCaptureService:
 
         refresh_progress_state: dict[str, Any] = {}
 
+        def emit_pipeline_progress(*, stage: str, metadata: dict[str, Any]) -> None:
+            if progress_callback is None:
+                return
+            event_progress_stage = stage in {'capturing_fundamentals', 'capture_candidates_loaded'}
+            if event_progress_stage and events_detected:
+                total = events_detected
+                succeeded = events_captured
+                failed = events_failed
+                processed = min(succeeded + failed, total)
+            else:
+                total = len(selected_stock_codes)
+                terminal_states = {
+                    'fresh',
+                    'stale',
+                    'missing',
+                    'lookup_failed',
+                    'terminal_no_newer_events',
+                    'missing_no_newer_events',
+                    'terminal_no_data',
+                    'terminal_mapping_failed',
+                    'terminal_resolved',
+                }
+                processed = sum(
+                    1
+                    for symbol_result in symbol_results.values()
+                    if symbol_result.get('state') in terminal_states
+                )
+                succeeded = symbols_fresh + symbols_refreshed
+                failed = symbols_failed
+            current_sync_group = metadata.get('current_sync_group') if isinstance(metadata.get('current_sync_group'), dict) else {}
+            stock_codes_sample = current_sync_group.get('stock_codes_sample') if isinstance(current_sync_group, dict) else None
+            progress_callback(
+                status='running',
+                current_step=stage,
+                current_activity=f'DART fundamentals daily refresh: {stage.replace("_", " ")}',
+                processed=processed,
+                total=total,
+                succeeded=succeeded,
+                failed=failed,
+                remaining=max(total - processed, 0) if total else 0,
+                current_symbol=(stock_codes_sample or [None])[0] if isinstance(stock_codes_sample, list) else None,
+                current_period=resolved_fs_div,
+                source_run_ids={
+                    'dart_refresh_run_id': run_id,
+                    'dart_capture_run_id': metadata.get('capture_run_id'),
+                    'dart_sync_run_ids': [
+                        item.get('run_id')
+                        for item in metadata.get('sync_runs', [])
+                        if isinstance(item, dict) and item.get('run_id') is not None
+                    ],
+                },
+                details={
+                    'source': 'dart_fundamentals_refresh_run',
+                    'fs_div': resolved_fs_div,
+                    'trigger': trigger,
+                    'progress_metadata': metadata,
+                },
+            )
+
         def update_refresh_progress(
             *,
             stage: str,
@@ -1471,6 +1531,7 @@ class DartFundamentalsCaptureService:
                 events_failed=events_failed,
                 run_metadata=dict(refresh_progress_state),
             )
+            emit_pipeline_progress(stage=stage, metadata=dict(refresh_progress_state))
 
         try:
             for stock_code in selected_stock_codes:

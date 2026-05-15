@@ -7,6 +7,7 @@ from app.core.settings import settings
 from app.eod.action_summaries import daily_action_summary_service
 from app.eod.auto_pykrx import auto_pykrx_eod_scheduler
 from app.eod.daily_pipeline_stages import daily_pipeline_stage_service
+from app.eod.daily_pipeline_tracking import run_tracked_market_risk_filter
 from app.eod.freshness import eod_freshness_service
 from app.eod.master import refresh_master_if_due
 from app.eod.pipeline_status import eod_pipeline_status_service
@@ -62,6 +63,7 @@ class EODPipelineRunRequest(BaseModel):
     feedback_max_cycles: int = Field(default=3, ge=1)
     feedback_outer_batch_size: int = Field(default=20, ge=1)
     reuse_existing_feedback: bool = True
+    resume_from_stage: str | None = None
 
 
 @router.get('/status')
@@ -140,6 +142,7 @@ async def run_eod_pipeline(payload: EODPipelineRunRequest) -> dict:
         )
         return await asyncio.to_thread(
             daily_pipeline_stage_service.run,
+            trigger='manual_api',
             **request_kwargs,
         )
     except ValueError as exc:
@@ -419,11 +422,14 @@ async def compute_daily_market_risk_filters(
 ) -> dict:
     try:
         parsed_symbols = [item.strip() for item in symbols.split(',') if item.strip()] if symbols else None
-        return await daily_market_risk_filter_service.rebuild_for_market_date(
+        return await run_tracked_market_risk_filter(
             market_date=market_date,
             symbols=parsed_symbols,
             source=source,
             market_code=market_code,
+            trigger='manual_api_stage',
+            entrypoint='POST /eod/market-risk-filters/compute',
+            filter_service=daily_market_risk_filter_service,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

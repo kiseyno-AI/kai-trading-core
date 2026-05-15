@@ -5,6 +5,7 @@ from datetime import date, datetime, timezone
 from typing import Any, Callable
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.core.settings import settings
 from app.db import session_scope
@@ -21,7 +22,8 @@ from app.db_models import (
     DailyValueFactorResult,
 )
 from app.dart.fundamentals_capture_service import dart_fundamentals_capture_service
-from app.eod.daily_pipeline_stages import FACTOR_STAGE_ORDER, STAGE_DEFINITIONS
+from app.eod.daily_pipeline_stages import DAILY_STAGE_ORDER, FACTOR_STAGE_ORDER, STAGE_DEFINITIONS
+from app.eod.daily_pipeline_state import daily_pipeline_run_state_service
 from app.eod.pykrx_backfill import DEFAULT_MARKETS, PYKRX_BACKFILL_SERVICE
 from app.eod.pykrx_enrichment import DEFAULT_PYKRX_ENRICHMENT_CATEGORIES, pykrx_enrichment_service
 from app.eod.pipeline_status_support import (
@@ -63,11 +65,7 @@ FILTER_STAGE_ORDER = (
     'piotroski_filter',
 )
 PIPELINE_STAGE_ORDER = (
-    ('price_collection', 'pykrx_enrichment')
-    + tuple(stage_id for stage_id in PYKRX_STAGE_ORDER if stage_id != 'price_collection')
-    + ('fundamentals_daily_refresh',)
-    + FILTER_STAGE_ORDER
-    + DEFAULT_FACTOR_STAGE_ORDER
+    tuple(stage_id for stage_id in DAILY_STAGE_ORDER if stage_id != 'market_risk_snapshots')
 )
 FACTOR_STAGE_MODELS = {
     'momentum_factors': DailyMomentumFactorResult,
@@ -121,6 +119,13 @@ def _load_latest_fundamentals_refresh_run(*, market_date: str, fs_div: str) -> d
         fs_div=fs_div,
     )
     return payload.get('latest_run')
+
+
+def _load_latest_daily_pipeline_run(*, market_date: str) -> dict[str, Any] | None:
+    try:
+        return daily_pipeline_run_state_service.get_latest_run(market_date=market_date)
+    except SQLAlchemyError:
+        return None
 
 
 def _noop_factor_stage_counts_loader(*, market_date: str) -> dict[str, dict[str, Any]]:
@@ -203,6 +208,7 @@ class EODPipelineStatusService:
     technical_snapshot_count_loader: Callable = _noop_price_bar_count_loader
     action_summary_count_loader: Callable = _noop_price_bar_count_loader
     pykrx_enrichment_loader: Callable = _load_pykrx_enrichment_coverage
+    official_run_loader: Callable = _load_latest_daily_pipeline_run
 
     def read(
         self,
@@ -220,6 +226,7 @@ class EODPipelineStatusService:
         )
         resolved_fs_div = (fs_div or settings.dart_fundamentals_default_fs_div).strip().upper()
         pykrx_run = self.pykrx_run_loader(trade_date=resolved_market_date)
+        official_run = self.official_run_loader(market_date=resolved_market_date)
         live_symbols_total = int(self.live_symbol_count_loader() or 0)
         pykrx_stage_counts = self.pykrx_stage_counts_loader(pykrx_run['id']) if pykrx_run else {}
         pykrx_stages = self._build_pykrx_stages(
@@ -304,6 +311,27 @@ class EODPipelineStatusService:
                 aggregate=dict(row_count_stage_counts.get(stage_id) or {}),
                 live_symbols_total=live_symbols_total,
             )
+        for stage_id in PIPELINE_STAGE_ORDER:
+            if stage_id in stages:
+                continue
+            stages[stage_id] = self._build_generic_pending_stage(
+                stage_id=stage_id,
+                market_date=resolved_market_date,
+            )
+        stages = {
+            stage_id: stages[stage_id]
+            for stage_id in PIPELINE_STAGE_ORDER
+        }
+        if official_run is not None:
+            stages = self._overlay_official_run_stages(
+                stages=stages,
+                official_run=official_run,
+                market_date=resolved_market_date,
+            )
+        overall_status = self._resolve_overall_status(stages)
+        official_run_status = str((official_run or {}).get('status') or '').strip().lower()
+        if official_run_status in {'running', 'interrupted', 'abandoned'}:
+            overall_status = official_run_status
         return {
             'market_date': resolved_market_date,
             'generated_at': _utcnow_iso(),
@@ -320,9 +348,151 @@ class EODPipelineStatusService:
             },
             'market_session': market_session,
             'fs_div': resolved_fs_div,
-            'status': self._resolve_overall_status(stages),
+            'status': overall_status,
             'stage_order': list(PIPELINE_STAGE_ORDER),
             'stages': stages,
+            'official_run': self._build_official_run_summary(official_run),
+        }
+
+    def _build_generic_pending_stage(
+        self,
+        *,
+        stage_id: str,
+        market_date: str,
+    ) -> dict[str, Any]:
+        definition = STAGE_DEFINITIONS[stage_id]
+        counts = build_stage_counts(total=0, succeeded=0, failed=0, processed=0)
+        return {
+            'task': stage_id,
+            'label': definition.label,
+            'status': 'pending',
+            'source_status': None,
+            'market_date': market_date,
+            'started_at': None,
+            'updated_at': None,
+            'completed_at': None,
+            'processed': counts.processed,
+            'total': counts.total,
+            'succeeded': counts.succeeded,
+            'failed': counts.failed,
+            'remaining': counts.remaining,
+            'current_step': None,
+            'current_activity': _default_activity(definition.label, 'pending'),
+            'current_symbol': None,
+            'current_period': None,
+            'source_run_ids': {},
+            'details': {
+                'mode': 'pending_until_official_run_or_persisted_rows',
+                'depends_on': list(definition.depends_on),
+                'output_tables': list(definition.output_tables),
+                'inspect_routes': list(definition.inspect_routes),
+                'default_selected': definition.default_selected,
+            },
+        }
+
+    def _overlay_official_run_stages(
+        self,
+        *,
+        stages: dict[str, dict[str, Any]],
+        official_run: dict[str, Any],
+        market_date: str,
+    ) -> dict[str, dict[str, Any]]:
+        official_stages = official_run.get('stages') if isinstance(official_run.get('stages'), dict) else {}
+        if not official_stages:
+            return stages
+        overlaid = dict(stages)
+        for stage_id in PIPELINE_STAGE_ORDER:
+            official_stage = official_stages.get(stage_id)
+            if not isinstance(official_stage, dict):
+                continue
+            overlaid[stage_id] = self._build_official_stage(
+                stage_id=stage_id,
+                market_date=market_date,
+                official_run=official_run,
+                official_stage=official_stage,
+                fallback_stage=stages.get(stage_id) or {},
+            )
+        return overlaid
+
+    def _build_official_stage(
+        self,
+        *,
+        stage_id: str,
+        market_date: str,
+        official_run: dict[str, Any],
+        official_stage: dict[str, Any],
+        fallback_stage: dict[str, Any],
+    ) -> dict[str, Any]:
+        definition = STAGE_DEFINITIONS[stage_id]
+        status = str(official_stage.get('status') or 'pending').strip().lower()
+        fallback_status = str(fallback_stage.get('status') or '').strip().lower()
+        use_fallback_progress = (
+            status == 'running'
+            and fallback_status == 'running'
+            and int(official_stage.get('processed') or 0) <= 0
+            and int(fallback_stage.get('processed') or 0) > 0
+        )
+        progress_source = fallback_stage if use_fallback_progress else official_stage
+        counts = build_stage_counts(
+            total=progress_source.get('total'),
+            succeeded=progress_source.get('succeeded'),
+            failed=progress_source.get('failed'),
+            processed=progress_source.get('processed'),
+        )
+        details = dict(official_stage.get('details') or {})
+        details['mode'] = 'official_daily_pipeline_run_state'
+        details['pipeline_run_id'] = official_run.get('id')
+        details['pipeline_trigger'] = official_run.get('trigger')
+        details['run_metadata'] = official_run.get('run_metadata') or {}
+        if use_fallback_progress:
+            details['progress_source'] = 'stage_specific_fallback_run'
+            details['fallback_details'] = fallback_stage.get('details') or {}
+        current_activity = official_stage.get('current_activity')
+        if use_fallback_progress:
+            current_activity = fallback_stage.get('current_activity') or current_activity
+        if status in {'failed', 'interrupted', 'abandoned'} and official_stage.get('error_message'):
+            current_activity = official_stage.get('error_message')
+        return {
+            'task': stage_id,
+            'label': definition.label,
+            'status': status,
+            'source_status': official_stage.get('status'),
+            'market_date': official_stage.get('market_date') or market_date,
+            'started_at': official_stage.get('started_at'),
+            'updated_at': progress_source.get('updated_at') or official_stage.get('updated_at') or official_run.get('updated_at'),
+            'completed_at': official_stage.get('completed_at'),
+            'processed': counts.processed,
+            'total': counts.total,
+            'succeeded': counts.succeeded,
+            'failed': counts.failed,
+            'remaining': counts.remaining,
+            'current_step': fallback_stage.get('current_step') if use_fallback_progress else official_stage.get('current_step'),
+            'current_activity': current_activity or _default_activity(definition.label, status),
+            'current_symbol': fallback_stage.get('current_symbol') if use_fallback_progress else official_stage.get('current_symbol'),
+            'current_period': fallback_stage.get('current_period') if use_fallback_progress else official_stage.get('current_period'),
+            'source_run_ids': (
+                {**(fallback_stage.get('source_run_ids') or {}), **(official_stage.get('source_run_ids') or {})}
+                if use_fallback_progress
+                else official_stage.get('source_run_ids') or {}
+            ),
+            'details': details,
+        }
+
+    @staticmethod
+    def _build_official_run_summary(official_run: dict[str, Any] | None) -> dict[str, Any] | None:
+        if official_run is None:
+            return None
+        return {
+            'id': official_run.get('id'),
+            'market_date': official_run.get('market_date'),
+            'trigger': official_run.get('trigger'),
+            'status': official_run.get('status'),
+            'current_stage': official_run.get('current_stage'),
+            'started_at': official_run.get('started_at'),
+            'updated_at': official_run.get('updated_at'),
+            'completed_at': official_run.get('completed_at'),
+            'error_message': official_run.get('error_message'),
+            'run_metadata': official_run.get('run_metadata') or {},
         }
 
     def _build_pykrx_enrichment_stage(
@@ -919,10 +1089,20 @@ class EODPipelineStatusService:
         statuses = [str(item.get('status') or 'pending') for item in stages.values()]
         if any(status == 'running' for status in statuses):
             return 'running'
+        if any(status == 'interrupted' for status in statuses):
+            return 'interrupted'
+        if any(status == 'abandoned' for status in statuses):
+            return 'abandoned'
+        if any(status == 'blocked' for status in statuses):
+            return 'blocked'
+        if any(status == 'waiting' for status in statuses):
+            return 'waiting'
         if all(status == 'pending' for status in statuses):
             return 'pending'
         if all(status == 'completed' for status in statuses):
             return 'completed'
+        if statuses and all(status == 'skipped' for status in statuses):
+            return 'skipped'
         if any(status == 'failed' for status in statuses) and not any(status in {'completed', 'partial'} for status in statuses):
             return 'failed'
         return 'partial'

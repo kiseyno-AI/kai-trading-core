@@ -397,6 +397,23 @@ class FakeMarketRiskFilterService:
         }
 
 
+class FakeDailyPipelineRunStateService:
+    def start_run(self, **kwargs):
+        return {'id': 7001, **kwargs, 'status': 'running', 'stages': {}}
+
+    def start_stage(self, **kwargs):
+        return {'id': 1, **kwargs, 'status': 'running'}
+
+    def update_stage(self, **kwargs):
+        return {'id': 1, **kwargs}
+
+    def finish_stage(self, **kwargs):
+        return {'id': 1, **kwargs}
+
+    def finish_run(self, **kwargs):
+        return {'id': kwargs['pipeline_run_id'], **kwargs}
+
+
 class FakeMomentumFactorService:
     def __init__(self):
         self.compute_args = None
@@ -1389,16 +1406,20 @@ class EODRouteTests(unittest.TestCase):
         original_service = routes_eod.daily_market_risk_filter_service
         routes_eod.daily_market_risk_filter_service = fake_service
         try:
-            client = TestClient(self.app)
-            response = client.post(
-                '/eod/market-risk-filters/compute',
-                params={
-                    'market_date': '2026-04-14',
-                    'symbols': '005930,000660',
-                    'source': 'kis_market_risk_v1',
-                    'market_code': 'UN',
-                },
-            )
+            with patch(
+                'app.eod.daily_pipeline_tracking.daily_pipeline_run_state_service',
+                FakeDailyPipelineRunStateService(),
+            ):
+                client = TestClient(self.app)
+                response = client.post(
+                    '/eod/market-risk-filters/compute',
+                    params={
+                        'market_date': '2026-04-14',
+                        'symbols': '005930,000660',
+                        'source': 'kis_market_risk_v1',
+                        'market_code': 'UN',
+                    },
+                )
         finally:
             routes_eod.daily_market_risk_filter_service = original_service
 
@@ -1407,6 +1428,8 @@ class EODRouteTests(unittest.TestCase):
         self.assertEqual(fake_service.compute_args['symbols'], ['005930', '000660'])
         self.assertEqual(fake_service.compute_args['source'], 'kis_market_risk_v1')
         self.assertEqual(fake_service.compute_args['market_code'], 'UN')
+        self.assertIn('progress_callback', fake_service.compute_args)
+        self.assertEqual(response.json()['pipeline_run_id'], 7001)
         self.assertEqual(response.json()['items'][0]['risk_state'], 'watchlist')
 
     def test_collect_market_risk_snapshots_route_calls_service(self):

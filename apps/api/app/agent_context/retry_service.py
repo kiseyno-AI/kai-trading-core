@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 from uuid import uuid4
 
 from sqlalchemy import select
@@ -38,6 +38,7 @@ class FeedbackRetryCycleConfig:
     max_cycles: int = 3
     outer_batch_size: int = 20
     reuse_existing: bool = True
+    progress_callback: Callable[..., Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -420,6 +421,7 @@ class AgentFeedbackRetryService:
         lifecycle_stage: str,
         status: str,
         cycle_result: dict[str, Any] | None = None,
+        progress_callback: Callable[..., Any] | None = None,
     ) -> dict[str, Any]:
         state = runtime_feedback_state_store.get_run(market_date, run_id=request_run_id, logical=True)
         if state is None:
@@ -433,12 +435,71 @@ class AgentFeedbackRetryService:
         )
         completed_count = int(summary_payload['progress_summary'].get('completed_feedback_count') or 0)
         failed_count = int(summary_payload['progress_summary'].get('failed_items') or 0)
-        return agent_context_feedback_run_state_service.checkpoint_run(
+        checkpoint = agent_context_feedback_run_state_service.checkpoint_run(
             run_id=request_run_id,
             status=status,
             completed_count=completed_count,
             failed_count=failed_count,
             summary_payload=summary_payload,
+        )
+        self._emit_progress_callback(
+            progress_callback=progress_callback,
+            request_run_id=request_run_id,
+            lifecycle_stage=lifecycle_stage,
+            status=status,
+            completed_count=completed_count,
+            failed_count=failed_count,
+            summary_payload=summary_payload,
+            cycle_result=cycle_result,
+        )
+        return checkpoint
+
+    @staticmethod
+    def _emit_progress_callback(
+        *,
+        progress_callback: Callable[..., Any] | None,
+        request_run_id: str,
+        lifecycle_stage: str,
+        status: str,
+        completed_count: int,
+        failed_count: int,
+        summary_payload: dict[str, Any],
+        cycle_result: dict[str, Any] | None,
+    ) -> None:
+        if progress_callback is None:
+            return
+        progress_summary = (
+            summary_payload.get('progress_summary')
+            if isinstance(summary_payload.get('progress_summary'), dict)
+            else {}
+        )
+        total = int(progress_summary.get('expected_feedback_count') or summary_payload.get('expected_feedback_count') or 0)
+        processed = min(completed_count + failed_count, total) if total else completed_count + failed_count
+        current_role = str(progress_summary.get('current_role') or summary_payload.get('current_role') or '').strip() or None
+        cycle_status = str(progress_summary.get('cycle_status') or summary_payload.get('cycle_status') or status).strip()
+        activity_role = current_role or 'agent feedback'
+        progress_callback(
+            status=status,
+            current_step=lifecycle_stage,
+            current_activity=f'Agent feedback {lifecycle_stage.replace("_", " ")}: {activity_role}',
+            processed=processed,
+            total=total,
+            succeeded=completed_count,
+            failed=failed_count,
+            remaining=max(total - processed, 0) if total else 0,
+            current_period=current_role,
+            source_run_ids={'agent_feedback_run_id': request_run_id},
+            details={
+                'source': 'agent_context_feedback_run_state',
+                'run_id': request_run_id,
+                'cycle_status': cycle_status,
+                'cycle_number': progress_summary.get('cycle_number') or summary_payload.get('cycle_number'),
+                'completed_cycles': progress_summary.get('completed_cycles') or summary_payload.get('completed_cycles'),
+                'max_cycles': progress_summary.get('max_cycles') or summary_payload.get('max_cycles'),
+                'completed_roles': list(progress_summary.get('completed_roles') or summary_payload.get('completed_roles') or []),
+                'remaining_roles': list(progress_summary.get('remaining_roles') or summary_payload.get('remaining_roles') or []),
+                'cycle_result': cycle_result,
+            },
         )
 
     @staticmethod
@@ -493,6 +554,7 @@ class AgentFeedbackRetryService:
 
     def run_retry_cycles(self, *, config: FeedbackRetryCycleConfig, force: bool = False) -> dict[str, Any]:
         roles = tuple(config.roles)
+        progress_callback = getattr(config, 'progress_callback', None)
         raw_requested_symbols = getattr(config, 'symbols', None)
         requested_symbols = (
             tuple(_normalize_requested_symbols(raw_requested_symbols))
@@ -646,6 +708,7 @@ class AgentFeedbackRetryService:
                     request_payload=request_payload,
                     lifecycle_stage='cycle_started',
                     status='running',
+                    progress_callback=progress_callback,
                     cycle_result={
                         'cycle': active_plan.cycle_number,
                         'mode': active_plan.mode,
@@ -698,6 +761,7 @@ class AgentFeedbackRetryService:
                         request_payload=request_payload,
                         lifecycle_stage='role_started',
                         status='running',
+                        progress_callback=progress_callback,
                         cycle_result={
                             'cycle': active_plan.cycle_number,
                             'mode': active_plan.mode,
@@ -784,6 +848,7 @@ class AgentFeedbackRetryService:
                         request_payload=request_payload,
                         lifecycle_stage='role_completed',
                         status='running',
+                        progress_callback=progress_callback,
                         cycle_result={
                             **role_result,
                             'cycle': active_plan.cycle_number,

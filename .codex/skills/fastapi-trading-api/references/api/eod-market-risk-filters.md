@@ -7,6 +7,8 @@ The compute path now runs in two layers:
 - collect or reuse stored KIS `inquire-price-2` snapshots first
 - evaluate focused policy rules second and store the downstream result rows in `daily_market_risk_filter_results`
 
+The compute route also creates a durable daily pipeline run for `market_risk_filter`. `/eod/pipeline/status` can show the stage as `running` and update `processed`, `total`, and `current_symbol` while KIS calls are still underway, before filter rows are persisted.
+
 The read path is intentionally filter-focused: it returns policy state plus explicit blocking or watchlist reasons, not the full normalized snapshot field set. These persisted rows are also one half of agent-feedback eligibility: symbol-level feedback now requires `passed_filter=true` here and in the same-day Piotroski rows.
 
 ## Example compute request
@@ -17,6 +19,7 @@ POST /eod/market-risk-filters/compute?market_date=2026-04-15&symbols=005930,0006
 ## Example compute response
 ```json
 {
+  "pipeline_run_id": 812,
   "market_date": "2026-04-15",
   "source": "kis_market_risk_v1",
   "snapshot_collection": {

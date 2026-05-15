@@ -22,6 +22,23 @@ from app.signals.quality_factor import QUALITY_FACTOR_SOURCE
 from app.signals.value_factor import VALUE_FACTOR_SOURCE
 
 
+class FakeDailyPipelineRunStateService:
+    def start_run(self, **kwargs):
+        return {'id': 7002, **kwargs, 'status': 'running', 'stages': {}}
+
+    def start_stage(self, **kwargs):
+        return {'id': 1, **kwargs, 'status': 'running'}
+
+    def update_stage(self, **kwargs):
+        return {'id': 1, **kwargs}
+
+    def finish_stage(self, **kwargs):
+        return {'id': 1, **kwargs}
+
+    def finish_run(self, **kwargs):
+        return {'id': kwargs['pipeline_run_id'], **kwargs}
+
+
 class InternalAPIClientTests(unittest.IsolatedAsyncioTestCase):
     async def test_client_attaches_bearer_token_for_internal_http_calls(self) -> None:
         original_token = settings.upstream_bearer_token
@@ -503,6 +520,10 @@ class InternalOpsTests(unittest.TestCase):
                 'app.internal.ops.daily_market_risk_filter_service.rebuild_for_market_date',
                 new=AsyncMock(return_value={'results_persisted': 2}),
             ) as compute_market_risk,
+            patch(
+                'app.eod.daily_pipeline_tracking.daily_pipeline_run_state_service',
+                FakeDailyPipelineRunStateService(),
+            ),
         ):
             result = ops.compute_market_risk_filters(
                 market_date='2026-04-14',
@@ -512,11 +533,13 @@ class InternalOpsTests(unittest.TestCase):
             )
 
         bootstrap_runtime.assert_called_once_with()
-        self.assertEqual(result, {'results_persisted': 2})
+        self.assertEqual(result['results_persisted'], 2)
+        self.assertEqual(result['pipeline_run_id'], 7002)
         self.assertEqual(compute_market_risk.call_args.kwargs['market_date'], '2026-04-14')
         self.assertEqual(compute_market_risk.call_args.kwargs['symbols'], ['005930', '000660'])
         self.assertEqual(compute_market_risk.call_args.kwargs['source'], MARKET_RISK_FILTER_SOURCE)
         self.assertEqual(compute_market_risk.call_args.kwargs['market_code'], 'UN')
+        self.assertIn('progress_callback', compute_market_risk.call_args.kwargs)
 
     def test_collect_market_risk_snapshots_uses_snapshot_service(self) -> None:
         with (
