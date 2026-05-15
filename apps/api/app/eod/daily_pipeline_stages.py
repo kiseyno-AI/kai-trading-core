@@ -1111,8 +1111,9 @@ class DailyPipelineStageService:
             raise ValueError(f'Unknown resume_from_stage: {resume_stage}')
         resume_index = DAILY_STAGE_ORDER.index(resume_stage)
         if not normalized_requested:
-            return list(DEFAULT_DAILY_STAGE_ORDER[DEFAULT_DAILY_STAGE_ORDER.index(resume_stage):])
+            return list(DAILY_STAGE_ORDER[resume_index:])
         requested_set = set(normalized_requested)
+        requested_set.add(resume_stage)
         return [
             stage_id
             for stage_id in DAILY_STAGE_ORDER[resume_index:]

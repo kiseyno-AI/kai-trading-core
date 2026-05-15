@@ -383,6 +383,23 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         self.assertEqual(execute_stage.call_args_list[0].args[0], 'market_risk_filter')
         self.assertEqual(self.run_state_service.runs[0]['run_metadata']['resume_from_stage'], 'market_risk_filter')
 
+    def test_run_resume_from_market_risk_snapshots_includes_requested_resume_stage(self) -> None:
+        service = DailyPipelineStageService()
+
+        with (
+            patch.object(service, '_normalize_market_date', return_value='2026-04-14'),
+            patch.object(service, '_execute_stage', side_effect=lambda stage_id, **_: {'stage_id': stage_id}) as execute_stage,
+        ):
+            result = service.run(
+                market_date='2026-04-14',
+                resume_from_stage='market_risk_snapshots',
+            )
+
+        self.assertEqual(result['resolved_stages'][0], 'market_risk_snapshots')
+        self.assertIn('market_risk_snapshots', result['requested_stages'])
+        self.assertEqual(execute_stage.call_args_list[0].args[0], 'market_risk_snapshots')
+        self.assertEqual(self.run_state_service.runs[0]['run_metadata']['resume_from_stage'], 'market_risk_snapshots')
+
     def test_run_starting_at_market_risk_filter_checkpoints_progress_before_rows_exist(self) -> None:
         service = DailyPipelineStageService()
 
