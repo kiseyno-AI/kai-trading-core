@@ -37,6 +37,7 @@ from app.core.audit_logging import (
 )
 from app.core.settings import settings
 from app.db import check_database, init_database
+from app.eod.daily_pipeline_state import daily_pipeline_run_state_service
 from app.eod.runner import background_runner
 from app.market.snapshot import market_snapshot_service
 from app.market_data_store import load_tracked_symbols
@@ -53,6 +54,10 @@ logger = logging.getLogger(__name__)
 async def lifespan(_: FastAPI):
     try:
         await asyncio.to_thread(init_database)
+        await asyncio.to_thread(
+            daily_pipeline_run_state_service.mark_active_runs_interrupted,
+            reason='Core process started while previous daily pipeline run was still marked running.',
+        )
         tracked_symbols = await asyncio.to_thread(load_tracked_symbols)
         scanner_state.hydrate(tracked_symbols)
     except Exception as exc:

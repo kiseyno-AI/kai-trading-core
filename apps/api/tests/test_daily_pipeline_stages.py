@@ -60,6 +60,18 @@ class _FakeFeedbackRetryService:
 
     def run_retry_cycles(self, *, config, force: bool = False):
         self.calls.append({'config': config, 'force': force})
+        if config.progress_callback is not None:
+            config.progress_callback(
+                status='running',
+                current_step='role_started',
+                current_activity='Agent feedback role started',
+                processed=1,
+                total=4,
+                succeeded=1,
+                failed=0,
+                current_period=config.roles[0],
+                source_run_ids={'agent_feedback_run_id': 'fake-feedback-run'},
+            )
         return {
             'completed': True,
             'final_pending': 0,
@@ -87,6 +99,42 @@ class _FakeSignalDeciderEvaluationService:
         }
 
 
+class _FakePipelineRunStateService:
+    def __init__(self) -> None:
+        self.next_run_id = 9000
+        self.runs: list[dict] = []
+        self.stage_events: list[dict] = []
+
+    def start_run(self, **kwargs):
+        run_id = self.next_run_id
+        self.next_run_id += 1
+        payload = {
+            'id': run_id,
+            **kwargs,
+            'status': 'running',
+            'stages': {},
+        }
+        self.runs.append(payload)
+        return payload
+
+    def start_stage(self, **kwargs):
+        self.stage_events.append({'event': 'start_stage', **kwargs})
+        return {'id': len(self.stage_events), **kwargs, 'status': 'running'}
+
+    def update_stage(self, **kwargs):
+        self.stage_events.append({'event': 'update_stage', **kwargs})
+        return {'id': len(self.stage_events), **kwargs}
+
+    def finish_stage(self, **kwargs):
+        self.stage_events.append({'event': 'finish_stage', **kwargs})
+        return {'id': len(self.stage_events), **kwargs}
+
+    def finish_run(self, **kwargs):
+        self.runs[-1]['status'] = kwargs.get('status')
+        self.runs[-1]['finish'] = kwargs
+        return {**self.runs[-1], **kwargs}
+
+
 class _FakeSkippedPykrxStageRunner:
     def __init__(self) -> None:
         self.calls: list[dict] = []
@@ -104,6 +152,13 @@ class _FakeSkippedPykrxStageRunner:
 
 class DailyPipelineStageServiceTests(unittest.TestCase):
     def setUp(self) -> None:
+        self.run_state_service = _FakePipelineRunStateService()
+        self.run_state_patcher = patch(
+            'app.eod.daily_pipeline_stages.daily_pipeline_run_state_service',
+            self.run_state_service,
+        )
+        self.run_state_patcher.start()
+        self.addCleanup(self.run_state_patcher.stop)
         self.prerequisite_patcher = patch(
             'app.eod.daily_pipeline_stages.agent_feedback_prerequisite_service.inspect_feedback_prerequisites',
             side_effect=lambda **_: _feedback_prerequisites(),
@@ -310,6 +365,84 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         self.assertEqual(executed_stage_ids[13], 'external_news_collect')
         self.assertEqual(executed_stage_ids[14], 'external_news_enrich')
 
+    def test_run_resume_from_market_risk_filter_preserves_upstream_outputs_by_not_rerunning_them(self) -> None:
+        service = DailyPipelineStageService()
+
+        with (
+            patch.object(service, '_normalize_market_date', return_value='2026-04-14'),
+            patch.object(service, '_execute_stage', side_effect=lambda stage_id, **_: {'stage_id': stage_id}) as execute_stage,
+        ):
+            result = service.run(
+                market_date='2026-04-14',
+                resume_from_stage='market_risk_filter',
+            )
+
+        self.assertEqual(result['resolved_stages'][0], 'market_risk_filter')
+        self.assertNotIn('price_collection', result['resolved_stages'])
+        self.assertNotIn('technical_snapshots', result['resolved_stages'])
+        self.assertEqual(execute_stage.call_args_list[0].args[0], 'market_risk_filter')
+        self.assertEqual(self.run_state_service.runs[0]['run_metadata']['resume_from_stage'], 'market_risk_filter')
+
+    def test_run_resume_from_market_risk_snapshots_includes_requested_resume_stage(self) -> None:
+        service = DailyPipelineStageService()
+
+        with (
+            patch.object(service, '_normalize_market_date', return_value='2026-04-14'),
+            patch.object(service, '_execute_stage', side_effect=lambda stage_id, **_: {'stage_id': stage_id}) as execute_stage,
+        ):
+            result = service.run(
+                market_date='2026-04-14',
+                resume_from_stage='market_risk_snapshots',
+            )
+
+        self.assertEqual(result['resolved_stages'][0], 'market_risk_snapshots')
+        self.assertIn('market_risk_snapshots', result['requested_stages'])
+        self.assertEqual(execute_stage.call_args_list[0].args[0], 'market_risk_snapshots')
+        self.assertEqual(self.run_state_service.runs[0]['run_metadata']['resume_from_stage'], 'market_risk_snapshots')
+
+    def test_run_starting_at_market_risk_filter_checkpoints_progress_before_rows_exist(self) -> None:
+        service = DailyPipelineStageService()
+
+        def _execute(stage_id, **kwargs):
+            kwargs['progress_callback'](
+                status='running',
+                current_step='fetching_kis_market_risk_snapshots',
+                current_activity='Fetching KIS market-risk snapshot for 005930',
+                processed=1,
+                total=2,
+                succeeded=1,
+                failed=0,
+                current_symbol='005930',
+            )
+            return {
+                'market_date': kwargs['market_date'],
+                'matched_symbols': ['005930', '000660'],
+                'results_persisted': 0,
+                'results_failed': 0,
+                'items': [],
+            }
+
+        with (
+            patch.object(service, '_normalize_market_date', return_value='2026-04-14'),
+            patch.object(service, '_execute_stage', side_effect=_execute),
+        ):
+            result = service.run(
+                market_date='2026-04-14',
+                stages=['market_risk_filter'],
+                symbols=['005930', '000660'],
+            )
+
+        self.assertEqual(result['status'], 'completed')
+        progress_events = [
+            event
+            for event in self.run_state_service.stage_events
+            if event['event'] == 'update_stage' and event['stage_id'] == 'market_risk_filter'
+        ]
+        self.assertEqual(progress_events[0]['status'], 'running')
+        self.assertEqual(progress_events[0]['processed'], 1)
+        self.assertEqual(progress_events[0]['total'], 2)
+        self.assertEqual(progress_events[0]['current_symbol'], '005930')
+
     def test_run_gates_feedback_stage_until_prerequisites_are_ready(self) -> None:
         pykrx_runner = _FakePykrxStageRunner()
         feedback_retry_service = _FakeFeedbackRetryService()
@@ -337,6 +470,75 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             'feedback_prerequisites_not_ready',
         )
         self.assertEqual(feedback_retry_service.calls, [])
+
+    def test_fundamentals_stage_checkpoints_dart_progress(self) -> None:
+        service = DailyPipelineStageService()
+
+        async def _fake_refresh(**kwargs):
+            kwargs['progress_callback'](
+                status='running',
+                current_step='syncing_disclosures',
+                current_activity='DART fundamentals daily refresh: syncing disclosures',
+                processed=1,
+                total=3,
+                succeeded=1,
+                failed=0,
+                current_symbol='005930',
+                current_period='CFS',
+                source_run_ids={'dart_refresh_run_id': 77},
+            )
+            return {
+                'triggered': True,
+                'run_id': 77,
+                'status': 'completed',
+                'symbols_refreshed': 3,
+                'symbols_failed': 0,
+                'events_captured': 3,
+                'events_failed': 0,
+            }
+
+        with (
+            patch.object(service, '_normalize_market_date', return_value='2026-04-14'),
+            patch(
+                'app.eod.daily_pipeline_stages.dart_fundamentals_capture_service.run_daily_incremental_refresh',
+                side_effect=_fake_refresh,
+            ),
+        ):
+            result = service.run(
+                market_date='2026-04-14',
+                stages=['fundamentals_daily_refresh'],
+            )
+
+        self.assertEqual(result['status'], 'completed')
+        progress_events = [
+            event
+            for event in self.run_state_service.stage_events
+            if event['event'] == 'update_stage' and event['stage_id'] == 'fundamentals_daily_refresh'
+        ]
+        self.assertEqual(progress_events[0]['current_step'], 'syncing_disclosures')
+        self.assertEqual(progress_events[0]['processed'], 1)
+        self.assertEqual(progress_events[0]['source_run_ids']['dart_refresh_run_id'], 77)
+
+    def test_agent_feedback_stage_checkpoints_retry_progress(self) -> None:
+        feedback_retry_service = _FakeFeedbackRetryService()
+        service = DailyPipelineStageService(feedback_retry_service=feedback_retry_service)
+
+        result = service.run(
+            market_date='2026-04-14',
+            stages=['agent_feedback_summaries'],
+            symbols=['005930', '000660'],
+        )
+
+        self.assertEqual(result['status'], 'completed')
+        self.assertIsNotNone(feedback_retry_service.calls[0]['config'].progress_callback)
+        progress_events = [
+            event
+            for event in self.run_state_service.stage_events
+            if event['event'] == 'update_stage' and event['stage_id'] == 'agent_feedback_summaries'
+        ]
+        self.assertEqual(progress_events[0]['current_step'], 'role_started')
+        self.assertEqual(progress_events[0]['processed'], 1)
+        self.assertEqual(progress_events[0]['source_run_ids']['agent_feedback_run_id'], 'fake-feedback-run')
 
     def test_run_rejects_unknown_stage(self) -> None:
         service = DailyPipelineStageService()

@@ -5,9 +5,9 @@ Operator-facing live status API for the post-close EOD pipeline.
 
 Canonical semantics for this route and `GET /eod/freshness` live in `docs/EOD_STATUS_SEMANTICS_CONTRACT.md`.
 
-Unlike `GET /eod/freshness`, this route focuses on in-flight work. It reports the current stage status for pykrx daily price collection, persisted PyKRX enrichment coverage, technical snapshot compute, action summary compute, stored trending-rank rebuild, the latest DART fundamentals daily refresh run, and the same-day filter or factor-scoring prerequisites that now gate agent-feedback follow-up for the requested `market_date`.
+Unlike `GET /eod/freshness`, this route focuses on in-flight work. It reads the first-class durable daily pipeline run state first, then falls back to the older persisted-row and source-run inference only for stages with no official stage row. It reports the current stage status from master refresh through signal-decider evaluations for the requested `market_date`.
 
-The same payload now also reports the default-selected filtering and factor/scoring stages for that market date: `market_risk_filter`, `piotroski_filter`, `momentum_factors`, `value_factors`, `low_risk_factors`, `beta_factors`, `advanced_value_factors`, `unified_value_factors`, `quality_factors`, and `composite_factors`. Those stages are derived from stored result-row coverage, so a completed core EOD day with missing filter or scoring rows stays `partial` instead of reading as a false completed success.
+The same payload also reports the default-selected filtering, factor/scoring, external-news, agent-feedback, signal-decider, and signal-decider-evaluation stages. When a stage has no official run state, stored result-row coverage still prevents a false completed success.
 
 The default `market_date` is the current Seoul calendar date from `server_time[:10]`. On weekends, holidays, or other break-days, callers must pass `market_date` explicitly if they want the previous trading day's pipeline view instead of the current calendar date.
 
@@ -48,13 +48,16 @@ GET /eod/pipeline/status?market_date=2026-04-21&fs_div=CFS
   "fs_div": "CFS",
   "status": "running",
   "stage_order": [
+    "master_refresh",
+    "pykrx_universe_refresh",
     "price_collection",
     "pykrx_enrichment",
     "technical_snapshots",
     "action_summaries",
     "trending_ranks",
-    "fundamentals_daily_refresh",
+    "signal_features",
     "market_risk_filter",
+    "fundamentals_daily_refresh",
     "piotroski_filter",
     "momentum_factors",
     "value_factors",
@@ -63,8 +66,20 @@ GET /eod/pipeline/status?market_date=2026-04-21&fs_div=CFS
     "advanced_value_factors",
     "unified_value_factors",
     "quality_factors",
-    "composite_factors"
+    "composite_factors",
+    "external_news_collect",
+    "external_news_enrich",
+    "agent_feedback_summaries",
+    "signal_decider",
+    "signal_decider_evaluations"
   ],
+  "official_run": {
+    "id": 812,
+    "trigger": "internal_ops_cli",
+    "status": "running",
+    "current_stage": "technical_snapshots",
+    "error_message": null
+  },
   "stages": {
     "price_collection": {
       "status": "completed",

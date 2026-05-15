@@ -7,7 +7,7 @@ Lists the canonical daily stage catalog and runs an explicit subset of those sta
 
 The default operator sequence now includes `pykrx_enrichment` immediately after `price_collection`, then the factor/scoring stages after `fundamentals_daily_refresh` and `piotroski_filter`: `momentum_factors`, `value_factors`, `low_risk_factors`, `beta_factors`, `advanced_value_factors`, `unified_value_factors`, `quality_factors`, and `composite_factors`.
 
-`POST /eod/pipeline/run` accepts a stage subset, preserves canonical ordering, and delegates execution to the reusable stage operations. Callers should include any prerequisites they need; the catalog response exposes `depends_on` for inspectability.
+`POST /eod/pipeline/run` accepts a stage subset, preserves canonical ordering, creates a durable `daily_pipeline_runs` row plus per-stage `daily_pipeline_stage_runs`, and delegates execution to the reusable stage operations. Callers should include any prerequisites they need; the catalog response exposes `depends_on` for inspectability. `resume_from_stage` narrows the run to that stage and later canonical stages so operators can restart at `market_risk_filter` without rerunning upstream price or technical outputs.
 
 ## Example catalog request
 ```http
@@ -26,13 +26,20 @@ Content-Type: application/json
   "markets": ["KOSPI", "KOSDAQ"],
   "force": true,
   "fs_div": "CFS",
-  "capture_limit": 100
+  "capture_limit": 100,
+  "resume_from_stage": "technical_snapshots"
 }
 ```
 
 ## Example response
 ```json
 {
+  "pipeline_run_id": 812,
+  "pipeline_run": {
+    "id": 812,
+    "status": "completed",
+    "current_stage": "signal_decider_evaluations"
+  },
   "market_date": "2026-04-21",
   "requested_stages": [
     "signal_decider_evaluations",

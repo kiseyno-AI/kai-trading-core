@@ -31,6 +31,7 @@ from app.db import init_database
 from app.eod.action_summaries import daily_action_summary_service
 from app.eod.auto_pykrx import auto_pykrx_eod_scheduler
 from app.eod.daily_pipeline_stages import daily_pipeline_stage_service
+from app.eod.daily_pipeline_tracking import run_tracked_market_risk_filter
 from app.eod.master import refresh_master_if_due
 from app.eod.master_state import master_refresh_state
 from app.eod.pykrx_backfill import DEFAULT_MARKETS, PYKRX_BACKFILL_SERVICE
@@ -307,6 +308,7 @@ def run_daily_pipeline_stages(
     feedback_max_cycles: int = 3,
     feedback_outer_batch_size: int = 20,
     reuse_existing_feedback: bool = True,
+    resume_from_stage: str | None = None,
 ) -> dict[str, Any]:
     bootstrap_runtime()
     parsed_stages = [item.strip() for item in stages.split(',') if item.strip()] if stages else None
@@ -327,6 +329,8 @@ def run_daily_pipeline_stages(
         feedback_max_cycles=feedback_max_cycles,
         feedback_outer_batch_size=feedback_outer_batch_size,
         reuse_existing_feedback=reuse_existing_feedback,
+        resume_from_stage=resume_from_stage,
+        trigger='internal_ops_cli',
     )
 
 
@@ -467,11 +471,14 @@ def compute_market_risk_filters(
     bootstrap_runtime()
     parsed_symbols = [item.strip() for item in symbols.split(',') if item.strip()] if symbols else None
     return asyncio.run(
-        daily_market_risk_filter_service.rebuild_for_market_date(
+        run_tracked_market_risk_filter(
             market_date=market_date,
             symbols=parsed_symbols,
             source=source,
             market_code=market_code,
+            trigger='internal_ops_cli_stage',
+            entrypoint='python -m app.internal.ops eod-market-risk-filters-compute',
+            filter_service=daily_market_risk_filter_service,
         )
     )
 
@@ -807,6 +814,7 @@ def _build_parser() -> argparse.ArgumentParser:
     pipeline_run_parser.add_argument('--feedback-max-cycles', type=int, default=3)
     pipeline_run_parser.add_argument('--feedback-outer-batch-size', type=int, default=20)
     pipeline_run_parser.add_argument('--reuse-existing-feedback', choices=('true', 'false'), default='true')
+    pipeline_run_parser.add_argument('--resume-from-stage')
 
     refresh_master_parser = subparsers.add_parser('eod-master-refresh-if-due', help='Run master refresh directly')
     refresh_master_parser.add_argument('--force', action='store_true')
@@ -1155,6 +1163,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             feedback_max_cycles=args.feedback_max_cycles,
             feedback_outer_batch_size=args.feedback_outer_batch_size,
             reuse_existing_feedback=args.reuse_existing_feedback == 'true',
+            resume_from_stage=args.resume_from_stage,
         )
     elif args.command == 'eod-master-refresh-if-due':
         payload = refresh_master_if_due_internal(force=args.force)

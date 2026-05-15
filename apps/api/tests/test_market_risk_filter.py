@@ -177,6 +177,7 @@ class DailyMarketRiskFilterServiceTests(unittest.IsolatedAsyncioTestCase):
             market_code='J',
             run_id=None,
             fetch_concurrency=None,
+            progress_callback=None,
         )
         self.assertEqual(result['results_persisted'], 1)
         self.assertEqual(result['results_failed'], 2)

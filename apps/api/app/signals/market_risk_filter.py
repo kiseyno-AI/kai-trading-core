@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 from app.market_data_store import (
     load_daily_market_risk_filter_results,
@@ -61,6 +61,7 @@ class DailyMarketRiskFilterService:
         market_code: str = DEFAULT_MARKET_CODE,
         run_id: int | None = None,
         fetch_concurrency: int | None = None,
+        progress_callback: Callable[..., Any] | None = None,
     ) -> dict[str, Any]:
         normalized_market_date = normalize_market_date(market_date)
         normalized_symbols = normalize_symbols(symbols)
@@ -70,6 +71,7 @@ class DailyMarketRiskFilterService:
             market_code=market_code,
             run_id=run_id,
             fetch_concurrency=fetch_concurrency,
+            progress_callback=progress_callback,
         )
         snapshot_items = list(snapshot_collection.get('items') or [])
         requested_symbols = list(snapshot_collection.get('requested_symbols') or [])
@@ -91,13 +93,41 @@ class DailyMarketRiskFilterService:
         persisted_items: list[dict[str, Any]] = []
         failed_symbols = list(snapshot_collection.get('failed_symbols') or [])
         failed_symbol_errors = list(snapshot_collection.get('failed_symbol_errors') or [])
-        for item in items:
+        if progress_callback is not None:
+            try:
+                progress_callback(
+                    status='running',
+                    current_step='persisting_market_risk_filter_results',
+                    current_activity='Persisting daily KIS market-risk filter results',
+                    processed=0,
+                    total=len(items),
+                    succeeded=0,
+                    failed=len(failed_symbols),
+                    current_symbol=(items[0].get('symbol') if items else None),
+                )
+            except Exception:
+                pass
+        for index, item in enumerate(items, start=1):
             try:
                 upsert_daily_market_risk_filter_result(item)
                 persisted_items.append(_public_filter_item(item))
             except Exception as exc:
                 failed_symbols.append(item['symbol'])
                 failed_symbol_errors.append({'symbol': item['symbol'], 'error': str(exc)})
+            if progress_callback is not None:
+                try:
+                    progress_callback(
+                        status='running',
+                        current_step='persisting_market_risk_filter_results',
+                        current_activity=f'Persisted daily KIS market-risk filter result for {item["symbol"]}',
+                        processed=index,
+                        total=len(items),
+                        succeeded=len(persisted_items),
+                        failed=len(failed_symbols),
+                        current_symbol=item['symbol'],
+                    )
+                except Exception:
+                    pass
 
         return {
             'market_date': normalized_market_date.isoformat(),

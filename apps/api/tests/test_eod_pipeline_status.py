@@ -159,6 +159,165 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
             {'fs_div': 'CFS'},
         )
 
+    def test_read_prefers_official_running_market_risk_filter_before_output_rows_exist(self):
+        official_run = {
+            'id': 501,
+            'market_date': '2026-04-21',
+            'trigger': 'internal_ops_cli_stage',
+            'status': 'running',
+            'current_stage': 'market_risk_filter',
+            'started_at': '2026-04-21T09:10:00+00:00',
+            'updated_at': '2026-04-21T09:11:00+00:00',
+            'completed_at': None,
+            'error_message': None,
+            'run_metadata': {'resume_from_stage': 'market_risk_filter'},
+            'stages': {
+                'market_risk_filter': {
+                    'stage_id': 'market_risk_filter',
+                    'status': 'running',
+                    'market_date': '2026-04-21',
+                    'started_at': '2026-04-21T09:10:00+00:00',
+                    'updated_at': '2026-04-21T09:11:00+00:00',
+                    'completed_at': None,
+                    'processed': 7,
+                    'total': 20,
+                    'succeeded': 7,
+                    'failed': 0,
+                    'remaining': 13,
+                    'current_step': 'fetching_kis_market_risk_snapshots',
+                    'current_activity': 'Fetching KIS market-risk snapshot for 005930',
+                    'current_symbol': '005930',
+                    'current_period': None,
+                    'source_run_ids': {},
+                    'details': {},
+                },
+            },
+        }
+        service = EODPipelineStatusService(
+            market_state_loader=lambda: _FakeMarketState(),
+            pykrx_run_loader=lambda **_: None,
+            pykrx_stage_counts_loader=lambda *_: {},
+            live_symbol_count_loader=lambda: 20,
+            fundamentals_refresh_loader=lambda **_: None,
+            row_count_stage_counts_loader=lambda **_: {'market_risk_filter': {'persisted': 0}},
+            official_run_loader=lambda **_: official_run,
+        )
+
+        result = service.read()
+
+        self.assertEqual(result['status'], 'running')
+        self.assertEqual(result['official_run']['id'], 501)
+        stage = result['stages']['market_risk_filter']
+        self.assertEqual(stage['status'], 'running')
+        self.assertEqual(stage['processed'], 7)
+        self.assertEqual(stage['total'], 20)
+        self.assertEqual(stage['current_symbol'], '005930')
+        self.assertEqual(stage['details']['mode'], 'official_daily_pipeline_run_state')
+
+    def test_read_surfaces_interrupted_official_run_as_resumable_stage_state(self):
+        official_run = {
+            'id': 502,
+            'market_date': '2026-04-21',
+            'trigger': 'manual_api',
+            'status': 'interrupted',
+            'current_stage': 'signal_decider',
+            'started_at': '2026-04-21T09:10:00+00:00',
+            'updated_at': '2026-04-21T09:30:00+00:00',
+            'completed_at': '2026-04-21T09:30:00+00:00',
+            'error_message': 'Core process started while previous daily pipeline run was still marked running.',
+            'run_metadata': {'resumable': True},
+            'stages': {
+                'signal_decider': {
+                    'stage_id': 'signal_decider',
+                    'status': 'interrupted',
+                    'market_date': '2026-04-21',
+                    'started_at': '2026-04-21T09:20:00+00:00',
+                    'updated_at': '2026-04-21T09:30:00+00:00',
+                    'completed_at': '2026-04-21T09:30:00+00:00',
+                    'processed': 3,
+                    'total': 10,
+                    'succeeded': 3,
+                    'failed': 0,
+                    'remaining': 7,
+                    'current_step': 'core_restart_interrupted',
+                    'current_activity': 'Core process started while previous daily pipeline run was still marked running.',
+                    'current_symbol': None,
+                    'current_period': None,
+                    'error_message': 'Core process started while previous daily pipeline run was still marked running.',
+                    'source_run_ids': {},
+                    'details': {'resumable': True},
+                },
+            },
+        }
+        service = EODPipelineStatusService(
+            market_state_loader=lambda: _FakeMarketState(),
+            pykrx_run_loader=lambda **_: None,
+            pykrx_stage_counts_loader=lambda *_: {},
+            live_symbol_count_loader=lambda: 10,
+            fundamentals_refresh_loader=lambda **_: None,
+            official_run_loader=lambda **_: official_run,
+        )
+
+        result = service.read()
+
+        self.assertEqual(result['status'], 'interrupted')
+        self.assertEqual(result['stages']['signal_decider']['status'], 'interrupted')
+        self.assertTrue(result['stages']['signal_decider']['details']['resumable'])
+        self.assertIn('previous daily pipeline run', result['stages']['signal_decider']['current_activity'])
+
+    def test_read_shows_downstream_signal_decider_running_with_zero_output_rows(self):
+        official_run = {
+            'id': 503,
+            'market_date': '2026-04-21',
+            'trigger': 'manual_api',
+            'status': 'running',
+            'current_stage': 'signal_decider',
+            'started_at': '2026-04-21T09:10:00+00:00',
+            'updated_at': '2026-04-21T09:20:00+00:00',
+            'completed_at': None,
+            'error_message': None,
+            'run_metadata': {'requested_stages': ['signal_decider']},
+            'stages': {
+                'signal_decider': {
+                    'stage_id': 'signal_decider',
+                    'status': 'running',
+                    'market_date': '2026-04-21',
+                    'started_at': '2026-04-21T09:20:00+00:00',
+                    'updated_at': '2026-04-21T09:20:00+00:00',
+                    'completed_at': None,
+                    'processed': 0,
+                    'total': 0,
+                    'succeeded': 0,
+                    'failed': 0,
+                    'remaining': 0,
+                    'current_step': 'signal_decider_started',
+                    'current_activity': 'Running decision support decider dispatch',
+                    'current_symbol': None,
+                    'current_period': None,
+                    'source_run_ids': {},
+                    'details': {},
+                },
+            },
+        }
+        service = EODPipelineStatusService(
+            market_state_loader=lambda: _FakeMarketState(),
+            pykrx_run_loader=lambda **_: None,
+            pykrx_stage_counts_loader=lambda *_: {},
+            live_symbol_count_loader=lambda: 10,
+            fundamentals_refresh_loader=lambda **_: None,
+            official_run_loader=lambda **_: official_run,
+        )
+
+        result = service.read()
+
+        self.assertEqual(result['status'], 'running')
+        self.assertEqual(result['stages']['signal_decider']['status'], 'running')
+        self.assertEqual(result['stages']['signal_decider']['processed'], 0)
+        self.assertEqual(
+            result['stages']['signal_decider']['current_activity'],
+            'Running decision support decider dispatch',
+        )
+
     def test_read_keeps_break_day_default_market_date_on_current_calendar_day(self):
         service = EODPipelineStatusService(
             market_state_loader=lambda: _FakeBreakDayMarketState(),
@@ -496,13 +655,16 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
         self.assertEqual(
             result['stage_order'],
             [
+                'master_refresh',
+                'pykrx_universe_refresh',
                 'price_collection',
                 'pykrx_enrichment',
                 'technical_snapshots',
                 'action_summaries',
                 'trending_ranks',
-                'fundamentals_daily_refresh',
+                'signal_features',
                 'market_risk_filter',
+                'fundamentals_daily_refresh',
                 'piotroski_filter',
                 'momentum_factors',
                 'value_factors',
@@ -512,6 +674,11 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
                 'unified_value_factors',
                 'quality_factors',
                 'composite_factors',
+                'external_news_collect',
+                'external_news_enrich',
+                'agent_feedback_summaries',
+                'signal_decider',
+                'signal_decider_evaluations',
             ],
         )
 
@@ -977,7 +1144,7 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
 
         result = service.read()
 
-        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['status'], 'partial')
         self.assertEqual(result['stages']['price_collection']['status'], 'completed')
         self.assertEqual(result['stages']['technical_snapshots']['status'], 'completed')
         self.assertEqual(result['stages']['action_summaries']['status'], 'completed')
@@ -1028,7 +1195,10 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
 
         result = service.read(market_date='2026-04-21', fs_div='CFS')
 
-        self.assertEqual(result['stage_order'][1], 'pykrx_enrichment')
+        self.assertLess(
+            result['stage_order'].index('price_collection'),
+            result['stage_order'].index('pykrx_enrichment'),
+        )
         self.assertEqual(result['stages']['pykrx_enrichment']['status'], 'partial')
         self.assertEqual(result['stages']['pykrx_enrichment']['details']['requested_symbol_count'], 2)
         self.assertEqual(
