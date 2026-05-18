@@ -448,6 +448,17 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(entry_item['quantity_policy']['estimated_notional_krw'])
         self.assertEqual(entry_item['risk_context']['classification'], EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING)
         self.assertEqual(
+            entry_item['risk_context']['max_holding_close_policy'],
+            {
+                'enabled': False,
+                'type': 'none',
+                'intent': None,
+                'max_holding_trading_sessions': None,
+                'reason': 'general_signal_decider_uses_decider_holding_context_no_short_term_forced_close',
+            },
+        )
+        self.assertNotIn('max_holding_close_sell', [item['intent'] for item in payload['items']])
+        self.assertEqual(
             entry_item['risk_context']['decider_handoff_context']['classification'],
             EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING,
         )
@@ -615,6 +626,9 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(signal_entry['quantity_policy']['type'], 'exec_agent_sized')
         self.assertNotIn('quantity', signal_entry['quantity_policy'])
         self.assertEqual(signal_entry['risk_context']['classification'], EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING)
+        self.assertEqual(signal_entry['risk_context']['max_holding_close_policy']['enabled'], False)
+        self.assertIsNone(signal_entry['risk_context']['max_holding_close_policy']['max_holding_trading_sessions'])
+        self.assertNotIn('max_holding_close_sell', [item['intent'] for item in signal_payload['items']])
         short_entry = short_payload['items'][0]
         self.assertEqual(short_entry['decision_agent_name'], 'short-term-decider')
         self.assertIsNone(short_entry['trigger_price'])
@@ -640,6 +654,16 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(short_entry['quantity_policy']['account_reference'], self.account_reference)
         self.assertEqual(short_entry['quantity_policy']['account_label'], 'Main')
         self.assertEqual(short_entry['risk_context']['classification'], EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING)
+        self.assertEqual(
+            short_entry['risk_context']['max_holding_close_policy'],
+            {
+                'enabled': True,
+                'type': 'exec_agent_default',
+                'intent': 'max_holding_close_sell',
+                'max_holding_trading_sessions': 3,
+                'reason': 'short_term_exec_agent_sizing_default',
+            },
+        )
         handoff = short_entry['risk_context']['decider_handoff_context']
         self.assertEqual(handoff['classification'], EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING)
         self.assertEqual(handoff['symbol'], self.symbol)

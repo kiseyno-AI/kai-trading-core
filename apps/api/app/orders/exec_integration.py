@@ -1347,6 +1347,23 @@ class SignalDeciderExecIntegrationService:
                 validation=validation,
                 decision_traceability=decision_traceability,
             )
+            max_holding_close_policy = (
+                {
+                    'enabled': True,
+                    'type': 'exec_agent_default',
+                    'intent': 'max_holding_close_sell',
+                    'max_holding_trading_sessions': 3,
+                    'reason': 'short_term_exec_agent_sizing_default',
+                }
+                if row_decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
+                else {
+                    'enabled': False,
+                    'type': 'none',
+                    'intent': None,
+                    'max_holding_trading_sessions': None,
+                    'reason': 'general_signal_decider_uses_decider_holding_context_no_short_term_forced_close',
+                }
+            )
             common_risk_context = {
                 'schema_version': EXEC_SOURCE_SCHEMA_VERSION,
                 'classification': decider_handoff_context['classification'],
@@ -1371,6 +1388,7 @@ class SignalDeciderExecIntegrationService:
                 ),
                 'suggested_holding_period': traceability.get('suggested_holding_period'),
                 'expected_holding_period': traceability.get('expected_holding_period'),
+                'max_holding_close_policy': max_holding_close_policy,
                 'tactical_action': traceability.get('tactical_action'),
                 'original_watch_trigger_price': trigger_price,
                 'original_watch_chase_limit_price': chase_limit_price,
