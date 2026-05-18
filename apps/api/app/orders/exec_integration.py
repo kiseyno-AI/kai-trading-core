@@ -240,6 +240,23 @@ def _strip_signal_decider_fixed_sizing_preview(payload: dict[str, Any], *, decis
 
 
 def _extract_agent_approved_quantity(payload: dict[str, Any]) -> Decimal | None:
+    approval_value = payload.get('approved')
+    if approval_value is False:
+        return None
+    if isinstance(approval_value, str) and approval_value.strip().lower() in {'false', 'no', 'rejected', 'declined'}:
+        return None
+
+    for key in ('approval_status', 'decision_status', 'status'):
+        status_value = payload.get(key)
+        if isinstance(status_value, str) and status_value.strip().lower() in {
+            'rejected',
+            'declined',
+            'denied',
+            'not_approved',
+            'blocked',
+        }:
+            return None
+
     for key in (
         'agent_approved_quantity',
         'approved_quantity',

@@ -41,6 +41,8 @@ class FakeExecClient:
         self.position_response: dict = {'items': []}
         self.agent_approved_quantities_by_agent: dict[str, str] = {}
         self.agent_approved_quantities_by_core_key: dict[str, str] = {}
+        self.agent_sizing_payloads_by_agent: dict[str, dict] = {}
+        self.agent_sizing_payloads_by_core_key: dict[str, dict] = {}
 
     async def get_runtime_status(self) -> dict:
         self.runtime_calls += 1
@@ -60,11 +62,17 @@ class FakeExecClient:
                 item.get('intent') == EXEC_INTENT_NEXT_OPEN_BUY
                 and (item.get('quantity_policy') or {}).get('type') == 'exec_agent_sized'
             ):
+                agent_sizing_payload = (
+                    self.agent_sizing_payloads_by_core_key.get(item['core_item_key'])
+                    or self.agent_sizing_payloads_by_agent.get(item.get('decision_agent_name'))
+                )
                 approved_quantity = (
                     self.agent_approved_quantities_by_core_key.get(item['core_item_key'])
                     or self.agent_approved_quantities_by_agent.get(item.get('decision_agent_name'))
                 )
-                if approved_quantity is not None:
+                if agent_sizing_payload is not None:
+                    response_item['agent_sizing'] = agent_sizing_payload
+                elif approved_quantity is not None:
                     response_item['agent_sizing'] = {
                         'approved': True,
                         'quantity': approved_quantity,
@@ -471,6 +479,29 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
             self.assertEqual(row.execution_status, EXECUTION_STATUS_SUBMITTED)
             entry_link = row.submission_payload['exec_dispatch']['item_links'][0]
+            self.assertEqual(entry_link['response_item']['agent_sizing']['quantity'], '5')
+
+    async def test_dispatch_next_open_plan_signal_rejected_agent_quantity_stays_delegated(self) -> None:
+        self.client.agent_sizing_payloads_by_agent['signal-decider'] = {
+            'approved': False,
+            'quantity': '5',
+        }
+
+        result = await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=False,
+            dry_run=False,
+            force=True,
+            trigger='test',
+        )
+
+        self.assertEqual(result['summary']['submitted_count'], 0)
+        self.assertEqual(result['summary']['delegated_for_exec_agent_sizing_count'], 1)
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            self.assertEqual(row.execution_status, EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING)
+            entry_link = row.submission_payload['exec_dispatch']['item_links'][0]
+            self.assertFalse(entry_link['response_item']['agent_sizing']['approved'])
             self.assertEqual(entry_link['response_item']['agent_sizing']['quantity'], '5')
 
     async def test_dispatch_next_open_plan_signal_handoff_strips_decider_only_labels(self) -> None:
