@@ -1,9 +1,9 @@
 # GET /trading/orders/next-open-execution and POST /trading/orders/next-open-execution/run-if-due
 
 ## Summary
-Inspect or execute the persisted next-open buy plan derived from the latest previous-trading-day decision snapshots. The planner now includes both classic `signal-decider` next-open buys and actionable `short-term-decider` tactical candidates, stores blocked-vs-eligible validation results durably with explicit decider identity, and the submit hook either reuses the existing trading-order persistence flow or, when `SIGNAL_DECIDER_EXEC_INTEGRATION_MODE=dispatch`, translates eligible rows into normalized exec plan items and dispatches them to `kai-trading-exec`.
+Inspect or execute the persisted next-open buy plan derived from the latest previous-trading-day decision snapshots. The planner now includes both classic `signal-decider` next-open buys and actionable `short-term-decider` tactical candidates, stores blocked-vs-eligible validation results durably with explicit decider identity, and the submit hook either reuses the existing trading-order persistence flow or, when `SIGNAL_DECIDER_EXEC_INTEGRATION_MODE=dispatch`, translates eligible rows into normalized exec plan items and delegates sizing/execution authority to `kai-trading-exec`.
 
-For short-term candidates, core now sends sizing context as a candidate contract (`quantity_policy.type='exec_agent_sized'`) so exec can make final share decisions using account/feedback/context rails, budgets, confidence, and target/stop metadata.
+For dispatch-mode buy candidates, core sends sizing context as a candidate contract (`quantity_policy.type='exec_agent_sized'`) so exec can make final share decisions using account/feedback/context rails, budgets, reference/entry context, confidence, and target/stop metadata. Core-local disabled mode keeps the legacy fixed-share signal-decider submit path.
 
 Short-term validation now preserves the decider request's `pre_decider_enrichment_context` in both `validation.pre_decider_enrichment_context` and `validation.short_term.pre_decider_enrichment_context`. Operators can inspect the quote/orderbook snapshot status, raw-vs-estimated trading value provenance, investor/short-selling flow, and sector-peer context that were available before dispatch validation.
 
@@ -57,7 +57,7 @@ Content-Type: application/json
       "decision_agent_name": "signal-decider",
       "decision_snapshot_id": 144,
       "planned_order_type": "market",
-      "planned_quantity": "30.00000000",
+      "planned_quantity": null,
       "estimated_reference_price": 50000,
       "eligibility_status": "eligible",
       "execution_status": "planned",
@@ -123,4 +123,4 @@ Content-Type: application/json
 }
 ```
 
-Signal-decider rows keep the existing market-open submit behavior. `short-term-decider` rows are only mapped when the tactical action is actionable, and in core-local mode they remain planned-only because trigger/chase semantics are not translated into live market orders locally. In exec dispatch mode those short-term entry legs are sent at/after 08:00 KST as `pending_trigger_limit` candidates, accepted rows move to `execution_status="delegated_for_exec_agent_sizing"`, and the delegated linkage or audit state is stored under `submission.exec_dispatch` for each item, including decider-aware `plan_id`, remote item ids, last dispatch attempt, and the latest matched readback snapshot.
+Signal-decider rows keep the existing market-open submit behavior only in core-local mode. `short-term-decider` rows are only mapped when the tactical action is actionable, and in core-local mode they remain planned-only because trigger/chase semantics are not translated into live market orders locally. In exec dispatch mode, both signal and short-term entry legs are sent at/after 08:00 KST as exec-agent-sized candidates; accepted rows without an agent-approved positive quantity move to `execution_status="delegated_for_exec_agent_sizing"`, and the delegated linkage or audit state is stored under `submission.exec_dispatch` for each item, including decider-aware `plan_id`, remote item ids, last dispatch attempt, and the latest matched readback snapshot.

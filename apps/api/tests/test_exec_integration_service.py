@@ -39,6 +39,8 @@ class FakeExecClient:
         self.order_response: dict = {'items': []}
         self.execution_response: dict = {'items': []}
         self.position_response: dict = {'items': []}
+        self.agent_approved_quantities_by_agent: dict[str, str] = {}
+        self.agent_approved_quantities_by_core_key: dict[str, str] = {}
 
     async def get_runtime_status(self) -> dict:
         self.runtime_calls += 1
@@ -48,14 +50,26 @@ class FakeExecClient:
         self.post_calls.append(payload)
         items = []
         for index, item in enumerate(payload['items'], start=1):
-            items.append(
-                {
-                    'core_item_key': item['core_item_key'],
-                    'execution_plan_id': payload['plan_id'],
-                    'execution_plan_item_id': f'exec-item-{index}',
-                    'status': 'accepted',
-                }
-            )
+            response_item = {
+                'core_item_key': item['core_item_key'],
+                'execution_plan_id': payload['plan_id'],
+                'execution_plan_item_id': f'exec-item-{index}',
+                'status': 'accepted',
+            }
+            if (
+                item.get('intent') == EXEC_INTENT_NEXT_OPEN_BUY
+                and (item.get('quantity_policy') or {}).get('type') == 'exec_agent_sized'
+            ):
+                approved_quantity = (
+                    self.agent_approved_quantities_by_core_key.get(item['core_item_key'])
+                    or self.agent_approved_quantities_by_agent.get(item.get('decision_agent_name'))
+                )
+                if approved_quantity is not None:
+                    response_item['agent_sizing'] = {
+                        'approved': True,
+                        'quantity': approved_quantity,
+                    }
+            items.append(response_item)
         return {
             'accepted_item_count': len(items),
             'rejected_item_count': 0,
@@ -419,14 +433,76 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             intents,
             [EXEC_INTENT_NEXT_OPEN_BUY, EXEC_INTENT_TARGET_SELL, EXEC_INTENT_STOP_SELL],
         )
+        entry_item = payload['items'][0]
+        self.assertEqual(entry_item['quantity_policy']['type'], 'exec_agent_sized')
+        self.assertNotIn('quantity', entry_item['quantity_policy'])
+        self.assertEqual(Decimal(str(entry_item['quantity_policy']['budget_krw'])), Decimal('1500000'))
+        self.assertIsNone(entry_item['quantity_policy']['estimated_notional_krw'])
+        self.assertEqual(entry_item['risk_context']['classification'], EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING)
+        self.assertEqual(
+            entry_item['risk_context']['decider_handoff_context']['classification'],
+            EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING,
+        )
+        self.assertNotIn('quantity', payload['items'][1]['quantity_policy'])
+        self.assertNotIn('quantity', payload['items'][2]['quantity_policy'])
 
         with session_scope() as session:
             row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
-            self.assertEqual(row.execution_status, EXECUTION_STATUS_SUBMITTED)
+            self.assertEqual(row.execution_status, EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING)
             exec_dispatch = row.submission_payload['exec_dispatch']
             self.assertIn('plan_id', exec_dispatch)
             self.assertEqual(exec_dispatch['dispatch_status'], 'accepted')
             self.assertEqual(len(exec_dispatch['item_links']), 3)
+
+    async def test_dispatch_next_open_plan_signal_agent_quantity_marks_submitted(self) -> None:
+        self.client.agent_approved_quantities_by_agent['signal-decider'] = '5'
+
+        result = await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=False,
+            dry_run=False,
+            force=True,
+            trigger='test',
+        )
+
+        self.assertEqual(result['summary']['submitted_count'], 1)
+        self.assertEqual(result['summary']['delegated_for_exec_agent_sizing_count'], 0)
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            self.assertEqual(row.execution_status, EXECUTION_STATUS_SUBMITTED)
+            entry_link = row.submission_payload['exec_dispatch']['item_links'][0]
+            self.assertEqual(entry_link['response_item']['agent_sizing']['quantity'], '5')
+
+    async def test_dispatch_next_open_plan_signal_handoff_strips_decider_only_labels(self) -> None:
+        with session_scope() as session:
+            snapshot = session.get(SignalDeciderDecisionSnapshot, self.snapshot_id)
+            snapshot.request_payload = {
+                'role': 'signal-decider',
+                'agent_name': 'signal-decider',
+                'signal_decider_policy': {'current_version': self.policy_version},
+            }
+            snapshot.response_payload = {
+                'role': 'signal-decider',
+                'agent_name': 'signal-decider',
+                'next_day_open_action': 'buy',
+                'risk_flags': ['Size account-aware.'],
+            }
+
+        await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=False,
+            dry_run=False,
+            force=True,
+            trigger='test',
+        )
+
+        entry_item = self.client.post_calls[0]['items'][0]
+        handoff = entry_item['risk_context']['decider_handoff_context']
+        self.assertNotIn('role', handoff['decider_input_context']['request_payload'])
+        self.assertNotIn('agent_name', handoff['decider_input_context']['request_payload'])
+        self.assertNotIn('role', handoff['decider_output']['response_payload'])
+        self.assertNotIn('agent_name', handoff['decider_output']['response_payload'])
+        self.assertEqual(handoff['decider_output']['response_payload']['next_day_open_action'], 'buy')
 
     async def test_dispatch_next_open_plan_uses_next_open_dry_run_default(self) -> None:
         settings.signal_decider_next_open_enabled = False
@@ -504,6 +580,10 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(signal_payload['plan_id'], f'core-signal_decider-20260430-{self.account_reference.replace(":", "_").replace("-", "_")}')
         self.assertEqual(short_payload['metadata']['decision_agent_name'], 'short-term-decider')
         self.assertEqual(short_payload['strategy_run_id'], f'short-term-decider:2026-04-30:{self.account_reference.replace(":", "_").replace("-", "_")}')
+        signal_entry = signal_payload['items'][0]
+        self.assertEqual(signal_entry['quantity_policy']['type'], 'exec_agent_sized')
+        self.assertNotIn('quantity', signal_entry['quantity_policy'])
+        self.assertEqual(signal_entry['risk_context']['classification'], EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING)
         short_entry = short_payload['items'][0]
         self.assertEqual(short_entry['decision_agent_name'], 'short-term-decider')
         self.assertIsNone(short_entry['trigger_price'])
@@ -551,7 +631,9 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         short_item = next(item for item in result['items'] if item['decision_agent_name'] == 'short-term-decider')
         self.assertEqual(short_item['execution_status'], EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING)
-        self.assertEqual(result['summary']['delegated_for_exec_agent_sizing_count'], 1)
+        signal_item = next(item for item in result['items'] if item['decision_agent_name'] == 'signal-decider')
+        self.assertEqual(signal_item['execution_status'], EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING)
+        self.assertEqual(result['summary']['delegated_for_exec_agent_sizing_count'], 2)
 
     async def test_dispatch_next_open_plan_short_term_missing_target_stop_dispatches_entry_only(self) -> None:
         short_snapshot_id = self._seed_short_term_snapshot(target_price=None, stop_loss_price=None)

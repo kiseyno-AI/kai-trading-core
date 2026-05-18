@@ -204,6 +204,13 @@ def _is_dispatch_terminal_status(value: Any) -> bool:
     }
 
 
+def _uses_exec_agent_sizing_for_dispatch(decision_agent_name: str) -> bool:
+    return _exec_agent_sizing_dispatch_enabled() and decision_agent_name in {
+        SIGNAL_DECIDER_AGENT_NAME,
+        SHORT_TERM_DECIDER_AGENT_NAME,
+    }
+
+
 @dataclass(frozen=True)
 class NextOpenAccountTarget:
     label: str
@@ -901,7 +908,18 @@ class SignalDeciderNextOpenExecutionService:
                     )
                 )
 
-        if decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME:
+        if decision_agent_name == SIGNAL_DECIDER_AGENT_NAME and _uses_exec_agent_sizing_for_dispatch(decision_agent_name):
+            if estimated_reference_price is None or estimated_reference_price <= 0:
+                warnings.append(
+                    _reason(
+                        'missing_reference_price',
+                        'Could not resolve the prior close price for exec-agent sizing context.',
+                    )
+                )
+            planned_quantity = None
+            estimated_notional = None
+            pricing_note = 'Sizing for signal-decider dispatch is delegated to exec-agent.'
+        elif decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME:
             if estimated_reference_price is None or estimated_reference_price <= 0:
                 warnings.append(
                     _reason(
@@ -1088,7 +1106,7 @@ class SignalDeciderNextOpenExecutionService:
             or suggested_holding_period,
             'core_execution_classification': (
                 EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING
-                if decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
+                if _uses_exec_agent_sizing_for_dispatch(decision_agent_name)
                 else 'core_fixed_quantity_next_open_candidate'
             ),
             'entry_execution_mode': (

@@ -369,6 +369,31 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn('035420', items_by_symbol)
 
+    def test_refresh_plan_items_signal_dispatch_does_not_budget_size_quantity(self) -> None:
+        settings.signal_decider_exec_integration_mode = 'dispatch'
+        self._seed_snapshot(symbol='005930')
+        service = self._service(state='PREOPEN', server_time='2026-04-30T08:40:00+09:00')
+
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[{'trade_date': '2026-04-29', 'close_price': 50000}],
+        ):
+            result = service.refresh_plan_items(target_trade_date=self.target_trade_date, trigger='test')
+
+        item = result['items'][0]
+        self.assertEqual(item['decision_agent_name'], 'signal-decider')
+        self.assertEqual(item['eligibility_status'], ELIGIBILITY_ELIGIBLE)
+        self.assertIsNone(item['planned_quantity'])
+        self.assertIsNone(item['estimated_notional_krw'])
+        self.assertEqual(item['estimated_reference_price'], 50000)
+        self.assertIsNone(item['validation']['pricing']['planned_quantity'])
+        self.assertIsNone(item['validation']['pricing']['estimated_notional_krw'])
+        self.assertEqual(
+            item['validation']['pricing_note'],
+            'Sizing for signal-decider dispatch is delegated to exec-agent.',
+        )
+        self.assertEqual(item['traceability']['core_execution_classification'], EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING)
+
     def test_refresh_plan_items_reuses_cached_policy_context_by_policy_version(self) -> None:
         self._seed_snapshot(symbol='005930')
         self._seed_snapshot(symbol='000660')
