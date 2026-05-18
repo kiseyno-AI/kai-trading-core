@@ -483,7 +483,7 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
 
         item = result['items'][0]
         self.assertEqual(item['eligibility_status'], ELIGIBILITY_BLOCKED)
-        self.assertEqual(item['validation']['decision_input_quality_context']['final_judgment']['decision_band'], 'blocked')
+        self.assertEqual(item['validation']['decision_input_quality_context']['final_judgment']['decision_band'], 'block')
         block_codes = {reason['code'] for reason in item['validation']['blocking_reasons']}
         self.assertIn('decision_input_quality_liquidity_turnover_hard_block', block_codes)
         self.assertIn('decision_input_quality_source_turnover_missing', block_codes)

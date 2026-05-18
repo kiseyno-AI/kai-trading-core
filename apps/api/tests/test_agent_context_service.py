@@ -1755,7 +1755,7 @@ class AgentContextReadServiceTests(unittest.TestCase):
         self.assertTrue(item['liquidity_context']['ranking']['passes_liquidity_floor'])
         self.assertEqual(item['decider_data_quality_context']['blocks']['liquidity_turnover']['status'], 'stale')
         self.assertEqual(item['decider_data_quality_context']['blocks']['intraday_realtime']['status'], 'stale')
-        self.assertEqual(item['decision_input_quality_context']['final_judgment']['decision_band'], 'blocked')
+        self.assertEqual(item['decision_input_quality_context']['final_judgment']['decision_band'], 'block')
         self.assertIn(
             'liquidity_turnover',
             item['decision_input_quality_context']['final_judgment']['missing_context'],

@@ -522,13 +522,20 @@ def _final_judgment(
     if hard_blocks:
         score = min(score, 35)
     if hard_blocks:
-        decision_band = 'blocked'
-    elif score >= 80:
-        decision_band = 'qualified'
+        decision_band = 'block'
+    elif score >= 85:
+        decision_band = 'high_conviction'
+    elif score >= 75:
+        decision_band = 'normal_buy'
     elif score >= 55:
-        decision_band = 'discounted'
+        decision_band = 'small_probe'
     else:
-        decision_band = 'weak_quality'
+        decision_band = 'watch'
+    recommended_agent_question = (
+        'Do not approve this buy until hard-blocked execution-quality inputs are repaired or explicitly waived.'
+        if hard_blocks
+        else 'If approving, size only within the execution-feasibility hints and cite the strongest confirmations.'
+    )
     return {
         'buy_quality_score': score,
         'decision_band': decision_band,
@@ -537,6 +544,7 @@ def _final_judgment(
         'positive_confirmations': _dedupe_text(positive_confirmations),
         'missing_context': _dedupe_text(missing_context),
         'secondary_context': secondary_context,
+        'recommended_agent_question': recommended_agent_question,
     }
 
 
@@ -581,6 +589,11 @@ def build_decision_input_quality_envelope(
             ],
             'builder': 'app.agent_context.decision_input_quality.build_decision_input_quality_envelope',
             'deterministic': True,
+            'data_policy': {
+                'paid_api_dependency': False,
+                'source_policy': 'free_current_sources_only',
+                'missingness_policy': 'encode_missingness_and_apply_conservative_gates_without_requesting_paid_data',
+            },
         },
         'data_quality': {
             'status': quality_context.get('status') or STATUS_UNAVAILABLE,

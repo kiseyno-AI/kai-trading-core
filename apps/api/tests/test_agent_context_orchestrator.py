@@ -90,7 +90,7 @@ class RepairJsonTailTests(unittest.TestCase):
         decision_input_quality_context = {
             'schema_version': 'decision_input_quality_v1',
             'final_judgment': {
-                'decision_band': 'qualified',
+                'decision_band': 'high_conviction',
                 'hard_blocks': [],
             },
             'execution_feasibility': {
@@ -229,7 +229,7 @@ class RepairJsonTailTests(unittest.TestCase):
                 'decision_input_quality_context': {
                     'schema_version': 'decision_input_quality_v1',
                     'execution_feasibility': {'liquidity_tier': 'medium'},
-                    'final_judgment': {'decision_band': 'discounted', 'hard_blocks': []},
+                    'final_judgment': {'decision_band': 'small_probe', 'hard_blocks': []},
                 },
                 'persisted_factor_rows': {
                     'value': {'value_score': 0.92, 'value_status': 'scored'},
@@ -257,7 +257,7 @@ class RepairJsonTailTests(unittest.TestCase):
         )
         self.assertEqual(
             trimmed['decision_input_quality_context']['final_judgment']['decision_band'],
-            'discounted',
+            'small_probe',
         )
 
 

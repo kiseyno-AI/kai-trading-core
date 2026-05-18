@@ -294,7 +294,7 @@ GET /agent-context/symbol-day?market_date=2026-04-15&symbols=005930&fs_div=CFS&d
         },
         "final_judgment": {
           "buy_quality_score": 88,
-          "decision_band": "qualified",
+          "decision_band": "high_conviction",
           "hard_blocks": [],
           "quality_penalties": [],
           "positive_confirmations": ["liquidity_turnover_available"]

@@ -99,7 +99,7 @@ Content-Type: application/json
             ]
           },
           "final_judgment": {
-            "decision_band": "discounted",
+            "decision_band": "small_probe",
             "hard_blocks": [],
             "quality_penalties": [
               {

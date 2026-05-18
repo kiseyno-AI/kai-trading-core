@@ -95,7 +95,9 @@ class DecisionInputQualityTests(unittest.TestCase):
         )
 
         final = result['final_judgment']
-        self.assertEqual(final['decision_band'], 'blocked')
+        self.assertEqual(final['decision_band'], 'block')
+        self.assertIn('hard-blocked execution-quality inputs', final['recommended_agent_question'])
+        self.assertFalse(result['quality_provenance']['data_policy']['paid_api_dependency'])
         self.assertLessEqual(final['buy_quality_score'], 35)
         block_codes = {block['code'] for block in final['hard_blocks']}
         penalty_codes = {penalty['code'] for penalty in final['quality_penalties']}
@@ -155,6 +157,7 @@ class DecisionInputQualityTests(unittest.TestCase):
             result['final_judgment']['secondary_context'][0]['decision_effect'],
             'neutral_secondary_context',
         )
+        self.assertEqual(result['quality_provenance']['data_policy']['source_policy'], 'free_current_sources_only')
 
 
 if __name__ == '__main__':
