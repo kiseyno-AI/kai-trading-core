@@ -9,6 +9,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.agent_context.derived_contexts import DEFAULT_DERIVED_CONTEXT_HISTORY_DAYS, build_price_context
+from app.agent_context.decision_input_quality import build_decision_input_quality_envelope
 from app.agent_context.missing_data_taxonomy import CATEGORY_DEFINITIONS_BY_KEY
 from app.agent_context.score_context import build_signal_decider_scores
 from app.core.settings import settings
@@ -5094,6 +5095,12 @@ class AgentContextReadService:
                 unified_value_row=current_factor_rows['unified_value'],
                 advanced_value_row=current_factor_rows['advanced_value'],
             )
+            decision_input_quality_context = build_decision_input_quality_envelope(
+                symbol=symbol,
+                market_date=normalized_market_date.isoformat(),
+                decider_data_quality_context=decider_data_quality_context,
+                pre_decider_enrichment_context=pre_decider_enrichment_context,
+            )
 
             fundamentals_entries = fundamentals_map.get(symbol) or []
             latest_disclosure = recent_disclosures[0] if recent_disclosures else None
@@ -5161,6 +5168,7 @@ class AgentContextReadService:
                     'liquidity_context': liquidity_context,
                     'pre_decider_enrichment_context': pre_decider_enrichment_context,
                     'decider_data_quality_context': decider_data_quality_context,
+                    'decision_input_quality_context': decision_input_quality_context,
                     'intraday_execution_context': intraday_execution_context,
                     'price_context_history': price_context_history,
                     'technical_snapshot': technical_snapshot,

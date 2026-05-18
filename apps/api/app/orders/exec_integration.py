@@ -11,6 +11,7 @@ from typing import Any, Iterable, Sequence
 import httpx
 from sqlalchemy import select
 
+from app.agent_context.decision_input_quality import build_decision_input_quality_envelope
 from app.agent_context.roles import SHORT_TERM_DECIDER_AGENT_NAME, SIGNAL_DECIDER_AGENT_NAME
 from app.core.audit_logging import request_with_audit
 from app.core.settings import settings
@@ -222,6 +223,43 @@ def _strip_signal_decider_only_labels(payload: dict[str, Any], *, decision_agent
         for key, value in payload.items()
         if key not in {'role', 'agent_name'}
     }
+
+
+def _decision_input_quality_from_payloads(
+    *,
+    symbol: str,
+    source_market_date: date,
+    request_payload: dict[str, Any],
+    validation: dict[str, Any],
+    traceability: dict[str, Any],
+    allocation_budget_krw: Any = None,
+    estimated_reference_price: Any = None,
+    planned_notional_krw: Any = None,
+) -> dict[str, Any]:
+    for payload in (validation, traceability, request_payload):
+        context = payload.get('decision_input_quality_context') if isinstance(payload, dict) else None
+        if isinstance(context, dict) and context:
+            return context
+    symbol_day_context = request_payload.get('symbol_day_context')
+    if isinstance(symbol_day_context, dict) and isinstance(symbol_day_context.get('decision_input_quality_context'), dict):
+        return symbol_day_context['decision_input_quality_context']
+
+    decider_quality = request_payload.get('decider_data_quality_context')
+    pre_decider = request_payload.get('pre_decider_enrichment_context')
+    if isinstance(symbol_day_context, dict):
+        if not isinstance(decider_quality, dict):
+            decider_quality = symbol_day_context.get('decider_data_quality_context')
+        if not isinstance(pre_decider, dict):
+            pre_decider = symbol_day_context.get('pre_decider_enrichment_context')
+    return build_decision_input_quality_envelope(
+        symbol=symbol,
+        market_date=source_market_date.isoformat(),
+        decider_data_quality_context=decider_quality if isinstance(decider_quality, dict) else {},
+        pre_decider_enrichment_context=pre_decider if isinstance(pre_decider, dict) else {},
+        allocation_budget_krw=allocation_budget_krw,
+        estimated_reference_price=estimated_reference_price,
+        planned_notional_krw=planned_notional_krw,
+    )
 
 
 def _strip_signal_decider_fixed_sizing_preview(payload: dict[str, Any], *, decision_agent_name: str) -> dict[str, Any]:
@@ -1211,6 +1249,16 @@ class SignalDeciderExecIntegrationService:
             if snapshot is not None and isinstance(snapshot.response_summary_payload, dict)
             else {}
         )
+        decision_input_quality_context = _decision_input_quality_from_payloads(
+            symbol=row.symbol,
+            source_market_date=row.source_market_date,
+            request_payload=request_payload,
+            validation=validation,
+            traceability=traceability,
+            allocation_budget_krw=row.allocation_budget_krw,
+            estimated_reference_price=row.estimated_reference_price,
+            planned_notional_krw=row.estimated_notional_krw,
+        )
         request_payload = _strip_signal_decider_only_labels(
             request_payload,
             decision_agent_name=row_decision_agent_name,
@@ -1241,7 +1289,9 @@ class SignalDeciderExecIntegrationService:
                     'request_payload': request_payload,
                     'input_feature_snapshot_payload': input_feature_snapshot_payload,
                     'pre_decider_enrichment_context': pre_decider_enrichment_context,
+                    'decision_input_quality_context': decision_input_quality_context,
                 },
+                'decision_input_quality_context': decision_input_quality_context,
                 'decider_output': {
                     'decision_action': snapshot.decision_action if snapshot is not None else None,
                     'preferred_action': snapshot.preferred_action if snapshot is not None else None,
@@ -1347,6 +1397,16 @@ class SignalDeciderExecIntegrationService:
                 validation=validation,
                 decision_traceability=decision_traceability,
             )
+            decision_input_quality_context = (
+                decider_handoff_context.get('decision_input_quality_context')
+                if isinstance(decider_handoff_context.get('decision_input_quality_context'), dict)
+                else {}
+            )
+            execution_feasibility_context = (
+                decision_input_quality_context.get('execution_feasibility')
+                if isinstance(decision_input_quality_context.get('execution_feasibility'), dict)
+                else {}
+            )
             max_holding_close_policy = (
                 {
                     'enabled': True,
@@ -1404,6 +1464,8 @@ class SignalDeciderExecIntegrationService:
                 'validation': validation,
                 'traceability': decision_traceability,
                 'decider_handoff_context': decider_handoff_context,
+                'decision_input_quality_context': decision_input_quality_context,
+                'execution_feasibility_context': execution_feasibility_context,
             }
             if uses_exec_agent_sizing:
                 if row_decision_agent_name == SIGNAL_DECIDER_AGENT_NAME:
@@ -1425,6 +1487,9 @@ class SignalDeciderExecIntegrationService:
                     'estimated_reference_price': row.estimated_reference_price,
                     'estimated_notional_krw': estimated_notional_krw,
                     'pricing_note': pricing_note,
+                    'sizing_hints': list(execution_feasibility_context.get('sizing_hints') or []),
+                    'max_safe_notional_krw': execution_feasibility_context.get('max_safe_notional_krw'),
+                    'liquidity_tier': execution_feasibility_context.get('liquidity_tier'),
                 }
             else:
                 quantity_policy = {

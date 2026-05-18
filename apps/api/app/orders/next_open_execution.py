@@ -10,6 +10,7 @@ import exchange_calendars as xcals
 import pandas as pd
 from sqlalchemy import select
 
+from app.agent_context.decision_input_quality import build_decision_input_quality_envelope
 from app.agent_context.roles import SHORT_TERM_DECIDER_AGENT_NAME, SIGNAL_DECIDER_AGENT_NAME
 from app.agent_context.signal_decider_loop_service import signal_decider_loop_service
 from app.core.settings import settings
@@ -161,6 +162,49 @@ def _snapshot_pre_decider_enrichment_context(snapshot: SignalDeciderDecisionSnap
     if isinstance(symbol_day_context, dict) and isinstance(symbol_day_context.get('pre_decider_enrichment_context'), dict):
         return symbol_day_context['pre_decider_enrichment_context']
     return {}
+
+
+def _snapshot_decider_data_quality_context(snapshot: SignalDeciderDecisionSnapshot) -> dict[str, Any]:
+    request_payload = _snapshot_request_payload(snapshot)
+    context = request_payload.get('decider_data_quality_context')
+    if isinstance(context, dict):
+        return context
+    symbol_day_context = request_payload.get('symbol_day_context')
+    if isinstance(symbol_day_context, dict) and isinstance(symbol_day_context.get('decider_data_quality_context'), dict):
+        return symbol_day_context['decider_data_quality_context']
+    return {}
+
+
+def _snapshot_decision_input_quality_context(
+    snapshot: SignalDeciderDecisionSnapshot,
+    *,
+    target: NextOpenAccountTarget | None = None,
+    estimated_reference_price: Any = None,
+    estimated_notional_krw: Any = None,
+) -> dict[str, Any]:
+    request_payload = _snapshot_request_payload(snapshot)
+    context = request_payload.get('decision_input_quality_context')
+    if not isinstance(context, dict):
+        symbol_day_context = request_payload.get('symbol_day_context')
+        if isinstance(symbol_day_context, dict) and isinstance(symbol_day_context.get('decision_input_quality_context'), dict):
+            context = symbol_day_context['decision_input_quality_context']
+        else:
+            context = {}
+    if context and target is None and estimated_reference_price is None and estimated_notional_krw is None:
+        return context
+    decider_quality_context = _snapshot_decider_data_quality_context(snapshot)
+    pre_decider_context = _snapshot_pre_decider_enrichment_context(snapshot)
+    if context and not decider_quality_context and not pre_decider_context:
+        return context
+    return build_decision_input_quality_envelope(
+        symbol=snapshot.symbol,
+        market_date=snapshot.market_date.isoformat(),
+        decider_data_quality_context=decider_quality_context,
+        pre_decider_enrichment_context=pre_decider_context,
+        allocation_budget_krw=target.budget_krw if target is not None else None,
+        estimated_reference_price=estimated_reference_price,
+        planned_notional_krw=estimated_notional_krw,
+    )
 
 
 def _short_term_tactical_action(snapshot: SignalDeciderDecisionSnapshot) -> str:
@@ -978,6 +1022,12 @@ class SignalDeciderNextOpenExecutionService:
                     )
             pricing_note = 'Configured budget rail is used for local quantity preview only.'
 
+        decision_input_quality_context = _snapshot_decision_input_quality_context(
+            snapshot,
+            target=target,
+            estimated_reference_price=estimated_reference_price,
+            estimated_notional_krw=estimated_notional,
+        )
         validation_payload = {
             'blocking_reasons': blocking_reasons,
             'warnings': warnings,
@@ -1001,6 +1051,7 @@ class SignalDeciderNextOpenExecutionService:
                 'estimated_notional_krw': _decimal_to_text(estimated_notional),
             },
             'pre_decider_enrichment_context': pre_decider_enrichment_context,
+            'decision_input_quality_context': decision_input_quality_context,
         }
         if decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME:
             validation_payload['short_term'] = {
@@ -1022,6 +1073,7 @@ class SignalDeciderNextOpenExecutionService:
                 'invalidation_conditions': snapshot.invalidation_conditions_payload,
                 'data_quality_warnings': snapshot.data_quality_warnings_payload,
                 'pre_decider_enrichment_context': pre_decider_enrichment_context,
+                'decision_input_quality_context': decision_input_quality_context,
                 'response_payload_summary': _to_json_safe(response_payload),
                 'response_summary': snapshot.response_summary_payload if isinstance(snapshot.response_summary_payload, dict) else None,
                 'expected_holding_period': _short_term_field_text(snapshot, 'expected_holding_period')
@@ -1127,6 +1179,7 @@ class SignalDeciderNextOpenExecutionService:
             'invalidation_conditions': snapshot.invalidation_conditions_payload,
             'data_quality_warnings': snapshot.data_quality_warnings_payload,
             'pre_decider_enrichment_context': validation_payload.get('pre_decider_enrichment_context') or {},
+            'decision_input_quality_context': validation_payload.get('decision_input_quality_context') or {},
             'response_summary': snapshot.response_summary_payload if isinstance(snapshot.response_summary_payload, dict) else None,
             'response_payload_summary': _to_json_safe(response_payload),
             'decision_traceability': snapshot.traceability_payload if isinstance(snapshot.traceability_payload, dict) else {},

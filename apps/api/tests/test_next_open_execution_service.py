@@ -489,6 +489,14 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(item['validation']['pre_decider_enrichment_context'], pre_decider_context)
         self.assertEqual(item['validation']['short_term']['pre_decider_enrichment_context'], pre_decider_context)
         self.assertEqual(item['traceability']['pre_decider_enrichment_context'], pre_decider_context)
+        quality_context = item['validation']['decision_input_quality_context']
+        self.assertEqual(quality_context['schema_version'], 'decision_input_quality_v1')
+        self.assertEqual(quality_context['execution_feasibility']['liquidity_tier'], 'medium')
+        self.assertEqual(
+            item['validation']['short_term']['decision_input_quality_context']['schema_version'],
+            'decision_input_quality_v1',
+        )
+        self.assertEqual(item['traceability']['decision_input_quality_context']['schema_version'], 'decision_input_quality_v1')
 
     def test_refresh_plan_items_delegates_short_term_data_warning_candidates_in_dispatch_mode(self) -> None:
         settings.signal_decider_exec_integration_mode = 'dispatch'

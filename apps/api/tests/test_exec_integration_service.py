@@ -584,6 +584,12 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 'pre_decider_enrichment_context': {
                     'schema_version': 'pre_decider_enrichment_v1',
                     'quote_orderbook_snapshot': {'status': 'stale_eod'},
+                    'trading_value': {
+                        'status': 'available',
+                        'source': 'raw',
+                        'raw_trading_value_krw': 9_870_000_000,
+                        'trading_value_krw': 9_870_000_000,
+                    },
                 },
                 'liquidity_context': {'turnover': {'status': 'available'}},
             },
@@ -677,6 +683,20 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             handoff['decider_input_context']['pre_decider_enrichment_context'],
             decider_request_payload['symbol_day_context']['pre_decider_enrichment_context'],
         )
+        self.assertEqual(
+            handoff['decider_input_context']['decision_input_quality_context']['schema_version'],
+            'decision_input_quality_v1',
+        )
+        self.assertEqual(
+            short_entry['risk_context']['decision_input_quality_context']['schema_version'],
+            'decision_input_quality_v1',
+        )
+        self.assertEqual(
+            short_entry['risk_context']['execution_feasibility_context']['liquidity_tier'],
+            'medium',
+        )
+        self.assertIn('sizing_hints', short_entry['quantity_policy'])
+        self.assertEqual(short_entry['quantity_policy']['max_safe_notional_krw'], 49350000)
         self.assertEqual(handoff['decider_output']['response_payload']['trigger_conditions'], ['Reclaim 50500 with volume.'])
         self.assertEqual(handoff['decider_output']['response_payload']['risk_flags'], ['Opening gap risk.'])
         self.assertEqual(result['summary']['translated_item_count'], 6)

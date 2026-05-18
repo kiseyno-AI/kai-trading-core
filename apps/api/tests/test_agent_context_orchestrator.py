@@ -87,12 +87,24 @@ class RepairJsonTailTests(unittest.TestCase):
             'trading_value': {'status': 'available', 'source': 'raw', 'trading_value_krw': 9870000000},
             'flow_short_sector_context': {'status': 'available'},
         }
+        decision_input_quality_context = {
+            'schema_version': 'decision_input_quality_v1',
+            'final_judgment': {
+                'decision_band': 'qualified',
+                'hard_blocks': [],
+            },
+            'execution_feasibility': {
+                'liquidity_tier': 'high',
+                'max_safe_notional_krw': 49350000,
+            },
+        }
 
         payload = build_signal_decider_payload(
             item={
                 'symbol': '005930',
                 'market_date': '2026-04-14',
                 'pre_decider_enrichment_context': pre_decider_context,
+                'decision_input_quality_context': decision_input_quality_context,
                 'scores': {},
                 'factor_summary': {},
                 'liquidity_context': {},
@@ -107,10 +119,17 @@ class RepairJsonTailTests(unittest.TestCase):
         )
 
         self.assertEqual(payload['pre_decider_enrichment_context'], pre_decider_context)
+        self.assertEqual(payload['decision_input_quality_context'], decision_input_quality_context)
         self.assertNotIn('pre_decider_enrichment_context', payload['symbol_day_context'])
+        self.assertNotIn('decision_input_quality_context', payload['symbol_day_context'])
         self.assertTrue(
             payload['decision_support_constraints']['missing_context_policy'][
                 'pre_decider_enrichment_context_authoritative'
+            ]
+        )
+        self.assertTrue(
+            payload['decision_support_constraints']['missing_context_policy'][
+                'decision_input_quality_context_authoritative'
             ]
         )
 
@@ -207,6 +226,11 @@ class RepairJsonTailTests(unittest.TestCase):
                         },
                     },
                 },
+                'decision_input_quality_context': {
+                    'schema_version': 'decision_input_quality_v1',
+                    'execution_feasibility': {'liquidity_tier': 'medium'},
+                    'final_judgment': {'decision_band': 'discounted', 'hard_blocks': []},
+                },
                 'persisted_factor_rows': {
                     'value': {'value_score': 0.92, 'value_status': 'scored'},
                 },
@@ -230,6 +254,10 @@ class RepairJsonTailTests(unittest.TestCase):
         self.assertEqual(
             trimmed['decider_data_quality_context']['blocks']['disclosures_news']['decision_guidance']['decision_tier'],
             'auxiliary_context',
+        )
+        self.assertEqual(
+            trimmed['decision_input_quality_context']['final_judgment']['decision_band'],
+            'discounted',
         )
 
 
