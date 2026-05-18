@@ -17,6 +17,8 @@ When live quote or intraday data is not expected for the requested date, `quote_
 
 The response also includes a compact `decider_data_quality_context` block per symbol/day. This is the decider-facing availability and provenance summary over factor-score coverage, liquidity/turnover, intraday freshness, financial/cash-flow detail, disclosures/news, investor flow and short-selling, sector/relative-strength context, and technical evidence. It keeps `available`, `partial`, `stale`, `empty`, `unavailable`, and `provider_error` semantics explicit so downstream deciders can distinguish no recent items from provider/storage failures, and it now adds `decision_priority` plus per-block `decision_guidance` so deciders can separate core execution blockers from auxiliary confidence-only gaps.
 
+The response now includes `decision_input_quality_context` per symbol/day. This is a reusable buy-quality / quality-provenance envelope layered over `decider_data_quality_context` and `pre_decider_enrichment_context`. It separates `data_quality`, `market_setup_edge`, `execution_feasibility`, and `final_judgment`, exposing hard blocks, quality penalties, positive confirmations, safe-notional sizing hints, liquidity tier, and neutral secondary context. Stale or fallback quote/orderbook evidence and missing raw source turnover are surfaced as hard blocks or major discounts with reasons. Empty news/disclosure context remains `neutral_secondary_context` with zero penalty unless a separate adverse event exists.
+
 ## Example request
 ```http
 GET /agent-context/symbol-day?market_date=2026-04-15&symbols=005930&fs_div=CFS&disclosures_limit=5
@@ -254,6 +256,48 @@ GET /agent-context/symbol-day?market_date=2026-04-15&symbols=005930&fs_div=CFS&d
         "recent_disclosures": {
           "freshness_status": "available_but_old",
           "provenance_status": "provider_sourced"
+        }
+      },
+      "decision_input_quality_context": {
+        "schema_version": "decision_input_quality_v1",
+        "data_quality": {
+          "blocks": {
+            "liquidity_turnover": {
+              "category": "liquidity_turnover_slippage",
+              "freshness_status": "fresh",
+              "source_quality": "provider_sourced",
+              "coverage_status": "available",
+              "decision_effect": "confirmed",
+              "confidence_penalty": 0
+            },
+            "disclosures_news": {
+              "category": "disclosures_news_events",
+              "coverage_status": "empty",
+              "decision_effect": "neutral_secondary_context",
+              "confidence_penalty": 0
+            }
+          }
+        },
+        "execution_feasibility": {
+          "score": 92,
+          "liquidity_tier": "medium",
+          "max_safe_notional_krw": 49350000,
+          "expected_slippage_bps": 15,
+          "blocking_reasons": [],
+          "sizing_hints": [
+            {
+              "code": "max_safe_notional",
+              "max_safe_notional_krw": 49350000,
+              "basis": "raw_trading_value_0_5pct"
+            }
+          ]
+        },
+        "final_judgment": {
+          "buy_quality_score": 88,
+          "decision_band": "high_conviction",
+          "hard_blocks": [],
+          "quality_penalties": [],
+          "positive_confirmations": ["liquidity_turnover_available"]
         }
       },
       "factor_summary": {

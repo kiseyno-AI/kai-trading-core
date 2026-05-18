@@ -7,6 +7,8 @@ Signal-decider and short-term entries dispatched in `SIGNAL_DECIDER_EXEC_INTEGRA
 
 Each exec item also carries `risk_context.decider_handoff_context`, which preserves execution/risk context, input feature snapshots, pre-decider enrichment context, response payload/summary, normalized tactical output fields, risk/data-quality warnings, and traceability ids. Accepted rows without an agent-approved positive quantity remain delegated sizing candidates in core (`execution_status="delegated_for_exec_agent_sizing"`) until exec readback reports scheduled/submitted/filled/monitoring outcomes.
 
+Exec handoffs now include `risk_context.decision_input_quality_context`, `risk_context.execution_feasibility_context`, and the same envelope under `risk_context.decider_handoff_context.decider_input_context.decision_input_quality_context`. The `quantity_policy` for exec-agent-sized buys also carries sizing hints such as `liquidity_tier`, `max_safe_notional_krw`, and `sizing_hints`. Exec should treat stale/fallback quote and missing raw turnover as hard blocks or major discounts, while empty news/disclosures stay neutral secondary context unless separate adverse-event evidence exists.
+
 ## Example request
 ```http
 GET /trading/orders/exec/signal-decider?target_trade_date=2026-04-30&symbol=005930&refresh=true

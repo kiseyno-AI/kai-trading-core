@@ -725,6 +725,11 @@ def build_signal_decider_payload(
         if isinstance(symbol_day_context.get('decider_data_quality_context'), dict)
         else {}
     )
+    decision_input_quality_context = (
+        symbol_day_context.pop('decision_input_quality_context', {})
+        if isinstance(symbol_day_context.get('decision_input_quality_context'), dict)
+        else {}
+    )
     pre_decider_enrichment_context = (
         symbol_day_context.pop('pre_decider_enrichment_context', {})
         if isinstance(symbol_day_context.get('pre_decider_enrichment_context'), dict)
@@ -812,6 +817,7 @@ def build_signal_decider_payload(
         'liquidity_context': jsonable_encoder(liquidity_context),
         'pre_decider_enrichment_context': jsonable_encoder(pre_decider_enrichment_context),
         'decider_data_quality_context': jsonable_encoder(decider_data_quality_context),
+        'decision_input_quality_context': jsonable_encoder(decision_input_quality_context),
         'market_context': jsonable_encoder(market_context or {}),
         'upstream_summaries': jsonable_encoder(upstream_summaries),
         'upstream_traceability': jsonable_encoder(upstream_traceability),
@@ -858,6 +864,14 @@ def build_signal_decider_payload(
                 'quarterly_financial_detail_confidence_only_unless_thesis_depends_on_it': True,
                 'forbid_untradeable_from_auxiliary_absence_only': True,
                 'pre_decider_enrichment_context_authoritative': True,
+                'decision_input_quality_context_authoritative': True,
+                'decision_input_quality_sections': [
+                    'data_quality',
+                    'market_setup_edge',
+                    'execution_feasibility',
+                    'final_judgment',
+                ],
+                'respect_decision_input_quality_hard_blocks': True,
                 'pre_decider_enrichment_blocks': [
                     'quote_orderbook_snapshot',
                     'trading_value',

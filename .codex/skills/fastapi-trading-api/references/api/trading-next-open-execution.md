@@ -7,6 +7,8 @@ For dispatch-mode buy candidates, core sends sizing context as a candidate contr
 
 Short-term validation now preserves the decider request's `pre_decider_enrichment_context` in both `validation.pre_decider_enrichment_context` and `validation.short_term.pre_decider_enrichment_context`. Operators can inspect the quote/orderbook snapshot status, raw-vs-estimated trading value provenance, investor/short-selling flow, and sector-peer context that were available before dispatch validation.
 
+Validation now also preserves `decision_input_quality_context` for both `signal-decider` and `short-term-decider` rows. This reusable quality-provenance envelope separates data quality, market/setup edge, execution feasibility, and final buy-quality judgment. Stale or fallback quote snapshots and missing raw source turnover appear as hard blocks or major discounts in the envelope; empty news remains neutral secondary context. The envelope is informational in core-local validation and is passed to exec for account-aware sizing/risk decisions in dispatch mode.
+
 In exec-dispatch mode, watcher candidates are not blocked solely because `data_quality_warnings` are present. Core carries those warnings into the validation and exec handoff so the exec-side account-aware agent can make the final sizing/risk decision.
 
 When short-term candidates are present but `SIGNAL_DECIDER_NEXT_OPEN_ACCOUNT_TARGETS` is empty, rows are still materialized with an explicit synthetic routing rail:
@@ -84,6 +86,30 @@ Content-Type: application/json
       "client_order_id": "STDE-20260430-005930",
       "validation": {
         "decision_agent_name": "short-term-decider",
+        "decision_input_quality_context": {
+          "schema_version": "decision_input_quality_v1",
+          "execution_feasibility": {
+            "liquidity_tier": "medium",
+            "max_safe_notional_krw": 49350000,
+            "sizing_hints": [
+              {
+                "code": "max_safe_notional",
+                "max_safe_notional_krw": 49350000
+              }
+            ]
+          },
+          "final_judgment": {
+            "decision_band": "small_probe",
+            "hard_blocks": [],
+            "quality_penalties": [
+              {
+                "code": "quote_stale_or_fallback",
+                "category": "execution_feasibility",
+                "decision_effect": "major_discount"
+              }
+            ]
+          }
+        },
         "short_term": {
           "tactical_action": "watch_for_trigger",
           "trigger_price": 50500,
@@ -106,6 +132,9 @@ Content-Type: application/json
             "flow_short_sector_context": {
               "status": "available"
             }
+          },
+          "decision_input_quality_context": {
+            "schema_version": "decision_input_quality_v1"
           }
         }
       },

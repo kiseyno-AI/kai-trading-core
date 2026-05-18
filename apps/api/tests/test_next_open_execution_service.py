@@ -182,6 +182,56 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
 
+    def _quality_context(self, *, trading_value_source: str = 'raw', trading_value_krw: int | None = 8_000_000_000) -> dict:
+        return {
+            'status': 'available',
+            'blocks': {
+                'liquidity_turnover': {
+                    'status': 'available' if trading_value_krw is not None else 'unavailable',
+                    'turnover': {
+                        'status': 'available' if trading_value_krw is not None else 'missing',
+                        'trading_value_source': trading_value_source,
+                        'raw_trading_value_krw': trading_value_krw if trading_value_source == 'raw' else None,
+                        'estimated_trading_value_krw': trading_value_krw if trading_value_source == 'estimated' else None,
+                        'freshness': {'freshness_status': 'fresh', 'provenance_status': 'provider_sourced'},
+                    },
+                    'liquidity_ranking': {
+                        'status': 'available',
+                        'avg_trading_value_20d': trading_value_krw or 8_000_000_000,
+                        'freshness': {'freshness_status': 'fresh', 'provenance_status': 'provider_sourced'},
+                    },
+                    'decision_guidance': {'category': 'liquidity_turnover_slippage', 'decision_tier': 'core_execution'},
+                },
+                'intraday_realtime': {
+                    'status': 'available',
+                    'quote': {'status': 'available', 'freshness': {'freshness_status': 'fresh', 'provenance_status': 'provider_sourced'}},
+                    'decision_guidance': {'category': 'after_hours_intraday_realtime', 'decision_tier': 'core_execution'},
+                },
+                'technical_evidence': {
+                    'status': 'available',
+                    'decision_guidance': {'category': 'technical_evidence_support_resistance', 'decision_tier': 'supporting_context'},
+                },
+                'disclosures_news': {
+                    'status': 'empty',
+                    'decision_guidance': {'category': 'disclosures_news_events', 'decision_tier': 'auxiliary_context'},
+                },
+            },
+        }
+
+    def _pre_decider_context(self, *, trading_value_source: str = 'raw', trading_value_krw: int = 8_000_000_000) -> dict:
+        return {
+            'schema_version': 'pre_decider_enrichment_v1',
+            'quote_orderbook_snapshot': {'status': 'available', 'spread_bps': 15},
+            'trading_value': {
+                'status': 'available',
+                'source': trading_value_source,
+                'raw_trading_value_krw': trading_value_krw if trading_value_source == 'raw' else None,
+                'estimated_trading_value_krw': trading_value_krw if trading_value_source == 'estimated' else None,
+                'trading_value_krw': trading_value_krw,
+            },
+            'flow_short_sector_context': {'status': 'available'},
+        }
+
     def _seed_snapshot(
         self,
         *,
@@ -227,7 +277,13 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
                     'technical': {'trend_state': 'uptrend'},
                     'meta': {'supporting_evidence_count': 1},
                 },
-                request_payload={'signal_decider_policy': {'current_version': self.policy_version}},
+                request_payload={
+                    'signal_decider_policy': {'current_version': self.policy_version},
+                    'symbol_day_context': {
+                        'decider_data_quality_context': self._quality_context(),
+                        'pre_decider_enrichment_context': self._pre_decider_context(),
+                    },
+                },
                 response_payload={'next_day_open_action': next_day_open_action},
                 response_summary_payload={'policy_version': self.policy_version},
             )
@@ -293,7 +349,8 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
                 input_feature_snapshot_payload={'meta': {'source_agent_name': 'short-term-decider'}},
                 request_payload={
                     'orchestration': {'required_upstream_roles': ['technical-summarizer']},
-                    'pre_decider_enrichment_context': pre_decider_enrichment_context or {},
+                    'decider_data_quality_context': self._quality_context(),
+                    'pre_decider_enrichment_context': pre_decider_enrichment_context or self._pre_decider_context(),
                 },
                 response_payload={
                     'role': 'short-term-decider',
@@ -394,6 +451,43 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(item['traceability']['core_execution_classification'], EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING)
 
+    def test_refresh_plan_items_blocks_decision_input_quality_hard_blocks(self) -> None:
+        snapshot_id = self._seed_snapshot(symbol='005930')
+        with session_scope() as session:
+            snapshot = session.get(SignalDeciderDecisionSnapshot, snapshot_id)
+            snapshot.request_payload = {
+                'signal_decider_policy': {'current_version': self.policy_version},
+                'symbol_day_context': {
+                    'decider_data_quality_context': self._quality_context(
+                        trading_value_source='missing',
+                        trading_value_krw=None,
+                    ),
+                    'pre_decider_enrichment_context': {
+                        'schema_version': 'pre_decider_enrichment_v1',
+                        'quote_orderbook_snapshot': {
+                            'status': 'stale_eod',
+                            'snapshot_type': 'eod_stale',
+                            'quote_freshness_status': 'stale',
+                        },
+                        'trading_value': {'status': 'unavailable', 'source': 'missing'},
+                    },
+                },
+            }
+        service = self._service(state='PREOPEN', server_time='2026-04-30T08:40:00+09:00')
+
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[{'trade_date': '2026-04-29', 'close_price': 50000}],
+        ):
+            result = service.refresh_plan_items(target_trade_date=self.target_trade_date, trigger='test')
+
+        item = result['items'][0]
+        self.assertEqual(item['eligibility_status'], ELIGIBILITY_BLOCKED)
+        self.assertEqual(item['validation']['decision_input_quality_context']['final_judgment']['decision_band'], 'block')
+        block_codes = {reason['code'] for reason in item['validation']['blocking_reasons']}
+        self.assertIn('decision_input_quality_liquidity_turnover_hard_block', block_codes)
+        self.assertIn('decision_input_quality_source_turnover_missing', block_codes)
+
     def test_refresh_plan_items_reuses_cached_policy_context_by_policy_version(self) -> None:
         self._seed_snapshot(symbol='005930')
         self._seed_snapshot(symbol='000660')
@@ -489,6 +583,14 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(item['validation']['pre_decider_enrichment_context'], pre_decider_context)
         self.assertEqual(item['validation']['short_term']['pre_decider_enrichment_context'], pre_decider_context)
         self.assertEqual(item['traceability']['pre_decider_enrichment_context'], pre_decider_context)
+        quality_context = item['validation']['decision_input_quality_context']
+        self.assertEqual(quality_context['schema_version'], 'decision_input_quality_v1')
+        self.assertEqual(quality_context['execution_feasibility']['liquidity_tier'], 'medium')
+        self.assertEqual(
+            item['validation']['short_term']['decision_input_quality_context']['schema_version'],
+            'decision_input_quality_v1',
+        )
+        self.assertEqual(item['traceability']['decision_input_quality_context']['schema_version'], 'decision_input_quality_v1')
 
     def test_refresh_plan_items_delegates_short_term_data_warning_candidates_in_dispatch_mode(self) -> None:
         settings.signal_decider_exec_integration_mode = 'dispatch'

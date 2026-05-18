@@ -1017,6 +1017,15 @@ class AgentContextReadServiceTests(unittest.TestCase):
             first_item['decider_data_quality_context']['blocks']['liquidity_turnover']['turnover']['status'],
             'available',
         )
+        self.assertEqual(first_item['decision_input_quality_context']['schema_version'], 'decision_input_quality_v1')
+        self.assertEqual(
+            first_item['decision_input_quality_context']['data_quality']['blocks']['liquidity_turnover']['decision_effect'],
+            'confirmed',
+        )
+        self.assertIn(
+            'technical_evidence_available',
+            first_item['decision_input_quality_context']['final_judgment']['positive_confirmations'],
+        )
         self.assertEqual(
             first_item['decider_data_quality_context']['decision_priority']['core_execution']['status'],
             'partial',
@@ -1746,6 +1755,11 @@ class AgentContextReadServiceTests(unittest.TestCase):
         self.assertTrue(item['liquidity_context']['ranking']['passes_liquidity_floor'])
         self.assertEqual(item['decider_data_quality_context']['blocks']['liquidity_turnover']['status'], 'stale')
         self.assertEqual(item['decider_data_quality_context']['blocks']['intraday_realtime']['status'], 'stale')
+        self.assertEqual(item['decision_input_quality_context']['final_judgment']['decision_band'], 'block')
+        self.assertIn(
+            'liquidity_turnover',
+            item['decision_input_quality_context']['final_judgment']['missing_context'],
+        )
         self.assertIsNone(item['signal_features'])
         self.assertEqual(item['context_provenance']['signal_features']['freshness_status'], 'stale')
         self.assertEqual(item['context_provenance']['signal_features']['latest_available_market_date'], '2026-04-07')
