@@ -1028,6 +1028,28 @@ class SignalDeciderNextOpenExecutionService:
             estimated_reference_price=estimated_reference_price,
             estimated_notional_krw=estimated_notional,
         )
+        quality_hard_blocks = (
+            ((decision_input_quality_context.get('final_judgment') or {}).get('hard_blocks') or [])
+            if isinstance(decision_input_quality_context, dict)
+            else []
+        )
+        existing_block_codes = {str(reason.get('code')) for reason in blocking_reasons if isinstance(reason, dict)}
+        for hard_block in quality_hard_blocks:
+            if not isinstance(hard_block, dict):
+                continue
+            code = f"decision_input_quality_{hard_block.get('code') or 'hard_block'}"
+            if code in existing_block_codes:
+                continue
+            raw_reasons = hard_block.get('reasons') if isinstance(hard_block.get('reasons'), list) else []
+            reason_text = '; '.join(str(reason) for reason in raw_reasons if str(reason).strip())
+            blocking_reasons.append(
+                _reason(
+                    code,
+                    reason_text
+                    or f"Decision input quality hard block: {hard_block.get('category') or hard_block.get('code') or 'unspecified'}.",
+                )
+            )
+            existing_block_codes.add(code)
         validation_payload = {
             'blocking_reasons': blocking_reasons,
             'warnings': warnings,
