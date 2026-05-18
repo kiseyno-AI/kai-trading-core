@@ -3,9 +3,9 @@
 ## Summary
 Read the core-owned aggregated core↔exec view for decider-driven next-open execution. The route name is legacy, but the payload now starts from persisted `signal_decider_execution_plan_items` for both `signal-decider` and actionable `short-term-decider` rows, overlays stored exec dispatch linkage and audit state, and with `refresh=true` calls the exec northbound runtime/order/execution/position APIs before persisting the latest matched readback snapshot back onto the durable plan rows.
 
-Short-term entries dispatched in `SIGNAL_DECIDER_EXEC_INTEGRATION_MODE=dispatch` now use the `exec_agent_sized` contract on core→exec translation, so they are routed as candidate entries and exec performs final sizing while preserving fixed-quantity semantics for existing signal-decider flow.
+Signal-decider and short-term entries dispatched in `SIGNAL_DECIDER_EXEC_INTEGRATION_MODE=dispatch` use the `exec_agent_sized` contract on core→exec translation, so they are routed as candidate entries and exec performs final sizing before materializing a buy.
 
-Each exec item also carries `risk_context.decider_handoff_context`, which preserves the decider request payload, input feature snapshot payload, pre-decider enrichment context, full response payload/summary, normalized tactical output fields, risk/data-quality warnings, and traceability ids. Accepted short-term rows remain delegated sizing candidates in core (`execution_status="delegated_for_exec_agent_sizing"`) until exec readback reports scheduled/submitted/filled/monitoring outcomes.
+Each exec item also carries `risk_context.decider_handoff_context`, which preserves execution/risk context, input feature snapshots, pre-decider enrichment context, response payload/summary, normalized tactical output fields, risk/data-quality warnings, and traceability ids. Accepted rows without an agent-approved positive quantity remain delegated sizing candidates in core (`execution_status="delegated_for_exec_agent_sizing"`) until exec readback reports scheduled/submitted/filled/monitoring outcomes.
 
 ## Example request
 ```http
@@ -59,6 +59,7 @@ GET /trading/orders/exec/signal-decider?target_trade_date=2026-04-30&symbol=0059
       "agent_name": "signal-decider",
       "decision_agent_name": "signal-decider",
       "decision_snapshot_id": 144,
+      "execution_status": "submitted",
       "target_price": 54000,
       "stop_loss_price": 47000,
       "dispatch": {

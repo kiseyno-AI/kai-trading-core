@@ -134,6 +134,13 @@ def _safe_decimal(value: Any) -> Decimal | None:
         return None
 
 
+def _positive_decimal(value: Any) -> Decimal | None:
+    parsed = _safe_decimal(value)
+    if parsed is not None and parsed > Decimal('0'):
+        return parsed
+    return None
+
+
 def _decimal_to_text(value: Decimal | None) -> str | None:
     if value is None:
         return None
@@ -205,6 +212,79 @@ def _extract_field(payload: dict[str, Any], *names: str) -> Any:
             return None
         current = current.get(name)
     return current
+
+
+def _strip_signal_decider_only_labels(payload: dict[str, Any], *, decision_agent_name: str) -> dict[str, Any]:
+    if decision_agent_name != SIGNAL_DECIDER_AGENT_NAME:
+        return payload
+    return {
+        key: value
+        for key, value in payload.items()
+        if key not in {'role', 'agent_name'}
+    }
+
+
+def _strip_signal_decider_fixed_sizing_preview(payload: dict[str, Any], *, decision_agent_name: str) -> dict[str, Any]:
+    if decision_agent_name != SIGNAL_DECIDER_AGENT_NAME:
+        return payload
+    sanitized = dict(payload)
+    pricing = sanitized.get('pricing')
+    if isinstance(pricing, dict):
+        sanitized['pricing'] = {
+            **pricing,
+            'planned_quantity': None,
+            'estimated_notional_krw': None,
+        }
+    sanitized['pricing_note'] = 'Sizing for signal-decider dispatch is delegated to exec-agent.'
+    return sanitized
+
+
+def _extract_agent_approved_quantity(payload: dict[str, Any]) -> Decimal | None:
+    approval_value = payload.get('approved')
+    if approval_value is False:
+        return None
+    if isinstance(approval_value, str) and approval_value.strip().lower() in {'false', 'no', 'rejected', 'declined'}:
+        return None
+
+    for key in ('approval_status', 'decision_status', 'status'):
+        status_value = payload.get(key)
+        if isinstance(status_value, str) and status_value.strip().lower() in {
+            'rejected',
+            'declined',
+            'denied',
+            'not_approved',
+            'blocked',
+        }:
+            return None
+
+    for key in (
+        'agent_approved_quantity',
+        'approved_quantity',
+        'sized_quantity',
+        'target_quantity',
+        'order_quantity',
+        'requested_quantity',
+        'quantity',
+    ):
+        parsed = _positive_decimal(payload.get(key))
+        if parsed is not None:
+            return parsed
+    for key in (
+        'agent_sizing',
+        'sizing',
+        'sizing_decision',
+        'quantity_decision',
+        'approval',
+        'decision',
+        'order',
+        'materialized_order',
+    ):
+        nested = payload.get(key)
+        if isinstance(nested, dict):
+            parsed = _extract_agent_approved_quantity(nested)
+            if parsed is not None:
+                return parsed
+    return None
 
 
 def _append_limited(items: Sequence[dict[str, Any]], item: dict[str, Any], *, limit: int = 10) -> list[dict[str, Any]]:
@@ -1131,14 +1211,18 @@ class SignalDeciderExecIntegrationService:
             if snapshot is not None and isinstance(snapshot.response_summary_payload, dict)
             else {}
         )
+        request_payload = _strip_signal_decider_only_labels(
+            request_payload,
+            decision_agent_name=row_decision_agent_name,
+        )
+        response_payload = _strip_signal_decider_only_labels(
+            response_payload,
+            decision_agent_name=row_decision_agent_name,
+        )
         return _json_safe(
             {
                 'schema_version': 'exec_agent_decider_handoff_v1',
-                'classification': (
-                    EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING
-                    if row_decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
-                    else 'delegated_fixed_quantity_next_open'
-                ),
+                'classification': EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING,
                 'symbol': row.symbol,
                 'target_trade_date': row.target_trade_date.isoformat(),
                 'source_market_date': row.source_market_date.isoformat(),
@@ -1217,6 +1301,10 @@ class SignalDeciderExecIntegrationService:
             row_decision_agent_name = _normalize_decision_agent_name(row.decision_agent_name)
             traceability = row.traceability_payload if isinstance(row.traceability_payload, dict) else {}
             validation = row.validation_payload if isinstance(row.validation_payload, dict) else {}
+            validation = _strip_signal_decider_fixed_sizing_preview(
+                validation,
+                decision_agent_name=row_decision_agent_name,
+            )
             is_short_term = row_decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
             short_term_context = (
                 validation.get('short_term')
@@ -1236,7 +1324,16 @@ class SignalDeciderExecIntegrationService:
                 if short_term_context.get('response_payload_summary') is not None
                 else traceability.get('response_payload_summary')
             )
+            if isinstance(response_payload_summary, dict):
+                response_payload_summary = _strip_signal_decider_only_labels(
+                    response_payload_summary,
+                    decision_agent_name=row_decision_agent_name,
+                )
             quantity = _safe_decimal(row.planned_quantity)
+            uses_exec_agent_sizing = row_decision_agent_name in {
+                SIGNAL_DECIDER_AGENT_NAME,
+                SHORT_TERM_DECIDER_AGENT_NAME,
+            }
             target_price = snapshot.target_price if snapshot is not None else traceability.get('target_price')
             stop_loss_price = snapshot.stop_loss_price if snapshot is not None else traceability.get('stop_loss_price')
             trigger_price = traceability.get('trigger_price')
@@ -1249,6 +1346,23 @@ class SignalDeciderExecIntegrationService:
                 traceability=traceability,
                 validation=validation,
                 decision_traceability=decision_traceability,
+            )
+            max_holding_close_policy = (
+                {
+                    'enabled': True,
+                    'type': 'exec_agent_default',
+                    'intent': 'max_holding_close_sell',
+                    'max_holding_trading_sessions': 3,
+                    'reason': 'short_term_exec_agent_sizing_default',
+                }
+                if row_decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
+                else {
+                    'enabled': False,
+                    'type': 'none',
+                    'intent': None,
+                    'max_holding_trading_sessions': None,
+                    'reason': 'general_signal_decider_uses_decider_holding_context_no_short_term_forced_close',
+                }
             )
             common_risk_context = {
                 'schema_version': EXEC_SOURCE_SCHEMA_VERSION,
@@ -1274,6 +1388,7 @@ class SignalDeciderExecIntegrationService:
                 ),
                 'suggested_holding_period': traceability.get('suggested_holding_period'),
                 'expected_holding_period': traceability.get('expected_holding_period'),
+                'max_holding_close_policy': max_holding_close_policy,
                 'tactical_action': traceability.get('tactical_action'),
                 'original_watch_trigger_price': trigger_price,
                 'original_watch_chase_limit_price': chase_limit_price,
@@ -1290,15 +1405,17 @@ class SignalDeciderExecIntegrationService:
                 'traceability': decision_traceability,
                 'decider_handoff_context': decider_handoff_context,
             }
-            if not is_short_term:
-                quantity_policy = {
-                    'type': 'fixed_quantity',
-                    'quantity': _decimal_to_text(quantity),
-                    'budget_krw': _decimal_to_text(_safe_decimal(row.allocation_budget_krw)),
-                    'estimated_reference_price': row.estimated_reference_price,
-                    'estimated_notional_krw': _decimal_to_text(_safe_decimal(row.estimated_notional_krw)),
-                }
-            else:
+            if uses_exec_agent_sizing:
+                if row_decision_agent_name == SIGNAL_DECIDER_AGENT_NAME:
+                    estimated_notional_krw = None
+                    pricing_note = 'Sizing for signal-decider dispatch is delegated to exec-agent.'
+                else:
+                    estimated_notional_krw = _decimal_to_text(_safe_decimal(row.estimated_notional_krw))
+                    pricing_note = (
+                        validation.get('pricing_note')
+                        if isinstance(validation.get('pricing_note'), str)
+                        else None
+                    )
                 quantity_policy = {
                     'type': 'exec_agent_sized',
                     'budget_krw': _decimal_to_text(_safe_decimal(row.allocation_budget_krw)),
@@ -1306,8 +1423,16 @@ class SignalDeciderExecIntegrationService:
                     'account_reference': row.account_reference,
                     'account_label': row.account_label,
                     'estimated_reference_price': row.estimated_reference_price,
+                    'estimated_notional_krw': estimated_notional_krw,
+                    'pricing_note': pricing_note,
+                }
+            else:
+                quantity_policy = {
+                    'type': 'fixed_quantity',
+                    'quantity': _decimal_to_text(quantity),
+                    'budget_krw': _decimal_to_text(_safe_decimal(row.allocation_budget_krw)),
+                    'estimated_reference_price': row.estimated_reference_price,
                     'estimated_notional_krw': _decimal_to_text(_safe_decimal(row.estimated_notional_krw)),
-                    'pricing_note': (validation.get('pricing_note') if isinstance(validation.get('pricing_note'), str) else None),
                 }
             entry_item = {
                 'core_item_key': core_entry_key,
@@ -1362,6 +1487,12 @@ class SignalDeciderExecIntegrationService:
 
             if target_price is not None:
                 target_key = f'core-plan-{row.id}:{EXEC_INTENT_TARGET_SELL}'
+                target_quantity_policy = {
+                    'type': 'position_exit_from_entry',
+                    'linked_entry_item_key': core_entry_key,
+                }
+                if not uses_exec_agent_sizing or is_short_term:
+                    target_quantity_policy['quantity'] = _decimal_to_text(quantity)
                 items.append(
                     {
                         'core_item_key': target_key,
@@ -1370,11 +1501,7 @@ class SignalDeciderExecIntegrationService:
                         'symbol': row.symbol,
                         'side': 'sell',
                         'intent': EXEC_INTENT_TARGET_SELL,
-                        'quantity_policy': {
-                            'type': 'position_exit_from_entry',
-                            'linked_entry_item_key': core_entry_key,
-                            'quantity': _decimal_to_text(quantity),
-                        },
+                        'quantity_policy': target_quantity_policy,
                         'limit_price': None,
                         'trigger_price': target_price,
                         'time_in_force': row.planned_time_in_force,
@@ -1397,6 +1524,12 @@ class SignalDeciderExecIntegrationService:
 
             if stop_loss_price is not None:
                 stop_key = f'core-plan-{row.id}:{EXEC_INTENT_STOP_SELL}'
+                stop_quantity_policy = {
+                    'type': 'position_exit_from_entry',
+                    'linked_entry_item_key': core_entry_key,
+                }
+                if not uses_exec_agent_sizing or is_short_term:
+                    stop_quantity_policy['quantity'] = _decimal_to_text(quantity)
                 items.append(
                     {
                         'core_item_key': stop_key,
@@ -1405,11 +1538,7 @@ class SignalDeciderExecIntegrationService:
                         'symbol': row.symbol,
                         'side': 'sell',
                         'intent': EXEC_INTENT_STOP_SELL,
-                        'quantity_policy': {
-                            'type': 'position_exit_from_entry',
-                            'linked_entry_item_key': core_entry_key,
-                            'quantity': _decimal_to_text(quantity),
-                        },
+                        'quantity_policy': stop_quantity_policy,
                         'limit_price': None,
                         'trigger_price': stop_loss_price,
                         'time_in_force': row.planned_time_in_force,
@@ -1563,6 +1692,7 @@ class SignalDeciderExecIntegrationService:
             for row in persisted_rows:
                 links = []
                 row_dispatch_status = EXEC_DISPATCH_STATUS_ACCEPTED
+                entry_response_item: dict[str, Any] = {}
                 for link in row_links.get(row.id, []):
                     response_item = response_by_key.get(link['core_item_key']) or {}
                     item_status = _normalize_status(
@@ -1575,6 +1705,8 @@ class SignalDeciderExecIntegrationService:
                         rejected_item_count += 1
                     else:
                         accepted_item_count += 1
+                    if link.get('intent') == EXEC_INTENT_NEXT_OPEN_BUY:
+                        entry_response_item = response_item
                     links.append(
                         {
                             **link,
@@ -1621,11 +1753,16 @@ class SignalDeciderExecIntegrationService:
                 }
                 row_decision_agent_name = _normalize_decision_agent_name(row.decision_agent_name)
                 if row_dispatch_status in {EXEC_DISPATCH_STATUS_ACCEPTED, EXEC_DISPATCH_STATUS_PARTIAL}:
-                    row.execution_status = (
-                        EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING
-                        if row_decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
-                        else EXECUTION_STATUS_SUBMITTED
-                    )
+                    if row_decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME:
+                        row.execution_status = EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING
+                    elif row_decision_agent_name == SIGNAL_DECIDER_AGENT_NAME:
+                        row.execution_status = (
+                            EXECUTION_STATUS_SUBMITTED
+                            if _extract_agent_approved_quantity(entry_response_item) is not None
+                            else EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING
+                        )
+                    else:
+                        row.execution_status = EXECUTION_STATUS_SUBMITTED
                 else:
                     row.execution_status = EXECUTION_STATUS_SUBMIT_FAILED
                 row.submitted_at = row.submitted_at or now
