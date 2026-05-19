@@ -41,8 +41,10 @@ VALID_INTEGRATION_MODES = {
 
 EXEC_SERVICE_NAME = 'kai-trading-exec'
 EXEC_INTENT_NEXT_OPEN_BUY = 'next_open_buy'
+EXEC_INTENT_INTRADAY_WATCH_BUY = 'intraday_watch_buy'
 EXEC_INTENT_TARGET_SELL = 'target_sell'
 EXEC_INTENT_STOP_SELL = 'stop_sell'
+EXEC_ENTRY_BUY_INTENTS = {EXEC_INTENT_NEXT_OPEN_BUY, EXEC_INTENT_INTRADAY_WATCH_BUY}
 EXEC_SOURCE_SCHEMA_VERSION = 'signal_decider_exec_plan_v2'
 
 EXEC_DISPATCH_STATUS_PREVIEW = 'preview'
@@ -1388,8 +1390,9 @@ class SignalDeciderExecIntegrationService:
             stop_loss_price = snapshot.stop_loss_price if snapshot is not None else traceability.get('stop_loss_price')
             trigger_price = traceability.get('trigger_price')
             chase_limit_price = traceability.get('chase_limit_price')
-            entry_execution_mode = 'next_open_market'
-            core_entry_key = f'core-plan-{row.id}:{EXEC_INTENT_NEXT_OPEN_BUY}'
+            entry_intent = EXEC_INTENT_INTRADAY_WATCH_BUY if is_short_term else EXEC_INTENT_NEXT_OPEN_BUY
+            entry_execution_mode = 'pending_trigger_limit' if is_short_term else 'next_open_market'
+            core_entry_key = f'core-plan-{row.id}:{entry_intent}'
             decider_handoff_context = self._build_decider_handoff_context(
                 row=row,
                 snapshot=snapshot,
@@ -1461,6 +1464,8 @@ class SignalDeciderExecIntegrationService:
                     )
                 ),
                 'entry_execution_mode': entry_execution_mode,
+                'monitoring_candidate': bool(is_short_term),
+                'monitoring_intent': entry_intent if is_short_term else None,
                 'validation': validation,
                 'traceability': decision_traceability,
                 'decider_handoff_context': decider_handoff_context,
@@ -1505,10 +1510,10 @@ class SignalDeciderExecIntegrationService:
                 'decision_agent_name': row_decision_agent_name,
                 'symbol': row.symbol,
                 'side': 'buy',
-                'intent': EXEC_INTENT_NEXT_OPEN_BUY,
+                'intent': entry_intent,
                 'quantity_policy': quantity_policy,
-                'limit_price': None,
-                'trigger_price': None,
+                'limit_price': _to_json_number(_safe_decimal(chase_limit_price)) if is_short_term else None,
+                'trigger_price': _to_json_number(_safe_decimal(trigger_price)) if is_short_term else None,
                 'time_in_force': row.planned_time_in_force,
                 'risk_context': {
                     **common_risk_context,
@@ -1534,7 +1539,7 @@ class SignalDeciderExecIntegrationService:
             row_links[row.id].append(
                 {
                     'core_item_key': core_entry_key,
-                    'intent': EXEC_INTENT_NEXT_OPEN_BUY,
+                    'intent': entry_intent,
                     'side': 'buy',
                     'symbol': row.symbol,
                     'trigger_price': (
@@ -1770,7 +1775,7 @@ class SignalDeciderExecIntegrationService:
                         rejected_item_count += 1
                     else:
                         accepted_item_count += 1
-                    if link.get('intent') == EXEC_INTENT_NEXT_OPEN_BUY:
+                    if link.get('intent') in EXEC_ENTRY_BUY_INTENTS:
                         entry_response_item = response_item
                     links.append(
                         {
@@ -2506,7 +2511,7 @@ class SignalDeciderExecIntegrationService:
             'market': metadata['market'],
             'agent_name': decision_agent_name,
             'decision_agent_name': decision_agent_name,
-            'intent': EXEC_INTENT_NEXT_OPEN_BUY,
+            'intent': self._resolve_entry_intent(item=item),
             'status': status,
             'monitoring_state': monitoring_state,
             'position_side': 'long' if open_quantity > Decimal('0') or planned_quantity is not None else None,
@@ -2858,9 +2863,18 @@ class SignalDeciderExecIntegrationService:
         intents = []
         for link in dispatch.get('item_links') or []:
             intent = _normalize_optional_text(link.get('intent'), lowercase=True)
-            if intent and intent != EXEC_INTENT_NEXT_OPEN_BUY:
+            if intent and intent not in EXEC_ENTRY_BUY_INTENTS:
                 intents.append(intent)
         return sorted(dict.fromkeys(intents))
+
+    @staticmethod
+    def _resolve_entry_intent(*, item: dict[str, Any]) -> str:
+        dispatch = item.get('dispatch') if isinstance(item.get('dispatch'), dict) else {}
+        for link in dispatch.get('item_links') or []:
+            intent = _normalize_optional_text(link.get('intent'), lowercase=True)
+            if intent in EXEC_ENTRY_BUY_INTENTS:
+                return intent
+        return EXEC_INTENT_NEXT_OPEN_BUY
 
     @staticmethod
     def _resolve_average_fill_price(*, executions: Sequence[dict[str, Any]], positions: Sequence[dict[str, Any]]) -> int | float | None:

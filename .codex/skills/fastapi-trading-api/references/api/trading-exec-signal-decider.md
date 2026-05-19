@@ -3,7 +3,7 @@
 ## Summary
 Read the core-owned aggregated core↔exec view for decider-driven next-open execution. The route name is legacy, but the payload now starts from persisted `signal_decider_execution_plan_items` for both `signal-decider` and actionable `short-term-decider` rows, overlays stored exec dispatch linkage and audit state, and with `refresh=true` calls the exec northbound runtime/order/execution/position APIs before persisting the latest matched readback snapshot back onto the durable plan rows.
 
-Signal-decider and short-term entries dispatched in `SIGNAL_DECIDER_EXEC_INTEGRATION_MODE=dispatch` use the `exec_agent_sized` contract on core→exec translation, so they are routed as candidate entries and exec performs final sizing before materializing a buy.
+Signal-decider and short-term entries dispatched in `SIGNAL_DECIDER_EXEC_INTEGRATION_MODE=dispatch` use the `exec_agent_sized` contract on core→exec translation, so they are routed as candidate entries and exec performs final sizing before materializing a buy. Classic signal-decider rows keep the `next_open_buy` intent. Short-term tactical rows use `intraday_watch_buy` with the decider's trigger and chase-limit prices so exec treats them as monitored intraday candidates, not unconditional next-open orders.
 
 Each exec item also carries `risk_context.decider_handoff_context`, which preserves execution/risk context, input feature snapshots, pre-decider enrichment context, response payload/summary, normalized tactical output fields, risk/data-quality warnings, and traceability ids. Accepted rows without an agent-approved positive quantity remain delegated sizing candidates in core (`execution_status="delegated_for_exec_agent_sizing"`) until exec readback reports scheduled/submitted/filled/monitoring outcomes.
 
@@ -135,7 +135,9 @@ GET /trading/orders/exec/signal-decider?target_trade_date=2026-04-30&symbol=0059
         "plan_id": "core-short_term_decider-20260430-KIS_12345678_01",
         "item_links": [
           {
-            "intent": "next_open_buy",
+            "intent": "intraday_watch_buy",
+            "trigger_price": 50500,
+            "limit_price": 51500,
             "exec_plan_item_id": "exec-item-4"
           },
           {
@@ -161,4 +163,4 @@ GET /trading/orders/exec/signal-decider?target_trade_date=2026-04-30&symbol=0059
 }
 ```
 
-Dispatch is grouped by `account_reference + decision_agent_name`, so same-symbol same-date rows from different deciders do not collide. `signal-decider` entry legs keep the existing next-open market semantics, while `short-term-decider` entry legs are dispatched as `pending_trigger_limit` candidates using `trigger_price` and `chase_limit_price`.
+Dispatch is grouped by `account_reference + decision_agent_name`, so same-symbol same-date rows from different deciders do not collide. `signal-decider` entry legs keep the existing next-open market semantics, while `short-term-decider` entry legs are dispatched as `intraday_watch_buy` / `pending_trigger_limit` candidates using `trigger_price` and `chase_limit_price`.

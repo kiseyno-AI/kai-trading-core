@@ -532,7 +532,8 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(by_agent['short-term-decider']['client_order_id'], 'STDE-20260430-005930')
         self.assertEqual(by_agent['short-term-decider']['eligibility_status'], ELIGIBILITY_ELIGIBLE)
 
-    def test_refresh_plan_items_selects_short_term_watchers_at_confidence_threshold(self) -> None:
+    def test_refresh_plan_items_dispatches_low_confidence_short_term_watchers_for_monitoring(self) -> None:
+        settings.signal_decider_exec_integration_mode = 'dispatch'
         self._seed_short_term_snapshot(symbol='005930', confidence_score_10=6.0)
         self._seed_short_term_snapshot(symbol='000660', confidence_score_10=5.9)
         service = self._service(state='PREOPEN', server_time='2026-04-30T08:40:00+09:00')
@@ -548,11 +549,28 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             result = service.refresh_plan_items(target_trade_date=self.target_trade_date, trigger='test')
 
         items_by_symbol = {item['symbol']: item for item in result['items']}
+        self.assertEqual(result['summary']['eligible_count'], 2)
         self.assertEqual(items_by_symbol['005930']['eligibility_status'], ELIGIBILITY_ELIGIBLE)
-        self.assertEqual(items_by_symbol['000660']['eligibility_status'], ELIGIBILITY_BLOCKED)
-        self.assertEqual(
-            items_by_symbol['000660']['validation']['blocking_reasons'][0]['code'],
+        self.assertEqual(items_by_symbol['000660']['eligibility_status'], ELIGIBILITY_ELIGIBLE)
+        self.assertEqual(items_by_symbol['000660']['validation']['blocking_reasons'], [])
+        self.assertIn(
             'confidence_below_threshold',
+            {warning['code'] for warning in items_by_symbol['000660']['validation']['warnings']},
+        )
+        self.assertEqual(
+            Decimal(str(items_by_symbol['000660']['validation']['short_term']['confidence_score_10'])),
+            Decimal('5.9'),
+        )
+        self.assertEqual(items_by_symbol['000660']['validation']['short_term']['tactical_action'], 'watch_for_trigger')
+        self.assertEqual(items_by_symbol['000660']['validation']['short_term']['trigger_price'], 50500)
+        self.assertEqual(items_by_symbol['000660']['validation']['short_term']['chase_limit_price'], 51500)
+        self.assertEqual(
+            Decimal(str(items_by_symbol['000660']['traceability']['confidence_score_10'])),
+            Decimal('5.9'),
+        )
+        self.assertEqual(
+            items_by_symbol['000660']['traceability']['core_execution_classification'],
+            EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING,
         )
 
     def test_refresh_plan_items_attaches_pre_decider_enrichment_to_short_term_validation(self) -> None:
