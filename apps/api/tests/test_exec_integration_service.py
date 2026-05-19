@@ -465,8 +465,11 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             entry_item['risk_context']['decider_handoff_context']['classification'],
             EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING,
         )
-        self.assertNotIn('quantity', payload['items'][1]['quantity_policy'])
-        self.assertNotIn('quantity', payload['items'][2]['quantity_policy'])
+        entry_key = entry_item['core_item_key']
+        for exit_item in payload['items'][1:]:
+            self.assertEqual(exit_item['quantity_policy']['type'], 'position_exit_from_entry')
+            self.assertEqual(exit_item['quantity_policy']['linked_entry_item_key'], entry_key)
+            self.assertNotIn('quantity', exit_item['quantity_policy'])
 
         with session_scope() as session:
             row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
@@ -667,6 +670,17 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(short_entry['quantity_policy']['account_reference'], self.account_reference)
         self.assertEqual(short_entry['quantity_policy']['account_label'], 'Main')
         self.assertEqual(short_entry['risk_context']['classification'], EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING)
+        short_items_by_intent = {item['intent']: item for item in short_payload['items']}
+        self.assertEqual(
+            set(short_items_by_intent),
+            {EXEC_INTENT_INTRADAY_WATCH_BUY, EXEC_INTENT_TARGET_SELL, EXEC_INTENT_STOP_SELL},
+        )
+        short_entry_key = short_entry['core_item_key']
+        for exit_intent in (EXEC_INTENT_TARGET_SELL, EXEC_INTENT_STOP_SELL):
+            exit_policy = short_items_by_intent[exit_intent]['quantity_policy']
+            self.assertEqual(exit_policy['type'], 'position_exit_from_entry')
+            self.assertEqual(exit_policy['linked_entry_item_key'], short_entry_key)
+            self.assertNotIn('quantity', exit_policy)
         self.assertEqual(
             short_entry['risk_context']['max_holding_close_policy'],
             {

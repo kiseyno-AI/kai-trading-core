@@ -1561,7 +1561,7 @@ class SignalDeciderExecIntegrationService:
                     'type': 'position_exit_from_entry',
                     'linked_entry_item_key': core_entry_key,
                 }
-                if not uses_exec_agent_sizing or is_short_term:
+                if not uses_exec_agent_sizing:
                     target_quantity_policy['quantity'] = _decimal_to_text(quantity)
                 items.append(
                     {
@@ -1598,7 +1598,7 @@ class SignalDeciderExecIntegrationService:
                     'type': 'position_exit_from_entry',
                     'linked_entry_item_key': core_entry_key,
                 }
-                if not uses_exec_agent_sizing or is_short_term:
+                if not uses_exec_agent_sizing:
                     stop_quantity_policy['quantity'] = _decimal_to_text(quantity)
                 items.append(
                     {
