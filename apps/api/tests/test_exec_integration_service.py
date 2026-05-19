@@ -17,6 +17,8 @@ from app.db_models import (
     Symbol,
 )
 from app.orders.exec_integration import (
+    EXEC_ENTRY_BUY_INTENTS,
+    EXEC_INTENT_INTRADAY_WATCH_BUY,
     EXEC_INTENT_NEXT_OPEN_BUY,
     EXEC_INTENT_STOP_SELL,
     EXEC_INTENT_TARGET_SELL,
@@ -59,7 +61,7 @@ class FakeExecClient:
                 'status': 'accepted',
             }
             if (
-                item.get('intent') == EXEC_INTENT_NEXT_OPEN_BUY
+                item.get('intent') in EXEC_ENTRY_BUY_INTENTS
                 and (item.get('quantity_policy') or {}).get('type') == 'exec_agent_sized'
             ):
                 agent_sizing_payload = (
@@ -220,6 +222,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         request_payload: dict | None = None,
         input_feature_snapshot_payload: dict | None = None,
         response_payload_extra: dict | None = None,
+        confidence_score_10: float = 7.3,
     ) -> int:
         generic_action = 'buy' if tactical_action in {'scalp_buy_candidate', 'watch_for_trigger'} else tactical_action
         if generic_action not in {'buy', 'wait', 'reject'}:
@@ -242,7 +245,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 expected_return_pct=None,
                 stop_loss_price=stop_loss_price,
                 suggested_holding_period='1-2 trading days',
-                confidence_score_10=7.3,
+                confidence_score_10=confidence_score_10,
                 conviction_score_10=6.5,
                 thesis_summary='Dispatch guarded short-term setup.',
                 supporting_evidence_payload=['Opening setup stayed constructive.'],
@@ -271,7 +274,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                     'target_price': target_price,
                     'stop_loss_price': stop_loss_price,
                     'expected_holding_period': '1-2 trading days',
-                    'confidence_score_10': 7.3,
+                    'confidence_score_10': confidence_score_10,
                     'conviction_score_10': 6.5,
                     **(response_payload_extra or {}),
                 },
@@ -462,8 +465,11 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             entry_item['risk_context']['decider_handoff_context']['classification'],
             EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING,
         )
-        self.assertNotIn('quantity', payload['items'][1]['quantity_policy'])
-        self.assertNotIn('quantity', payload['items'][2]['quantity_policy'])
+        entry_key = entry_item['core_item_key']
+        for exit_item in payload['items'][1:]:
+            self.assertEqual(exit_item['quantity_policy']['type'], 'position_exit_from_entry')
+            self.assertEqual(exit_item['quantity_policy']['linked_entry_item_key'], entry_key)
+            self.assertNotIn('quantity', exit_item['quantity_policy'])
 
         with session_scope() as session:
             row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
@@ -602,6 +608,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         short_snapshot_id = self._seed_short_term_snapshot(
             request_payload=decider_request_payload,
             input_feature_snapshot_payload=decider_input_features,
+            confidence_score_10=5.2,
             response_payload_extra={
                 'trigger_conditions': ['Reclaim 50500 with volume.'],
                 'risk_flags': ['Opening gap risk.'],
@@ -637,11 +644,14 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('max_holding_close_sell', [item['intent'] for item in signal_payload['items']])
         short_entry = short_payload['items'][0]
         self.assertEqual(short_entry['decision_agent_name'], 'short-term-decider')
-        self.assertIsNone(short_entry['trigger_price'])
-        self.assertIsNone(short_entry['limit_price'])
+        self.assertEqual(short_entry['intent'], EXEC_INTENT_INTRADAY_WATCH_BUY)
+        self.assertEqual(short_entry['trigger_price'], 50500)
+        self.assertEqual(short_entry['limit_price'], 51500)
         self.assertEqual(short_entry['risk_context']['agent_name'], 'short-term-decider')
         self.assertEqual(short_entry['risk_context']['decision_agent_name'], 'short-term-decider')
-        self.assertEqual(short_entry['risk_context']['entry_execution_mode'], 'next_open_market')
+        self.assertEqual(short_entry['risk_context']['entry_execution_mode'], 'pending_trigger_limit')
+        self.assertTrue(short_entry['risk_context']['monitoring_candidate'])
+        self.assertEqual(short_entry['risk_context']['monitoring_intent'], EXEC_INTENT_INTRADAY_WATCH_BUY)
         self.assertEqual(short_entry['risk_context']['original_watch_trigger_price'], 50500)
         self.assertEqual(short_entry['risk_context']['original_watch_chase_limit_price'], 51500)
         self.assertNotIn('trigger_price', short_entry['risk_context'])
@@ -651,7 +661,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('source_market_date', short_entry['risk_context'])
         self.assertEqual(short_entry['risk_context']['allocation_mode'], 'specified')
         self.assertEqual(Decimal(str(short_entry['risk_context']['allocation_budget_krw'])), Decimal('1500000'))
-        self.assertEqual(short_entry['risk_context']['confidence_score_10'], 7.3)
+        self.assertEqual(short_entry['risk_context']['confidence_score_10'], 5.2)
         self.assertEqual(short_entry['risk_context']['conviction_score_10'], 6.5)
         self.assertEqual(short_entry['risk_context']['decision_run_id'], 'short-run-1')
         self.assertEqual(short_entry['quantity_policy']['type'], 'exec_agent_sized')
@@ -660,6 +670,17 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(short_entry['quantity_policy']['account_reference'], self.account_reference)
         self.assertEqual(short_entry['quantity_policy']['account_label'], 'Main')
         self.assertEqual(short_entry['risk_context']['classification'], EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING)
+        short_items_by_intent = {item['intent']: item for item in short_payload['items']}
+        self.assertEqual(
+            set(short_items_by_intent),
+            {EXEC_INTENT_INTRADAY_WATCH_BUY, EXEC_INTENT_TARGET_SELL, EXEC_INTENT_STOP_SELL},
+        )
+        short_entry_key = short_entry['core_item_key']
+        for exit_intent in (EXEC_INTENT_TARGET_SELL, EXEC_INTENT_STOP_SELL):
+            exit_policy = short_items_by_intent[exit_intent]['quantity_policy']
+            self.assertEqual(exit_policy['type'], 'position_exit_from_entry')
+            self.assertEqual(exit_policy['linked_entry_item_key'], short_entry_key)
+            self.assertNotIn('quantity', exit_policy)
         self.assertEqual(
             short_entry['risk_context']['max_holding_close_policy'],
             {
@@ -695,10 +716,12 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             short_entry['risk_context']['execution_feasibility_context']['liquidity_tier'],
             'medium',
         )
+        self.assertEqual(Decimal(str(handoff['decider_output']['confidence_score_10'])), Decimal('5.2'))
         self.assertIn('sizing_hints', short_entry['quantity_policy'])
         self.assertEqual(short_entry['quantity_policy']['max_safe_notional_krw'], 49350000)
         self.assertEqual(handoff['decider_output']['response_payload']['trigger_conditions'], ['Reclaim 50500 with volume.'])
         self.assertEqual(handoff['decider_output']['response_payload']['risk_flags'], ['Opening gap risk.'])
+        self.assertEqual(Decimal(str(handoff['decider_output']['response_payload']['confidence_score_10'])), Decimal('5.2'))
         self.assertEqual(result['summary']['translated_item_count'], 6)
         self.assertEqual(
             {group['decision_agent_name'] for group in result['dispatch']['groups']},
@@ -730,9 +753,11 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             payload for payload in self.client.post_calls if payload['metadata']['decision_agent_name'] == 'short-term-decider'
         )
         self.assertEqual(len(short_payload['items']), 1)
-        self.assertIsNone(short_payload['items'][0]['trigger_price'])
-        self.assertIsNone(short_payload['items'][0]['limit_price'])
-        self.assertEqual(short_payload['items'][0]['risk_context']['entry_execution_mode'], 'next_open_market')
+        self.assertEqual(short_payload['items'][0]['intent'], EXEC_INTENT_INTRADAY_WATCH_BUY)
+        self.assertEqual(short_payload['items'][0]['trigger_price'], 50500)
+        self.assertEqual(short_payload['items'][0]['limit_price'], 51500)
+        self.assertEqual(short_payload['items'][0]['risk_context']['entry_execution_mode'], 'pending_trigger_limit')
+        self.assertTrue(short_payload['items'][0]['risk_context']['monitoring_candidate'])
         self.assertEqual(short_payload['items'][0]['quantity_policy']['type'], 'exec_agent_sized')
 
     async def test_dispatch_next_open_plan_short_term_idempotent_redispatch_skips_duplicate_payload(self) -> None:

@@ -805,12 +805,20 @@ class SignalDeciderNextOpenExecutionService:
 
         confidence_score = _to_decimal(snapshot.confidence_score_10)
         if confidence_score is None or confidence_score < Decimal(str(settings.signal_decider_next_open_min_confidence_score_10)):
-            blocking_reasons.append(
-                _reason(
-                    'confidence_below_threshold',
-                    'Confidence score is below the next-open automation threshold.',
+            if decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME and _exec_agent_sizing_dispatch_enabled():
+                warnings.append(
+                    _reason(
+                        'confidence_below_threshold',
+                        'Confidence score is below the next-open automation threshold; dispatched to exec for intraday monitoring only.',
+                    )
                 )
-            )
+            else:
+                blocking_reasons.append(
+                    _reason(
+                        'confidence_below_threshold',
+                        'Confidence score is below the next-open automation threshold.',
+                    )
+                )
         data_quality_warnings = _normalize_text_list(snapshot.data_quality_warnings_payload)
         if settings.signal_decider_next_open_block_on_data_warnings and data_quality_warnings:
             if decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME and _exec_agent_sizing_dispatch_enabled():

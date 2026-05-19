@@ -36,7 +36,7 @@ GET /execution/runtime/daily-board?market_date=2026-04-30&refresh=true
       "market": "KOSPI",
       "agent_name": "short-term-decider",
       "decision_agent_name": "short-term-decider",
-      "intent": "next_open_buy",
+      "intent": "intraday_watch_buy",
       "status": "filled",
       "monitoring_state": "watching_target_stop",
       "planned_quantity": 5,
