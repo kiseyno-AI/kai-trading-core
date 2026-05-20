@@ -44,6 +44,30 @@ class PykrxBackfillServiceTests(TestCase):
             [PykrxSymbol(symbol='005930', market='KOSPI', name_ko='삼성전자')],
         )
 
+    def test_fetch_recent_universe_falls_back_to_ticker_when_name_lookup_returns_frame(self) -> None:
+        service = PykrxBackfillService()
+        service.name_pause_seconds = 0
+        frame = pd.DataFrame({'현재가': [196500]}, index=['005930'])
+        bad_name = pd.DataFrame({'unexpected': ['html']})
+
+        def fake_call(func, *args, **kwargs):
+            if func.__name__ == 'get_market_ohlcv_by_ticker':
+                return frame
+            if func.__name__ == 'get_market_ticker_name':
+                return bad_name
+            raise AssertionError(f'unexpected pykrx function: {func.__name__}')
+
+        with (
+            patch.object(service, 'resolve_latest_trade_date', return_value='2026-04-07'),
+            patch('app.eod.pykrx_backfill._call_pykrx', side_effect=fake_call),
+        ):
+            result = service.fetch_recent_universe_snapshot(markets=('KOSPI',))
+
+        self.assertEqual(
+            result['symbols'],
+            [PykrxSymbol(symbol='005930', market='KOSPI', name_ko='005930')],
+        )
+
     def test_fetch_recent_universe_falls_back_per_market_when_pykrx_market_ohlcv_breaks(self) -> None:
         service = PykrxBackfillService()
         service.name_pause_seconds = 0
