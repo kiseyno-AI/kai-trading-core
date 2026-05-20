@@ -10,7 +10,9 @@ from sqlalchemy.dialects.postgresql import insert
 from app.agent_context.signal_decider_loop_service import (
     DEFAULT_SIGNAL_DECIDER_EVALUATION_LOOKBACK_DAYS,
     DEFAULT_SIGNAL_DECIDER_EVALUATION_VERSION,
+    SIGNAL_DECIDER_BULK_UPSERT_CHUNK_SIZE,
     SIGNAL_DECIDER_EVALUATION_HORIZONS,
+    _iter_bulk_upsert_chunks,
     _normalize_horizons,
     _normalize_market_date,
     _normalize_optional_text,
@@ -154,8 +156,14 @@ class SignalDeciderCalendarReviewRepository:
     def bulk_upsert_review_items(self, *, items: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
         if not items:
             return []
+        item_list = list(items)
+        if len(item_list) > SIGNAL_DECIDER_BULK_UPSERT_CHUNK_SIZE:
+            results: list[dict[str, Any]] = []
+            for chunk in _iter_bulk_upsert_chunks(item_list):
+                results.extend(self.bulk_upsert_review_items(items=chunk))
+            return results
         with session_scope() as session:
-            stmt = insert(SignalDeciderCalendarReviewItem).values(list(items))
+            stmt = insert(SignalDeciderCalendarReviewItem).values(item_list)
             excluded = stmt.excluded
             stmt = stmt.on_conflict_do_update(
                 constraint='uq_sd_cal_review_items_snapshot_eval_horizon',
@@ -193,7 +201,7 @@ class SignalDeciderCalendarReviewRepository:
             }
             return [
                 by_key[(item['decision_snapshot_id'], item['evaluation_version'], item['primary_horizon_days'])]
-                for item in items
+                for item in item_list
             ]
 
     def list_review_items(

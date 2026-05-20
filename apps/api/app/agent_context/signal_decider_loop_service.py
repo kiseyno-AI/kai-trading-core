@@ -35,6 +35,23 @@ DEFAULT_SIGNAL_DECIDER_POLICY_CREATED_BY = 'system:bootstrap'
 DEFAULT_SIGNAL_DECIDER_POLICY_ACTIVATION_MODE = 'manual_only'
 DEFAULT_POLICY_CANDIDATE_STATUS = 'generated'
 DEFAULT_SIGNAL_DECIDER_EVALUATION_LOOKBACK_DAYS = 30
+# Keep multi-row INSERT/UPSERT calls well below PostgreSQL/psycopg's
+# 65,535-parameter limit. Realized outcomes currently bind ~30 params/row,
+# so a 1,000 row chunk leaves margin for future columns.
+SIGNAL_DECIDER_BULK_UPSERT_CHUNK_SIZE = 1000
+
+
+def _iter_bulk_upsert_chunks(
+    items: Sequence[dict[str, Any]],
+    *,
+    chunk_size: int = SIGNAL_DECIDER_BULK_UPSERT_CHUNK_SIZE,
+) -> list[list[dict[str, Any]]]:
+    if chunk_size < 1:
+        raise ValueError('chunk_size must be >= 1')
+    item_list = list(items)
+    return [item_list[index : index + chunk_size] for index in range(0, len(item_list), chunk_size)]
+
+
 DEFAULT_SIGNAL_DECIDER_REVIEW_PRIMARY_HORIZON = 5
 DEFAULT_SIGNAL_DECIDER_REVIEW_HORIZONS: tuple[int, ...] = (1, 3, 5)
 SIGNAL_DECIDER_REPLAY_REVIEW_VERSION = 'signal_decider_replay_review_v1'
@@ -1661,8 +1678,14 @@ class SignalDeciderLoopRepository:
     def bulk_upsert_realized_outcomes(self, *, items: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
         if not items:
             return []
+        item_list = list(items)
+        if len(item_list) > SIGNAL_DECIDER_BULK_UPSERT_CHUNK_SIZE:
+            results: list[dict[str, Any]] = []
+            for chunk in _iter_bulk_upsert_chunks(item_list):
+                results.extend(self.bulk_upsert_realized_outcomes(items=chunk))
+            return results
         with session_scope() as session:
-            stmt = insert(SignalDeciderRealizedOutcome).values(list(items))
+            stmt = insert(SignalDeciderRealizedOutcome).values(item_list)
             excluded = stmt.excluded
             stmt = stmt.on_conflict_do_update(
                 constraint='uq_signal_decider_realized_outcomes_snapshot_horizon',
@@ -1705,13 +1728,19 @@ class SignalDeciderLoopRepository:
                 (row.decision_snapshot_id, row.horizon_days): _serialize_outcome_row(row)
                 for row in rows
             }
-            return [by_key[(item['decision_snapshot_id'], item['horizon_days'])] for item in items]
+            return [by_key[(item['decision_snapshot_id'], item['horizon_days'])] for item in item_list]
 
     def bulk_upsert_evaluations(self, *, items: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
         if not items:
             return []
+        item_list = list(items)
+        if len(item_list) > SIGNAL_DECIDER_BULK_UPSERT_CHUNK_SIZE:
+            results: list[dict[str, Any]] = []
+            for chunk in _iter_bulk_upsert_chunks(item_list):
+                results.extend(self.bulk_upsert_evaluations(items=chunk))
+            return results
         with session_scope() as session:
-            stmt = insert(SignalDeciderEvaluation).values(list(items))
+            stmt = insert(SignalDeciderEvaluation).values(item_list)
             excluded = stmt.excluded
             stmt = stmt.on_conflict_do_update(
                 constraint='uq_signal_decider_evaluations_snapshot_horizon_version',
@@ -1745,7 +1774,7 @@ class SignalDeciderLoopRepository:
             }
             return [
                 by_key[(item['decision_snapshot_id'], item['horizon_days'], item['evaluation_version'])]
-                for item in items
+                for item in item_list
             ]
 
     def bulk_upsert_policy_candidates(self, *, items: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:

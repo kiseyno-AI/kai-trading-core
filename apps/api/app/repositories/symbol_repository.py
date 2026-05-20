@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import logging
 
 from sqlalchemy import delete, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -8,6 +9,9 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from app.db import session_scope
 from app.db_models import Symbol, TrackedSymbol
 from app.scanner.state import scanner_state
+
+
+logger = logging.getLogger(__name__)
 
 
 def _get_symbol(session, symbol: str) -> Symbol | None:
@@ -60,6 +64,62 @@ def ensure_symbol(
         return record.id
 
 
+def _coerce_optional_text(value: object) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        normalized = value.strip()
+        return normalized or None
+    return None
+
+
+def _coerce_required_text(value: object) -> str | None:
+    if isinstance(value, str):
+        normalized = value.strip()
+        return normalized or None
+    return None
+
+
+def _build_symbol_universe_rows(items: list, *, source: str, instrument_type: str, refreshed_at: datetime) -> tuple[list[dict], list[object]]:
+    symbol_rows: list[dict] = []
+    valid_items: list[object] = []
+    skipped_items = 0
+
+    for entry in items:
+        symbol = _coerce_required_text(getattr(entry, 'symbol', None))
+        market = _coerce_required_text(getattr(entry, 'market', None))
+        if symbol and symbol.isdigit():
+            symbol = symbol.zfill(6)
+        name_ko = _coerce_optional_text(getattr(entry, 'name_ko', None)) or symbol
+        standard_code = _coerce_optional_text(getattr(entry, 'standard_code', None))
+        if not symbol or not market:
+            skipped_items += 1
+            logger.warning(
+                'Skipping invalid symbol universe row from %s: symbol_type=%s market_type=%s',
+                source,
+                type(getattr(entry, 'symbol', None)).__name__,
+                type(getattr(entry, 'market', None)).__name__,
+            )
+            continue
+        symbol_rows.append(
+            {
+                'symbol': symbol,
+                'standard_code': standard_code,
+                'name_ko': name_ko,
+                'market': market,
+                'instrument_type': instrument_type,
+                'source': source,
+                'is_active': True,
+                'last_refreshed_at': refreshed_at,
+            }
+        )
+        valid_items.append(entry)
+
+    if skipped_items:
+        logger.warning('Skipped %s invalid symbol universe rows from %s before DB upsert', skipped_items, source)
+    return symbol_rows, valid_items
+
+
 def upsert_symbol_universe(
     items: list,
     *,
@@ -72,19 +132,14 @@ def upsert_symbol_universe(
         return 0
 
     refreshed_at = datetime.utcnow()
-    symbol_rows = [
-        {
-            'symbol': entry.symbol,
-            'standard_code': getattr(entry, 'standard_code', None),
-            'name_ko': entry.name_ko,
-            'market': entry.market,
-            'instrument_type': instrument_type,
-            'source': source,
-            'is_active': True,
-            'last_refreshed_at': refreshed_at,
-        }
-        for entry in items
-    ]
+    symbol_rows, valid_items = _build_symbol_universe_rows(
+        items,
+        source=source,
+        instrument_type=instrument_type,
+        refreshed_at=refreshed_at,
+    )
+    if not symbol_rows:
+        return 0
 
     with session_scope() as session:
         statement = pg_insert(Symbol).values(symbol_rows)
@@ -105,16 +160,17 @@ def upsert_symbol_universe(
         )
         stale_source_names = [source] if stale_sources is None else stale_sources
         if stale_source_names:
-            target_markets = stale_markets or list({entry.market for entry in items if getattr(entry, 'market', None)})
+            valid_symbols = [row['symbol'] for row in symbol_rows]
+            target_markets = stale_markets or list({row['market'] for row in symbol_rows if row.get('market')})
             stale_stmt = (
                 update(Symbol)
-                .where(Symbol.source.in_(stale_source_names), ~Symbol.symbol.in_([entry.symbol for entry in items]))
+                .where(Symbol.source.in_(stale_source_names), ~Symbol.symbol.in_(valid_symbols))
                 .values(is_active=False, last_refreshed_at=refreshed_at, updated_at=refreshed_at)
             )
             if target_markets:
                 stale_stmt = stale_stmt.where(Symbol.market.in_(target_markets))
             session.execute(stale_stmt)
-    return len(items)
+    return len(valid_items)
 
 
 def upsert_master_symbols(items: list) -> int:

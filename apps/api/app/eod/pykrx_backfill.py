@@ -126,6 +126,30 @@ def _call_pykrx(func, *args, **kwargs):
         return func(*args, **kwargs)
 
 
+def _coerce_pykrx_ticker_name(value: object, *, ticker: str) -> str:
+    """Return a DB-safe ticker name from pykrx output.
+
+    pykrx normally returns a plain string from ``get_market_ticker_name``.
+    During provider/session instability it can return non-scalar objects (for
+    example an HTML-parsed DataFrame).  Those objects cannot be bound into the
+    symbols table by psycopg, so keep the daily pipeline moving by falling back
+    to the ticker code and logging the unexpected shape for diagnosis.
+    """
+
+    if isinstance(value, str):
+        normalized = value.strip()
+        return normalized or ticker
+    if value is None:
+        return ticker
+
+    logger.warning(
+        'pykrx ticker name lookup returned non-string value for %s: %s',
+        ticker,
+        type(value).__name__,
+    )
+    return ticker
+
+
 def _get_market_ohlcv_by_date(start_date: str, end_date: str, symbol: str):
     getter = getattr(stock, 'get_market_ohlcv_by_date', None) or getattr(stock, 'get_market_ohlcv')
     return _call_pykrx(getter, start_date, end_date, symbol)
@@ -361,10 +385,12 @@ class PykrxBackfillService:
                 continue
             for ticker in tickers:
                 try:
-                    name_ko = _call_pykrx(stock.get_market_ticker_name, ticker)
+                    raw_name_ko = _call_pykrx(stock.get_market_ticker_name, ticker)
                 except Exception:
                     logger.warning('Falling back to ticker as name for %s', ticker)
                     name_ko = ticker
+                else:
+                    name_ko = _coerce_pykrx_ticker_name(raw_name_ko, ticker=ticker)
                 items.append(
                     PykrxSymbol(
                         symbol=ticker,
