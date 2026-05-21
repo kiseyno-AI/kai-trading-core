@@ -44,6 +44,7 @@ class PykrxPipelineDependencies:
     complete_eod_collection_run: Callable[..., None]
     persist_daily_price_bars: Callable[..., int]
     get_market_ohlcv_by_date: Callable[..., Any]
+    get_market_ohlcv_by_ticker: Callable[..., Any] | None
     price_context_service: Any
     technical_snapshot_service: Any
     action_summary_service: Any
@@ -152,6 +153,100 @@ def _run_daily_external_news_followup(*, market_date: str, enabled: bool) -> dic
         'triggered': True,
         **result,
     }
+
+
+def _frame_value(frame: Any, symbol: str, column: str) -> Any:
+    if frame is None or getattr(frame, 'empty', False):
+        return None
+    try:
+        if symbol in frame.index and column in frame.columns:
+            return frame.loc[symbol, column]
+    except Exception:
+        pass
+    try:
+        row = frame.loc[symbol]
+        if hasattr(row, 'get'):
+            return row.get(column)
+    except Exception:
+        return None
+    return None
+
+
+def _to_int_or_none(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        if hasattr(value, 'item'):
+            value = value.item()
+        converted = int(value)
+    except (TypeError, ValueError):
+        return None
+    return converted if converted > 0 else None
+
+
+def _enrich_bars_with_market_turnover(
+    *,
+    bars: list[dict[str, Any]],
+    symbol: str,
+    market: str,
+    dependencies: PykrxPipelineDependencies,
+    market_turnover_cache: dict[tuple[str, str], Any],
+    run_id: int | None,
+) -> list[dict[str, Any]]:
+    getter = dependencies.get_market_ohlcv_by_ticker
+    if getter is None or not bars:
+        return bars
+    enriched: list[dict[str, Any]] = []
+    for bar in bars:
+        trade_date = str(bar.get('trade_date'))
+        pykrx_date = trade_date.replace('-', '')
+        cache_key = (pykrx_date, market)
+        if cache_key not in market_turnover_cache:
+            try:
+                market_turnover_cache[cache_key] = getter(pykrx_date, market)
+            except Exception as exc:
+                market_turnover_cache[cache_key] = None
+                dependencies.log_fetch(
+                    'fetch_market_ohlcv_turnover',
+                    'failed',
+                    run_id=run_id,
+                    market=market,
+                    trade_date=trade_date,
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
+                )
+        provider_turnover = _to_int_or_none(_frame_value(market_turnover_cache.get(cache_key), symbol, '거래대금'))
+        if provider_turnover is not None:
+            updated = dict(bar)
+            updated['turnover'] = provider_turnover
+            enriched.append(updated)
+            continue
+        enriched.append(bar)
+    return enriched
+
+
+def _run_daily_intraday_snapshot_followup(*, market_date: str, enabled: bool) -> dict[str, Any]:
+    if not enabled:
+        return {'triggered': False, 'reason': 'followup_disabled', 'market_date': market_date}
+    from datetime import date
+
+    from app.agent_context.eligibility import load_agent_feedback_eligible_symbols
+    from app.core.settings import settings
+    from app.market.kis_intraday_snapshots import kis_intraday_snapshot_service
+
+    symbols = load_agent_feedback_eligible_symbols(market_date=date.fromisoformat(market_date))
+    if not symbols:
+        return {'triggered': False, 'reason': 'no_agent_feedback_eligible_symbols', 'market_date': market_date}
+    result = asyncio.run(
+        kis_intraday_snapshot_service.collect_snapshots(
+            symbols=symbols,
+            market_code=settings.kis_intraday_snapshot_market_code,
+            max_ranking_pages=settings.kis_intraday_snapshot_max_ranking_pages,
+            max_news_items=settings.kis_intraday_snapshot_news_limit,
+            include_news=False,
+        )
+    )
+    return {'triggered': True, 'market_date': market_date, **result}
 
 
 def _run_daily_feedback_followup(*, market_date: str, enabled: bool) -> dict[str, Any]:
@@ -382,6 +477,7 @@ def run_market_data_pipeline(
             )
 
     try:
+        market_turnover_cache: dict[tuple[str, str], Any] = {}
         for index, item in enumerate(symbols):
             symbol_started_at = time.perf_counter()
             try:
@@ -394,6 +490,14 @@ def run_market_data_pipeline(
                     end_date=normalized_end,
                 )
                 bars = service._map_symbol_bars(frame, fundamentals_frame=fundamentals_frame)
+                bars = _enrich_bars_with_market_turnover(
+                    bars=bars,
+                    symbol=item.symbol,
+                    market=item.market,
+                    dependencies=dependencies,
+                    market_turnover_cache=market_turnover_cache,
+                    run_id=run_id,
+                )
                 persisted_count = dependencies.persist_daily_price_bars(
                     item.symbol,
                     bars,
@@ -943,6 +1047,10 @@ def run_market_data_pipeline(
                 'market_date': latest_trade_date,
                 'fundamentals_status': fundamentals_status or None,
             }
+        result['intraday_snapshot_followup'] = _run_daily_intraday_snapshot_followup(
+            market_date=latest_trade_date,
+            enabled=bool(dependencies.settings.kis_intraday_snapshot_enabled),
+        )
         result['feedback_followup'] = _run_daily_feedback_followup(
             market_date=latest_trade_date,
             enabled=bool(dependencies.settings.openclaw_feedback_trigger_after_fundamentals_refresh),
@@ -965,6 +1073,10 @@ def run_market_data_pipeline(
         result['external_news_followup'] = _run_daily_external_news_followup(
             market_date=latest_trade_date,
             enabled=True,
+        )
+        result['intraday_snapshot_followup'] = _run_daily_intraday_snapshot_followup(
+            market_date=latest_trade_date,
+            enabled=bool(dependencies.settings.kis_intraday_snapshot_enabled),
         )
         result['feedback_followup'] = _run_daily_feedback_followup(
             market_date=latest_trade_date,

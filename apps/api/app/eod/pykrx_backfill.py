@@ -155,6 +155,17 @@ def _get_market_ohlcv_by_date(start_date: str, end_date: str, symbol: str):
     return _call_pykrx(getter, start_date, end_date, symbol)
 
 
+def _get_market_ohlcv_by_ticker(trade_date: str, market: str):
+    """Return market-wide OHLCV for one date.
+
+    PyKRX's per-symbol date-range API can omit/zero 거래대금 depending on the
+    endpoint/version, while the market-wide daily API carries provider trading
+    value.  Use this as the authoritative turnover source for EOD bars.
+    """
+    getter = getattr(stock, 'get_market_ohlcv_by_ticker', None) or getattr(stock, 'get_market_ohlcv')
+    return _call_pykrx(getter, trade_date, market)
+
+
 def _get_market_fundamental_by_date(start_date: str, end_date: str, symbol: str):
     getter = getattr(stock, 'get_market_fundamental_by_date', None) or getattr(stock, 'get_market_fundamental')
     return _call_pykrx(getter, start_date, end_date, symbol)
@@ -1020,6 +1031,7 @@ class PykrxBackfillService:
                 complete_eod_collection_run=complete_eod_collection_run,
                 persist_daily_price_bars=persist_daily_price_bars,
                 get_market_ohlcv_by_date=_get_market_ohlcv_by_date,
+                get_market_ohlcv_by_ticker=_get_market_ohlcv_by_ticker,
                 price_context_service=daily_price_context_service,
                 technical_snapshot_service=daily_technical_snapshot_service,
                 action_summary_service=daily_action_summary_service,

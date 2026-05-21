@@ -1626,10 +1626,20 @@ def _build_pre_decider_quote_orderbook_snapshot(
         current_price = _to_int(price_payload.get('close_price'))
 
     bid_price = _to_int(spread.get('bid_price'))
+    if bid_price is None:
+        bid_price = _to_int(intraday_quote.get('bid_price'))
+    if bid_price is None:
+        bid_price = _to_int(intraday_orderbook.get('best_bid_price'))
     ask_price = _to_int(spread.get('ask_price'))
+    if ask_price is None:
+        ask_price = _to_int(intraday_quote.get('ask_price'))
+    if ask_price is None:
+        ask_price = _to_int(intraday_orderbook.get('best_ask_price'))
     spread_points = _to_int(spread.get('spread_points'))
     if spread_points is None:
         spread_points = _to_int(intraday_quote.get('spread_points'))
+    if spread_points is None and ask_price is not None and bid_price is not None and ask_price >= bid_price:
+        spread_points = ask_price - bid_price
     spread_bps = _to_float(spread.get('spread_bps_of_price'))
     if spread_bps is None and spread_points is not None and current_price not in (None, 0):
         spread_bps = round((spread_points / current_price) * 10000, 4)
@@ -1706,8 +1716,10 @@ def _build_pre_decider_quote_orderbook_snapshot(
         'spread_points': spread_points,
         'spread_bps': spread_bps,
         'orderbook_depth': {
-            'ask_total_size': _to_int(intraday_orderbook.get('ask_total_size')),
-            'bid_total_size': _to_int(intraday_orderbook.get('bid_total_size')),
+            'ask_total_size': _to_int(intraday_orderbook.get('ask_total_size'))
+            or _to_int(intraday_orderbook.get('total_ask_depth')),
+            'bid_total_size': _to_int(intraday_orderbook.get('bid_total_size'))
+            or _to_int(intraday_orderbook.get('total_bid_depth')),
         },
         'orderbook_imbalance': _to_float(intraday_orderbook.get('imbalance')),
         'quote_freshness_timestamp': quote_timestamp,
