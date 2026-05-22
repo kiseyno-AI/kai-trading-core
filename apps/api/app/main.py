@@ -51,6 +51,19 @@ configure_file_logging()
 logger = logging.getLogger(__name__)
 
 
+async def _run_startup_step(label: str, awaitable, *, timeout_seconds: float = 8.0) -> None:
+    try:
+        await asyncio.wait_for(awaitable, timeout=timeout_seconds)
+    except asyncio.TimeoutError:
+        logger.warning(
+            'Startup step %s timed out after %.1fs; continuing so the API can serve traffic',
+            label,
+            timeout_seconds,
+        )
+    except Exception as exc:
+        logger.warning('Startup step %s failed; continuing in degraded mode: %s', label, exc)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     try:
@@ -63,31 +76,39 @@ async def lifespan(_: FastAPI):
         scanner_state.hydrate(tracked_symbols)
     except Exception as exc:
         logger.warning('Database initialization failed; starting in degraded mode: %s', exc)
-    await kis_realtime_order_notice_service.start()
-    await kis_realtime_price_service.start()
-    try:
-        await trading_order_reconciliation_service.run_startup_reconcile()
-    except Exception as exc:
-        logger.exception('Trading order startup reconcile failed: %s', exc)
-    try:
-        await market_snapshot_service.refresh_market_snapshot_if_due(trigger='startup')
-    except Exception as exc:
-        logger.warning('Market snapshot startup refresh failed; serving cache when available: %s', exc)
-    try:
-        await portfolio_summary_service.refresh_portfolio_summary_if_due(trigger='startup', force=True)
-    except Exception as exc:
-        logger.warning('Portfolio summary startup refresh failed; serving cache when available: %s', exc)
-    try:
-        await asyncio.to_thread(
-            signal_decider_evaluation_maintenance_service.refresh_latest_stored_coverage,
-            trigger='startup',
-        )
-    except Exception as exc:
-        logger.warning(
-            'Signal-decider evaluation startup refresh failed; recent review coverage may stay stale: %s',
-            exc,
-        )
-    await background_runner.start()
+    await _run_startup_step(
+        'kis_realtime_order_notice_service.start',
+        kis_realtime_order_notice_service.start(),
+        timeout_seconds=5.0,
+    )
+    await _run_startup_step(
+        'kis_realtime_price_service.start',
+        kis_realtime_price_service.start(),
+        timeout_seconds=5.0,
+    )
+    await _run_startup_step(
+        'trading_order_reconciliation_service.run_startup_reconcile',
+        trading_order_reconciliation_service.run_startup_reconcile(),
+        timeout_seconds=8.0,
+    )
+    await _run_startup_step(
+        'market_snapshot_service.refresh_market_snapshot_if_due',
+        market_snapshot_service.refresh_market_snapshot_if_due(trigger='startup'),
+        timeout_seconds=8.0,
+    )
+    await _run_startup_step(
+        'portfolio_summary_service.refresh_portfolio_summary_if_due',
+        portfolio_summary_service.refresh_portfolio_summary_if_due(trigger='startup', force=True),
+        timeout_seconds=8.0,
+    )
+    logger.warning(
+        'Signal-decider evaluation startup refresh skipped; it can run large DB readbacks and block API startup'
+    )
+    if settings.background_runner_enabled:
+        await _run_startup_step('background_runner.start', background_runner.start(), timeout_seconds=5.0)
+    else:
+        logger.warning('Background runner disabled by settings; API startup will skip scheduled maintenance tasks')
+
     try:
         yield
     finally:
