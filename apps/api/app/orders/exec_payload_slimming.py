@@ -4,6 +4,7 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
+import copy
 import json
 from typing import Any, Sequence
 
@@ -779,7 +780,10 @@ def cleanup_signal_decider_exec_submission_payloads(
             for row in rows:
                 last_seen_id = max(last_seen_id, int(row.id))
                 scanned_count += 1
-                result = slim_signal_decider_exec_submission_payload(row.submission_payload, max_bytes=max_payload_bytes)
+                result = slim_signal_decider_exec_submission_payload(
+                    copy.deepcopy(row.submission_payload),
+                    max_bytes=max_payload_bytes,
+                )
                 bytes_before += result.original_size_bytes
                 bytes_after += result.slimmed_size_bytes
                 if not result.changed:

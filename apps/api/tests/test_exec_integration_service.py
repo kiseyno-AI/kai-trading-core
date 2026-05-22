@@ -719,6 +719,9 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         with session_scope() as session:
             row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
             row.submission_payload = oversized_payload
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            committed_payload = row.submission_payload
 
         dry_run = cleanup_signal_decider_exec_submission_payloads(
             dry_run=True,
@@ -731,7 +734,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(dry_run['updated_count'], 0)
         with session_scope() as session:
             row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
-            self.assertIn('last_request_payload', row.submission_payload['exec_dispatch'])
+            self.assertEqual(row.submission_payload, committed_payload)
 
         applied = cleanup_signal_decider_exec_submission_payloads(
             dry_run=False,
