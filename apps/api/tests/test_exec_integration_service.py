@@ -1519,6 +1519,130 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
+    async def test_runtime_dashboard_filled_order_position_overrides_blocked_eligibility_without_execution(self) -> None:
+        dispatch_result = await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=False,
+            dry_run=False,
+            force=True,
+            trigger='test',
+        )
+        plan_id = dispatch_result['dispatch']['groups'][0]['plan_id']
+        self.client.plan_response = {'items': [{'external_plan_id': plan_id, 'status': 'accepted'}]}
+        self.client.order_response = {
+            'items': [
+                {
+                    'id': 'order-1',
+                    'execution_plan_item_id': 'exec-item-1',
+                    'symbol': self.symbol,
+                    'side': 'buy',
+                    'status': 'filled',
+                    'quantity': '5',
+                    'updated_at': '2026-04-30T00:05:00+00:00',
+                }
+            ]
+        }
+        self.client.execution_response = {'items': []}
+        self.client.position_response = {
+            'items': [
+                {
+                    'account_reference': self.account_reference,
+                    'symbol': self.symbol,
+                    'quantity': '5',
+                    'average_price': '50100',
+                    'updated_at': '2026-04-30T00:07:00+00:00',
+                }
+            ]
+        }
+
+        await self.service.list_signal_decider_exec_overview(
+            target_trade_date=self.target_trade_date,
+            refresh=True,
+            trigger='test',
+        )
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            row.eligibility_status = 'blocked'
+            row.validation_payload = {
+                **(row.validation_payload or {}),
+                'blocking_reasons': [{'code': 'stale_planning_block', 'message': 'stale planning block'}],
+            }
+            session.flush()
+
+        board = await self.service.get_runtime_daily_board(
+            market_date=self.target_trade_date,
+            refresh=False,
+            trigger='test',
+        )
+
+        self.assertEqual(board['summary']['filled'], 1)
+        self.assertEqual(board['summary']['failed'], 0)
+        self.assertEqual(board['items'][0]['status'], 'filled')
+        self.assertEqual(board['items'][0]['filled_quantity'], 5)
+        self.assertEqual(board['items'][0]['open_quantity'], 5)
+        self.assertIsNone(board['items'][0]['failure_reason'])
+
+    async def test_runtime_dashboard_position_without_plan_fill_evidence_does_not_mark_filled(self) -> None:
+        dispatch_result = await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=False,
+            dry_run=False,
+            force=True,
+            trigger='test',
+        )
+        plan_id = dispatch_result['dispatch']['groups'][0]['plan_id']
+        self.client.plan_response = {'items': [{'external_plan_id': plan_id, 'status': 'accepted'}]}
+        self.client.order_response = {'items': []}
+        self.client.execution_response = {'items': []}
+        self.client.position_response = {
+            'items': [
+                {
+                    'account_reference': self.account_reference,
+                    'symbol': self.symbol,
+                    'quantity': '5',
+                    'average_price': '50100',
+                    'updated_at': '2026-04-30T00:07:00+00:00',
+                }
+            ]
+        }
+
+        await self.service.list_signal_decider_exec_overview(
+            target_trade_date=self.target_trade_date,
+            refresh=True,
+            trigger='test',
+        )
+        board = await self.service.get_runtime_daily_board(
+            market_date=self.target_trade_date,
+            refresh=False,
+            trigger='test',
+        )
+
+        self.assertEqual(board['summary']['filled'], 0)
+        self.assertEqual(board['summary']['accepted'], 1)
+        self.assertEqual(board['items'][0]['status'], 'accepted')
+        self.assertEqual(board['items'][0]['open_quantity'], 0)
+
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            row.eligibility_status = 'blocked'
+            row.validation_payload = {
+                **(row.validation_payload or {}),
+                'blocking_reasons': [{'code': 'stale_planning_block', 'message': 'stale planning block'}],
+            }
+            session.flush()
+        self.service._dashboard_cache.clear()
+
+        blocked_board = await self.service.get_runtime_daily_board(
+            market_date=self.target_trade_date,
+            refresh=False,
+            trigger='test',
+        )
+
+        self.assertEqual(blocked_board['summary']['filled'], 0)
+        self.assertEqual(blocked_board['summary']['failed'], 1)
+        self.assertEqual(blocked_board['items'][0]['status'], 'failed')
+        self.assertEqual(blocked_board['items'][0]['open_quantity'], 0)
+
     async def test_runtime_dashboard_sell_fill_overrides_blocked_eligibility(self) -> None:
         await self.service.dispatch_next_open_plan(
             target_trade_date=self.target_trade_date,
