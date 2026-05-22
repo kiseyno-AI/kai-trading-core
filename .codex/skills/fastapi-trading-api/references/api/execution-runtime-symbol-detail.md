@@ -3,6 +3,8 @@
 ## Summary
 Read the per-symbol execution detail from core for dashboard/operator pages. The route preserves the normalized daily-board status while adding account-scoped dispatch/readback detail and the planning context needed for debugging, including one-or-many decider provenance when the same symbol is active from multiple deciders. Like the board routes, `refresh=true` is cache-first and schedules a bounded background refresh rather than blocking on exec readback. Row items share the daily-board `today_activity` contract for side-aware selected-date buy/sell facts.
 
+Top-level and row price fields use the dashboard display price read model: realtime websocket first, then local current-quote/cache, then recent daily close, with explicit fallback and realtime subscription metadata.
+
 ## Example request
 ```http
 GET /execution/runtime/symbols/005930?market_date=2026-04-30&refresh=true
@@ -20,6 +22,10 @@ GET /execution/runtime/symbols/005930?market_date=2026-04-30&refresh=true
   "price_received_at": "2026-04-30T00:15:31+00:00",
   "price_source": "kis_realtime_ws",
   "price_status": "available",
+  "display_price_available": true,
+  "display_price_fallback_reason": null,
+  "realtime_subscribed": true,
+  "realtime_subscription_reason": "subscribed",
   "runtime": {
     "status": "ready",
     "mode": "mock"
@@ -125,6 +131,10 @@ GET /execution/runtime/symbols/005930?market_date=2026-04-30&refresh=true
       "price_received_at": "2026-04-30T00:15:31+00:00",
       "price_source": "kis_realtime_ws",
       "price_status": "available",
+      "display_price_available": true,
+      "display_price_fallback_reason": null,
+      "realtime_subscribed": true,
+      "realtime_subscription_reason": "subscribed",
       "monitoring_state": "watching_target_stop",
       "dispatch": {
         "status": "accepted",

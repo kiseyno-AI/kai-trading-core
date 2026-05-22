@@ -156,6 +156,22 @@ class KISRealtimePriceServiceTests(unittest.IsolatedAsyncioTestCase):
             [('2', '000660'), ('2', '005930'), ('1', '035420')],
         )
 
+    async def test_subscription_limit_preserves_priority_order_when_requested(self) -> None:
+        service = KISRealtimePriceService(client=FakeKISRealtimePriceClient())
+
+        snapshot = service.observe_monitored_symbols(
+            ['035420', '000660', '005930'],
+            trigger='priority-test',
+            preserve_order=True,
+        )
+
+        self.assertEqual(snapshot['allowed_symbols'], ['035420', '000660'])
+        self.assertEqual(snapshot['limited_symbols'], ['005930'])
+        limited_fields = service.price_fields_for_symbol('005930')
+        self.assertEqual(limited_fields['price_status'], 'limited')
+        self.assertFalse(limited_fields['realtime_subscribed'])
+        self.assertEqual(limited_fields['realtime_subscription_reason'], 'capacity_limited')
+
     async def test_failed_subscription_ack_clears_subscribed_symbol_for_retry(self) -> None:
         service = KISRealtimePriceService(client=FakeKISRealtimePriceClient())
         websocket = FakeWebSocket()

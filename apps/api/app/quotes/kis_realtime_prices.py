@@ -270,6 +270,7 @@ class KISRealtimePriceService:
         self._state_lock = threading.RLock()
         self._prices: dict[str, KISRealtimePriceTick] = {}
         self._desired_symbols: set[str] = set()
+        self._desired_symbol_order: list[str] = []
         self._subscribed_symbols: set[str] = set()
         self._limited_symbols: set[str] = set()
         self._last_observed_symbols_at: datetime | None = None
@@ -349,7 +350,8 @@ class KISRealtimePriceService:
                 }
 
     def _sync_health_symbols_locked(self) -> None:
-        self._health['desired_symbols'] = sorted(self._desired_symbols)
+        ordered_symbols = self._ordered_desired_symbols_locked()
+        self._health['desired_symbols'] = ordered_symbols
         self._health['subscribed_symbols'] = sorted(self._subscribed_symbols)
         self._health['limited_symbols'] = sorted(self._limited_symbols)
         self._health['last_observed_symbols_at'] = _isoformat(self._last_observed_symbols_at)
@@ -430,20 +432,37 @@ class KISRealtimePriceService:
 
         self._set_status('stopped')
 
-    def observe_monitored_symbols(self, symbols: Iterable[Any], *, trigger: str) -> dict[str, Any]:
-        normalized_symbols = sorted(
-            {
-                symbol
-                for value in symbols
-                if (symbol := _normalize_symbol(value))
-            }
-        )
+    def observe_monitored_symbols(
+        self,
+        symbols: Iterable[Any],
+        *,
+        trigger: str,
+        preserve_order: bool = False,
+    ) -> dict[str, Any]:
+        if preserve_order:
+            seen: set[str] = set()
+            normalized_symbols = []
+            for value in symbols:
+                symbol = _normalize_symbol(value)
+                if symbol and symbol not in seen:
+                    seen.add(symbol)
+                    normalized_symbols.append(symbol)
+        else:
+            normalized_symbols = sorted(
+                {
+                    symbol
+                    for value in symbols
+                    if (symbol := _normalize_symbol(value))
+                }
+            )
         with self._state_lock:
             before = set(self._desired_symbols)
+            before_order = list(self._desired_symbol_order)
             self._desired_symbols = set(normalized_symbols)
+            self._desired_symbol_order = list(normalized_symbols)
             self._last_observed_symbols_at = _utc_now()
-            self._sync_health_symbols_locked()
-            changed = before != self._desired_symbols
+            self._target_symbols_snapshot_locked()
+            changed = before != self._desired_symbols or before_order != self._desired_symbol_order
             if changed:
                 self._health['subscription']['message'] = f'symbols_observed:{trigger}'
                 self._health['subscription']['updated_at'] = _isoformat(self._last_observed_symbols_at)
@@ -477,7 +496,7 @@ class KISRealtimePriceService:
                 with self._state_lock:
                     self._health['metrics']['subscription_refreshes'] += 1
                     self._health['last_subscription_refresh_at'] = _isoformat(_utc_now())
-                self.observe_monitored_symbols(symbols, trigger=trigger)
+                self.observe_monitored_symbols(symbols, trigger=trigger, preserve_order=True)
         return self.subscription_snapshot()
 
     async def _load_runtime_monitored_symbols(self, *, trigger: str) -> list[str]:
@@ -597,17 +616,31 @@ class KISRealtimePriceService:
             return exc.retryable
         return not self._is_fatal_error(exc)
 
+    def _ordered_desired_symbols_locked(self) -> list[str]:
+        ordered = [
+            symbol
+            for symbol in self._desired_symbol_order
+            if symbol in self._desired_symbols
+        ]
+        if len(ordered) < len(self._desired_symbols):
+            ordered.extend(sorted(self._desired_symbols - set(ordered)))
+        return ordered
+
+    def _target_symbols_snapshot_locked(self) -> tuple[list[str], list[str]]:
+        max_subscriptions = _parse_positive_int(
+            settings.kis_realtime_price_max_subscriptions,
+            default=40,
+        )
+        desired = self._ordered_desired_symbols_locked()
+        allowed = desired[:max_subscriptions]
+        limited = desired[max_subscriptions:]
+        self._limited_symbols = set(limited)
+        self._sync_health_symbols_locked()
+        return allowed, limited
+
     def _target_symbols_snapshot(self) -> tuple[list[str], list[str]]:
         with self._state_lock:
-            max_subscriptions = _parse_positive_int(
-                settings.kis_realtime_price_max_subscriptions,
-                default=40,
-            )
-            desired = sorted(self._desired_symbols)
-            allowed = desired[:max_subscriptions]
-            limited = desired[max_subscriptions:]
-            self._limited_symbols = set(limited)
-            self._sync_health_symbols_locked()
+            allowed, limited = self._target_symbols_snapshot_locked()
         return allowed, limited
 
     async def _sync_subscriptions(self, websocket: Any, *, approval_key: str) -> None:
@@ -798,25 +831,63 @@ class KISRealtimePriceService:
             return self._empty_price_fields('invalid_symbol')
         now = _utc_now()
         with self._state_lock:
+            self._target_symbols_snapshot_locked()
             tick = self._prices.get(normalized)
             desired = normalized in self._desired_symbols
             subscribed = normalized in self._subscribed_symbols
             limited = normalized in self._limited_symbols
             enabled = settings.kis_realtime_price_enabled
             configured, _ = self._is_configured()
+            subscription_fields = self._subscription_fields_for_symbol_locked(
+                desired=desired,
+                subscribed=subscribed,
+                limited=limited,
+                enabled=enabled,
+                configured=configured,
+            )
 
         if tick is not None:
             status = 'limited' if limited else self._price_status_for_tick(tick, now=now)
-            return tick.to_public_dict(price_status=status)
+            return {
+                **tick.to_public_dict(price_status=status),
+                **subscription_fields,
+                'display_price_available': tick.current_price is not None,
+            }
         if limited:
-            return self._empty_price_fields('limited')
+            return self._empty_price_fields('limited', subscription_fields=subscription_fields)
         if not enabled:
-            return self._empty_price_fields('disabled')
+            return self._empty_price_fields('disabled', subscription_fields=subscription_fields)
         if not configured:
-            return self._empty_price_fields('not_configured')
+            return self._empty_price_fields('not_configured', subscription_fields=subscription_fields)
         if desired or subscribed:
-            return self._empty_price_fields('pending')
-        return self._empty_price_fields('not_monitored')
+            return self._empty_price_fields('pending', subscription_fields=subscription_fields)
+        return self._empty_price_fields('not_monitored', subscription_fields=subscription_fields)
+
+    @staticmethod
+    def _subscription_fields_for_symbol_locked(
+        *,
+        desired: bool,
+        subscribed: bool,
+        limited: bool,
+        enabled: bool,
+        configured: bool,
+    ) -> dict[str, Any]:
+        if limited:
+            reason = 'capacity_limited'
+        elif subscribed:
+            reason = 'subscribed'
+        elif not enabled:
+            reason = 'disabled'
+        elif not configured:
+            reason = 'not_configured'
+        elif desired:
+            reason = 'pending'
+        else:
+            reason = 'not_monitored'
+        return {
+            'realtime_subscribed': bool(subscribed),
+            'realtime_subscription_reason': reason,
+        }
 
     def _price_status_for_tick(self, tick: KISRealtimePriceTick, *, now: datetime) -> str:
         stale_after_seconds = max(1.0, float(settings.kis_realtime_price_stale_after_seconds))
@@ -824,13 +895,19 @@ class KISRealtimePriceService:
         return 'stale' if age_seconds > stale_after_seconds else 'available'
 
     @staticmethod
-    def _empty_price_fields(status: str) -> dict[str, Any]:
+    def _empty_price_fields(
+        status: str,
+        *,
+        subscription_fields: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         return {
             'current_price': None,
             'price_as_of': None,
             'price_received_at': None,
             'price_source': None,
             'price_status': status,
+            'display_price_available': False,
+            **(subscription_fields or {}),
         }
 
     def monitored_snapshot(self) -> dict[str, Any]:

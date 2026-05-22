@@ -41,6 +41,10 @@ from app.orders.next_open_execution import (
     EXECUTION_WINDOW_NEXT_OPEN,
     signal_decider_next_open_execution_service,
 )
+from app.quotes.display_prices import (
+    DISPLAY_FALLBACK_SOURCES,
+    build_display_price_fields,
+)
 from app.quotes.kis_realtime_prices import kis_realtime_price_service
 from app.repositories.symbol_repository import load_symbols
 
@@ -1232,14 +1236,24 @@ class SignalDeciderExecIntegrationService:
             if symbol:
                 grouped[symbol].append(item)
 
+        included_groups = {
+            symbol: grouped_items
+            for symbol, grouped_items in grouped.items()
+            if self._should_include_monitored_symbol_group(grouped_items)
+        }
+        realtime_symbols = self._prioritized_runtime_symbols_for_realtime(included_groups)
+        self._observe_runtime_symbols_for_realtime_prices(
+            realtime_symbols,
+            trigger='dashboard_read_model',
+        )
         items = [
             self._build_runtime_monitored_symbol_item(
                 symbol=symbol,
-                items=grouped_items,
+                items=included_groups[symbol],
                 runtime_status=board['runtime']['status'],
+                market_date=resolved_market_date,
             )
-            for symbol, grouped_items in sorted(grouped.items())
-            if self._should_include_monitored_symbol_group(grouped_items)
+            for symbol in realtime_symbols
         ]
         generated_at = _utcnow()
         return {
@@ -1250,6 +1264,11 @@ class SignalDeciderExecIntegrationService:
             'runtime': board['runtime'],
             'market_date': board['market_date'],
             'summary': self._build_runtime_monitored_summary(items=items),
+            'realtime_subscription': {
+                'desired_symbols': realtime_symbols,
+                'desired_symbol_count': len(realtime_symbols),
+                'max_subscriptions': settings.kis_realtime_price_max_subscriptions,
+            },
             'freshness': self._build_dashboard_freshness(
                 endpoint=DASHBOARD_ENDPOINT_MONITORED_SYMBOLS,
                 market_date=resolved_market_date,
@@ -1308,7 +1327,7 @@ class SignalDeciderExecIntegrationService:
             'symbol': symbol,
             'name': metadata['name'],
             'market': metadata['market'],
-            **self._price_fields_for_symbol(symbol),
+            **self._price_fields_for_symbol(symbol, market_date=market_date),
             'planning': {
                 'decision_source': (
                     next(iter(agent_names))
@@ -3348,7 +3367,7 @@ class SignalDeciderExecIntegrationService:
             'entry_execution_mode': item.get('entry_execution_mode'),
             'target_trade_date': item.get('target_trade_date'),
             'source_market_date': item.get('source_market_date'),
-            **self._price_fields_for_symbol(symbol),
+            **self._price_fields_for_symbol(symbol, market_date=market_date),
         }
 
     def _build_runtime_daily_board_summary(self, *, items: Sequence[dict[str, Any]]) -> dict[str, Any]:
@@ -3377,6 +3396,7 @@ class SignalDeciderExecIntegrationService:
         symbol: str,
         items: Sequence[dict[str, Any]],
         runtime_status: str,
+        market_date: date,
     ) -> dict[str, Any]:
         first = items[0]
         monitoring = self._build_runtime_symbol_monitoring(items=items, runtime_status=runtime_status)
@@ -3384,7 +3404,7 @@ class SignalDeciderExecIntegrationService:
             'symbol': symbol,
             'name': first.get('name') or symbol,
             'market': first.get('market'),
-            **self._price_fields_for_symbol(symbol),
+            **self._price_fields_for_symbol(symbol, market_date=market_date),
             'monitoring_state': monitoring['state'],
             'position_side': monitoring['position_side'],
             'planned_intents': monitoring['planned_intents'],
@@ -3439,17 +3459,92 @@ class SignalDeciderExecIntegrationService:
                 return True
         return False
 
+    @classmethod
+    def _prioritized_runtime_symbols_for_realtime(
+        cls,
+        grouped: dict[str, Sequence[dict[str, Any]]],
+    ) -> list[str]:
+        ranked = [
+            (
+                -cls._runtime_symbol_realtime_priority(items),
+                symbol,
+            )
+            for symbol, items in grouped.items()
+        ]
+        return [
+            symbol
+            for _, symbol in sorted(ranked)
+        ]
+
+    @classmethod
+    def _runtime_symbol_realtime_priority(cls, items: Sequence[dict[str, Any]]) -> int:
+        priority = 0
+        for item in items:
+            status = _normalize_optional_text(item.get('status'), lowercase=True)
+            monitoring_state = _normalize_optional_text(item.get('monitoring_state'), lowercase=True)
+            intent = _normalize_optional_text(item.get('intent'), lowercase=True)
+            open_quantity = _safe_decimal(item.get('open_quantity')) or Decimal('0')
+            has_target_stop = bool(
+                set(item.get('planned_intents') or []) & {EXEC_INTENT_TARGET_SELL, EXEC_INTENT_STOP_SELL}
+            ) or any(
+                _positive_decimal(item.get(field_name)) is not None
+                for field_name in ('target_price', 'stop_loss_price')
+            )
+            if (
+                monitoring_state == UI_MONITORING_STATE_WATCHING_TARGET_STOP
+                and open_quantity > Decimal('0')
+                and has_target_stop
+            ):
+                priority = max(priority, 400)
+                continue
+            if (
+                intent == EXEC_INTENT_INTRADAY_WATCH_BUY
+                and status in {
+                    UI_BOARD_STATUS_PLANNED,
+                    UI_BOARD_STATUS_ACCEPTED,
+                    UI_BOARD_STATUS_SCHEDULED,
+                    UI_BOARD_STATUS_SUBMITTED,
+                    UI_BOARD_STATUS_PARTIAL,
+                }
+                and any(
+                    _positive_decimal(item.get(field_name)) is not None
+                    for field_name in ('trigger_price', 'chase_limit_price')
+                )
+            ):
+                priority = max(priority, 300)
+                continue
+            if status in {
+                UI_BOARD_STATUS_ACCEPTED,
+                UI_BOARD_STATUS_SCHEDULED,
+                UI_BOARD_STATUS_SUBMITTED,
+                UI_BOARD_STATUS_PARTIAL,
+            } or _normalize_optional_text(item.get('broker_order_id')):
+                priority = max(priority, 200)
+                continue
+            if item.get('planned_intents') or cls._has_target_stop_watch_facts(item):
+                priority = max(priority, 100)
+        return priority
+
     @staticmethod
     def _observe_runtime_symbols_for_realtime_prices(symbols: Iterable[Any], *, trigger: str) -> None:
         try:
-            kis_realtime_price_service.observe_monitored_symbols(symbols, trigger=trigger)
+            kis_realtime_price_service.observe_monitored_symbols(
+                symbols,
+                trigger=trigger,
+                preserve_order=True,
+            )
         except Exception:
             pass
 
     @staticmethod
-    def _price_fields_for_symbol(symbol: Any) -> dict[str, Any]:
+    def _price_fields_for_symbol(symbol: Any, *, market_date: date) -> dict[str, Any]:
         try:
-            return kis_realtime_price_service.price_fields_for_symbol(symbol)
+            realtime_fields = kis_realtime_price_service.price_fields_for_symbol(symbol)
+            return build_display_price_fields(
+                symbol,
+                market_date=market_date,
+                realtime_fields=realtime_fields,
+            )
         except Exception:
             return {
                 'current_price': None,
@@ -3457,12 +3552,29 @@ class SignalDeciderExecIntegrationService:
                 'price_received_at': None,
                 'price_source': None,
                 'price_status': 'unavailable',
+                'display_price_available': False,
+                'realtime_subscribed': False,
+                'realtime_subscription_reason': 'unavailable',
             }
 
     def _build_runtime_monitored_summary(self, *, items: Sequence[dict[str, Any]]) -> dict[str, Any]:
         state_counts = Counter(
             _normalize_optional_text(item.get('monitoring_state'), lowercase=True) or 'unknown'
             for item in items
+        )
+        price_status_counts = Counter(
+            _normalize_optional_text(item.get('price_status'), lowercase=True) or 'unknown'
+            for item in items
+        )
+        price_source_counts = Counter(
+            _normalize_optional_text(item.get('price_source'), lowercase=True) or 'none'
+            for item in items
+        )
+        fallback_covered_count = sum(
+            1
+            for item in items
+            if item.get('display_price_available')
+            and _normalize_optional_text(item.get('price_source'), lowercase=True) in DISPLAY_FALLBACK_SOURCES
         )
         return {
             'items_total': len(items),
@@ -3471,6 +3583,18 @@ class SignalDeciderExecIntegrationService:
             'reconciling': state_counts.get(UI_MONITORING_STATE_RECONCILING, 0),
             'idle': state_counts.get(UI_MONITORING_STATE_IDLE, 0),
             'monitoring_state_counts': dict(sorted(state_counts.items())),
+            'desired_symbol_count': len(items),
+            'realtime_subscribed_count': sum(1 for item in items if item.get('realtime_subscribed')),
+            'capacity_limited_count': sum(
+                1
+                for item in items
+                if _normalize_optional_text(item.get('realtime_subscription_reason'), lowercase=True) == 'capacity_limited'
+            ),
+            'cached_fallback_covered_count': fallback_covered_count,
+            'truly_unavailable_count': sum(1 for item in items if not item.get('display_price_available')),
+            'display_price_available_count': sum(1 for item in items if item.get('display_price_available')),
+            'price_status_counts': dict(sorted(price_status_counts.items())),
+            'price_source_counts': dict(sorted(price_source_counts.items())),
         }
 
     def _build_runtime_symbol_detail_item(
