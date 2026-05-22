@@ -1,9 +1,10 @@
 import logging
 import time
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from secrets import compare_digest
 import asyncio
+from typing import Awaitable, Callable
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -49,23 +50,47 @@ from app.scanner.state import scanner_state
 
 configure_file_logging()
 logger = logging.getLogger(__name__)
+STARTUP_MAINTENANCE_TIMEOUT_SECONDS = 30
 
 
-async def _run_startup_step(label: str, awaitable, *, timeout_seconds: float = 8.0) -> None:
+async def _run_startup_maintenance_step(name: str, factory: Callable[[], Awaitable[object]]) -> None:
     try:
-        await asyncio.wait_for(awaitable, timeout=timeout_seconds)
+        await asyncio.wait_for(factory(), timeout=STARTUP_MAINTENANCE_TIMEOUT_SECONDS)
     except asyncio.TimeoutError:
         logger.warning(
-            'Startup step %s timed out after %.1fs; continuing so the API can serve traffic',
-            label,
-            timeout_seconds,
+            'Startup maintenance step timed out after %ss and will not block API readiness: %s',
+            STARTUP_MAINTENANCE_TIMEOUT_SECONDS,
+            name,
         )
     except Exception as exc:
-        logger.warning('Startup step %s failed; continuing in degraded mode: %s', label, exc)
+        logger.warning('Startup maintenance step failed: %s: %s', name, exc)
+
+
+async def _run_startup_maintenance() -> None:
+    await _run_startup_maintenance_step(
+        'trading_order_startup_reconcile',
+        lambda: trading_order_reconciliation_service.run_startup_reconcile(),
+    )
+    await _run_startup_maintenance_step(
+        'market_snapshot_startup_refresh',
+        lambda: market_snapshot_service.refresh_market_snapshot_if_due(trigger='startup'),
+    )
+    await _run_startup_maintenance_step(
+        'portfolio_summary_startup_refresh',
+        lambda: portfolio_summary_service.refresh_portfolio_summary_if_due(trigger='startup', force=True),
+    )
+    await _run_startup_maintenance_step(
+        'signal_decider_evaluation_startup_refresh',
+        lambda: asyncio.to_thread(
+            signal_decider_evaluation_maintenance_service.refresh_latest_stored_coverage,
+            trigger='startup',
+        ),
+    )
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    startup_maintenance_task: asyncio.Task | None = None
     try:
         await asyncio.to_thread(init_database)
         await asyncio.to_thread(
@@ -76,42 +101,17 @@ async def lifespan(_: FastAPI):
         scanner_state.hydrate(tracked_symbols)
     except Exception as exc:
         logger.warning('Database initialization failed; starting in degraded mode: %s', exc)
-    await _run_startup_step(
-        'kis_realtime_order_notice_service.start',
-        kis_realtime_order_notice_service.start(),
-        timeout_seconds=5.0,
-    )
-    await _run_startup_step(
-        'kis_realtime_price_service.start',
-        kis_realtime_price_service.start(),
-        timeout_seconds=5.0,
-    )
-    await _run_startup_step(
-        'trading_order_reconciliation_service.run_startup_reconcile',
-        trading_order_reconciliation_service.run_startup_reconcile(),
-        timeout_seconds=8.0,
-    )
-    await _run_startup_step(
-        'market_snapshot_service.refresh_market_snapshot_if_due',
-        market_snapshot_service.refresh_market_snapshot_if_due(trigger='startup'),
-        timeout_seconds=8.0,
-    )
-    await _run_startup_step(
-        'portfolio_summary_service.refresh_portfolio_summary_if_due',
-        portfolio_summary_service.refresh_portfolio_summary_if_due(trigger='startup', force=True),
-        timeout_seconds=8.0,
-    )
-    logger.warning(
-        'Signal-decider evaluation startup refresh skipped; it can run large DB readbacks and block API startup'
-    )
-    if settings.background_runner_enabled:
-        await _run_startup_step('background_runner.start', background_runner.start(), timeout_seconds=5.0)
-    else:
-        logger.warning('Background runner disabled by settings; API startup will skip scheduled maintenance tasks')
-
+    await kis_realtime_order_notice_service.start()
+    await kis_realtime_price_service.start()
+    startup_maintenance_task = asyncio.create_task(_run_startup_maintenance(), name='startup-maintenance')
+    await background_runner.start()
     try:
         yield
     finally:
+        if startup_maintenance_task and not startup_maintenance_task.done():
+            startup_maintenance_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await startup_maintenance_task
         await kis_realtime_price_service.stop()
         await kis_realtime_order_notice_service.stop()
         await background_runner.stop()

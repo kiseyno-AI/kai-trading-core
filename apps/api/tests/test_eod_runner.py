@@ -38,6 +38,40 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
         refresh_plan.assert_called_once_with()
         reconcile.assert_awaited_once_with()
 
+    async def test_preopen_sync_maintenance_uses_thread_offload(self) -> None:
+        runner = EODBackgroundRunner(interval_seconds=0)
+        market_state = MarketState(
+            market='KRX',
+            state='PREOPEN',
+            is_trading_day=True,
+            is_open=False,
+            server_time='2026-04-30T07:45:00+09:00',
+            session_open_at='2026-04-30T09:00:00+09:00',
+            session_close_at='2026-04-30T15:30:00+09:00',
+        )
+
+        async def stop_after_tick(_seconds: int) -> None:
+            runner._running = False
+
+        async def run_inline(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with (
+            patch('app.eod.runner.asyncio.to_thread', side_effect=run_inline) as to_thread,
+            patch('app.eod.runner.get_market_state', return_value=market_state),
+            patch('app.eod.runner.refresh_master_if_due'),
+            patch('app.eod.runner.signal_decider_next_open_execution_service.refresh_plan_if_due'),
+            patch(
+                'app.eod.runner.trading_order_reconciliation_service.run_periodic_if_due',
+                new=AsyncMock(),
+            ),
+            patch('app.eod.runner.asyncio.sleep', side_effect=stop_after_tick),
+        ):
+            runner._running = True
+            await runner._run_loop()
+
+        self.assertGreaterEqual(to_thread.await_count, 2)
+
     async def test_open_loop_runs_next_open_execution_submission(self) -> None:
         runner = EODBackgroundRunner(interval_seconds=0)
         market_state = MarketState(

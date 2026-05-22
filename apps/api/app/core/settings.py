@@ -121,7 +121,6 @@ class Settings(BaseSettings):
     dart_fundamentals_event_timeout_seconds: int = 60
     dart_fundamentals_stale_run_minutes: int = 60
 
-    background_runner_enabled: bool = True
     eod_auto_pykrx_enabled: bool = True
     eod_auto_pykrx_poll_seconds: int = 60
     eod_auto_pykrx_after_close_minutes: int = 10

@@ -240,6 +240,7 @@ Internal ops commands from `apps/api`:
 - `python3.11 -m app.internal.ops eod-composite-factors-compute --market-date 2026-04-24`
 - `python3.11 -m app.internal.ops trading-intraday-auto-sell-run-if-due --account-reference KIS:12345678-01 --symbol 005930 --force`
 - `python3.11 -m app.internal.ops trading-next-open-execution-run-if-due --target-trade-date 2026-04-30 --dry-run true --force`
+- `python3.11 -m app.internal.ops trading-signal-decider-slim-exec-payloads --dry-run true --target-trade-date 2026-05-22`
 - `python3.11 -m app.internal.ops dart-fundamentals-daily-run-if-due --market-date 2026-04-14 --symbol-limit 250 --capture-limit 500`
 - `python3.11 -m app.internal.ops agent-feedback-retry-cycles --market-date 2026-04-14 --symbols 005930`
 - `python3.11 -m app.internal.ops agent-feedback-data-gap-summary --market-date-from 2026-05-01 --market-date-to 2026-05-06 --persist-missing-categories true`
