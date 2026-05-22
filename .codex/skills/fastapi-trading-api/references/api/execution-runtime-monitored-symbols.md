@@ -3,6 +3,8 @@
 ## Summary
 Read the current symbol-level exec monitoring view from core. The route is dashboard-safe and cache-first: it groups the local daily-board read model by symbol and returns immediately, including an empty item list when no symbols are monitored. `refresh=true` schedules a bounded, debounced background exec refresh instead of making the request wait on exec/KIS readback.
 
+Price fields are display-oriented: realtime websocket prices are preferred, then local current-quote/cache fallback, then recent daily close. Fallback prices are labeled with `price_source`, `price_status`, `display_price_available`, and realtime subscription metadata so capacity-limited symbols do not look like true data gaps.
+
 ## Example request
 ```http
 GET /execution/runtime/monitored-symbols?market_date=2026-04-30&refresh=true
@@ -51,7 +53,26 @@ GET /execution/runtime/monitored-symbols?market_date=2026-04-30&refresh=true
     "watching_target_stop": 1,
     "watching_fill": 0,
     "reconciling": 0,
-    "idle": 0
+    "idle": 0,
+    "desired_symbol_count": 1,
+    "realtime_subscribed_count": 0,
+    "capacity_limited_count": 1,
+    "cached_fallback_covered_count": 1,
+    "truly_unavailable_count": 0,
+    "display_price_available_count": 1,
+    "price_status_counts": {
+      "fallback": 1
+    },
+    "price_source_counts": {
+      "cached_quote": 1
+    }
+  },
+  "realtime_subscription": {
+    "desired_symbols": [
+      "005930"
+    ],
+    "desired_symbol_count": 1,
+    "max_subscriptions": 40
   },
   "items": [
     {
@@ -59,10 +80,14 @@ GET /execution/runtime/monitored-symbols?market_date=2026-04-30&refresh=true
       "name": "Samsung Electronics",
       "market": "KOSPI",
       "current_price": 71500,
-      "price_as_of": "2026-04-30T00:15:30+00:00",
-      "price_received_at": "2026-04-30T00:15:31+00:00",
-      "price_source": "kis_realtime_ws",
-      "price_status": "available",
+      "price_as_of": "2026-04-30T00:10:00+00:00",
+      "price_received_at": "2026-04-30T00:10:01+00:00",
+      "price_source": "cached_quote",
+      "price_status": "fallback",
+      "display_price_available": true,
+      "display_price_fallback_reason": "current_quote_cache",
+      "realtime_subscribed": false,
+      "realtime_subscription_reason": "capacity_limited",
       "monitoring_state": "watching_target_stop",
       "position_side": "long",
       "planned_intents": [

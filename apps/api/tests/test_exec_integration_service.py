@@ -3,7 +3,7 @@ from datetime import date, datetime, timezone
 from decimal import Decimal
 import json
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 
 from sqlalchemy import delete, select
@@ -1425,6 +1425,190 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(detail['current_price'], 50200)
         self.assertEqual(detail['items'][0]['status'], 'filled')
         self.assertEqual(detail['items'][0]['remote_state']['derived_status'], 'open')
+
+    async def test_runtime_monitored_symbols_use_cached_display_fallback_when_capacity_limited(self) -> None:
+        fallback_symbol = '000660'
+        self._seed_signal_candidate(
+            symbol=fallback_symbol,
+            name_ko='SK hynix',
+            decision_run_id='exec-run-2',
+            client_order_id='SDNO-20260430-000660',
+        )
+
+        def realtime_fields(symbol: str) -> dict:
+            if symbol == self.symbol:
+                return {
+                    'current_price': 50200,
+                    'price_as_of': '2026-04-30T00:07:30+00:00',
+                    'price_received_at': '2026-04-30T00:07:31+00:00',
+                    'price_source': 'kis_realtime_ws',
+                    'price_status': 'available',
+                    'realtime_subscribed': True,
+                    'realtime_subscription_reason': 'subscribed',
+                    'display_price_available': True,
+                }
+            return {
+                'current_price': None,
+                'price_as_of': None,
+                'price_received_at': None,
+                'price_source': None,
+                'price_status': 'limited',
+                'realtime_subscribed': False,
+                'realtime_subscription_reason': 'capacity_limited',
+                'display_price_available': False,
+            }
+
+        def current_quote(symbol: str) -> dict | None:
+            if symbol != fallback_symbol:
+                return None
+            return {
+                'symbol': fallback_symbol,
+                'price': 182500,
+                'cached_at': '2026-04-30T00:06:00+00:00',
+                'as_of': '2026-04-30T00:06:00+00:00',
+                'trade_date': '2026-04-30',
+            }
+
+        with (
+            patch('app.orders.exec_integration.kis_realtime_price_service') as price_service,
+            patch('app.quotes.display_prices.load_current_quote', side_effect=current_quote),
+            patch('app.quotes.display_prices.load_daily_bars_for_symbol') as load_daily_bars,
+            patch('app.brokers.kis.client.KISClient.fetch_domestic_quote', new_callable=AsyncMock) as fetch_quote,
+        ):
+            price_service.price_fields_for_symbol.side_effect = realtime_fields
+            price_service.observe_monitored_symbols.return_value = {
+                'allowed_symbols': [self.symbol],
+                'limited_symbols': [fallback_symbol],
+            }
+
+            monitored = await self.service.list_runtime_monitored_symbols(
+                market_date=self.target_trade_date,
+                refresh=False,
+                trigger='test',
+            )
+            cached_monitored = await self.service.list_runtime_monitored_symbols(
+                market_date=self.target_trade_date,
+                refresh=False,
+                trigger='test',
+            )
+
+        by_symbol = {item['symbol']: item for item in monitored['items']}
+        fallback_item = by_symbol[fallback_symbol]
+        self.assertEqual(fallback_item['current_price'], 182500)
+        self.assertEqual(fallback_item['price_source'], 'cached_quote')
+        self.assertEqual(fallback_item['price_status'], 'fallback')
+        self.assertTrue(fallback_item['display_price_available'])
+        self.assertFalse(fallback_item['realtime_subscribed'])
+        self.assertEqual(fallback_item['realtime_subscription_reason'], 'capacity_limited')
+        self.assertEqual(monitored['summary']['desired_symbol_count'], 2)
+        self.assertEqual(monitored['summary']['realtime_subscribed_count'], 1)
+        self.assertEqual(monitored['summary']['capacity_limited_count'], 1)
+        self.assertEqual(monitored['summary']['cached_fallback_covered_count'], 1)
+        self.assertEqual(monitored['summary']['truly_unavailable_count'], 0)
+        self.assertEqual(cached_monitored['summary']['cached_fallback_covered_count'], 1)
+        self.assertEqual(monitored['realtime_subscription']['desired_symbol_count'], 2)
+        load_daily_bars.assert_not_called()
+        fetch_quote.assert_not_called()
+
+    async def test_runtime_symbol_detail_labels_stale_cached_display_fallback(self) -> None:
+        with (
+            patch('app.orders.exec_integration.kis_realtime_price_service') as price_service,
+            patch(
+                'app.quotes.display_prices.load_current_quote',
+                return_value={
+                    'symbol': self.symbol,
+                    'price': 49800,
+                    'cached_at': '2026-04-29T06:10:00+00:00',
+                    'trade_date': '2026-04-29',
+                },
+            ),
+            patch('app.quotes.display_prices.load_daily_bars_for_symbol') as load_daily_bars,
+        ):
+            price_service.price_fields_for_symbol.return_value = {
+                'current_price': None,
+                'price_as_of': None,
+                'price_received_at': None,
+                'price_source': None,
+                'price_status': 'unavailable',
+                'realtime_subscribed': False,
+                'realtime_subscription_reason': 'not_monitored',
+                'display_price_available': False,
+            }
+
+            detail = await self.service.get_runtime_symbol_detail(
+                market_date=self.target_trade_date,
+                symbol=self.symbol,
+                refresh=False,
+                trigger='test',
+            )
+
+        self.assertEqual(detail['current_price'], 49800)
+        self.assertEqual(detail['price_source'], 'cached_quote')
+        self.assertEqual(detail['price_status'], 'stale')
+        self.assertTrue(detail['display_price_available'])
+        self.assertEqual(detail['items'][0]['price_status'], 'stale')
+        load_daily_bars.assert_not_called()
+
+    async def test_runtime_monitored_symbols_observe_high_priority_symbols_first(self) -> None:
+        board = {
+            'market_date': self.target_trade_date.isoformat(),
+            'runtime': {'status': 'ready', 'mode': 'mock'},
+            'items': [
+                {
+                    'symbol': 'LOW',
+                    'name': 'Low priority',
+                    'market': 'KOSPI',
+                    'status': 'planned',
+                    'monitoring_state': 'idle',
+                    'planned_intents': ['target_sell'],
+                    'decision_agent_name': 'signal-decider',
+                },
+                {
+                    'symbol': 'HIGH',
+                    'name': 'Held position',
+                    'market': 'KOSPI',
+                    'status': 'filled',
+                    'monitoring_state': 'watching_target_stop',
+                    'planned_intents': ['stop_sell', 'target_sell'],
+                    'open_quantity': 5,
+                    'decision_agent_name': 'signal-decider',
+                },
+                {
+                    'symbol': 'MID',
+                    'name': 'Intraday watch',
+                    'market': 'KOSPI',
+                    'intent': 'intraday_watch_buy',
+                    'status': 'accepted',
+                    'monitoring_state': 'watching_fill',
+                    'trigger_price': 50500,
+                    'chase_limit_price': 51500,
+                    'decision_agent_name': 'short-term-decider',
+                },
+            ],
+        }
+        with patch('app.orders.exec_integration.kis_realtime_price_service') as price_service:
+            price_service.price_fields_for_symbol.return_value = {
+                'current_price': 100,
+                'price_as_of': '2026-04-30T00:00:00+00:00',
+                'price_received_at': '2026-04-30T00:00:01+00:00',
+                'price_source': 'kis_realtime_ws',
+                'price_status': 'available',
+                'realtime_subscribed': True,
+                'realtime_subscription_reason': 'subscribed',
+                'display_price_available': True,
+            }
+
+            payload = self.service._build_runtime_monitored_symbols_payload(
+                board=board,
+                refresh=False,
+                refresh_state={'requested': False, 'status': 'not_requested'},
+                served_from_cache=False,
+            )
+
+        observed_symbols = list(price_service.observe_monitored_symbols.call_args.args[0])
+        self.assertEqual(observed_symbols, ['HIGH', 'MID', 'LOW'])
+        self.assertTrue(price_service.observe_monitored_symbols.call_args.kwargs['preserve_order'])
+        self.assertEqual(payload['realtime_subscription']['desired_symbols'], ['HIGH', 'MID', 'LOW'])
 
     async def test_runtime_dashboard_readback_facts_override_blocked_eligibility(self) -> None:
         dispatch_result = await self.service.dispatch_next_open_plan(

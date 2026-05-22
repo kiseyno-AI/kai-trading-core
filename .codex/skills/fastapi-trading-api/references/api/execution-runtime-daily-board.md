@@ -5,6 +5,8 @@ Read the same-day execution board from core. The route is dashboard-safe and cac
 
 Each row includes compact `today_activity` facts for the requested `market_date`. Use these side-aware fields for Today bought/sold sections instead of inferring from lifecycle `intent` or aggregate `status`. Buy/sell quantities are counted only from timestamped compact execution/readback facts for the selected date; side facts without timestamps are marked unavailable rather than guessed.
 
+Price fields are display-oriented and cache-first: realtime websocket prices are preferred, but rows can fall back to local current-quote/cache or recent daily close with explicit source, freshness, and realtime subscription metadata.
+
 ## Example request
 ```http
 GET /execution/runtime/daily-board?market_date=2026-04-30&refresh=true
@@ -75,6 +77,10 @@ GET /execution/runtime/daily-board?market_date=2026-04-30&refresh=true
       "price_received_at": "2026-04-30T00:15:31+00:00",
       "price_source": "kis_realtime_ws",
       "price_status": "available",
+      "display_price_available": true,
+      "display_price_fallback_reason": null,
+      "realtime_subscribed": true,
+      "realtime_subscription_reason": "subscribed",
       "monitoring_state": "watching_target_stop",
       "planned_quantity": 5,
       "filled_quantity": 5,
