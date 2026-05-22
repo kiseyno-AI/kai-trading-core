@@ -12,6 +12,7 @@ from app.core.settings import settings
 from app.quotes import kis_realtime_prices
 from app.quotes.kis_realtime_prices import (
     KIS_REALTIME_PRICE_COLUMNS,
+    KISRealtimePriceSubscriptionError,
     KISRealtimePriceService,
     parse_realtime_price_message,
 )
@@ -154,6 +155,49 @@ class KISRealtimePriceServiceTests(unittest.IsolatedAsyncioTestCase):
             [(msg['header']['tr_type'], msg['body']['input']['tr_key']) for msg in sent_after_update],
             [('2', '000660'), ('2', '005930'), ('1', '035420')],
         )
+
+    async def test_failed_subscription_ack_clears_subscribed_symbol_for_retry(self) -> None:
+        service = KISRealtimePriceService(client=FakeKISRealtimePriceClient())
+        websocket = FakeWebSocket()
+
+        service.observe_monitored_symbols(['005930'], trigger='test')
+        await service._sync_subscriptions(websocket, approval_key='approval-test')
+
+        self.assertEqual(service.subscription_snapshot()['subscribed_symbols'], ['005930'])
+
+        failure_message = json.dumps(
+            {
+                'header': {'tr_id': 'H0STCNT0', 'tr_key': '005930'},
+                'body': {'rt_cd': '1', 'msg1': 'subscription rejected'},
+            }
+        )
+        with self.assertRaises(KISRealtimePriceSubscriptionError):
+            await service._handle_system_message(
+                websocket,
+                failure_message,
+                received_at=datetime.now(timezone.utc),
+            )
+
+        health = service.health_snapshot()
+        self.assertEqual(health['status'], 'reconnecting')
+        self.assertEqual(service.subscription_snapshot()['subscribed_symbols'], [])
+        self.assertEqual(health['subscription']['status'], 'failed')
+        self.assertEqual(health['subscription']['result_code'], '1')
+        self.assertEqual(health['subscription']['failed_symbol'], '005930')
+
+        await service._sync_subscriptions(websocket, approval_key='approval-test')
+
+        self.assertEqual(
+            [msg['body']['input']['tr_key'] for msg in websocket.sent],
+            ['005930', '005930'],
+        )
+
+    async def test_subscription_ack_failure_is_retryable_for_reconnect(self) -> None:
+        service = KISRealtimePriceService(client=FakeKISRealtimePriceClient())
+        exc = KISRealtimePriceSubscriptionError('subscription rejected')
+
+        self.assertFalse(service._is_fatal_error(exc))
+        self.assertTrue(service._is_retryable_error(exc))
 
 
 class FakeRealtimePriceRouteService:

@@ -536,7 +536,7 @@ class KISRealtimePriceService:
                 fatal = self._is_fatal_error(exc)
                 retryable = self._is_retryable_error(exc)
                 self._record_error(
-                    stage=stage,
+                    stage='subscription' if isinstance(exc, KISRealtimePriceSubscriptionError) else stage,
                     message=str(exc),
                     fatal=fatal,
                     retryable=retryable,
@@ -586,7 +586,7 @@ class KISRealtimePriceService:
             event.clear()
 
     def _is_fatal_error(self, exc: Exception) -> bool:
-        if isinstance(exc, (KISConfigurationError, KISAPIError, KISRealtimePriceSubscriptionError)):
+        if isinstance(exc, (KISConfigurationError, KISAPIError)):
             return True
         if isinstance(exc, KISHTTPError) and exc.status_code is not None and 400 <= exc.status_code < 500:
             return True
@@ -719,12 +719,37 @@ class KISRealtimePriceService:
         result_code = _normalize_text(body.get('rt_cd'))
         message_text = _normalize_text(body.get('msg1')) or 'system_message'
         if result_code and result_code != '0':
-            self._record_error(
-                stage='subscription',
-                message=message_text,
-                fatal=False,
-                retryable=False,
+            failed_symbol = self._system_message_symbol(header=header, body=body)
+            failure_message = (
+                f'{message_text} (rt_cd={result_code}, symbol={failed_symbol})'
+                if failed_symbol
+                else f'{message_text} (rt_cd={result_code})'
             )
+            with self._state_lock:
+                if failed_symbol:
+                    self._subscribed_symbols.discard(failed_symbol)
+                else:
+                    self._subscribed_symbols.clear()
+                self._health['status'] = 'reconnecting'
+                self._health['subscription'] = {
+                    'status': 'failed',
+                    'updated_at': _isoformat(received_at),
+                    'message': failure_message,
+                    'result_code': result_code,
+                    'failed_symbol': failed_symbol,
+                }
+                self._sync_health_symbols_locked()
+            raise KISRealtimePriceSubscriptionError(failure_message)
+
+    @staticmethod
+    def _system_message_symbol(*, header: dict[str, Any], body: dict[str, Any]) -> str | None:
+        output = body.get('output') if isinstance(body.get('output'), dict) else {}
+        input_payload = body.get('input') if isinstance(body.get('input'), dict) else {}
+        for source in (header, output, input_payload, body):
+            for key in ('tr_key', 'trkey', 'symbol', 'MKSC_SHRN_ISCD'):
+                if symbol := _normalize_symbol(source.get(key)):
+                    return symbol
+        return None
 
     def ingest_price_message(
         self,
