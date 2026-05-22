@@ -83,6 +83,9 @@ class Settings(BaseSettings):
     signal_decider_exec_dispatch_source: str = 'kai-trading-core'
     signal_decider_exec_runtime_mode: str = 'mock'
     signal_decider_exec_request_timeout_seconds: float = 10.0
+    signal_decider_exec_dashboard_cache_ttl_seconds: int = 5
+    signal_decider_exec_dashboard_refresh_debounce_seconds: float = 15.0
+    signal_decider_exec_dashboard_refresh_timeout_seconds: float = 2.0
     signal_decider_intraday_auto_sell_enabled: bool = False
     signal_decider_intraday_auto_sell_dry_run: bool = True
     signal_decider_intraday_auto_sell_cooldown_seconds: int = 120

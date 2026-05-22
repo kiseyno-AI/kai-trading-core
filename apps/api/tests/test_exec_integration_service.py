@@ -1,3 +1,4 @@
+import asyncio
 from datetime import date, datetime, timezone
 from decimal import Decimal
 import json
@@ -1348,20 +1349,25 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             }
             price_service.observe_monitored_symbols.return_value = {'allowed_symbols': [self.symbol]}
 
+            await self.service.list_signal_decider_exec_overview(
+                target_trade_date=self.target_trade_date,
+                refresh=True,
+                trigger='test',
+            )
             board = await self.service.get_runtime_daily_board(
                 market_date=self.target_trade_date,
-                refresh=True,
+                refresh=False,
                 trigger='test',
             )
             monitored = await self.service.list_runtime_monitored_symbols(
                 market_date=self.target_trade_date,
-                refresh=True,
+                refresh=False,
                 trigger='test',
             )
             detail = await self.service.get_runtime_symbol_detail(
                 market_date=self.target_trade_date,
                 symbol=self.symbol,
-                refresh=True,
+                refresh=False,
                 trigger='test',
             )
 
@@ -1386,6 +1392,101 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(detail['current_price'], 50200)
         self.assertEqual(detail['items'][0]['status'], 'filled')
         self.assertEqual(detail['items'][0]['remote_state']['derived_status'], 'open')
+
+    async def test_runtime_dashboard_refresh_true_returns_local_read_model_while_refresh_runs(self) -> None:
+        await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=False,
+            dry_run=False,
+            force=True,
+            trigger='test',
+        )
+        original_overview = self.service.list_signal_decider_exec_overview
+        refresh_started = asyncio.Event()
+        release_refresh = asyncio.Event()
+        refresh_call_count = 0
+
+        async def slow_refresh_overview(**kwargs):
+            nonlocal refresh_call_count
+            if kwargs.get('refresh'):
+                refresh_call_count += 1
+                refresh_started.set()
+                await release_refresh.wait()
+            return await original_overview(**kwargs)
+
+        self.service.list_signal_decider_exec_overview = slow_refresh_overview
+        try:
+            board = await asyncio.wait_for(
+                self.service.get_runtime_daily_board(
+                    market_date=self.target_trade_date,
+                    refresh=True,
+                    trigger='test',
+                ),
+                timeout=1.0,
+            )
+
+            self.assertEqual(board['refresh']['status'], 'scheduled')
+            self.assertEqual(board['freshness']['status'], 'refreshing')
+            self.assertEqual(board['freshness']['read_model_source'], 'persisted_exec_read_model')
+            await asyncio.wait_for(refresh_started.wait(), timeout=1.0)
+
+            monitored = await asyncio.wait_for(
+                self.service.list_runtime_monitored_symbols(
+                    market_date=self.target_trade_date,
+                    refresh=True,
+                    trigger='test',
+                ),
+                timeout=1.0,
+            )
+
+            self.assertEqual(refresh_call_count, 1)
+            self.assertEqual(monitored['refresh']['status'], 'running')
+            self.assertEqual(monitored['freshness']['status'], 'refreshing')
+        finally:
+            release_refresh.set()
+            tasks = list(self.service._dashboard_refresh_tasks.values())
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            self.service.list_signal_decider_exec_overview = original_overview
+
+    async def test_runtime_monitored_symbols_empty_response_does_not_wait_for_refresh(self) -> None:
+        empty_market_date = date(2027, 5, 21)
+        original_overview = self.service.list_signal_decider_exec_overview
+        refresh_started = asyncio.Event()
+        release_refresh = asyncio.Event()
+        refresh_call_count = 0
+
+        async def slow_refresh_overview(**kwargs):
+            nonlocal refresh_call_count
+            if kwargs.get('refresh'):
+                refresh_call_count += 1
+                refresh_started.set()
+                await release_refresh.wait()
+            return await original_overview(**kwargs)
+
+        self.service.list_signal_decider_exec_overview = slow_refresh_overview
+        try:
+            monitored = await asyncio.wait_for(
+                self.service.list_runtime_monitored_symbols(
+                    market_date=empty_market_date,
+                    refresh=True,
+                    trigger='test',
+                ),
+                timeout=1.0,
+            )
+
+            self.assertEqual(monitored['summary']['items_total'], 0)
+            self.assertEqual(monitored['items'], [])
+            self.assertEqual(monitored['freshness']['status'], 'refreshing')
+            self.assertEqual(monitored['refresh']['status'], 'scheduled')
+            await asyncio.wait_for(refresh_started.wait(), timeout=1.0)
+            self.assertEqual(refresh_call_count, 1)
+        finally:
+            release_refresh.set()
+            tasks = list(self.service._dashboard_refresh_tasks.values())
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            self.service.list_signal_decider_exec_overview = original_overview
 
     async def test_runtime_dashboard_views_classify_cancelled_orders_before_failed(self) -> None:
         dispatch_result = await self.service.dispatch_next_open_plan(
@@ -1426,15 +1527,20 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                     ]
                 }
 
+                await self.service.list_signal_decider_exec_overview(
+                    target_trade_date=self.target_trade_date,
+                    refresh=True,
+                    trigger='test',
+                )
                 board = await self.service.get_runtime_daily_board(
                     market_date=self.target_trade_date,
-                    refresh=True,
+                    refresh=False,
                     trigger='test',
                 )
                 detail = await self.service.get_runtime_symbol_detail(
                     market_date=self.target_trade_date,
                     symbol=self.symbol,
-                    refresh=True,
+                    refresh=False,
                     trigger='test',
                 )
 

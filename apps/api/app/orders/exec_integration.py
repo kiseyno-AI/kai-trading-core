@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 from collections import Counter, defaultdict
+import copy
+from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 import hashlib
@@ -112,6 +115,29 @@ UI_MONITORING_STATE_WATCHING_TARGET_STOP = 'watching_target_stop'
 UI_MONITORING_STATE_WATCHING_FILL = 'watching_fill'
 UI_MONITORING_STATE_RECONCILING = 'reconciling'
 UI_MONITORING_STATE_IDLE = 'idle'
+
+DASHBOARD_ENDPOINT_DAILY_BOARD = 'daily_board'
+DASHBOARD_ENDPOINT_MONITORED_SYMBOLS = 'monitored_symbols'
+DASHBOARD_ENDPOINT_SYMBOL_DETAIL = 'symbol_detail'
+DASHBOARD_READ_MODEL_SCHEMA_VERSION = 'execution_runtime_dashboard_read_model_v1'
+DASHBOARD_REFRESH_STATUS_NOT_REQUESTED = 'not_requested'
+DASHBOARD_REFRESH_STATUS_SCHEDULED = 'scheduled'
+DASHBOARD_REFRESH_STATUS_RUNNING = 'running'
+DASHBOARD_REFRESH_STATUS_DEBOUNCED = 'debounced'
+DASHBOARD_REFRESH_STATUS_SUCCEEDED = 'succeeded'
+DASHBOARD_REFRESH_STATUS_TIMEOUT = 'timeout'
+DASHBOARD_REFRESH_STATUS_FAILED = 'failed'
+DASHBOARD_FRESHNESS_STATUS_FRESH = 'fresh'
+DASHBOARD_FRESHNESS_STATUS_STALE = 'stale'
+DASHBOARD_FRESHNESS_STATUS_PARTIAL = 'partial'
+DASHBOARD_FRESHNESS_STATUS_REFRESHING = 'refreshing'
+DASHBOARD_FRESHNESS_STATUS_UNAVAILABLE = 'unavailable'
+
+
+@dataclass
+class DashboardReadModelCacheRecord:
+    payload: dict[str, Any]
+    cached_at: datetime
 
 
 def _utcnow() -> datetime:
@@ -556,6 +582,18 @@ class SignalDeciderExecIntegrationService:
         client: SignalDeciderExecClient | None = None,
     ) -> None:
         self.client = client or SignalDeciderExecClient()
+        self.dashboard_cache_ttl_seconds = max(int(settings.signal_decider_exec_dashboard_cache_ttl_seconds), 0)
+        self.dashboard_refresh_debounce_seconds = max(
+            float(settings.signal_decider_exec_dashboard_refresh_debounce_seconds),
+            0.0,
+        )
+        self.dashboard_refresh_timeout_seconds = max(
+            float(settings.signal_decider_exec_dashboard_refresh_timeout_seconds),
+            0.0,
+        )
+        self._dashboard_cache: dict[tuple[str, str, str | None], DashboardReadModelCacheRecord] = {}
+        self._dashboard_refresh_tasks: dict[tuple[str, str | None, str | None], asyncio.Task] = {}
+        self._dashboard_refresh_state: dict[tuple[str, str | None, str | None], dict[str, Any]] = {}
 
     def integration_status(self) -> dict[str, Any]:
         mode = _normalize_optional_text(settings.signal_decider_exec_integration_mode, lowercase=True) or INTEGRATION_MODE_DISABLED
@@ -985,36 +1023,43 @@ class SignalDeciderExecIntegrationService:
         trigger: str = 'manual',
     ) -> dict[str, Any]:
         resolved_market_date = _normalize_date(market_date)
-        overview = await self._load_dashboard_overview(
+        refresh_state = self._ensure_dashboard_background_refresh(
             target_trade_date=resolved_market_date,
             account_reference=None,
             symbol=None,
             refresh=refresh,
             trigger=trigger,
         )
-        symbol_metadata_map = self._load_symbol_metadata_map(item.get('symbol') for item in overview['items'])
-        runtime = self._build_dashboard_runtime_status(
-            integration=overview['integration'],
-            runtime=overview['runtime'],
+        cached = self._load_dashboard_cached_payload(
+            endpoint=DASHBOARD_ENDPOINT_DAILY_BOARD,
+            market_date=resolved_market_date,
+            symbol=None,
+            refresh_state=refresh_state,
+            allow_stale=False,
         )
-        items = [
-            self._build_runtime_board_item(
-                item=item,
-                symbol_metadata_map=symbol_metadata_map,
-                runtime_status=runtime['status'],
-            )
-            for item in overview['items']
-        ]
-        return {
-            'request': {
-                'market_date': resolved_market_date.isoformat(),
-                'refresh': refresh,
-            },
-            'runtime': runtime,
-            'market_date': resolved_market_date.isoformat(),
-            'summary': self._build_runtime_daily_board_summary(items=items),
-            'items': items,
-        }
+        if cached is not None:
+            return cached
+
+        overview = await self._load_dashboard_read_model_overview(
+            target_trade_date=resolved_market_date,
+            account_reference=None,
+            symbol=None,
+            trigger=trigger,
+        )
+        payload = self._build_runtime_daily_board_payload(
+            market_date=resolved_market_date,
+            refresh=refresh,
+            overview=overview,
+            refresh_state=refresh_state,
+            served_from_cache=False,
+        )
+        self._store_dashboard_cached_payload(
+            endpoint=DASHBOARD_ENDPOINT_DAILY_BOARD,
+            market_date=resolved_market_date,
+            symbol=None,
+            payload=payload,
+        )
+        return payload
 
     async def list_runtime_monitored_symbols(
         self,
@@ -1023,40 +1068,50 @@ class SignalDeciderExecIntegrationService:
         refresh: bool = True,
         trigger: str = 'manual',
     ) -> dict[str, Any]:
-        board = await self.get_runtime_daily_board(
-            market_date=market_date,
+        resolved_market_date = _normalize_date(market_date)
+        refresh_state = self._ensure_dashboard_background_refresh(
+            target_trade_date=resolved_market_date,
+            account_reference=None,
+            symbol=None,
             refresh=refresh,
             trigger=trigger,
         )
-        grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
-        for item in board['items']:
-            symbol = _normalize_optional_text(item.get('symbol'))
-            if symbol:
-                grouped[symbol].append(item)
-
-        items = [
-            self._build_runtime_monitored_symbol_item(
-                symbol=symbol,
-                items=grouped_items,
-                runtime_status=board['runtime']['status'],
+        cached = self._load_dashboard_cached_payload(
+            endpoint=DASHBOARD_ENDPOINT_MONITORED_SYMBOLS,
+            market_date=resolved_market_date,
+            symbol=None,
+            refresh_state=refresh_state,
+            allow_stale=False,
+        )
+        if cached is not None:
+            self._observe_runtime_symbols_for_realtime_prices(
+                (item.get('symbol') for item in cached.get('items') or []),
+                trigger=trigger,
             )
-            for symbol, grouped_items in sorted(grouped.items())
-            if self._should_include_monitored_symbol_group(grouped_items)
-        ]
-        self._observe_runtime_symbols_for_realtime_prices(
-            (item.get('symbol') for item in items),
+            return cached
+
+        board = await self.get_runtime_daily_board(
+            market_date=resolved_market_date,
+            refresh=False,
             trigger=trigger,
         )
-        return {
-            'request': {
-                'market_date': board['market_date'],
-                'refresh': refresh,
-            },
-            'runtime': board['runtime'],
-            'market_date': board['market_date'],
-            'summary': self._build_runtime_monitored_summary(items=items),
-            'items': items,
-        }
+        payload = self._build_runtime_monitored_symbols_payload(
+            board=board,
+            refresh=refresh,
+            refresh_state=refresh_state,
+            served_from_cache=False,
+        )
+        self._observe_runtime_symbols_for_realtime_prices(
+            (item.get('symbol') for item in payload['items']),
+            trigger=trigger,
+        )
+        self._store_dashboard_cached_payload(
+            endpoint=DASHBOARD_ENDPOINT_MONITORED_SYMBOLS,
+            market_date=resolved_market_date,
+            symbol=None,
+            payload=payload,
+        )
+        return payload
 
     async def get_runtime_symbol_detail(
         self,
@@ -1070,17 +1125,154 @@ class SignalDeciderExecIntegrationService:
         resolved_symbol = _normalize_optional_text(symbol)
         if not resolved_symbol:
             raise ValueError('symbol is required')
-        overview = await self._load_dashboard_overview(
+        refresh_state = self._ensure_dashboard_background_refresh(
             target_trade_date=resolved_market_date,
             account_reference=None,
             symbol=resolved_symbol,
+            trigger=trigger,
             refresh=refresh,
+        )
+        cached = self._load_dashboard_cached_payload(
+            endpoint=DASHBOARD_ENDPOINT_SYMBOL_DETAIL,
+            market_date=resolved_market_date,
+            symbol=resolved_symbol,
+            refresh_state=refresh_state,
+            allow_stale=False,
+        )
+        if cached is not None:
+            return cached
+
+        overview = await self._load_dashboard_read_model_overview(
+            target_trade_date=resolved_market_date,
+            account_reference=None,
+            symbol=resolved_symbol,
             trigger=trigger,
         )
-        symbol_metadata_map = self._load_symbol_metadata_map([resolved_symbol])
+        payload = self._build_runtime_symbol_detail_payload(
+            market_date=resolved_market_date,
+            symbol=resolved_symbol,
+            refresh=refresh,
+            overview=overview,
+            refresh_state=refresh_state,
+            served_from_cache=False,
+        )
+        self._store_dashboard_cached_payload(
+            endpoint=DASHBOARD_ENDPOINT_SYMBOL_DETAIL,
+            market_date=resolved_market_date,
+            symbol=resolved_symbol,
+            payload=payload,
+        )
+        return payload
+
+    def _build_runtime_daily_board_payload(
+        self,
+        *,
+        market_date: date,
+        refresh: bool,
+        overview: dict[str, Any],
+        refresh_state: dict[str, Any],
+        served_from_cache: bool,
+    ) -> dict[str, Any]:
+        generated_at = _utcnow()
+        overview_items = overview.get('items') or []
+        symbol_metadata_map = self._load_symbol_metadata_map(item.get('symbol') for item in overview_items)
         runtime = self._build_dashboard_runtime_status(
             integration=overview['integration'],
-            runtime=overview['runtime'],
+            runtime=self._resolve_dashboard_runtime_read_model(overview=overview, overview_items=overview_items),
+        )
+        items = [
+            self._build_runtime_board_item(
+                item=item,
+                symbol_metadata_map=symbol_metadata_map,
+                runtime_status=runtime['status'],
+            )
+            for item in overview_items
+        ]
+        return {
+            'request': {
+                'market_date': market_date.isoformat(),
+                'refresh': refresh,
+            },
+            'runtime': runtime,
+            'market_date': market_date.isoformat(),
+            'summary': self._build_runtime_daily_board_summary(items=items),
+            'freshness': self._build_dashboard_freshness(
+                endpoint=DASHBOARD_ENDPOINT_DAILY_BOARD,
+                market_date=market_date,
+                generated_at=generated_at,
+                served_from_cache=served_from_cache,
+                runtime_status=runtime['status'],
+                overview_items=overview_items,
+                output_item_count=len(items),
+                refresh_state=refresh_state,
+            ),
+            'refresh': refresh_state,
+            'items': items,
+        }
+
+    def _build_runtime_monitored_symbols_payload(
+        self,
+        *,
+        board: dict[str, Any],
+        refresh: bool,
+        refresh_state: dict[str, Any],
+        served_from_cache: bool,
+    ) -> dict[str, Any]:
+        resolved_market_date = date.fromisoformat(str(board['market_date']))
+        grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for item in board.get('items') or []:
+            symbol = _normalize_optional_text(item.get('symbol'))
+            if symbol:
+                grouped[symbol].append(item)
+
+        items = [
+            self._build_runtime_monitored_symbol_item(
+                symbol=symbol,
+                items=grouped_items,
+                runtime_status=board['runtime']['status'],
+            )
+            for symbol, grouped_items in sorted(grouped.items())
+            if self._should_include_monitored_symbol_group(grouped_items)
+        ]
+        generated_at = _utcnow()
+        return {
+            'request': {
+                'market_date': board['market_date'],
+                'refresh': refresh,
+            },
+            'runtime': board['runtime'],
+            'market_date': board['market_date'],
+            'summary': self._build_runtime_monitored_summary(items=items),
+            'freshness': self._build_dashboard_freshness(
+                endpoint=DASHBOARD_ENDPOINT_MONITORED_SYMBOLS,
+                market_date=resolved_market_date,
+                generated_at=generated_at,
+                served_from_cache=served_from_cache,
+                runtime_status=board['runtime']['status'],
+                overview_items=board.get('items') or [],
+                output_item_count=len(items),
+                refresh_state=refresh_state,
+            ),
+            'refresh': refresh_state,
+            'items': items,
+        }
+
+    def _build_runtime_symbol_detail_payload(
+        self,
+        *,
+        market_date: date,
+        symbol: str,
+        refresh: bool,
+        overview: dict[str, Any],
+        refresh_state: dict[str, Any],
+        served_from_cache: bool,
+    ) -> dict[str, Any]:
+        generated_at = _utcnow()
+        overview_items = overview.get('items') or []
+        symbol_metadata_map = self._load_symbol_metadata_map([symbol])
+        runtime = self._build_dashboard_runtime_status(
+            integration=overview['integration'],
+            runtime=self._resolve_dashboard_runtime_read_model(overview=overview, overview_items=overview_items),
         )
         items = [
             self._build_runtime_symbol_detail_item(
@@ -1088,27 +1280,27 @@ class SignalDeciderExecIntegrationService:
                 symbol_metadata_map=symbol_metadata_map,
                 runtime_status=runtime['status'],
             )
-            for item in overview['items']
+            for item in overview_items
         ]
         metadata = symbol_metadata_map.get(
-            resolved_symbol,
+            symbol,
             {
-                'name': resolved_symbol,
+                'name': symbol,
                 'market': None,
             },
         )
-        return {
+        payload = {
             'request': {
-                'market_date': resolved_market_date.isoformat(),
-                'symbol': resolved_symbol,
+                'market_date': market_date.isoformat(),
+                'symbol': symbol,
                 'refresh': refresh,
             },
             'runtime': runtime,
-            'market_date': resolved_market_date.isoformat(),
-            'symbol': resolved_symbol,
+            'market_date': market_date.isoformat(),
+            'symbol': symbol,
             'name': metadata['name'],
             'market': metadata['market'],
-            **self._price_fields_for_symbol(resolved_symbol),
+            **self._price_fields_for_symbol(symbol),
             'planning': {
                 'decision_source': (
                     next(iter(agent_names))
@@ -1162,8 +1354,530 @@ class SignalDeciderExecIntegrationService:
             },
             'monitoring': self._build_runtime_symbol_monitoring(items=items, runtime_status=runtime['status']),
             'summary': self._build_runtime_symbol_detail_summary(items=items),
+            'freshness': self._build_dashboard_freshness(
+                endpoint=DASHBOARD_ENDPOINT_SYMBOL_DETAIL,
+                market_date=market_date,
+                generated_at=generated_at,
+                served_from_cache=served_from_cache,
+                runtime_status=runtime['status'],
+                overview_items=overview_items,
+                output_item_count=len(items),
+                refresh_state=refresh_state,
+            ),
+            'refresh': refresh_state,
             'items': items,
         }
+        return payload
+
+    @staticmethod
+    def _resolve_dashboard_runtime_read_model(
+        *,
+        overview: dict[str, Any],
+        overview_items: Sequence[dict[str, Any]],
+    ) -> dict[str, Any]:
+        fallback = overview.get('runtime') if isinstance(overview.get('runtime'), dict) else {}
+        latest_runtime: dict[str, Any] | None = None
+        latest_synced_at: datetime | None = None
+        for item in overview_items:
+            remote_state = item.get('remote_state') if isinstance(item.get('remote_state'), dict) else {}
+            runtime = remote_state.get('runtime') if isinstance(remote_state.get('runtime'), dict) else None
+            if runtime is None:
+                continue
+            synced_at = _parse_iso_datetime(remote_state.get('last_synced_at')) or datetime.min.replace(tzinfo=timezone.utc)
+            if latest_runtime is None or synced_at > (latest_synced_at or datetime.min.replace(tzinfo=timezone.utc)):
+                latest_runtime = runtime
+                latest_synced_at = synced_at
+        return latest_runtime or fallback
+
+    async def _load_dashboard_read_model_overview(
+        self,
+        *,
+        target_trade_date: date,
+        account_reference: str | None,
+        symbol: str | None,
+        trigger: str,
+    ) -> dict[str, Any]:
+        return await self.list_signal_decider_exec_overview(
+            target_trade_date=target_trade_date,
+            account_reference=account_reference,
+            symbol=symbol,
+            refresh=False,
+            trigger=trigger,
+        )
+
+    def _ensure_dashboard_background_refresh(
+        self,
+        *,
+        target_trade_date: date,
+        account_reference: str | None,
+        symbol: str | None,
+        refresh: bool,
+        trigger: str,
+    ) -> dict[str, Any]:
+        key = self._dashboard_refresh_key(
+            target_trade_date=target_trade_date,
+            account_reference=account_reference,
+            symbol=symbol,
+        )
+        if not refresh:
+            return self._dashboard_refresh_payload(
+                key,
+                requested=False,
+                status=DASHBOARD_REFRESH_STATUS_NOT_REQUESTED,
+            )
+
+        integration = self.integration_status()
+        if not integration['enabled'] or integration['config_status'] != 'ready':
+            status = integration['config_status']
+            self._dashboard_refresh_state[key] = {
+                **self._dashboard_refresh_state.get(key, {}),
+                'status': status,
+                'last_error': integration['issues'][0] if integration['issues'] else None,
+            }
+            return self._dashboard_refresh_payload(key, requested=True, status=status)
+
+        task = self._dashboard_refresh_tasks.get(key)
+        if task is not None and not task.done():
+            return self._dashboard_refresh_payload(
+                key,
+                requested=True,
+                status=DASHBOARD_REFRESH_STATUS_RUNNING,
+            )
+
+        now = _utcnow()
+        state = self._dashboard_refresh_state.get(key) or {}
+        last_attempted_at = _parse_iso_datetime(state.get('last_attempted_at'))
+        if last_attempted_at is not None:
+            elapsed_seconds = (now - last_attempted_at).total_seconds()
+            if elapsed_seconds < self.dashboard_refresh_debounce_seconds:
+                debounced_status = (
+                    state.get('status')
+                    if state.get('status') in {
+                        DASHBOARD_REFRESH_STATUS_FAILED,
+                        DASHBOARD_REFRESH_STATUS_SUCCEEDED,
+                        DASHBOARD_REFRESH_STATUS_TIMEOUT,
+                    }
+                    else DASHBOARD_REFRESH_STATUS_DEBOUNCED
+                )
+                payload = self._dashboard_refresh_payload(
+                    key,
+                    requested=True,
+                    status=debounced_status,
+                )
+                payload['debounced'] = True
+                return payload
+
+        self._dashboard_refresh_state[key] = {
+            **state,
+            'status': DASHBOARD_REFRESH_STATUS_SCHEDULED,
+            'last_attempted_at': now.isoformat(),
+            'last_trigger': trigger,
+            'last_error': None,
+        }
+        task = asyncio.create_task(
+            self._refresh_dashboard_read_model(
+                key=key,
+                target_trade_date=target_trade_date,
+                account_reference=account_reference,
+                symbol=symbol,
+                trigger=trigger,
+            ),
+            name=f'exec-runtime-dashboard-refresh:{target_trade_date.isoformat()}:{symbol or "all"}',
+        )
+        self._dashboard_refresh_tasks[key] = task
+        task.add_done_callback(lambda completed: self._finalize_dashboard_refresh_task(key, completed))
+        return self._dashboard_refresh_payload(
+            key,
+            requested=True,
+            status=DASHBOARD_REFRESH_STATUS_SCHEDULED,
+        )
+
+    async def _refresh_dashboard_read_model(
+        self,
+        *,
+        key: tuple[str, str | None, str | None],
+        target_trade_date: date,
+        account_reference: str | None,
+        symbol: str | None,
+        trigger: str,
+    ) -> None:
+        state = self._dashboard_refresh_state.get(key) or {}
+        started_at = _utcnow()
+        self._dashboard_refresh_state[key] = {
+            **state,
+            'status': DASHBOARD_REFRESH_STATUS_RUNNING,
+            'started_at': started_at.isoformat(),
+            'last_error': None,
+        }
+        try:
+            refresh_coro = self.list_signal_decider_exec_overview(
+                target_trade_date=target_trade_date,
+                account_reference=account_reference,
+                symbol=symbol,
+                refresh=True,
+                trigger=f'{trigger}:dashboard_background_refresh',
+            )
+            if self.dashboard_refresh_timeout_seconds > 0:
+                overview = await asyncio.wait_for(
+                    refresh_coro,
+                    timeout=self.dashboard_refresh_timeout_seconds,
+                )
+            else:
+                overview = await refresh_coro
+        except asyncio.TimeoutError:
+            finished_at = _utcnow()
+            self._dashboard_refresh_state[key] = {
+                **self._dashboard_refresh_state.get(key, {}),
+                'status': DASHBOARD_REFRESH_STATUS_TIMEOUT,
+                'finished_at': finished_at.isoformat(),
+                'last_error': _serialize_error(
+                    code='dashboard_refresh_timeout',
+                    message=(
+                        'Exec dashboard refresh exceeded '
+                        f'{self.dashboard_refresh_timeout_seconds:g}s and was left on the cached read model.'
+                    ),
+                    retryable=True,
+                ),
+            }
+            return
+        except Exception as exc:
+            finished_at = _utcnow()
+            self._dashboard_refresh_state[key] = {
+                **self._dashboard_refresh_state.get(key, {}),
+                'status': DASHBOARD_REFRESH_STATUS_FAILED,
+                'finished_at': finished_at.isoformat(),
+                'last_error': _serialize_error(
+                    code='dashboard_refresh_failed',
+                    message=str(exc),
+                    retryable=True,
+                ),
+            }
+            return
+
+        finished_at = _utcnow()
+        self._dashboard_refresh_state[key] = {
+            **self._dashboard_refresh_state.get(key, {}),
+            'status': DASHBOARD_REFRESH_STATUS_SUCCEEDED,
+            'finished_at': finished_at.isoformat(),
+            'last_succeeded_at': finished_at.isoformat(),
+            'last_error': None,
+        }
+        refresh_state = self._dashboard_refresh_payload(
+            key,
+            requested=True,
+            status=DASHBOARD_REFRESH_STATUS_SUCCEEDED,
+        )
+        self._store_dashboard_caches_from_overview(
+            market_date=target_trade_date,
+            symbol=symbol,
+            overview=overview,
+            refresh_state=refresh_state,
+        )
+
+    def _finalize_dashboard_refresh_task(
+        self,
+        key: tuple[str, str | None, str | None],
+        task: asyncio.Task,
+    ) -> None:
+        if self._dashboard_refresh_tasks.get(key) is task:
+            self._dashboard_refresh_tasks.pop(key, None)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            self._dashboard_refresh_state[key] = {
+                **self._dashboard_refresh_state.get(key, {}),
+                'status': DASHBOARD_REFRESH_STATUS_FAILED,
+                'finished_at': _utcnow().isoformat(),
+                'last_error': _serialize_error(
+                    code='dashboard_refresh_task_failed',
+                    message=str(exc),
+                    retryable=True,
+                ),
+            }
+
+    def _store_dashboard_caches_from_overview(
+        self,
+        *,
+        market_date: date,
+        symbol: str | None,
+        overview: dict[str, Any],
+        refresh_state: dict[str, Any],
+    ) -> None:
+        if symbol:
+            detail = self._build_runtime_symbol_detail_payload(
+                market_date=market_date,
+                symbol=symbol,
+                refresh=True,
+                overview=overview,
+                refresh_state=refresh_state,
+                served_from_cache=False,
+            )
+            self._store_dashboard_cached_payload(
+                endpoint=DASHBOARD_ENDPOINT_SYMBOL_DETAIL,
+                market_date=market_date,
+                symbol=symbol,
+                payload=detail,
+            )
+            return
+
+        board = self._build_runtime_daily_board_payload(
+            market_date=market_date,
+            refresh=True,
+            overview=overview,
+            refresh_state=refresh_state,
+            served_from_cache=False,
+        )
+        self._store_dashboard_cached_payload(
+            endpoint=DASHBOARD_ENDPOINT_DAILY_BOARD,
+            market_date=market_date,
+            symbol=None,
+            payload=board,
+        )
+        monitored = self._build_runtime_monitored_symbols_payload(
+            board=board,
+            refresh=True,
+            refresh_state=refresh_state,
+            served_from_cache=False,
+        )
+        self._store_dashboard_cached_payload(
+            endpoint=DASHBOARD_ENDPOINT_MONITORED_SYMBOLS,
+            market_date=market_date,
+            symbol=None,
+            payload=monitored,
+        )
+
+    def _load_dashboard_cached_payload(
+        self,
+        *,
+        endpoint: str,
+        market_date: date,
+        symbol: str | None,
+        refresh_state: dict[str, Any],
+        allow_stale: bool,
+    ) -> dict[str, Any] | None:
+        record = self._dashboard_cache.get(self._dashboard_cache_key(endpoint, market_date, symbol))
+        if record is None:
+            return None
+        if not allow_stale and self._dashboard_cache_is_due(record):
+            return None
+        return self._decorate_dashboard_cached_payload(record, refresh_state=refresh_state)
+
+    def _store_dashboard_cached_payload(
+        self,
+        *,
+        endpoint: str,
+        market_date: date,
+        symbol: str | None,
+        payload: dict[str, Any],
+    ) -> None:
+        cache_key = self._dashboard_cache_key(endpoint, market_date, symbol)
+        self._dashboard_cache[cache_key] = DashboardReadModelCacheRecord(
+            payload=copy.deepcopy(payload),
+            cached_at=_utcnow(),
+        )
+        self._prune_dashboard_cache()
+
+    def _decorate_dashboard_cached_payload(
+        self,
+        record: DashboardReadModelCacheRecord,
+        *,
+        refresh_state: dict[str, Any],
+    ) -> dict[str, Any]:
+        payload = copy.deepcopy(record.payload)
+        request_payload = payload.get('request') if isinstance(payload.get('request'), dict) else {}
+        request_payload['refresh'] = bool(refresh_state.get('requested'))
+        payload['request'] = request_payload
+        freshness = payload.get('freshness') if isinstance(payload.get('freshness'), dict) else {}
+        stale_by_cache = self._dashboard_cache_is_due(record)
+        refreshing = self._dashboard_refresh_in_flight(refresh_state)
+        if refreshing:
+            status = DASHBOARD_FRESHNESS_STATUS_REFRESHING
+        elif stale_by_cache or freshness.get('is_stale'):
+            status = DASHBOARD_FRESHNESS_STATUS_STALE
+        elif freshness.get('is_partial'):
+            status = DASHBOARD_FRESHNESS_STATUS_PARTIAL
+        else:
+            status = DASHBOARD_FRESHNESS_STATUS_FRESH
+        freshness = {
+            **freshness,
+            'status': status,
+            'served_from_cache': True,
+            'read_model_source': 'in_process_cache',
+            'cached_at': record.cached_at.isoformat(),
+            'cache_age_seconds': self._dashboard_cache_age_seconds(record),
+            'cache_ttl_seconds': self.dashboard_cache_ttl_seconds,
+            'is_stale': bool(stale_by_cache or freshness.get('is_stale')),
+            'refreshing': refreshing,
+        }
+        payload['freshness'] = freshness
+        payload['refresh'] = refresh_state
+        return payload
+
+    def _build_dashboard_freshness(
+        self,
+        *,
+        endpoint: str,
+        market_date: date,
+        generated_at: datetime,
+        served_from_cache: bool,
+        runtime_status: str,
+        overview_items: Sequence[dict[str, Any]],
+        output_item_count: int,
+        refresh_state: dict[str, Any],
+    ) -> dict[str, Any]:
+        last_readback_synced_at = _latest_iso_timestamp(
+            (item.get('remote_state') or {}).get('last_synced_at')
+            for item in overview_items
+        )
+        readback_synced_count = sum(
+            1
+            for item in overview_items
+            if _normalize_optional_text((item.get('remote_state') or {}).get('last_synced_at'))
+        )
+        readback_missing_count = max(len(overview_items) - readback_synced_count, 0)
+        readback_age_seconds = self._seconds_since(last_readback_synced_at)
+        stale_by_readback = (
+            readback_age_seconds is not None
+            and self.dashboard_cache_ttl_seconds > 0
+            and readback_age_seconds > self.dashboard_cache_ttl_seconds
+        )
+        status = self._resolve_dashboard_freshness_status(
+            output_item_count=output_item_count,
+            overview_item_count=len(overview_items),
+            readback_synced_count=readback_synced_count,
+            readback_missing_count=readback_missing_count,
+            stale_by_readback=stale_by_readback,
+            runtime_status=runtime_status,
+            refresh_state=refresh_state,
+        )
+        return {
+            'schema_version': DASHBOARD_READ_MODEL_SCHEMA_VERSION,
+            'endpoint': endpoint,
+            'market_date': market_date.isoformat(),
+            'status': status,
+            'served_from_cache': served_from_cache,
+            'read_model_source': 'in_process_cache' if served_from_cache else 'persisted_exec_read_model',
+            'generated_at': generated_at.isoformat(),
+            'cached_at': generated_at.isoformat(),
+            'cache_age_seconds': 0,
+            'cache_ttl_seconds': self.dashboard_cache_ttl_seconds,
+            'is_stale': bool(stale_by_readback or status == DASHBOARD_FRESHNESS_STATUS_STALE),
+            'is_partial': bool(readback_missing_count > 0 or status == DASHBOARD_FRESHNESS_STATUS_PARTIAL),
+            'refreshing': self._dashboard_refresh_in_flight(refresh_state),
+            'last_readback_synced_at': last_readback_synced_at,
+            'readback_age_seconds': readback_age_seconds,
+            'readback_synced_count': readback_synced_count,
+            'readback_missing_count': readback_missing_count,
+            'overview_item_count': len(overview_items),
+            'output_item_count': output_item_count,
+        }
+
+    def _resolve_dashboard_freshness_status(
+        self,
+        *,
+        output_item_count: int,
+        overview_item_count: int,
+        readback_synced_count: int,
+        readback_missing_count: int,
+        stale_by_readback: bool,
+        runtime_status: str,
+        refresh_state: dict[str, Any],
+    ) -> str:
+        if self._dashboard_refresh_in_flight(refresh_state):
+            return DASHBOARD_FRESHNESS_STATUS_REFRESHING
+        if output_item_count == 0 and overview_item_count == 0:
+            return DASHBOARD_FRESHNESS_STATUS_FRESH
+        if runtime_status in {UI_RUNTIME_STATUS_OFFLINE, UI_RUNTIME_STATUS_DEGRADED} and readback_synced_count == 0:
+            return DASHBOARD_FRESHNESS_STATUS_PARTIAL
+        if readback_missing_count > 0:
+            return DASHBOARD_FRESHNESS_STATUS_PARTIAL
+        if stale_by_readback:
+            return DASHBOARD_FRESHNESS_STATUS_STALE
+        return DASHBOARD_FRESHNESS_STATUS_FRESH
+
+    def _dashboard_refresh_payload(
+        self,
+        key: tuple[str, str | None, str | None],
+        *,
+        requested: bool,
+        status: str | None = None,
+    ) -> dict[str, Any]:
+        state = self._dashboard_refresh_state.get(key) or {}
+        task = self._dashboard_refresh_tasks.get(key)
+        in_flight = task is not None and not task.done()
+        resolved_status = status or state.get('status') or DASHBOARD_REFRESH_STATUS_NOT_REQUESTED
+        return {
+            'requested': requested,
+            'status': resolved_status,
+            'background': requested and resolved_status != DASHBOARD_REFRESH_STATUS_NOT_REQUESTED,
+            'in_flight': in_flight,
+            'debounced': resolved_status == DASHBOARD_REFRESH_STATUS_DEBOUNCED,
+            'timeout_seconds': self.dashboard_refresh_timeout_seconds,
+            'debounce_seconds': self.dashboard_refresh_debounce_seconds,
+            'last_trigger': state.get('last_trigger'),
+            'last_attempted_at': state.get('last_attempted_at'),
+            'started_at': state.get('started_at'),
+            'finished_at': state.get('finished_at'),
+            'last_succeeded_at': state.get('last_succeeded_at'),
+            'last_error': state.get('last_error'),
+        }
+
+    @staticmethod
+    def _dashboard_refresh_key(
+        *,
+        target_trade_date: date,
+        account_reference: str | None,
+        symbol: str | None,
+    ) -> tuple[str, str | None, str | None]:
+        return (
+            target_trade_date.isoformat(),
+            _normalize_optional_text(account_reference),
+            _normalize_optional_text(symbol),
+        )
+
+    @staticmethod
+    def _dashboard_cache_key(
+        endpoint: str,
+        market_date: date,
+        symbol: str | None,
+    ) -> tuple[str, str, str | None]:
+        return (
+            endpoint,
+            market_date.isoformat(),
+            _normalize_optional_text(symbol),
+        )
+
+    @staticmethod
+    def _dashboard_refresh_in_flight(refresh_state: dict[str, Any]) -> bool:
+        return bool(refresh_state.get('in_flight')) or refresh_state.get('status') in {
+            DASHBOARD_REFRESH_STATUS_SCHEDULED,
+            DASHBOARD_REFRESH_STATUS_RUNNING,
+        }
+
+    def _dashboard_cache_is_due(self, record: DashboardReadModelCacheRecord) -> bool:
+        if self.dashboard_cache_ttl_seconds <= 0:
+            return True
+        return self._dashboard_cache_age_seconds(record) > self.dashboard_cache_ttl_seconds
+
+    @staticmethod
+    def _dashboard_cache_age_seconds(record: DashboardReadModelCacheRecord) -> int:
+        return max(int((_utcnow() - record.cached_at).total_seconds()), 0)
+
+    @staticmethod
+    def _seconds_since(value: Any) -> int | None:
+        parsed = _parse_iso_datetime(value)
+        if parsed is None:
+            return None
+        return max(int((_utcnow() - parsed).total_seconds()), 0)
+
+    def _prune_dashboard_cache(self) -> None:
+        max_entries = 96
+        if len(self._dashboard_cache) <= max_entries:
+            return
+        sorted_items = sorted(self._dashboard_cache.items(), key=lambda item: item[1].cached_at)
+        for cache_key, _ in sorted_items[: len(self._dashboard_cache) - max_entries]:
+            self._dashboard_cache.pop(cache_key, None)
 
     def _load_next_open_rows(
         self,
@@ -2295,6 +3009,7 @@ class SignalDeciderExecIntegrationService:
             },
             'remote_state': {
                 'last_synced_at': readback.get('last_synced_at'),
+                'runtime': readback.get('runtime') if isinstance(readback.get('runtime'), dict) else None,
                 'derived_status': derived_state.get('derived_status'),
                 'entry_filled_quantity': derived_state.get('entry_filled_quantity'),
                 'exit_filled_quantity': derived_state.get('exit_filled_quantity'),
@@ -2358,31 +3073,6 @@ class SignalDeciderExecIntegrationService:
             'remote_state': item.get('remote_state'),
             'traceability': item.get('traceability'),
             'validation': item.get('validation'),
-        }
-
-    async def _load_dashboard_overview(
-        self,
-        *,
-        target_trade_date: date,
-        account_reference: str | None,
-        symbol: str | None,
-        refresh: bool,
-        trigger: str,
-    ) -> dict[str, Any]:
-        overview = await self.list_signal_decider_exec_overview(
-            target_trade_date=target_trade_date,
-            account_reference=account_reference,
-            symbol=symbol,
-            refresh=refresh,
-            trigger=trigger,
-        )
-        if refresh:
-            return overview
-        live_runtime = await self.runtime_status(refresh=True)
-        return {
-            **overview,
-            'integration': live_runtime['integration'],
-            'runtime': live_runtime['runtime'],
         }
 
     def _build_dashboard_runtime_status(

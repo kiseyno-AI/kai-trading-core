@@ -1,7 +1,7 @@
 # GET /execution/runtime/symbols/{symbol}
 
 ## Summary
-Read the per-symbol execution detail from core for dashboard/operator pages. The route preserves the normalized daily-board status while adding account-scoped dispatch/readback detail and the planning context needed for debugging, including one-or-many decider provenance when the same symbol is active from multiple deciders.
+Read the per-symbol execution detail from core for dashboard/operator pages. The route preserves the normalized daily-board status while adding account-scoped dispatch/readback detail and the planning context needed for debugging, including one-or-many decider provenance when the same symbol is active from multiple deciders. Like the board routes, `refresh=true` is cache-first and schedules a bounded background refresh rather than blocking on exec readback.
 
 ## Example request
 ```http
@@ -23,6 +23,22 @@ GET /execution/runtime/symbols/005930?market_date=2026-04-30&refresh=true
   "runtime": {
     "status": "ready",
     "mode": "mock"
+  },
+  "freshness": {
+    "schema_version": "execution_runtime_dashboard_read_model_v1",
+    "endpoint": "symbol_detail",
+    "market_date": "2026-04-30",
+    "status": "refreshing",
+    "served_from_cache": false,
+    "read_model_source": "persisted_exec_read_model",
+    "refreshing": true,
+    "last_readback_synced_at": "2026-04-30T00:07:00+00:00"
+  },
+  "refresh": {
+    "requested": true,
+    "status": "scheduled",
+    "background": true,
+    "in_flight": true
   },
   "planning": {
     "decision_source": "multiple",
