@@ -1,10 +1,11 @@
 from datetime import date, datetime, timezone
 from decimal import Decimal
+import json
 import unittest
 from unittest.mock import patch
 from uuid import uuid4
 
-from sqlalchemy import delete
+from sqlalchemy import delete, select
 
 from app.core.settings import settings
 from app.db import engine, session_scope
@@ -24,6 +25,11 @@ from app.orders.exec_integration import (
     EXEC_INTENT_TARGET_SELL,
     SignalDeciderExecClientError,
     SignalDeciderExecIntegrationService,
+)
+from app.orders.exec_payload_slimming import (
+    SIGNAL_DECIDER_EXEC_SUBMISSION_MAX_BYTES,
+    cleanup_signal_decider_exec_submission_payloads,
+    json_size_bytes,
 )
 from app.orders.next_open_execution import EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING, EXECUTION_STATUS_SUBMITTED
 
@@ -128,6 +134,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.policy_version = f'signal_decider_policy_exec_{suffix.lower()}'
         self.account_reference = f'KIS:98{suffix[:6]}-01'
         self.symbol = '005930'
+        self.seeded_symbols = {self.symbol}
         self.market_date = date(2026, 4, 29)
         self.target_trade_date = date(2026, 4, 30)
         self.original_settings = {
@@ -172,7 +179,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                     SignalDeciderDecisionSnapshot.market_date == self.market_date,
                 )
             )
-            session.execute(delete(Symbol).where(Symbol.symbol == self.symbol))
+            session.execute(delete(Symbol).where(Symbol.symbol.in_(self.seeded_symbols)))
 
     def _seed_snapshot(self) -> int:
         with session_scope() as session:
@@ -284,14 +291,16 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             session.flush()
             return row.id
 
-    def _seed_symbol(self) -> None:
+    def _seed_symbol(self, *, symbol: str | None = None, name_ko: str = 'Samsung Electronics') -> None:
+        resolved_symbol = symbol or self.symbol
+        self.seeded_symbols.add(resolved_symbol)
         with session_scope() as session:
-            session.execute(delete(Symbol).where(Symbol.symbol == self.symbol))
+            session.execute(delete(Symbol).where(Symbol.symbol == resolved_symbol))
             session.add(
                 Symbol(
-                    symbol=self.symbol,
+                    symbol=resolved_symbol,
                     standard_code=None,
-                    name_ko='Samsung Electronics',
+                    name_ko=name_ko,
                     market='KOSPI',
                     instrument_type='equity',
                     source='test',
@@ -299,6 +308,98 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
             session.flush()
+
+    def _seed_signal_candidate(
+        self,
+        *,
+        symbol: str,
+        name_ko: str,
+        decision_run_id: str,
+        client_order_id: str,
+        request_payload: dict | None = None,
+        input_feature_snapshot_payload: dict | None = None,
+    ) -> int:
+        self._seed_symbol(symbol=symbol, name_ko=name_ko)
+        with session_scope() as session:
+            snapshot = SignalDeciderDecisionSnapshot(
+                feedback_id=None,
+                market_date=self.market_date,
+                symbol=symbol,
+                agent_name='signal-decider',
+                agent_version='test-agent',
+                decision_run_id=decision_run_id,
+                feedback_received_at=datetime(2026, 4, 29, 6, 0, tzinfo=timezone.utc),
+                policy_version=self.policy_version,
+                decision_action='buy',
+                preferred_action='buy',
+                next_day_open_action='buy',
+                entry_price_basis='next_open',
+                target_price=130000,
+                expected_return_pct=3.1,
+                stop_loss_price=112000,
+                suggested_holding_period='3-10 trading days',
+                confidence_score_10=7.1,
+                conviction_score_10=6.0,
+                thesis_summary='Second dispatch candidate.',
+                supporting_evidence_payload=['Liquidity remained strong.'],
+                decision_risks_payload=['Gap risk.'],
+                invalidation_conditions_payload=['Lose support.'],
+                data_quality_warnings_payload=[],
+                specialist_disagreement_payload=[],
+                traceability_payload={'gate_checks': {'missing_upstream_roles': []}},
+                input_feature_snapshot_payload=input_feature_snapshot_payload or {'technical': {'trend_state': 'uptrend'}},
+                request_payload=request_payload or {'signal_decider_policy': {'current_version': self.policy_version}},
+                response_payload={'next_day_open_action': 'buy'},
+                response_summary_payload={'policy_version': self.policy_version},
+            )
+            session.add(snapshot)
+            session.flush()
+            plan_item = SignalDeciderExecutionPlanItem(
+                execution_window='next_open',
+                decision_agent_name='signal-decider',
+                decision_snapshot_id=snapshot.id,
+                order_request_id=None,
+                broker_order_row_id=None,
+                broker_name='kis',
+                target_trade_date=self.target_trade_date,
+                source_market_date=self.market_date,
+                account_reference=self.account_reference,
+                account_label='Main',
+                symbol=symbol,
+                policy_version=self.policy_version,
+                planned_side='buy',
+                planned_order_type='market',
+                planned_time_in_force='day',
+                allocation_budget_krw='1500000',
+                estimated_reference_price=120000,
+                planned_quantity='5',
+                estimated_notional_krw='600000',
+                eligibility_status='eligible',
+                execution_status='planned',
+                client_order_id=client_order_id,
+                validation_payload={'blocking_reasons': [], 'warnings': []},
+                traceability_payload={
+                    'decision_snapshot_id': snapshot.id,
+                    'decision_run_id': decision_run_id,
+                    'policy_version': self.policy_version,
+                    'target_trade_date': self.target_trade_date.isoformat(),
+                    'source_market_date': self.market_date.isoformat(),
+                    'account_reference': self.account_reference,
+                    'account_label': 'Main',
+                    'allocation_budget_krw': '1500000',
+                    'target_price': 130000,
+                    'stop_loss_price': 112000,
+                    'suggested_holding_period': '3-10 trading days',
+                    'signal_traceability': {'gate_checks': {'missing_upstream_roles': []}},
+                },
+                submission_payload=None,
+                first_ready_at=datetime(2026, 4, 29, 23, 30, tzinfo=timezone.utc),
+                last_evaluated_at=datetime(2026, 4, 29, 23, 30, tzinfo=timezone.utc),
+                submitted_at=None,
+            )
+            session.add(plan_item)
+            session.flush()
+            return plan_item.id
 
     def _seed_plan_item(self) -> int:
         with session_scope() as session:
@@ -479,6 +580,81 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(exec_dispatch['dispatch_status'], 'accepted')
             self.assertEqual(len(exec_dispatch['item_links']), 3)
 
+    async def test_dispatch_next_open_plan_persists_compact_per_row_payload_for_multi_item_plan(self) -> None:
+        bulky_decider_context = {
+            'decider_input_context': {
+                'items': [
+                    {
+                        'symbol': self.symbol,
+                        'risk_context': {
+                            'decider_handoff_context': {
+                                'decider_input_context': {'blob': 'x' * 12000},
+                            },
+                        },
+                    }
+                ],
+                'raw_request_payload': {'blob': 'y' * 12000},
+            },
+            'symbol_day_context': {
+                'pre_decider_enrichment_context': {'quote': 'available'},
+                'decision_input_quality_context': {
+                    'schema_version': 'decision_input_quality_v1',
+                    'execution_feasibility': {'status': 'usable', 'liquidity_tier': 'large_cap'},
+                },
+            },
+        }
+        with session_scope() as session:
+            snapshot = session.get(SignalDeciderDecisionSnapshot, self.snapshot_id)
+            snapshot.request_payload = {
+                'signal_decider_policy': {'current_version': self.policy_version},
+                **bulky_decider_context,
+            }
+            snapshot.input_feature_snapshot_payload = {'raw_feature_blob': 'z' * 12000}
+
+        self._seed_signal_candidate(
+            symbol='000660',
+            name_ko='SK hynix',
+            decision_run_id='exec-run-2',
+            client_order_id='SDNO-20260430-000660',
+            request_payload={
+                'signal_decider_policy': {'current_version': self.policy_version},
+                **bulky_decider_context,
+            },
+            input_feature_snapshot_payload={'raw_feature_blob': 'q' * 12000},
+        )
+
+        result = await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=False,
+            dry_run=False,
+            force=True,
+            trigger='test',
+        )
+
+        self.assertEqual(result['summary']['eligible_count'], 2)
+        self.assertEqual(result['summary']['translated_item_count'], 6)
+        with session_scope() as session:
+            rows = session.execute(
+                select(SignalDeciderExecutionPlanItem).where(
+                    SignalDeciderExecutionPlanItem.account_reference == self.account_reference,
+                    SignalDeciderExecutionPlanItem.target_trade_date == self.target_trade_date,
+                )
+            ).scalars().all()
+            self.assertEqual(len(rows), 2)
+            for row in rows:
+                submission_payload = row.submission_payload
+                payload_text = json.dumps(submission_payload, ensure_ascii=False, sort_keys=True)
+                exec_dispatch = submission_payload['exec_dispatch']
+                self.assertLess(json_size_bytes(submission_payload), SIGNAL_DECIDER_EXEC_SUBMISSION_MAX_BYTES)
+                self.assertNotIn('last_request_payload', exec_dispatch)
+                self.assertNotIn('last_response_payload', exec_dispatch)
+                self.assertIn('last_request_summary', exec_dispatch)
+                self.assertEqual(exec_dispatch['last_request_summary']['total_item_count'], 6)
+                self.assertEqual(exec_dispatch['last_request_summary']['row_item_count'], 3)
+                self.assertNotIn('decider_input_context', payload_text)
+                self.assertNotIn('raw_request_payload', payload_text)
+                self.assertNotIn('last_request_payload', payload_text)
+
     async def test_dispatch_next_open_plan_signal_agent_quantity_marks_submitted(self) -> None:
         self.client.agent_approved_quantities_by_agent['signal-decider'] = '5'
 
@@ -497,6 +673,80 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(row.execution_status, EXECUTION_STATUS_SUBMITTED)
             entry_link = row.submission_payload['exec_dispatch']['item_links'][0]
             self.assertEqual(entry_link['response_item']['agent_sizing']['quantity'], '5')
+
+    async def test_cleanup_signal_decider_exec_payloads_dry_run_preserves_rows(self) -> None:
+        oversized_payload = {
+            'mode': 'exec_dispatch',
+            'latest': {'dispatch_status': 'failed', 'attempted_at': '2026-05-22T00:00:00+00:00'},
+            'exec_dispatch': {
+                'plan_id': 'core-signal-decider-20260522-KIS',
+                'plan_fingerprint': 'abc123',
+                'dispatch_status': 'failed',
+                'last_attempt_at': '2026-05-22T00:00:00+00:00',
+                'last_error': {'code': 'unavailable', 'message': 'x' * 4096},
+                'item_links': [
+                    {
+                        'core_item_key': f'core-plan-{self.plan_item_id}:next_open_buy',
+                        'intent': 'next_open_buy',
+                        'side': 'buy',
+                        'symbol': self.symbol,
+                    }
+                ],
+                'last_request_payload': {
+                    'plan_id': 'core-signal-decider-20260522-KIS',
+                    'items': [
+                        {
+                            'core_item_key': f'core-plan-{self.plan_item_id}:next_open_buy',
+                            'symbol': self.symbol,
+                            'risk_context': {
+                                'decider_handoff_context': {
+                                    'decider_input_context': {'raw_blob': 'x' * 70000},
+                                },
+                            },
+                        }
+                    ],
+                },
+                'readback': {
+                    'orders': {
+                        'status': 'ok',
+                        'count': 1,
+                        'items': [{'symbol': self.symbol, 'status': 'rejected', 'raw_blob': 'y' * 70000}],
+                    },
+                    'derived_state': {'derived_status': 'failed'},
+                },
+            },
+        }
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            row.submission_payload = oversized_payload
+
+        dry_run = cleanup_signal_decider_exec_submission_payloads(
+            dry_run=True,
+            target_trade_date=self.target_trade_date,
+            min_payload_bytes=1024,
+            limit=10,
+        )
+
+        self.assertEqual(dry_run['would_update_count'], 1)
+        self.assertEqual(dry_run['updated_count'], 0)
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            self.assertIn('last_request_payload', row.submission_payload['exec_dispatch'])
+
+        applied = cleanup_signal_decider_exec_submission_payloads(
+            dry_run=False,
+            target_trade_date=self.target_trade_date,
+            min_payload_bytes=1024,
+            limit=10,
+        )
+
+        self.assertEqual(applied['updated_count'], 1)
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            payload_text = json.dumps(row.submission_payload, ensure_ascii=False, sort_keys=True)
+            self.assertLess(json_size_bytes(row.submission_payload), SIGNAL_DECIDER_EXEC_SUBMISSION_MAX_BYTES)
+            self.assertNotIn('last_request_payload', row.submission_payload['exec_dispatch'])
+            self.assertNotIn('decider_input_context', payload_text)
 
     async def test_dispatch_next_open_plan_signal_rejected_agent_quantity_stays_delegated(self) -> None:
         self.client.agent_sizing_payloads_by_agent['signal-decider'] = {

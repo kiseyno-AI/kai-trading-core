@@ -18,6 +18,15 @@ from app.core.settings import settings
 from app.db import session_scope
 from app.db_models import SignalDeciderDecisionSnapshot, SignalDeciderExecutionPlanItem
 from app.market.clock import get_market_state
+from app.orders.exec_payload_slimming import (
+    compact_exec_item_link,
+    compact_exec_readback,
+    compact_exec_request_summary,
+    compact_exec_response_item,
+    compact_exec_response_summary,
+    slim_signal_decider_exec_submission_payload,
+    summarize_error,
+)
 from app.orders.next_open_execution import (
     ELIGIBILITY_BLOCKED,
     ELIGIBILITY_ELIGIBLE,
@@ -753,6 +762,7 @@ class SignalDeciderExecIntegrationService:
                 failed_group_count += 1
                 self._persist_dispatch_failure(
                     rows=eligible_rows,
+                    row_links=row_links,
                     plan_id=plan_id,
                     fingerprint=fingerprint,
                     payload=plan_payload,
@@ -782,6 +792,7 @@ class SignalDeciderExecIntegrationService:
                 failed_group_count += 1
                 self._persist_dispatch_failure(
                     rows=eligible_rows,
+                    row_links=row_links,
                     plan_id=plan_id,
                     fingerprint=fingerprint,
                     payload=plan_payload,
@@ -1688,6 +1699,7 @@ class SignalDeciderExecIntegrationService:
         self,
         *,
         rows: Sequence[SignalDeciderExecutionPlanItem],
+        row_links: dict[int, list[dict[str, Any]]],
         plan_id: str,
         fingerprint: str,
         payload: dict[str, Any],
@@ -1713,24 +1725,34 @@ class SignalDeciderExecIntegrationService:
                     'attempted_at': now.isoformat(),
                     'trigger': trigger,
                     'dispatch_status': status,
-                    'error': error,
+                    'error': summarize_error(error),
                 }
+                compact_existing_links = [
+                    compact
+                    for link in (existing_exec.get('item_links') or row_links.get(row.id, []))
+                    if (compact := compact_exec_item_link(link))
+                ]
                 exec_dispatch = {
-                    **existing_exec,
                     'plan_id': plan_id,
                     'plan_fingerprint': fingerprint,
                     'dispatch_status': status,
                     'last_attempt_at': now.isoformat(),
-                    'last_error': error,
+                    'last_success_at': existing_exec.get('last_success_at'),
+                    'last_error': summarize_error(error),
+                    'item_links': compact_existing_links,
                     'attempts': _append_limited(existing_exec.get('attempts') or [], attempt),
-                    'last_request_payload': _json_safe(payload),
+                    'last_request_summary': compact_exec_request_summary(
+                        payload,
+                        item_links=row_links.get(row.id, []),
+                    ),
                 }
-                row.submission_payload = {
+                submission = {
                     **existing_submission,
                     'mode': 'exec_dispatch',
                     'latest': attempt,
                     'exec_dispatch': exec_dispatch,
                 }
+                row.submission_payload = slim_signal_decider_exec_submission_payload(submission).payload
             session.flush()
 
     def _persist_dispatch_success(
@@ -1793,7 +1815,7 @@ class SignalDeciderExecIntegrationService:
                                 or response_item.get('id')
                             ),
                             'remote_status': item_status,
-                            'response_item': response_item if response_item else None,
+                            'response_item': compact_exec_response_item(response_item) if response_item else None,
                         }
                     )
 
@@ -1815,17 +1837,26 @@ class SignalDeciderExecIntegrationService:
                     'response_summary': response_summary,
                 }
                 exec_dispatch = {
-                    **existing_exec,
                     'plan_id': plan_id,
                     'plan_fingerprint': fingerprint,
                     'dispatch_status': row_dispatch_status,
                     'last_attempt_at': now.isoformat(),
                     'last_success_at': now.isoformat(),
                     'last_error': None,
-                    'item_links': links,
+                    'item_links': [
+                        compact
+                        for item in links
+                        if (compact := compact_exec_item_link(item))
+                    ],
                     'attempts': _append_limited(existing_exec.get('attempts') or [], attempt),
-                    'last_request_payload': _json_safe(payload),
-                    'last_response_payload': _json_safe(response_payload),
+                    'last_request_summary': compact_exec_request_summary(
+                        payload,
+                        item_links=row_links.get(row.id, []),
+                    ),
+                    'last_response_summary': compact_exec_response_summary(
+                        response_payload,
+                        item_links=row_links.get(row.id, []),
+                    ),
                 }
                 row_decision_agent_name = _normalize_decision_agent_name(row.decision_agent_name)
                 if row_dispatch_status in {EXEC_DISPATCH_STATUS_ACCEPTED, EXEC_DISPATCH_STATUS_PARTIAL}:
@@ -1842,12 +1873,13 @@ class SignalDeciderExecIntegrationService:
                 else:
                     row.execution_status = EXECUTION_STATUS_SUBMIT_FAILED
                 row.submitted_at = row.submitted_at or now
-                row.submission_payload = {
+                submission = {
                     **existing_submission,
                     'mode': 'exec_dispatch',
                     'latest': attempt,
                     'exec_dispatch': exec_dispatch,
                 }
+                row.submission_payload = slim_signal_decider_exec_submission_payload(submission).payload
                 row_statuses[row_dispatch_status] += 1
             session.flush()
 
@@ -2022,14 +2054,29 @@ class SignalDeciderExecIntegrationService:
                     },
                     'derived_state': derived_state,
                 }
+                compact_readback = compact_exec_readback(readback)
                 exec_dispatch = {
-                    **exec_dispatch,
-                    'readback': _json_safe(readback),
+                    'plan_id': exec_dispatch.get('plan_id'),
+                    'plan_fingerprint': exec_dispatch.get('plan_fingerprint'),
+                    'dispatch_status': exec_dispatch.get('dispatch_status'),
+                    'last_attempt_at': exec_dispatch.get('last_attempt_at'),
+                    'last_success_at': exec_dispatch.get('last_success_at'),
+                    'last_error': summarize_error(exec_dispatch.get('last_error')),
+                    'item_links': [
+                        compact
+                        for item in item_links
+                        if (compact := compact_exec_item_link(item))
+                    ],
+                    'attempts': exec_dispatch.get('attempts') or [],
+                    'last_request_summary': exec_dispatch.get('last_request_summary'),
+                    'last_response_summary': exec_dispatch.get('last_response_summary'),
+                    'readback': compact_readback,
                 }
-                row.submission_payload = {
+                submission = {
                     **existing_submission,
                     'exec_dispatch': exec_dispatch,
                 }
+                row.submission_payload = slim_signal_decider_exec_submission_payload(submission).payload
             session.flush()
 
     @staticmethod
