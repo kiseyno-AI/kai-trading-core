@@ -159,7 +159,7 @@ def _cached_quote_display_fields(
             continue
         age_days = (market_date - fallback_date).days
         if age_days < 0:
-            age_days = 0
+            continue
         if age_days > MAX_RECENT_DISPLAY_FALLBACK_AGE_DAYS:
             continue
         status = (
