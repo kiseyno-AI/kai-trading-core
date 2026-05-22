@@ -3,6 +3,8 @@
 ## Summary
 Read the same-day execution board from core. The route is dashboard-safe and cache-first: it returns the best local read model immediately from persisted Core planning/readback state and a short in-process snapshot cache. `refresh=true` schedules a bounded, debounced background exec refresh instead of blocking the HTTP request. Consumers should use `freshness` and `refresh` to label stale, partial, or refreshing data honestly.
 
+Each row includes compact `today_activity` facts for the requested `market_date`. Use these side-aware fields for Today bought/sold sections instead of inferring from lifecycle `intent` or aggregate `status`. Buy/sell quantities are counted only from timestamped compact execution/readback facts for the selected date; side facts without timestamps are marked unavailable rather than guessed.
+
 ## Example request
 ```http
 GET /execution/runtime/daily-board?market_date=2026-04-30&refresh=true
@@ -76,9 +78,31 @@ GET /execution/runtime/daily-board?market_date=2026-04-30&refresh=true
       "monitoring_state": "watching_target_stop",
       "planned_quantity": 5,
       "filled_quantity": 5,
+      "exit_filled_quantity": 0,
       "open_quantity": 5,
       "planned_price": 51500,
       "avg_fill_price": 50600,
+      "today_activity": {
+        "schema_version": "execution_runtime_today_activity_v1",
+        "market_date": "2026-04-30",
+        "buy_activity_status": "available",
+        "buy_activity_source": "executions",
+        "buy_filled_quantity_today": 5,
+        "buy_avg_fill_price_today": 50600,
+        "buy_last_filled_at": "2026-04-30T00:07:00+00:00",
+        "buy_broker_order_ids": [
+          "order-1"
+        ],
+        "buy_broker_order_ids_omitted_count": 0,
+        "sell_activity_status": "none",
+        "sell_activity_source": null,
+        "sell_filled_quantity_today": 0,
+        "sell_avg_fill_price_today": null,
+        "sell_last_filled_at": null,
+        "sell_broker_order_ids": [],
+        "sell_broker_order_ids_omitted_count": 0,
+        "net_open_quantity": 5
+      },
       "decision_source": "short-term-decider",
       "decision_snapshot_id": 145,
       "source_feedback_id": 702,
