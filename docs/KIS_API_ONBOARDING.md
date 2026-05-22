@@ -7,6 +7,7 @@
 - KIS access-token issue route
 - KIS quote route
 - KIS intraday snapshot collect/read routes for execution-aware context persistence
+- Core-owned KIS realtime monitored price websocket with process-local cache and Core fan-out routes
 
 ## Files
 - `apps/api/app/core/settings.py`
@@ -29,9 +30,14 @@
    - `KIS_INTRADAY_SNAPSHOT_MARKET_CODE=J`
    - `KIS_INTRADAY_SNAPSHOT_MAX_RANKING_PAGES=2`
    - `KIS_INTRADAY_SNAPSHOT_NEWS_LIMIT=5`
-5. Install dependencies:
+5. Optional realtime monitored price knobs:
+   - `KIS_REALTIME_PRICE_ENABLED=true`
+   - `KIS_REALTIME_PRICE_TR_ID=H0STCNT0`
+   - `KIS_REALTIME_PRICE_MAX_SUBSCRIPTIONS=40`
+   - `KIS_REALTIME_PRICE_STALE_AFTER_SECONDS=30`
+6. Install dependencies:
    - `pip install -r apps/api/requirements.txt`
-6. Run server:
+7. Run server:
    - `uvicorn app.main:app --app-dir apps/api --reload`
 
 ## Test routes
@@ -39,6 +45,7 @@
 - `GET /broker/kis/health`
 - `POST /broker/kis/token`
 - `GET /broker/kis/quote?symbol=005930&market_code=J`
+- `GET /quotes/realtime/monitored`
 - `POST /broker/kis/intraday-snapshots/collect?symbols=005930`
 - `GET /broker/kis/intraday-snapshots?symbols=005930`
 
@@ -50,4 +57,6 @@
 - Start with mock trading base URL first
 - `GET /market/snapshot` is the exception to the general mock-first guidance: it uses real-domain KIS market data by default because the selected index and investor-flow APIs do not exist on the mock domain. Keep `MARKET_SNAPSHOT_KIS_USE_REAL=true` and set `KOREAEXIM_API_KEY` alongside the KIS credentials when you need that route.
 - The intraday snapshot path is separate from PyKRX/DART EOD jobs. When KIS credentials are missing or `KIS_INTRADAY_SNAPSHOT_ENABLED=false`, the collect route returns `status=disabled` instead of failing or trying partial live work.
+- The realtime monitored price path is for dashboard display only. Core opens one KIS websocket, subscribes to current monitored symbols with bounded/deduplicated updates, keeps latest ticks in process memory only, and serves web clients through Core routes. Do not persist these ticks to DB or let browsers open KIS sockets directly.
+- KIS's official open-trading-api `ccnl_krx` sample uses `H0STCNT0` for domestic realtime transaction prices in both real and mock environments. Keep `KIS_REALTIME_PRICE_TR_ID=H0STCNT0` unless KIS publishes a replacement.
 - Add account, quote, balance, and order adapters after token flow is confirmed

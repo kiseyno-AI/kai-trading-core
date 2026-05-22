@@ -42,6 +42,7 @@
 39. Signal-decider actual execution outcome reporting routes
 40. Signal-decider replay review calendar routes
 41. Core-owned exec runtime dashboard read APIs
+42. Core-owned realtime monitored price fan-out read/stream APIs
 
 ## Current routes
 - `POST /broker/kis/token`
@@ -80,6 +81,8 @@
 - `GET /market/status`
 - `GET /market/snapshot`
 - `GET /quotes/tracked`
+- `GET /quotes/realtime/monitored?refresh_symbols=false`
+- `GET /quotes/realtime/monitored/stream`
 - `GET /quotes/005930`
 - `GET /scanner/tracked-symbols`
 - `GET /scanner/realtime-trending?limit=20&market_code=J&sources=volume-rank,fluctuation,hts-top-view`
@@ -256,6 +259,16 @@
 - `GET /execution/runtime/monitored-symbols` is the symbol-level monitored-watch view for dashboard cards. It groups the same-day core-owned exec board by symbol and exposes normalized monitoring states such as `watching_fill`, `watching_target_stop`, `reconciling`, and `idle`, plus the distinct `decision_agent_names` currently active for that symbol.
 - `GET /execution/runtime/daily-board` is the same-day execution board for the web/dashboard. It combines persisted core planning rows with exec readback truth and normalizes each row into `planned`, `accepted`, `scheduled`, `submitted`, `partial`, `filled`, `cancelled`, or `failed`, while surfacing explicit per-row decider identity and tactical trigger/chase metadata when the source is `short-term-decider`.
 - `GET /execution/runtime/symbols/{symbol}` is the per-symbol execution detail read for dashboard/operator pages. It preserves the normalized board status, adds account-scoped dispatch/readback detail and planning context, surfaces one-or-many decider provenance (`decision_agent_names`, `decision_run_ids`, `source_feedback_ids`), and keeps degraded or offline exec runtime state explicit without requiring the web to call exec directly.
+- The execution runtime dashboard rows now include `current_price`, `price_as_of`, `price_received_at`, `price_source`, and `price_status` from Core's process-local realtime price cache. These fields never trigger browser-side KIS access or request-time KIS REST quote fan-out.
+
+## Core-owned realtime monitored price notes
+- Core owns a single KIS realtime domestic stock transaction-price websocket for the currently monitored execution-runtime symbols when `KIS_REALTIME_PRICE_ENABLED=true` and KIS credentials are configured.
+- The KIS realtime price consumer uses domestic realtime transaction TR `H0STCNT0` for both real and mock environments, matching the Korea Investment open-trading-api sample for `ccnl_krx`; there is no `H0STCNT9` mock-price split in that sample.
+- Latest ticks are stored only in process-local memory. They are not persisted to quote tables or realtime DB tables for dashboard live display.
+- `GET /quotes/realtime/monitored` reads that local memory snapshot and returns explicit `available`, `stale`, `pending`, `limited`, `not_configured`, `disabled`, or `not_monitored` price states. `refresh_symbols=true` only asks Core to refresh the monitored-symbol subscription source in a debounced way; it does not call KIS for prices.
+- `GET /quotes/realtime/monitored/stream` is a Server-Sent Events fan-out over the same local memory snapshot. Browsers should consume Core's route and must not open KIS sockets directly.
+- Subscription updates are bounded and deduplicated. `KIS_REALTIME_PRICE_MAX_SUBSCRIPTIONS` caps active symbols, with excess symbols surfaced as `price_status=limited` and listed under `health.limited_symbols` instead of exceeding an uncertain upstream limit.
+- The websocket loop uses the shared KIS realtime websocket URL settings plus `KIS_REALTIME_RECONNECT_BASE_DELAY_SECONDS` / `KIS_REALTIME_RECONNECT_MAX_DELAY_SECONDS` for reconnect backoff. It does not introduce aggressive REST polling or per-browser KIS connections.
 
 ## Trading account inquiry notes
 - `GET /portfolio/summary` is the aggregate portfolio read for the dashboard and portfolio cards. It resolves the deployment-configured account list from `PORTFOLIO_ACCOUNT_REFERENCES`, reuses the KIS-backed account-summary and positions inquiries per account, and returns the web `PortfolioSummaryDto`-style shape with `accounts`, `holdings`, `allocation`, `recentActivity`, `sync`, and `notices`.
@@ -277,7 +290,7 @@
 - Realtime notices append durable rows into `broker_order_events` with `source=ws_notice`, preserve the raw decrypted field payload, and patch the current `broker_orders` snapshot when the notice advances the known order state.
 - Duplicate notices are deduplicated through a stable websocket event fingerprint. Older notices can still be persisted for audit, but they do not regress a newer `broker_orders` snapshot.
 - `GET /broker/kis/health` now includes a `realtime_order_notices` block with connection status, last message timing, reconnect attempts, subscription or auth lifecycle state, last fatal vs recoverable error, and ingest counters.
-- `GET /broker/kis/health` also includes `market_snapshot_runtime`, `portfolio_summary_runtime`, and `intraday_snapshot_runtime` so operators can confirm route-specific readiness without triggering the full downstream payloads.
+- `GET /broker/kis/health` also includes `realtime_prices`, `market_snapshot_runtime`, `portfolio_summary_runtime`, and `intraday_snapshot_runtime` so operators can confirm route-specific readiness without triggering the full downstream payloads.
 
 ## KIS intraday snapshot notes
 - `kis_intraday_snapshots` is the append-only intraday history table for execution-aware KIS captures, and `current_kis_intraday_snapshot_cache` is the latest-per-symbol cache that powers fast reads and agent context enrichment.

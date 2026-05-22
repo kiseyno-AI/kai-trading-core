@@ -44,6 +44,7 @@ from app.market_data_store import load_tracked_symbols
 from app.orders.portfolio_summary_service import portfolio_summary_service
 from app.orders.reconciliation import trading_order_reconciliation_service
 from app.orders.kis_realtime_order_notices import kis_realtime_order_notice_service
+from app.quotes.kis_realtime_prices import kis_realtime_price_service
 from app.scanner.state import scanner_state
 
 configure_file_logging()
@@ -63,6 +64,7 @@ async def lifespan(_: FastAPI):
     except Exception as exc:
         logger.warning('Database initialization failed; starting in degraded mode: %s', exc)
     await kis_realtime_order_notice_service.start()
+    await kis_realtime_price_service.start()
     try:
         await trading_order_reconciliation_service.run_startup_reconcile()
     except Exception as exc:
@@ -89,6 +91,7 @@ async def lifespan(_: FastAPI):
     try:
         yield
     finally:
+        await kis_realtime_price_service.stop()
         await kis_realtime_order_notice_service.stop()
         await background_runner.stop()
 

@@ -23,6 +23,7 @@ What it does:
 ## Health checks
 - `GET /health`
 - `GET /broker/kis/health`
+- `GET /quotes/realtime/monitored`
 - `POST /broker/kis/intraday-snapshots/collect?symbols=005930`
 - `GET /broker/kis/intraday-snapshots?symbols=005930&limit=5`
 - `GET /portfolio/summary`
@@ -83,6 +84,7 @@ What it does:
 - Core server should stay up 24/7.
 - The API startup path tries to prime the persisted `/market/snapshot` cache once, and the background runner refreshes it on the configured cadence (`MARKET_SNAPSHOT_REFRESH_INTERVAL_SECONDS`, default 3600s).
 - `GET /market/snapshot` serves the persisted snapshot read model instead of making live upstream calls per dashboard request.
+- Core owns one KIS realtime domestic price websocket for currently monitored execution-runtime symbols when `KIS_REALTIME_PRICE_ENABLED=true`; dashboard reads use process-local memory through `/quotes/realtime/monitored`, `/quotes/realtime/monitored/stream`, and execution-runtime price fields instead of browser-side KIS sockets or request-time KIS quote fan-out.
 - Pre-market master refresh uses the KIS master zip files.
 - A background runner checks market state every 60 seconds while the API process is alive.
 - During `PREOPEN`, it refreshes the daily master if needed.
