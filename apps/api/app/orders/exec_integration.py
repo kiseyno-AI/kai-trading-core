@@ -10,6 +10,7 @@ import hashlib
 import json
 import re
 from typing import Any, Iterable, Sequence
+from zoneinfo import ZoneInfo
 
 import httpx
 from sqlalchemy import select
@@ -133,6 +134,10 @@ DASHBOARD_FRESHNESS_STATUS_STALE = 'stale'
 DASHBOARD_FRESHNESS_STATUS_PARTIAL = 'partial'
 DASHBOARD_FRESHNESS_STATUS_REFRESHING = 'refreshing'
 DASHBOARD_FRESHNESS_STATUS_UNAVAILABLE = 'unavailable'
+DASHBOARD_TODAY_ACTIVITY_SCHEMA_VERSION = 'execution_runtime_today_activity_v1'
+DASHBOARD_TODAY_ACTIVITY_BROKER_ORDER_ID_LIMIT = 5
+
+MARKET_TIME_ZONE = ZoneInfo('Asia/Seoul')
 
 
 @dataclass
@@ -1184,6 +1189,7 @@ class SignalDeciderExecIntegrationService:
         items = [
             self._build_runtime_board_item(
                 item=item,
+                market_date=market_date,
                 symbol_metadata_map=symbol_metadata_map,
                 runtime_status=runtime['status'],
             )
@@ -1278,6 +1284,7 @@ class SignalDeciderExecIntegrationService:
         items = [
             self._build_runtime_symbol_detail_item(
                 item=item,
+                market_date=market_date,
                 symbol_metadata_map=symbol_metadata_map,
                 runtime_status=runtime['status'],
             )
@@ -3221,6 +3228,7 @@ class SignalDeciderExecIntegrationService:
         self,
         *,
         item: dict[str, Any],
+        market_date: date,
         symbol_metadata_map: dict[str, dict[str, Any]],
         runtime_status: str,
     ) -> dict[str, Any]:
@@ -3273,6 +3281,12 @@ class SignalDeciderExecIntegrationService:
             entry_filled_quantity - exit_filled_quantity,
             Decimal('0'),
         )
+        today_activity = self._build_today_activity(
+            market_date=market_date,
+            orders=orders,
+            executions=executions,
+            net_open_quantity=open_quantity,
+        )
         status = self._normalize_board_item_status(
             item=item,
             order_statuses=order_statuses,
@@ -3311,6 +3325,7 @@ class SignalDeciderExecIntegrationService:
             'open_quantity': _to_json_number(open_quantity),
             'planned_price': item.get('estimated_reference_price'),
             'avg_fill_price': self._resolve_average_fill_price(executions=executions, positions=positions),
+            'today_activity': today_activity,
             'decision_source': decision_agent_name,
             'decision_snapshot_id': item.get('decision_snapshot_id'),
             'source_feedback_id': item.get('source_feedback_id'),
@@ -3462,11 +3477,13 @@ class SignalDeciderExecIntegrationService:
         self,
         *,
         item: dict[str, Any],
+        market_date: date,
         symbol_metadata_map: dict[str, dict[str, Any]],
         runtime_status: str,
     ) -> dict[str, Any]:
         board_item = self._build_runtime_board_item(
             item=item,
+            market_date=market_date,
             symbol_metadata_map=symbol_metadata_map,
             runtime_status=runtime_status,
         )
@@ -3664,6 +3681,255 @@ class SignalDeciderExecIntegrationService:
             if status:
                 statuses.add(status)
         return statuses
+
+    @classmethod
+    def _build_today_activity(
+        cls,
+        *,
+        market_date: date,
+        orders: Sequence[dict[str, Any]],
+        executions: Sequence[dict[str, Any]],
+        net_open_quantity: Decimal,
+    ) -> dict[str, Any]:
+        buy = cls._build_today_activity_side(
+            side='buy',
+            market_date=market_date,
+            orders=orders,
+            executions=executions,
+        )
+        sell = cls._build_today_activity_side(
+            side='sell',
+            market_date=market_date,
+            orders=orders,
+            executions=executions,
+        )
+        return {
+            'schema_version': DASHBOARD_TODAY_ACTIVITY_SCHEMA_VERSION,
+            'market_date': market_date.isoformat(),
+            'buy_activity_status': buy['status'],
+            'buy_activity_source': buy['source'],
+            'buy_filled_quantity_today': _to_json_number(buy['filled_quantity_today']),
+            'buy_avg_fill_price_today': _to_json_number(buy['avg_fill_price_today']),
+            'buy_last_filled_at': buy['last_filled_at'],
+            'buy_broker_order_ids': buy['broker_order_ids'],
+            'buy_broker_order_ids_omitted_count': buy['broker_order_ids_omitted_count'],
+            'sell_activity_status': sell['status'],
+            'sell_activity_source': sell['source'],
+            'sell_filled_quantity_today': _to_json_number(sell['filled_quantity_today']),
+            'sell_avg_fill_price_today': _to_json_number(sell['avg_fill_price_today']),
+            'sell_last_filled_at': sell['last_filled_at'],
+            'sell_broker_order_ids': sell['broker_order_ids'],
+            'sell_broker_order_ids_omitted_count': sell['broker_order_ids_omitted_count'],
+            'net_open_quantity': _to_json_number(net_open_quantity),
+        }
+
+    @classmethod
+    def _build_today_activity_side(
+        cls,
+        *,
+        side: str,
+        market_date: date,
+        orders: Sequence[dict[str, Any]],
+        executions: Sequence[dict[str, Any]],
+    ) -> dict[str, Any]:
+        execution_facts, execution_has_untimestamped = cls._collect_today_execution_facts(
+            executions=executions,
+            side=side,
+            market_date=market_date,
+        )
+        if execution_facts:
+            return cls._summarize_today_activity_facts(
+                facts=execution_facts,
+                source='executions',
+                has_untimestamped_fills=execution_has_untimestamped,
+            )
+
+        order_facts, order_has_untimestamped = cls._collect_today_order_facts(
+            orders=orders,
+            side=side,
+            market_date=market_date,
+        )
+        if order_facts:
+            return cls._summarize_today_activity_facts(
+                facts=order_facts,
+                source='orders',
+                has_untimestamped_fills=execution_has_untimestamped or order_has_untimestamped,
+            )
+
+        status = 'unavailable' if execution_has_untimestamped or order_has_untimestamped else 'none'
+        return {
+            'status': status,
+            'source': None,
+            'filled_quantity_today': None if status == 'unavailable' else Decimal('0'),
+            'avg_fill_price_today': None,
+            'last_filled_at': None,
+            'broker_order_ids': [],
+            'broker_order_ids_omitted_count': 0,
+        }
+
+    @classmethod
+    def _collect_today_execution_facts(
+        cls,
+        *,
+        executions: Sequence[dict[str, Any]],
+        side: str,
+        market_date: date,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        facts: list[dict[str, Any]] = []
+        has_untimestamped_fills = False
+        for execution in executions:
+            if cls._normalize_activity_side(execution.get('side')) != side:
+                continue
+            quantity = _safe_decimal(execution.get('quantity') or execution.get('filled_quantity'))
+            if quantity is None or quantity <= Decimal('0'):
+                continue
+            filled_at = cls._activity_timestamp(
+                execution,
+                fields=('executed_at', 'filled_at', 'last_filled_at', 'created_at', 'updated_at'),
+            )
+            if filled_at is None:
+                has_untimestamped_fills = True
+                continue
+            if filled_at.astimezone(MARKET_TIME_ZONE).date() != market_date:
+                continue
+            facts.append(
+                {
+                    'quantity': quantity,
+                    'price': cls._activity_price(execution),
+                    'filled_at': filled_at.isoformat(),
+                    'broker_order_id': cls._activity_broker_order_id(execution),
+                }
+            )
+        return facts, has_untimestamped_fills
+
+    @classmethod
+    def _collect_today_order_facts(
+        cls,
+        *,
+        orders: Sequence[dict[str, Any]],
+        side: str,
+        market_date: date,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        facts: list[dict[str, Any]] = []
+        has_untimestamped_fills = False
+        for order in orders:
+            if cls._normalize_activity_side(order.get('side')) != side:
+                continue
+            quantity = _safe_decimal(
+                order.get('filled_quantity')
+                or order.get('executed_quantity')
+                or order.get('cumulative_filled_quantity')
+            )
+            if quantity is None and _normalize_status(
+                order.get('status') or order.get('current_status') or order.get('broker_status')
+            ) in REMOTE_FILLED_STATUSES:
+                quantity = _safe_decimal(order.get('quantity'))
+            if quantity is None or quantity <= Decimal('0'):
+                continue
+            filled_at = cls._activity_timestamp(
+                order,
+                fields=('filled_at', 'last_filled_at', 'updated_at', 'created_at', 'submitted_at'),
+            )
+            if filled_at is None:
+                has_untimestamped_fills = True
+                continue
+            if filled_at.astimezone(MARKET_TIME_ZONE).date() != market_date:
+                continue
+            facts.append(
+                {
+                    'quantity': quantity,
+                    'price': cls._activity_price(order),
+                    'filled_at': filled_at.isoformat(),
+                    'broker_order_id': cls._activity_broker_order_id(order),
+                }
+            )
+        return facts, has_untimestamped_fills
+
+    @classmethod
+    def _summarize_today_activity_facts(
+        cls,
+        *,
+        facts: Sequence[dict[str, Any]],
+        source: str,
+        has_untimestamped_fills: bool,
+    ) -> dict[str, Any]:
+        total_quantity = sum(
+            ((_safe_decimal(fact.get('quantity')) or Decimal('0')) for fact in facts),
+            start=Decimal('0'),
+        )
+        priced_quantity = Decimal('0')
+        priced_notional = Decimal('0')
+        for fact in facts:
+            quantity = _safe_decimal(fact.get('quantity')) or Decimal('0')
+            price = _safe_decimal(fact.get('price'))
+            if quantity <= Decimal('0') or price is None or price <= Decimal('0'):
+                continue
+            priced_quantity += quantity
+            priced_notional += quantity * price
+        broker_order_ids, omitted_count = cls._limited_activity_broker_order_ids(
+            fact.get('broker_order_id') for fact in facts
+        )
+        return {
+            'status': 'partial' if has_untimestamped_fills else 'available',
+            'source': source,
+            'filled_quantity_today': total_quantity,
+            'avg_fill_price_today': (priced_notional / priced_quantity) if priced_quantity > Decimal('0') else None,
+            'last_filled_at': _latest_iso_timestamp(fact.get('filled_at') for fact in facts),
+            'broker_order_ids': broker_order_ids,
+            'broker_order_ids_omitted_count': omitted_count,
+        }
+
+    @staticmethod
+    def _normalize_activity_side(value: Any) -> str | None:
+        normalized = _normalize_optional_text(value, lowercase=True)
+        if normalized in {'buy', 'b', 'bid'}:
+            return 'buy'
+        if normalized in {'sell', 's', 'ask'}:
+            return 'sell'
+        return None
+
+    @staticmethod
+    def _activity_timestamp(payload: dict[str, Any], *, fields: Sequence[str]) -> datetime | None:
+        for field in fields:
+            parsed = _parse_iso_datetime(payload.get(field))
+            if parsed is not None:
+                return parsed
+        return None
+
+    @staticmethod
+    def _activity_price(payload: dict[str, Any]) -> Decimal | None:
+        return _safe_decimal(
+            payload.get('average_fill_price')
+            or payload.get('avg_fill_price')
+            or payload.get('fill_price')
+            or payload.get('price')
+            or payload.get('avg_price')
+        )
+
+    @staticmethod
+    def _activity_broker_order_id(payload: dict[str, Any]) -> str | None:
+        return _coalesce_text(
+            payload.get('broker_order_id'),
+            payload.get('order_id'),
+            payload.get('broker_order_pk'),
+            payload.get('id'),
+        )
+
+    @staticmethod
+    def _limited_activity_broker_order_ids(values: Iterable[Any]) -> tuple[list[str], int]:
+        ids: list[str] = []
+        seen: set[str] = set()
+        omitted_count = 0
+        for value in values:
+            normalized = _normalize_optional_text(value)
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            if len(ids) < DASHBOARD_TODAY_ACTIVITY_BROKER_ORDER_ID_LIMIT:
+                ids.append(normalized)
+            else:
+                omitted_count += 1
+        return ids, omitted_count
 
     def _normalize_board_item_status(
         self,

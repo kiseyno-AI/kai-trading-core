@@ -1403,6 +1403,16 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(board['items'][0]['execution_plan_id'], plan_id)
         self.assertEqual(board['items'][0]['current_price'], 50200)
         self.assertEqual(board['items'][0]['price_status'], 'available')
+        today_activity = board['items'][0]['today_activity']
+        self.assertEqual(today_activity['buy_activity_status'], 'available')
+        self.assertEqual(today_activity['buy_activity_source'], 'executions')
+        self.assertEqual(today_activity['buy_filled_quantity_today'], 5)
+        self.assertEqual(today_activity['buy_avg_fill_price_today'], 50100)
+        self.assertEqual(today_activity['buy_last_filled_at'], '2026-04-30T00:06:00+00:00')
+        self.assertEqual(today_activity['buy_broker_order_ids'], ['order-1'])
+        self.assertEqual(today_activity['sell_activity_status'], 'none')
+        self.assertEqual(today_activity['sell_filled_quantity_today'], 0)
+        self.assertEqual(today_activity['net_open_quantity'], 5)
 
         self.assertEqual(monitored['summary']['items_total'], 1)
         self.assertEqual(monitored['items'][0]['symbol'], self.symbol)
@@ -1666,7 +1676,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 },
                 'derived_state': {
                     'derived_status': 'closed',
-                    'entry_filled_quantity': None,
+                    'entry_filled_quantity': '5',
                     'exit_filled_quantity': '5',
                     'open_quantity': '0',
                     'closed_quantity': '5',
@@ -1708,10 +1718,247 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(board['summary']['filled'], 1)
         self.assertEqual(board['summary']['failed'], 0)
         self.assertEqual(board['items'][0]['status'], 'filled')
-        self.assertEqual(board['items'][0]['filled_quantity'], 0)
+        self.assertEqual(board['items'][0]['filled_quantity'], 5)
         self.assertEqual(board['items'][0]['exit_filled_quantity'], 5)
         self.assertEqual(board['items'][0]['open_quantity'], 0)
         self.assertEqual(board['items'][0]['broker_order_id'], 'sell-order-1')
+        today_activity = board['items'][0]['today_activity']
+        self.assertEqual(today_activity['buy_activity_status'], 'none')
+        self.assertEqual(today_activity['buy_filled_quantity_today'], 0)
+        self.assertIsNone(today_activity['buy_avg_fill_price_today'])
+        self.assertIsNone(today_activity['buy_last_filled_at'])
+        self.assertEqual(today_activity['buy_broker_order_ids'], [])
+        self.assertEqual(today_activity['sell_activity_status'], 'available')
+        self.assertEqual(today_activity['sell_activity_source'], 'executions')
+        self.assertEqual(today_activity['sell_filled_quantity_today'], 5)
+        self.assertEqual(today_activity['sell_avg_fill_price_today'], 51000)
+        self.assertEqual(today_activity['sell_last_filled_at'], '2026-04-30T05:31:00+00:00')
+        self.assertEqual(today_activity['sell_broker_order_ids'], ['sell-order-1'])
+        self.assertEqual(today_activity['net_open_quantity'], 0)
+
+    async def test_runtime_dashboard_today_activity_exposes_mixed_buy_and_sell_fills(self) -> None:
+        await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=False,
+            dry_run=False,
+            force=True,
+            trigger='test',
+        )
+        self._mark_plan_item_blocked_with_readback(
+            dispatch_status='failed',
+            execution_status='submit_failed',
+            readback={
+                'last_synced_at': '2026-04-30T05:31:00+00:00',
+                'runtime': {
+                    'status': 'ok',
+                    'payload': {
+                        'mode': 'mock',
+                        'ready': True,
+                        'monitoring_alive': True,
+                    },
+                },
+                'derived_state': {
+                    'derived_status': 'open',
+                    'entry_filled_quantity': '5',
+                    'exit_filled_quantity': '2',
+                    'open_quantity': '3',
+                    'closed_quantity': '2',
+                },
+                'orders': {
+                    'items': [
+                        {
+                            'id': 'buy-order-1',
+                            'broker_order_id': 'buy-order-1',
+                            'symbol': self.symbol,
+                            'side': 'buy',
+                            'status': 'filled',
+                            'updated_at': '2026-04-30T00:06:30+00:00',
+                        },
+                        {
+                            'id': 'sell-order-1',
+                            'broker_order_id': 'sell-order-1',
+                            'symbol': self.symbol,
+                            'side': 'sell',
+                            'status': 'filled',
+                            'updated_at': '2026-04-30T05:31:30+00:00',
+                        },
+                    ]
+                },
+                'executions': {
+                    'items': [
+                        {
+                            'broker_order_id': 'buy-order-1',
+                            'symbol': self.symbol,
+                            'side': 'buy',
+                            'quantity': '5',
+                            'price': '50100',
+                            'executed_at': '2026-04-30T00:06:00+00:00',
+                        },
+                        {
+                            'broker_order_id': 'sell-order-1',
+                            'symbol': self.symbol,
+                            'side': 'sell',
+                            'quantity': '2',
+                            'price': '51200',
+                            'executed_at': '2026-04-30T05:31:00+00:00',
+                        },
+                    ]
+                },
+                'positions': {'items': []},
+            },
+        )
+
+        board = await self.service.get_runtime_daily_board(
+            market_date=self.target_trade_date,
+            refresh=False,
+            trigger='test',
+        )
+
+        self.assertEqual(board['summary']['partial'], 1)
+        item = board['items'][0]
+        self.assertEqual(item['status'], 'partial')
+        self.assertEqual(item['filled_quantity'], 5)
+        self.assertEqual(item['exit_filled_quantity'], 2)
+        self.assertEqual(item['open_quantity'], 3)
+        today_activity = item['today_activity']
+        self.assertEqual(today_activity['buy_filled_quantity_today'], 5)
+        self.assertEqual(today_activity['buy_avg_fill_price_today'], 50100)
+        self.assertEqual(today_activity['buy_last_filled_at'], '2026-04-30T00:06:00+00:00')
+        self.assertEqual(today_activity['buy_broker_order_ids'], ['buy-order-1'])
+        self.assertEqual(today_activity['sell_filled_quantity_today'], 2)
+        self.assertEqual(today_activity['sell_avg_fill_price_today'], 51200)
+        self.assertEqual(today_activity['sell_last_filled_at'], '2026-04-30T05:31:00+00:00')
+        self.assertEqual(today_activity['sell_broker_order_ids'], ['sell-order-1'])
+        self.assertEqual(today_activity['net_open_quantity'], 3)
+
+    async def test_runtime_dashboard_today_activity_marks_untimestamped_side_unavailable(self) -> None:
+        await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=False,
+            dry_run=False,
+            force=True,
+            trigger='test',
+        )
+        self._mark_plan_item_blocked_with_readback(
+            readback={
+                'last_synced_at': '2026-04-30T00:07:00+00:00',
+                'runtime': {'status': 'ok', 'payload': {'mode': 'mock', 'ready': True}},
+                'derived_state': {
+                    'derived_status': 'open',
+                    'entry_filled_quantity': '5',
+                    'exit_filled_quantity': None,
+                    'open_quantity': '5',
+                    'closed_quantity': '0',
+                },
+                'orders': {'items': []},
+                'executions': {
+                    'items': [
+                        {
+                            'broker_order_id': 'buy-order-no-time',
+                            'symbol': self.symbol,
+                            'side': 'buy',
+                            'quantity': '5',
+                            'price': '50100',
+                        }
+                    ]
+                },
+                'positions': {'items': []},
+            },
+        )
+
+        board = await self.service.get_runtime_daily_board(
+            market_date=self.target_trade_date,
+            refresh=False,
+            trigger='test',
+        )
+
+        today_activity = board['items'][0]['today_activity']
+        self.assertEqual(today_activity['buy_activity_status'], 'unavailable')
+        self.assertIsNone(today_activity['buy_filled_quantity_today'])
+        self.assertIsNone(today_activity['buy_avg_fill_price_today'])
+        self.assertIsNone(today_activity['buy_last_filled_at'])
+        self.assertEqual(today_activity['buy_broker_order_ids'], [])
+        self.assertEqual(today_activity['sell_activity_status'], 'none')
+
+    async def test_runtime_dashboard_today_activity_caps_ids_and_omits_raw_readback_blobs(self) -> None:
+        dispatch_result = await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=False,
+            dry_run=False,
+            force=True,
+            trigger='test',
+        )
+        plan_id = dispatch_result['dispatch']['groups'][0]['plan_id']
+        self.client.plan_response = {'items': [{'external_plan_id': plan_id, 'status': 'accepted'}]}
+        self.client.order_response = {
+            'items': [
+                {
+                    'id': f'buy-order-{index}',
+                    'broker_order_id': f'buy-order-{index}',
+                    'execution_plan_item_id': 'exec-item-1',
+                    'symbol': self.symbol,
+                    'side': 'buy',
+                    'status': 'filled',
+                    'quantity': '1',
+                    'filled_quantity': '1',
+                    'avg_fill_price': str(50100 + index),
+                    'updated_at': '2026-04-30T00:06:30+00:00',
+                    'raw_blob': 'x' * 4096,
+                }
+                for index in range(7)
+            ]
+        }
+        self.client.execution_response = {
+            'items': [
+                {
+                    'broker_order_id': f'buy-order-{index}',
+                    'execution_plan_item_id': 'exec-item-1',
+                    'symbol': self.symbol,
+                    'side': 'buy',
+                    'quantity': '1',
+                    'fill_price': str(50100 + index),
+                    'executed_at': f'2026-04-30T00:0{index}:00+00:00',
+                    'raw_blob': 'y' * 4096,
+                }
+                for index in range(7)
+            ]
+        }
+        self.client.position_response = {
+            'items': [
+                {
+                    'account_reference': self.account_reference,
+                    'symbol': self.symbol,
+                    'quantity': '7',
+                    'average_price': '50103',
+                    'updated_at': '2026-04-30T00:07:00+00:00',
+                    'raw_blob': 'z' * 4096,
+                }
+            ]
+        }
+
+        await self.service.list_signal_decider_exec_overview(
+            target_trade_date=self.target_trade_date,
+            refresh=True,
+            trigger='test',
+        )
+        board = await self.service.get_runtime_daily_board(
+            market_date=self.target_trade_date,
+            refresh=False,
+            trigger='test',
+        )
+
+        today_activity = board['items'][0]['today_activity']
+        self.assertEqual(today_activity['buy_filled_quantity_today'], 7)
+        self.assertEqual(today_activity['buy_avg_fill_price_today'], 50103)
+        self.assertEqual(
+            today_activity['buy_broker_order_ids'],
+            ['buy-order-0', 'buy-order-1', 'buy-order-2', 'buy-order-3', 'buy-order-4'],
+        )
+        self.assertEqual(today_activity['buy_broker_order_ids_omitted_count'], 2)
+        board_payload = json.dumps(board, ensure_ascii=False, sort_keys=True)
+        self.assertNotIn('raw_blob', board_payload)
+        self.assertNotIn('xxxx', board_payload)
+        self.assertLess(len(board_payload.encode('utf-8')), 20000)
 
     async def test_runtime_monitored_symbols_include_target_stop_watch_from_partial_read_model(self) -> None:
         with session_scope() as session:

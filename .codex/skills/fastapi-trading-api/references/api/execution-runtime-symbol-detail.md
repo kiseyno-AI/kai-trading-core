@@ -1,7 +1,7 @@
 # GET /execution/runtime/symbols/{symbol}
 
 ## Summary
-Read the per-symbol execution detail from core for dashboard/operator pages. The route preserves the normalized daily-board status while adding account-scoped dispatch/readback detail and the planning context needed for debugging, including one-or-many decider provenance when the same symbol is active from multiple deciders. Like the board routes, `refresh=true` is cache-first and schedules a bounded background refresh rather than blocking on exec readback.
+Read the per-symbol execution detail from core for dashboard/operator pages. The route preserves the normalized daily-board status while adding account-scoped dispatch/readback detail and the planning context needed for debugging, including one-or-many decider provenance when the same symbol is active from multiple deciders. Like the board routes, `refresh=true` is cache-first and schedules a bounded background refresh rather than blocking on exec readback. Row items share the daily-board `today_activity` contract for side-aware selected-date buy/sell facts.
 
 ## Example request
 ```http
@@ -100,6 +100,26 @@ GET /execution/runtime/symbols/005930?market_date=2026-04-30&refresh=true
       "agent_name": "signal-decider",
       "decision_agent_name": "signal-decider",
       "status": "filled",
+      "filled_quantity": 5,
+      "exit_filled_quantity": 0,
+      "open_quantity": 5,
+      "today_activity": {
+        "schema_version": "execution_runtime_today_activity_v1",
+        "market_date": "2026-04-30",
+        "buy_activity_status": "available",
+        "buy_filled_quantity_today": 5,
+        "buy_avg_fill_price_today": 50600,
+        "buy_last_filled_at": "2026-04-30T00:07:00+00:00",
+        "buy_broker_order_ids": [
+          "order-1"
+        ],
+        "sell_activity_status": "none",
+        "sell_filled_quantity_today": 0,
+        "sell_avg_fill_price_today": null,
+        "sell_last_filled_at": null,
+        "sell_broker_order_ids": [],
+        "net_open_quantity": 5
+      },
       "current_price": 71500,
       "price_as_of": "2026-04-30T00:15:30+00:00",
       "price_received_at": "2026-04-30T00:15:31+00:00",
