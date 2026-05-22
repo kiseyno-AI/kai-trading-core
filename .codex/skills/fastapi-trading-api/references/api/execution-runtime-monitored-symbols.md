@@ -28,6 +28,11 @@ GET /execution/runtime/monitored-symbols?market_date=2026-04-30&refresh=true
       "symbol": "005930",
       "name": "Samsung Electronics",
       "market": "KOSPI",
+      "current_price": 71500,
+      "price_as_of": "2026-04-30T00:15:30+00:00",
+      "price_received_at": "2026-04-30T00:15:31+00:00",
+      "price_source": "kis_realtime_ws",
+      "price_status": "available",
       "monitoring_state": "watching_target_stop",
       "position_side": "long",
       "planned_intents": [

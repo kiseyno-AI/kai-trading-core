@@ -28,6 +28,7 @@ from app.orders.next_open_execution import (
     EXECUTION_WINDOW_NEXT_OPEN,
     signal_decider_next_open_execution_service,
 )
+from app.quotes.kis_realtime_prices import kis_realtime_price_service
 from app.repositories.symbol_repository import load_symbols
 
 INTEGRATION_MODE_DISABLED = 'disabled'
@@ -1031,6 +1032,10 @@ class SignalDeciderExecIntegrationService:
             for symbol, grouped_items in sorted(grouped.items())
             if self._should_include_monitored_symbol_group(grouped_items)
         ]
+        self._observe_runtime_symbols_for_realtime_prices(
+            (item.get('symbol') for item in items),
+            trigger=trigger,
+        )
         return {
             'request': {
                 'market_date': board['market_date'],
@@ -1092,6 +1097,7 @@ class SignalDeciderExecIntegrationService:
             'symbol': resolved_symbol,
             'name': metadata['name'],
             'market': metadata['market'],
+            **self._price_fields_for_symbol(resolved_symbol),
             'planning': {
                 'decision_source': (
                     next(iter(agent_names))
@@ -2543,6 +2549,7 @@ class SignalDeciderExecIntegrationService:
             'entry_execution_mode': item.get('entry_execution_mode'),
             'target_trade_date': item.get('target_trade_date'),
             'source_market_date': item.get('source_market_date'),
+            **self._price_fields_for_symbol(symbol),
         }
 
     def _build_runtime_daily_board_summary(self, *, items: Sequence[dict[str, Any]]) -> dict[str, Any]:
@@ -2578,6 +2585,7 @@ class SignalDeciderExecIntegrationService:
             'symbol': symbol,
             'name': first.get('name') or symbol,
             'market': first.get('market'),
+            **self._price_fields_for_symbol(symbol),
             'monitoring_state': monitoring['state'],
             'position_side': monitoring['position_side'],
             'planned_intents': monitoring['planned_intents'],
@@ -2619,6 +2627,26 @@ class SignalDeciderExecIntegrationService:
             }:
                 return True
         return False
+
+    @staticmethod
+    def _observe_runtime_symbols_for_realtime_prices(symbols: Iterable[Any], *, trigger: str) -> None:
+        try:
+            kis_realtime_price_service.observe_monitored_symbols(symbols, trigger=trigger)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _price_fields_for_symbol(symbol: Any) -> dict[str, Any]:
+        try:
+            return kis_realtime_price_service.price_fields_for_symbol(symbol)
+        except Exception:
+            return {
+                'current_price': None,
+                'price_as_of': None,
+                'price_received_at': None,
+                'price_source': None,
+                'price_status': 'unavailable',
+            }
 
     def _build_runtime_monitored_summary(self, *, items: Sequence[dict[str, Any]]) -> dict[str, Any]:
         state_counts = Counter(

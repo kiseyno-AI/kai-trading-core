@@ -1085,22 +1085,32 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             ]
         }
 
-        board = await self.service.get_runtime_daily_board(
-            market_date=self.target_trade_date,
-            refresh=True,
-            trigger='test',
-        )
-        monitored = await self.service.list_runtime_monitored_symbols(
-            market_date=self.target_trade_date,
-            refresh=True,
-            trigger='test',
-        )
-        detail = await self.service.get_runtime_symbol_detail(
-            market_date=self.target_trade_date,
-            symbol=self.symbol,
-            refresh=True,
-            trigger='test',
-        )
+        with patch('app.orders.exec_integration.kis_realtime_price_service') as price_service:
+            price_service.price_fields_for_symbol.return_value = {
+                'current_price': 50200,
+                'price_as_of': '2026-04-30T00:07:30+00:00',
+                'price_received_at': '2026-04-30T00:07:31+00:00',
+                'price_source': 'kis_realtime_ws',
+                'price_status': 'available',
+            }
+            price_service.observe_monitored_symbols.return_value = {'allowed_symbols': [self.symbol]}
+
+            board = await self.service.get_runtime_daily_board(
+                market_date=self.target_trade_date,
+                refresh=True,
+                trigger='test',
+            )
+            monitored = await self.service.list_runtime_monitored_symbols(
+                market_date=self.target_trade_date,
+                refresh=True,
+                trigger='test',
+            )
+            detail = await self.service.get_runtime_symbol_detail(
+                market_date=self.target_trade_date,
+                symbol=self.symbol,
+                refresh=True,
+                trigger='test',
+            )
 
         self.assertEqual(board['runtime']['status'], 'ready')
         self.assertEqual(board['summary']['filled'], 1)
@@ -1109,14 +1119,18 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(board['items'][0]['filled_quantity'], 5)
         self.assertEqual(board['items'][0]['avg_fill_price'], 50100)
         self.assertEqual(board['items'][0]['execution_plan_id'], plan_id)
+        self.assertEqual(board['items'][0]['current_price'], 50200)
+        self.assertEqual(board['items'][0]['price_status'], 'available')
 
         self.assertEqual(monitored['summary']['items_total'], 1)
         self.assertEqual(monitored['items'][0]['symbol'], self.symbol)
         self.assertEqual(monitored['items'][0]['monitoring_state'], 'watching_target_stop')
         self.assertEqual(monitored['items'][0]['planned_intents'], ['stop_sell', 'target_sell'])
+        self.assertEqual(monitored['items'][0]['current_price'], 50200)
 
         self.assertEqual(detail['summary']['items_total'], 1)
         self.assertEqual(detail['monitoring']['state'], 'watching_target_stop')
+        self.assertEqual(detail['current_price'], 50200)
         self.assertEqual(detail['items'][0]['status'], 'filled')
         self.assertEqual(detail['items'][0]['remote_state']['derived_status'], 'open')
 

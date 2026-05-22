@@ -41,6 +41,15 @@ class Settings(BaseSettings):
     kis_token_refresh_margin_seconds: int = 300
     kis_realtime_trending_cache_ttl_seconds: int = 20
     kis_realtime_order_notice_enabled: bool = True
+    kis_realtime_price_enabled: bool = True
+    kis_realtime_price_tr_id: str = 'H0STCNT0'
+    kis_realtime_price_max_subscriptions: int = 40
+    kis_realtime_price_subscription_refresh_seconds: float = 30.0
+    kis_realtime_price_idle_poll_seconds: float = 5.0
+    kis_realtime_price_stale_after_seconds: float = 30.0
+    kis_realtime_price_subscribe_pause_seconds: float = 0.05
+    kis_realtime_price_unsubscribe_tr_type: str = '2'
+    kis_realtime_price_sse_interval_seconds: float = 1.0
     kis_realtime_ws_url: str = 'ws://ops.koreainvestment.com:21000'
     kis_realtime_mock_ws_url: str = 'ws://ops.koreainvestment.com:31000'
     kis_realtime_reconnect_base_delay_seconds: float = 3.0

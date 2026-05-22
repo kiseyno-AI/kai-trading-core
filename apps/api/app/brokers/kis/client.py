@@ -169,6 +169,7 @@ class KISClient:
             'app_secret_configured': bool(settings.kis_app_secret),
             'hts_id_configured': bool(settings.kis_hts_id),
             'realtime_order_notice_enabled': settings.kis_realtime_order_notice_enabled,
+            'realtime_price_enabled': settings.kis_realtime_price_enabled,
         }
 
     async def issue_approval_key(self) -> dict[str, Any]:

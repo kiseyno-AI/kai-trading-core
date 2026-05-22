@@ -1,7 +1,7 @@
 # GET /broker/kis/health
 
 ## Summary
-Broker connectivity and configuration health for the KIS adapter, including realtime domestic order-notice websocket status.
+Broker connectivity and configuration health for the KIS adapter, including realtime domestic order-notice and monitored-price websocket status.
 
 ## Example request
 ```http
@@ -20,6 +20,7 @@ GET /broker/kis/health
   "app_secret_configured": true,
   "hts_id_configured": true,
   "realtime_order_notice_enabled": true,
+  "realtime_price_enabled": true,
   "market_snapshot_runtime": {
     "ready": true,
     "effective_kis_environment": "real",
@@ -82,11 +83,30 @@ GET /broker/kis/health
       "unmatched_notices": 0,
       "parse_errors": 0
     }
+  },
+  "realtime_prices": {
+    "enabled": true,
+    "configured": true,
+    "status": "subscribed",
+    "tr_id": "H0STCNT0",
+    "max_subscriptions": 40,
+    "desired_symbols": ["005930"],
+    "subscribed_symbols": ["005930"],
+    "limited_symbols": [],
+    "last_price_received_at": "2026-04-30T00:15:31+00:00",
+    "metrics": {
+      "messages_received": 12,
+      "price_messages_received": 10,
+      "prices_ingested": 10,
+      "subscribe_requests": 1,
+      "unsubscribe_requests": 0
+    }
   }
 }
 ```
 
 ## Notes
+- `realtime_prices` is process-local live dashboard state. It does not imply realtime ticks are persisted to the database.
 - `market_snapshot_runtime` and `portfolio_summary_runtime` are route-specific readiness summaries for deploy and operator checks.
 - `intraday_snapshot_runtime` is the readiness summary for the separate KIS intraday execution-context capture path. `ready=false` means Core will safely return `status=disabled` from the collect route instead of attempting live KIS calls.
 - `portfolio_summary_runtime.ready=false` means `/portfolio/summary` is still blocked by config such as missing `PORTFOLIO_ACCOUNT_REFERENCES`, missing KIS secrets, or `KIS_USE_MOCK=true` in `APP_ENV=production`.
