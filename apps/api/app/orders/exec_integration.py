@@ -93,6 +93,7 @@ REMOTE_FAILED_STATUSES = {'canceled', 'cancelled', 'failed', 'rejected'}
 REMOTE_SCHEDULED_STATUSES = {'accepted', 'created', 'pending', 'queued'}
 REMOTE_SUBMITTED_STATUSES = {'open', 'running', 'submitted', 'working'}
 REMOTE_PARTIAL_STATUSES = {'partial', 'partial_fill', 'partially_filled'}
+REMOTE_FILLED_STATUSES = {'complete', 'completed', 'done', 'filled'}
 REMOTE_CANCELLED_STATUSES = {'canceled', 'cancelled'}
 REMOTE_TERMINAL_FAILURE_STATUSES = REMOTE_FAILED_STATUSES - REMOTE_CANCELLED_STATUSES
 
@@ -2934,6 +2935,10 @@ class SignalDeciderExecIntegrationService:
                 sell_quantity += quantity
             else:
                 buy_quantity += quantity
+        if buy_quantity <= Decimal('0'):
+            buy_quantity = self._sum_order_filled_quantity(orders=orders, side='buy')
+        if sell_quantity <= Decimal('0'):
+            sell_quantity = self._sum_order_filled_quantity(orders=orders, side='sell')
 
         position_quantity = Decimal('0')
         if positions:
@@ -2946,10 +2951,20 @@ class SignalDeciderExecIntegrationService:
             if _normalize_status(link.get('remote_status'))
         }
         status_set = item_statuses.union(set(order_status_counts.keys()))
+        has_entry_fill_evidence = (
+            buy_quantity > Decimal('0')
+            or self._has_order_fill_evidence(orders=orders, side='buy')
+            or bool(order_status_counts.keys() & REMOTE_PARTIAL_STATUSES)
+        )
+        has_exit_fill_evidence = sell_quantity > Decimal('0') or self._has_order_fill_evidence(orders=orders, side='sell')
+        has_plan_fill_evidence = has_entry_fill_evidence or has_exit_fill_evidence
+        attributed_position_quantity = position_quantity if has_plan_fill_evidence else Decimal('0')
+        open_quantity = max(attributed_position_quantity, buy_quantity - sell_quantity)
+
         derived_status = EXEC_DISPATCH_STATUS_ACCEPTED
-        if sell_quantity > 0 and (position_quantity <= 0 or (buy_quantity > 0 and sell_quantity >= buy_quantity)):
+        if sell_quantity > 0 and (open_quantity <= 0 or (buy_quantity > 0 and sell_quantity >= buy_quantity)):
             derived_status = 'closed'
-        elif position_quantity > 0 or buy_quantity > 0:
+        elif open_quantity > 0 or has_entry_fill_evidence:
             derived_status = 'open'
         elif any(status in REMOTE_ACTIVE_STATUSES for status in order_status_counts):
             derived_status = 'working'
@@ -2958,13 +2973,13 @@ class SignalDeciderExecIntegrationService:
         elif any(status in REMOTE_TERMINAL_FAILURE_STATUSES for status in status_set):
             derived_status = 'failed'
 
-        open_quantity = max(position_quantity, buy_quantity - sell_quantity)
         return {
             'derived_status': derived_status,
             'entry_filled_quantity': _decimal_to_text(buy_quantity if buy_quantity > 0 else None),
             'exit_filled_quantity': _decimal_to_text(sell_quantity if sell_quantity > 0 else None),
             'open_quantity': _decimal_to_text(open_quantity if open_quantity > 0 else Decimal('0')),
             'closed_quantity': _decimal_to_text(sell_quantity if sell_quantity > 0 else Decimal('0')),
+            'has_plan_attributed_fill_evidence': has_plan_fill_evidence,
             'order_status_counts': dict(sorted(order_status_counts.items())),
             'endpoint_statuses': endpoint_statuses,
         }
@@ -3219,16 +3234,45 @@ class SignalDeciderExecIntegrationService:
 
         planned_quantity = _safe_decimal(item.get('planned_quantity'))
         entry_filled_quantity = _safe_decimal(remote_state.get('entry_filled_quantity'))
+        entry_execution_quantity = self._sum_execution_quantity(executions=executions, side='buy')
+        entry_order_quantity = self._sum_order_filled_quantity(orders=orders, side='buy')
         if entry_filled_quantity is None:
-            entry_filled_quantity = self._sum_execution_quantity(executions=executions, side='buy')
+            entry_filled_quantity = entry_execution_quantity
+        if entry_filled_quantity <= Decimal('0'):
+            entry_filled_quantity = max(entry_filled_quantity, entry_execution_quantity, entry_order_quantity)
         exit_filled_quantity = _safe_decimal(remote_state.get('exit_filled_quantity'))
+        exit_execution_quantity = self._sum_execution_quantity(executions=executions, side='sell')
+        exit_order_quantity = self._sum_order_filled_quantity(orders=orders, side='sell')
         if exit_filled_quantity is None:
-            exit_filled_quantity = self._sum_execution_quantity(executions=executions, side='sell')
-        open_quantity = _safe_decimal(remote_state.get('open_quantity'))
-        if open_quantity is None:
-            open_quantity = max(Decimal('0'), entry_filled_quantity - exit_filled_quantity)
+            exit_filled_quantity = exit_execution_quantity
+        if exit_filled_quantity <= Decimal('0'):
+            exit_filled_quantity = max(exit_filled_quantity, exit_execution_quantity, exit_order_quantity)
 
         order_statuses = self._collect_order_statuses(orders=orders)
+        has_entry_fill_evidence = (
+            entry_filled_quantity > Decimal('0')
+            or self._has_order_fill_evidence(orders=orders, side='buy')
+            or bool(order_statuses & REMOTE_PARTIAL_STATUSES)
+        )
+        has_exit_fill_evidence = (
+            exit_filled_quantity > Decimal('0') or self._has_order_fill_evidence(orders=orders, side='sell')
+        )
+        readback_fill_evidence = _normalize_bool(remote_state.get('has_plan_attributed_fill_evidence'))
+        has_plan_attributed_fill_evidence = (
+            has_entry_fill_evidence or has_exit_fill_evidence or bool(readback_fill_evidence)
+        )
+        remote_open_quantity = _safe_decimal(remote_state.get('open_quantity'))
+        position_quantity = self._sum_position_quantity(positions=positions)
+        attributed_position_quantity = (
+            max(remote_open_quantity or Decimal('0'), position_quantity)
+            if has_plan_attributed_fill_evidence
+            else Decimal('0')
+        )
+        open_quantity = max(
+            attributed_position_quantity,
+            entry_filled_quantity - exit_filled_quantity,
+            Decimal('0'),
+        )
         status = self._normalize_board_item_status(
             item=item,
             order_statuses=order_statuses,
@@ -3236,6 +3280,7 @@ class SignalDeciderExecIntegrationService:
             entry_filled_quantity=entry_filled_quantity,
             exit_filled_quantity=exit_filled_quantity,
             open_quantity=open_quantity,
+            has_plan_attributed_fill_evidence=has_plan_attributed_fill_evidence,
         )
         planned_intents = self._collect_planned_intents(item=item)
         monitoring_state = self._resolve_monitoring_state(
@@ -3244,6 +3289,7 @@ class SignalDeciderExecIntegrationService:
             planned_intents=planned_intents,
             runtime_status=runtime_status,
             has_execution_plan=bool(_normalize_optional_text((item.get('dispatch') or {}).get('plan_id'))),
+            has_target_stop_watch=self._has_target_stop_watch_facts(item),
         )
         return {
             'plan_item_id': item.get('plan_item_id'),
@@ -3261,6 +3307,7 @@ class SignalDeciderExecIntegrationService:
             'planned_intents': planned_intents,
             'planned_quantity': _to_json_number(planned_quantity),
             'filled_quantity': _to_json_number(entry_filled_quantity),
+            'exit_filled_quantity': _to_json_number(exit_filled_quantity),
             'open_quantity': _to_json_number(open_quantity),
             'planned_price': item.get('estimated_reference_price'),
             'avg_fill_price': self._resolve_average_fill_price(executions=executions, positions=positions),
@@ -3362,6 +3409,18 @@ class SignalDeciderExecIntegrationService:
                 UI_BOARD_STATUS_PARTIAL,
                 UI_BOARD_STATUS_FILLED,
             }:
+                return True
+            if (_safe_decimal(item.get('filled_quantity')) or Decimal('0')) > Decimal('0'):
+                return True
+            if (_safe_decimal(item.get('exit_filled_quantity')) or Decimal('0')) > Decimal('0'):
+                return True
+            if (_safe_decimal(item.get('open_quantity')) or Decimal('0')) > Decimal('0'):
+                return True
+            if _normalize_optional_text(item.get('broker_order_id')):
+                return True
+            if item.get('planned_intents'):
+                return True
+            if self._has_target_stop_watch_facts(item):
                 return True
         return False
 
@@ -3544,6 +3603,60 @@ class SignalDeciderExecIntegrationService:
         return total
 
     @staticmethod
+    def _sum_order_filled_quantity(*, orders: Sequence[dict[str, Any]], side: str) -> Decimal:
+        total = Decimal('0')
+        for order in orders:
+            order_side = _normalize_status(order.get('side'))
+            if side == 'sell':
+                if order_side != 'sell':
+                    continue
+            elif order_side == 'sell':
+                continue
+
+            filled_quantity = _safe_decimal(
+                order.get('filled_quantity')
+                or order.get('executed_quantity')
+                or order.get('cumulative_filled_quantity')
+            )
+            if filled_quantity is None and _normalize_status(
+                order.get('status') or order.get('current_status') or order.get('broker_status')
+            ) in REMOTE_FILLED_STATUSES:
+                filled_quantity = _safe_decimal(order.get('quantity'))
+            total += filled_quantity or Decimal('0')
+        return total
+
+    @staticmethod
+    def _has_order_fill_evidence(*, orders: Sequence[dict[str, Any]], side: str) -> bool:
+        for order in orders:
+            order_side = _normalize_status(order.get('side'))
+            if side == 'sell':
+                if order_side != 'sell':
+                    continue
+            elif order_side == 'sell':
+                continue
+
+            if (
+                _safe_decimal(
+                    order.get('filled_quantity')
+                    or order.get('executed_quantity')
+                    or order.get('cumulative_filled_quantity')
+                )
+                or Decimal('0')
+            ) > Decimal('0'):
+                return True
+            status = _normalize_status(order.get('status') or order.get('current_status') or order.get('broker_status'))
+            if status in REMOTE_PARTIAL_STATUSES or status in REMOTE_FILLED_STATUSES:
+                return True
+        return False
+
+    @staticmethod
+    def _sum_position_quantity(*, positions: Sequence[dict[str, Any]]) -> Decimal:
+        total = Decimal('0')
+        for position in positions:
+            total += _safe_decimal(position.get('quantity') or position.get('available_quantity')) or Decimal('0')
+        return total
+
+    @staticmethod
     def _collect_order_statuses(*, orders: Sequence[dict[str, Any]]) -> set[str]:
         statuses: set[str] = set()
         for order in orders:
@@ -3561,6 +3674,7 @@ class SignalDeciderExecIntegrationService:
         entry_filled_quantity: Decimal,
         exit_filled_quantity: Decimal,
         open_quantity: Decimal,
+        has_plan_attributed_fill_evidence: bool,
     ) -> str:
         eligibility_status = _normalize_optional_text(item.get('eligibility_status'), lowercase=True)
         execution_status = _normalize_optional_text(item.get('execution_status'), lowercase=True)
@@ -3569,7 +3683,23 @@ class SignalDeciderExecIntegrationService:
         derived_status = _normalize_optional_text(remote_state.get('derived_status'), lowercase=True)
         failed_order_statuses = order_statuses & REMOTE_TERMINAL_FAILURE_STATUSES
 
-        if eligibility_status == ELIGIBILITY_BLOCKED:
+        if order_statuses & REMOTE_PARTIAL_STATUSES:
+            return UI_BOARD_STATUS_PARTIAL
+        if planned_quantity is not None and entry_filled_quantity > Decimal('0') and entry_filled_quantity < planned_quantity:
+            return UI_BOARD_STATUS_PARTIAL
+        if has_plan_attributed_fill_evidence and exit_filled_quantity > Decimal('0') and open_quantity > Decimal('0'):
+            return UI_BOARD_STATUS_PARTIAL
+        if has_plan_attributed_fill_evidence:
+            return UI_BOARD_STATUS_FILLED
+        if order_statuses & REMOTE_SUBMITTED_STATUSES:
+            return UI_BOARD_STATUS_SUBMITTED
+        if order_statuses & REMOTE_SCHEDULED_STATUSES:
+            return UI_BOARD_STATUS_SCHEDULED
+        if (order_statuses & REMOTE_CANCELLED_STATUSES or derived_status == UI_BOARD_STATUS_CANCELLED) and (
+            entry_filled_quantity <= Decimal('0')
+        ):
+            return UI_BOARD_STATUS_CANCELLED
+        if failed_order_statuses or derived_status == 'failed':
             return UI_BOARD_STATUS_FAILED
         if execution_status == EXECUTION_STATUS_SUBMIT_FAILED or dispatch_status in {
             EXEC_DISPATCH_STATUS_FAILED,
@@ -3578,24 +3708,8 @@ class SignalDeciderExecIntegrationService:
             EXEC_DISPATCH_STATUS_UNAVAILABLE,
         }:
             return UI_BOARD_STATUS_FAILED
-        if (order_statuses & REMOTE_CANCELLED_STATUSES or derived_status == UI_BOARD_STATUS_CANCELLED) and (
-            entry_filled_quantity <= Decimal('0')
-        ):
-            return UI_BOARD_STATUS_CANCELLED
-        if failed_order_statuses or derived_status == 'failed':
+        if eligibility_status == ELIGIBILITY_BLOCKED:
             return UI_BOARD_STATUS_FAILED
-        if order_statuses & REMOTE_PARTIAL_STATUSES:
-            return UI_BOARD_STATUS_PARTIAL
-        if planned_quantity is not None and entry_filled_quantity > Decimal('0') and entry_filled_quantity < planned_quantity:
-            return UI_BOARD_STATUS_PARTIAL
-        if exit_filled_quantity > Decimal('0') and open_quantity > Decimal('0'):
-            return UI_BOARD_STATUS_PARTIAL
-        if entry_filled_quantity > Decimal('0'):
-            return UI_BOARD_STATUS_FILLED
-        if order_statuses & REMOTE_SUBMITTED_STATUSES:
-            return UI_BOARD_STATUS_SUBMITTED
-        if order_statuses & REMOTE_SCHEDULED_STATUSES:
-            return UI_BOARD_STATUS_SCHEDULED
         if dispatch_status in {EXEC_DISPATCH_STATUS_ACCEPTED, EXEC_DISPATCH_STATUS_PARTIAL}:
             return UI_BOARD_STATUS_ACCEPTED
         return UI_BOARD_STATUS_PLANNED
@@ -3608,10 +3722,11 @@ class SignalDeciderExecIntegrationService:
         planned_intents: Sequence[str],
         runtime_status: str,
         has_execution_plan: bool,
+        has_target_stop_watch: bool,
     ) -> str:
         if runtime_status in {UI_RUNTIME_STATUS_DEGRADED, UI_RUNTIME_STATUS_OFFLINE} and has_execution_plan:
             return UI_MONITORING_STATE_RECONCILING
-        if open_quantity > Decimal('0') and planned_intents:
+        if open_quantity > Decimal('0') and (planned_intents or has_target_stop_watch):
             return UI_MONITORING_STATE_WATCHING_TARGET_STOP
         if status in {
             UI_BOARD_STATUS_ACCEPTED,
@@ -3619,6 +3734,8 @@ class SignalDeciderExecIntegrationService:
             UI_BOARD_STATUS_SUBMITTED,
             UI_BOARD_STATUS_PARTIAL,
         }:
+            return UI_MONITORING_STATE_WATCHING_FILL
+        if has_target_stop_watch:
             return UI_MONITORING_STATE_WATCHING_FILL
         return UI_MONITORING_STATE_IDLE
 
@@ -3630,7 +3747,18 @@ class SignalDeciderExecIntegrationService:
             intent = _normalize_optional_text(link.get('intent'), lowercase=True)
             if intent and intent not in EXEC_ENTRY_BUY_INTENTS:
                 intents.append(intent)
+        if _positive_decimal(item.get('target_price')) is not None:
+            intents.append(EXEC_INTENT_TARGET_SELL)
+        if _positive_decimal(item.get('stop_loss_price')) is not None:
+            intents.append(EXEC_INTENT_STOP_SELL)
         return sorted(dict.fromkeys(intents))
+
+    @staticmethod
+    def _has_target_stop_watch_facts(item: dict[str, Any]) -> bool:
+        return any(
+            _positive_decimal(item.get(field_name)) is not None
+            for field_name in ('target_price', 'stop_loss_price', 'trigger_price', 'chase_limit_price')
+        )
 
     @staticmethod
     def _resolve_entry_intent(*, item: dict[str, Any]) -> str:
