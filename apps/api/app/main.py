@@ -1,9 +1,10 @@
 import logging
 import time
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from secrets import compare_digest
 import asyncio
+from typing import Awaitable, Callable
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -49,10 +50,47 @@ from app.scanner.state import scanner_state
 
 configure_file_logging()
 logger = logging.getLogger(__name__)
+STARTUP_MAINTENANCE_TIMEOUT_SECONDS = 30
+
+
+async def _run_startup_maintenance_step(name: str, factory: Callable[[], Awaitable[object]]) -> None:
+    try:
+        await asyncio.wait_for(factory(), timeout=STARTUP_MAINTENANCE_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        logger.warning(
+            'Startup maintenance step timed out after %ss and will not block API readiness: %s',
+            STARTUP_MAINTENANCE_TIMEOUT_SECONDS,
+            name,
+        )
+    except Exception as exc:
+        logger.warning('Startup maintenance step failed: %s: %s', name, exc)
+
+
+async def _run_startup_maintenance() -> None:
+    await _run_startup_maintenance_step(
+        'trading_order_startup_reconcile',
+        lambda: trading_order_reconciliation_service.run_startup_reconcile(),
+    )
+    await _run_startup_maintenance_step(
+        'market_snapshot_startup_refresh',
+        lambda: market_snapshot_service.refresh_market_snapshot_if_due(trigger='startup'),
+    )
+    await _run_startup_maintenance_step(
+        'portfolio_summary_startup_refresh',
+        lambda: portfolio_summary_service.refresh_portfolio_summary_if_due(trigger='startup', force=True),
+    )
+    await _run_startup_maintenance_step(
+        'signal_decider_evaluation_startup_refresh',
+        lambda: asyncio.to_thread(
+            signal_decider_evaluation_maintenance_service.refresh_latest_stored_coverage,
+            trigger='startup',
+        ),
+    )
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    startup_maintenance_task: asyncio.Task | None = None
     try:
         await asyncio.to_thread(init_database)
         await asyncio.to_thread(
@@ -65,32 +103,15 @@ async def lifespan(_: FastAPI):
         logger.warning('Database initialization failed; starting in degraded mode: %s', exc)
     await kis_realtime_order_notice_service.start()
     await kis_realtime_price_service.start()
-    try:
-        await trading_order_reconciliation_service.run_startup_reconcile()
-    except Exception as exc:
-        logger.exception('Trading order startup reconcile failed: %s', exc)
-    try:
-        await market_snapshot_service.refresh_market_snapshot_if_due(trigger='startup')
-    except Exception as exc:
-        logger.warning('Market snapshot startup refresh failed; serving cache when available: %s', exc)
-    try:
-        await portfolio_summary_service.refresh_portfolio_summary_if_due(trigger='startup', force=True)
-    except Exception as exc:
-        logger.warning('Portfolio summary startup refresh failed; serving cache when available: %s', exc)
-    try:
-        await asyncio.to_thread(
-            signal_decider_evaluation_maintenance_service.refresh_latest_stored_coverage,
-            trigger='startup',
-        )
-    except Exception as exc:
-        logger.warning(
-            'Signal-decider evaluation startup refresh failed; recent review coverage may stay stale: %s',
-            exc,
-        )
+    startup_maintenance_task = asyncio.create_task(_run_startup_maintenance(), name='startup-maintenance')
     await background_runner.start()
     try:
         yield
     finally:
+        if startup_maintenance_task and not startup_maintenance_task.done():
+            startup_maintenance_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await startup_maintenance_task
         await kis_realtime_price_service.stop()
         await kis_realtime_order_notice_service.stop()
         await background_runner.stop()

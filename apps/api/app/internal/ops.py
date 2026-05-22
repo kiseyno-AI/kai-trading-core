@@ -46,6 +46,7 @@ from app.market_data_store import (
     load_tracked_symbols,
     persist_market_status_snapshot,
 )
+from app.orders.exec_payload_slimming import cleanup_signal_decider_exec_submission_payloads
 from app.orders.exec_integration import signal_decider_exec_integration_service
 from app.orders.intraday_auto_sell import signal_decider_intraday_auto_sell_service
 from app.orders.next_open_execution import signal_decider_next_open_execution_service
@@ -106,6 +107,26 @@ def get_eod_status() -> dict[str, Any]:
         'master': master_refresh_state.snapshot(),
         'pykrx_auto': auto_pykrx_eod_scheduler.snapshot(),
     }
+
+
+def slim_signal_decider_exec_payloads(
+    *,
+    dry_run: bool = True,
+    target_trade_date: str | None = None,
+    min_payload_bytes: int = 64 * 1024,
+    max_payload_bytes: int = 24 * 1024,
+    batch_size: int = 100,
+    limit: int | None = None,
+) -> dict[str, Any]:
+    bootstrap_runtime()
+    return cleanup_signal_decider_exec_submission_payloads(
+        dry_run=dry_run,
+        target_trade_date=target_trade_date,
+        min_payload_bytes=min_payload_bytes,
+        max_payload_bytes=max_payload_bytes,
+        batch_size=batch_size,
+        limit=limit,
+    )
 
 
 def run_pykrx_daily_if_due(
@@ -1122,6 +1143,17 @@ def _build_parser() -> argparse.ArgumentParser:
     next_open_execution_parser.add_argument('--dry-run', choices=('true', 'false'))
     next_open_execution_parser.add_argument('--force', action='store_true')
 
+    slim_exec_payloads_parser = subparsers.add_parser(
+        'trading-signal-decider-slim-exec-payloads',
+        help='Slim oversized per-item signal-decider exec dispatch payloads; dry-run by default',
+    )
+    slim_exec_payloads_parser.add_argument('--dry-run', choices=('true', 'false'), default='true')
+    slim_exec_payloads_parser.add_argument('--target-trade-date')
+    slim_exec_payloads_parser.add_argument('--min-payload-bytes', type=int, default=64 * 1024)
+    slim_exec_payloads_parser.add_argument('--max-payload-bytes', type=int, default=24 * 1024)
+    slim_exec_payloads_parser.add_argument('--batch-size', type=int, default=100)
+    slim_exec_payloads_parser.add_argument('--limit', type=int)
+
     intraday_auto_sell_parser = subparsers.add_parser(
         'trading-intraday-auto-sell-run-if-due',
         help='Evaluate linked next-open positions and execute signal-decider intraday auto-sells directly',
@@ -1348,6 +1380,15 @@ def main(argv: Iterable[str] | None = None) -> int:
             target_trade_date=args.target_trade_date,
             dry_run=None if args.dry_run is None else args.dry_run == 'true',
             force=args.force,
+        )
+    elif args.command == 'trading-signal-decider-slim-exec-payloads':
+        payload = slim_signal_decider_exec_payloads(
+            dry_run=args.dry_run == 'true',
+            target_trade_date=args.target_trade_date,
+            min_payload_bytes=args.min_payload_bytes,
+            max_payload_bytes=args.max_payload_bytes,
+            batch_size=args.batch_size,
+            limit=args.limit,
         )
     elif args.command == 'trading-intraday-auto-sell-run-if-due':
         payload = run_intraday_auto_sell_if_due(
