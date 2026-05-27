@@ -2,7 +2,11 @@ import asyncio
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from app.eod.runner import EODBackgroundRunner, is_preopen_exec_dispatch_due
+from app.eod.runner import (
+    BACKGROUND_RUNNER_STEP_TIMEOUT_SECONDS,
+    EODBackgroundRunner,
+    is_preopen_exec_dispatch_due,
+)
 from app.market.clock import MarketState
 
 
@@ -245,6 +249,7 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
         schedule_refresh.assert_called_once_with(
             target_trade_date='2026-04-30',
             trigger='market_open_scheduler',
+            timeout_seconds=BACKGROUND_RUNNER_STEP_TIMEOUT_SECONDS,
         )
 
     async def test_open_loop_schedules_slow_exec_readback_without_blocking_cycle(self) -> None:
@@ -328,7 +333,13 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(fake_service.refresh_started.wait(), timeout=0.25)
             self.assertEqual(
                 fake_service.calls,
-                [{'target_trade_date': '2026-04-30', 'trigger': 'market_open_scheduler'}],
+                [
+                    {
+                        'target_trade_date': '2026-04-30',
+                        'trigger': 'market_open_scheduler',
+                        'timeout_seconds': BACKGROUND_RUNNER_STEP_TIMEOUT_SECONDS,
+                    }
+                ],
             )
             self.assertEqual(fake_service.refresh_state['status'], 'scheduled')
             self.assertTrue(fake_service.refresh_state['in_flight'])

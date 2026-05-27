@@ -79,6 +79,7 @@ class EODBackgroundRunner:
         result = signal_decider_exec_integration_service.schedule_signal_decider_exec_readback_refresh(
             target_trade_date=target_trade_date,
             trigger=trigger,
+            timeout_seconds=BACKGROUND_RUNNER_STEP_TIMEOUT_SECONDS,
         )
         refresh = result.get('refresh') if isinstance(result, dict) else {}
         request = result.get('request') if isinstance(result, dict) else {}
