@@ -51,6 +51,9 @@ CATEGORY_SCOPE_TYPE = {
 }
 SECTOR_SUPPORTED_MARKETS = {'KOSPI', 'KOSDAQ'}
 SHORTING_SUPPORTED_MARKETS = {'KOSPI', 'KOSDAQ', 'KONEX'}
+CATEGORY_SUPPORTED_MARKETS = {
+    'sector_classification': SECTOR_SUPPORTED_MARKETS,
+}
 SYMBOL_INVESTOR_GROUPS: tuple[str, ...] = ('개인', '외국인', '기관합계')
 
 
@@ -162,6 +165,10 @@ def _coverage_status(*, present_rows: int, expected_rows: int) -> str:
     if present_rows >= expected_rows:
         return 'complete'
     return 'partial'
+
+
+def _row_market(row: dict[str, Any]) -> str:
+    return str(row.get('market') or '').strip().upper()
 
 
 def _frame_value(frame: pd.DataFrame, symbol: str, column: Any) -> Any:
@@ -1014,7 +1021,11 @@ class PykrxEnrichmentService:
             limit=max(len(normalized_symbols), 5000) if normalized_symbols else 5000,
         )
         expected_symbol_count = len(normalized_symbols) if normalized_symbols else len(active_symbol_rows)
-        expected_market_count = len(normalized_markets or sorted({row['market'] for row in active_symbol_rows if row.get('market')}))
+        requested_markets = normalized_markets or sorted(
+            {_row_market(row) for row in active_symbol_rows if row.get('market')}
+        )
+        expected_market_count = len(requested_markets)
+        normalized_symbol_set = set(normalized_symbols)
         symbol_categories = [category for category in categories if CATEGORY_SCOPE_TYPE[category] == 'symbol']
         market_categories = [category for category in categories if CATEGORY_SCOPE_TYPE[category] == 'market']
         rows: list[dict[str, Any]] = []
@@ -1040,13 +1051,36 @@ class PykrxEnrichmentService:
 
         category_summaries: dict[str, dict[str, Any]] = {}
         for category in categories:
-            category_rows = [item for item in rows if item['category'] == category]
+            supported_markets = CATEGORY_SUPPORTED_MARKETS.get(category)
+            category_rows = [
+                item
+                for item in rows
+                if item['category'] == category
+                and (supported_markets is None or _row_market(item) in supported_markets)
+            ]
             present_scope_keys = {
                 item.get('symbol') or item['scope_key']
                 for item in category_rows
                 if (item.get('symbol') or item['scope_key'])
             }
-            expected_rows = expected_symbol_count if CATEGORY_SCOPE_TYPE[category] == 'symbol' else expected_market_count
+            if CATEGORY_SCOPE_TYPE[category] == 'symbol':
+                expected_rows = expected_symbol_count
+                if supported_markets is not None:
+                    if normalized_symbols:
+                        unsupported_known_symbols = {
+                            str(item.get('symbol') or '').strip().upper()
+                            for item in active_symbol_rows
+                            if str(item.get('symbol') or '').strip().upper() in normalized_symbol_set
+                            and _row_market(item)
+                            and _row_market(item) not in supported_markets
+                        }
+                        expected_rows = max(len(normalized_symbols) - len(unsupported_known_symbols), 0)
+                    else:
+                        expected_rows = sum(1 for item in active_symbol_rows if _row_market(item) in supported_markets)
+            else:
+                expected_rows = expected_market_count
+                if supported_markets is not None:
+                    expected_rows = sum(1 for market in requested_markets if market in supported_markets)
             latest_captured_at = None
             latest_parsed = None
             for item in category_rows:

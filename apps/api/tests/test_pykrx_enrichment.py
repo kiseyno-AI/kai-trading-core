@@ -301,6 +301,82 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
         self.assertEqual(result['coverage']['categories']['investor_flow_symbol']['coverage_status'], 'missing')
         self.assertEqual(result['coverage']['categories']['investor_flow_symbol']['expected_rows'], 2)
 
+    @patch('app.eod.pykrx_enrichment.load_symbols')
+    def test_sector_classification_coverage_excludes_unsupported_konex_symbols(self, load_symbols_mock):
+        load_symbols_mock.return_value = [
+            {
+                'symbol': '005930',
+                'name_ko': '삼성전자',
+                'market': 'KOSPI',
+                'standard_code': 'KR7005930003',
+                'instrument_type': 'equity',
+            },
+            {
+                'symbol': '035720',
+                'name_ko': '카카오',
+                'market': 'KOSDAQ',
+                'standard_code': 'KR7035720002',
+                'instrument_type': 'equity',
+            },
+            {
+                'symbol': '900001',
+                'name_ko': '코넥스테스트',
+                'market': 'KONEX',
+                'standard_code': 'KR7900001001',
+                'instrument_type': 'equity',
+            },
+        ]
+        persisted_rows = [
+            {
+                'market_date': '2026-04-21',
+                'market': 'KOSPI',
+                'category': 'sector_classification',
+                'scope_type': 'symbol',
+                'scope_key': '005930',
+                'source': 'pykrx',
+                'symbol': '005930',
+                'name_ko': '삼성전자',
+                'payload': {'sector_name': '반도체'},
+                'captured_at': '2026-04-21T15:10:00+09:00',
+            },
+            {
+                'market_date': '2026-04-21',
+                'market': 'KOSDAQ',
+                'category': 'sector_classification',
+                'scope_type': 'symbol',
+                'scope_key': '035720',
+                'source': 'pykrx',
+                'symbol': '035720',
+                'name_ko': '카카오',
+                'payload': {'sector_name': '서비스업'},
+                'captured_at': '2026-04-21T15:10:00+09:00',
+            },
+        ]
+
+        with patch(
+            'app.eod.pykrx_enrichment.load_daily_pykrx_enrichment_rows',
+            side_effect=lambda *, market_date, categories=None, markets=None, symbols=None, **kwargs: _filter_rows(
+                persisted_rows,
+                market_date=market_date,
+                categories=categories,
+                markets=markets,
+                symbols=symbols,
+            ),
+        ):
+            result = PykrxEnrichmentService().inspect(
+                market_date='2026-04-21',
+                markets=['KOSPI', 'KOSDAQ', 'KONEX'],
+                categories=['sector_classification'],
+                limit=10,
+            )
+
+        coverage = result['coverage']['categories']['sector_classification']
+        self.assertEqual(result['coverage']['requested_symbol_count'], 3)
+        self.assertEqual(coverage['expected_rows'], 2)
+        self.assertEqual(coverage['present_rows'], 2)
+        self.assertEqual(coverage['coverage_ratio'], 1.0)
+        self.assertEqual(coverage['coverage_status'], 'complete')
+
 
 if __name__ == '__main__':
     unittest.main()
