@@ -665,7 +665,7 @@ class EODPipelineStatusService:
 
     @staticmethod
     def _resolve_current_stage(*, stages: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
-        for preferred_status in ('running', 'partial', 'blocked', 'failed', 'pending'):
+        for preferred_status in ('running', 'partial', 'blocked', 'failed', 'interrupted', 'abandoned', 'pending'):
             for stage in stages.values():
                 if str(stage.get('status') or '').strip().lower() == preferred_status:
                     return stage
