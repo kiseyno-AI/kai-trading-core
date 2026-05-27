@@ -60,6 +60,11 @@ class AgentFeedbackPrerequisiteService:
     def _classify_stage_gate_status(stage_payload: dict[str, Any]) -> str:
         status = str(stage_payload.get('status') or 'pending').strip().lower()
         details = stage_payload.get('details') if isinstance(stage_payload.get('details'), dict) else {}
+        explicit_gate_status = str(
+            stage_payload.get('gate_status') or details.get('gate_status') or ''
+        ).strip().lower()
+        if explicit_gate_status in {'ready', 'blocked', 'waiting'}:
+            return explicit_gate_status
         if str(stage_payload.get('task') or '') == PYKRX_ENRICHMENT_PREREQUISITE_STAGE_ID:
             category_gate_status = str(details.get('decider_category_gate_status') or '').strip().lower()
             if category_gate_status in {'ready', 'blocked', 'waiting'}:
@@ -244,6 +249,7 @@ class AgentFeedbackPrerequisiteService:
         *,
         market_date: str | date,
         fs_div: str | None = None,
+        feedback_run_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         from app.eod.pipeline_status import eod_pipeline_status_service
 
@@ -252,6 +258,9 @@ class AgentFeedbackPrerequisiteService:
         pipeline_status = eod_pipeline_status_service.read(
             market_date=normalized_market_date.isoformat(),
             fs_div=resolved_fs_div,
+            include_feedback_context=feedback_run_context is not None,
+            feedback_run_context=feedback_run_context,
+            include_feedback_stage=False,
         )
         stages = pipeline_status.get('stages') if isinstance(pipeline_status.get('stages'), dict) else {}
 
@@ -279,6 +288,21 @@ class AgentFeedbackPrerequisiteService:
                 'label': stage_payload.get('label') or stage_id.replace('_', ' '),
                 'status': stage_payload.get('status') or 'pending',
                 'gate_status': gate_status,
+                'severity': stage_payload.get('severity') or (
+                    stage_payload.get('details', {}).get('severity')
+                    if isinstance(stage_payload.get('details'), dict)
+                    else None
+                ),
+                'blocking_status': stage_payload.get('blocking_status') or (
+                    stage_payload.get('details', {}).get('blocking_status')
+                    if isinstance(stage_payload.get('details'), dict)
+                    else None
+                ),
+                'gate_reason': (
+                    stage_payload.get('details', {}).get('gate_reason')
+                    if isinstance(stage_payload.get('details'), dict)
+                    else None
+                ),
                 'current_activity': stage_payload.get('current_activity'),
                 'details': stage_payload.get('details') if isinstance(stage_payload.get('details'), dict) else {},
             }

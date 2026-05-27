@@ -54,13 +54,13 @@ def _pykrx_enrichment_stage(
     }
 
 
-def _pipeline_status(*, pykrx_stage: dict) -> dict:
-    return {
-        'stages': {
-            stage_id: pykrx_stage if stage_id == 'pykrx_enrichment' else _completed_stage(stage_id)
-            for stage_id in FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER
-        }
+def _pipeline_status(*, pykrx_stage: dict, stage_overrides: dict[str, dict] | None = None) -> dict:
+    stages = {
+        stage_id: pykrx_stage if stage_id == 'pykrx_enrichment' else _completed_stage(stage_id)
+        for stage_id in FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER
     }
+    stages.update(stage_overrides or {})
+    return {'stages': stages}
 
 
 def test_high_coverage_terminal_partial_prerequisite_is_progressable_ready():
@@ -128,6 +128,72 @@ def test_partial_prerequisite_with_blocking_dependency_remains_blocked():
     }
 
     assert AgentFeedbackPrerequisiteService._classify_stage_gate_status(payload) == 'blocked'
+
+
+def test_explicit_pipeline_gate_status_overrides_partial_coverage_heuristic():
+    payload = {
+        'status': 'partial',
+        'total': 2806,
+        'succeeded': 2805,
+        'processed': 2805,
+        'gate_status': 'ready',
+        'details': {
+            'gate_status': 'ready',
+            'blocking_status': 'non_blocking',
+            'gate_reason': 'missing_rows_outside_active_feedback_scope',
+            'rows_persisted': 2805,
+            'expected_rows': 2806,
+            'missing_count': 1,
+            'missing_symbols_sample': ['176750'],
+        },
+    }
+
+    assert AgentFeedbackPrerequisiteService._classify_stage_gate_status(payload) == 'ready'
+
+
+def test_inspect_feedback_prerequisites_preserves_non_blocking_market_risk_gate():
+    pykrx_stage = _pykrx_enrichment_stage(category_overrides={})
+    market_risk_stage = {
+        'task': 'market_risk_filter',
+        'label': 'KIS market-risk filter compute',
+        'status': 'partial',
+        'gate_status': 'ready',
+        'severity': 'degraded',
+        'blocking_status': 'non_blocking',
+        'current_activity': 'Stored 2805/2806 rows for KIS market-risk filter compute',
+        'details': {
+            'gate_status': 'ready',
+            'severity': 'degraded',
+            'blocking_status': 'non_blocking',
+            'gate_reason': 'missing_rows_outside_active_feedback_scope',
+            'rows_persisted': 2805,
+            'expected_rows': 2806,
+            'missing_count': 1,
+            'missing_symbols_sample': ['176750'],
+        },
+    }
+
+    with patch(
+        'app.eod.pipeline_status.eod_pipeline_status_service.read',
+        return_value=_pipeline_status(
+            pykrx_stage=pykrx_stage,
+            stage_overrides={'market_risk_filter': market_risk_stage},
+        ),
+    ):
+        result = AgentFeedbackPrerequisiteService().inspect_feedback_prerequisites(
+            market_date='2026-05-27',
+            fs_div='CFS',
+        )
+
+    assert result['ready'] is True
+    assert result['status'] == 'ready'
+    assert 'market_risk_filter' not in result['blocked_stage_ids']
+    stage = result['stages']['market_risk_filter']
+    assert stage['gate_status'] == 'ready'
+    assert stage['severity'] == 'degraded'
+    assert stage['blocking_status'] == 'non_blocking'
+    assert stage['gate_reason'] == 'missing_rows_outside_active_feedback_scope'
+    assert stage['details']['missing_symbols_sample'] == ['176750']
 
 
 def test_inspect_feedback_prerequisites_blocks_missing_pykrx_enrichment_category_rows():

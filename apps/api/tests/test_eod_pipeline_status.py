@@ -1018,6 +1018,127 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
             2810,
         )
 
+    def test_read_marks_market_risk_gap_non_blocking_when_feedback_running_cleanly(self):
+        pykrx_run = {
+            'id': 390,
+            'market': 'KRX',
+            'trade_date': '2026-05-27',
+            'source': 'pykrx',
+            'trigger': 'auto_close_scheduler',
+            'status': 'completed',
+            'symbols_total': 2806,
+            'symbols_succeeded': 2806,
+            'symbols_failed': 0,
+            'error_message': None,
+            'started_at': '2026-05-27T06:10:00+00:00',
+            'completed_at': '2026-05-27T07:00:00+00:00',
+            'run_metadata': {
+                'mode': 'daily_auto',
+                'latest_available_trade_date': '2026-05-27',
+                'markets': ['KOSPI', 'KOSDAQ'],
+            },
+        }
+        stage_counts = {
+            'price_collection': {'persisted': 2806, 'updated_at': '2026-05-27T06:20:00+00:00'},
+            'technical_snapshots': {'persisted': 2806, 'updated_at': '2026-05-27T06:35:00+00:00'},
+            'action_summaries': {'persisted': 2806, 'updated_at': '2026-05-27T06:45:00+00:00'},
+            'trending_ranks': {'persisted': 8418, 'periods_persisted': 3, 'updated_at': '2026-05-27T06:55:00+00:00'},
+        }
+        fundamentals_run = {
+            'id': 3901,
+            'market_date': '2026-05-27',
+            'trigger': 'eod_pykrx_followup',
+            'status': 'completed',
+            'fs_div': 'CFS',
+            'force': False,
+            'symbol_limit': None,
+            'symbol_offset': 0,
+            'symbols_total': 2806,
+            'symbols_checked': 2806,
+            'symbols_missing': 0,
+            'symbols_stale': 0,
+            'symbols_fresh': 2800,
+            'symbols_refreshed': 6,
+            'symbols_failed': 0,
+            'events_detected': 0,
+            'events_captured': 0,
+            'events_failed': 0,
+            'error_message': None,
+            'started_at': '2026-05-27T07:01:00+00:00',
+            'completed_at': '2026-05-27T07:05:00+00:00',
+            'run_metadata': {
+                'symbols_selected': 2806,
+                'last_progress_at': '2026-05-27T07:05:00+00:00',
+            },
+        }
+        row_counts = _full_feedback_prerequisite_stage_counts(
+            total=2806,
+            updated_at='2026-05-27T07:15:00+00:00',
+        )
+        row_counts['market_risk_filter'] = {
+            'persisted': 2805,
+            'updated_at': '2026-05-27T07:15:00+00:00',
+            'missing_count': 1,
+            'missing_symbols_sample': ['176750'],
+            'missing_symbol_details_sample': [
+                {'symbol': '176750', 'name_ko': 'DuChemBio', 'market': 'KOSDAQ'},
+            ],
+        }
+        feedback_run = {
+            'source': 'runtime_feedback_state',
+            'run_id': 'feedback-cycle-2026-05-27-c21e78a409',
+            'status': 'running',
+            'requested_symbols': ['005930', '000660'],
+            'summary': {
+                'run_status': 'running',
+                'run_table_status': 'running',
+                'current_role': 'fundamental-summarizer',
+                'failed_items': 0,
+                'completed_feedback_count': 280,
+                'expected_feedback_count': 565,
+            },
+        }
+        service = EODPipelineStatusService(
+            market_state_loader=lambda: _FakeMarketState(),
+            pykrx_run_loader=lambda **_: pykrx_run,
+            pykrx_stage_counts_loader=lambda *_: stage_counts,
+            live_symbol_count_loader=lambda: 3579,
+            fundamentals_refresh_loader=lambda **_: fundamentals_run,
+            row_count_stage_counts_loader=lambda **_: row_counts,
+            price_bar_count_loader=lambda **_: 2806,
+            pykrx_enrichment_loader=lambda **_: _full_pykrx_enrichment_coverage(
+                symbol_count=2806,
+                market_count=2,
+                updated_at='2026-05-27T06:25:00+00:00',
+            ),
+            feedback_run_loader=lambda **_: feedback_run,
+            row_count_scope_gap_loader=lambda **_: {
+                'missing_count': 0,
+                'missing_symbols_sample': [],
+                'missing_symbol_details_sample': [],
+            },
+        )
+
+        result = service.read(market_date='2026-05-27')
+
+        self.assertEqual(result['status'], 'running')
+        market_risk_stage = result['stages']['market_risk_filter']
+        self.assertEqual(market_risk_stage['status'], 'partial')
+        self.assertEqual(market_risk_stage['gate_status'], 'ready')
+        self.assertEqual(market_risk_stage['severity'], 'degraded')
+        self.assertEqual(market_risk_stage['blocking_status'], 'non_blocking')
+        self.assertEqual(market_risk_stage['details']['missing_count'], 1)
+        self.assertEqual(market_risk_stage['details']['missing_symbols_sample'], ['176750'])
+        self.assertEqual(
+            market_risk_stage['details']['gate_reason'],
+            'missing_rows_outside_active_feedback_scope',
+        )
+        self.assertEqual(market_risk_stage['details']['feedback_scope_gap']['missing_count'], 0)
+        feedback_stage = result['stages']['agent_feedback_summaries']
+        self.assertEqual(feedback_stage['status'], 'running')
+        self.assertEqual(feedback_stage['failed'], 0)
+        self.assertEqual(feedback_stage['details']['feedback_failure_status'], 'no_failures')
+
     def test_read_treats_stored_full_coverage_as_completed_after_scoped_retry_run(self):
         pykrx_run = {
             'id': 401,

@@ -14,6 +14,7 @@ The response is now a stable coverage and liveness snapshot:
 - `terminal_feedback_count` shows how many expected feedback items are already terminal via either stored feedback or stored failure rows
 - `run_status` indicates whether feedback appears to be actively moving, stalled, pending, or completed
 - when prerequisites are not ready and no live or durable run exists yet, `run_status` can be `waiting` or `blocked`, and the top-level `prerequisites` block explains which upstream stages still gate dispatch
+- prerequisite stage items preserve pipeline gate diagnostics (`gate_status`, `severity`, `blocking_status`, and `gate_reason`) so a partial upstream row-count stage can be shown as non-blocking degraded coverage instead of a feedback failure
 - `latest_feedback_at` and `seconds_since_last_feedback` help operators tell whether a run is still alive
 - `first_feedback_at`, `elapsed_seconds`, rates, and ETA fields are calculated only from feedback rows for the same target symbol universe used by the progress counts
 - `estimated_completion_at` is an ETA for active runs and the latest feedback timestamp for already completed runs
@@ -91,7 +92,20 @@ GET /agent-context/feedback/progress?market_date=2026-04-16&run_id=feedback-cycl
   "prerequisites": {
     "status": "ready",
     "waiting_stage_ids": [],
-    "blocked_stage_ids": []
+    "blocked_stage_ids": [],
+    "stages": {
+      "market_risk_filter": {
+        "status": "partial",
+        "gate_status": "ready",
+        "severity": "degraded",
+        "blocking_status": "non_blocking",
+        "gate_reason": "missing_rows_outside_active_feedback_scope",
+        "details": {
+          "missing_count": 1,
+          "missing_symbols_sample": ["176750"]
+        }
+      }
+    }
   }
 }
 ```

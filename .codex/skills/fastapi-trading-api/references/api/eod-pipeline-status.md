@@ -15,6 +15,10 @@ The response now also includes `market` and `market_session` blocks. `market` is
 
 The `pykrx_enrichment` stage is also the operator status source for the decider enrichment join. Completed coverage for `valuation_snapshot`, `investor_flow_symbol`, `investor_flow_market`, `short_selling`, `sector_classification`, and `market_breadth` means `GET /agent-context/symbol-day` can populate `pre_decider_enrichment_context.trading_value` and `flow_short_sector_context`. Live quote/orderbook snapshots are outside the EOD stage and appear in symbol-day context as available, unavailable, or `stale_eod` with a timestamp when the market is closed.
 
+Row-count-derived stages expose missing-row diagnostics when they are partial. For example, `market_risk_filter.details.missing_count` and `missing_symbols_sample` show the full-universe coverage gap, while `gate_status`, `severity`, and `blocking_status` tell feedback/dashboard consumers whether that gap blocks the active feedback scope.
+
+When a same-day feedback run is active, `agent_feedback_summaries` reflects the run from feedback runtime/durable state even if no official daily pipeline stage row exists. That keeps active feedback progress separate from upstream degraded coverage.
+
 ## Example request
 ```http
 GET /eod/pipeline/status?market_date=2026-04-21&fs_div=CFS
@@ -142,11 +146,41 @@ GET /eod/pipeline/status?market_date=2026-04-21&fs_div=CFS
       }
     },
     "market_risk_filter": {
-      "status": "pending",
-      "processed": 0,
-      "total": 3579,
+      "status": "partial",
+      "gate_status": "ready",
+      "severity": "degraded",
+      "blocking_status": "non_blocking",
+      "processed": 2805,
+      "total": 2806,
       "failed": 0,
-      "current_activity": "Waiting on pykrx daily price collection"
+      "current_activity": "Stored 2805/2806 rows for KIS market-risk filter compute",
+      "details": {
+        "rows_persisted": 2805,
+        "expected_rows": 2806,
+        "coverage_ratio": 0.999644,
+        "missing_count": 1,
+        "missing_symbols_sample": ["176750"],
+        "gate_reason": "missing_rows_outside_active_feedback_scope",
+        "feedback_scope_gap": {
+          "missing_count": 0,
+          "missing_symbols_sample": []
+        }
+      }
+    },
+    "agent_feedback_summaries": {
+      "status": "running",
+      "processed": 280,
+      "total": 565,
+      "failed": 0,
+      "current_activity": "Running agent feedback for fundamental-summarizer",
+      "details": {
+        "run_id": "feedback-cycle-2026-05-27-c21e78a409",
+        "run_status": "running",
+        "current_role": "fundamental-summarizer",
+        "failed_items": 0,
+        "feedback_failure_status": "no_failures",
+        "feedback_health": "running"
+      }
     },
     "momentum_factors": {
       "status": "pending",
