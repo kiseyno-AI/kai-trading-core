@@ -3,7 +3,7 @@
 ## Summary
 Reports latest-run workflow status for the default five-role symbol feedback workflow.
 
-When upstream fundamentals, filtering, or factor/scoring stages are not ready yet, symbol items now surface `waiting` or `blocked` instead of a generic `pending`, and the response includes a top-level `prerequisites` block describing the missing same-day stages.
+When upstream PyKRX enrichment, fundamentals, filtering, or factor/scoring stages are not ready yet, symbol items now surface `waiting` or `blocked` instead of a generic `pending`, and the response includes a top-level `prerequisites` block describing the missing same-day stages. PyKRX enrichment prerequisite details include expected and present row counts for decider-required categories such as investor flow, short selling, sector classification, market breadth, and valuation snapshots.
 
 ## Example request
 ```http

@@ -8,7 +8,7 @@ The retry universe is the persisted active-pre-filter intersection for the reque
 Callers can optionally provide `symbols` to restrict the real daily retry cycle to one explicit symbol or a small explicit symbol list. Core still runs the same summarizer and decider sequence, persists through the same durable tables, and keeps the run inspectable through the normal progress/latest/read surfaces. Requested symbols outside the active-pre-filter intersection are reported as `skipped_symbols`.
 
 The response includes cycle and batch details plus a fresh `progress` snapshot using the same response shape as `GET /agent-context/feedback/progress`. Consumers can read `progress.summary.first_feedback_at`, `elapsed_seconds`, rate fields, and ETA fields immediately after the retry request completes.
-Retry cycles now also enforce the same-day feedback prerequisites by default. If fundamentals, filtering, or factor/scoring stages are still pending or blocked, the route returns a gated `waiting` or `blocked` response with a `prerequisites` block and does not create a new durable run. Operators can bypass that safety check only with `force=true`.
+Retry cycles now also enforce the same-day feedback prerequisites by default. If PyKRX enrichment, fundamentals, filtering, or factor/scoring stages are still pending or blocked, the route returns a gated `waiting` or `blocked` response with a `prerequisites` block and does not create a new durable run. Operators can bypass that safety check only with `force=true`.
 
 ## Example request
 ```http
@@ -91,7 +91,23 @@ Content-Type: application/json
   "completed": false,
   "prerequisites": {
     "status": "blocked",
-    "blocked_stage_ids": ["quality_factors", "composite_factors"]
+    "blocked_stage_ids": ["pykrx_enrichment"],
+    "missing_prerequisites": [
+      {
+        "stage": "pykrx_enrichment",
+        "gate_status": "blocked",
+        "details": {
+          "decider_blocking_categories": [
+            {
+              "category": "short_selling",
+              "expected_rows": 3579,
+              "present_rows": 1920,
+              "missing_rows": 1659
+            }
+          ]
+        }
+      }
+    ]
   }
 }
 ```
