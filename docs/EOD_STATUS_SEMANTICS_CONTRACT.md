@@ -104,6 +104,13 @@ It freezes the behavior currently shipped on `main` so future web work, core ref
 
 ### pykrx stages
 
+- `stage_order` is the canonical default daily process order and contains the 24 web-facing stages shown in the Daily Process monitor.
+- `stages` is keyed by those same stage ids. Every default stage is present even when Core only has pending or fallback-inferred state for that stage.
+- Top-level summary fields mirror the stage map for operator UIs:
+  `total_stages`, `completed_stages`, `skipped_stages`, `display_completed_stages`, `partial_stages`, `failed_stages`, `blocked_stages`, `running_stages`, `pending_stages`, `stage_status_counts`, `current_stage`, and `current_stage_status`.
+- Each stage includes normalized monitor metadata in addition to legacy fields:
+  `stage_id`, `task`, `label`, `group`, `order`, `depends_on`, `inspect_routes`, `output_tables`, `default_selected`, and `details.progress_source`.
+- Stage `details` also carries `rows_persisted`, `expected_rows`, and a readable `reason` where Core can infer one from diagnostics, activity, or errors.
 - The pykrx stage order is fixed:
   `price_collection`, `technical_snapshots`, `action_summaries`, `trending_ranks`.
 - Stage counts come from the selected pykrx `eod_collection_runs` row plus downstream rows linked by `eod_run_id`, with live stage progress from `run_metadata.stage_progress`.

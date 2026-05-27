@@ -548,10 +548,12 @@ class EODPipelineStatusService:
                 official_run=official_run,
                 market_date=resolved_market_date,
             )
+        stages = self._normalize_stage_contract(stages)
         overall_status = self._resolve_overall_status(stages)
         official_run_status = str((official_run or {}).get('status') or '').strip().lower()
         if official_run_status in {'running', 'interrupted', 'abandoned'}:
             overall_status = official_run_status
+        summary = self._build_stage_summary(stages=stages)
         return {
             'market_date': resolved_market_date,
             'generated_at': _utcnow_iso(),
@@ -570,9 +572,104 @@ class EODPipelineStatusService:
             'fs_div': resolved_fs_div,
             'status': overall_status,
             'stage_order': list(PIPELINE_STAGE_ORDER),
+            **summary,
             'stages': stages,
             'official_run': self._build_official_run_summary(official_run),
         }
+
+    @staticmethod
+    def _normalize_stage_contract(stages: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        normalized: dict[str, dict[str, Any]] = {}
+        for index, stage_id in enumerate(PIPELINE_STAGE_ORDER, start=1):
+            definition = STAGE_DEFINITIONS[stage_id]
+            stage = dict(stages.get(stage_id) or {})
+            details = dict(stage.get('details') or {})
+            details.setdefault('depends_on', list(definition.depends_on))
+            details.setdefault('inspect_routes', list(definition.inspect_routes))
+            details.setdefault('output_tables', list(definition.output_tables))
+            details.setdefault('default_selected', definition.default_selected)
+            if details.get('rows_persisted') is None and stage.get('succeeded') is not None:
+                details['rows_persisted'] = int(stage.get('succeeded') or 0)
+            if details.get('expected_rows') is None and stage.get('total') is not None:
+                details['expected_rows'] = int(stage.get('total') or 0)
+            if details.get('progress_source') is None:
+                details['progress_source'] = EODPipelineStatusService._infer_stage_progress_source(stage)
+            if details.get('reason') is None:
+                details['reason'] = EODPipelineStatusService._infer_stage_reason(stage, details)
+
+            normalized[stage_id] = {
+                **stage,
+                'task': stage.get('task') or stage_id,
+                'stage_id': stage_id,
+                'label': stage.get('label') or definition.label,
+                'group': definition.group,
+                'order': index,
+                'depends_on': list(definition.depends_on),
+                'inspect_routes': list(definition.inspect_routes),
+                'output_tables': list(definition.output_tables),
+                'default_selected': definition.default_selected,
+                'details': details,
+            }
+        return normalized
+
+    @staticmethod
+    def _infer_stage_progress_source(stage: dict[str, Any]) -> str:
+        mode = str(dict(stage.get('details') or {}).get('mode') or '').strip()
+        if mode == 'official_daily_pipeline_run_state':
+            return 'official_run'
+        source_status = str(stage.get('source_status') or '').strip()
+        if source_status == 'stored_rows_present':
+            return 'stored_rows'
+        if stage.get('source_run_ids'):
+            return 'live_run_metadata'
+        return 'fallback_inference'
+
+    @staticmethod
+    def _infer_stage_reason(stage: dict[str, Any], details: dict[str, Any]) -> str | None:
+        for key in ('reason', 'message', 'failure_reason', 'error_message', 'gate_reason'):
+            value = details.get(key) or stage.get(key)
+            if value:
+                return str(value)
+        status = str(stage.get('status') or '').strip().lower()
+        if status in {'partial', 'blocked', 'failed', 'running'} and stage.get('current_activity'):
+            return str(stage.get('current_activity'))
+        missing_count = int(details.get('missing_count') or 0)
+        if missing_count > 0:
+            return f'{missing_count} symbols are missing persisted rows for this stage.'
+        return None
+
+    @staticmethod
+    def _build_stage_summary(*, stages: dict[str, dict[str, Any]]) -> dict[str, Any]:
+        status_counts: dict[str, int] = {}
+        for stage in stages.values():
+            status = str(stage.get('status') or 'pending').strip().lower()
+            status_counts[status] = status_counts.get(status, 0) + 1
+
+        current_stage = EODPipelineStatusService._resolve_current_stage(stages=stages)
+        completed_count = status_counts.get('completed', 0)
+        skipped_count = status_counts.get('skipped', 0)
+        return {
+            'total_stages': len(stages),
+            'completed_stages': completed_count,
+            'skipped_stages': skipped_count,
+            'display_completed_stages': completed_count + skipped_count,
+            'partial_stages': status_counts.get('partial', 0),
+            'failed_stages': status_counts.get('failed', 0),
+            'blocked_stages': status_counts.get('blocked', 0),
+            'running_stages': status_counts.get('running', 0),
+            'pending_stages': status_counts.get('pending', 0),
+            'stage_status_counts': status_counts,
+            'current_stage': current_stage.get('task') if current_stage else None,
+            'current_stage_status': current_stage.get('status') if current_stage else None,
+        }
+
+    @staticmethod
+    def _resolve_current_stage(*, stages: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
+        for preferred_status in ('running', 'partial', 'blocked', 'failed', 'pending'):
+            for stage in stages.values():
+                if str(stage.get('status') or '').strip().lower() == preferred_status:
+                    return stage
+        return None
 
     def _build_generic_pending_stage(
         self,

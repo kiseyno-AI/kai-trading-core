@@ -148,15 +148,23 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
 
         self.assertEqual(result['market_date'], '2026-04-21')
         self.assertEqual(result['status'], 'pending')
+        self.assertEqual(result['total_stages'], 24)
+        self.assertEqual(result['completed_stages'], 0)
+        self.assertEqual(result['pending_stages'], 24)
+        self.assertEqual(result['current_stage'], 'master_refresh')
         self.assertEqual(result['stages']['price_collection']['status'], 'pending')
+        self.assertEqual(result['stages']['price_collection']['order'], 3)
+        self.assertEqual(result['stages']['price_collection']['group'], 'market_data')
+        self.assertEqual(result['stages']['price_collection']['inspect_routes'], ['/eod/pipeline/status', '/eod/pykrx/daily/run-if-due'])
         self.assertEqual(result['stages']['price_collection']['total'], 3579)
         self.assertEqual(result['stages']['trending_ranks']['total'], 3)
         self.assertEqual(result['stages']['fundamentals_daily_refresh']['status'], 'pending')
         self.assertEqual(result['stages']['momentum_factors']['status'], 'pending')
         self.assertEqual(result['stages']['composite_factors']['status'], 'pending')
+        self.assertEqual(result['stages']['fundamentals_daily_refresh']['details']['fs_div'], 'CFS')
         self.assertEqual(
-            result['stages']['fundamentals_daily_refresh']['details'],
-            {'fs_div': 'CFS'},
+            result['stages']['fundamentals_daily_refresh']['details']['inspect_routes'],
+            ['/disclosures/dart/fundamentals/daily/inspect', '/eod/pipeline/status'],
         )
 
     def test_read_prefers_official_running_market_risk_filter_before_output_rows_exist(self):
@@ -206,9 +214,15 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
         result = service.read()
 
         self.assertEqual(result['status'], 'running')
+        self.assertEqual(result['total_stages'], 24)
+        self.assertEqual(result['running_stages'], 1)
+        self.assertEqual(result['current_stage'], 'market_risk_filter')
         self.assertEqual(result['official_run']['id'], 501)
         stage = result['stages']['market_risk_filter']
         self.assertEqual(stage['status'], 'running')
+        self.assertEqual(stage['order'], 9)
+        self.assertEqual(stage['group'], 'market_data')
+        self.assertEqual(stage['details']['progress_source'], 'official_run')
         self.assertEqual(stage['processed'], 7)
         self.assertEqual(stage['total'], 20)
         self.assertEqual(stage['current_symbol'], '005930')
@@ -1266,6 +1280,11 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
         result = service.read()
 
         self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['total_stages'], 24)
+        self.assertEqual(result['stage_status_counts']['completed'], 16)
+        self.assertEqual(result['partial_stages'], 0)
+        self.assertEqual(result['pending_stages'], 8)
+        self.assertEqual(result['current_stage'], 'master_refresh')
         self.assertEqual(result['stages']['price_collection']['status'], 'completed')
         self.assertEqual(result['stages']['technical_snapshots']['status'], 'completed')
         self.assertEqual(result['stages']['action_summaries']['status'], 'completed')
