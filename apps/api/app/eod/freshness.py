@@ -11,6 +11,10 @@ from app.eod.freshness_repository import (
     _load_latest_price_bar_updated_at,
     _load_today_fundamentals_refresh_run,
 )
+from app.eod.pykrx_enrichment import (
+    DEFAULT_PYKRX_ENRICHMENT_CATEGORIES,
+    pykrx_enrichment_service,
+)
 from app.market.clock import get_market_state
 from app.market.session import build_market_session_metadata
 from app.market_data_store import (
@@ -58,6 +62,23 @@ def _load_freshness_run_rows(
     )
 
 
+def _load_pykrx_enrichment_coverage(*, market_date: str) -> dict[str, Any]:
+    return pykrx_enrichment_service.inspect(
+        market_date=market_date,
+        categories=DEFAULT_PYKRX_ENRICHMENT_CATEGORIES,
+        limit=1,
+    ).get('coverage') or {}
+
+
+def _noop_pykrx_enrichment_coverage(*, market_date: str) -> dict[str, Any]:
+    return {
+        'market_date': market_date,
+        'requested_symbol_count': None,
+        'requested_market_count': None,
+        'categories': {},
+    }
+
+
 @dataclass
 class EODFreshnessService:
     market_state_loader: Callable = get_market_state
@@ -76,6 +97,7 @@ class EODFreshnessService:
     latest_technical_market_date_loader: Callable = load_latest_available_daily_technical_snapshot_date
     latest_action_market_date_loader: Callable = load_latest_available_daily_action_summary_date
     best_run_loader: Callable = load_most_complete_eod_collection_run
+    pykrx_enrichment_coverage_loader: Callable = _noop_pykrx_enrichment_coverage
 
     def read(self) -> dict:
         # Keep "today" bound to the current Seoul calendar date.
@@ -93,6 +115,10 @@ class EODFreshnessService:
         fundamentals_counts = self.daily_fundamentals_count_loader(trade_date)
         fundamentals_today_run = self.fundamentals_today_refresh_loader(trade_date)
         latest_available_fundamentals_run = self.latest_fundamentals_refresh_loader()
+        today_pykrx_enrichment = self._build_pykrx_enrichment_stage(
+            coverage=self.pykrx_enrichment_coverage_loader(market_date=trade_date),
+            fallback_market_date=trade_date,
+        )
 
         if latest_price_trade_date:
             latest_price_run = self._select_freshness_run(
@@ -100,9 +126,21 @@ class EODFreshnessService:
                 statuses=['completed', 'completed_with_errors'],
             ) or self._select_freshness_run(trade_date=latest_price_trade_date)
             latest_price_bar_count = self.latest_price_bar_count_loader(latest_price_trade_date)
+            latest_pykrx_enrichment = (
+                today_pykrx_enrichment
+                if latest_price_trade_date == trade_date
+                else self._build_pykrx_enrichment_stage(
+                    coverage=self.pykrx_enrichment_coverage_loader(market_date=latest_price_trade_date),
+                    fallback_market_date=latest_price_trade_date,
+                )
+            )
         else:
             latest_price_run = None
             latest_price_bar_count = 0
+            latest_pykrx_enrichment = self._build_pykrx_enrichment_stage(
+                coverage=None,
+                fallback_market_date=None,
+            )
 
         latest_summary = self._build_latest_summary(
             trade_date=latest_price_trade_date,
@@ -144,6 +182,7 @@ class EODFreshnessService:
                     counts=fundamentals_counts,
                     current_run=fundamentals_today_run,
                 ),
+                'pykrx_enrichment': today_pykrx_enrichment,
             },
             'latest': {
                 'trade_date': latest_price_trade_date,
@@ -163,6 +202,7 @@ class EODFreshnessService:
                     latest_available_fundamentals_run,
                     basis='latest_available_refresh_run',
                 ),
+                'pykrx_enrichment': latest_pykrx_enrichment,
             },
         }
 
@@ -251,6 +291,73 @@ class EODFreshnessService:
                 current_run,
                 basis='market_date_refresh_run',
             ),
+        }
+
+    @staticmethod
+    def _build_pykrx_enrichment_stage(
+        *,
+        coverage: dict[str, Any] | None,
+        fallback_market_date: str | None,
+    ) -> dict:
+        coverage_payload = dict(coverage or {})
+        category_rows = dict(coverage_payload.get('categories') or {})
+        categories: dict[str, dict[str, Any]] = {}
+        latest_captured_at = None
+        for category in DEFAULT_PYKRX_ENRICHMENT_CATEGORIES:
+            raw_item = category_rows.get(category)
+            raw_item = raw_item if isinstance(raw_item, dict) else {}
+            item = dict(raw_item)
+            present_rows = int(item.get('present_rows') or 0)
+            expected_rows = item.get('expected_rows')
+            try:
+                expected_rows = int(expected_rows) if expected_rows is not None else None
+            except (TypeError, ValueError):
+                expected_rows = None
+            coverage_status = str(item.get('coverage_status') or 'missing')
+            categories[category] = {
+                'scope_type': item.get('scope_type'),
+                'present_rows': present_rows,
+                'expected_rows': expected_rows,
+                'coverage_ratio': item.get('coverage_ratio'),
+                'coverage_status': coverage_status,
+                'latest_captured_at': item.get('latest_captured_at'),
+            }
+            candidate = item.get('latest_captured_at')
+            if candidate and (latest_captured_at is None or str(candidate) > str(latest_captured_at)):
+                latest_captured_at = candidate
+
+        missing_categories = [
+            category
+            for category, item in categories.items()
+            if item['coverage_status'] == 'missing' or int(item.get('present_rows') or 0) <= 0
+        ]
+        partial_categories = [
+            category
+            for category, item in categories.items()
+            if category not in missing_categories and item['coverage_status'] != 'complete'
+        ]
+        if not category_rows:
+            status = 'missing'
+        elif missing_categories:
+            status = 'partial'
+        elif partial_categories:
+            status = 'partial'
+        else:
+            status = 'ready'
+
+        return {
+            'status': status,
+            'market_date': coverage_payload.get('market_date') or fallback_market_date,
+            'updated_at': latest_captured_at,
+            'requested_symbol_count': coverage_payload.get('requested_symbol_count'),
+            'requested_market_count': coverage_payload.get('requested_market_count'),
+            'category_count': len(categories),
+            'complete_category_count': sum(
+                1 for item in categories.values() if item['coverage_status'] == 'complete'
+            ),
+            'missing_categories': missing_categories,
+            'partial_categories': partial_categories,
+            'categories': categories,
         }
 
     def _build_fundamentals_refresh_summary(
@@ -363,4 +470,7 @@ class EODFreshnessService:
             return 'completed'
         return 'missing'
 
-eod_freshness_service = EODFreshnessService(latest_run_rows_loader=_load_freshness_run_rows)
+eod_freshness_service = EODFreshnessService(
+    latest_run_rows_loader=_load_freshness_run_rows,
+    pykrx_enrichment_coverage_loader=_load_pykrx_enrichment_coverage,
+)

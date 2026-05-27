@@ -6,6 +6,7 @@ from typing import Any
 from app.core.settings import settings
 
 FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER: tuple[str, ...] = (
+    'pykrx_enrichment',
     'fundamentals_daily_refresh',
     'market_risk_filter',
     'piotroski_filter',
@@ -21,6 +22,16 @@ FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER: tuple[str, ...] = (
 PREREQUISITE_WAITING_STATUSES = {'pending', 'running'}
 PREREQUISITE_BLOCKED_STATUSES = {'failed', 'partial', 'blocked'}
 PARTIAL_PREREQUISITE_MIN_COVERAGE_RATIO = 0.99
+PYKRX_ENRICHMENT_PREREQUISITE_STAGE_ID = 'pykrx_enrichment'
+PYKRX_DECIDER_ENRICHMENT_REQUIRED_CATEGORIES: tuple[str, ...] = (
+    'sector_classification',
+    'market_breadth',
+    'investor_flow_market',
+    'investor_flow_symbol',
+    'short_selling',
+    'valuation_snapshot',
+)
+PYKRX_DECIDER_ENRICHMENT_MIN_COVERAGE_RATIO = PARTIAL_PREREQUISITE_MIN_COVERAGE_RATIO
 
 
 def _normalize_market_date(value: str | date) -> date:
@@ -49,6 +60,10 @@ class AgentFeedbackPrerequisiteService:
     def _classify_stage_gate_status(stage_payload: dict[str, Any]) -> str:
         status = str(stage_payload.get('status') or 'pending').strip().lower()
         details = stage_payload.get('details') if isinstance(stage_payload.get('details'), dict) else {}
+        if str(stage_payload.get('task') or '') == PYKRX_ENRICHMENT_PREREQUISITE_STAGE_ID:
+            category_gate_status = str(details.get('decider_category_gate_status') or '').strip().lower()
+            if category_gate_status in {'ready', 'blocked', 'waiting'}:
+                return category_gate_status
         failed_blocking_stages = details.get('failed_blocking_stages')
         if isinstance(failed_blocking_stages, list) and failed_blocking_stages:
             return 'blocked'
@@ -124,6 +139,106 @@ class AgentFeedbackPrerequisiteService:
         except (TypeError, ValueError):
             return None
 
+    @staticmethod
+    def _coerce_optional_float(value: Any) -> float | None:
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _pykrx_category_gate_item(
+        cls,
+        *,
+        category: str,
+        payload: dict[str, Any],
+        missing_category_payload: bool,
+    ) -> dict[str, Any]:
+        expected_rows = cls._coerce_optional_int(payload.get('expected_rows'))
+        present_rows = cls._coerce_optional_int(payload.get('present_rows')) or 0
+        coverage_ratio = cls._coerce_optional_float(payload.get('coverage_ratio'))
+        if coverage_ratio is None and expected_rows and expected_rows > 0:
+            coverage_ratio = round(min(present_rows, expected_rows) / expected_rows, 6)
+        coverage_status = str(payload.get('coverage_status') or 'missing').strip().lower()
+        missing_rows = max(expected_rows - present_rows, 0) if expected_rows is not None else None
+
+        if missing_category_payload or expected_rows is None or expected_rows <= 0:
+            gate_status = 'waiting'
+            reason = 'coverage_expectation_unavailable'
+        elif present_rows <= 0 or coverage_status == 'missing':
+            gate_status = 'blocked'
+            reason = 'missing_required_pykrx_enrichment_category'
+        elif (coverage_ratio or 0.0) < PYKRX_DECIDER_ENRICHMENT_MIN_COVERAGE_RATIO:
+            gate_status = 'blocked'
+            reason = 'required_pykrx_enrichment_category_below_min_coverage'
+        elif coverage_status != 'complete':
+            gate_status = 'ready'
+            reason = 'required_pykrx_enrichment_category_near_complete'
+        else:
+            gate_status = 'ready'
+            reason = None
+
+        return {
+            'category': category,
+            'scope_type': payload.get('scope_type'),
+            'gate_status': gate_status,
+            'coverage_status': coverage_status,
+            'expected_rows': expected_rows,
+            'present_rows': present_rows,
+            'missing_rows': missing_rows,
+            'coverage_ratio': coverage_ratio,
+            'min_coverage_ratio': PYKRX_DECIDER_ENRICHMENT_MIN_COVERAGE_RATIO,
+            'reason': reason,
+        }
+
+    @classmethod
+    def _augment_pykrx_enrichment_prerequisite_stage(cls, stage_payload: dict[str, Any]) -> dict[str, Any]:
+        details = dict(stage_payload.get('details') if isinstance(stage_payload.get('details'), dict) else {})
+        category_payloads = dict(details.get('categories') if isinstance(details.get('categories'), dict) else {})
+        gate_items = [
+            cls._pykrx_category_gate_item(
+                category=category,
+                payload=(
+                    dict(category_payloads.get(category))
+                    if isinstance(category_payloads.get(category), dict)
+                    else {}
+                ),
+                missing_category_payload=not isinstance(category_payloads.get(category), dict),
+            )
+            for category in PYKRX_DECIDER_ENRICHMENT_REQUIRED_CATEGORIES
+        ]
+        blocked_categories = [item for item in gate_items if item['gate_status'] == 'blocked']
+        waiting_categories = [item for item in gate_items if item['gate_status'] == 'waiting']
+        warning_categories = [
+            item
+            for item in gate_items
+            if item['gate_status'] == 'ready' and item.get('coverage_status') != 'complete'
+        ]
+        if blocked_categories:
+            category_gate_status = 'blocked'
+        elif waiting_categories:
+            category_gate_status = 'waiting'
+        else:
+            category_gate_status = 'ready'
+
+        details.update(
+            {
+                'decider_required_categories': list(PYKRX_DECIDER_ENRICHMENT_REQUIRED_CATEGORIES),
+                'decider_min_coverage_ratio': PYKRX_DECIDER_ENRICHMENT_MIN_COVERAGE_RATIO,
+                'decider_category_gates': gate_items,
+                'decider_blocking_categories': blocked_categories,
+                'decider_waiting_categories': waiting_categories,
+                'decider_warning_categories': warning_categories,
+                'decider_category_gate_status': category_gate_status,
+            }
+        )
+        return {
+            **stage_payload,
+            'details': details,
+        }
+
     def inspect_feedback_prerequisites(
         self,
         *,
@@ -156,6 +271,8 @@ class AgentFeedbackPrerequisiteService:
                     market_date=normalized_market_date.isoformat(),
                 )
             )
+            if stage_id == PYKRX_ENRICHMENT_PREREQUISITE_STAGE_ID:
+                stage_payload = self._augment_pykrx_enrichment_prerequisite_stage(stage_payload)
             gate_status = self._classify_stage_gate_status(stage_payload)
             item = {
                 'stage': stage_id,

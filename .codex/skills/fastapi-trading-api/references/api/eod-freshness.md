@@ -9,6 +9,8 @@ The `today` block is scoped to the current Seoul trade date and is derived from 
 
 The `latest` block keeps the latest stored price date, preserves the legacy `price_trade_date` and `symbols_*` fields, and exposes top-level `trade_date`, `updated_at`, `succeeded`, `failed`, and `total` values for the web. `latest.fundamentals` is the latest-available fundamentals coverage view sourced from the latest completed or partial `dart_fundamentals_refresh_runs` row, so clients can keep showing the last completed refresh result until a newer completed run supersedes it.
 
+Both `today.pykrx_enrichment` and `latest.pykrx_enrichment` expose PyKRX enrichment coverage from `daily_pykrx_enrichment_rows`, including expected and present row counts by category plus `missing_categories` and `partial_categories`.
+
 `latest.summary.basis` names the count basis. `latest_eod_run_symbol_universe` means the summary comes from the selected latest `eod_collection_runs` row for that trade date. `stored_price_bars_for_latest_trade_date` is the fallback when stored bars exist but no matching EOD run row is available.
 
 The response now also includes a top-level `market_session` block with the requested/current calendar date, latest valid trading date, session status, data-expected flags, and `recommendation_basis`. On weekends and holidays, it makes the latest completed trading session explicit without backshifting `today.trade_date`.
@@ -77,6 +79,37 @@ GET /eod/freshness
         "events_failed": 1,
         "error_message": null
       }
+    },
+    "pykrx_enrichment": {
+      "status": "partial",
+      "market_date": "2026-04-16",
+      "updated_at": "2026-04-16T15:40:00+09:00",
+      "requested_symbol_count": 3579,
+      "requested_market_count": 2,
+      "category_count": 7,
+      "complete_category_count": 6,
+      "missing_categories": [
+        "investor_flow_symbol"
+      ],
+      "partial_categories": [],
+      "categories": {
+        "investor_flow_symbol": {
+          "scope_type": "symbol",
+          "present_rows": 0,
+          "expected_rows": 3579,
+          "coverage_ratio": 0.0,
+          "coverage_status": "missing",
+          "latest_captured_at": null
+        },
+        "short_selling": {
+          "scope_type": "symbol",
+          "present_rows": 3579,
+          "expected_rows": 3579,
+          "coverage_ratio": 1.0,
+          "coverage_status": "complete",
+          "latest_captured_at": "2026-04-16T15:40:00+09:00"
+        }
+      }
     }
   },
   "latest": {
@@ -118,6 +151,27 @@ GET /eod/freshness
       "events_captured": 11,
       "events_failed": 0,
       "error_message": null
+    },
+    "pykrx_enrichment": {
+      "status": "ready",
+      "market_date": "2026-04-15",
+      "updated_at": "2026-04-15T15:40:00+09:00",
+      "requested_symbol_count": 3579,
+      "requested_market_count": 2,
+      "category_count": 7,
+      "complete_category_count": 7,
+      "missing_categories": [],
+      "partial_categories": [],
+      "categories": {
+        "sector_classification": {
+          "scope_type": "symbol",
+          "present_rows": 3579,
+          "expected_rows": 3579,
+          "coverage_ratio": 1.0,
+          "coverage_status": "complete",
+          "latest_captured_at": "2026-04-15T15:40:00+09:00"
+        }
+      }
     }
   }
 }

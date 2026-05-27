@@ -59,6 +59,13 @@ It freezes the behavior currently shipped on `main` so future web work, core ref
   This is true even if same-day successes already exist.
 - A completed same-day no-op refresh run does not make `today.fundamentals.status` become `ready` by itself. Without same-day snapshot updates, the stage stays `missing` and the no-op run remains visible only through `today.fundamentals.current_run`.
 
+### `today.pykrx_enrichment`
+
+- `today.pykrx_enrichment` is a same-day coverage view over persisted `daily_pykrx_enrichment_rows`.
+- It reports `ready` only when all normalized PyKRX enrichment categories are complete for the current Seoul date.
+- It reports `partial` when at least one category has some persisted coverage but another category is missing or incomplete, and it includes per-category `expected_rows`, `present_rows`, and `coverage_status`.
+- It reports `missing` when no category coverage is available for the current Seoul date.
+
 ### `latest`
 
 - `latest.trade_date` and `latest.price_trade_date` are anchored to the latest stored daily price-bar trade date.
@@ -69,6 +76,11 @@ It freezes the behavior currently shipped on `main` so future web work, core ref
 - `latest.eod_status` is derived from the selected latest run plus stored bar availability for the latest trade date.
 - `latest.eod_status` uses all stored bars for `latest.price_trade_date`, not only symbols still active in the current live universe.
 - `latest.trade_date`, `latest.updated_at`, `latest.succeeded`, `latest.failed`, and `latest.total` mirror `latest.summary` for compact web consumption.
+
+### `latest.pykrx_enrichment`
+
+- `latest.pykrx_enrichment` uses the same coverage shape as `today.pykrx_enrichment`, but it is anchored to `latest.price_trade_date`.
+- This lets operators see whether the latest usable price date also has investor-flow, short-selling, sector, market-breadth, valuation, and ownership enrichment coverage.
 
 ### `latest.fundamentals`
 

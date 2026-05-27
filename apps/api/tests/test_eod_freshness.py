@@ -117,6 +117,34 @@ def _empty_fundamentals_refresh_summary() -> dict:
     }
 
 
+def _pykrx_enrichment_coverage(
+    *,
+    market_date: str,
+    symbol_count: int,
+    market_count: int,
+    missing_category: str | None = None,
+) -> dict:
+    categories = {}
+    for category in freshness_module.DEFAULT_PYKRX_ENRICHMENT_CATEGORIES:
+        is_market_category = category in {'market_breadth', 'investor_flow_market'}
+        expected_rows = market_count if is_market_category else symbol_count
+        present_rows = 0 if category == missing_category else expected_rows
+        categories[category] = {
+            'scope_type': 'market' if is_market_category else 'symbol',
+            'present_rows': present_rows,
+            'expected_rows': expected_rows,
+            'coverage_ratio': round(present_rows / expected_rows, 6) if expected_rows else None,
+            'coverage_status': 'missing' if present_rows == 0 else 'complete',
+            'latest_captured_at': None if present_rows == 0 else '2026-04-09T15:40:00+09:00',
+        }
+    return {
+        'market_date': market_date,
+        'requested_symbol_count': symbol_count,
+        'requested_market_count': market_count,
+        'categories': categories,
+    }
+
+
 class EODFreshnessServiceTests(unittest.TestCase):
     def test_read_returns_missing_when_no_run_or_data(self):
         service = EODFreshnessService(
@@ -264,6 +292,64 @@ class EODFreshnessServiceTests(unittest.TestCase):
         self.assertEqual(requested_run_dates, ['2026-04-09', '2026-04-10', '2026-04-10'])
         self.assertEqual(requested_live_count_dates, ['2026-04-10'])
         self.assertEqual(requested_latest_count_dates, ['2026-04-09', '2026-04-09'])
+
+    def test_read_exposes_today_and_latest_pykrx_enrichment_coverage(self):
+        requested_pykrx_dates = []
+
+        def pykrx_enrichment_coverage_loader(*, market_date):
+            requested_pykrx_dates.append(market_date)
+            if market_date == '2026-04-09':
+                return _pykrx_enrichment_coverage(
+                    market_date=market_date,
+                    symbol_count=3,
+                    market_count=2,
+                    missing_category='investor_flow_symbol',
+                )
+            return _pykrx_enrichment_coverage(
+                market_date=market_date,
+                symbol_count=3,
+                market_count=2,
+            )
+
+        service = EODFreshnessService(
+            market_state_loader=lambda: _FakeMarketState(),
+            latest_run_loader=lambda **_: _latest_run(
+                status='completed',
+                symbols_total=3,
+                symbols_succeeded=3,
+                symbols_failed=0,
+            ),
+            live_symbol_count_loader=lambda: 3,
+            daily_price_bar_count_loader=lambda _: 0,
+            daily_technical_snapshot_count_loader=lambda _: 0,
+            daily_action_summary_count_loader=lambda _: 0,
+            daily_fundamentals_count_loader=lambda _: {'symbols_succeeded': 0, 'symbols_failed': 0},
+            fundamentals_today_refresh_loader=lambda _: None,
+            latest_fundamentals_refresh_loader=lambda: None,
+            latest_price_trade_date_loader=lambda: '2026-04-09',
+            latest_price_bar_count_loader=lambda _: 3,
+            latest_technical_market_date_loader=lambda: '2026-04-09',
+            latest_action_market_date_loader=lambda: '2026-04-09',
+            pykrx_enrichment_coverage_loader=pykrx_enrichment_coverage_loader,
+        )
+
+        result = service.read()
+
+        self.assertEqual(requested_pykrx_dates, ['2026-04-10', '2026-04-09'])
+        self.assertEqual(result['today']['pykrx_enrichment']['status'], 'ready')
+        self.assertEqual(result['today']['pykrx_enrichment']['requested_symbol_count'], 3)
+        latest_enrichment = result['latest']['pykrx_enrichment']
+        self.assertEqual(latest_enrichment['market_date'], '2026-04-09')
+        self.assertEqual(latest_enrichment['status'], 'partial')
+        self.assertEqual(latest_enrichment['missing_categories'], ['investor_flow_symbol'])
+        self.assertEqual(
+            latest_enrichment['categories']['investor_flow_symbol']['expected_rows'],
+            3,
+        )
+        self.assertEqual(
+            latest_enrichment['categories']['investor_flow_symbol']['present_rows'],
+            0,
+        )
 
     def test_latest_status_uses_all_stored_price_bars_not_only_live_symbols(self):
         requested_live_count_dates = []
