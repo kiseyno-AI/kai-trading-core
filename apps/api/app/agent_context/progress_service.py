@@ -30,9 +30,6 @@ class AgentContextProgressService:
         normalized_market_date = _normalize_market_date(market_date)
         normalized_symbols = _normalize_symbols(symbols) if symbols is not None else None
         expected_agent_names = self._normalize_expected_agents(expected_agents)
-        prerequisites = agent_feedback_prerequisite_service.inspect_feedback_prerequisites(
-            market_date=normalized_market_date,
-        )
         resolved_run = self._resolve_run_snapshot(
             market_date=normalized_market_date,
             symbols=normalized_symbols,
@@ -50,6 +47,13 @@ class AgentContextProgressService:
             state = runtime_feedback_state_store.get_run(normalized_market_date, run_id=resolved_run['run_id'])
         if state is None and run_id is None and resolved_run is None and normalized_symbols is None:
             state = runtime_feedback_state_store.get_run(normalized_market_date, logical=True)
+        prerequisites = agent_feedback_prerequisite_service.inspect_feedback_prerequisites(
+            market_date=normalized_market_date,
+            feedback_run_context=self._build_feedback_run_context_for_prerequisites(
+                state=state,
+                resolved_run=resolved_run,
+            ),
+        )
 
         scoped_symbols, scope_resolved_from_run = self._resolve_progress_scope_symbols(
             requested_symbols=normalized_symbols,
@@ -215,6 +219,53 @@ class AgentContextProgressService:
             if normalized:
                 return normalized
         return None
+
+    @staticmethod
+    def _build_feedback_run_context_for_prerequisites(
+        *,
+        state: Any,
+        resolved_run: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        if state is not None:
+            summary = state.to_progress_summary()
+            return {
+                'source': 'runtime_feedback_state',
+                'run_id': getattr(state, 'run_id', None) or summary.get('run_id'),
+                'status': summary.get('run_status') or getattr(state, 'status', None),
+                'requested_symbols': AgentContextProgressService._normalize_scope_symbols(
+                    getattr(state, 'requested_symbols', None)
+                ) or [],
+                'summary': summary,
+            }
+        if resolved_run is None:
+            return None
+        summary_payload = (
+            resolved_run.get('summary_payload')
+            if isinstance(resolved_run.get('summary_payload'), dict)
+            else {}
+        )
+        progress_summary = (
+            summary_payload.get('progress_summary')
+            if isinstance(summary_payload.get('progress_summary'), dict)
+            else summary_payload
+        )
+        summary = dict(progress_summary)
+        status = str(summary.get('run_status') or resolved_run.get('status') or '').strip().lower()
+        if status:
+            summary.setdefault('run_status', status)
+        summary.setdefault('run_table_status', resolved_run.get('status'))
+        summary.setdefault('completed_feedback_count', resolved_run.get('completed_count'))
+        summary.setdefault('failed_items', resolved_run.get('failed_count'))
+        requested_symbols = agent_context_feedback_run_state_service.resolve_run_requested_symbols(
+            run_snapshot=resolved_run,
+        )
+        return {
+            'source': 'agent_context_feedback_runs',
+            'run_id': resolved_run.get('run_id'),
+            'status': status or None,
+            'requested_symbols': requested_symbols or [],
+            'summary': summary,
+        }
 
     def _merge_live_retry_summary_with_persisted_progress(
         self,

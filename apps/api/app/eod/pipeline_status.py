@@ -4,8 +4,9 @@ from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from typing import Any, Callable
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import aliased
 
 from app.core.settings import settings
 from app.db import session_scope
@@ -17,9 +18,11 @@ from app.db_models import (
     DailyCompositeFactorResult,
     DailyLowRiskFactorResult,
     DailyMomentumFactorResult,
+    DailyPriceBar,
     DailyQualityFactorResult,
     DailyUnifiedValueFactorResult,
     DailyValueFactorResult,
+    Symbol,
 )
 from app.dart.fundamentals_capture_service import dart_fundamentals_capture_service
 from app.eod.daily_pipeline_stages import DAILY_STAGE_ORDER, FACTOR_STAGE_ORDER, STAGE_DEFINITIONS
@@ -82,6 +85,8 @@ ROW_COUNT_STAGE_MODELS = {
     'piotroski_filter': DailyPiotroskiFilterResult,
     **FACTOR_STAGE_MODELS,
 }
+ROW_COUNT_STAGE_MISSING_SAMPLE_LIMIT = 10
+PARTIAL_ROW_COUNT_MIN_NON_BLOCKING_COVERAGE_RATIO = 0.99
 
 
 def _utcnow_iso() -> str:
@@ -140,6 +145,23 @@ def _noop_price_bar_count_loader(*args, market_date: str | None = None, **kwargs
     return 0
 
 
+def _noop_feedback_run_loader(*, market_date: str) -> dict[str, Any] | None:
+    return None
+
+
+def _noop_row_count_scope_gap_loader(
+    *,
+    stage_id: str,
+    market_date: str,
+    symbols: list[str],
+) -> dict[str, Any]:
+    return {
+        'missing_count': None,
+        'missing_symbols_sample': [],
+        'missing_symbol_details_sample': [],
+    }
+
+
 def _load_pykrx_enrichment_coverage(*, market_date: str) -> dict[str, Any]:
     return pykrx_enrichment_service.inspect(
         market_date=market_date,
@@ -181,11 +203,193 @@ def _load_row_count_stage_counts(*, market_date: str) -> dict[str, dict[str, Any
                 .select_from(model)
                 .where(model.market_date == normalized_market_date)
             ).one()
+            missing_diagnostics = _load_row_count_missing_diagnostics_for_model(
+                session=session,
+                model=model,
+                market_date=normalized_market_date,
+                limit=ROW_COUNT_STAGE_MISSING_SAMPLE_LIMIT,
+            )
             counts[stage_id] = {
                 'persisted': int(persisted or 0),
                 'updated_at': updated_at.isoformat() if updated_at else None,
+                **missing_diagnostics,
             }
     return counts
+
+
+def _load_row_count_missing_diagnostics_for_model(
+    *,
+    session: Any,
+    model: Any,
+    market_date: date,
+    limit: int,
+) -> dict[str, Any]:
+    target = aliased(model)
+    join_condition = and_(
+        target.symbol_id == DailyPriceBar.symbol_id,
+        target.market_date == market_date,
+    )
+    missing_count = session.execute(
+        select(func.count(func.distinct(DailyPriceBar.symbol_id)))
+        .select_from(DailyPriceBar)
+        .outerjoin(target, join_condition)
+        .where(DailyPriceBar.trade_date == market_date)
+        .where(target.symbol_id.is_(None))
+    ).scalar_one()
+    sample_rows = session.execute(
+        select(Symbol.symbol, Symbol.name_ko, Symbol.market)
+        .select_from(DailyPriceBar)
+        .join(Symbol, Symbol.id == DailyPriceBar.symbol_id)
+        .outerjoin(target, join_condition)
+        .where(DailyPriceBar.trade_date == market_date)
+        .where(target.symbol_id.is_(None))
+        .order_by(Symbol.symbol.asc())
+        .limit(limit)
+    ).all()
+    details_sample = [
+        {
+            'symbol': row.symbol,
+            'name_ko': row.name_ko,
+            'market': row.market,
+        }
+        for row in sample_rows
+    ]
+    return {
+        'missing_count': int(missing_count or 0),
+        'missing_symbols_sample': [item['symbol'] for item in details_sample],
+        'missing_symbol_details_sample': details_sample,
+        'missing_sample_limit': limit,
+    }
+
+
+def _load_row_count_stage_scope_gap(
+    *,
+    stage_id: str,
+    market_date: str,
+    symbols: list[str],
+) -> dict[str, Any]:
+    model = ROW_COUNT_STAGE_MODELS.get(stage_id)
+    normalized_symbols = [str(symbol or '').strip().upper() for symbol in symbols if str(symbol or '').strip()]
+    if model is None or not normalized_symbols:
+        return {
+            'missing_count': 0,
+            'missing_symbols_sample': [],
+            'missing_symbol_details_sample': [],
+        }
+
+    normalized_market_date = date.fromisoformat(market_date)
+    target = aliased(model)
+    join_condition = and_(
+        target.symbol_id == Symbol.id,
+        target.market_date == normalized_market_date,
+    )
+    with session_scope() as session:
+        missing_count = session.execute(
+            select(func.count(func.distinct(Symbol.id)))
+            .select_from(Symbol)
+            .join(DailyPriceBar, DailyPriceBar.symbol_id == Symbol.id)
+            .outerjoin(target, join_condition)
+            .where(DailyPriceBar.trade_date == normalized_market_date)
+            .where(Symbol.symbol.in_(normalized_symbols))
+            .where(target.symbol_id.is_(None))
+        ).scalar_one()
+        sample_rows = session.execute(
+            select(Symbol.symbol, Symbol.name_ko, Symbol.market)
+            .select_from(Symbol)
+            .join(DailyPriceBar, DailyPriceBar.symbol_id == Symbol.id)
+            .outerjoin(target, join_condition)
+            .where(DailyPriceBar.trade_date == normalized_market_date)
+            .where(Symbol.symbol.in_(normalized_symbols))
+            .where(target.symbol_id.is_(None))
+            .order_by(Symbol.symbol.asc())
+            .limit(ROW_COUNT_STAGE_MISSING_SAMPLE_LIMIT)
+        ).all()
+    details_sample = [
+        {
+            'symbol': row.symbol,
+            'name_ko': row.name_ko,
+            'market': row.market,
+        }
+        for row in sample_rows
+    ]
+    return {
+        'missing_count': int(missing_count or 0),
+        'missing_symbols_sample': [item['symbol'] for item in details_sample],
+        'missing_symbol_details_sample': details_sample,
+    }
+
+
+def _coerce_int(*values: Any, default: int = 0) -> int:
+    for value in values:
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    return default
+
+
+def _progress_summary_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    progress_summary = payload.get('progress_summary')
+    if isinstance(progress_summary, dict):
+        return dict(progress_summary)
+    return dict(payload)
+
+
+def _load_latest_feedback_run_summary(*, market_date: str) -> dict[str, Any] | None:
+    normalized_market_date = date.fromisoformat(market_date)
+    try:
+        from app.agent_context.run_state_service import agent_context_feedback_run_state_service
+        from app.agent_context.runtime_state import runtime_feedback_state_store
+    except Exception:
+        return None
+
+    runtime_state = (
+        runtime_feedback_state_store.get_run(normalized_market_date, logical=True)
+        or runtime_feedback_state_store.get_run(normalized_market_date)
+    )
+    if runtime_state is not None:
+        summary = runtime_state.to_progress_summary()
+        requested_symbols = getattr(runtime_state, 'requested_symbols', None)
+        return {
+            'source': 'runtime_feedback_state',
+            'run_id': getattr(runtime_state, 'run_id', None) or summary.get('run_id'),
+            'status': summary.get('run_status') or getattr(runtime_state, 'status', None),
+            'requested_symbols': list(requested_symbols or []),
+            'summary': summary,
+        }
+
+    run_snapshot = agent_context_feedback_run_state_service.find_latest_run(
+        market_date=normalized_market_date,
+    )
+    if run_snapshot is None:
+        return None
+
+    summary_payload = (
+        dict(run_snapshot.get('summary_payload'))
+        if isinstance(run_snapshot.get('summary_payload'), dict)
+        else {}
+    )
+    summary = _progress_summary_from_payload(summary_payload)
+    requested_symbols = agent_context_feedback_run_state_service.resolve_run_requested_symbols(
+        run_snapshot=run_snapshot,
+    )
+    status = str(summary.get('run_status') or run_snapshot.get('status') or '').strip().lower()
+    if not status:
+        status = 'running' if run_snapshot.get('completed_at') is None else 'partial'
+    summary.setdefault('run_status', status)
+    summary.setdefault('run_table_status', run_snapshot.get('status'))
+    summary.setdefault('completed_feedback_count', run_snapshot.get('completed_count'))
+    summary.setdefault('failed_items', run_snapshot.get('failed_count'))
+    return {
+        'source': 'agent_context_feedback_runs',
+        'run_id': run_snapshot.get('run_id'),
+        'status': status,
+        'requested_symbols': requested_symbols or [],
+        'summary': summary,
+        'run_snapshot': run_snapshot,
+    }
 
 
 def _stage_label(stage_id: str) -> str:
@@ -209,12 +413,17 @@ class EODPipelineStatusService:
     action_summary_count_loader: Callable = _noop_price_bar_count_loader
     pykrx_enrichment_loader: Callable = _load_pykrx_enrichment_coverage
     official_run_loader: Callable = _load_latest_daily_pipeline_run
+    feedback_run_loader: Callable = _noop_feedback_run_loader
+    row_count_scope_gap_loader: Callable = _noop_row_count_scope_gap_loader
 
     def read(
         self,
         *,
         market_date: str | None = None,
         fs_div: str | None = None,
+        include_feedback_context: bool = True,
+        feedback_run_context: dict[str, Any] | None = None,
+        include_feedback_stage: bool = True,
     ) -> dict[str, Any]:
         market_state = self.market_state_loader()
         # The default operator view stays on the current Seoul calendar date.
@@ -227,6 +436,9 @@ class EODPipelineStatusService:
         resolved_fs_div = (fs_div or settings.dart_fundamentals_default_fs_div).strip().upper()
         pykrx_run = self.pykrx_run_loader(trade_date=resolved_market_date)
         official_run = self.official_run_loader(market_date=resolved_market_date)
+        feedback_run = feedback_run_context
+        if feedback_run is None and include_feedback_context:
+            feedback_run = self.feedback_run_loader(market_date=resolved_market_date)
         live_symbols_total = int(self.live_symbol_count_loader() or 0)
         pykrx_stage_counts = self.pykrx_stage_counts_loader(pykrx_run['id']) if pykrx_run else {}
         pykrx_stages = self._build_pykrx_stages(
@@ -300,6 +512,7 @@ class EODPipelineStatusService:
                 prior_stages=stages,
                 aggregate=dict(row_count_stage_counts.get(stage_id) or {}),
                 live_symbols_total=live_symbols_total,
+                feedback_run=feedback_run,
             )
         for stage_id in DEFAULT_FACTOR_STAGE_ORDER:
             stages[stage_id] = self._build_row_count_stage(
@@ -310,6 +523,7 @@ class EODPipelineStatusService:
                 prior_stages=stages,
                 aggregate=dict(row_count_stage_counts.get(stage_id) or {}),
                 live_symbols_total=live_symbols_total,
+                feedback_run=feedback_run,
             )
         for stage_id in PIPELINE_STAGE_ORDER:
             if stage_id in stages:
@@ -317,6 +531,12 @@ class EODPipelineStatusService:
             stages[stage_id] = self._build_generic_pending_stage(
                 stage_id=stage_id,
                 market_date=resolved_market_date,
+            )
+        if include_feedback_stage and feedback_run is not None:
+            stages['agent_feedback_summaries'] = self._build_agent_feedback_stage(
+                market_date=resolved_market_date,
+                feedback_run=feedback_run,
+                fallback_stage=stages.get('agent_feedback_summaries') or {},
             )
         stages = {
             stage_id: stages[stage_id]
@@ -477,6 +697,133 @@ class EODPipelineStatusService:
             ),
             'details': details,
         }
+
+    def _build_agent_feedback_stage(
+        self,
+        *,
+        market_date: str,
+        feedback_run: dict[str, Any],
+        fallback_stage: dict[str, Any],
+    ) -> dict[str, Any]:
+        definition = STAGE_DEFINITIONS['agent_feedback_summaries']
+        summary = dict(feedback_run.get('summary') if isinstance(feedback_run.get('summary'), dict) else {})
+        run_status = str(summary.get('run_status') or feedback_run.get('status') or 'pending').strip().lower()
+        failed_items = _coerce_int(summary.get('failed_items'), summary.get('buffered_failure_count'))
+        completed_feedback_count = _coerce_int(
+            summary.get('completed_feedback_count'),
+            summary.get('flushed_feedback_count'),
+        )
+        expected_feedback_count = _coerce_int(summary.get('expected_feedback_count'))
+        if expected_feedback_count <= 0:
+            requested_symbol_count = len(feedback_run.get('requested_symbols') or [])
+            remaining_roles = summary.get('remaining_roles') if isinstance(summary.get('remaining_roles'), list) else []
+            completed_roles = summary.get('completed_roles') if isinstance(summary.get('completed_roles'), list) else []
+            expected_feedback_count = requested_symbol_count * max(len(remaining_roles) + len(completed_roles), 1)
+
+        if run_status == 'running':
+            status = 'running'
+        elif run_status in {'blocked', 'waiting'}:
+            status = run_status
+        elif failed_items > 0 and completed_feedback_count <= 0:
+            status = 'failed'
+        elif failed_items > 0:
+            status = 'partial'
+        elif expected_feedback_count > 0 and completed_feedback_count >= expected_feedback_count:
+            status = 'completed'
+        elif completed_feedback_count > 0:
+            status = 'partial'
+        else:
+            status = run_status if run_status in {'failed', 'partial', 'completed'} else 'pending'
+
+        processed = min(
+            expected_feedback_count,
+            max(0, completed_feedback_count + failed_items),
+        ) if expected_feedback_count > 0 else max(0, completed_feedback_count + failed_items)
+        counts = build_stage_counts(
+            total=expected_feedback_count,
+            succeeded=completed_feedback_count,
+            failed=failed_items,
+            processed=processed,
+        )
+        current_role = summary.get('current_role')
+        activity = self._build_agent_feedback_activity(
+            status=status,
+            current_role=str(current_role or '').strip() or None,
+            failed_items=failed_items,
+        )
+        requested_symbols = list(feedback_run.get('requested_symbols') or [])
+        seconds_since_last_feedback = summary.get('seconds_since_last_feedback')
+        stalled_threshold_seconds = summary.get('stalled_threshold_seconds')
+        stalled = False
+        try:
+            stalled = (
+                status == 'running'
+                and seconds_since_last_feedback is not None
+                and stalled_threshold_seconds is not None
+                and int(seconds_since_last_feedback) > int(stalled_threshold_seconds)
+            )
+        except (TypeError, ValueError):
+            stalled = False
+        details = {
+            'mode': 'agent_feedback_run_state',
+            'depends_on': list(definition.depends_on),
+            'output_tables': list(definition.output_tables),
+            'inspect_routes': list(definition.inspect_routes),
+            'default_selected': definition.default_selected,
+            'run_id': feedback_run.get('run_id'),
+            'run_state_source': feedback_run.get('source'),
+            'run_status': run_status,
+            'run_table_status': summary.get('run_table_status'),
+            'current_role': current_role,
+            'requested_symbol_count': len(requested_symbols),
+            'failed_items': failed_items,
+            'completed_feedback_count': completed_feedback_count,
+            'expected_feedback_count': expected_feedback_count,
+            'active_feedback_running': status == 'running',
+            'feedback_failure_status': 'failures_present' if failed_items > 0 else 'no_failures',
+            'feedback_health': 'stalled' if stalled else status,
+            'seconds_since_last_feedback': seconds_since_last_feedback,
+            'stalled_threshold_seconds': stalled_threshold_seconds,
+        }
+        return {
+            'task': 'agent_feedback_summaries',
+            'label': definition.label,
+            'status': status,
+            'source_status': run_status,
+            'market_date': market_date,
+            'started_at': summary.get('run_started_at') or fallback_stage.get('started_at'),
+            'updated_at': summary.get('latest_feedback_at') or fallback_stage.get('updated_at'),
+            'completed_at': summary.get('run_completed_at') if status != 'running' else None,
+            'processed': counts.processed,
+            'total': counts.total,
+            'succeeded': counts.succeeded,
+            'failed': counts.failed,
+            'remaining': counts.remaining,
+            'current_step': 'agent_feedback_running' if status == 'running' else None,
+            'current_activity': activity,
+            'current_symbol': None,
+            'current_period': None,
+            'source_run_ids': {'feedback_run_id': feedback_run.get('run_id')},
+            'gate_status': 'waiting' if status == 'running' else ('ready' if status == 'completed' else status),
+            'severity': 'degraded' if status == 'partial' else status,
+            'blocking_status': 'blocking' if status in {'failed', 'blocked'} else 'non_blocking',
+            'details': details,
+        }
+
+    @staticmethod
+    def _build_agent_feedback_activity(
+        *,
+        status: str,
+        current_role: str | None,
+        failed_items: int,
+    ) -> str:
+        if status == 'running' and current_role:
+            return f'Running agent feedback for {current_role}'
+        if status == 'running':
+            return 'Running agent feedback'
+        if failed_items > 0:
+            return f'Agent feedback has {failed_items} failed item(s)'
+        return _default_activity(_stage_label('agent_feedback_summaries'), status)
 
     @staticmethod
     def _build_official_run_summary(official_run: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -926,6 +1273,7 @@ class EODPipelineStatusService:
         prior_stages: dict[str, dict[str, Any]],
         aggregate: dict[str, Any],
         live_symbols_total: int,
+        feedback_run: dict[str, Any] | None,
     ) -> dict[str, Any]:
         definition = STAGE_DEFINITIONS[stage_id]
         label = definition.label
@@ -959,11 +1307,25 @@ class EODPipelineStatusService:
             failed=0,
             processed=persisted,
         )
+        diagnostics = self._build_row_count_stage_diagnostics(
+            stage_id=stage_id,
+            status=status,
+            market_date=market_date,
+            persisted=persisted,
+            expected_total=counts.total,
+            blocking_stages=blocking_stages,
+            failed_blocking_stages=failed_blocking_stages,
+            aggregate=aggregate,
+            feedback_run=feedback_run,
+        )
         return {
             'task': stage_id,
             'label': label,
             'status': status,
             'source_status': 'stored_rows_present' if persisted > 0 else None,
+            'gate_status': diagnostics['gate_status'],
+            'severity': diagnostics['severity'],
+            'blocking_status': diagnostics['blocking_status'],
             'market_date': market_date,
             'started_at': None,
             'updated_at': aggregate.get('updated_at'),
@@ -999,7 +1361,160 @@ class EODPipelineStatusService:
                 'output_tables': list(definition.output_tables),
                 'inspect_routes': list(definition.inspect_routes),
                 'default_selected': definition.default_selected,
+                **diagnostics,
             },
+        }
+
+    def _build_row_count_stage_diagnostics(
+        self,
+        *,
+        stage_id: str,
+        status: str,
+        market_date: str,
+        persisted: int,
+        expected_total: int,
+        blocking_stages: list[str],
+        failed_blocking_stages: list[str],
+        aggregate: dict[str, Any],
+        feedback_run: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        missing_count = self._resolve_missing_count(
+            aggregate=aggregate,
+            persisted=persisted,
+            expected_total=expected_total,
+        )
+        missing_symbols_sample = self._normalize_symbol_list(aggregate.get('missing_symbols_sample'))
+        missing_symbol_details_sample = (
+            list(aggregate.get('missing_symbol_details_sample'))
+            if isinstance(aggregate.get('missing_symbol_details_sample'), list)
+            else []
+        )
+        coverage_ratio = (
+            round(min(persisted, expected_total) / expected_total, 6)
+            if expected_total > 0
+            else None
+        )
+        gate_status, severity, blocking_status, gate_reason = self._default_row_count_gate_contract(
+            status=status,
+            coverage_ratio=coverage_ratio,
+            blocking_stages=blocking_stages,
+            failed_blocking_stages=failed_blocking_stages,
+        )
+        feedback_scope_gap = None
+        if (
+            stage_id == 'market_risk_filter'
+            and status == 'partial'
+            and feedback_run is not None
+        ):
+            active_contract = self._resolve_active_feedback_market_risk_gate_contract(
+                market_date=market_date,
+                feedback_run=feedback_run,
+            )
+            if active_contract is not None:
+                gate_status = active_contract['gate_status']
+                severity = active_contract['severity']
+                blocking_status = active_contract['blocking_status']
+                gate_reason = active_contract['gate_reason']
+                feedback_scope_gap = active_contract['feedback_scope_gap']
+
+        return {
+            'gate_status': gate_status,
+            'severity': severity,
+            'blocking_status': blocking_status,
+            'gate_reason': gate_reason,
+            'coverage_ratio': coverage_ratio,
+            'min_non_blocking_coverage_ratio': PARTIAL_ROW_COUNT_MIN_NON_BLOCKING_COVERAGE_RATIO,
+            'missing_count': missing_count,
+            'missing_symbols_sample': missing_symbols_sample,
+            'missing_symbol_details_sample': missing_symbol_details_sample,
+            'missing_sample_limit': aggregate.get('missing_sample_limit') or ROW_COUNT_STAGE_MISSING_SAMPLE_LIMIT,
+            'feedback_scope_gap': feedback_scope_gap,
+        }
+
+    @staticmethod
+    def _resolve_missing_count(
+        *,
+        aggregate: dict[str, Any],
+        persisted: int,
+        expected_total: int,
+    ) -> int:
+        if aggregate.get('missing_count') is not None:
+            return _coerce_int(aggregate.get('missing_count'))
+        return max(int(expected_total or 0) - int(persisted or 0), 0)
+
+    @staticmethod
+    def _normalize_symbol_list(value: Any) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for item in value:
+            symbol = str(item or '').strip().upper()
+            if not symbol or symbol in seen:
+                continue
+            seen.add(symbol)
+            normalized.append(symbol)
+        return normalized
+
+    @staticmethod
+    def _default_row_count_gate_contract(
+        *,
+        status: str,
+        coverage_ratio: float | None,
+        blocking_stages: list[str],
+        failed_blocking_stages: list[str],
+    ) -> tuple[str, str, str, str | None]:
+        if failed_blocking_stages:
+            return 'blocked', 'blocked', 'blocking', 'failed_dependency'
+        if blocking_stages:
+            return 'waiting', 'waiting', 'waiting', 'waiting_on_dependency'
+        if status == 'completed':
+            return 'ready', 'ready', 'non_blocking', None
+        if status == 'partial':
+            if (coverage_ratio or 0.0) >= PARTIAL_ROW_COUNT_MIN_NON_BLOCKING_COVERAGE_RATIO:
+                return 'ready', 'degraded', 'non_blocking', 'row_count_partial_above_min_coverage'
+            return 'blocked', 'blocked', 'blocking', 'row_count_partial_below_min_coverage'
+        if status == 'failed':
+            return 'blocked', 'failed', 'blocking', 'stage_failed'
+        return 'waiting', 'waiting', 'waiting', None
+
+    def _resolve_active_feedback_market_risk_gate_contract(
+        self,
+        *,
+        market_date: str,
+        feedback_run: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        summary = dict(feedback_run.get('summary') if isinstance(feedback_run.get('summary'), dict) else {})
+        run_status = str(summary.get('run_status') or feedback_run.get('status') or '').strip().lower()
+        failed_items = _coerce_int(summary.get('failed_items'), feedback_run.get('failed_count'))
+        requested_symbols = self._normalize_symbol_list(feedback_run.get('requested_symbols'))
+        if run_status != 'running' or failed_items > 0 or not requested_symbols:
+            return None
+
+        feedback_scope_gap = self.row_count_scope_gap_loader(
+            stage_id='market_risk_filter',
+            market_date=market_date,
+            symbols=requested_symbols,
+        )
+        missing_scope_count = (
+            _coerce_int(feedback_scope_gap.get('missing_count'))
+            if isinstance(feedback_scope_gap, dict) and feedback_scope_gap.get('missing_count') is not None
+            else 0
+        )
+        if missing_scope_count > 0:
+            return {
+                'gate_status': 'blocked',
+                'severity': 'blocked',
+                'blocking_status': 'blocking',
+                'gate_reason': 'missing_rows_intersect_active_feedback_scope',
+                'feedback_scope_gap': feedback_scope_gap,
+            }
+        return {
+            'gate_status': 'ready',
+            'severity': 'degraded',
+            'blocking_status': 'non_blocking',
+            'gate_reason': 'missing_rows_outside_active_feedback_scope',
+            'feedback_scope_gap': feedback_scope_gap,
         }
 
     @staticmethod
@@ -1111,7 +1626,9 @@ class EODPipelineStatusService:
 eod_pipeline_status_service = EODPipelineStatusService(
     factor_stage_counts_loader=_load_factor_stage_counts,
     row_count_stage_counts_loader=_load_row_count_stage_counts,
+    row_count_scope_gap_loader=_load_row_count_stage_scope_gap,
     price_bar_count_loader=lambda *, market_date: count_daily_price_bars_for_date(market_date),
     technical_snapshot_count_loader=lambda market_date: count_daily_technical_snapshots_for_live_symbols(market_date),
     action_summary_count_loader=lambda market_date: count_daily_action_summaries_for_live_symbols(market_date),
+    feedback_run_loader=_load_latest_feedback_run_summary,
 )
