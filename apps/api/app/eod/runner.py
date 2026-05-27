@@ -75,6 +75,31 @@ class EODBackgroundRunner:
                 name,
             )
 
+    def _schedule_exec_readback_refresh(self, *, target_trade_date: str, trigger: str) -> None:
+        result = signal_decider_exec_integration_service.schedule_signal_decider_exec_readback_refresh(
+            target_trade_date=target_trade_date,
+            trigger=trigger,
+            timeout_seconds=BACKGROUND_RUNNER_STEP_TIMEOUT_SECONDS,
+        )
+        refresh = result.get('refresh') if isinstance(result, dict) else {}
+        request = result.get('request') if isinstance(result, dict) else {}
+        logger.info(
+            'Background runner exec readback refresh status',
+            extra={
+                'exec_readback_refresh': {
+                    'target_trade_date': (request or {}).get('target_trade_date') or target_trade_date,
+                    'status': (refresh or {}).get('status'),
+                    'in_flight': (refresh or {}).get('in_flight'),
+                    'debounced': (refresh or {}).get('debounced'),
+                    'timeout_seconds': (refresh or {}).get('timeout_seconds'),
+                    'last_trigger': (refresh or {}).get('last_trigger'),
+                    'last_attempted_at': (refresh or {}).get('last_attempted_at'),
+                    'last_succeeded_at': (refresh or {}).get('last_succeeded_at'),
+                    'last_error': (refresh or {}).get('last_error'),
+                }
+            },
+        )
+
     async def _run_loop(self) -> None:
         while self._running:
             try:
@@ -99,13 +124,9 @@ class EODBackgroundRunner:
                         )
                 elif market.state == 'OPEN':
                     if signal_decider_exec_integration_service.should_delegate_execution():
-                        await self._run_async_step(
-                            'signal_decider_exec_readback_refresh',
-                            signal_decider_exec_integration_service.list_signal_decider_exec_overview(
-                                target_trade_date=market.server_time[:10],
-                                refresh=True,
-                                trigger='market_open_scheduler',
-                            ),
+                        self._schedule_exec_readback_refresh(
+                            target_trade_date=market.server_time[:10],
+                            trigger='market_open_scheduler',
                         )
                     else:
                         await self._run_async_step(

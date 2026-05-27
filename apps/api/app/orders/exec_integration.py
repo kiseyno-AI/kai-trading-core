@@ -1018,6 +1018,39 @@ class SignalDeciderExecIntegrationService:
             'items': items,
         }
 
+    def schedule_signal_decider_exec_readback_refresh(
+        self,
+        *,
+        target_trade_date: str | date | None = None,
+        account_reference: str | None = None,
+        symbol: str | None = None,
+        trigger: str = 'manual',
+        timeout_seconds: float | None = None,
+    ) -> dict[str, Any]:
+        resolved_target_date = _normalize_date(target_trade_date)
+        resolved_account_reference = _normalize_optional_text(account_reference)
+        resolved_symbol = _normalize_optional_text(symbol, lowercase=False)
+        refresh_state = self._ensure_dashboard_background_refresh(
+            target_trade_date=resolved_target_date,
+            account_reference=resolved_account_reference,
+            symbol=resolved_symbol,
+            refresh=True,
+            trigger=trigger,
+            timeout_seconds=timeout_seconds,
+        )
+        return {
+            'request': {
+                'target_trade_date': resolved_target_date.isoformat(),
+                'account_reference': resolved_account_reference,
+                'symbol': resolved_symbol,
+                'refresh': True,
+                'trigger': trigger,
+                'timeout_seconds': refresh_state.get('timeout_seconds'),
+            },
+            'integration': self.integration_status(),
+            'refresh': refresh_state,
+        }
+
     async def dashboard_runtime_status(self, *, refresh: bool = True) -> dict[str, Any]:
         runtime_result = await self.runtime_status(refresh=refresh)
         return self._build_dashboard_runtime_status(
@@ -1440,12 +1473,14 @@ class SignalDeciderExecIntegrationService:
         symbol: str | None,
         refresh: bool,
         trigger: str,
+        timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
         key = self._dashboard_refresh_key(
             target_trade_date=target_trade_date,
             account_reference=account_reference,
             symbol=symbol,
         )
+        resolved_timeout_seconds = self._resolve_dashboard_refresh_timeout(timeout_seconds)
         if not refresh:
             return self._dashboard_refresh_payload(
                 key,
@@ -1459,6 +1494,7 @@ class SignalDeciderExecIntegrationService:
             self._dashboard_refresh_state[key] = {
                 **self._dashboard_refresh_state.get(key, {}),
                 'status': status,
+                'timeout_seconds': resolved_timeout_seconds,
                 'last_error': integration['issues'][0] if integration['issues'] else None,
             }
             return self._dashboard_refresh_payload(key, requested=True, status=status)
@@ -1497,6 +1533,7 @@ class SignalDeciderExecIntegrationService:
         self._dashboard_refresh_state[key] = {
             **state,
             'status': DASHBOARD_REFRESH_STATUS_SCHEDULED,
+            'timeout_seconds': resolved_timeout_seconds,
             'last_attempted_at': now.isoformat(),
             'last_trigger': trigger,
             'last_error': None,
@@ -1508,6 +1545,7 @@ class SignalDeciderExecIntegrationService:
                 account_reference=account_reference,
                 symbol=symbol,
                 trigger=trigger,
+                timeout_seconds=resolved_timeout_seconds,
             ),
             name=f'exec-runtime-dashboard-refresh:{target_trade_date.isoformat()}:{symbol or "all"}',
         )
@@ -1527,6 +1565,7 @@ class SignalDeciderExecIntegrationService:
         account_reference: str | None,
         symbol: str | None,
         trigger: str,
+        timeout_seconds: float,
     ) -> None:
         state = self._dashboard_refresh_state.get(key) or {}
         started_at = _utcnow()
@@ -1544,10 +1583,10 @@ class SignalDeciderExecIntegrationService:
                 refresh=True,
                 trigger=f'{trigger}:dashboard_background_refresh',
             )
-            if self.dashboard_refresh_timeout_seconds > 0:
+            if timeout_seconds > 0:
                 overview = await asyncio.wait_for(
                     refresh_coro,
-                    timeout=self.dashboard_refresh_timeout_seconds,
+                    timeout=timeout_seconds,
                 )
             else:
                 overview = await refresh_coro
@@ -1561,7 +1600,7 @@ class SignalDeciderExecIntegrationService:
                     code='dashboard_refresh_timeout',
                     message=(
                         'Exec dashboard refresh exceeded '
-                        f'{self.dashboard_refresh_timeout_seconds:g}s and was left on the cached read model.'
+                        f'{timeout_seconds:g}s and was left on the cached read model.'
                     ),
                     retryable=True,
                 ),
@@ -1840,7 +1879,7 @@ class SignalDeciderExecIntegrationService:
             'background': requested and resolved_status != DASHBOARD_REFRESH_STATUS_NOT_REQUESTED,
             'in_flight': in_flight,
             'debounced': resolved_status == DASHBOARD_REFRESH_STATUS_DEBOUNCED,
-            'timeout_seconds': self.dashboard_refresh_timeout_seconds,
+            'timeout_seconds': state.get('timeout_seconds', self.dashboard_refresh_timeout_seconds),
             'debounce_seconds': self.dashboard_refresh_debounce_seconds,
             'last_trigger': state.get('last_trigger'),
             'last_attempted_at': state.get('last_attempted_at'),
@@ -1862,6 +1901,11 @@ class SignalDeciderExecIntegrationService:
             _normalize_optional_text(account_reference),
             _normalize_optional_text(symbol),
         )
+
+    def _resolve_dashboard_refresh_timeout(self, timeout_seconds: float | None) -> float:
+        if timeout_seconds is None:
+            return self.dashboard_refresh_timeout_seconds
+        return max(float(timeout_seconds), 0.0)
 
     @staticmethod
     def _dashboard_cache_key(

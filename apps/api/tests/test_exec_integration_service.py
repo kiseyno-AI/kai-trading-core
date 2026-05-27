@@ -2238,6 +2238,120 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.gather(*tasks, return_exceptions=True)
             self.service.list_signal_decider_exec_overview = original_overview
 
+    async def test_scheduled_exec_readback_refresh_reuses_dashboard_background_state(self) -> None:
+        await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=False,
+            dry_run=False,
+            force=True,
+            trigger='test',
+        )
+        original_overview = self.service.list_signal_decider_exec_overview
+        refresh_started = asyncio.Event()
+        release_refresh = asyncio.Event()
+        refresh_call_count = 0
+
+        async def slow_refresh_overview(**kwargs):
+            nonlocal refresh_call_count
+            if kwargs.get('refresh'):
+                refresh_call_count += 1
+                refresh_started.set()
+                await release_refresh.wait()
+            return await original_overview(**kwargs)
+
+        self.service.list_signal_decider_exec_overview = slow_refresh_overview
+        try:
+            scheduled = self.service.schedule_signal_decider_exec_readback_refresh(
+                target_trade_date=self.target_trade_date,
+                trigger='market_open_scheduler',
+            )
+
+            self.assertEqual(scheduled['refresh']['status'], 'scheduled')
+            self.assertTrue(scheduled['refresh']['background'])
+            self.assertEqual(scheduled['request']['target_trade_date'], self.target_trade_date.isoformat())
+            await asyncio.wait_for(refresh_started.wait(), timeout=1.0)
+
+            running = self.service.schedule_signal_decider_exec_readback_refresh(
+                target_trade_date=self.target_trade_date,
+                trigger='market_open_scheduler',
+            )
+
+            self.assertEqual(refresh_call_count, 1)
+            self.assertEqual(running['refresh']['status'], 'running')
+            self.assertTrue(running['refresh']['in_flight'])
+        finally:
+            release_refresh.set()
+            tasks = list(self.service._dashboard_refresh_tasks.values())
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            self.service.list_signal_decider_exec_overview = original_overview
+
+    async def test_scheduled_exec_readback_refresh_uses_supplied_timeout(self) -> None:
+        await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=False,
+            dry_run=False,
+            force=True,
+            trigger='test',
+        )
+        original_overview = self.service.list_signal_decider_exec_overview
+        self.service.dashboard_refresh_timeout_seconds = 0.001
+        refresh_started = asyncio.Event()
+        release_refresh = asyncio.Event()
+        refresh_cancelled = False
+
+        async def slow_refresh_overview(**kwargs):
+            nonlocal refresh_cancelled
+            if kwargs.get('refresh'):
+                refresh_started.set()
+                try:
+                    await release_refresh.wait()
+                except asyncio.CancelledError:
+                    refresh_cancelled = True
+                    raise
+            return await original_overview(**kwargs)
+
+        self.service.list_signal_decider_exec_overview = slow_refresh_overview
+        try:
+            scheduled = self.service.schedule_signal_decider_exec_readback_refresh(
+                target_trade_date=self.target_trade_date,
+                trigger='market_open_scheduler',
+                timeout_seconds=0.2,
+            )
+
+            self.assertEqual(scheduled['refresh']['status'], 'scheduled')
+            self.assertAlmostEqual(scheduled['refresh']['timeout_seconds'], 0.2)
+            await asyncio.wait_for(refresh_started.wait(), timeout=1.0)
+            tasks = list(self.service._dashboard_refresh_tasks.values())
+            self.assertEqual(len(tasks), 1)
+            task = tasks[0]
+
+            await asyncio.sleep(0.03)
+
+            self.assertFalse(refresh_cancelled)
+            self.assertFalse(task.done())
+
+            release_refresh.set()
+            await asyncio.wait_for(task, timeout=1.0)
+            key = self.service._dashboard_refresh_key(
+                target_trade_date=self.target_trade_date,
+                account_reference=None,
+                symbol=None,
+            )
+            refresh_state = self.service._dashboard_refresh_payload(
+                key,
+                requested=True,
+            )
+            self.assertEqual(refresh_state['status'], 'succeeded')
+            self.assertAlmostEqual(refresh_state['timeout_seconds'], 0.2)
+            self.assertIsNone(refresh_state['last_error'])
+        finally:
+            release_refresh.set()
+            tasks = list(self.service._dashboard_refresh_tasks.values())
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            self.service.list_signal_decider_exec_overview = original_overview
+
     async def test_runtime_monitored_symbols_empty_response_does_not_wait_for_refresh(self) -> None:
         empty_market_date = date(2027, 5, 21)
         original_overview = self.service.list_signal_decider_exec_overview

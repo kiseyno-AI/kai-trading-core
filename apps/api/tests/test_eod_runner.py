@@ -1,7 +1,12 @@
+import asyncio
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from app.eod.runner import EODBackgroundRunner, is_preopen_exec_dispatch_due
+from app.eod.runner import (
+    BACKGROUND_RUNNER_STEP_TIMEOUT_SECONDS,
+    EODBackgroundRunner,
+    is_preopen_exec_dispatch_due,
+)
 from app.market.clock import MarketState
 
 
@@ -226,9 +231,12 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
             patch('app.eod.runner.get_market_state', return_value=market_state),
             patch('app.eod.runner.signal_decider_exec_integration_service.should_delegate_execution', return_value=True),
             patch(
-                'app.eod.runner.signal_decider_exec_integration_service.list_signal_decider_exec_overview',
-                new=AsyncMock(return_value={'summary': {'remote_open_count': 1}}),
-            ) as refresh_exec,
+                'app.eod.runner.signal_decider_exec_integration_service.schedule_signal_decider_exec_readback_refresh',
+                return_value={
+                    'request': {'target_trade_date': '2026-04-30'},
+                    'refresh': {'status': 'scheduled', 'in_flight': True},
+                },
+            ) as schedule_refresh,
             patch(
                 'app.eod.runner.trading_order_reconciliation_service.run_periodic_if_due',
                 new=AsyncMock(),
@@ -238,8 +246,107 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
             runner._running = True
             await runner._run_loop()
 
-        refresh_exec.assert_awaited_once_with(
+        schedule_refresh.assert_called_once_with(
             target_trade_date='2026-04-30',
-            refresh=True,
             trigger='market_open_scheduler',
+            timeout_seconds=BACKGROUND_RUNNER_STEP_TIMEOUT_SECONDS,
         )
+
+    async def test_open_loop_schedules_slow_exec_readback_without_blocking_cycle(self) -> None:
+        runner = EODBackgroundRunner(interval_seconds=0)
+        market_state = MarketState(
+            market='KRX',
+            state='OPEN',
+            is_trading_day=True,
+            is_open=True,
+            server_time='2026-04-30T09:05:00+09:00',
+            session_open_at='2026-04-30T09:00:00+09:00',
+            session_close_at='2026-04-30T15:30:00+09:00',
+        )
+
+        class SlowExecReadbackService:
+            def __init__(self) -> None:
+                self.calls: list[dict] = []
+                self.refresh_started = asyncio.Event()
+                self.release_refresh = asyncio.Event()
+                self.refresh_state = {
+                    'status': 'not_requested',
+                    'in_flight': False,
+                }
+                self.task: asyncio.Task | None = None
+
+            def should_delegate_execution(self) -> bool:
+                return True
+
+            def schedule_signal_decider_exec_readback_refresh(self, **kwargs) -> dict:
+                self.calls.append(kwargs)
+                self.refresh_state = {
+                    'status': 'scheduled',
+                    'in_flight': True,
+                    'last_trigger': kwargs.get('trigger'),
+                }
+                self.task = asyncio.create_task(self._slow_refresh())
+                return {
+                    'request': {
+                        'target_trade_date': kwargs.get('target_trade_date'),
+                        'trigger': kwargs.get('trigger'),
+                    },
+                    'refresh': self.refresh_state,
+                }
+
+            async def _slow_refresh(self) -> None:
+                self.refresh_started.set()
+                await self.release_refresh.wait()
+                self.refresh_state.update(
+                    {
+                        'status': 'succeeded',
+                        'in_flight': False,
+                    }
+                )
+
+        fake_service = SlowExecReadbackService()
+
+        async def stop_after_tick(_seconds: int) -> None:
+            runner._running = False
+
+        try:
+            with (
+                patch('app.eod.runner.get_market_state', return_value=market_state),
+                patch('app.eod.runner.signal_decider_exec_integration_service', fake_service),
+                patch(
+                    'app.eod.runner.trading_order_reconciliation_service.run_periodic_if_due',
+                    new=AsyncMock(),
+                ) as reconcile,
+                patch(
+                    'app.eod.runner.market_snapshot_service.refresh_market_snapshot_if_due',
+                    new=AsyncMock(),
+                ),
+                patch(
+                    'app.eod.runner.portfolio_summary_service.refresh_portfolio_summary_if_due',
+                    new=AsyncMock(),
+                ),
+                patch('app.eod.runner.asyncio.sleep', side_effect=stop_after_tick),
+            ):
+                runner._running = True
+                await asyncio.wait_for(runner._run_loop(), timeout=0.25)
+
+            await asyncio.wait_for(fake_service.refresh_started.wait(), timeout=0.25)
+            self.assertEqual(
+                fake_service.calls,
+                [
+                    {
+                        'target_trade_date': '2026-04-30',
+                        'trigger': 'market_open_scheduler',
+                        'timeout_seconds': BACKGROUND_RUNNER_STEP_TIMEOUT_SECONDS,
+                    }
+                ],
+            )
+            self.assertEqual(fake_service.refresh_state['status'], 'scheduled')
+            self.assertTrue(fake_service.refresh_state['in_flight'])
+            self.assertIsNotNone(fake_service.task)
+            self.assertFalse(fake_service.task.done())
+            reconcile.assert_awaited_once_with()
+        finally:
+            fake_service.release_refresh.set()
+            if fake_service.task is not None:
+                await asyncio.gather(fake_service.task, return_exceptions=True)
