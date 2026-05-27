@@ -148,15 +148,23 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
 
         self.assertEqual(result['market_date'], '2026-04-21')
         self.assertEqual(result['status'], 'pending')
+        self.assertEqual(result['total_stages'], 24)
+        self.assertEqual(result['completed_stages'], 0)
+        self.assertEqual(result['pending_stages'], 24)
+        self.assertEqual(result['current_stage'], 'master_refresh')
         self.assertEqual(result['stages']['price_collection']['status'], 'pending')
+        self.assertEqual(result['stages']['price_collection']['order'], 3)
+        self.assertEqual(result['stages']['price_collection']['group'], 'market_data')
+        self.assertEqual(result['stages']['price_collection']['inspect_routes'], ['/eod/pipeline/status', '/eod/pykrx/daily/run-if-due'])
         self.assertEqual(result['stages']['price_collection']['total'], 3579)
         self.assertEqual(result['stages']['trending_ranks']['total'], 3)
         self.assertEqual(result['stages']['fundamentals_daily_refresh']['status'], 'pending')
         self.assertEqual(result['stages']['momentum_factors']['status'], 'pending')
         self.assertEqual(result['stages']['composite_factors']['status'], 'pending')
+        self.assertEqual(result['stages']['fundamentals_daily_refresh']['details']['fs_div'], 'CFS')
         self.assertEqual(
-            result['stages']['fundamentals_daily_refresh']['details'],
-            {'fs_div': 'CFS'},
+            result['stages']['fundamentals_daily_refresh']['details']['inspect_routes'],
+            ['/disclosures/dart/fundamentals/daily/inspect', '/eod/pipeline/status'],
         )
 
     def test_read_prefers_official_running_market_risk_filter_before_output_rows_exist(self):
@@ -206,9 +214,15 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
         result = service.read()
 
         self.assertEqual(result['status'], 'running')
+        self.assertEqual(result['total_stages'], 24)
+        self.assertEqual(result['running_stages'], 1)
+        self.assertEqual(result['current_stage'], 'market_risk_filter')
         self.assertEqual(result['official_run']['id'], 501)
         stage = result['stages']['market_risk_filter']
         self.assertEqual(stage['status'], 'running')
+        self.assertEqual(stage['order'], 9)
+        self.assertEqual(stage['group'], 'market_data')
+        self.assertEqual(stage['details']['progress_source'], 'official_run')
         self.assertEqual(stage['processed'], 7)
         self.assertEqual(stage['total'], 20)
         self.assertEqual(stage['current_symbol'], '005930')
@@ -261,9 +275,65 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
         result = service.read()
 
         self.assertEqual(result['status'], 'interrupted')
+        self.assertEqual(result['current_stage'], 'signal_decider')
+        self.assertEqual(result['current_stage_status'], 'interrupted')
+        self.assertEqual(result['stage_status_counts']['interrupted'], 1)
         self.assertEqual(result['stages']['signal_decider']['status'], 'interrupted')
         self.assertTrue(result['stages']['signal_decider']['details']['resumable'])
         self.assertIn('previous daily pipeline run', result['stages']['signal_decider']['current_activity'])
+
+    def test_read_selects_abandoned_official_stage_before_pending_stage(self):
+        official_run = {
+            'id': 504,
+            'market_date': '2026-04-21',
+            'trigger': 'manual_api',
+            'status': 'abandoned',
+            'current_stage': 'signal_decider',
+            'started_at': '2026-04-21T09:10:00+00:00',
+            'updated_at': '2026-04-21T09:30:00+00:00',
+            'completed_at': '2026-04-21T09:30:00+00:00',
+            'error_message': 'Previous daily pipeline run was abandoned after restart.',
+            'run_metadata': {'resumable': True},
+            'stages': {
+                'signal_decider': {
+                    'stage_id': 'signal_decider',
+                    'status': 'abandoned',
+                    'market_date': '2026-04-21',
+                    'started_at': '2026-04-21T09:20:00+00:00',
+                    'updated_at': '2026-04-21T09:30:00+00:00',
+                    'completed_at': '2026-04-21T09:30:00+00:00',
+                    'processed': 3,
+                    'total': 10,
+                    'succeeded': 3,
+                    'failed': 0,
+                    'remaining': 7,
+                    'current_step': 'core_restart_abandoned',
+                    'current_activity': 'Previous daily pipeline run was abandoned after restart.',
+                    'current_symbol': None,
+                    'current_period': None,
+                    'error_message': 'Previous daily pipeline run was abandoned after restart.',
+                    'source_run_ids': {},
+                    'details': {'resumable': True},
+                },
+            },
+        }
+        service = EODPipelineStatusService(
+            market_state_loader=lambda: _FakeMarketState(),
+            pykrx_run_loader=lambda **_: None,
+            pykrx_stage_counts_loader=lambda *_: {},
+            live_symbol_count_loader=lambda: 10,
+            fundamentals_refresh_loader=lambda **_: None,
+            official_run_loader=lambda **_: official_run,
+        )
+
+        result = service.read()
+
+        self.assertEqual(result['status'], 'abandoned')
+        self.assertEqual(result['current_stage'], 'signal_decider')
+        self.assertEqual(result['current_stage_status'], 'abandoned')
+        self.assertEqual(result['stage_status_counts']['abandoned'], 1)
+        self.assertEqual(result['stages']['signal_decider']['status'], 'abandoned')
+        self.assertTrue(result['stages']['signal_decider']['details']['resumable'])
 
     def test_read_shows_downstream_signal_decider_running_with_zero_output_rows(self):
         official_run = {
@@ -1266,6 +1336,11 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
         result = service.read()
 
         self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['total_stages'], 24)
+        self.assertEqual(result['stage_status_counts']['completed'], 16)
+        self.assertEqual(result['partial_stages'], 0)
+        self.assertEqual(result['pending_stages'], 8)
+        self.assertEqual(result['current_stage'], 'master_refresh')
         self.assertEqual(result['stages']['price_collection']['status'], 'completed')
         self.assertEqual(result['stages']['technical_snapshots']['status'], 'completed')
         self.assertEqual(result['stages']['action_summaries']['status'], 'completed')
