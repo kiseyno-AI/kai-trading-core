@@ -1018,6 +1018,36 @@ class SignalDeciderExecIntegrationService:
             'items': items,
         }
 
+    def schedule_signal_decider_exec_readback_refresh(
+        self,
+        *,
+        target_trade_date: str | date | None = None,
+        account_reference: str | None = None,
+        symbol: str | None = None,
+        trigger: str = 'manual',
+    ) -> dict[str, Any]:
+        resolved_target_date = _normalize_date(target_trade_date)
+        resolved_account_reference = _normalize_optional_text(account_reference)
+        resolved_symbol = _normalize_optional_text(symbol, lowercase=False)
+        refresh_state = self._ensure_dashboard_background_refresh(
+            target_trade_date=resolved_target_date,
+            account_reference=resolved_account_reference,
+            symbol=resolved_symbol,
+            refresh=True,
+            trigger=trigger,
+        )
+        return {
+            'request': {
+                'target_trade_date': resolved_target_date.isoformat(),
+                'account_reference': resolved_account_reference,
+                'symbol': resolved_symbol,
+                'refresh': True,
+                'trigger': trigger,
+            },
+            'integration': self.integration_status(),
+            'refresh': refresh_state,
+        }
+
     async def dashboard_runtime_status(self, *, refresh: bool = True) -> dict[str, Any]:
         runtime_result = await self.runtime_status(refresh=refresh)
         return self._build_dashboard_runtime_status(
