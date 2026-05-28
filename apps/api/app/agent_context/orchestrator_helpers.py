@@ -461,11 +461,156 @@ def build_response_storage_payload(
     }
 
 
+def _compact_symbol_day_context_for_decider(context: dict[str, Any]) -> dict[str, Any]:
+    """Keep decision-relevant symbol context without shipping bulky raw provenance."""
+    keep_keys = {
+        'symbol',
+        'market_date',
+        'company',
+        'market_session',
+        'quote_context',
+        'price_context',
+        'technical_snapshot',
+        'action_summary',
+        'intraday_execution_context',
+        'valuation_context',
+        'investor_flow_context',
+        'short_selling_context',
+        'sector_peer_context',
+        'market_relative_context',
+        'market_breadth_context',
+        'recent_disclosures',
+        'recent_dart_events',
+        'recent_external_news',
+        'fundamentals',
+    }
+    compacted = {key: context.get(key) for key in keep_keys if key in context}
+    completeness = context.get('context_completeness')
+    if isinstance(completeness, dict):
+        compacted['context_completeness'] = {
+            key: completeness.get(key)
+            for key in ('summary', 'missing_sections', 'critical_missing_sections', 'coverage_status')
+            if key in completeness
+        }
+    provenance = context.get('context_provenance')
+    if isinstance(provenance, dict):
+        compacted['context_provenance'] = {
+            key: provenance.get(key)
+            for key in ('summary', 'missing_sources', 'stale_sources', 'source_status_counts')
+            if key in provenance
+        }
+    return compacted
+
+
+def _compact_factor_scores(scores: dict[str, Any]) -> dict[str, Any]:
+    compacted: dict[str, Any] = {}
+    keep_fields = {
+        'score',
+        'rank',
+        'percentile',
+        'status',
+        'value_score',
+        'value_rank',
+        'value_percentile',
+        'quality_score',
+        'quality_rank',
+        'quality_percentile',
+        'momentum_score',
+        'momentum_rank',
+        'momentum_percentile',
+        'signal_count',
+        'volume_power_rank',
+        'volume_power',
+        'overtime_volume_rank',
+        'overtime_volume',
+        'overtime_fluctuation_rank',
+        'overtime_fluctuation_rate',
+    }
+    for name, payload in scores.items():
+        if isinstance(payload, dict):
+            compacted[name] = {key: payload.get(key) for key in keep_fields if key in payload}
+        else:
+            compacted[name] = payload
+    return compacted
+
+
+def _compact_decider_data_quality_context(context: dict[str, Any]) -> dict[str, Any]:
+    compacted = {
+        key: context.get(key)
+        for key in ('status', 'requested_market_date', 'block_status_counts', 'decision_priority')
+        if key in context
+    }
+    blocks = context.get('blocks')
+    if isinstance(blocks, dict):
+        compacted['blocks'] = {
+            name: {
+                key: block.get(key)
+                for key in ('status', 'decision_guidance', 'providers')
+                if isinstance(block, dict) and key in block
+            }
+            for name, block in blocks.items()
+            if isinstance(block, dict)
+        }
+    return compacted
+
+
+def _compact_pre_decider_enrichment_context(context: dict[str, Any]) -> dict[str, Any]:
+    compacted = {
+        key: context.get(key)
+        for key in ('schema_version', 'status', 'market_date')
+        if key in context
+    }
+    for key in ('quote_orderbook_snapshot', 'trading_value'):
+        value = context.get(key)
+        if isinstance(value, dict):
+            compacted[key] = value
+    flow_context = context.get('flow_short_sector_context')
+    if isinstance(flow_context, dict):
+        compacted['flow_short_sector_context'] = {
+            field: flow_context.get(field)
+            for field in (
+                'status',
+                'summary',
+                'investor_flow',
+                'short_selling',
+                'sector_relative_strength',
+                'missing_fields',
+                'risk_flags',
+            )
+            if field in flow_context
+        }
+    return compacted
+
+
 def trim_batch_item_for_prompt(item: dict[str, Any]) -> dict[str, Any]:
     trimmed = json.loads(json.dumps(item, ensure_ascii=False))
     symbol_day_context = trimmed.get('symbol_day_context')
     if isinstance(symbol_day_context, dict):
-        trimmed['symbol_day_context'] = trim_batch_item_for_prompt(symbol_day_context)
+        trimmed['symbol_day_context'] = trim_batch_item_for_prompt(
+            _compact_symbol_day_context_for_decider(symbol_day_context)
+        )
+    else:
+        bulky_duplicate_keys = {
+            'context_provenance',
+            'persisted_factor_rows',
+            'price_context_history',
+        }
+        for key in bulky_duplicate_keys:
+            trimmed.pop(key, None)
+    scores = trimmed.get('scores')
+    if isinstance(scores, dict):
+        trimmed['scores'] = _compact_factor_scores(scores)
+    factor_summary = trimmed.get('factor_summary')
+    if isinstance(factor_summary, dict):
+        factor_scores = factor_summary.get('factor_scores')
+        if isinstance(factor_scores, dict):
+            factor_summary['factor_scores'] = _compact_factor_scores(factor_scores)
+    decider_data_quality_context = trimmed.get('decider_data_quality_context')
+    if isinstance(decider_data_quality_context, dict):
+        trimmed['decider_data_quality_context'] = _compact_decider_data_quality_context(decider_data_quality_context)
+    pre_decider_enrichment_context = trimmed.get('pre_decider_enrichment_context')
+    if isinstance(pre_decider_enrichment_context, dict):
+        trimmed['pre_decider_enrichment_context'] = _compact_pre_decider_enrichment_context(pre_decider_enrichment_context)
     technical_snapshot = trimmed.get('technical_snapshot')
     if isinstance(technical_snapshot, dict):
         technical_snapshot.pop('signal_payload', None)
@@ -481,6 +626,38 @@ def trim_batch_item_for_prompt(item: dict[str, Any]) -> dict[str, Any]:
             if isinstance(statement, dict):
                 keep_statement_keys = {'fs_div', 'fs_label', 'statement_type', 'currency', 'source_status', 'source_message', 'row_count'}
                 latest_snapshot['statement'] = {k: v for k, v in statement.items() if k in keep_statement_keys}
+            highlights = latest_snapshot.get('highlights')
+            if isinstance(highlights, dict):
+                latest_snapshot['highlights'] = {
+                    key: highlights.get(key)
+                    for key in (
+                        'revenue',
+                        'operating_profit',
+                        'net_income',
+                        'total_assets',
+                        'total_liabilities',
+                        'equity',
+                        'operating_cash_flow',
+                        'free_cash_flow',
+                        'summary',
+                        'data_quality',
+                    )
+                    if key in highlights
+                }
+            fundamental_context = latest_snapshot.get('fundamental_context')
+            if isinstance(fundamental_context, dict):
+                latest_snapshot['fundamental_context'] = {
+                    key: fundamental_context.get(key)
+                    for key in (
+                        'quality_summary',
+                        'growth_summary',
+                        'balance_sheet_summary',
+                        'cash_flow_summary',
+                        'risk_flags',
+                        'missing_fields',
+                    )
+                    if key in fundamental_context
+                }
         history_summary = fundamentals.get('history_summary')
         if isinstance(history_summary, dict):
             recent_periods = history_summary.get('recent_periods')

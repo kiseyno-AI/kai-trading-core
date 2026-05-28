@@ -2275,7 +2275,7 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertEqual(metadata['unexpected_symbols'], ['999999'])
         self.assertEqual(metadata['fallback_attributions'], [])
 
-    def test_openclaw_batch_dispatch_classifies_invalid_json_parse_failures(self):
+    def test_openclaw_batch_dispatch_converts_invalid_json_to_structured_fallback(self):
         dispatch_id = 'symbol-run-2026-04-14-abc123:signal-decider:slot-1:batch-1'
         request_marker = f'batch-request::{dispatch_id}:attempt-1'
         http_calls = []
@@ -2330,22 +2330,21 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
                         side_effect=lambda stage, **payload: captured_logs.append({'stage': stage, **payload}),
                     ):
                         client = OpenClawAgentClient()
-                        with self.assertRaisesRegex(orchestrator_module.AgentDispatchRetryableError, 'invalid_json'):
-                            client.dispatch_batch(
-                                spec=orchestrator_module.DISPATCH_SPECS[-1],
-                                market_date=orchestrator_module.date.fromisoformat('2026-04-14'),
-                                batch_items=[
-                                    {
-                                        'symbol': '005930',
-                                        'market_date': '2026-04-14',
-                                        'request_run_id': 'symbol-run-2026-04-14-abc123',
-                                        'dispatch_id': dispatch_id,
-                                        'session_slot': 1,
-                                        'session_key': 'agent:signal-decider:feedback/signal-decider/slot-01',
-                                        'session_reuse_mode': 'slot_reused',
-                                    }
-                                ],
-                            )
+                        result = client.dispatch_batch(
+                            spec=orchestrator_module.DISPATCH_SPECS[-1],
+                            market_date=orchestrator_module.date.fromisoformat('2026-04-14'),
+                            batch_items=[
+                                {
+                                    'symbol': '005930',
+                                    'market_date': '2026-04-14',
+                                    'request_run_id': 'symbol-run-2026-04-14-abc123',
+                                    'dispatch_id': dispatch_id,
+                                    'session_slot': 1,
+                                    'session_key': 'agent:signal-decider:feedback/signal-decider/slot-01',
+                                    'session_reuse_mode': 'slot_reused',
+                                }
+                            ],
+                        )
 
         parse_log = next(entry for entry in captured_logs if entry['stage'] == 'batch_response_parse_failed')
         self.assertEqual(parse_log['failure_class'], 'invalid_json')
@@ -2355,6 +2354,17 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
             parse_log['response_correlation']['response_recovery']['history']['failure_mode'],
             'session_history_assistant_non_json_after_marker',
         )
+        fallback_log = next(entry for entry in captured_logs if entry['stage'] == 'batch_response_structured_fallback')
+        self.assertEqual(fallback_log['failure_class'], 'invalid_json')
+        self.assertTrue(result['ok'])
+        self.assertEqual(result['decoded']['items'][0]['symbol'], '005930')
+        feedback = result['decoded']['items'][0]['feedback']
+        self.assertEqual(feedback['preferred_action'], 'wait')
+        self.assertEqual(feedback['next_day_open_action'], 'wait')
+        self.assertEqual(feedback['wait_reason']['code'], 'core_execution_evidence_gap')
+        self.assertIn('agent_json_contract_violation', feedback['risk_flags'])
+        self.assertEqual(result['response_correlation']['decoded_source'], 'core_structured_fallback')
+        self.assertEqual(result['response_correlation']['missing_symbols'], [])
         self.assertNotIn('batch_response_symbol_mismatch', [entry['stage'] for entry in captured_logs])
 
     def test_openclaw_batch_dispatch_recovers_from_trajectory_when_session_history_is_missing(self):
@@ -2506,7 +2516,7 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertTrue(recovery['trajectory']['matched_response_id'])
         self.assertNotIn('batch_response_parse_failed', [entry['stage'] for entry in captured_logs])
 
-    def test_openclaw_batch_dispatch_fails_with_trajectory_response_id_mismatch_when_only_stale_run_artifacts_exist(self):
+    def test_openclaw_batch_dispatch_uses_fallback_when_only_stale_trajectory_artifacts_exist(self):
         dispatch_id = 'symbol-run-2026-04-14-abc123:signal-decider:slot-1:batch-1'
         session_key = 'agent:signal-decider:feedback/signal-decider/slot-01'
         http_calls = []
@@ -2599,37 +2609,22 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
                             side_effect=lambda stage, **payload: captured_logs.append({'stage': stage, **payload}),
                         ):
                             client = OpenClawAgentClient()
-                            with self.assertRaisesRegex(
-                                orchestrator_module.AgentDispatchRetryableError,
-                                'trajectory_response_id_mismatch',
-                            ) as exc:
-                                client.dispatch_batch(
-                                    spec=orchestrator_module.DISPATCH_SPECS[-1],
-                                    market_date=orchestrator_module.date.fromisoformat('2026-04-14'),
-                                    batch_items=[
-                                        {
-                                            'symbol': '005930',
-                                            'market_date': '2026-04-14',
-                                            'request_run_id': 'symbol-run-2026-04-14-abc123',
-                                            'dispatch_id': dispatch_id,
-                                            'session_slot': 1,
-                                            'session_key': session_key,
-                                            'session_reuse_mode': 'fresh_per_batch',
-                                        }
-                                    ],
-                                )
+                            result = client.dispatch_batch(
+                                spec=orchestrator_module.DISPATCH_SPECS[-1],
+                                market_date=orchestrator_module.date.fromisoformat('2026-04-14'),
+                                batch_items=[
+                                    {
+                                        'symbol': '005930',
+                                        'market_date': '2026-04-14',
+                                        'request_run_id': 'symbol-run-2026-04-14-abc123',
+                                        'dispatch_id': dispatch_id,
+                                        'session_slot': 1,
+                                        'session_key': session_key,
+                                        'session_reuse_mode': 'fresh_per_batch',
+                                    }
+                                ],
+                            )
 
-        self.assertEqual(exc.exception.details['failure_mode'], 'trajectory_response_id_mismatch')
-        self.assertEqual(exc.exception.details['failure_class'], 'trajectory_response_id_mismatch')
-        self.assertEqual(
-            exc.exception.details['response_recovery']['trajectory']['failure_mode'],
-            'trajectory_response_id_mismatch',
-        )
-        self.assertFalse(exc.exception.details['response_recovery']['trajectory']['matched_response_id'])
-        self.assertEqual(
-            exc.exception.details['response_recovery']['trajectory']['candidate_run_ids'],
-            ['stale-run-id'],
-        )
         parse_log = next(entry for entry in captured_logs if entry['stage'] == 'batch_response_parse_failed')
         self.assertEqual(parse_log['failure_mode'], 'trajectory_response_id_mismatch')
         self.assertEqual(parse_log['failure_class'], 'trajectory_response_id_mismatch')
@@ -2637,6 +2632,18 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
             parse_log['response_correlation']['response_recovery']['trajectory']['failure_mode'],
             'trajectory_response_id_mismatch',
         )
+        self.assertFalse(parse_log['response_correlation']['response_recovery']['trajectory']['matched_response_id'])
+        self.assertEqual(
+            parse_log['response_correlation']['response_recovery']['trajectory']['candidate_run_ids'],
+            ['stale-run-id'],
+        )
+        fallback_log = next(entry for entry in captured_logs if entry['stage'] == 'batch_response_structured_fallback')
+        self.assertEqual(fallback_log['failure_mode'], 'trajectory_response_id_mismatch')
+        self.assertTrue(result['ok'])
+        self.assertEqual(result['decoded']['items'][0]['symbol'], '005930')
+        self.assertEqual(result['decoded']['items'][0]['feedback']['preferred_action'], 'wait')
+        self.assertIn('agent_json_contract_violation', result['decoded']['items'][0]['feedback']['risk_flags'])
+        self.assertEqual(result['response_correlation']['decoded_source'], 'core_structured_fallback')
 
     def test_spawn_symbol_subagent_terminal_error_logs_only_in_scope_fields(self):
         http_calls = []

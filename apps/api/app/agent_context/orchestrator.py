@@ -308,6 +308,134 @@ class OpenClawAgentClient:
             return 'invalid_json'
         return str(failure_mode)
 
+    @staticmethod
+    def _build_structured_fallback_batch_response(
+        *,
+        spec: AgentDispatchSpec,
+        market_date: date,
+        batch_items: Sequence[dict[str, Any]],
+        output_text: str | None,
+        failure_class: str,
+        failure_mode: str | None,
+        json_failure_class: str | None,
+        response_recovery: dict[str, Any],
+    ) -> dict[str, Any]:
+        summary = (
+            '에이전트가 구조화 JSON을 반환하지 않아 Core가 보수적 fallback 피드백을 생성했습니다.'
+        )
+        data_warning = (
+            f'agent_response_contract_violation: {failure_class}'
+            + (f':{failure_mode}' if failure_mode and failure_mode != failure_class else '')
+        )
+        raw_output = str(output_text or '').strip()
+        raw_output_excerpt = raw_output[:1000] if raw_output else None
+
+        def _base_feedback(symbol: str) -> dict[str, Any]:
+            details = {
+                'fallback_generated_by_core': True,
+                'fallback_reason': 'agent_response_not_parseable_json',
+                'failure_class': failure_class,
+                'failure_mode': failure_mode,
+                'json_failure_class': json_failure_class,
+                'response_recovery': response_recovery,
+            }
+            if raw_output_excerpt:
+                details['raw_output_excerpt'] = raw_output_excerpt
+            return {
+                'role': spec.role,
+                'agent_name': spec.agent_name,
+                'symbol': symbol,
+                'market_date': market_date.isoformat(),
+                'summary': summary,
+                'confidence': 0.0,
+                'risk_flags': ['unstructured_response', 'agent_json_contract_violation'],
+                'details': details,
+                'improvement_notes': [
+                    '에이전트는 raw JSON object만 반환해야 합니다.',
+                    'Core fallback이 생성된 row는 매수 확신도에 긍정적으로 사용하면 안 됩니다.',
+                ],
+            }
+
+        def _decision_feedback(symbol: str) -> dict[str, Any]:
+            feedback = _base_feedback(symbol)
+            wait_reason = {
+                'code': 'core_execution_evidence_gap',
+                'summary': '에이전트 응답이 JSON 계약을 위반해 구조화 판단 근거를 신뢰할 수 없습니다.',
+            }
+            return {
+                **feedback,
+                'preferred_action': 'wait',
+                'next_day_open_action': 'wait',
+                'wait_reason': wait_reason,
+                'entry_price_basis': 'next_open',
+                'target_price': None,
+                'expected_return_pct': None,
+                'stop_loss_price': None,
+                'suggested_holding_period': None,
+                'confidence_score_10': 1.0,
+                'conviction_score_10': 1.0,
+                'thesis_summary': summary,
+                'supporting_evidence': [],
+                'decision_risks': ['agent_json_contract_violation'],
+                'decision_delta': {},
+                'invalidation_conditions': [],
+                'data_quality_warnings': [data_warning],
+                'specialist_disagreement': [],
+                'traceability': {
+                    'agent_name': spec.agent_name,
+                    'symbol': symbol,
+                    'market_date': market_date.isoformat(),
+                    'fallback_generated_by_core': True,
+                },
+            }
+
+        def _short_term_feedback(symbol: str) -> dict[str, Any]:
+            feedback = _base_feedback(symbol)
+            wait_reason = {
+                'code': 'core_execution_evidence_gap',
+                'summary': '에이전트 응답이 JSON 계약을 위반해 단기 진입 판단 근거를 신뢰할 수 없습니다.',
+            }
+            return {
+                **feedback,
+                'tactical_action': 'wait',
+                'preferred_action': 'wait',
+                'wait_reason': wait_reason,
+                'trigger_price': None,
+                'chase_limit_price': None,
+                'target_price': None,
+                'stop_loss_price': None,
+                'expected_holding_period': None,
+                'confidence_score_10': 1.0,
+                'conviction_score_10': 1.0,
+                'thesis_summary': summary,
+                'trigger_conditions': [],
+                'supporting_evidence': [],
+                'tactical_risks': ['agent_json_contract_violation'],
+                'decision_delta': {},
+                'invalidation_conditions': [],
+                'data_quality_warnings': [data_warning],
+                'traceability': {
+                    'agent_name': spec.agent_name,
+                    'symbol': symbol,
+                    'market_date': market_date.isoformat(),
+                    'fallback_generated_by_core': True,
+                },
+            }
+
+        items = []
+        for batch_item in batch_items:
+            symbol = str(batch_item.get('symbol') or '').strip()
+            if not symbol:
+                continue
+            if spec.role == SIGNAL_DECIDER_AGENT_NAME:
+                feedback = _decision_feedback(symbol)
+            elif spec.role == SHORT_TERM_DECIDER_AGENT_NAME:
+                feedback = _short_term_feedback(symbol)
+            else:
+                feedback = _base_feedback(symbol)
+            items.append({'symbol': symbol, 'feedback': feedback})
+        return {'items': items}
+
     def _recover_from_session_history(
         self,
         *,
@@ -1304,28 +1432,37 @@ class OpenClawAgentClient:
                         json_failure_class=json_failure_class,
                         response_correlation=response_correlation,
                     )
-                    error_message = (
-                        f'OpenClaw batch response {failure_class}:{failure_mode}'
-                        if failure_mode and failure_mode != failure_class
-                        else f'OpenClaw batch response {failure_class}'
+                    decoded = self._build_structured_fallback_batch_response(
+                        spec=spec,
+                        market_date=market_date,
+                        batch_items=batch_items,
+                        output_text=output_text,
+                        failure_class=failure_class,
+                        failure_mode=failure_mode,
+                        json_failure_class=json_failure_class,
+                        response_recovery=response_recovery,
                     )
-                    raise AgentDispatchRetryableError(
-                        error_message,
-                        details={
-                            'failure_kind': failure_mode or failure_class,
-                            'failure_class': failure_class,
-                            'failure_mode': failure_mode,
-                            'json_failure_class': json_failure_class,
-                            'session_key': request_session_key,
-                            'session_id': session_ref.get('session_id'),
-                            'response_id': response_id,
-                            'request_marker': request_marker,
-                            'response_recovery': response_recovery,
-                            'batch_symbols': batch_symbols,
-                            'dispatch_id': dispatch_id,
-                            'attempt_id': attempt_id,
-                            'slot': slot,
-                        },
+                    decoded_source = 'core_structured_fallback'
+                    log_agent_feedback_event(
+                        'batch_response_structured_fallback',
+                        status='accepted_with_fallback',
+                        request_run_id=request_run_id,
+                        dispatch_id=dispatch_id,
+                        attempt_id=attempt_id,
+                        agent_name=spec.agent_name,
+                        role=spec.role,
+                        market_date=market_date.isoformat(),
+                        session_key=request_session_key,
+                        session_id=session_ref.get('session_id'),
+                        response_id=response_id,
+                        request_marker=request_marker,
+                        batch_symbols=batch_symbols,
+                        slot=slot,
+                        session_reuse_mode=session_reuse_mode,
+                        failure_class=failure_class,
+                        failure_mode=failure_mode,
+                        json_failure_class=json_failure_class,
+                        response_recovery=response_recovery,
                     )
                 decoded = _coerce_decoded_batch_response(decoded)
                 top_level_object_fallback = False
@@ -1767,6 +1904,7 @@ class AgentFeedbackOrchestrator:
         market_date: date,
         request_run_id: str,
         role: str | None = None,
+        max_seconds: float = 10.0,
     ) -> list[dict[str, Any]]:
         state = runtime_feedback_state_store.get_run(market_date, run_id=request_run_id)
         if state is None:
@@ -1807,8 +1945,40 @@ class AgentFeedbackOrchestrator:
         if not rows_to_cleanup and not failure_cleanup_targets:
             return []
 
-        cleanup_results = self._cleanup_buffered_feedback_sessions(rows=rows_to_cleanup)
+        started_at = time.monotonic()
+        deadline = started_at + max(0.0, float(max_seconds))
+        cleanup_results: list[dict[str, Any]] = []
+        deferred_session_keys: set[str] = set()
+
+        def _deadline_exceeded() -> bool:
+            return time.monotonic() >= deadline
+
+        seen_session_keys: set[str] = set()
+        for row in rows_to_cleanup:
+            response = row.get('summary') if isinstance(row.get('summary'), dict) else None
+            session_key = self._session_key_from_response(response)
+            if session_key is None or session_key in seen_session_keys:
+                continue
+            if _deadline_exceeded():
+                deferred_session_keys.add(session_key)
+                continue
+            cleanup_result = self._cleanup_feedback_session(
+                market_date=row['market_date'],
+                symbol=str(row.get('symbol') or ''),
+                agent_name=str(row.get('agent_name') or ''),
+                run_id=row.get('run_id'),
+                response=response,
+            )
+            if cleanup_result is not None:
+                cleanup_results.append(cleanup_result)
+            seen_session_keys.add(session_key)
+
         for target in failure_cleanup_targets:
+            session_key = target.get('session_key')
+            if _deadline_exceeded():
+                if isinstance(session_key, str):
+                    deferred_session_keys.add(session_key)
+                continue
             cleanup_results.append(self._cleanup_session_key(**target))
         session_keys = {
             session_key
@@ -1823,6 +1993,28 @@ class AgentFeedbackOrchestrator:
             for target in failure_cleanup_targets
             if isinstance(target.get('session_key'), str)
         )
+        if deferred_session_keys:
+            cleanup_results.append(
+                {
+                    'status': 'deferred',
+                    'reason': 'cleanup_time_budget_exhausted',
+                    'deferred_count': len(deferred_session_keys),
+                    'max_seconds': max_seconds,
+                }
+            )
+            log_agent_feedback_event(
+                'cleanup_persisted_run_sessions_deferred',
+                status='deferred',
+                market_date=market_date.isoformat(),
+                request_run_id=request_run_id,
+                role=role,
+                persistence_result={
+                    'cleaned_count': len(session_keys - deferred_session_keys),
+                    'deferred_count': len(deferred_session_keys),
+                    'max_seconds': max_seconds,
+                },
+            )
+        session_keys = session_keys - deferred_session_keys
 
         def _mark_cleaned(current: RuntimeFeedbackRunState) -> None:
             current.cleaned_session_keys.update(session_keys)

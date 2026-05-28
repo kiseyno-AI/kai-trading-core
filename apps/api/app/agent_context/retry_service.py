@@ -782,6 +782,7 @@ class AgentFeedbackRetryService:
                                 symbols=dispatch_symbols,
                                 roles=[role],
                                 reuse_existing=config.reuse_existing,
+                                force=force,
                             )
                             role_result.update(
                                 {
