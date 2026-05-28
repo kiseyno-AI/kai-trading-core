@@ -4,7 +4,7 @@ import asyncio
 from collections import Counter, defaultdict
 import copy
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 import hashlib
 import json
@@ -121,6 +121,57 @@ UI_MONITORING_STATE_WATCHING_TARGET_STOP = 'watching_target_stop'
 UI_MONITORING_STATE_WATCHING_FILL = 'watching_fill'
 UI_MONITORING_STATE_RECONCILING = 'reconciling'
 UI_MONITORING_STATE_IDLE = 'idle'
+
+EXEC_AGENT_APPROVE_ACTIONS = {'approve', 'approved'}
+EXEC_AGENT_REJECT_ACTIONS = {
+    'block',
+    'blocked',
+    'cancel',
+    'cancelled',
+    'decline',
+    'declined',
+    'denied',
+    'deny',
+    'expired',
+    'failed',
+    'not_approved',
+    'reject',
+    'rejected',
+}
+EXEC_MONITORING_ACTIVE_STATUSES = {
+    'accepted',
+    'active',
+    'created',
+    'monitoring',
+    'open',
+    'partial',
+    'partial_fill',
+    'partially_filled',
+    'pending',
+    'queued',
+    'running',
+    'scheduled',
+    'submitted',
+    'target_sell_monitoring',
+    'watch_monitoring_active',
+    'watch_monitoring_pending',
+    'working',
+}
+EXEC_MONITORING_TERMINAL_STATUSES = {
+    'canceled',
+    'cancelled',
+    'closed',
+    'declined',
+    'denied',
+    'done',
+    'expired',
+    'failed',
+    'not_approved',
+    'reject',
+    'rejected',
+    'stop_sell_cancelled',
+    'target_sell_cancelled',
+}
 
 DASHBOARD_ENDPOINT_DAILY_BOARD = 'daily_board'
 DASHBOARD_ENDPOINT_MONITORED_SYMBOLS = 'monitored_symbols'
@@ -1156,6 +1207,148 @@ class SignalDeciderExecIntegrationService:
         )
         return payload
 
+    @staticmethod
+    def _collect_runtime_plan_item_ids(items: Sequence[dict[str, Any]]) -> set[int]:
+        ids: set[int] = set()
+        for item in items:
+            parsed = _safe_decimal(item.get('plan_item_id'))
+            if parsed is not None:
+                ids.add(int(parsed))
+        return ids
+
+    @staticmethod
+    def _collect_runtime_held_scopes(items: Sequence[dict[str, Any]]) -> set[tuple[str, str]]:
+        scopes: set[tuple[str, str]] = set()
+        for item in items:
+            if not item.get('held_position') and (_safe_decimal(item.get('position_quantity')) or Decimal('0')) <= Decimal('0'):
+                continue
+            account_reference = _normalize_optional_text(item.get('account_reference'))
+            symbol = _normalize_optional_text(item.get('symbol'))
+            if account_reference and symbol:
+                scopes.add((account_reference, symbol))
+        return scopes
+
+    def _load_historical_held_runtime_board_items(
+        self,
+        *,
+        market_date: date,
+        runtime_status: str,
+        existing_plan_item_ids: set[int],
+        existing_held_scopes: set[tuple[str, str]],
+    ) -> list[dict[str, Any]]:
+        lookback_start = market_date - timedelta(days=365)
+        with session_scope() as session:
+            rows = session.execute(
+                select(SignalDeciderExecutionPlanItem)
+                .where(
+                    SignalDeciderExecutionPlanItem.execution_window == EXECUTION_WINDOW_NEXT_OPEN,
+                    SignalDeciderExecutionPlanItem.target_trade_date < market_date,
+                    SignalDeciderExecutionPlanItem.target_trade_date >= lookback_start,
+                    SignalDeciderExecutionPlanItem.submission_payload.is_not(None),
+                )
+                .order_by(
+                    SignalDeciderExecutionPlanItem.target_trade_date.desc(),
+                    SignalDeciderExecutionPlanItem.id.desc(),
+                )
+                .limit(500)
+            ).scalars().all()
+            serialized_rows = [self._serialize_execution_plan_row_for_runtime(row) for row in rows]
+
+        candidate_items = [self._augment_exec_overview_item(item) for item in serialized_rows]
+        held_symbols = [
+            item.get('symbol')
+            for item in candidate_items
+            if self._overview_item_has_held_position(item)
+            and self._overview_item_has_recent_readback(item, market_date=market_date)
+            and _safe_decimal(item.get('plan_item_id')) is not None
+            and int(_safe_decimal(item.get('plan_item_id'))) not in existing_plan_item_ids
+        ]
+        symbol_metadata_map = self._load_symbol_metadata_map(held_symbols)
+
+        held_items: list[dict[str, Any]] = []
+        seen_scopes = set(existing_held_scopes)
+        for item in candidate_items:
+            parsed_plan_item_id = _safe_decimal(item.get('plan_item_id'))
+            if parsed_plan_item_id is None or int(parsed_plan_item_id) in existing_plan_item_ids:
+                continue
+            if not self._overview_item_has_held_position(item):
+                continue
+            if not self._overview_item_has_recent_readback(item, market_date=market_date):
+                continue
+            account_reference = _normalize_optional_text(item.get('account_reference'))
+            symbol = _normalize_optional_text(item.get('symbol'))
+            if not account_reference or not symbol:
+                continue
+            scope = (account_reference, symbol)
+            if scope in seen_scopes:
+                continue
+            seen_scopes.add(scope)
+            held_items.append(
+                self._build_runtime_board_item(
+                    item=item,
+                    market_date=market_date,
+                    symbol_metadata_map=symbol_metadata_map,
+                    runtime_status=runtime_status,
+                )
+            )
+        return held_items
+
+    @staticmethod
+    def _serialize_execution_plan_row_for_runtime(row: SignalDeciderExecutionPlanItem) -> dict[str, Any]:
+        return {
+            'plan_item_id': row.id,
+            'execution_window': row.execution_window,
+            'agent_name': row.decision_agent_name,
+            'decision_agent_name': row.decision_agent_name,
+            'target_trade_date': row.target_trade_date.isoformat(),
+            'source_market_date': row.source_market_date.isoformat(),
+            'account_reference': row.account_reference,
+            'account_label': row.account_label,
+            'symbol': row.symbol,
+            'policy_version': row.policy_version,
+            'decision_snapshot_id': row.decision_snapshot_id,
+            'planned_side': row.planned_side,
+            'planned_order_type': row.planned_order_type,
+            'planned_time_in_force': row.planned_time_in_force,
+            'allocation_budget_krw': _decimal_to_text(_safe_decimal(row.allocation_budget_krw)),
+            'estimated_reference_price': row.estimated_reference_price,
+            'planned_quantity': _decimal_to_text(_safe_decimal(row.planned_quantity)),
+            'estimated_notional_krw': _decimal_to_text(_safe_decimal(row.estimated_notional_krw)),
+            'eligibility_status': row.eligibility_status,
+            'execution_status': row.execution_status,
+            'client_order_id': row.client_order_id,
+            'order_request_id': row.order_request_id,
+            'broker_order_row_id': row.broker_order_row_id,
+            'validation': row.validation_payload,
+            'traceability': row.traceability_payload,
+            'submission': row.submission_payload,
+            'first_ready_at': row.first_ready_at.isoformat() if row.first_ready_at else None,
+            'last_evaluated_at': row.last_evaluated_at.isoformat() if row.last_evaluated_at else None,
+            'submitted_at': row.submitted_at.isoformat() if row.submitted_at else None,
+        }
+
+    @staticmethod
+    def _overview_item_has_held_position(item: dict[str, Any]) -> bool:
+        remote_state = item.get('remote_state') if isinstance(item.get('remote_state'), dict) else {}
+        positions = remote_state.get('positions') if isinstance(remote_state.get('positions'), list) else []
+        if any((_safe_decimal(position.get('quantity') or position.get('available_quantity')) or Decimal('0')) > Decimal('0') for position in positions):
+            return True
+        return (_safe_decimal(remote_state.get('open_quantity')) or Decimal('0')) > Decimal('0')
+
+    @staticmethod
+    def _overview_item_has_recent_readback(
+        item: dict[str, Any],
+        *,
+        market_date: date,
+        max_age_days: int = 30,
+    ) -> bool:
+        remote_state = item.get('remote_state') if isinstance(item.get('remote_state'), dict) else {}
+        last_synced_at = _parse_iso_datetime(remote_state.get('last_synced_at'))
+        if last_synced_at is None:
+            return False
+        latest_allowed_date = market_date - timedelta(days=max_age_days)
+        return latest_allowed_date <= last_synced_at.date() <= market_date
+
     async def get_runtime_symbol_detail(
         self,
         *,
@@ -1263,8 +1456,17 @@ class SignalDeciderExecIntegrationService:
         served_from_cache: bool,
     ) -> dict[str, Any]:
         resolved_market_date = date.fromisoformat(str(board['market_date']))
+        board_items = list(board.get('items') or [])
+        board_items.extend(
+            self._load_historical_held_runtime_board_items(
+                market_date=resolved_market_date,
+                runtime_status=board['runtime']['status'],
+                existing_plan_item_ids=self._collect_runtime_plan_item_ids(board_items),
+                existing_held_scopes=self._collect_runtime_held_scopes(board_items),
+            )
+        )
         grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
-        for item in board.get('items') or []:
+        for item in board_items:
             symbol = _normalize_optional_text(item.get('symbol'))
             if symbol:
                 grouped[symbol].append(item)
@@ -1308,7 +1510,7 @@ class SignalDeciderExecIntegrationService:
                 generated_at=generated_at,
                 served_from_cache=served_from_cache,
                 runtime_status=board['runtime']['status'],
-                overview_items=board.get('items') or [],
+                overview_items=board_items,
                 output_item_count=len(items),
                 refresh_state=refresh_state,
             ),
@@ -3287,6 +3489,321 @@ class SignalDeciderExecIntegrationService:
             'delegate_execution': bool(integration.get('delegate_execution')),
         }
 
+    @classmethod
+    def _iter_exec_agent_payloads(cls, item: dict[str, Any]) -> Iterable[dict[str, Any]]:
+        dispatch = item.get('dispatch') if isinstance(item.get('dispatch'), dict) else {}
+        links = [link for link in dispatch.get('item_links') or [] if isinstance(link, dict)]
+        entry_links = [
+            link
+            for link in links
+            if _normalize_optional_text(link.get('intent'), lowercase=True) in EXEC_ENTRY_BUY_INTENTS
+        ]
+        for link in entry_links or links:
+            response_item = link.get('response_item') if isinstance(link.get('response_item'), dict) else {}
+            if response_item:
+                yield response_item
+                yield from cls._iter_nested_exec_agent_payloads(response_item)
+
+    @classmethod
+    def _iter_nested_exec_agent_payloads(cls, payload: dict[str, Any], *, depth: int = 0) -> Iterable[dict[str, Any]]:
+        if depth >= 3:
+            return
+        for key in (
+            'agent_sizing',
+            'sizing',
+            'sizing_decision',
+            'quantity_decision',
+            'approval',
+            'decision',
+            'audit',
+            'exec_agent_audit',
+            'order',
+            'materialized_order',
+        ):
+            nested = payload.get(key)
+            if isinstance(nested, dict):
+                yield nested
+                yield from cls._iter_nested_exec_agent_payloads(nested, depth=depth + 1)
+
+    @staticmethod
+    def _extract_agent_approval_status(payload: dict[str, Any]) -> bool | None:
+        for key in ('approved', 'is_approved', 'exec_agent_approved'):
+            parsed = _normalize_bool(payload.get(key))
+            if parsed is not None:
+                return parsed
+        for key in (
+            'exec_agent_action',
+            'agent_action',
+            'approval_action',
+            'decision_action',
+            'risk_decision',
+            'approval_status',
+            'decision_status',
+            'status',
+            'action',
+        ):
+            normalized = _normalize_status(payload.get(key))
+            if normalized in EXEC_AGENT_APPROVE_ACTIONS:
+                return True
+            if normalized in EXEC_AGENT_REJECT_ACTIONS:
+                return False
+        return None
+
+    @staticmethod
+    def _first_agent_text(payloads: Sequence[dict[str, Any]], keys: Sequence[str]) -> str | None:
+        for payload in payloads:
+            for key in keys:
+                value = _normalize_optional_text(payload.get(key))
+                if value:
+                    return value
+        return None
+
+    @staticmethod
+    def _first_agent_bool(payloads: Sequence[dict[str, Any]], keys: Sequence[str]) -> bool | None:
+        for payload in payloads:
+            for key in keys:
+                parsed = _normalize_bool(payload.get(key))
+                if parsed is not None:
+                    return parsed
+        return None
+
+    @classmethod
+    def _extract_exec_agent_decision(cls, item: dict[str, Any]) -> dict[str, Any]:
+        payloads = list(cls._iter_exec_agent_payloads(item))
+        approval_values = [
+            parsed
+            for payload in payloads
+            if (parsed := cls._extract_agent_approval_status(payload)) is not None
+        ]
+        approved_quantity: Decimal | None = None
+        approved_notional: Decimal | None = None
+        for payload in payloads:
+            if approved_quantity is None:
+                approved_quantity = _extract_agent_approved_quantity(payload)
+            if approved_notional is None:
+                for key in (
+                    'approved_notional',
+                    'approved_notional_krw',
+                    'notional',
+                    'notional_krw',
+                    'order_notional',
+                    'order_notional_krw',
+                ):
+                    approved_notional = _positive_decimal(payload.get(key))
+                    if approved_notional is not None:
+                        break
+
+        approved = any(value is True for value in approval_values)
+        rejected = any(value is False for value in approval_values)
+        if not approved and approved_quantity is not None and not rejected:
+            approved = True
+
+        action = cls._first_agent_text(
+            payloads,
+            (
+                'exec_agent_action',
+                'agent_action',
+                'approval_action',
+                'decision_action',
+                'risk_decision',
+                'action',
+            ),
+        )
+        normalized_action = _normalize_status(action)
+        if not action:
+            if approved:
+                action = 'approve'
+            elif rejected:
+                action = 'reject'
+        elif normalized_action in EXEC_AGENT_APPROVE_ACTIONS:
+            action = 'approve'
+        elif normalized_action in EXEC_AGENT_REJECT_ACTIONS:
+            action = 'reject'
+
+        return {
+            'approved': approved,
+            'rejected': rejected and not approved,
+            'action': action,
+            'reason_code': cls._first_agent_text(
+                payloads,
+                (
+                    'reason_code',
+                    'reasonCode',
+                    'approval_reason_code',
+                    'rejection_reason_code',
+                    'reason',
+                    'rejection_reason',
+                    'message',
+                ),
+            ),
+            'target_profile': cls._first_agent_text(payloads, ('target_profile', 'targetProfile')),
+            'target_tag': cls._first_agent_text(payloads, ('target_tag', 'targetTag')),
+            'special_tactical_scalp': cls._first_agent_bool(
+                payloads,
+                ('special_tactical_scalp', 'specialTacticalScalp'),
+            ),
+            'approved_quantity': approved_quantity,
+            'approved_notional': approved_notional,
+        }
+
+    @classmethod
+    def _collect_runtime_monitoring_statuses(
+        cls,
+        *,
+        item: dict[str, Any],
+        status: str,
+        monitoring_state: str,
+        intent: str,
+        planned_intents: Sequence[str],
+        held_position: bool,
+        exec_agent_approved: bool,
+    ) -> list[str]:
+        statuses: set[str] = set()
+
+        def add_status(value: Any) -> None:
+            normalized = _normalize_status(value)
+            if normalized:
+                statuses.add(normalized)
+
+        def collect_from_payload(payload: dict[str, Any]) -> None:
+            for key in (
+                'monitoring_status',
+                'monitoring_state',
+                'watch_status',
+                'plan_item_status',
+                'decision_status',
+                'status',
+                'remote_status',
+            ):
+                add_status(payload.get(key))
+            for key in ('monitoring_statuses', 'monitoringStatuses', 'statuses'):
+                values = payload.get(key)
+                if isinstance(values, list):
+                    for value in values:
+                        add_status(value)
+            monitoring = payload.get('monitoring')
+            if isinstance(monitoring, dict):
+                collect_from_payload(monitoring)
+
+        dispatch = item.get('dispatch') if isinstance(item.get('dispatch'), dict) else {}
+        for link in dispatch.get('item_links') or []:
+            if not isinstance(link, dict):
+                continue
+            collect_from_payload(link)
+            response_item = link.get('response_item')
+            if isinstance(response_item, dict):
+                collect_from_payload(response_item)
+                for nested in cls._iter_nested_exec_agent_payloads(response_item):
+                    collect_from_payload(nested)
+
+        if held_position:
+            if EXEC_INTENT_TARGET_SELL in planned_intents or _positive_decimal(item.get('target_price')) is not None:
+                statuses.add('target_sell_monitoring')
+            if EXEC_INTENT_STOP_SELL in planned_intents or _positive_decimal(item.get('stop_loss_price')) is not None:
+                statuses.add('stop_sell_monitoring')
+
+        active_entry_status = status in {
+            UI_BOARD_STATUS_ACCEPTED,
+            UI_BOARD_STATUS_SCHEDULED,
+            UI_BOARD_STATUS_SUBMITTED,
+            UI_BOARD_STATUS_PARTIAL,
+        }
+        if exec_agent_approved and intent in EXEC_ENTRY_BUY_INTENTS:
+            if monitoring_state == UI_MONITORING_STATE_WATCHING_FILL or active_entry_status:
+                statuses.add('watch_monitoring_active')
+            elif status == UI_BOARD_STATUS_PLANNED:
+                statuses.add('watch_monitoring_pending')
+
+        return sorted(statuses)
+
+    @staticmethod
+    def _has_active_exec_monitoring_status(statuses: Sequence[str]) -> bool:
+        for status in statuses:
+            normalized = _normalize_status(status)
+            if not normalized or normalized in EXEC_MONITORING_TERMINAL_STATUSES:
+                continue
+            if normalized in EXEC_MONITORING_ACTIVE_STATUSES:
+                return True
+            if normalized.endswith('_monitoring') or normalized.startswith('watch_monitoring_'):
+                return True
+        return False
+
+    @staticmethod
+    def _has_terminal_exec_monitoring_status(*, status: str, statuses: Sequence[str]) -> bool:
+        if _normalize_status(status) in {UI_BOARD_STATUS_CANCELLED, UI_BOARD_STATUS_FAILED}:
+            return True
+        return any(_normalize_status(value) in EXEC_MONITORING_TERMINAL_STATUSES for value in statuses)
+
+    @classmethod
+    def _build_runtime_exec_contract(
+        cls,
+        *,
+        item: dict[str, Any],
+        status: str,
+        monitoring_state: str,
+        intent: str,
+        planned_intents: Sequence[str],
+        position_quantity: Decimal,
+        position_average_price: Decimal | None,
+    ) -> dict[str, Any]:
+        held_position = position_quantity > Decimal('0')
+        agent_decision = cls._extract_exec_agent_decision(item)
+        exec_agent_approved = bool(agent_decision['approved'])
+        monitoring_statuses = cls._collect_runtime_monitoring_statuses(
+            item=item,
+            status=status,
+            monitoring_state=monitoring_state,
+            intent=intent,
+            planned_intents=planned_intents,
+            held_position=held_position,
+            exec_agent_approved=exec_agent_approved,
+        )
+        terminal = cls._has_terminal_exec_monitoring_status(status=status, statuses=monitoring_statuses)
+        active_monitoring = cls._has_active_exec_monitoring_status(monitoring_statuses)
+        exec_monitoring_active = held_position or (exec_agent_approved and active_monitoring and not terminal)
+        has_execution_plan = bool(_normalize_optional_text((item.get('dispatch') or {}).get('plan_id')))
+
+        if held_position:
+            runtime_state = 'held_position'
+            exclusion_reason = None
+        elif exec_agent_approved and active_monitoring and not terminal:
+            runtime_state = 'exec_approved_watch'
+            exclusion_reason = None
+        elif agent_decision['rejected']:
+            runtime_state = 'exec_agent_rejected'
+            exclusion_reason = 'exec_agent_rejected'
+        elif terminal:
+            runtime_state = 'terminal_no_position'
+            exclusion_reason = 'terminal_no_position'
+        elif exec_agent_approved:
+            runtime_state = 'exec_approved_inactive'
+            exclusion_reason = 'exec_approved_without_active_monitoring'
+        elif has_execution_plan or planned_intents or status == UI_BOARD_STATUS_PLANNED:
+            runtime_state = 'core_planned_only'
+            exclusion_reason = 'core_planned_not_exec_approved'
+        else:
+            runtime_state = 'stale_no_active_monitoring'
+            exclusion_reason = 'stale_no_active_monitoring'
+
+        return {
+            'exec_monitoring_active': exec_monitoring_active,
+            'exec_runtime_showable': exec_monitoring_active,
+            'exec_runtime_state': runtime_state,
+            'exec_runtime_exclusion_reason': exclusion_reason,
+            'exec_agent_approved': exec_agent_approved,
+            'exec_agent_action': agent_decision['action'],
+            'exec_agent_reason_code': agent_decision['reason_code'],
+            'exec_agent_target_profile': agent_decision['target_profile'],
+            'exec_agent_target_tag': agent_decision['target_tag'],
+            'exec_agent_special_tactical_scalp': agent_decision['special_tactical_scalp'],
+            'held_position': held_position,
+            'position_quantity': _to_json_number(position_quantity),
+            'position_average_price': _to_json_number(position_average_price),
+            'approved_quantity': _to_json_number(agent_decision['approved_quantity']),
+            'approved_notional': _decimal_to_text(agent_decision['approved_notional']),
+            'monitoring_statuses': monitoring_statuses,
+        }
+
     def _build_runtime_board_item(
         self,
         *,
@@ -3334,6 +3851,7 @@ class SignalDeciderExecIntegrationService:
         )
         remote_open_quantity = _safe_decimal(remote_state.get('open_quantity'))
         position_quantity = self._sum_position_quantity(positions=positions)
+        position_average_price = self._weighted_position_average_price(positions=positions)
         attributed_position_quantity = (
             max(remote_open_quantity or Decimal('0'), position_quantity)
             if has_plan_attributed_fill_evidence
@@ -3368,6 +3886,16 @@ class SignalDeciderExecIntegrationService:
             has_execution_plan=bool(_normalize_optional_text((item.get('dispatch') or {}).get('plan_id'))),
             has_target_stop_watch=self._has_target_stop_watch_facts(item),
         )
+        intent = self._resolve_entry_intent(item=item)
+        exec_contract = self._build_runtime_exec_contract(
+            item=item,
+            status=status,
+            monitoring_state=monitoring_state,
+            intent=intent,
+            planned_intents=planned_intents,
+            position_quantity=position_quantity,
+            position_average_price=position_average_price,
+        )
         return {
             'plan_item_id': item.get('plan_item_id'),
             'account_reference': item.get('account_reference'),
@@ -3377,10 +3905,13 @@ class SignalDeciderExecIntegrationService:
             'market': metadata['market'],
             'agent_name': decision_agent_name,
             'decision_agent_name': decision_agent_name,
-            'intent': self._resolve_entry_intent(item=item),
+            'intent': intent,
             'status': status,
             'monitoring_state': monitoring_state,
-            'position_side': 'long' if open_quantity > Decimal('0') or planned_quantity is not None else None,
+            **exec_contract,
+            'position_side': 'long'
+            if open_quantity > Decimal('0') or position_quantity > Decimal('0') or planned_quantity is not None
+            else None,
             'planned_intents': planned_intents,
             'planned_quantity': _to_json_number(planned_quantity),
             'filled_quantity': _to_json_number(entry_filled_quantity),
@@ -3444,14 +3975,96 @@ class SignalDeciderExecIntegrationService:
     ) -> dict[str, Any]:
         first = items[0]
         monitoring = self._build_runtime_symbol_monitoring(items=items, runtime_status=runtime_status)
+        preferred_items = sorted(
+            items,
+            key=lambda item: (
+                bool(item.get('held_position')),
+                bool(item.get('exec_agent_approved')),
+                bool(item.get('exec_runtime_showable')),
+                _normalize_optional_text(item.get('last_updated_at')) or '',
+            ),
+            reverse=True,
+        )
+
+        def first_value(field_name: str) -> Any:
+            for candidate in preferred_items:
+                value = candidate.get(field_name)
+                if value is not None and value != '':
+                    return value
+            return None
+
+        monitoring_statuses = sorted(
+            {
+                status
+                for item in items
+                for status in (item.get('monitoring_statuses') or [])
+                if _normalize_optional_text(status)
+            }
+        )
+        position_by_account: dict[str, tuple[Decimal, Decimal | None]] = {}
+        for index, item in enumerate(items):
+            quantity = _safe_decimal(item.get('position_quantity')) or Decimal('0')
+            if quantity <= Decimal('0'):
+                continue
+            account_key = (
+                _normalize_optional_text(item.get('account_reference'))
+                or _normalize_optional_text(item.get('plan_item_id'))
+                or str(index)
+            )
+            existing_quantity = position_by_account.get(account_key, (Decimal('0'), None))[0]
+            if quantity >= existing_quantity:
+                position_by_account[account_key] = (quantity, _safe_decimal(item.get('position_average_price')))
+        position_quantity = sum((quantity for quantity, _ in position_by_account.values()), start=Decimal('0'))
+        approved_quantity = sum(
+            ((_safe_decimal(item.get('approved_quantity')) or Decimal('0')) for item in items),
+            start=Decimal('0'),
+        )
+        approved_notional = sum(
+            ((_safe_decimal(item.get('approved_notional')) or Decimal('0')) for item in items),
+            start=Decimal('0'),
+        )
+        position_average_price = self._weighted_average_from_quantity_price_pairs(position_by_account.values())
+        exclusion_reasons = sorted(
+            {
+                reason
+                for item in items
+                if (reason := _normalize_optional_text(item.get('exec_runtime_exclusion_reason'), lowercase=True))
+            }
+        )
+        exec_runtime_showable = any(bool(item.get('exec_runtime_showable')) for item in items)
+        exec_monitoring_active = any(bool(item.get('exec_monitoring_active')) for item in items)
         return {
             'symbol': symbol,
             'name': first.get('name') or symbol,
             'market': first.get('market'),
             **self._price_fields_for_symbol(symbol, market_date=market_date),
             'monitoring_state': monitoring['state'],
+            'exec_monitoring_active': exec_monitoring_active,
+            'exec_runtime_showable': exec_runtime_showable,
+            'exec_runtime_state': first_value('exec_runtime_state') or 'stale_no_active_monitoring',
+            'exec_runtime_exclusion_reason': None
+            if exec_runtime_showable
+            else (exclusion_reasons[0] if exclusion_reasons else 'stale_no_active_monitoring'),
+            'exec_runtime_exclusion_reasons': [] if exec_runtime_showable else exclusion_reasons,
+            'exec_agent_approved': any(bool(item.get('exec_agent_approved')) for item in items),
+            'exec_agent_action': first_value('exec_agent_action'),
+            'exec_agent_reason_code': first_value('exec_agent_reason_code'),
+            'exec_agent_target_profile': first_value('exec_agent_target_profile'),
+            'exec_agent_target_tag': first_value('exec_agent_target_tag'),
+            'exec_agent_special_tactical_scalp': first_value('exec_agent_special_tactical_scalp'),
+            'held_position': position_quantity > Decimal('0') or any(bool(item.get('held_position')) for item in items),
+            'position_quantity': _to_json_number(position_quantity),
+            'position_average_price': _to_json_number(position_average_price),
+            'approved_quantity': _to_json_number(approved_quantity if approved_quantity > Decimal('0') else None),
+            'approved_notional': _decimal_to_text(approved_notional if approved_notional > Decimal('0') else None),
+            'monitoring_statuses': monitoring_statuses,
             'position_side': monitoring['position_side'],
             'planned_intents': monitoring['planned_intents'],
+            'target_price': first_value('target_price'),
+            'stop_loss_price': first_value('stop_loss_price'),
+            'trigger_price': first_value('trigger_price'),
+            'chase_limit_price': first_value('chase_limit_price'),
+            'expected_holding_period': first_value('expected_holding_period'),
             'decision_agent_names': sorted(
                 {
                     _normalize_decision_agent_name(item.get('decision_agent_name'))
@@ -3479,6 +4092,8 @@ class SignalDeciderExecIntegrationService:
 
     def _should_include_monitored_symbol_group(self, items: Sequence[dict[str, Any]]) -> bool:
         for item in items:
+            if item.get('exec_runtime_showable') or item.get('held_position'):
+                return True
             if _normalize_optional_text(item.get('monitoring_state'), lowercase=True) != UI_MONITORING_STATE_IDLE:
                 return True
             if _normalize_optional_text(item.get('status'), lowercase=True) in {
@@ -3735,6 +4350,8 @@ class SignalDeciderExecIntegrationService:
             'state': state,
             'position_side': 'long'
             if any((_safe_decimal(item.get('open_quantity')) or Decimal('0')) > Decimal('0') for item in items)
+            or any((_safe_decimal(item.get('position_quantity')) or Decimal('0')) > Decimal('0') for item in items)
+            or any(bool(item.get('held_position')) for item in items)
             else None,
             'planned_intents': sorted(
                 {
@@ -3840,6 +4457,42 @@ class SignalDeciderExecIntegrationService:
         for position in positions:
             total += _safe_decimal(position.get('quantity') or position.get('available_quantity')) or Decimal('0')
         return total
+
+    @staticmethod
+    def _weighted_position_average_price(*, positions: Sequence[dict[str, Any]]) -> Decimal | None:
+        total_quantity = Decimal('0')
+        total_notional = Decimal('0')
+        fallback_price: Decimal | None = None
+        for position in positions:
+            quantity = _safe_decimal(position.get('quantity') or position.get('available_quantity')) or Decimal('0')
+            price = _safe_decimal(position.get('average_price') or position.get('avg_price'))
+            if price is not None and fallback_price is None:
+                fallback_price = price
+            if quantity <= Decimal('0') or price is None:
+                continue
+            total_quantity += quantity
+            total_notional += quantity * price
+        if total_quantity > Decimal('0'):
+            return total_notional / total_quantity
+        return fallback_price
+
+    @staticmethod
+    def _weighted_average_from_quantity_price_pairs(
+        pairs: Iterable[tuple[Decimal, Decimal | None]],
+    ) -> Decimal | None:
+        total_quantity = Decimal('0')
+        total_notional = Decimal('0')
+        fallback_price: Decimal | None = None
+        for quantity, price in pairs:
+            if price is not None and fallback_price is None:
+                fallback_price = price
+            if quantity <= Decimal('0') or price is None:
+                continue
+            total_quantity += quantity
+            total_notional += quantity * price
+        if total_quantity > Decimal('0'):
+            return total_notional / total_quantity
+        return fallback_price
 
     @staticmethod
     def _collect_order_statuses(*, orders: Sequence[dict[str, Any]]) -> set[str]:
