@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Callable
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import and_, func, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import aliased
 
+from app.agent_context.prerequisite_service import AgentFeedbackPrerequisiteService
 from app.core.settings import settings
 from app.db import session_scope
 from app.db_models import (
+    AgentContextFeedback,
     DailyMarketRiskFilterResult,
     DailyPiotroskiFilterResult,
     DailyAdvancedValueFactorResult,
@@ -18,10 +21,15 @@ from app.db_models import (
     DailyCompositeFactorResult,
     DailyLowRiskFactorResult,
     DailyMomentumFactorResult,
+    DailyPipelineRun,
+    DailyPipelineStageRun,
     DailyPriceBar,
     DailyQualityFactorResult,
+    DailySignalFeature,
     DailyUnifiedValueFactorResult,
     DailyValueFactorResult,
+    ExternalNewsItem,
+    SignalDeciderDecisionSnapshot,
     Symbol,
 )
 from app.dart.fundamentals_capture_service import dart_fundamentals_capture_service
@@ -87,6 +95,25 @@ ROW_COUNT_STAGE_MODELS = {
 }
 ROW_COUNT_STAGE_MISSING_SAMPLE_LIMIT = 10
 PARTIAL_ROW_COUNT_MIN_NON_BLOCKING_COVERAGE_RATIO = 0.99
+NON_DATE_SCOPED_PREOPEN_STAGE_IDS = (
+    'master_refresh',
+    'pykrx_universe_refresh',
+)
+SIGNAL_DECIDER_AGENT_NAME = 'signal-decider'
+SEOUL_TZ = ZoneInfo('Asia/Seoul')
+PERSISTED_OUTPUT_FALLBACK_MODES = {
+    'derived_from_daily_signal_features',
+    'derived_from_external_news_items',
+    'derived_from_signal_decider_outputs',
+}
+OFFICIAL_STAGE_HISTORY_INCOMPLETE_STATUSES = {
+    'running',
+    'partial',
+    'failed',
+    'blocked',
+    'interrupted',
+    'abandoned',
+}
 
 
 def _utcnow_iso() -> str:
@@ -149,6 +176,14 @@ def _noop_feedback_run_loader(*, market_date: str) -> dict[str, Any] | None:
     return None
 
 
+def _noop_stage_history_loader(*, market_date: str) -> dict[str, dict[str, Any]]:
+    return {}
+
+
+def _noop_persisted_output_counts_loader(*, market_date: str) -> dict[str, Any]:
+    return {}
+
+
 def _noop_row_count_scope_gap_loader(
     *,
     stage_id: str,
@@ -170,6 +205,31 @@ def _load_pykrx_enrichment_coverage(*, market_date: str) -> dict[str, Any]:
     ).get('coverage') or {}
 
 
+def _load_daily_pipeline_stage_history(*, market_date: str) -> dict[str, dict[str, Any]]:
+    normalized_market_date = date.fromisoformat(market_date)
+    latest_by_stage: dict[str, dict[str, Any]] = {}
+    with session_scope() as session:
+        rows = session.execute(
+            select(DailyPipelineRun, DailyPipelineStageRun)
+            .join(DailyPipelineStageRun, DailyPipelineStageRun.pipeline_run_id == DailyPipelineRun.id)
+            .where(DailyPipelineRun.market_date == normalized_market_date)
+            .where(DailyPipelineStageRun.stage_id.in_(PIPELINE_STAGE_ORDER))
+            .order_by(
+                DailyPipelineStageRun.updated_at.desc().nullslast(),
+                DailyPipelineRun.started_at.desc().nullslast(),
+                DailyPipelineStageRun.id.desc(),
+            )
+        ).all()
+    for run_row, stage_row in rows:
+        if stage_row.stage_id in latest_by_stage:
+            continue
+        latest_by_stage[stage_row.stage_id] = {
+            'run': daily_pipeline_run_state_service._serialize_run(run_row),
+            'stage': daily_pipeline_run_state_service._serialize_stage(stage_row),
+        }
+    return latest_by_stage
+
+
 def _load_factor_stage_counts(*, market_date: str) -> dict[str, dict[str, Any]]:
     normalized_market_date = date.fromisoformat(market_date)
     counts: dict[str, dict[str, Any]] = {}
@@ -188,6 +248,89 @@ def _load_factor_stage_counts(*, market_date: str) -> dict[str, dict[str, Any]]:
                 'updated_at': updated_at.isoformat() if updated_at else None,
             }
     return counts
+
+
+def _load_signal_feature_counts(*, market_date: str) -> dict[str, Any]:
+    normalized_market_date = date.fromisoformat(market_date)
+    with session_scope() as session:
+        persisted, updated_at = session.execute(
+            select(
+                func.count(func.distinct(DailySignalFeature.symbol_id)),
+                func.max(DailySignalFeature.captured_at),
+            )
+            .select_from(DailySignalFeature)
+            .where(DailySignalFeature.market_date == normalized_market_date)
+        ).one()
+    return {
+        'persisted': int(persisted or 0),
+        'updated_at': updated_at.isoformat() if updated_at else None,
+    }
+
+
+def _market_date_utc_bounds(market_date: str) -> tuple[datetime, datetime]:
+    normalized_market_date = date.fromisoformat(market_date)
+    start = datetime.combine(normalized_market_date, time.min, tzinfo=SEOUL_TZ).astimezone(timezone.utc)
+    return start, start + timedelta(days=1)
+
+
+def _load_external_news_counts(*, market_date: str) -> dict[str, Any]:
+    start, end = _market_date_utc_bounds(market_date)
+    with session_scope() as session:
+        rows = session.execute(
+            select(ExternalNewsItem.symbol_id, ExternalNewsItem.payload, ExternalNewsItem.collected_at)
+            .where(ExternalNewsItem.collected_at >= start)
+            .where(ExternalNewsItem.collected_at < end)
+        ).all()
+    symbol_ids = {row.symbol_id for row in rows if row.symbol_id is not None}
+    classified_count = 0
+    latest_collected_at = None
+    for row in rows:
+        payload = row.payload if isinstance(row.payload, dict) else {}
+        classification = payload.get('classification') if isinstance(payload.get('classification'), dict) else {}
+        if classification.get('classifier'):
+            classified_count += 1
+        if row.collected_at and (latest_collected_at is None or row.collected_at > latest_collected_at):
+            latest_collected_at = row.collected_at
+    return {
+        'items': len(rows),
+        'symbols': len(symbol_ids),
+        'classified_items': classified_count,
+        'updated_at': latest_collected_at.isoformat() if latest_collected_at else None,
+    }
+
+
+def _load_signal_decider_output_counts(*, market_date: str) -> dict[str, Any]:
+    normalized_market_date = date.fromisoformat(market_date)
+    with session_scope() as session:
+        feedback_rows, feedback_symbols, latest_feedback_at = session.execute(
+            select(
+                func.count(AgentContextFeedback.id),
+                func.count(func.distinct(AgentContextFeedback.symbol)),
+                func.max(AgentContextFeedback.received_at),
+            )
+            .select_from(AgentContextFeedback)
+            .where(AgentContextFeedback.market_date == normalized_market_date)
+            .where(AgentContextFeedback.agent_name == SIGNAL_DECIDER_AGENT_NAME)
+        ).one()
+        snapshot_rows, snapshot_symbols, latest_snapshot_at = session.execute(
+            select(
+                func.count(SignalDeciderDecisionSnapshot.id),
+                func.count(func.distinct(SignalDeciderDecisionSnapshot.symbol)),
+                func.max(SignalDeciderDecisionSnapshot.created_at),
+            )
+            .select_from(SignalDeciderDecisionSnapshot)
+            .where(SignalDeciderDecisionSnapshot.market_date == normalized_market_date)
+            .where(SignalDeciderDecisionSnapshot.agent_name == SIGNAL_DECIDER_AGENT_NAME)
+        ).one()
+    updated_at_candidates = [value for value in (latest_feedback_at, latest_snapshot_at) if value is not None]
+    updated_at = max(updated_at_candidates).isoformat() if updated_at_candidates else None
+    return {
+        'feedback_rows': int(feedback_rows or 0),
+        'feedback_symbols': int(feedback_symbols or 0),
+        'decision_snapshots': int(snapshot_rows or 0),
+        'decision_snapshot_symbols': int(snapshot_symbols or 0),
+        'updated_at': updated_at,
+    }
 
 
 def _load_row_count_stage_counts(*, market_date: str) -> dict[str, dict[str, Any]]:
@@ -413,7 +556,11 @@ class EODPipelineStatusService:
     action_summary_count_loader: Callable = _noop_price_bar_count_loader
     pykrx_enrichment_loader: Callable = _load_pykrx_enrichment_coverage
     official_run_loader: Callable = _load_latest_daily_pipeline_run
+    official_stage_history_loader: Callable = _noop_stage_history_loader
     feedback_run_loader: Callable = _noop_feedback_run_loader
+    signal_feature_counts_loader: Callable = _noop_persisted_output_counts_loader
+    external_news_counts_loader: Callable = _noop_persisted_output_counts_loader
+    signal_decider_counts_loader: Callable = _noop_persisted_output_counts_loader
     row_count_scope_gap_loader: Callable = _noop_row_count_scope_gap_loader
 
     def read(
@@ -436,6 +583,9 @@ class EODPipelineStatusService:
         resolved_fs_div = (fs_div or settings.dart_fundamentals_default_fs_div).strip().upper()
         pykrx_run = self.pykrx_run_loader(trade_date=resolved_market_date)
         official_run = self.official_run_loader(market_date=resolved_market_date)
+        official_stage_history = dict(
+            self.official_stage_history_loader(market_date=resolved_market_date) or {}
+        )
         feedback_run = feedback_run_context
         if feedback_run is None and include_feedback_context:
             feedback_run = self.feedback_run_loader(market_date=resolved_market_date)
@@ -526,6 +676,24 @@ class EODPipelineStatusService:
                 live_symbols_total=live_symbols_total,
                 feedback_run=feedback_run,
             )
+        stages['signal_features'] = self._build_signal_features_stage(
+            market_date=resolved_market_date,
+            aggregate=dict(self.signal_feature_counts_loader(market_date=resolved_market_date) or {}),
+        )
+        external_news_counts = dict(self.external_news_counts_loader(market_date=resolved_market_date) or {})
+        stages['external_news_collect'] = self._build_external_news_collect_stage(
+            market_date=resolved_market_date,
+            aggregate=external_news_counts,
+        )
+        stages['external_news_enrich'] = self._build_external_news_enrich_stage(
+            market_date=resolved_market_date,
+            aggregate=external_news_counts,
+            collect_stage=stages['external_news_collect'],
+        )
+        stages['signal_decider'] = self._build_signal_decider_stage(
+            market_date=resolved_market_date,
+            aggregate=dict(self.signal_decider_counts_loader(market_date=resolved_market_date) or {}),
+        )
         for stage_id in PIPELINE_STAGE_ORDER:
             if stage_id in stages:
                 continue
@@ -543,18 +711,26 @@ class EODPipelineStatusService:
             stage_id: stages[stage_id]
             for stage_id in PIPELINE_STAGE_ORDER
         }
+        if official_stage_history:
+            stages = self._overlay_official_stage_history(
+                stages=stages,
+                stage_history=official_stage_history,
+                market_date=resolved_market_date,
+            )
         if official_run is not None:
             stages = self._overlay_official_run_stages(
                 stages=stages,
                 official_run=official_run,
                 market_date=resolved_market_date,
             )
+        stages = self._mark_preopen_stage_skips(stages=stages)
         stages = self._normalize_stage_contract(stages)
         overall_status = self._resolve_overall_status(stages)
         official_run_status = str((official_run or {}).get('status') or '').strip().lower()
         if official_run_status in {'running', 'interrupted', 'abandoned'}:
             overall_status = official_run_status
         summary = self._build_stage_summary(stages=stages)
+        gate_summary = self._build_gate_summary(stages=stages)
         return {
             'market_date': resolved_market_date,
             'generated_at': _utcnow_iso(),
@@ -574,6 +750,7 @@ class EODPipelineStatusService:
             'status': overall_status,
             'stage_order': list(PIPELINE_STAGE_ORDER),
             **summary,
+            'gate_summary': gate_summary,
             'stages': stages,
             'official_run': self._build_official_run_summary(official_run),
         }
@@ -619,7 +796,7 @@ class EODPipelineStatusService:
         if mode == 'official_daily_pipeline_run_state':
             return 'official_run'
         source_status = str(stage.get('source_status') or '').strip()
-        if source_status == 'stored_rows_present':
+        if source_status == 'stored_rows_present' or source_status.startswith('stored_'):
             return 'stored_rows'
         if stage.get('source_run_ids'):
             return 'live_run_metadata'
@@ -632,6 +809,10 @@ class EODPipelineStatusService:
             if value:
                 return str(value)
         status = str(stage.get('status') or '').strip().lower()
+        if status == 'skipped':
+            return str(stage.get('current_activity') or 'Stage is not applicable to this market-date status view.')
+        if status == 'pending':
+            return str(stage.get('current_activity') or 'No official run state or persisted output rows were found.')
         if status in {'partial', 'blocked', 'failed', 'running'} and stage.get('current_activity'):
             return str(stage.get('current_activity'))
         missing_count = int(details.get('missing_count') or 0)
@@ -662,6 +843,59 @@ class EODPipelineStatusService:
             'stage_status_counts': status_counts,
             'current_stage': current_stage.get('task') if current_stage else None,
             'current_stage_status': current_stage.get('status') if current_stage else None,
+        }
+
+    @staticmethod
+    def _build_gate_summary(*, stages: dict[str, dict[str, Any]]) -> dict[str, Any]:
+        stage_gates: dict[str, dict[str, Any]] = {}
+        ready_stage_ids: list[str] = []
+        waiting_stage_ids: list[str] = []
+        blocked_stage_ids: list[str] = []
+        for stage_id, stage in stages.items():
+            gate_status = str(stage.get('gate_status') or '').strip().lower()
+            if gate_status not in {'ready', 'waiting', 'blocked'}:
+                continue
+            details = dict(stage.get('details') or {})
+            gate_item = {
+                'stage': stage_id,
+                'status': stage.get('status'),
+                'gate_status': gate_status,
+                'severity': stage.get('severity'),
+                'blocking_status': stage.get('blocking_status'),
+                'gate_reason': details.get('gate_reason') or details.get('reason'),
+            }
+            if stage_id == 'pykrx_enrichment':
+                gate_item.update(
+                    {
+                        'required_categories': details.get('decider_required_categories') or [],
+                        'min_coverage_ratio': details.get('decider_min_coverage_ratio'),
+                        'blocking_categories': details.get('decider_blocking_categories') or [],
+                        'waiting_categories': details.get('decider_waiting_categories') or [],
+                        'warning_categories': details.get('decider_warning_categories') or [],
+                    }
+                )
+            stage_gates[stage_id] = gate_item
+            if gate_status == 'ready':
+                ready_stage_ids.append(stage_id)
+            elif gate_status == 'blocked':
+                blocked_stage_ids.append(stage_id)
+            else:
+                waiting_stage_ids.append(stage_id)
+
+        if blocked_stage_ids:
+            status = 'blocked'
+        elif waiting_stage_ids:
+            status = 'waiting'
+        elif ready_stage_ids:
+            status = 'ready'
+        else:
+            status = None
+        return {
+            'status': status,
+            'ready_stage_ids': ready_stage_ids,
+            'waiting_stage_ids': waiting_stage_ids,
+            'blocked_stage_ids': blocked_stage_ids,
+            'stages': stage_gates,
         }
 
     @staticmethod
@@ -708,6 +942,85 @@ class EODPipelineStatusService:
             },
         }
 
+    def _build_skipped_stage(
+        self,
+        *,
+        stage_id: str,
+        market_date: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        definition = STAGE_DEFINITIONS[stage_id]
+        counts = build_stage_counts(total=0, succeeded=0, failed=0, processed=0)
+        activity = 'Skipped: ' + reason.replace('_', ' ')
+        return {
+            'task': stage_id,
+            'label': definition.label,
+            'status': 'skipped',
+            'source_status': 'not_applicable',
+            'market_date': market_date,
+            'started_at': None,
+            'updated_at': None,
+            'completed_at': None,
+            'processed': counts.processed,
+            'total': counts.total,
+            'succeeded': counts.succeeded,
+            'failed': counts.failed,
+            'remaining': counts.remaining,
+            'current_step': None,
+            'current_activity': activity,
+            'current_symbol': None,
+            'current_period': None,
+            'source_run_ids': {},
+            'details': {
+                'mode': 'not_applicable_to_market_date_status',
+                'reason': reason,
+                'depends_on': list(definition.depends_on),
+                'output_tables': list(definition.output_tables),
+                'inspect_routes': list(definition.inspect_routes),
+                'default_selected': definition.default_selected,
+            },
+        }
+
+    def _mark_preopen_stage_skips(
+        self,
+        *,
+        stages: dict[str, dict[str, Any]],
+    ) -> dict[str, dict[str, Any]]:
+        if not self._has_date_scoped_activity(stages=stages):
+            return stages
+        overlaid = dict(stages)
+        for stage_id in NON_DATE_SCOPED_PREOPEN_STAGE_IDS:
+            stage = dict(overlaid.get(stage_id) or {})
+            if str(stage.get('status') or '').strip().lower() != 'pending':
+                continue
+            overlaid[stage_id] = self._build_skipped_stage(
+                stage_id=stage_id,
+                market_date=str(stage.get('market_date') or ''),
+                reason='preopen_global_stage_not_required_for_resumed_market_date_status',
+            )
+        return overlaid
+
+    @staticmethod
+    def _has_date_scoped_activity(*, stages: dict[str, dict[str, Any]]) -> bool:
+        active_statuses = {
+            'completed',
+            'partial',
+            'running',
+            'failed',
+            'blocked',
+            'waiting',
+            'interrupted',
+            'abandoned',
+        }
+        for stage_id, stage in stages.items():
+            if stage_id in NON_DATE_SCOPED_PREOPEN_STAGE_IDS:
+                continue
+            if str(stage.get('status') or '').strip().lower() in active_statuses:
+                return True
+            if int(stage.get('succeeded') or 0) > 0:
+                return True
+        return False
+
     def _overlay_official_run_stages(
         self,
         *,
@@ -731,6 +1044,57 @@ class EODPipelineStatusService:
                 fallback_stage=stages.get(stage_id) or {},
             )
         return overlaid
+
+    def _overlay_official_stage_history(
+        self,
+        *,
+        stages: dict[str, dict[str, Any]],
+        stage_history: dict[str, dict[str, Any]],
+        market_date: str,
+    ) -> dict[str, dict[str, Any]]:
+        overlaid = dict(stages)
+        for stage_id in PIPELINE_STAGE_ORDER:
+            fallback_stage = stages.get(stage_id) or {}
+            history_item = stage_history.get(stage_id)
+            if not isinstance(history_item, dict):
+                continue
+            official_stage = history_item.get('stage') if isinstance(history_item.get('stage'), dict) else None
+            official_run = history_item.get('run') if isinstance(history_item.get('run'), dict) else None
+            if not isinstance(official_stage, dict) or not isinstance(official_run, dict):
+                continue
+            if not self._should_overlay_official_stage_history(
+                fallback_stage=fallback_stage,
+                official_stage=official_stage,
+            ):
+                continue
+            overlaid[stage_id] = self._build_official_stage(
+                stage_id=stage_id,
+                market_date=market_date,
+                official_run=official_run,
+                official_stage=official_stage,
+                fallback_stage=fallback_stage,
+            )
+            details = dict(overlaid[stage_id].get('details') or {})
+            details['historical_stage_state'] = True
+            details['progress_source'] = 'official_stage_history'
+            overlaid[stage_id]['details'] = details
+        return overlaid
+
+    @staticmethod
+    def _should_overlay_official_stage_history(
+        *,
+        fallback_stage: dict[str, Any],
+        official_stage: dict[str, Any],
+    ) -> bool:
+        fallback_status = str(fallback_stage.get('status') or '').strip().lower()
+        if fallback_status == 'pending':
+            return True
+        official_status = str(official_stage.get('status') or '').strip().lower()
+        if official_status not in OFFICIAL_STAGE_HISTORY_INCOMPLETE_STATUSES:
+            return False
+        fallback_details = fallback_stage.get('details') if isinstance(fallback_stage.get('details'), dict) else {}
+        fallback_mode = str(fallback_details.get('mode') or '').strip()
+        return fallback_mode in PERSISTED_OUTPUT_FALLBACK_MODES
 
     def _build_official_stage(
         self,
@@ -923,6 +1287,221 @@ class EODPipelineStatusService:
             return f'Agent feedback has {failed_items} failed item(s)'
         return _default_activity(_stage_label('agent_feedback_summaries'), status)
 
+    def _build_signal_features_stage(
+        self,
+        *,
+        market_date: str,
+        aggregate: dict[str, Any],
+    ) -> dict[str, Any]:
+        return self._build_persisted_count_stage(
+            stage_id='signal_features',
+            market_date=market_date,
+            persisted=int(aggregate.get('persisted') or aggregate.get('rows_persisted') or 0),
+            updated_at=aggregate.get('updated_at'),
+            source_status='stored_signal_features_present',
+            mode='derived_from_daily_signal_features',
+            available_reason='persisted_signal_features_available',
+            pending_reason='no_persisted_signal_features_for_market_date',
+            extra_details={
+                'rows_persisted': int(aggregate.get('persisted') or aggregate.get('rows_persisted') or 0),
+            },
+        )
+
+    def _build_external_news_collect_stage(
+        self,
+        *,
+        market_date: str,
+        aggregate: dict[str, Any],
+    ) -> dict[str, Any]:
+        item_count = int(aggregate.get('items') or aggregate.get('items_persisted') or 0)
+        return self._build_persisted_count_stage(
+            stage_id='external_news_collect',
+            market_date=market_date,
+            persisted=item_count,
+            updated_at=aggregate.get('updated_at'),
+            source_status='stored_external_news_present',
+            mode='derived_from_external_news_items',
+            available_reason='persisted_external_news_items_available',
+            pending_reason='no_external_news_items_collected_for_market_date',
+            extra_details={
+                'items_persisted': item_count,
+                'symbols_with_news': int(aggregate.get('symbols') or aggregate.get('symbol_count') or 0),
+            },
+        )
+
+    def _build_external_news_enrich_stage(
+        self,
+        *,
+        market_date: str,
+        aggregate: dict[str, Any],
+        collect_stage: dict[str, Any],
+    ) -> dict[str, Any]:
+        definition = STAGE_DEFINITIONS['external_news_enrich']
+        item_count = int(aggregate.get('items') or aggregate.get('items_persisted') or 0)
+        classified_count = int(aggregate.get('classified_items') or aggregate.get('classified') or 0)
+        if item_count <= 0:
+            status = 'pending'
+            source_status = None
+        elif classified_count >= item_count:
+            status = 'completed'
+            source_status = 'stored_external_news_classified'
+        elif classified_count > 0:
+            status = 'partial'
+            source_status = 'stored_external_news_partially_classified'
+        else:
+            status = 'pending'
+            source_status = 'stored_external_news_unclassified'
+
+        counts = build_stage_counts(
+            total=max(item_count, classified_count),
+            succeeded=classified_count,
+            failed=0,
+            processed=classified_count,
+        )
+        coverage_ratio = (
+            round(classified_count / item_count, 6)
+            if item_count > 0
+            else None
+        )
+        details = {
+            'mode': 'derived_from_external_news_items',
+            'depends_on': list(definition.depends_on),
+            'blocking_stages': (
+                ['external_news_collect']
+                if str(collect_stage.get('status') or '').strip().lower() == 'pending' and item_count <= 0
+                else []
+            ),
+            'items_persisted': item_count,
+            'classified_items': classified_count,
+            'classification_coverage_ratio': coverage_ratio,
+            'symbols_with_news': int(aggregate.get('symbols') or aggregate.get('symbol_count') or 0),
+            'reason': (
+                'persisted_external_news_classification_available'
+                if status == 'completed'
+                else 'external_news_items_need_classification'
+                if item_count > 0
+                else 'no_external_news_items_collected_for_market_date'
+            ),
+        }
+        return {
+            'task': 'external_news_enrich',
+            'label': definition.label,
+            'status': status,
+            'source_status': source_status,
+            'market_date': market_date,
+            'started_at': None,
+            'updated_at': aggregate.get('updated_at'),
+            'completed_at': aggregate.get('updated_at') if status in {'completed', 'partial'} else None,
+            'processed': counts.processed,
+            'total': counts.total,
+            'succeeded': counts.succeeded,
+            'failed': counts.failed,
+            'remaining': counts.remaining,
+            'current_step': None,
+            'current_activity': self._build_external_news_enrich_activity(
+                status=status,
+                item_count=item_count,
+                classified_count=classified_count,
+            ),
+            'current_symbol': None,
+            'current_period': None,
+            'source_run_ids': {},
+            'details': details,
+        }
+
+    @staticmethod
+    def _build_external_news_enrich_activity(
+        *,
+        status: str,
+        item_count: int,
+        classified_count: int,
+    ) -> str:
+        label = _stage_label('external_news_enrich')
+        if item_count > 0 and status == 'partial':
+            return f'Classified {classified_count}/{item_count} external news item(s)'
+        if item_count > 0 and status == 'pending':
+            return f'Waiting to classify {item_count} external news item(s)'
+        return _default_activity(label, status)
+
+    def _build_signal_decider_stage(
+        self,
+        *,
+        market_date: str,
+        aggregate: dict[str, Any],
+    ) -> dict[str, Any]:
+        feedback_rows = int(aggregate.get('feedback_rows') or 0)
+        snapshot_rows = int(aggregate.get('decision_snapshots') or aggregate.get('snapshot_rows') or 0)
+        persisted = max(feedback_rows, snapshot_rows)
+        return self._build_persisted_count_stage(
+            stage_id='signal_decider',
+            market_date=market_date,
+            persisted=persisted,
+            updated_at=aggregate.get('updated_at'),
+            source_status='stored_signal_decider_outputs_present',
+            mode='derived_from_signal_decider_outputs',
+            available_reason='persisted_signal_decider_outputs_available',
+            pending_reason='no_signal_decider_feedback_or_snapshots_for_market_date',
+            extra_details={
+                'feedback_rows': feedback_rows,
+                'feedback_symbols': int(aggregate.get('feedback_symbols') or 0),
+                'decision_snapshots': snapshot_rows,
+                'decision_snapshot_symbols': int(aggregate.get('decision_snapshot_symbols') or 0),
+            },
+        )
+
+    def _build_persisted_count_stage(
+        self,
+        *,
+        stage_id: str,
+        market_date: str,
+        persisted: int,
+        updated_at: Any,
+        source_status: str,
+        mode: str,
+        available_reason: str,
+        pending_reason: str,
+        extra_details: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        definition = STAGE_DEFINITIONS[stage_id]
+        persisted_count = int(persisted or 0)
+        status = 'completed' if persisted_count > 0 else 'pending'
+        counts = build_stage_counts(
+            total=persisted_count,
+            succeeded=persisted_count,
+            failed=0,
+            processed=persisted_count,
+        )
+        return {
+            'task': stage_id,
+            'label': definition.label,
+            'status': status,
+            'source_status': source_status if persisted_count > 0 else None,
+            'market_date': market_date,
+            'started_at': None,
+            'updated_at': updated_at,
+            'completed_at': updated_at if status == 'completed' else None,
+            'processed': counts.processed,
+            'total': counts.total,
+            'succeeded': counts.succeeded,
+            'failed': counts.failed,
+            'remaining': counts.remaining,
+            'current_step': None,
+            'current_activity': _default_activity(definition.label, status),
+            'current_symbol': None,
+            'current_period': None,
+            'source_run_ids': {},
+            'details': {
+                'mode': mode,
+                'depends_on': list(definition.depends_on),
+                'available': persisted_count > 0,
+                'reason': available_reason if persisted_count > 0 else pending_reason,
+                'output_tables': list(definition.output_tables),
+                'inspect_routes': list(definition.inspect_routes),
+                'default_selected': definition.default_selected,
+                **dict(extra_details or {}),
+            },
+        }
+
     @staticmethod
     def _build_official_run_summary(official_run: dict[str, Any] | None) -> dict[str, Any] | None:
         if official_run is None:
@@ -1012,11 +1591,20 @@ class EODPipelineStatusService:
         updated_at = progress.get('updated_at') or latest_captured_at
         completed_at = progress.get('completed_at') or (latest_captured_at if status in {'completed', 'partial'} else None)
         source_run_ids = {'eod_run_id': run.get('id')} if run and progress else {}
+        gate_details = AgentFeedbackPrerequisiteService.build_pykrx_enrichment_gate_details(
+            category_payloads=category_rows,
+        )
+        gate_status = str(gate_details.get('decider_category_gate_status') or 'waiting')
+        severity = 'blocked' if gate_status == 'blocked' else gate_status
+        blocking_status = 'blocking' if gate_status == 'blocked' else gate_status
         return {
             'task': 'pykrx_enrichment',
             'label': STAGE_LABELS['pykrx_enrichment'],
             'status': status,
             'source_status': source_status if (category_rows or progress) else None,
+            'gate_status': gate_status,
+            'severity': severity,
+            'blocking_status': blocking_status if gate_status != 'ready' else 'non_blocking',
             'market_date': market_date,
             'started_at': progress.get('started_at'),
             'updated_at': updated_at,
@@ -1039,6 +1627,7 @@ class EODPipelineStatusService:
                 'missing_categories': missing_categories,
                 'coverage_warning_categories': coverage_warning_categories,
                 'progress_source': 'live_run_metadata' if progress else 'stored_rows',
+                **gate_details,
             },
         }
 
@@ -1743,6 +2332,8 @@ class EODPipelineStatusService:
             return 'pending'
         if all(status == 'completed' for status in statuses):
             return 'completed'
+        if statuses and all(status in {'completed', 'skipped'} for status in statuses):
+            return 'completed' if any(status == 'completed' for status in statuses) else 'skipped'
         if statuses and all(status == 'skipped' for status in statuses):
             return 'skipped'
         if any(status == 'failed' for status in statuses) and not any(status in {'completed', 'partial'} for status in statuses):
@@ -1753,6 +2344,10 @@ class EODPipelineStatusService:
 eod_pipeline_status_service = EODPipelineStatusService(
     factor_stage_counts_loader=_load_factor_stage_counts,
     row_count_stage_counts_loader=_load_row_count_stage_counts,
+    official_stage_history_loader=_load_daily_pipeline_stage_history,
+    signal_feature_counts_loader=_load_signal_feature_counts,
+    external_news_counts_loader=_load_external_news_counts,
+    signal_decider_counts_loader=_load_signal_decider_output_counts,
     row_count_scope_gap_loader=_load_row_count_stage_scope_gap,
     price_bar_count_loader=lambda *, market_date: count_daily_price_bars_for_date(market_date),
     technical_snapshot_count_loader=lambda market_date: count_daily_technical_snapshots_for_live_symbols(market_date),

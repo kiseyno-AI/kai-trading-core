@@ -5,19 +5,21 @@ Operator-facing live status API for the post-close EOD pipeline.
 
 Canonical semantics for this route and `GET /eod/freshness` live in `docs/EOD_STATUS_SEMANTICS_CONTRACT.md`.
 
-Unlike `GET /eod/freshness`, this route focuses on in-flight work. It reads the first-class durable daily pipeline run state first, then falls back to the older persisted-row and source-run inference only for stages with no official stage row. It reports the current stage status from master refresh through signal-decider evaluations for the requested `market_date`.
+Unlike `GET /eod/freshness`, this route focuses on in-flight work. It reads the first-class durable daily pipeline run state first, merges same-date historical official stage rows when the latest run is only a resumed subset, then falls back to persisted-row and source-run inference for stages with no official stage row. It reports the current stage status from master refresh through signal-decider evaluations for the requested `market_date`.
 
-The same payload also reports the default-selected filtering, factor/scoring, external-news, agent-feedback, signal-decider, and signal-decider-evaluation stages. When a stage has no official run state, stored result-row coverage still prevents a false completed success.
+The same payload also reports the default-selected filtering, factor/scoring, external-news, agent-feedback, signal-decider, and signal-decider-evaluation stages. Persisted `daily_signal_features`, `external_news_items` classification state, `agent_context_feedback`, and `signal_decider_decision_snapshots` rows can mark omitted same-day stages completed/available so a resumed single-stage run does not make earlier persisted outputs look pending.
 
 The default `market_date` is the current Seoul calendar date from `server_time[:10]`. On weekends, holidays, or other break-days, callers must pass `market_date` explicitly if they want the previous trading day's pipeline view instead of the current calendar date.
 
 The response now also includes `market` and `market_session` blocks. `market` is the current exchange-clock state, and `market_session` describes the semantics of the requested `market_date`, including the latest valid trading date and whether live quote or intraday data is expected for that date.
 
-The `pykrx_enrichment` stage is also the operator status source for the decider enrichment join. Completed coverage for `valuation_snapshot`, `investor_flow_symbol`, `investor_flow_market`, `short_selling`, `sector_classification`, and `market_breadth` means `GET /agent-context/symbol-day` can populate `pre_decider_enrichment_context.trading_value` and `flow_short_sector_context`. Scheduled PyKRX daily runs publish live `pykrx_enrichment` stage progress before rows are fully visible, including downstream preflight status, category row counts, and failed categories. Live quote/orderbook snapshots are outside the EOD stage and appear in symbol-day context as available, unavailable, or `stale_eod` with a timestamp when the market is closed.
+The `pykrx_enrichment` stage is also the operator status source for the decider enrichment join. Completed storage coverage for `valuation_snapshot`, `investor_flow_symbol`, `investor_flow_market`, `short_selling`, `sector_classification`, and `market_breadth` means `GET /agent-context/symbol-day` can populate `pre_decider_enrichment_context.trading_value` and `flow_short_sector_context`. Decider gate readiness is reported separately through stage-level `gate_status` fields and the top-level `gate_summary`, so `pykrx_enrichment.status` can be `completed` while `gate_status` is `blocked` due below-threshold category coverage. Scheduled PyKRX daily runs publish live `pykrx_enrichment` stage progress before rows are fully visible, including downstream preflight status, category row counts, and failed categories. Live quote/orderbook snapshots are outside the EOD stage and appear in symbol-day context as available, unavailable, or `stale_eod` with a timestamp when the market is closed.
 
 Row-count-derived stages expose missing-row diagnostics when they are partial. For example, `market_risk_filter.details.missing_count` and `missing_symbols_sample` show the full-universe coverage gap, while `gate_status`, `severity`, and `blocking_status` tell feedback/dashboard consumers whether that gap blocks the active feedback scope.
 
 When a same-day feedback run is active, `agent_feedback_summaries` reflects the run from feedback runtime/durable state even if no official daily pipeline stage row exists. That keeps active feedback progress separate from upstream degraded coverage.
+
+Pre-open/global stages such as `master_refresh` and `pykrx_universe_refresh` may be `skipped` with reason metadata once same-date downstream output exists and there is no active/pre-open official stage row. This prevents `current_stage` from pointing at `master_refresh` after a resumed EOD or agent-stage recovery has already completed.
 
 ## Example request
 ```http
@@ -51,6 +53,36 @@ GET /eod/pipeline/status?market_date=2026-04-21&fs_div=CFS
   },
   "fs_div": "CFS",
   "status": "running",
+  "total_stages": 24,
+  "completed_stages": 16,
+  "skipped_stages": 0,
+  "partial_stages": 2,
+  "running_stages": 1,
+  "pending_stages": 5,
+  "current_stage": "technical_snapshots",
+  "gate_summary": {
+    "status": "blocked",
+    "ready_stage_ids": ["market_risk_filter"],
+    "waiting_stage_ids": [],
+    "blocked_stage_ids": ["pykrx_enrichment"],
+    "stages": {
+      "pykrx_enrichment": {
+        "stage": "pykrx_enrichment",
+        "status": "partial",
+        "gate_status": "blocked",
+        "blocking_status": "blocking",
+        "required_categories": ["sector_classification", "market_breadth", "investor_flow_market", "investor_flow_symbol", "short_selling", "valuation_snapshot"],
+        "blocking_categories": [
+          {
+            "category": "investor_flow_symbol",
+            "coverage_ratio": 0.596429,
+            "min_coverage_ratio": 0.99,
+            "reason": "required_pykrx_enrichment_category_below_min_coverage"
+          }
+        ]
+      }
+    }
+  },
   "stage_order": [
     "master_refresh",
     "pykrx_universe_refresh",
@@ -96,6 +128,8 @@ GET /eod/pipeline/status?market_date=2026-04-21&fs_div=CFS
     },
     "pykrx_enrichment": {
       "status": "partial",
+      "gate_status": "blocked",
+      "blocking_status": "blocking",
       "processed": 7,
       "total": 7,
       "failed": 2,
@@ -134,6 +168,39 @@ GET /eod/pipeline/status?market_date=2026-04-21&fs_div=CFS
             "expected_rows": 3579
           }
         }
+      }
+    },
+    "signal_features": {
+      "status": "completed",
+      "source_status": "stored_signal_features_present",
+      "processed": 2823,
+      "total": 2823,
+      "details": {
+        "mode": "derived_from_daily_signal_features",
+        "available": true,
+        "reason": "persisted_signal_features_available",
+        "rows_persisted": 2823
+      }
+    },
+    "external_news_collect": {
+      "status": "completed",
+      "source_status": "stored_external_news_present",
+      "details": {
+        "mode": "derived_from_external_news_items",
+        "reason": "persisted_external_news_items_available",
+        "items_persisted": 1091,
+        "symbols_with_news": 114
+      }
+    },
+    "external_news_enrich": {
+      "status": "completed",
+      "source_status": "stored_external_news_classified",
+      "details": {
+        "mode": "derived_from_external_news_items",
+        "reason": "persisted_external_news_classification_available",
+        "items_persisted": 1091,
+        "classified_items": 1091,
+        "classification_coverage_ratio": 1.0
       }
     },
     "technical_snapshots": {
@@ -197,6 +264,16 @@ GET /eod/pipeline/status?market_date=2026-04-21&fs_div=CFS
         "failed_items": 0,
         "feedback_failure_status": "no_failures",
         "feedback_health": "running"
+      }
+    },
+    "signal_decider": {
+      "status": "completed",
+      "source_status": "stored_signal_decider_outputs_present",
+      "details": {
+        "mode": "derived_from_signal_decider_outputs",
+        "reason": "persisted_signal_decider_outputs_available",
+        "feedback_rows": 114,
+        "decision_snapshots": 228
       }
     },
     "momentum_factors": {
