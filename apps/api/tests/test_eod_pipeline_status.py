@@ -157,6 +157,56 @@ def _completed_official_stage(
     }
 
 
+def _incomplete_official_stage(
+    *,
+    run_id: int,
+    stage_id: str,
+    market_date: str,
+    status: str,
+    updated_at: str,
+    succeeded: int,
+    failed: int,
+) -> dict[str, dict]:
+    processed = succeeded + failed
+    return {
+        'run': {
+            'id': run_id,
+            'market_date': market_date,
+            'trigger': 'manual_api',
+            'status': status,
+            'current_stage': stage_id,
+            'started_at': updated_at,
+            'updated_at': updated_at,
+            'completed_at': updated_at,
+            'error_message': 'Signal feature collection did not finish cleanly' if status == 'failed' else None,
+            'run_metadata': {'requested_stages': [stage_id], 'resolved_stages': [stage_id]},
+        },
+        'stage': {
+            'stage_id': stage_id,
+            'status': status,
+            'market_date': market_date,
+            'started_at': updated_at,
+            'updated_at': updated_at,
+            'completed_at': updated_at,
+            'processed': processed,
+            'total': processed,
+            'succeeded': succeeded,
+            'failed': failed,
+            'remaining': 0,
+            'current_step': f'{stage_id}_{status}',
+            'current_activity': f'{stage_id} finished {status}',
+            'current_symbol': None,
+            'current_period': None,
+            'error_message': 'Signal feature collection did not finish cleanly' if status == 'failed' else None,
+            'source_run_ids': {},
+            'details': {
+                'features_persisted': succeeded,
+                'features_failed': failed,
+            },
+        },
+    }
+
+
 class EODPipelineStatusServiceTests(unittest.TestCase):
     def test_load_latest_pipeline_pykrx_run_reconciles_selected_daily_run_instead_of_newer_historical_backfill(self):
         historical_run = {
@@ -1611,6 +1661,74 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
             blocking_categories[0]['reason'],
             'required_pykrx_enrichment_category_below_min_coverage',
         )
+
+    def test_read_preserves_incomplete_official_history_for_persisted_output_stage(self):
+        market_date = '2026-05-28'
+        resumed_stage = _completed_official_stage(
+            run_id=22,
+            stage_id='signal_decider_evaluations',
+            market_date=market_date,
+            processed=10,
+            total=10,
+            updated_at='2026-05-28T09:05:00+00:00',
+        )['stage']
+        latest_resume_run = {
+            'id': 22,
+            'market_date': market_date,
+            'trigger': 'manual_api',
+            'status': 'completed',
+            'current_stage': 'signal_decider_evaluations',
+            'started_at': '2026-05-28T09:00:00+00:00',
+            'updated_at': '2026-05-28T09:05:00+00:00',
+            'completed_at': '2026-05-28T09:05:00+00:00',
+            'error_message': None,
+            'run_metadata': {
+                'requested_stages': ['signal_decider_evaluations'],
+                'resolved_stages': ['signal_decider_evaluations'],
+            },
+            'stages': {'signal_decider_evaluations': resumed_stage},
+        }
+
+        for official_status in ('partial', 'failed'):
+            with self.subTest(official_status=official_status):
+                service = EODPipelineStatusService(
+                    market_state_loader=lambda: _FakeMarketState(),
+                    pykrx_run_loader=lambda **_: None,
+                    pykrx_stage_counts_loader=lambda *_: {},
+                    live_symbol_count_loader=lambda: 10,
+                    fundamentals_refresh_loader=lambda **_: None,
+                    official_run_loader=lambda **_: latest_resume_run,
+                    official_stage_history_loader=lambda **_: {
+                        'signal_features': _incomplete_official_stage(
+                            run_id=21,
+                            stage_id='signal_features',
+                            market_date=market_date,
+                            status=official_status,
+                            updated_at='2026-05-28T08:45:00+00:00',
+                            succeeded=3,
+                            failed=2,
+                        ),
+                    },
+                    signal_feature_counts_loader=lambda **_: {
+                        'persisted': 3,
+                        'updated_at': '2026-05-28T08:40:00+00:00',
+                    },
+                )
+
+                result = service.read(market_date=market_date)
+
+                stage = result['stages']['signal_features']
+                self.assertEqual(stage['status'], official_status)
+                self.assertEqual(stage['source_status'], official_status)
+                self.assertEqual(stage['processed'], 5)
+                self.assertEqual(stage['succeeded'], 3)
+                self.assertEqual(stage['failed'], 2)
+                self.assertEqual(stage['details']['features_persisted'], 3)
+                self.assertEqual(stage['details']['features_failed'], 2)
+                self.assertTrue(stage['details']['historical_stage_state'])
+                self.assertEqual(stage['details']['progress_source'], 'official_stage_history')
+                self.assertEqual(result['current_stage'], 'signal_features')
+                self.assertEqual(result['stages']['signal_decider_evaluations']['status'], 'completed')
 
     def test_read_reports_external_news_enrich_pending_when_persisted_items_are_unclassified(self):
         service = EODPipelineStatusService(

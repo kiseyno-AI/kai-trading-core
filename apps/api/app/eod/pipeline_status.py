@@ -101,6 +101,19 @@ NON_DATE_SCOPED_PREOPEN_STAGE_IDS = (
 )
 SIGNAL_DECIDER_AGENT_NAME = 'signal-decider'
 SEOUL_TZ = ZoneInfo('Asia/Seoul')
+PERSISTED_OUTPUT_FALLBACK_MODES = {
+    'derived_from_daily_signal_features',
+    'derived_from_external_news_items',
+    'derived_from_signal_decider_outputs',
+}
+OFFICIAL_STAGE_HISTORY_INCOMPLETE_STATUSES = {
+    'running',
+    'partial',
+    'failed',
+    'blocked',
+    'interrupted',
+    'abandoned',
+}
 
 
 def _utcnow_iso() -> str:
@@ -1042,14 +1055,17 @@ class EODPipelineStatusService:
         overlaid = dict(stages)
         for stage_id in PIPELINE_STAGE_ORDER:
             fallback_stage = stages.get(stage_id) or {}
-            if str(fallback_stage.get('status') or '').strip().lower() != 'pending':
-                continue
             history_item = stage_history.get(stage_id)
             if not isinstance(history_item, dict):
                 continue
             official_stage = history_item.get('stage') if isinstance(history_item.get('stage'), dict) else None
             official_run = history_item.get('run') if isinstance(history_item.get('run'), dict) else None
             if not isinstance(official_stage, dict) or not isinstance(official_run, dict):
+                continue
+            if not self._should_overlay_official_stage_history(
+                fallback_stage=fallback_stage,
+                official_stage=official_stage,
+            ):
                 continue
             overlaid[stage_id] = self._build_official_stage(
                 stage_id=stage_id,
@@ -1063,6 +1079,22 @@ class EODPipelineStatusService:
             details['progress_source'] = 'official_stage_history'
             overlaid[stage_id]['details'] = details
         return overlaid
+
+    @staticmethod
+    def _should_overlay_official_stage_history(
+        *,
+        fallback_stage: dict[str, Any],
+        official_stage: dict[str, Any],
+    ) -> bool:
+        fallback_status = str(fallback_stage.get('status') or '').strip().lower()
+        if fallback_status == 'pending':
+            return True
+        official_status = str(official_stage.get('status') or '').strip().lower()
+        if official_status not in OFFICIAL_STAGE_HISTORY_INCOMPLETE_STATUSES:
+            return False
+        fallback_details = fallback_stage.get('details') if isinstance(fallback_stage.get('details'), dict) else {}
+        fallback_mode = str(fallback_details.get('mode') or '').strip()
+        return fallback_mode in PERSISTED_OUTPUT_FALLBACK_MODES
 
     def _build_official_stage(
         self,
