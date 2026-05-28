@@ -748,6 +748,29 @@ class DailyPipelineStageService:
                 'succeeded': succeeded,
                 'failed': failed,
             }
+        if stage_id == 'pykrx_enrichment':
+            category_results = result.get('categories') if isinstance(result.get('categories'), dict) else {}
+            categories_requested = result.get('categories_requested') or list(category_results)
+            failed_categories = [
+                category
+                for category, details in category_results.items()
+                if isinstance(details, dict) and details.get('errors')
+            ]
+            succeeded = sum(
+                1
+                for category, details in category_results.items()
+                if isinstance(details, dict)
+                and category not in set(failed_categories)
+                and int(details.get('rows_persisted') or 0) > 0
+            )
+            failed = len(failed_categories)
+            total = len(categories_requested) or succeeded + failed
+            return {
+                'processed': min(succeeded + failed, total) if total else succeeded + failed,
+                'total': total,
+                'succeeded': succeeded,
+                'failed': failed,
+            }
 
         count_pairs = (
             ('snapshots_persisted', 'snapshots_failed'),

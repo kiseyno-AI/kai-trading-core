@@ -18,6 +18,39 @@ def _lock(acquired: bool = True):
     yield acquired
 
 
+def _ready_pykrx_enrichment_result(*, market_date: str = '2026-04-03') -> dict:
+    categories = {
+        'sector_classification': {'rows_persisted': 1, 'errors': []},
+        'investor_flow_market': {'rows_persisted': 1, 'errors': []},
+        'investor_flow_symbol': {'rows_persisted': 1, 'errors': []},
+        'short_selling': {'rows_persisted': 1, 'errors': []},
+        'valuation_snapshot': {'rows_persisted': 1, 'errors': []},
+        'market_breadth': {'rows_persisted': 1, 'errors': []},
+        'foreign_ownership': {'rows_persisted': 1, 'errors': []},
+    }
+    return {
+        'market_date': market_date,
+        'status': 'completed',
+        'categories_requested': list(categories),
+        'categories': categories,
+        'coverage': {
+            'requested_symbol_count': 1,
+            'requested_market_count': 1,
+            'categories': {
+                category: {
+                    'scope_type': 'symbol' if category in {'investor_flow_symbol', 'short_selling'} else 'market',
+                    'expected_rows': 1,
+                    'present_rows': 1,
+                    'coverage_ratio': 1.0,
+                    'coverage_status': 'complete',
+                }
+                for category in categories
+            },
+        },
+        'summary': {'categories_failed': 0},
+    }
+
+
 class PykrxBackfillServiceTests(TestCase):
     def test_fetch_recent_universe_uses_index_when_market_frame_columns_change(self) -> None:
         service = PykrxBackfillService()
@@ -147,6 +180,41 @@ class PykrxBackfillServiceTests(TestCase):
         self.assertFalse(result['triggered'])
         self.assertEqual(result['reason'], 'already_completed')
         run_collection.assert_not_called()
+
+    def test_run_daily_pipeline_uses_scheduled_stage_sequence_with_pykrx_enrichment(self) -> None:
+        service = PykrxBackfillService()
+
+        with (
+            patch.object(service, 'resolve_latest_trade_date', return_value='2026-04-03'),
+            patch('app.eod.pykrx_backfill.advisory_eod_collection_lock', return_value=_lock()),
+            patch('app.eod.pykrx_backfill.load_latest_eod_collection_run', return_value=None),
+            patch.object(
+                service,
+                '_run_market_data_pipeline',
+                return_value={
+                    'run_id': 9,
+                    'source': 'pykrx',
+                    'status': 'completed',
+                },
+            ) as run_collection,
+        ):
+            result = service.run_daily_pipeline_if_due(
+                market_date='2026-04-03',
+                trigger='auto_close_scheduler',
+            )
+
+        self.assertTrue(result['triggered'])
+        kwargs = run_collection.call_args.kwargs
+        self.assertEqual(kwargs['selected_stages'], PYKRX_STAGE_SEQUENCE)
+        self.assertIn('pykrx_enrichment', kwargs['selected_stages'])
+        self.assertLess(
+            kwargs['selected_stages'].index('price_collection'),
+            kwargs['selected_stages'].index('pykrx_enrichment'),
+        )
+        self.assertLess(
+            kwargs['selected_stages'].index('pykrx_enrichment'),
+            kwargs['selected_stages'].index('technical_snapshots'),
+        )
 
     def test_run_daily_pipeline_force_bypasses_stale_running_row(self) -> None:
         service = PykrxBackfillService()
@@ -676,6 +744,10 @@ class PykrxBackfillServiceTests(TestCase):
                 return_value={'contexts_persisted': 1, 'contexts_failed': 0},
             ) as price_contexts,
             patch(
+                'app.eod.pykrx_backfill.pykrx_enrichment_service.collect_for_market_date',
+                return_value=_ready_pykrx_enrichment_result(),
+            ) as pykrx_enrichment,
+            patch(
                 'app.eod.pykrx_backfill.daily_technical_snapshot_service.rebuild_for_market_date',
                 return_value={'snapshots_persisted': 1, 'snapshots_failed': 0},
             ),
@@ -713,7 +785,22 @@ class PykrxBackfillServiceTests(TestCase):
             )
 
         self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['pykrx_enrichment']['status'], 'completed')
+        self.assertTrue(result['pykrx_enrichment']['downstream_preflight']['allowed'])
+        self.assertEqual(
+            result['pykrx_enrichment']['downstream_preflight']['category_row_counts'],
+            {
+                'sector_classification': 1,
+                'investor_flow_symbol': 1,
+                'short_selling': 1,
+            },
+        )
         self.assertEqual(result['price_contexts']['contexts_persisted'], 1)
+        pykrx_enrichment.assert_called_once_with(
+            market_date='2026-04-03',
+            markets=('KOSPI',),
+            symbols=['005930'],
+        )
         price_contexts.assert_called_once_with(
             market_date='2026-04-03',
             symbols=['005930'],

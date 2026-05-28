@@ -125,6 +125,24 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         settings.signal_decider_next_open_block_on_specialist_disagreement = True
         settings.signal_decider_next_open_require_target_and_stop = True
         settings.signal_decider_exec_integration_mode = 'disabled'
+        self.enrichment_preflight_patcher = patch(
+            'app.orders.next_open_execution.inspect_pykrx_enrichment_preflight',
+            side_effect=lambda **kwargs: {
+                'market_date': str(kwargs.get('market_date') or self.market_date),
+                'status': 'ready',
+                'allowed': True,
+                'required_categories': ['sector_classification', 'investor_flow_symbol', 'short_selling'],
+                'failed_categories': [],
+                'zero_coverage_categories': [],
+                'category_row_counts': {
+                    'sector_classification': 1,
+                    'investor_flow_symbol': 1,
+                    'short_selling': 1,
+                },
+            },
+        )
+        self.enrichment_preflight_mock = self.enrichment_preflight_patcher.start()
+        self.addCleanup(self.enrichment_preflight_patcher.stop)
         self._seed_policy_version()
 
     def tearDown(self) -> None:
@@ -425,6 +443,47 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             'data_quality_warnings_present',
         )
         self.assertNotIn('035420', items_by_symbol)
+
+    def test_refresh_plan_items_blocks_existing_rows_when_pykrx_enrichment_missing(self) -> None:
+        self._seed_snapshot(symbol='005930')
+        service = self._service(state='PREOPEN', server_time='2026-04-30T08:40:00+09:00')
+
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[{'trade_date': '2026-04-29', 'close_price': 50000}],
+        ):
+            initial = service.refresh_plan_items(target_trade_date=self.target_trade_date, trigger='test')
+
+        self.assertEqual(initial['summary']['eligible_count'], 1)
+        blocked_preflight = {
+            'market_date': self.market_date.isoformat(),
+            'status': 'blocked',
+            'allowed': False,
+            'required_categories': ['sector_classification', 'investor_flow_symbol', 'short_selling'],
+            'failed_categories': ['investor_flow_symbol', 'short_selling'],
+            'zero_coverage_categories': ['investor_flow_symbol', 'short_selling'],
+            'category_row_counts': {
+                'sector_classification': 1,
+                'investor_flow_symbol': 0,
+                'short_selling': 0,
+            },
+        }
+        with patch('app.orders.next_open_execution.inspect_pykrx_enrichment_preflight', return_value=blocked_preflight):
+            result = service.refresh_plan_items(target_trade_date=self.target_trade_date, trigger='test_retry')
+
+        self.assertEqual(result['summary']['reason'], 'pykrx_enrichment_preflight_blocked')
+        self.assertFalse(result['summary']['enrichment_preflight_allowed'])
+        self.assertEqual(result['summary']['enrichment_preflight_status'], 'blocked')
+        self.assertEqual(result['summary']['blocked_count'], 1)
+        self.assertEqual(result['enrichment_preflight']['failed_categories'], ['investor_flow_symbol', 'short_selling'])
+        item = result['items'][0]
+        self.assertEqual(item['eligibility_status'], ELIGIBILITY_BLOCKED)
+        blocking_codes = [entry['code'] for entry in item['validation']['blocking_reasons']]
+        self.assertIn('pykrx_enrichment_preflight_blocked', blocking_codes)
+        self.assertEqual(
+            item['validation']['pykrx_enrichment_preflight']['zero_coverage_categories'],
+            ['investor_flow_symbol', 'short_selling'],
+        )
 
     def test_refresh_plan_items_signal_dispatch_does_not_budget_size_quantity(self) -> None:
         settings.signal_decider_exec_integration_mode = 'dispatch'

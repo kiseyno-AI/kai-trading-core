@@ -1401,3 +1401,61 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
             result['stages']['pykrx_enrichment']['details']['categories']['sector_classification']['coverage_status'],
             'complete',
         )
+
+    def test_read_exposes_pykrx_enrichment_stage_from_live_run_progress(self):
+        pykrx_run = {
+            'id': 91,
+            'trade_date': '2026-04-21',
+            'status': 'completed_with_errors',
+            'run_metadata': {
+                'stage_progress': {
+                    'pykrx_enrichment': {
+                        'status': 'failed',
+                        'started_at': '2026-04-21T08:00:00+00:00',
+                        'updated_at': '2026-04-21T08:02:00+00:00',
+                        'current_step': 'pykrx_enrichment_failed',
+                        'current_activity': 'PyKRX enrichment collection failed',
+                        'processed': 1,
+                        'total': len(DEFAULT_PYKRX_ENRICHMENT_CATEGORIES),
+                        'succeeded': 1,
+                        'failed': 3,
+                        'category_row_counts': {
+                            'sector_classification': 1,
+                            'investor_flow_symbol': 0,
+                            'short_selling': 0,
+                        },
+                        'failed_categories': ['investor_flow_symbol', 'short_selling'],
+                        'downstream_allowed': False,
+                        'downstream_preflight_status': 'blocked',
+                    },
+                },
+            },
+        }
+        service = EODPipelineStatusService(
+            market_state_loader=lambda: _FakeMarketState(),
+            pykrx_run_loader=lambda **_: pykrx_run,
+            pykrx_stage_counts_loader=lambda *_: {},
+            live_symbol_count_loader=lambda: 2,
+            fundamentals_refresh_loader=lambda **_: None,
+            factor_stage_counts_loader=lambda **_: {},
+            price_bar_count_loader=lambda **_: 0,
+            pykrx_enrichment_loader=lambda **_: {},
+        )
+
+        result = service.read(market_date='2026-04-21', fs_div='CFS')
+
+        stage = result['stages']['pykrx_enrichment']
+        self.assertEqual(stage['status'], 'failed')
+        self.assertEqual(stage['source_status'], 'failed')
+        self.assertEqual(stage['source_run_ids'], {'eod_run_id': 91})
+        self.assertEqual(stage['details']['progress_source'], 'live_run_metadata')
+        self.assertFalse(stage['details']['downstream_allowed'])
+        self.assertEqual(stage['details']['downstream_preflight_status'], 'blocked')
+        self.assertEqual(
+            stage['details']['category_row_counts'],
+            {
+                'sector_classification': 1,
+                'investor_flow_symbol': 0,
+                'short_selling': 0,
+            },
+        )
