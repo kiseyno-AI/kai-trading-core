@@ -42,6 +42,7 @@ from app.orders.next_open_execution import (
     _previous_trading_day,
     signal_decider_next_open_execution_service,
 )
+from app.orders.portfolio_summary_service import portfolio_summary_service
 from app.quotes.display_prices import (
     DISPLAY_FALLBACK_SOURCES,
     build_display_price_fields,
@@ -1269,11 +1270,13 @@ class SignalDeciderExecIntegrationService:
             refresh=False,
             trigger=trigger,
         )
+        live_holding_symbols = await self._load_live_portfolio_holding_symbols(trigger=trigger)
         payload = self._build_runtime_monitored_symbols_payload(
             board=board,
             refresh=refresh,
             refresh_state=refresh_state,
             served_from_cache=False,
+            live_holding_symbols=live_holding_symbols,
         )
         self._observe_runtime_symbols_for_realtime_prices(
             (item.get('symbol') for item in payload['items']),
@@ -1286,6 +1289,28 @@ class SignalDeciderExecIntegrationService:
             payload=payload,
         )
         return payload
+
+    async def _load_live_portfolio_holding_symbols(self, *, trigger: str) -> set[str] | None:
+        try:
+            payload = await portfolio_summary_service.get_portfolio_summary(
+                refresh=False,
+                trigger=f'{trigger}:runtime_monitored_holdings',
+            )
+        except Exception:
+            return None
+
+        symbols: set[str] = set()
+        for account in payload.get('accounts') or []:
+            if not isinstance(account, dict):
+                continue
+            for holding in account.get('holdings') or []:
+                if not isinstance(holding, dict):
+                    continue
+                symbol = _normalize_optional_text(holding.get('symbol'))
+                quantity = _safe_decimal(holding.get('quantity')) or Decimal('0')
+                if symbol and quantity > Decimal('0'):
+                    symbols.add(symbol)
+        return symbols
 
     @staticmethod
     def _collect_runtime_plan_item_ids(items: Sequence[dict[str, Any]]) -> set[int]:
@@ -1315,6 +1340,7 @@ class SignalDeciderExecIntegrationService:
         runtime_status: str,
         existing_plan_item_ids: set[int],
         existing_held_scopes: set[tuple[str, str]],
+        live_holding_symbols: set[str] | None,
     ) -> list[dict[str, Any]]:
         lookback_start = market_date - timedelta(days=365)
         with session_scope() as session:
@@ -1340,6 +1366,7 @@ class SignalDeciderExecIntegrationService:
             for item in candidate_items
             if self._overview_item_has_held_position(item)
             and self._overview_item_has_recent_readback(item, market_date=market_date)
+            and self._historical_held_symbol_is_live(item, live_holding_symbols=live_holding_symbols)
             and _safe_decimal(item.get('plan_item_id')) is not None
             and int(_safe_decimal(item.get('plan_item_id'))) not in existing_plan_item_ids
         ]
@@ -1354,6 +1381,8 @@ class SignalDeciderExecIntegrationService:
             if not self._overview_item_has_held_position(item):
                 continue
             if not self._overview_item_has_recent_readback(item, market_date=market_date):
+                continue
+            if not self._historical_held_symbol_is_live(item, live_holding_symbols=live_holding_symbols):
                 continue
             account_reference = _normalize_optional_text(item.get('account_reference'))
             symbol = _normalize_optional_text(item.get('symbol'))
@@ -1372,6 +1401,17 @@ class SignalDeciderExecIntegrationService:
                 )
             )
         return held_items
+
+    @staticmethod
+    def _historical_held_symbol_is_live(
+        item: dict[str, Any],
+        *,
+        live_holding_symbols: set[str] | None,
+    ) -> bool:
+        if live_holding_symbols is None:
+            return True
+        symbol = _normalize_optional_text(item.get('symbol'))
+        return bool(symbol and symbol in live_holding_symbols)
 
     @staticmethod
     def _serialize_execution_plan_row_for_runtime(row: SignalDeciderExecutionPlanItem) -> dict[str, Any]:
@@ -1534,6 +1574,7 @@ class SignalDeciderExecIntegrationService:
         refresh: bool,
         refresh_state: dict[str, Any],
         served_from_cache: bool,
+        live_holding_symbols: set[str] | None = None,
     ) -> dict[str, Any]:
         resolved_market_date = date.fromisoformat(str(board['market_date']))
         board_items = list(board.get('items') or [])
@@ -1543,6 +1584,7 @@ class SignalDeciderExecIntegrationService:
                 runtime_status=board['runtime']['status'],
                 existing_plan_item_ids=self._collect_runtime_plan_item_ids(board_items),
                 existing_held_scopes=self._collect_runtime_held_scopes(board_items),
+                live_holding_symbols=live_holding_symbols,
             )
         )
         grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -1987,6 +2029,7 @@ class SignalDeciderExecIntegrationService:
             refresh=True,
             refresh_state=refresh_state,
             served_from_cache=False,
+            live_holding_symbols=None,
         )
         self._store_dashboard_cached_payload(
             endpoint=DASHBOARD_ENDPOINT_MONITORED_SYMBOLS,
