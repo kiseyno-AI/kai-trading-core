@@ -165,7 +165,7 @@ class AgentFeedbackSessionCleanupService:
             cmd,
             capture_output=True,
             text=True,
-            timeout=max(30, int(settings.openclaw_agent_timeout_seconds)),
+            timeout=min(10, max(1, int(settings.openclaw_agent_timeout_seconds))),
         )
         stdout = completed.stdout.strip()
         stderr = completed.stderr.strip()

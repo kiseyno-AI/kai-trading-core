@@ -576,13 +576,16 @@ class FeedbackRetryCycleTests(unittest.TestCase):
                                     max_cycles=1,
                                     outer_batch_size=20,
                                     reuse_existing=True,
-                                )
+                                ),
+                                force=True,
                             )
 
         self.assertEqual(
             [(call['roles'][0], call['symbols']) for call in dispatch_calls],
             [('technical-summarizer', ['005930', '000660']), ('fundamental-summarizer', ['005930', '000660'])],
         )
+        self.assertTrue(all(call['force'] is True for call in dispatch_calls))
+        self.assertTrue(all(call['reuse_existing'] is False for call in dispatch_calls))
         role_completed_checkpoints = [
             checkpoint['summary_payload']
             for checkpoint in run_state_service.checkpoints
@@ -677,6 +680,7 @@ class FeedbackRetryCycleTests(unittest.TestCase):
                 ('signal-decider', ['000660']),
             ],
         )
+        self.assertTrue(all(call['reuse_existing'] is True for call in dispatch_calls))
         self.assertTrue(result['completed'])
         self.assertEqual(result['final_pending'], 0)
         self.assertEqual(result['cycles'][0]['mode'], 'boundary_resume')
