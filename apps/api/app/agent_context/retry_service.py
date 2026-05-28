@@ -781,7 +781,7 @@ class AgentFeedbackRetryService:
                                 market_date=config.market_date,
                                 symbols=dispatch_symbols,
                                 roles=[role],
-                                reuse_existing=config.reuse_existing,
+                                reuse_existing=False if force else config.reuse_existing,
                                 force=force,
                             )
                             role_result.update(
