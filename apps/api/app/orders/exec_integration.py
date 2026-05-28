@@ -3887,13 +3887,14 @@ class SignalDeciderExecIntegrationService:
             has_target_stop_watch=self._has_target_stop_watch_facts(item),
         )
         intent = self._resolve_entry_intent(item=item)
+        contract_position_quantity = max(position_quantity, open_quantity)
         exec_contract = self._build_runtime_exec_contract(
             item=item,
             status=status,
             monitoring_state=monitoring_state,
             intent=intent,
             planned_intents=planned_intents,
-            position_quantity=position_quantity,
+            position_quantity=contract_position_quantity,
             position_average_price=position_average_price,
         )
         return {

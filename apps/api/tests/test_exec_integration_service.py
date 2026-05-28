@@ -2293,6 +2293,67 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(today_activity['sell_broker_order_ids'], ['sell-order-1'])
         self.assertEqual(today_activity['net_open_quantity'], 3)
 
+    async def test_runtime_dashboard_uses_derived_open_quantity_for_held_position_contract(self) -> None:
+        await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=False,
+            dry_run=False,
+            force=True,
+            trigger='test',
+        )
+        self._mark_plan_item_blocked_with_readback(
+            readback={
+                'last_synced_at': '2026-04-30T05:31:00+00:00',
+                'runtime': {'status': 'ok', 'payload': {'mode': 'mock', 'ready': True}},
+                'derived_state': {
+                    'derived_status': 'open',
+                    'entry_filled_quantity': '5',
+                    'exit_filled_quantity': '2',
+                    'open_quantity': '3',
+                    'closed_quantity': '2',
+                },
+                'orders': {'items': []},
+                'executions': {
+                    'items': [
+                        {
+                            'broker_order_id': 'buy-order-1',
+                            'symbol': self.symbol,
+                            'side': 'buy',
+                            'quantity': '5',
+                            'price': '50100',
+                            'executed_at': '2026-04-30T00:06:00+00:00',
+                        },
+                        {
+                            'broker_order_id': 'sell-order-1',
+                            'symbol': self.symbol,
+                            'side': 'sell',
+                            'quantity': '2',
+                            'price': '51200',
+                            'executed_at': '2026-04-30T05:31:00+00:00',
+                        },
+                    ]
+                },
+                'positions': {'items': []},
+            },
+        )
+
+        board = await self.service.get_runtime_daily_board(
+            market_date=self.target_trade_date,
+            refresh=False,
+            trigger='test',
+        )
+
+        item = board['items'][0]
+        self.assertEqual(item['open_quantity'], 3)
+        self.assertTrue(item['held_position'])
+        self.assertTrue(item['exec_monitoring_active'])
+        self.assertTrue(item['exec_runtime_showable'])
+        self.assertEqual(item['exec_runtime_state'], 'held_position')
+        self.assertEqual(item['position_quantity'], 3)
+        self.assertIsNone(item['position_average_price'])
+        self.assertIn('target_sell_monitoring', item['monitoring_statuses'])
+        self.assertIn('stop_sell_monitoring', item['monitoring_statuses'])
+
     async def test_runtime_dashboard_today_activity_marks_untimestamped_side_unavailable(self) -> None:
         await self.service.dispatch_next_open_plan(
             target_trade_date=self.target_trade_date,
