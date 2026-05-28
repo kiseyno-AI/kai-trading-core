@@ -3,6 +3,8 @@
 ## Summary
 Read the current symbol-level exec monitoring view from core. The route is dashboard-safe and cache-first: it groups the local daily-board read model by symbol and returns immediately, including an empty item list when no symbols are monitored. `refresh=true` schedules a bounded, debounced background exec refresh instead of making the request wait on exec/KIS readback.
 
+Each item includes explicit exec-runtime ownership fields so dashboard clients do not infer behavior from labels. Use `exec_runtime_showable=true` for the exec-owned card. Rows are showable when an exec-agent approved watch candidate has active monitoring or when an account/exec position is currently held. Core-only, rejected, expired, failed, cancelled, or stale rows carry `exec_runtime_exclusion_reason` when present in the broader monitored read model.
+
 Price fields are display-oriented: realtime websocket prices are preferred, then local current-quote/cache fallback, then recent daily close. Fallback prices are labeled with `price_source`, `price_status`, `display_price_available`, and realtime subscription metadata so capacity-limited symbols do not look like true data gaps.
 
 ## Example request
@@ -89,11 +91,36 @@ GET /execution/runtime/monitored-symbols?market_date=2026-04-30&refresh=true
       "realtime_subscribed": false,
       "realtime_subscription_reason": "capacity_limited",
       "monitoring_state": "watching_target_stop",
+      "exec_monitoring_active": true,
+      "exec_runtime_showable": true,
+      "exec_runtime_state": "held_position",
+      "exec_runtime_exclusion_reason": null,
+      "exec_runtime_exclusion_reasons": [],
+      "exec_agent_approved": false,
+      "exec_agent_action": null,
+      "exec_agent_reason_code": null,
+      "exec_agent_target_profile": null,
+      "exec_agent_target_tag": null,
+      "exec_agent_special_tactical_scalp": null,
+      "held_position": true,
+      "position_quantity": 5,
+      "position_average_price": 70100,
+      "approved_quantity": null,
+      "approved_notional": null,
+      "monitoring_statuses": [
+        "stop_sell_monitoring",
+        "target_sell_monitoring"
+      ],
       "position_side": "long",
       "planned_intents": [
         "stop_sell",
         "target_sell"
       ],
+      "target_price": "73500",
+      "stop_loss_price": "69000",
+      "trigger_price": null,
+      "chase_limit_price": null,
+      "expected_holding_period": "3-10 trading days",
       "decision_agent_names": [
         "short-term-decider",
         "signal-decider"

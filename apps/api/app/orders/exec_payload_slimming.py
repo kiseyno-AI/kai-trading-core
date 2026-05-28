@@ -248,7 +248,16 @@ def compact_exec_response_item(item: Any) -> dict[str, Any] | None:
         'trace_id',
         'request_id',
         'reason',
+        'reason_code',
         'message',
+        'exec_agent_action',
+        'agent_action',
+        'approval_action',
+        'decision_action',
+        'risk_decision',
+        'target_profile',
+        'target_tag',
+        'special_tactical_scalp',
     ):
         if key in item and item.get(key) is not None:
             compact[key] = _truncate_text(item.get(key), max_chars=256)
@@ -265,9 +274,16 @@ def compact_exec_response_item(item: Any) -> dict[str, Any] | None:
                 'price',
                 'limit_price',
                 'notional_krw',
+                'approved_notional',
+                'approved_notional_krw',
+                'action',
+                'reason_code',
                 'reason',
                 'rejection_reason',
                 'risk_decision',
+                'target_profile',
+                'target_tag',
+                'special_tactical_scalp',
                 'exec_trace_id',
             )
             if agent_sizing.get(key) is not None

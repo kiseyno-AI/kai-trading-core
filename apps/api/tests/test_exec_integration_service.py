@@ -1419,12 +1419,290 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(monitored['items'][0]['monitoring_state'], 'watching_target_stop')
         self.assertEqual(monitored['items'][0]['planned_intents'], ['stop_sell', 'target_sell'])
         self.assertEqual(monitored['items'][0]['current_price'], 50200)
+        self.assertTrue(monitored['items'][0]['exec_monitoring_active'])
+        self.assertTrue(monitored['items'][0]['exec_runtime_showable'])
+        self.assertFalse(monitored['items'][0]['exec_agent_approved'])
+        self.assertTrue(monitored['items'][0]['held_position'])
+        self.assertEqual(monitored['items'][0]['position_quantity'], 5)
+        self.assertEqual(monitored['items'][0]['position_average_price'], 50100)
+        self.assertIn('target_sell_monitoring', monitored['items'][0]['monitoring_statuses'])
+        self.assertIn('stop_sell_monitoring', monitored['items'][0]['monitoring_statuses'])
+        self.assertEqual(monitored['items'][0]['target_price'], 54000)
+        self.assertEqual(monitored['items'][0]['stop_loss_price'], 47000)
 
         self.assertEqual(detail['summary']['items_total'], 1)
         self.assertEqual(detail['monitoring']['state'], 'watching_target_stop')
         self.assertEqual(detail['current_price'], 50200)
         self.assertEqual(detail['items'][0]['status'], 'filled')
         self.assertEqual(detail['items'][0]['remote_state']['derived_status'], 'open')
+
+    async def test_runtime_monitored_symbols_flags_exec_approved_watch_candidate(self) -> None:
+        self.client.agent_sizing_payloads_by_agent['signal-decider'] = {
+            'approved': True,
+            'quantity': '5',
+            'notional_krw': '250000.0000',
+            'action': 'approve',
+            'reason_code': 'small_tactical_upside',
+            'target_profile': 'tactical_2pct',
+            'target_tag': 'target_profile:tactical_2pct',
+            'special_tactical_scalp': True,
+        }
+
+        await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=False,
+            dry_run=False,
+            force=True,
+            trigger='test',
+        )
+
+        with patch('app.orders.exec_integration.kis_realtime_price_service') as price_service:
+            price_service.price_fields_for_symbol.return_value = {
+                'current_price': 50200,
+                'price_as_of': '2026-04-30T00:07:30+00:00',
+                'price_received_at': '2026-04-30T00:07:31+00:00',
+                'price_source': 'kis_realtime_ws',
+                'price_status': 'available',
+                'realtime_subscribed': True,
+                'realtime_subscription_reason': 'subscribed',
+                'display_price_available': True,
+            }
+            price_service.observe_monitored_symbols.return_value = {'allowed_symbols': [self.symbol]}
+
+            monitored = await self.service.list_runtime_monitored_symbols(
+                market_date=self.target_trade_date,
+                refresh=False,
+                trigger='test',
+            )
+
+        self.assertEqual(monitored['summary']['items_total'], 1)
+        item = monitored['items'][0]
+        self.assertEqual(item['symbol'], self.symbol)
+        self.assertIn(item['monitoring_state'], {'watching_fill', 'reconciling'})
+        self.assertTrue(item['exec_monitoring_active'])
+        self.assertTrue(item['exec_runtime_showable'])
+        self.assertEqual(item['exec_runtime_state'], 'exec_approved_watch')
+        self.assertTrue(item['exec_agent_approved'])
+        self.assertEqual(item['exec_agent_action'], 'approve')
+        self.assertEqual(item['exec_agent_reason_code'], 'small_tactical_upside')
+        self.assertEqual(item['exec_agent_target_profile'], 'tactical_2pct')
+        self.assertEqual(item['exec_agent_target_tag'], 'target_profile:tactical_2pct')
+        self.assertTrue(item['exec_agent_special_tactical_scalp'])
+        self.assertFalse(item['held_position'])
+        self.assertEqual(item['approved_quantity'], 5)
+        self.assertEqual(item['approved_notional'], '250000.0000')
+        self.assertIn('watch_monitoring_active', item['monitoring_statuses'])
+
+    async def test_runtime_monitored_symbols_flags_core_only_and_rejected_candidates(self) -> None:
+        core_only = self.service._build_runtime_board_item(
+            item={
+                'plan_item_id': 9001,
+                'account_reference': self.account_reference,
+                'account_label': 'Main',
+                'symbol': 'CORE',
+                'decision_agent_name': 'signal-decider',
+                'estimated_reference_price': 1000,
+                'planned_quantity': '10',
+                'eligibility_status': 'eligible',
+                'execution_status': 'planned',
+                'dispatch': {},
+                'target_price': '1100',
+                'stop_loss_price': '950',
+            },
+            market_date=self.target_trade_date,
+            symbol_metadata_map={'CORE': {'name': 'Core only', 'market': 'KOSPI'}},
+            runtime_status='ready',
+        )
+        rejected = self.service._build_runtime_board_item(
+            item={
+                'plan_item_id': 9002,
+                'account_reference': self.account_reference,
+                'account_label': 'Main',
+                'symbol': 'REJ',
+                'decision_agent_name': 'signal-decider',
+                'estimated_reference_price': 2000,
+                'planned_quantity': '10',
+                'eligibility_status': 'eligible',
+                'execution_status': 'planned',
+                'dispatch': {
+                    'status': 'accepted',
+                    'plan_id': 'exec-rejected',
+                    'item_links': [
+                        {
+                            'intent': EXEC_INTENT_INTRADAY_WATCH_BUY,
+                            'side': 'buy',
+                            'symbol': 'REJ',
+                            'remote_status': 'rejected',
+                            'response_item': {
+                                'status': 'rejected',
+                                'agent_sizing': {
+                                    'approved': False,
+                                    'action': 'reject',
+                                    'reason_code': 'expired_setup',
+                                },
+                            },
+                        }
+                    ],
+                },
+                'target_price': '2200',
+                'stop_loss_price': '1900',
+            },
+            market_date=self.target_trade_date,
+            symbol_metadata_map={'REJ': {'name': 'Rejected', 'market': 'KOSPI'}},
+            runtime_status='ready',
+        )
+
+        with patch('app.orders.exec_integration.kis_realtime_price_service') as price_service:
+            price_service.price_fields_for_symbol.return_value = {
+                'current_price': None,
+                'price_as_of': None,
+                'price_received_at': None,
+                'price_source': None,
+                'price_status': 'unavailable',
+                'realtime_subscribed': False,
+                'realtime_subscription_reason': 'not_monitored',
+                'display_price_available': False,
+            }
+            price_service.observe_monitored_symbols.return_value = {'allowed_symbols': []}
+
+            payload = self.service._build_runtime_monitored_symbols_payload(
+                board={
+                    'market_date': self.target_trade_date.isoformat(),
+                    'runtime': {'status': 'ready', 'mode': 'mock'},
+                    'items': [core_only, rejected],
+                },
+                refresh=False,
+                refresh_state={'requested': False, 'status': 'not_requested'},
+                served_from_cache=False,
+            )
+
+        by_symbol = {item['symbol']: item for item in payload['items']}
+        self.assertFalse(by_symbol['CORE']['exec_runtime_showable'])
+        self.assertFalse(by_symbol['CORE']['exec_agent_approved'])
+        self.assertFalse(by_symbol['CORE']['held_position'])
+        self.assertEqual(by_symbol['CORE']['exec_runtime_state'], 'core_planned_only')
+        self.assertEqual(by_symbol['CORE']['exec_runtime_exclusion_reason'], 'core_planned_not_exec_approved')
+        self.assertFalse(by_symbol['REJ']['exec_runtime_showable'])
+        self.assertFalse(by_symbol['REJ']['exec_agent_approved'])
+        self.assertEqual(by_symbol['REJ']['exec_agent_action'], 'reject')
+        self.assertEqual(by_symbol['REJ']['exec_agent_reason_code'], 'expired_setup')
+        self.assertEqual(by_symbol['REJ']['exec_runtime_state'], 'exec_agent_rejected')
+        self.assertEqual(by_symbol['REJ']['exec_runtime_exclusion_reason'], 'exec_agent_rejected')
+        self.assertIn('rejected', by_symbol['REJ']['monitoring_statuses'])
+
+    async def test_runtime_monitored_symbols_include_historical_held_position(self) -> None:
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            row.target_trade_date = self.market_date
+            row.source_market_date = date(2026, 4, 28)
+            row.execution_status = EXECUTION_STATUS_SUBMITTED
+            row.submitted_at = datetime(2026, 4, 29, 0, 0, tzinfo=timezone.utc)
+            row.submission_payload = {
+                'mode': 'exec_dispatch',
+                'exec_dispatch': {
+                    'plan_id': 'historical-held-plan',
+                    'dispatch_status': 'accepted',
+                    'last_attempt_at': '2026-04-29T00:00:00+00:00',
+                    'last_success_at': '2026-04-29T00:00:00+00:00',
+                    'item_links': [
+                        {
+                            'core_item_key': f'core-plan-{self.plan_item_id}:next_open_buy',
+                            'intent': EXEC_INTENT_NEXT_OPEN_BUY,
+                            'side': 'buy',
+                            'symbol': self.symbol,
+                            'remote_status': 'filled',
+                        },
+                        {
+                            'core_item_key': f'core-plan-{self.plan_item_id}:target_sell',
+                            'intent': EXEC_INTENT_TARGET_SELL,
+                            'side': 'sell',
+                            'symbol': self.symbol,
+                        },
+                        {
+                            'core_item_key': f'core-plan-{self.plan_item_id}:stop_sell',
+                            'intent': EXEC_INTENT_STOP_SELL,
+                            'side': 'sell',
+                            'symbol': self.symbol,
+                        },
+                    ],
+                    'readback': {
+                        'last_synced_at': '2026-04-29T00:07:00+00:00',
+                        'runtime': {'status': 'ok', 'payload': {'ready': True}},
+                        'orders': {'status': 'ok', 'count': 0, 'items': []},
+                        'executions': {
+                            'status': 'ok',
+                            'count': 1,
+                            'items': [
+                                {
+                                    'broker_order_id': 'historical-buy-order',
+                                    'symbol': self.symbol,
+                                    'side': 'buy',
+                                    'quantity': '7',
+                                    'fill_price': '50100',
+                                    'executed_at': '2026-04-29T00:06:00+00:00',
+                                }
+                            ],
+                        },
+                        'positions': {
+                            'status': 'ok',
+                            'count': 1,
+                            'items': [
+                                {
+                                    'account_reference': self.account_reference,
+                                    'symbol': self.symbol,
+                                    'quantity': '7',
+                                    'average_price': '50100',
+                                    'updated_at': '2026-04-29T00:07:00+00:00',
+                                }
+                            ],
+                        },
+                        'derived_state': {
+                            'derived_status': 'open',
+                            'entry_filled_quantity': '7',
+                            'exit_filled_quantity': None,
+                            'open_quantity': '7',
+                            'closed_quantity': '0',
+                            'has_plan_attributed_fill_evidence': True,
+                            'endpoint_statuses': {
+                                'plans': 'ok',
+                                'orders': 'ok',
+                                'executions': 'ok',
+                                'positions': 'ok',
+                            },
+                        },
+                    },
+                },
+            }
+
+        with patch('app.orders.exec_integration.kis_realtime_price_service') as price_service:
+            price_service.price_fields_for_symbol.return_value = {
+                'current_price': 50200,
+                'price_as_of': '2026-04-30T00:07:30+00:00',
+                'price_received_at': '2026-04-30T00:07:31+00:00',
+                'price_source': 'kis_realtime_ws',
+                'price_status': 'available',
+                'realtime_subscribed': True,
+                'realtime_subscription_reason': 'subscribed',
+                'display_price_available': True,
+            }
+            price_service.observe_monitored_symbols.return_value = {'allowed_symbols': [self.symbol]}
+
+            monitored = await self.service.list_runtime_monitored_symbols(
+                market_date=self.target_trade_date,
+                refresh=False,
+                trigger='test',
+            )
+
+        self.assertEqual(monitored['summary']['items_total'], 1)
+        item = monitored['items'][0]
+        self.assertEqual(item['symbol'], self.symbol)
+        self.assertIn(item['monitoring_state'], {'watching_target_stop', 'reconciling'})
+        self.assertTrue(item['held_position'])
+        self.assertTrue(item['exec_runtime_showable'])
+        self.assertEqual(item['position_quantity'], 7)
+        self.assertEqual(item['position_average_price'], 50100)
+        self.assertIn('target_sell_monitoring', item['monitoring_statuses'])
+        self.assertIn('stop_sell_monitoring', item['monitoring_statuses'])
 
     async def test_runtime_monitored_symbols_use_cached_display_fallback_when_capacity_limited(self) -> None:
         fallback_symbol = '000660'
@@ -2014,6 +2292,67 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(today_activity['sell_last_filled_at'], '2026-04-30T05:31:00+00:00')
         self.assertEqual(today_activity['sell_broker_order_ids'], ['sell-order-1'])
         self.assertEqual(today_activity['net_open_quantity'], 3)
+
+    async def test_runtime_dashboard_uses_derived_open_quantity_for_held_position_contract(self) -> None:
+        await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=False,
+            dry_run=False,
+            force=True,
+            trigger='test',
+        )
+        self._mark_plan_item_blocked_with_readback(
+            readback={
+                'last_synced_at': '2026-04-30T05:31:00+00:00',
+                'runtime': {'status': 'ok', 'payload': {'mode': 'mock', 'ready': True}},
+                'derived_state': {
+                    'derived_status': 'open',
+                    'entry_filled_quantity': '5',
+                    'exit_filled_quantity': '2',
+                    'open_quantity': '3',
+                    'closed_quantity': '2',
+                },
+                'orders': {'items': []},
+                'executions': {
+                    'items': [
+                        {
+                            'broker_order_id': 'buy-order-1',
+                            'symbol': self.symbol,
+                            'side': 'buy',
+                            'quantity': '5',
+                            'price': '50100',
+                            'executed_at': '2026-04-30T00:06:00+00:00',
+                        },
+                        {
+                            'broker_order_id': 'sell-order-1',
+                            'symbol': self.symbol,
+                            'side': 'sell',
+                            'quantity': '2',
+                            'price': '51200',
+                            'executed_at': '2026-04-30T05:31:00+00:00',
+                        },
+                    ]
+                },
+                'positions': {'items': []},
+            },
+        )
+
+        board = await self.service.get_runtime_daily_board(
+            market_date=self.target_trade_date,
+            refresh=False,
+            trigger='test',
+        )
+
+        item = board['items'][0]
+        self.assertEqual(item['open_quantity'], 3)
+        self.assertTrue(item['held_position'])
+        self.assertTrue(item['exec_monitoring_active'])
+        self.assertTrue(item['exec_runtime_showable'])
+        self.assertEqual(item['exec_runtime_state'], 'held_position')
+        self.assertEqual(item['position_quantity'], 3)
+        self.assertIsNone(item['position_average_price'])
+        self.assertIn('target_sell_monitoring', item['monitoring_statuses'])
+        self.assertIn('stop_sell_monitoring', item['monitoring_statuses'])
 
     async def test_runtime_dashboard_today_activity_marks_untimestamped_side_unavailable(self) -> None:
         await self.service.dispatch_next_open_plan(
