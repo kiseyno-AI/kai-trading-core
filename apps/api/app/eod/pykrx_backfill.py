@@ -22,6 +22,7 @@ from app.eod.pykrx_pipeline_support import (
     build_daily_skip_result,
 )
 from app.dart.fundamentals_capture_service import dart_fundamentals_capture_service
+from app.eod.pykrx_enrichment import pykrx_enrichment_service
 from app.eod.action_summaries import daily_action_summary_service
 from app.eod.pykrx_pipeline_runner import PykrxPipelineDependencies, run_market_data_pipeline
 from app.eod.technical_snapshots import daily_technical_snapshot_service
@@ -54,6 +55,7 @@ MAX_AUTO_PYKRX_DAILY_RUNS_PER_TRADE_DATE = 5
 RETRYABLE_DAILY_STATUSES = {'completed_with_errors', 'failed'}
 PYKRX_STAGE_SEQUENCE = (
     'price_collection',
+    'pykrx_enrichment',
     'technical_snapshots',
     'action_summaries',
     'trending_ranks',
@@ -1036,6 +1038,7 @@ class PykrxBackfillService:
                 technical_snapshot_service=daily_technical_snapshot_service,
                 action_summary_service=daily_action_summary_service,
                 compute_trending_ranks=compute_and_persist_daily_trending_ranks,
+                pykrx_enrichment_service=pykrx_enrichment_service,
                 signal_feature_service=daily_signal_feature_service,
                 market_risk_filter_service=daily_market_risk_filter_service,
                 dart_fundamentals_capture_service=dart_fundamentals_capture_service,

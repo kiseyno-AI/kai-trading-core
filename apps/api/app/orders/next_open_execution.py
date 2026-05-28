@@ -4,6 +4,7 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
+import logging
 from typing import Any, Callable, Sequence
 
 import exchange_calendars as xcals
@@ -16,6 +17,7 @@ from app.agent_context.signal_decider_loop_service import signal_decider_loop_se
 from app.core.settings import settings
 from app.db import session_scope
 from app.db_models import SignalDeciderDecisionSnapshot, SignalDeciderExecutionPlanItem
+from app.eod.pykrx_enrichment_gate import inspect_pykrx_enrichment_preflight
 from app.market.clock import MarketState, get_market_state
 from app.market_data_store import load_daily_bars_for_symbol_range
 from app.orders.account_scope import parse_kis_account_reference
@@ -47,6 +49,8 @@ UNSPECIFIED_ROUTE_ACCOUNT_BUDGET_KRW = Decimal('0')
 # Short-term candidates are no longer blocked when account routing is omitted.
 # They still need a concrete row shape for exec routing; this synthetic rail
 # is treated as a routing/budget placeholder and does not drive fixed sizing.
+
+logger = logging.getLogger(__name__)
 
 
 def _utcnow() -> datetime:
@@ -344,10 +348,53 @@ class SignalDeciderNextOpenExecutionService:
         *,
         target_trade_date: str | date | None = None,
         trigger: str = 'manual',
+        force: bool = False,
     ) -> dict[str, Any]:
         resolved_target_date = self._resolve_target_trade_date(target_trade_date)
         source_market_date = _previous_trading_day(resolved_target_date)
         runtime = self.runtime_status()
+        enrichment_preflight = (
+            {
+                'market_date': source_market_date.isoformat(),
+                'status': 'force_bypassed',
+                'allowed': True,
+                'failed_categories': [],
+                'category_row_counts': {},
+            }
+            if force
+            else self.inspect_source_market_enrichment_preflight(
+                source_market_date=source_market_date,
+                trigger=trigger,
+            )
+        )
+        if not force and not enrichment_preflight.get('allowed'):
+            self._block_existing_plan_rows_for_enrichment_preflight(
+                target_trade_date=resolved_target_date,
+                source_market_date=source_market_date,
+                preflight=enrichment_preflight,
+            )
+            rows = self._load_plan_rows(target_trade_date=resolved_target_date, account_reference=None)
+            return {
+                'request': {
+                    'target_trade_date': resolved_target_date.isoformat(),
+                    'trigger': trigger,
+                },
+                'runtime': runtime,
+                'summary': {
+                    **self._build_summary(
+                        rows=rows,
+                        target_trade_date=resolved_target_date,
+                        runtime=runtime,
+                        source_market_date=source_market_date,
+                    ),
+                    'reason': 'pykrx_enrichment_preflight_blocked',
+                    'enrichment_preflight_allowed': False,
+                    'enrichment_preflight_status': enrichment_preflight.get('status'),
+                    'enrichment_failed_categories': enrichment_preflight.get('failed_categories') or [],
+                },
+                'enrichment_preflight': enrichment_preflight,
+                'items': [self._serialize_row(row) for row in rows],
+            }
         account_targets, account_target_errors = self._parse_account_targets()
         account_targets_setting_configured = bool(settings.signal_decider_next_open_account_targets.strip())
         snapshots = self._load_latest_snapshots(source_market_date=source_market_date)
@@ -501,7 +548,9 @@ class SignalDeciderNextOpenExecutionService:
                 target_trade_date=resolved_target_date,
                 runtime=runtime,
                 source_market_date=source_market_date,
+                enrichment_preflight=enrichment_preflight,
             ),
+            'enrichment_preflight': enrichment_preflight,
             'items': [self._serialize_row(row) for row in rows],
         }
 
@@ -595,10 +644,43 @@ class SignalDeciderNextOpenExecutionService:
                     'items': [],
                 }
 
-        self.refresh_plan_items(
+        refresh_result = self.refresh_plan_items(
             target_trade_date=resolved_target_date,
             trigger=f'{trigger}_prepare',
+            force=force,
         )
+        enrichment_preflight = refresh_result.get('enrichment_preflight') if isinstance(refresh_result, dict) else None
+        if (
+            not force
+            and isinstance(enrichment_preflight, dict)
+            and not enrichment_preflight.get('allowed')
+        ):
+            return {
+                'request': {
+                    'target_trade_date': resolved_target_date.isoformat(),
+                    'dry_run': effective_dry_run,
+                    'force': force,
+                    'trigger': trigger,
+                },
+                'runtime': {
+                    **runtime,
+                    'market_state': market_state.state,
+                    'server_time': market_state.server_time,
+                },
+                'summary': {
+                    'triggered': False,
+                    'reason': 'pykrx_enrichment_preflight_blocked',
+                    'selected_count': 0,
+                    'submitted_count': 0,
+                    'dry_run_count': 0,
+                    'failed_count': 0,
+                    'idempotent_replay_count': 0,
+                    'enrichment_preflight_status': enrichment_preflight.get('status'),
+                    'enrichment_failed_categories': enrichment_preflight.get('failed_categories') or [],
+                },
+                'enrichment_preflight': enrichment_preflight,
+                'items': [],
+            }
         candidate_rows = self._load_plan_rows(
             target_trade_date=resolved_target_date,
             account_reference=None,
@@ -677,6 +759,92 @@ class SignalDeciderNextOpenExecutionService:
         state = market_state or self.market_state_getter()
         default_date = date.fromisoformat(state.server_time[:10])
         return _normalize_date(target_trade_date, default=default_date)
+
+    def inspect_source_market_enrichment_preflight(
+        self,
+        *,
+        source_market_date: date,
+        trigger: str,
+    ) -> dict[str, Any]:
+        preflight = inspect_pykrx_enrichment_preflight(market_date=source_market_date)
+        log_payload = {
+            'source_market_date': source_market_date.isoformat(),
+            'trigger': trigger,
+            'status': preflight.get('status'),
+            'allowed': bool(preflight.get('allowed')),
+            'category_row_counts': preflight.get('category_row_counts') or {},
+            'failed_categories': preflight.get('failed_categories') or [],
+            'zero_coverage_categories': preflight.get('zero_coverage_categories') or [],
+        }
+        if preflight.get('allowed'):
+            logger.info(
+                'Next-open PyKRX enrichment preflight allowed downstream use',
+                extra={'pykrx_enrichment_preflight': log_payload},
+            )
+        else:
+            logger.warning(
+                'Next-open PyKRX enrichment preflight blocked downstream use',
+                extra={'pykrx_enrichment_preflight': log_payload},
+            )
+        return preflight
+
+    def _block_existing_plan_rows_for_enrichment_preflight(
+        self,
+        *,
+        target_trade_date: date,
+        source_market_date: date,
+        preflight: dict[str, Any],
+    ) -> None:
+        now = _utcnow()
+        reason = _reason(
+            'pykrx_enrichment_preflight_blocked',
+            (
+                'PyKRX enrichment coverage is not ready for source_market_date '
+                f'{source_market_date.isoformat()}; failed categories: '
+                f'{", ".join(preflight.get("failed_categories") or []) or "unknown"}.'
+            ),
+        )
+        with session_scope() as session:
+            rows = session.execute(
+                select(SignalDeciderExecutionPlanItem)
+                .where(
+                    SignalDeciderExecutionPlanItem.execution_window == EXECUTION_WINDOW_NEXT_OPEN,
+                    SignalDeciderExecutionPlanItem.target_trade_date == target_trade_date,
+                    SignalDeciderExecutionPlanItem.source_market_date == source_market_date,
+                )
+            ).scalars().all()
+            for row in rows:
+                if _is_dispatch_terminal_status(row.execution_status):
+                    continue
+                existing = row.validation_payload if isinstance(row.validation_payload, dict) else {}
+                existing_reasons = [
+                    item
+                    for item in (existing.get('blocking_reasons') or [])
+                    if isinstance(item, dict) and item.get('code') != reason['code']
+                ]
+                row.eligibility_status = ELIGIBILITY_BLOCKED
+                row.execution_status = EXECUTION_STATUS_PLANNED
+                row.last_evaluated_at = now
+                row.validation_payload = {
+                    **existing,
+                    'blocking_reasons': [*existing_reasons, reason],
+                    'warnings': existing.get('warnings') or [],
+                    'pykrx_enrichment_preflight': preflight,
+                }
+            session.flush()
+
+    def block_existing_plan_rows_for_enrichment_preflight(
+        self,
+        *,
+        target_trade_date: date,
+        source_market_date: date,
+        preflight: dict[str, Any],
+    ) -> None:
+        self._block_existing_plan_rows_for_enrichment_preflight(
+            target_trade_date=target_trade_date,
+            source_market_date=source_market_date,
+            preflight=preflight,
+        )
 
     def _parse_account_targets(self) -> tuple[list[NextOpenAccountTarget], list[str]]:
         raw_value = settings.signal_decider_next_open_account_targets.strip()
@@ -1280,6 +1448,7 @@ class SignalDeciderNextOpenExecutionService:
         target_trade_date: date,
         runtime: dict[str, Any],
         source_market_date: date | None = None,
+        enrichment_preflight: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         source_market_date = source_market_date or _previous_trading_day(target_trade_date)
         counts = {
@@ -1308,6 +1477,15 @@ class SignalDeciderNextOpenExecutionService:
             'account_targets_configured': runtime['account_targets_configured'],
             'account_targets_valid': runtime['account_targets_valid'],
             'account_target_errors': runtime['account_target_errors'],
+            'enrichment_preflight_allowed': (
+                bool(enrichment_preflight.get('allowed')) if enrichment_preflight is not None else None
+            ),
+            'enrichment_preflight_status': (
+                enrichment_preflight.get('status') if enrichment_preflight is not None else None
+            ),
+            'enrichment_failed_categories': (
+                enrichment_preflight.get('failed_categories') if enrichment_preflight is not None else []
+            ),
         }
 
     def _serialize_row(self, row: SignalDeciderExecutionPlanItem) -> dict[str, Any]:

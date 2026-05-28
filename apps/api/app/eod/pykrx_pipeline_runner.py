@@ -6,6 +6,11 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Sequence
 
+from app.eod.pykrx_enrichment import DEFAULT_PYKRX_ENRICHMENT_CATEGORIES
+from app.eod.pykrx_enrichment_gate import (
+    REQUIRED_EXEC_DECIDER_PYKRX_ENRICHMENT_CATEGORIES,
+    build_pykrx_enrichment_preflight,
+)
 from app.eod.pykrx_pipeline_support import (
     append_stage_error,
     build_stage_failure_result,
@@ -49,6 +54,7 @@ class PykrxPipelineDependencies:
     technical_snapshot_service: Any
     action_summary_service: Any
     compute_trending_ranks: Callable[..., dict]
+    pykrx_enrichment_service: Any
     signal_feature_service: Any
     market_risk_filter_service: Any
     dart_fundamentals_capture_service: Any
@@ -645,6 +651,131 @@ def run_market_data_pipeline(
             'source': 'pykrx',
         }
 
+    pykrx_enrichment_result: dict
+    pykrx_enrichment_error_message: str | None = None
+    if 'pykrx_enrichment' in requested_stage_set:
+        try:
+            persist_stage_progress(
+                stage='pykrx_enrichment',
+                status='running',
+                current_step='collecting_pykrx_enrichment',
+                current_activity='Collecting PyKRX enrichment categories',
+                processed=0,
+                total=len(DEFAULT_PYKRX_ENRICHMENT_CATEGORIES),
+                succeeded=0,
+                failed=0,
+                extra={
+                    'categories_requested': list(DEFAULT_PYKRX_ENRICHMENT_CATEGORIES),
+                    'required_downstream_categories': list(REQUIRED_EXEC_DECIDER_PYKRX_ENRICHMENT_CATEGORIES),
+                },
+            )
+            pykrx_enrichment_result = dependencies.pykrx_enrichment_service.collect_for_market_date(
+                market_date=latest_trade_date,
+                markets=markets,
+                symbols=[item.symbol for item in symbols],
+            )
+            preflight = build_pykrx_enrichment_preflight(
+                market_date=latest_trade_date,
+                coverage=dict(pykrx_enrichment_result.get('coverage') or {}),
+                categories=REQUIRED_EXEC_DECIDER_PYKRX_ENRICHMENT_CATEGORIES,
+            )
+            pykrx_enrichment_result['downstream_preflight'] = preflight
+            category_results = (
+                pykrx_enrichment_result.get('categories')
+                if isinstance(pykrx_enrichment_result.get('categories'), dict)
+                else {}
+            )
+            collection_failed_categories = [
+                category
+                for category, details in category_results.items()
+                if isinstance(details, dict) and details.get('errors')
+            ]
+            failed_categories = sorted(
+                {
+                    *collection_failed_categories,
+                    *(preflight.get('failed_categories') or []),
+                }
+            )
+            category_row_counts = {
+                category: int((details or {}).get('rows_persisted') or 0)
+                for category, details in category_results.items()
+                if isinstance(details, dict)
+            }
+            stage_status = (
+                'completed'
+                if pykrx_enrichment_result.get('status') == 'completed' and preflight.get('allowed')
+                else 'partial'
+            )
+            if failed_categories:
+                pykrx_enrichment_error_message = (
+                    'PyKRX enrichment incomplete for categories: ' + ','.join(failed_categories)
+                )
+            persist_stage_progress(
+                stage='pykrx_enrichment',
+                status=stage_status,
+                current_step='pykrx_enrichment_completed',
+                current_activity=(
+                    'PyKRX enrichment collected'
+                    if stage_status == 'completed'
+                    else 'PyKRX enrichment collected with coverage gaps'
+                ),
+                processed=len(DEFAULT_PYKRX_ENRICHMENT_CATEGORIES),
+                total=len(DEFAULT_PYKRX_ENRICHMENT_CATEGORIES),
+                succeeded=max(len(DEFAULT_PYKRX_ENRICHMENT_CATEGORIES) - len(failed_categories), 0),
+                failed=len(failed_categories),
+                extra={
+                    'categories_requested': pykrx_enrichment_result.get('categories_requested'),
+                    'category_row_counts': category_row_counts,
+                    'failed_categories': failed_categories,
+                    'downstream_preflight_status': preflight.get('status'),
+                    'downstream_allowed': bool(preflight.get('allowed')),
+                    'zero_coverage_categories': preflight.get('zero_coverage_categories'),
+                },
+            )
+            dependencies.log_fetch(
+                'pykrx_enrichment',
+                stage_status,
+                run_id=run_id,
+                market_date=latest_trade_date,
+                categories_requested=pykrx_enrichment_result.get('categories_requested'),
+                category_row_counts=category_row_counts,
+                failed_categories=failed_categories,
+                downstream_preflight_status=preflight.get('status'),
+                downstream_allowed=bool(preflight.get('allowed')),
+            )
+        except Exception as exc:
+            pykrx_enrichment_result = build_stage_failure_result(
+                market_date=latest_trade_date,
+                source='pykrx_enrichment',
+                error=exc,
+                totals={
+                    'categories_requested': list(DEFAULT_PYKRX_ENRICHMENT_CATEGORIES),
+                    'categories_failed': len(DEFAULT_PYKRX_ENRICHMENT_CATEGORIES),
+                },
+            )
+            pykrx_enrichment_error_message = f'PyKRX enrichment collection failed: {exc}'
+            persist_stage_progress(
+                stage='pykrx_enrichment',
+                status='failed',
+                current_step='pykrx_enrichment_failed',
+                current_activity='PyKRX enrichment collection failed',
+                processed=0,
+                total=len(DEFAULT_PYKRX_ENRICHMENT_CATEGORIES),
+                succeeded=0,
+                failed=len(DEFAULT_PYKRX_ENRICHMENT_CATEGORIES),
+                extra={
+                    'categories_requested': list(DEFAULT_PYKRX_ENRICHMENT_CATEGORIES),
+                    'required_downstream_categories': list(REQUIRED_EXEC_DECIDER_PYKRX_ENRICHMENT_CATEGORIES),
+                },
+            )
+    else:
+        pykrx_enrichment_result = {
+            'skipped': True,
+            'reason': 'stage_not_requested',
+            'market_date': latest_trade_date,
+            'source': 'pykrx_enrichment',
+        }
+
     technical_snapshot_result: dict
     snapshot_error_message: str | None = None
     if 'technical_snapshots' in requested_stage_set:
@@ -946,6 +1077,7 @@ def run_market_data_pipeline(
         incomplete_prefix='Price context persistence incomplete for symbols: ',
         exclude_symbols=failed_symbol_set,
     )
+    append_stage_error(run_errors, direct_error=pykrx_enrichment_error_message)
     append_stage_error(
         run_errors,
         direct_error=snapshot_error_message,
@@ -1002,6 +1134,7 @@ def run_market_data_pipeline(
         'failed_symbols': failed_symbols[:50],
         'bars_upserted': bars_upserted,
         'price_contexts': price_context_result,
+        'pykrx_enrichment': pykrx_enrichment_result,
         'technical_snapshots': technical_snapshot_result,
         'action_summaries': action_summary_result,
         'trending_ranks': trending_rank_result,

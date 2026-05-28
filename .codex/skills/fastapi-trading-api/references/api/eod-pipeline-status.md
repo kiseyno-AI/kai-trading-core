@@ -13,7 +13,7 @@ The default `market_date` is the current Seoul calendar date from `server_time[:
 
 The response now also includes `market` and `market_session` blocks. `market` is the current exchange-clock state, and `market_session` describes the semantics of the requested `market_date`, including the latest valid trading date and whether live quote or intraday data is expected for that date.
 
-The `pykrx_enrichment` stage is also the operator status source for the decider enrichment join. Completed coverage for `valuation_snapshot`, `investor_flow_symbol`, `investor_flow_market`, `short_selling`, `sector_classification`, and `market_breadth` means `GET /agent-context/symbol-day` can populate `pre_decider_enrichment_context.trading_value` and `flow_short_sector_context`. Live quote/orderbook snapshots are outside the EOD stage and appear in symbol-day context as available, unavailable, or `stale_eod` with a timestamp when the market is closed.
+The `pykrx_enrichment` stage is also the operator status source for the decider enrichment join. Completed coverage for `valuation_snapshot`, `investor_flow_symbol`, `investor_flow_market`, `short_selling`, `sector_classification`, and `market_breadth` means `GET /agent-context/symbol-day` can populate `pre_decider_enrichment_context.trading_value` and `flow_short_sector_context`. Scheduled PyKRX daily runs publish live `pykrx_enrichment` stage progress before rows are fully visible, including downstream preflight status, category row counts, and failed categories. Live quote/orderbook snapshots are outside the EOD stage and appear in symbol-day context as available, unavailable, or `stale_eod` with a timestamp when the market is closed.
 
 Row-count-derived stages expose missing-row diagnostics when they are partial. For example, `market_risk_filter.details.missing_count` and `missing_symbols_sample` show the full-universe coverage gap, while `gate_status`, `severity`, and `blocking_status` tell feedback/dashboard consumers whether that gap blocks the active feedback scope.
 
@@ -99,7 +99,19 @@ GET /eod/pipeline/status?market_date=2026-04-21&fs_div=CFS
       "processed": 7,
       "total": 7,
       "failed": 2,
+      "source_run_ids": {
+        "eod_run_id": 184
+      },
       "details": {
+        "progress_source": "live_run_metadata",
+        "downstream_allowed": false,
+        "downstream_preflight_status": "blocked",
+        "failed_categories": ["investor_flow_symbol", "short_selling"],
+        "category_row_counts": {
+          "sector_classification": 3579,
+          "investor_flow_symbol": 0,
+          "short_selling": 0
+        },
         "categories": {
           "sector_classification": {
             "coverage_status": "complete",
@@ -112,8 +124,13 @@ GET /eod/pipeline/status?market_date=2026-04-21&fs_div=CFS
             "expected_rows": 3579
           },
           "investor_flow_symbol": {
-            "coverage_status": "complete",
-            "present_rows": 3579,
+            "coverage_status": "missing",
+            "present_rows": 0,
+            "expected_rows": 3579
+          },
+          "short_selling": {
+            "coverage_status": "missing",
+            "present_rows": 0,
             "expected_rows": 3579
           }
         }

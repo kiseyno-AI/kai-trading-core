@@ -39,6 +39,7 @@ from app.orders.next_open_execution import (
     EXECUTION_STATUS_SUBMIT_FAILED,
     EXECUTION_STATUS_SUBMITTED,
     EXECUTION_WINDOW_NEXT_OPEN,
+    _previous_trading_day,
     signal_decider_next_open_execution_service,
 )
 from app.quotes.display_prices import (
@@ -742,6 +743,7 @@ class SignalDeciderExecIntegrationService:
         resolved_target_date = _normalize_date(target_trade_date)
         resolved_account_reference = _normalize_optional_text(account_reference)
         resolved_dry_run = settings.signal_decider_next_open_dry_run if dry_run is None else dry_run
+        source_market_date = _previous_trading_day(resolved_target_date)
 
         if not force and not settings.signal_decider_next_open_enabled and not resolved_dry_run:
             plan_view = signal_decider_next_open_execution_service.list_plan_items(
@@ -778,11 +780,79 @@ class SignalDeciderExecIntegrationService:
                 'items': plan_view.get('items') or [],
             }
 
+        enrichment_preflight: dict[str, Any] | None = None
         if refresh_plan:
-            signal_decider_next_open_execution_service.refresh_plan_items(
+            refresh_result = signal_decider_next_open_execution_service.refresh_plan_items(
                 target_trade_date=resolved_target_date,
                 trigger=f'{trigger}_plan_refresh',
+                force=force,
             )
+            enrichment_preflight = (
+                refresh_result.get('enrichment_preflight')
+                if isinstance(refresh_result, dict)
+                and isinstance(refresh_result.get('enrichment_preflight'), dict)
+                else None
+            )
+        elif force:
+            enrichment_preflight = {
+                'market_date': source_market_date.isoformat(),
+                'status': 'force_bypassed',
+                'allowed': True,
+                'failed_categories': [],
+                'category_row_counts': {},
+            }
+        else:
+            enrichment_preflight = (
+                signal_decider_next_open_execution_service.inspect_source_market_enrichment_preflight(
+                    source_market_date=source_market_date,
+                    trigger=f'{trigger}_dispatch',
+                )
+            )
+            if not enrichment_preflight.get('allowed'):
+                signal_decider_next_open_execution_service.block_existing_plan_rows_for_enrichment_preflight(
+                    target_trade_date=resolved_target_date,
+                    source_market_date=source_market_date,
+                    preflight=enrichment_preflight,
+                )
+
+        if enrichment_preflight is not None and not force and not enrichment_preflight.get('allowed'):
+            plan_view = signal_decider_next_open_execution_service.list_plan_items(
+                target_trade_date=resolved_target_date,
+                account_reference=resolved_account_reference,
+                refresh=False,
+            )
+            return {
+                'request': {
+                    'target_trade_date': resolved_target_date.isoformat(),
+                    'account_reference': resolved_account_reference,
+                    'refresh_plan': refresh_plan,
+                    'dry_run': resolved_dry_run,
+                    'force': force,
+                    'trigger': trigger,
+                },
+                'integration': integration,
+                'dispatch': {
+                    'groups': [],
+                    'preview_plans': [],
+                },
+                'summary': {
+                    **(plan_view.get('summary') or {}),
+                    'delegated_to_exec': True,
+                    'triggered': False,
+                    'reason': 'pykrx_enrichment_preflight_blocked',
+                    'dispatch_mode': integration['mode'],
+                    'translated_item_count': 0,
+                    'dispatched_group_count': 0,
+                    'failed_group_count': 0,
+                    'skipped_group_count': 0,
+                    'preview_group_count': 0,
+                    'enrichment_preflight_allowed': False,
+                    'enrichment_preflight_status': enrichment_preflight.get('status'),
+                    'enrichment_failed_categories': enrichment_preflight.get('failed_categories') or [],
+                },
+                'enrichment_preflight': enrichment_preflight,
+                'items': plan_view.get('items') or [],
+            }
 
         rows = self._load_next_open_rows(
             target_trade_date=resolved_target_date,
@@ -957,6 +1027,15 @@ class SignalDeciderExecIntegrationService:
             'failed_group_count': failed_group_count,
             'skipped_group_count': skipped_group_count,
             'preview_group_count': len(preview_plans),
+            'enrichment_preflight_allowed': (
+                bool(enrichment_preflight.get('allowed')) if enrichment_preflight else None
+            ),
+            'enrichment_preflight_status': (
+                enrichment_preflight.get('status') if enrichment_preflight else None
+            ),
+            'enrichment_failed_categories': (
+                enrichment_preflight.get('failed_categories') if enrichment_preflight else []
+            ),
         }
         return {
             'request': {
@@ -973,6 +1052,7 @@ class SignalDeciderExecIntegrationService:
                 'preview_plans': preview_plans,
             },
             'summary': summary,
+            'enrichment_preflight': enrichment_preflight,
             'items': plan_view.get('items') or [],
         }
 

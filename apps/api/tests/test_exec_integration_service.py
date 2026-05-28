@@ -156,6 +156,24 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         settings.signal_decider_next_open_dry_run = False
         self.client = FakeExecClient()
         self.service = SignalDeciderExecIntegrationService(client=self.client)
+        self.enrichment_preflight_patcher = patch(
+            'app.orders.next_open_execution.inspect_pykrx_enrichment_preflight',
+            side_effect=lambda **kwargs: {
+                'market_date': str(kwargs.get('market_date') or self.market_date),
+                'status': 'ready',
+                'allowed': True,
+                'required_categories': ['sector_classification', 'investor_flow_symbol', 'short_selling'],
+                'failed_categories': [],
+                'zero_coverage_categories': [],
+                'category_row_counts': {
+                    'sector_classification': 1,
+                    'investor_flow_symbol': 1,
+                    'short_selling': 1,
+                },
+            },
+        )
+        self.enrichment_preflight_mock = self.enrichment_preflight_patcher.start()
+        self.addCleanup(self.enrichment_preflight_patcher.stop)
         self._seed_symbol()
         self.snapshot_id = self._seed_snapshot()
         self.plan_item_id = self._seed_plan_item()
@@ -549,6 +567,40 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 'blocking_reasons': [{'code': 'stale_planning_block', 'message': 'stale planning block'}],
             }
             session.flush()
+
+    async def test_dispatch_next_open_plan_blocks_when_source_pykrx_enrichment_missing(self) -> None:
+        blocked_preflight = {
+            'market_date': self.market_date.isoformat(),
+            'status': 'blocked',
+            'allowed': False,
+            'required_categories': ['sector_classification', 'investor_flow_symbol', 'short_selling'],
+            'failed_categories': ['investor_flow_symbol', 'short_selling'],
+            'zero_coverage_categories': ['investor_flow_symbol', 'short_selling'],
+            'category_row_counts': {
+                'sector_classification': 1,
+                'investor_flow_symbol': 0,
+                'short_selling': 0,
+            },
+        }
+        with patch('app.orders.next_open_execution.inspect_pykrx_enrichment_preflight', return_value=blocked_preflight):
+            result = await self.service.dispatch_next_open_plan(
+                target_trade_date=self.target_trade_date,
+                refresh_plan=False,
+                dry_run=False,
+                force=False,
+                trigger='test',
+            )
+
+        self.assertEqual(result['summary']['reason'], 'pykrx_enrichment_preflight_blocked')
+        self.assertFalse(result['summary']['triggered'])
+        self.assertEqual(result['summary']['translated_item_count'], 0)
+        self.assertFalse(result['summary']['enrichment_preflight_allowed'])
+        self.assertEqual(result['summary']['enrichment_preflight_status'], 'blocked')
+        self.assertEqual(result['enrichment_preflight']['zero_coverage_categories'], ['investor_flow_symbol', 'short_selling'])
+        self.assertEqual(self.client.post_calls, [])
+        self.assertEqual(result['items'][0]['eligibility_status'], 'blocked')
+        blocking_codes = [entry['code'] for entry in result['items'][0]['validation']['blocking_reasons']]
+        self.assertIn('pykrx_enrichment_preflight_blocked', blocking_codes)
 
     async def test_dispatch_next_open_plan_translates_and_persists_exec_linkage(self) -> None:
         result = await self.service.dispatch_next_open_plan(

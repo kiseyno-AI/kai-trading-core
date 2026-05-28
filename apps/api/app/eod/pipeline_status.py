@@ -450,6 +450,7 @@ class EODPipelineStatusService:
         pykrx_enrichment_stage = self._build_pykrx_enrichment_stage(
             market_date=resolved_market_date,
             coverage=dict(self.pykrx_enrichment_loader(market_date=resolved_market_date) or {}),
+            run=pykrx_run,
         )
         fundamentals_stage = self._build_fundamentals_stage(
             market_date=resolved_market_date,
@@ -944,8 +945,12 @@ class EODPipelineStatusService:
         *,
         market_date: str,
         coverage: dict[str, Any],
+        run: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         category_rows = dict(coverage.get('categories') or {})
+        run_metadata = get_run_metadata(run) if run else {}
+        stage_progress = run_metadata.get('stage_progress') if isinstance(run_metadata.get('stage_progress'), dict) else {}
+        progress = dict(stage_progress.get('pykrx_enrichment') or {})
         total = len(DEFAULT_PYKRX_ENRICHMENT_CATEGORIES)
         latest_captured_at = None
         for item in category_rows.values():
@@ -984,31 +989,56 @@ class EODPipelineStatusService:
             else:
                 status = 'partial'
                 source_status = 'partial'
+        progress_status = _normalize_status(progress.get('status'))
+        if progress_status in {'running', 'failed'}:
+            status = progress_status
+            source_status = progress.get('status') or source_status
+            counts = build_stage_counts(
+                total=progress.get('total') or total,
+                succeeded=progress.get('succeeded'),
+                failed=progress.get('failed'),
+                processed=progress.get('processed'),
+            )
+        elif progress_status in {'completed', 'partial'} and status == 'pending':
+            status = progress_status
+            source_status = progress.get('status') or source_status
+            counts = build_stage_counts(
+                total=progress.get('total') or total,
+                succeeded=progress.get('succeeded'),
+                failed=progress.get('failed'),
+                processed=progress.get('processed'),
+            )
+        progress_extras = _progress_extras(progress)
+        updated_at = progress.get('updated_at') or latest_captured_at
+        completed_at = progress.get('completed_at') or (latest_captured_at if status in {'completed', 'partial'} else None)
+        source_run_ids = {'eod_run_id': run.get('id')} if run and progress else {}
         return {
             'task': 'pykrx_enrichment',
             'label': STAGE_LABELS['pykrx_enrichment'],
             'status': status,
-            'source_status': source_status if category_rows else None,
+            'source_status': source_status if (category_rows or progress) else None,
             'market_date': market_date,
-            'started_at': None,
-            'updated_at': latest_captured_at,
-            'completed_at': latest_captured_at if status in {'completed', 'partial'} else None,
+            'started_at': progress.get('started_at'),
+            'updated_at': updated_at,
+            'completed_at': completed_at,
             'processed': counts.processed,
             'total': counts.total,
             'succeeded': counts.succeeded,
             'failed': counts.failed,
             'remaining': counts.remaining,
-            'current_step': None,
-            'current_activity': _default_activity(STAGE_LABELS['pykrx_enrichment'], status),
+            'current_step': progress.get('current_step'),
+            'current_activity': progress.get('current_activity') or _default_activity(STAGE_LABELS['pykrx_enrichment'], status),
             'current_symbol': None,
             'current_period': None,
-            'source_run_ids': {},
+            'source_run_ids': source_run_ids,
             'details': {
+                **progress_extras,
                 'requested_symbol_count': coverage.get('requested_symbol_count'),
                 'requested_market_count': coverage.get('requested_market_count'),
                 'categories': category_rows,
                 'missing_categories': missing_categories,
                 'coverage_warning_categories': coverage_warning_categories,
+                'progress_source': 'live_run_metadata' if progress else 'stored_rows',
             },
         }
 

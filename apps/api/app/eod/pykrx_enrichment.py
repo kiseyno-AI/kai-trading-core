@@ -323,12 +323,28 @@ class PykrxEnrichmentService:
             symbols=normalized_symbols,
             categories=resolved_categories,
         )
+        status = 'partial' if categories_with_errors else 'completed'
+        _log_pykrx_enrichment_fetch(
+            'collect_for_market_date',
+            status,
+            market_date=market_date_iso,
+            markets=normalized_markets,
+            symbols_requested=normalized_symbols or None,
+            categories_requested=resolved_categories,
+            category_row_counts={
+                category: int((details or {}).get('rows_persisted') or 0)
+                for category, details in category_results.items()
+            },
+            failed_categories=categories_with_errors,
+            requested_symbol_count=coverage.get('requested_symbol_count'),
+            requested_market_count=coverage.get('requested_market_count'),
+        )
         return {
             'market_date': market_date_iso,
             'markets': normalized_markets,
             'symbols_requested': normalized_symbols or None,
             'categories_requested': resolved_categories,
-            'status': 'partial' if categories_with_errors else 'completed',
+            'status': status,
             'categories': category_results,
             'coverage': coverage,
         }
