@@ -202,6 +202,18 @@ class AgentFeedbackPrerequisiteService:
     def _augment_pykrx_enrichment_prerequisite_stage(cls, stage_payload: dict[str, Any]) -> dict[str, Any]:
         details = dict(stage_payload.get('details') if isinstance(stage_payload.get('details'), dict) else {})
         category_payloads = dict(details.get('categories') if isinstance(details.get('categories'), dict) else {})
+        details.update(cls.build_pykrx_enrichment_gate_details(category_payloads=category_payloads))
+        return {
+            **stage_payload,
+            'details': details,
+        }
+
+    @classmethod
+    def build_pykrx_enrichment_gate_details(
+        cls,
+        *,
+        category_payloads: dict[str, Any],
+    ) -> dict[str, Any]:
         gate_items = [
             cls._pykrx_category_gate_item(
                 category=category,
@@ -228,20 +240,14 @@ class AgentFeedbackPrerequisiteService:
         else:
             category_gate_status = 'ready'
 
-        details.update(
-            {
-                'decider_required_categories': list(PYKRX_DECIDER_ENRICHMENT_REQUIRED_CATEGORIES),
-                'decider_min_coverage_ratio': PYKRX_DECIDER_ENRICHMENT_MIN_COVERAGE_RATIO,
-                'decider_category_gates': gate_items,
-                'decider_blocking_categories': blocked_categories,
-                'decider_waiting_categories': waiting_categories,
-                'decider_warning_categories': warning_categories,
-                'decider_category_gate_status': category_gate_status,
-            }
-        )
         return {
-            **stage_payload,
-            'details': details,
+            'decider_required_categories': list(PYKRX_DECIDER_ENRICHMENT_REQUIRED_CATEGORIES),
+            'decider_min_coverage_ratio': PYKRX_DECIDER_ENRICHMENT_MIN_COVERAGE_RATIO,
+            'decider_category_gates': gate_items,
+            'decider_blocking_categories': blocked_categories,
+            'decider_waiting_categories': waiting_categories,
+            'decider_warning_categories': warning_categories,
+            'decider_category_gate_status': category_gate_status,
         }
 
     def inspect_feedback_prerequisites(

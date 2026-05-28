@@ -111,6 +111,8 @@ It freezes the behavior currently shipped on `main` so future web work, core ref
 - Each stage includes normalized monitor metadata in addition to legacy fields:
   `stage_id`, `task`, `label`, `group`, `order`, `depends_on`, `inspect_routes`, `output_tables`, `default_selected`, and `details.progress_source`.
 - Stage `details` also carries `rows_persisted`, `expected_rows`, and a readable `reason` where Core can infer one from diagnostics, activity, or errors.
+- When the latest official daily run is only a resumed subset, same-date historical official stage rows and persisted outputs are still considered so omitted prior stages do not regress to opaque `pending`.
+- Pre-open/global stages such as `master_refresh` and `pykrx_universe_refresh` may report `skipped` with reason metadata once same-date downstream output exists and those global stages have no active official stage row.
 - The pykrx stage order is fixed:
   `price_collection`, `technical_snapshots`, `action_summaries`, `trending_ranks`.
 - Stage counts come from the selected pykrx `eod_collection_runs` row plus downstream rows linked by `eod_run_id`, with live stage progress from `run_metadata.stage_progress`.
@@ -150,11 +152,25 @@ It freezes the behavior currently shipped on `main` so future web work, core ref
 - A running feedback run keeps `agent_feedback_summaries.status=running` and therefore makes the overall pipeline `status=running`; non-blocking upstream row gaps stay visible on their own stages instead of being conflated with feedback failure.
 - Feedback run diagnostics include `run_id`, `run_status`, `current_role`, `failed_items`, `completed_feedback_count`, `expected_feedback_count`, `feedback_failure_status`, and `feedback_health` so consumers can separate active progress from failed or stalled feedback.
 
+### persisted downstream outputs
+
+- `signal_features` can be inferred as `completed` from same-date `daily_signal_features` rows.
+- `external_news_collect` can be inferred as `completed` from same-date `external_news_items` collected rows.
+- `external_news_enrich` is based on the classification state of those stored news rows: fully classified rows are `completed`, partially classified rows are `partial`, and unclassified stored rows keep the enrich stage `pending` with reason metadata.
+- `signal_decider` can be inferred as `completed` from same-date `agent_context_feedback` rows for `agent_name=signal-decider` and/or same-date `signal_decider_decision_snapshots`.
+- These persisted-output inferences are storage availability signals. They do not silently relax prerequisite gates.
+
+### gate summary
+
+- Stages that expose downstream readiness include stage-level `gate_status`, `severity`, and `blocking_status` where applicable.
+- The top-level `gate_summary` aggregates those gate statuses separately from physical stage execution/storage status.
+- `pykrx_enrichment.status` can be `completed` while `pykrx_enrichment.gate_status` and `gate_summary.status` are `blocked` when required decider categories are below the minimum coverage ratio. Blocking category details remain visible under `details.decider_blocking_categories`.
+
 ### overall status
 
 - Overall pipeline `status` is `running` if any stage is `running`.
 - Overall pipeline `status` is `pending` only when every stage is `pending`.
-- Overall pipeline `status` is `completed` only when every stage is `completed`.
+- Overall pipeline `status` is `completed` when every stage is `completed`, or when every remaining non-completed stage is explicitly `skipped` because skipped stages are non-actionable for that market-date view.
 - On a same-day run where pykrx and fundamentals are complete but one or more default-selected factor stages still have no stored rows, overall status must stay `partial`.
 - Overall pipeline `status` is `failed` only when at least one stage is `failed` and no stage is `completed` or `partial`.
 - All other mixed states resolve to `partial`.

@@ -73,6 +73,90 @@ def _full_pykrx_enrichment_coverage(*, symbol_count: int, market_count: int, upd
     }
 
 
+def _blocked_pykrx_enrichment_coverage(*, expected_symbols: int, market_count: int, updated_at: str) -> dict[str, dict]:
+    present_by_category = {
+        'sector_classification': int(expected_symbols * 0.62),
+        'investor_flow_symbol': int(expected_symbols * 0.60),
+        'short_selling': int(expected_symbols * 0.63),
+        'valuation_snapshot': int(expected_symbols * 0.61),
+        'foreign_ownership': expected_symbols,
+    }
+    return {
+        'requested_symbol_count': expected_symbols,
+        'requested_market_count': market_count,
+        'categories': {
+            category: {
+                'present_rows': (
+                    market_count
+                    if category in {'market_breadth', 'investor_flow_market'}
+                    else present_by_category.get(category, expected_symbols)
+                ),
+                'expected_rows': (
+                    market_count
+                    if category in {'market_breadth', 'investor_flow_market'}
+                    else expected_symbols
+                ),
+                'coverage_ratio': (
+                    1.0
+                    if category in {'market_breadth', 'investor_flow_market', 'foreign_ownership'}
+                    else round(present_by_category.get(category, expected_symbols) / expected_symbols, 6)
+                ),
+                'coverage_status': (
+                    'complete'
+                    if category in {'market_breadth', 'investor_flow_market', 'foreign_ownership'}
+                    else 'partial'
+                ),
+                'latest_captured_at': updated_at,
+            }
+            for category in DEFAULT_PYKRX_ENRICHMENT_CATEGORIES
+        },
+    }
+
+
+def _completed_official_stage(
+    *,
+    run_id: int,
+    stage_id: str,
+    market_date: str,
+    processed: int = 1,
+    total: int = 1,
+    updated_at: str = '2026-05-28T08:30:00+00:00',
+) -> dict[str, dict]:
+    return {
+        'run': {
+            'id': run_id,
+            'market_date': market_date,
+            'trigger': 'manual_api',
+            'status': 'completed',
+            'current_stage': stage_id,
+            'started_at': updated_at,
+            'updated_at': updated_at,
+            'completed_at': updated_at,
+            'error_message': None,
+            'run_metadata': {'requested_stages': [stage_id], 'resolved_stages': [stage_id]},
+        },
+        'stage': {
+            'stage_id': stage_id,
+            'status': 'completed',
+            'market_date': market_date,
+            'started_at': updated_at,
+            'updated_at': updated_at,
+            'completed_at': updated_at,
+            'processed': processed,
+            'total': total,
+            'succeeded': processed,
+            'failed': 0,
+            'remaining': 0,
+            'current_step': None,
+            'current_activity': None,
+            'current_symbol': None,
+            'current_period': None,
+            'source_run_ids': {},
+            'details': {},
+        },
+    }
+
+
 class EODPipelineStatusServiceTests(unittest.TestCase):
     def test_load_latest_pipeline_pykrx_run_reconciles_selected_daily_run_instead_of_newer_historical_backfill(self):
         historical_run = {
@@ -1338,9 +1422,12 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
         self.assertEqual(result['status'], 'partial')
         self.assertEqual(result['total_stages'], 24)
         self.assertEqual(result['stage_status_counts']['completed'], 16)
+        self.assertEqual(result['skipped_stages'], 2)
         self.assertEqual(result['partial_stages'], 0)
-        self.assertEqual(result['pending_stages'], 8)
-        self.assertEqual(result['current_stage'], 'master_refresh')
+        self.assertEqual(result['pending_stages'], 6)
+        self.assertEqual(result['current_stage'], 'signal_features')
+        self.assertEqual(result['stages']['master_refresh']['status'], 'skipped')
+        self.assertEqual(result['stages']['pykrx_universe_refresh']['status'], 'skipped')
         self.assertEqual(result['stages']['price_collection']['status'], 'completed')
         self.assertEqual(result['stages']['technical_snapshots']['status'], 'completed')
         self.assertEqual(result['stages']['action_summaries']['status'], 'completed')
@@ -1350,6 +1437,205 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
         self.assertEqual(result['stages']['composite_factors']['status'], 'completed')
         self.assertEqual(result['stages']['trending_ranks']['processed'], 3)
         self.assertEqual(result['stages']['fundamentals_daily_refresh']['succeeded'], 3)
+
+    def test_read_uses_persisted_outputs_when_latest_official_run_is_single_stage_resume(self):
+        market_date = '2026-05-28'
+        pykrx_run = {
+            'id': 400,
+            'market': 'KRX',
+            'trade_date': market_date,
+            'source': 'pykrx',
+            'trigger': 'auto_close_scheduler',
+            'status': 'completed',
+            'symbols_total': 2806,
+            'symbols_succeeded': 2806,
+            'symbols_failed': 0,
+            'error_message': None,
+            'started_at': '2026-05-28T06:10:00+00:00',
+            'completed_at': '2026-05-28T07:00:00+00:00',
+            'run_metadata': {
+                'mode': 'daily_auto',
+                'latest_available_trade_date': market_date,
+                'markets': ['KOSPI', 'KOSDAQ'],
+            },
+        }
+        stage_counts = {
+            'price_collection': {'persisted': 2806, 'updated_at': '2026-05-28T06:20:00+00:00'},
+            'technical_snapshots': {'persisted': 2806, 'updated_at': '2026-05-28T06:35:00+00:00'},
+            'action_summaries': {'persisted': 2806, 'updated_at': '2026-05-28T06:45:00+00:00'},
+            'trending_ranks': {'persisted': 8418, 'periods_persisted': 3, 'updated_at': '2026-05-28T06:55:00+00:00'},
+        }
+        fundamentals_run = {
+            'id': 4001,
+            'market_date': market_date,
+            'trigger': 'eod_pykrx_followup',
+            'status': 'completed',
+            'fs_div': 'CFS',
+            'force': False,
+            'symbol_limit': None,
+            'symbol_offset': 0,
+            'symbols_total': 2806,
+            'symbols_checked': 2806,
+            'symbols_missing': 0,
+            'symbols_stale': 0,
+            'symbols_fresh': 2800,
+            'symbols_refreshed': 6,
+            'symbols_failed': 0,
+            'events_detected': 0,
+            'events_captured': 0,
+            'events_failed': 0,
+            'error_message': None,
+            'started_at': '2026-05-28T07:01:00+00:00',
+            'completed_at': '2026-05-28T07:05:00+00:00',
+            'run_metadata': {
+                'symbols_selected': 2806,
+                'last_progress_at': '2026-05-28T07:05:00+00:00',
+            },
+        }
+        official_run = {
+            'id': 9,
+            'market_date': market_date,
+            'trigger': 'manual_api',
+            'status': 'completed',
+            'current_stage': 'signal_decider_evaluations',
+            'started_at': '2026-05-28T09:00:00+00:00',
+            'updated_at': '2026-05-28T09:05:00+00:00',
+            'completed_at': '2026-05-28T09:05:00+00:00',
+            'error_message': None,
+            'run_metadata': {
+                'requested_stages': ['signal_decider_evaluations'],
+                'resolved_stages': ['signal_decider_evaluations'],
+            },
+            'stages': {
+                'signal_decider_evaluations': {
+                    'stage_id': 'signal_decider_evaluations',
+                    'status': 'completed',
+                    'market_date': market_date,
+                    'started_at': '2026-05-28T09:00:00+00:00',
+                    'updated_at': '2026-05-28T09:05:00+00:00',
+                    'completed_at': '2026-05-28T09:05:00+00:00',
+                    'processed': 228,
+                    'total': 228,
+                    'succeeded': 228,
+                    'failed': 0,
+                    'remaining': 0,
+                    'current_step': None,
+                    'current_activity': None,
+                    'current_symbol': None,
+                    'current_period': None,
+                    'source_run_ids': {},
+                    'details': {},
+                },
+            },
+        }
+        service = EODPipelineStatusService(
+            market_state_loader=lambda: _FakeMarketState(),
+            pykrx_run_loader=lambda **_: pykrx_run,
+            pykrx_stage_counts_loader=lambda *_: stage_counts,
+            live_symbol_count_loader=lambda: 4480,
+            fundamentals_refresh_loader=lambda **_: fundamentals_run,
+            row_count_stage_counts_loader=lambda **_: _full_feedback_prerequisite_stage_counts(
+                total=2806,
+                updated_at='2026-05-28T07:15:00+00:00',
+            ),
+            price_bar_count_loader=lambda **_: 2806,
+            pykrx_enrichment_loader=lambda **_: _blocked_pykrx_enrichment_coverage(
+                expected_symbols=4480,
+                market_count=3,
+                updated_at='2026-05-28T06:25:00+00:00',
+            ),
+            official_run_loader=lambda **_: official_run,
+            official_stage_history_loader=lambda **_: {
+                'agent_feedback_summaries': _completed_official_stage(
+                    run_id=8,
+                    stage_id='agent_feedback_summaries',
+                    market_date=market_date,
+                    processed=570,
+                    total=570,
+                ),
+            },
+            signal_feature_counts_loader=lambda **_: {
+                'persisted': 2823,
+                'updated_at': '2026-05-28T06:30:00+00:00',
+            },
+            external_news_counts_loader=lambda **_: {
+                'items': 1091,
+                'symbols': 114,
+                'classified_items': 1091,
+                'updated_at': '2026-05-28T06:40:00+00:00',
+            },
+            signal_decider_counts_loader=lambda **_: {
+                'feedback_rows': 114,
+                'feedback_symbols': 114,
+                'decision_snapshots': 228,
+                'decision_snapshot_symbols': 114,
+                'updated_at': '2026-05-28T08:50:00+00:00',
+            },
+        )
+
+        result = service.read(market_date=market_date)
+
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['total_stages'], 24)
+        self.assertEqual(result['completed_stages'], 22)
+        self.assertEqual(result['skipped_stages'], 2)
+        self.assertEqual(result['display_completed_stages'], 24)
+        self.assertEqual(result['pending_stages'], 0)
+        self.assertEqual(result['partial_stages'], 0)
+        self.assertEqual(result['running_stages'], 0)
+        self.assertIsNone(result['current_stage'])
+        self.assertEqual(result['stages']['master_refresh']['status'], 'skipped')
+        self.assertEqual(
+            result['stages']['master_refresh']['details']['reason'],
+            'preopen_global_stage_not_required_for_resumed_market_date_status',
+        )
+        self.assertEqual(result['stages']['signal_features']['status'], 'completed')
+        self.assertEqual(result['stages']['signal_features']['details']['rows_persisted'], 2823)
+        self.assertEqual(result['stages']['external_news_collect']['status'], 'completed')
+        self.assertEqual(result['stages']['external_news_collect']['details']['items_persisted'], 1091)
+        self.assertEqual(result['stages']['external_news_enrich']['status'], 'completed')
+        self.assertEqual(result['stages']['external_news_enrich']['details']['classified_items'], 1091)
+        self.assertEqual(result['stages']['signal_decider']['status'], 'completed')
+        self.assertEqual(result['stages']['signal_decider']['details']['feedback_rows'], 114)
+        self.assertEqual(result['stages']['signal_decider']['details']['decision_snapshots'], 228)
+        self.assertEqual(result['stages']['signal_decider_evaluations']['status'], 'completed')
+        pykrx_stage = result['stages']['pykrx_enrichment']
+        self.assertEqual(pykrx_stage['status'], 'completed')
+        self.assertEqual(pykrx_stage['gate_status'], 'blocked')
+        self.assertEqual(pykrx_stage['details']['decider_category_gate_status'], 'blocked')
+        self.assertEqual(result['gate_summary']['status'], 'blocked')
+        self.assertEqual(result['gate_summary']['blocked_stage_ids'], ['pykrx_enrichment'])
+        blocking_categories = pykrx_stage['details']['decider_blocking_categories']
+        self.assertIn('sector_classification', {item['category'] for item in blocking_categories})
+        self.assertEqual(
+            blocking_categories[0]['reason'],
+            'required_pykrx_enrichment_category_below_min_coverage',
+        )
+
+    def test_read_reports_external_news_enrich_pending_when_persisted_items_are_unclassified(self):
+        service = EODPipelineStatusService(
+            market_state_loader=lambda: _FakeMarketState(),
+            pykrx_run_loader=lambda **_: None,
+            pykrx_stage_counts_loader=lambda *_: {},
+            live_symbol_count_loader=lambda: 10,
+            fundamentals_refresh_loader=lambda **_: None,
+            external_news_counts_loader=lambda **_: {
+                'items': 7,
+                'symbols': 3,
+                'classified_items': 0,
+                'updated_at': '2026-05-28T06:40:00+00:00',
+            },
+        )
+
+        result = service.read(market_date='2026-05-28')
+
+        self.assertEqual(result['stages']['external_news_collect']['status'], 'completed')
+        enrich_stage = result['stages']['external_news_enrich']
+        self.assertEqual(enrich_stage['status'], 'pending')
+        self.assertEqual(enrich_stage['source_status'], 'stored_external_news_unclassified')
+        self.assertEqual(enrich_stage['details']['items_persisted'], 7)
+        self.assertEqual(enrich_stage['details']['classified_items'], 0)
+        self.assertEqual(enrich_stage['details']['reason'], 'external_news_items_need_classification')
 
     def test_read_includes_pykrx_enrichment_stage_from_coverage(self):
         coverage = {
