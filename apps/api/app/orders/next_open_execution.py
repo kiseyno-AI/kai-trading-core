@@ -17,9 +17,12 @@ from app.agent_context.signal_decider_loop_service import signal_decider_loop_se
 from app.core.settings import settings
 from app.db import session_scope
 from app.db_models import SignalDeciderDecisionSnapshot, SignalDeciderExecutionPlanItem
-from app.eod.pykrx_enrichment_gate import inspect_pykrx_enrichment_preflight
+from app.eod.pykrx_enrichment_gate import (
+    REQUIRED_EXEC_DECIDER_PYKRX_ENRICHMENT_CATEGORIES,
+    inspect_pykrx_enrichment_preflight,
+)
 from app.market.clock import MarketState, get_market_state
-from app.market_data_store import load_daily_bars_for_symbol_range
+from app.market_data_store import load_daily_bars_for_symbol_range, load_daily_pykrx_enrichment_rows
 from app.orders.account_scope import parse_kis_account_reference
 from app.orders.signal_decider_execution_outcomes import signal_decider_execution_outcome_service
 from app.orders.service import (
@@ -235,6 +238,19 @@ def _short_term_tactical_action(snapshot: SignalDeciderDecisionSnapshot) -> str:
     return 'wait'
 
 
+def _is_actionable_snapshot(snapshot: SignalDeciderDecisionSnapshot) -> bool:
+    decision_agent_name = _snapshot_agent_name(snapshot)
+    if decision_agent_name == SIGNAL_DECIDER_AGENT_NAME:
+        return _normalize_action(snapshot.next_day_open_action or snapshot.decision_action) == 'buy'
+    if decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME:
+        return _short_term_tactical_action(snapshot) in SHORT_TERM_ACTIONABLE_ACTIONS
+    return False
+
+
+def _is_actionable_short_term_snapshot(snapshot: SignalDeciderDecisionSnapshot) -> bool:
+    return _snapshot_agent_name(snapshot) == SHORT_TERM_DECIDER_AGENT_NAME and _is_actionable_snapshot(snapshot)
+
+
 def _short_term_generic_action(tactical_action: str) -> str:
     return SHORT_TERM_GENERIC_ACTION_BY_TACTICAL_ACTION.get(tactical_action, 'wait')
 
@@ -411,9 +427,53 @@ class SignalDeciderNextOpenExecutionService:
             )
         )
         enrichment_preflight_blocked = not force and not enrichment_preflight.get('allowed')
+        snapshots = self._load_latest_snapshots(source_market_date=source_market_date)
+        actionable_short_term_symbols = [
+            snapshot.symbol for snapshot in snapshots if _is_actionable_short_term_snapshot(snapshot)
+        ]
+        candidate_enrichment_by_symbol = (
+            {}
+            if not enrichment_preflight_blocked or not actionable_short_term_symbols
+            else self._inspect_candidate_pykrx_enrichment(
+                source_market_date=source_market_date,
+                symbols=actionable_short_term_symbols,
+                categories=(
+                    enrichment_preflight.get('required_categories')
+                    or list(REQUIRED_EXEC_DECIDER_PYKRX_ENRICHMENT_CATEGORIES)
+                ),
+            )
+        )
+        if enrichment_preflight_blocked and not actionable_short_term_symbols:
+            self._block_existing_plan_rows_for_enrichment_preflight(
+                target_trade_date=resolved_target_date,
+                source_market_date=source_market_date,
+                preflight=enrichment_preflight,
+            )
+            rows = self._load_plan_rows(target_trade_date=resolved_target_date, account_reference=None)
+            return {
+                'request': {
+                    'target_trade_date': resolved_target_date.isoformat(),
+                    'trigger': trigger,
+                },
+                'runtime': runtime,
+                'summary': {
+                    **self._build_summary(
+                        rows=rows,
+                        target_trade_date=resolved_target_date,
+                        runtime=runtime,
+                        source_market_date=source_market_date,
+                        enrichment_preflight=enrichment_preflight,
+                    ),
+                    'reason': 'pykrx_enrichment_preflight_blocked',
+                    'enrichment_preflight_allowed': False,
+                    'enrichment_preflight_status': enrichment_preflight.get('status'),
+                    'enrichment_failed_categories': enrichment_preflight.get('failed_categories') or [],
+                },
+                'enrichment_preflight': enrichment_preflight,
+                'items': [self._serialize_row(row) for row in rows],
+            }
         account_targets, account_target_errors = self._parse_account_targets()
         account_targets_setting_configured = bool(settings.signal_decider_next_open_account_targets.strip())
-        snapshots = self._load_latest_snapshots(source_market_date=source_market_date)
         existing_rows = self._load_plan_rows(target_trade_date=resolved_target_date, account_reference=None)
         policy_cache: dict[str, dict[str, Any]] = {}
         price_cache: dict[str, int | None] = {}
@@ -516,6 +576,8 @@ class SignalDeciderNextOpenExecutionService:
                         target=target,
                         policy_context=policy_context,
                         price_cache=price_cache,
+                        enrichment_preflight=enrichment_preflight,
+                        candidate_enrichment=candidate_enrichment_by_symbol.get(snapshot.symbol),
                     )
                     if account_target_blocking_reasons:
                         validation['blocking_reasons'] = [
@@ -819,8 +881,14 @@ class SignalDeciderNextOpenExecutionService:
         target_trade_date: date,
         source_market_date: date,
         preflight: dict[str, Any],
+        decision_agent_names: Sequence[str] | None = None,
     ) -> None:
         now = _utcnow()
+        normalized_agent_names = (
+            {_normalize_agent_name(name) for name in decision_agent_names}
+            if decision_agent_names is not None
+            else None
+        )
         reason = _reason(
             'pykrx_enrichment_preflight_blocked',
             (
@@ -839,6 +907,11 @@ class SignalDeciderNextOpenExecutionService:
                 )
             ).scalars().all()
             for row in rows:
+                if (
+                    normalized_agent_names is not None
+                    and _normalize_agent_name(row.decision_agent_name) not in normalized_agent_names
+                ):
+                    continue
                 if _is_dispatch_terminal_status(row.execution_status):
                     continue
                 existing = row.validation_payload if isinstance(row.validation_payload, dict) else {}
@@ -864,12 +937,53 @@ class SignalDeciderNextOpenExecutionService:
         target_trade_date: date,
         source_market_date: date,
         preflight: dict[str, Any],
+        decision_agent_names: Sequence[str] | None = None,
     ) -> None:
         self._block_existing_plan_rows_for_enrichment_preflight(
             target_trade_date=target_trade_date,
             source_market_date=source_market_date,
             preflight=preflight,
+            decision_agent_names=decision_agent_names,
         )
+
+    def _inspect_candidate_pykrx_enrichment(
+        self,
+        *,
+        source_market_date: date,
+        symbols: Sequence[str],
+        categories: Sequence[str],
+    ) -> dict[str, dict[str, Any]]:
+        ordered_symbols = list(dict.fromkeys(symbol for symbol in symbols if symbol))
+        ordered_categories = list(dict.fromkeys(category for category in categories if category))
+        if not ordered_symbols or not ordered_categories:
+            return {}
+        rows = load_daily_pykrx_enrichment_rows(
+            market_date=source_market_date,
+            categories=ordered_categories,
+            symbols=ordered_symbols,
+            limit=max(len(ordered_symbols) * len(ordered_categories), 1),
+        )
+        present_by_symbol: dict[str, set[str]] = {symbol: set() for symbol in ordered_symbols}
+        for row in rows:
+            symbol = _normalize_optional_text(row.get('symbol'))
+            category = _normalize_optional_text(row.get('category'))
+            if symbol in present_by_symbol and category in ordered_categories:
+                present_by_symbol[symbol].add(category)
+        result: dict[str, dict[str, Any]] = {}
+        for symbol in ordered_symbols:
+            present_categories = sorted(present_by_symbol.get(symbol) or set())
+            missing_categories = [
+                category for category in ordered_categories if category not in set(present_categories)
+            ]
+            result[symbol] = {
+                'market_date': source_market_date.isoformat(),
+                'required_categories': ordered_categories,
+                'present_categories': present_categories,
+                'missing_categories': missing_categories,
+                'allowed': not missing_categories,
+                'source': 'candidate_symbol_pykrx_enrichment',
+            }
+        return result
 
     def _apply_enrichment_preflight_to_validation(
         self,
@@ -1021,6 +1135,8 @@ class SignalDeciderNextOpenExecutionService:
         target: NextOpenAccountTarget,
         policy_context: dict[str, Any] | None,
         price_cache: dict[str, int | None],
+        enrichment_preflight: dict[str, Any] | None = None,
+        candidate_enrichment: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         decision_agent_name = _snapshot_agent_name(snapshot)
         response_payload = _snapshot_response_payload(snapshot)
@@ -1099,6 +1215,52 @@ class SignalDeciderNextOpenExecutionService:
                     'Snapshot has specialist disagreement warnings.',
                 )
             )
+        if enrichment_preflight is not None and not enrichment_preflight.get('allowed'):
+            failed_categories = enrichment_preflight.get('failed_categories') or []
+            if decision_agent_name == SIGNAL_DECIDER_AGENT_NAME:
+                blocking_reasons.append(
+                    _reason(
+                        'pykrx_enrichment_preflight_blocked',
+                        (
+                            'PyKRX enrichment coverage is not ready for source_market_date '
+                            f'{snapshot.market_date.isoformat()}; failed categories: '
+                            f'{", ".join(failed_categories) or "unknown"}.'
+                        ),
+                    )
+                )
+            elif decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME:
+                missing_categories = (
+                    candidate_enrichment.get('missing_categories')
+                    if isinstance(candidate_enrichment, dict)
+                    else None
+                )
+                if missing_categories:
+                    blocking_reasons.append(
+                        _reason(
+                            'candidate_pykrx_enrichment_missing',
+                            (
+                                'Short-term candidate is missing required symbol-level PyKRX enrichment categories: '
+                                f'{", ".join(str(item) for item in missing_categories)}.'
+                            ),
+                        )
+                    )
+                elif isinstance(candidate_enrichment, dict) and candidate_enrichment.get('allowed'):
+                    warnings.append(
+                        _reason(
+                            'global_pykrx_enrichment_preflight_partial',
+                            (
+                                'Global PyKRX enrichment coverage is partial, but required symbol-level enrichment '
+                                'is present for this short-term candidate.'
+                            ),
+                        )
+                    )
+                else:
+                    blocking_reasons.append(
+                        _reason(
+                            'candidate_pykrx_enrichment_unavailable',
+                            'Could not verify required symbol-level PyKRX enrichment for this short-term candidate.',
+                        )
+                    )
 
         estimated_reference_price = price_cache.get(snapshot.symbol)
         if snapshot.symbol not in price_cache:
@@ -1368,6 +1530,10 @@ class SignalDeciderNextOpenExecutionService:
                 ),
             },
         }
+        if enrichment_preflight is not None:
+            validation_payload['pykrx_enrichment_preflight'] = enrichment_preflight
+        if candidate_enrichment is not None:
+            validation_payload['candidate_pykrx_enrichment'] = candidate_enrichment
         if decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME:
             validation_payload['short_term'] = {
                 'raw_action': short_term_tactical_action,

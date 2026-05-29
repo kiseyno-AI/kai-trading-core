@@ -612,6 +612,70 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         blocking_codes = [entry['code'] for entry in result['items'][0]['validation']['blocking_reasons']]
         self.assertIn('pykrx_enrichment_preflight_blocked', blocking_codes)
 
+    async def test_dispatch_next_open_plan_continues_for_candidate_enriched_short_term_rows(self) -> None:
+        short_snapshot_id = self._seed_short_term_snapshot()
+        self._seed_short_term_plan_item(snapshot_id=short_snapshot_id)
+        with session_scope() as session:
+            short_row = session.execute(
+                select(SignalDeciderExecutionPlanItem).where(
+                    SignalDeciderExecutionPlanItem.decision_snapshot_id == short_snapshot_id,
+                    SignalDeciderExecutionPlanItem.decision_agent_name == 'short-term-decider',
+                )
+            ).scalar_one()
+            short_validation = dict(short_row.validation_payload or {})
+            short_validation['candidate_pykrx_enrichment'] = {
+                'market_date': self.market_date.isoformat(),
+                'required_categories': ['sector_classification', 'investor_flow_symbol', 'short_selling'],
+                'present_categories': ['sector_classification', 'investor_flow_symbol', 'short_selling'],
+                'missing_categories': [],
+                'allowed': True,
+                'source': 'candidate_symbol_pykrx_enrichment',
+            }
+            short_validation['warnings'] = [
+                {
+                    'code': 'global_pykrx_enrichment_preflight_partial',
+                    'message': 'Global PyKRX enrichment coverage is partial, but this candidate is complete.',
+                }
+            ]
+            short_row.validation_payload = short_validation
+            session.flush()
+        blocked_preflight = {
+            'market_date': self.market_date.isoformat(),
+            'status': 'blocked',
+            'allowed': False,
+            'required_categories': ['sector_classification', 'investor_flow_symbol', 'short_selling'],
+            'failed_categories': ['sector_classification', 'investor_flow_symbol', 'short_selling'],
+            'zero_coverage_categories': [],
+            'category_row_counts': {
+                'sector_classification': 2699,
+                'investor_flow_symbol': 2672,
+                'short_selling': 2806,
+            },
+        }
+
+        with patch('app.orders.next_open_execution.inspect_pykrx_enrichment_preflight', return_value=blocked_preflight):
+            result = await self.service.dispatch_next_open_plan(
+                target_trade_date=self.target_trade_date,
+                refresh_plan=False,
+                dry_run=False,
+                force=False,
+                trigger='test',
+            )
+
+        self.assertTrue(result['summary']['triggered'])
+        self.assertEqual(result['summary']['translated_item_count'], 3)
+        self.assertEqual(result['summary']['dispatched_group_count'], 1)
+        self.assertFalse(result['summary']['enrichment_preflight_allowed'])
+        self.assertIn('dispatch_note', result['enrichment_preflight'])
+        self.assertEqual(len(self.client.post_calls), 1)
+        self.assertEqual(self.client.post_calls[0]['metadata']['decision_agent_name'], 'short-term-decider')
+        groups_by_agent = {group['decision_agent_name']: group for group in result['dispatch']['groups']}
+        self.assertEqual(groups_by_agent['signal-decider']['dispatch_status'], 'skipped')
+        self.assertEqual(groups_by_agent['short-term-decider']['dispatch_status'], 'accepted')
+        items_by_agent = {item['decision_agent_name']: item for item in result['items']}
+        self.assertEqual(items_by_agent['signal-decider']['eligibility_status'], 'blocked')
+        self.assertEqual(items_by_agent['short-term-decider']['execution_status'], EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING)
+
     async def test_dispatch_next_open_plan_translates_and_persists_exec_linkage(self) -> None:
         result = await self.service.dispatch_next_open_plan(
             target_trade_date=self.target_trade_date,

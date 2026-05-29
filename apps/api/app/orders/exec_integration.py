@@ -809,51 +809,73 @@ class SignalDeciderExecIntegrationService:
                     trigger=f'{trigger}_dispatch',
                 )
             )
-            if not enrichment_preflight.get('allowed'):
-                signal_decider_next_open_execution_service.block_existing_plan_rows_for_enrichment_preflight(
-                    target_trade_date=resolved_target_date,
-                    source_market_date=source_market_date,
-                    preflight=enrichment_preflight,
-                )
 
         if enrichment_preflight is not None and not force and not enrichment_preflight.get('allowed'):
+            existing_rows = self._load_next_open_rows(
+                target_trade_date=resolved_target_date,
+                account_reference=resolved_account_reference,
+            )
+            has_eligible_short_term_watch = any(
+                _normalize_decision_agent_name(row.decision_agent_name) == SHORT_TERM_DECIDER_AGENT_NAME
+                and self._row_is_dispatchable(row)
+                for row in existing_rows
+            )
+            signal_decider_next_open_execution_service.block_existing_plan_rows_for_enrichment_preflight(
+                target_trade_date=resolved_target_date,
+                source_market_date=source_market_date,
+                preflight=enrichment_preflight,
+                decision_agent_names=(
+                    [SIGNAL_DECIDER_AGENT_NAME]
+                    if has_eligible_short_term_watch
+                    else None
+                ),
+            )
             plan_view = signal_decider_next_open_execution_service.list_plan_items(
                 target_trade_date=resolved_target_date,
                 account_reference=resolved_account_reference,
                 refresh=False,
             )
-            return {
-                'request': {
-                    'target_trade_date': resolved_target_date.isoformat(),
-                    'account_reference': resolved_account_reference,
-                    'refresh_plan': refresh_plan,
-                    'dry_run': resolved_dry_run,
-                    'force': force,
-                    'trigger': trigger,
-                },
-                'integration': integration,
-                'dispatch': {
-                    'groups': [],
-                    'preview_plans': [],
-                },
-                'summary': {
-                    **(plan_view.get('summary') or {}),
-                    'delegated_to_exec': True,
-                    'triggered': False,
-                    'reason': 'pykrx_enrichment_preflight_blocked',
-                    'dispatch_mode': integration['mode'],
-                    'translated_item_count': 0,
-                    'dispatched_group_count': 0,
-                    'failed_group_count': 0,
-                    'skipped_group_count': 0,
-                    'preview_group_count': 0,
-                    'enrichment_preflight_allowed': False,
-                    'enrichment_preflight_status': enrichment_preflight.get('status'),
-                    'enrichment_failed_categories': enrichment_preflight.get('failed_categories') or [],
-                },
-                'enrichment_preflight': enrichment_preflight,
-                'items': plan_view.get('items') or [],
-            }
+            if has_eligible_short_term_watch:
+                enrichment_preflight = {
+                    **enrichment_preflight,
+                    'dispatch_note': (
+                        'Global PyKRX enrichment coverage is partial; eligible short-term candidates passed '
+                        'candidate-level enrichment checks and remain dispatchable for guarded monitoring.'
+                    ),
+                }
+            else:
+                return {
+                    'request': {
+                        'target_trade_date': resolved_target_date.isoformat(),
+                        'account_reference': resolved_account_reference,
+                        'refresh_plan': refresh_plan,
+                        'dry_run': resolved_dry_run,
+                        'force': force,
+                        'trigger': trigger,
+                    },
+                    'integration': integration,
+                    'dispatch': {
+                        'groups': [],
+                        'preview_plans': [],
+                    },
+                    'summary': {
+                        **(plan_view.get('summary') or {}),
+                        'delegated_to_exec': True,
+                        'triggered': False,
+                        'reason': 'pykrx_enrichment_preflight_blocked',
+                        'dispatch_mode': integration['mode'],
+                        'translated_item_count': 0,
+                        'dispatched_group_count': 0,
+                        'failed_group_count': 0,
+                        'skipped_group_count': 0,
+                        'preview_group_count': 0,
+                        'enrichment_preflight_allowed': False,
+                        'enrichment_preflight_status': enrichment_preflight.get('status'),
+                        'enrichment_failed_categories': enrichment_preflight.get('failed_categories') or [],
+                    },
+                    'enrichment_preflight': enrichment_preflight,
+                    'items': plan_view.get('items') or [],
+                }
 
         rows = self._load_next_open_rows(
             target_trade_date=resolved_target_date,
