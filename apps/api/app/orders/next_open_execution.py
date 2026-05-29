@@ -259,6 +259,10 @@ def _uses_exec_agent_sizing_for_dispatch(decision_agent_name: str) -> bool:
     }
 
 
+def _row_validation_payload(row: SignalDeciderExecutionPlanItem) -> dict[str, Any]:
+    return row.validation_payload if isinstance(row.validation_payload, dict) else {}
+
+
 @dataclass(frozen=True)
 class NextOpenAccountTarget:
     label: str
@@ -367,34 +371,7 @@ class SignalDeciderNextOpenExecutionService:
                 trigger=trigger,
             )
         )
-        if not force and not enrichment_preflight.get('allowed'):
-            self._block_existing_plan_rows_for_enrichment_preflight(
-                target_trade_date=resolved_target_date,
-                source_market_date=source_market_date,
-                preflight=enrichment_preflight,
-            )
-            rows = self._load_plan_rows(target_trade_date=resolved_target_date, account_reference=None)
-            return {
-                'request': {
-                    'target_trade_date': resolved_target_date.isoformat(),
-                    'trigger': trigger,
-                },
-                'runtime': runtime,
-                'summary': {
-                    **self._build_summary(
-                        rows=rows,
-                        target_trade_date=resolved_target_date,
-                        runtime=runtime,
-                        source_market_date=source_market_date,
-                    ),
-                    'reason': 'pykrx_enrichment_preflight_blocked',
-                    'enrichment_preflight_allowed': False,
-                    'enrichment_preflight_status': enrichment_preflight.get('status'),
-                    'enrichment_failed_categories': enrichment_preflight.get('failed_categories') or [],
-                },
-                'enrichment_preflight': enrichment_preflight,
-                'items': [self._serialize_row(row) for row in rows],
-            }
+        enrichment_preflight_blocked = not force and not enrichment_preflight.get('allowed')
         account_targets, account_target_errors = self._parse_account_targets()
         account_targets_setting_configured = bool(settings.signal_decider_next_open_account_targets.strip())
         snapshots = self._load_latest_snapshots(source_market_date=source_market_date)
@@ -506,6 +483,13 @@ class SignalDeciderNextOpenExecutionService:
                             *(validation.get('blocking_reasons') or []),
                             *account_target_blocking_reasons,
                         ]
+                    if enrichment_preflight_blocked:
+                        self._apply_enrichment_preflight_to_validation(
+                            validation=validation,
+                            decision_agent_name=decision_agent_name,
+                            source_market_date=source_market_date,
+                            preflight=enrichment_preflight,
+                        )
                     self._apply_plan_row(
                         row=row,
                         snapshot=snapshot,
@@ -549,6 +533,7 @@ class SignalDeciderNextOpenExecutionService:
                 runtime=runtime,
                 source_market_date=source_market_date,
                 enrichment_preflight=enrichment_preflight,
+                reason='pykrx_enrichment_preflight_blocked' if enrichment_preflight_blocked else None,
             ),
             'enrichment_preflight': enrichment_preflight,
             'items': [self._serialize_row(row) for row in rows],
@@ -677,9 +662,10 @@ class SignalDeciderNextOpenExecutionService:
                     'idempotent_replay_count': 0,
                     'enrichment_preflight_status': enrichment_preflight.get('status'),
                     'enrichment_failed_categories': enrichment_preflight.get('failed_categories') or [],
+                    'refresh_summary': refresh_result.get('summary') if isinstance(refresh_result, dict) else None,
                 },
                 'enrichment_preflight': enrichment_preflight,
-                'items': [],
+                'items': refresh_result.get('items') if isinstance(refresh_result, dict) else [],
             }
         candidate_rows = self._load_plan_rows(
             target_trade_date=resolved_target_date,
@@ -845,6 +831,51 @@ class SignalDeciderNextOpenExecutionService:
             source_market_date=source_market_date,
             preflight=preflight,
         )
+
+    def _apply_enrichment_preflight_to_validation(
+        self,
+        *,
+        validation: dict[str, Any],
+        decision_agent_name: str,
+        source_market_date: date,
+        preflight: dict[str, Any],
+    ) -> None:
+        reason = _reason(
+            'pykrx_enrichment_preflight_blocked',
+            (
+                'PyKRX enrichment coverage is not ready for source_market_date '
+                f'{source_market_date.isoformat()}; failed categories: '
+                f'{", ".join(preflight.get("failed_categories") or []) or "unknown"}.'
+            ),
+        )
+        existing_block_codes = {
+            item.get('code')
+            for item in validation.get('blocking_reasons') or []
+            if isinstance(item, dict)
+        }
+        existing_warning_codes = {
+            item.get('code')
+            for item in validation.get('warnings') or []
+            if isinstance(item, dict)
+        }
+        if decision_agent_name == SIGNAL_DECIDER_AGENT_NAME:
+            if reason['code'] not in existing_block_codes:
+                validation['blocking_reasons'] = [
+                    *(validation.get('blocking_reasons') or []),
+                    reason,
+                ]
+        elif reason['code'] not in existing_warning_codes:
+            validation['warnings'] = [
+                *(validation.get('warnings') or []),
+                {
+                    **reason,
+                    'message': (
+                        f"{reason['message']} Candidate remains visible for conditional "
+                        'exec monitoring; candidate-level trigger/chase/risk validation still applies.'
+                    ),
+                },
+            ]
+        validation['pykrx_enrichment_preflight'] = preflight
 
     def _parse_account_targets(self) -> tuple[list[NextOpenAccountTarget], list[str]]:
         raw_value = settings.signal_decider_next_open_account_targets.strip()
@@ -1449,6 +1480,7 @@ class SignalDeciderNextOpenExecutionService:
         runtime: dict[str, Any],
         source_market_date: date | None = None,
         enrichment_preflight: dict[str, Any] | None = None,
+        reason: str | None = None,
     ) -> dict[str, Any]:
         source_market_date = source_market_date or _previous_trading_day(target_trade_date)
         counts = {
@@ -1467,11 +1499,39 @@ class SignalDeciderNextOpenExecutionService:
                     Counter(_normalize_agent_name(row.decision_agent_name) for row in rows).items()
                 )
             ),
+            'short_term_candidates_total': sum(
+                1 for row in rows if _normalize_agent_name(row.decision_agent_name) == SHORT_TERM_DECIDER_AGENT_NAME
+            ),
+            'short_term_watch_active_count': sum(
+                1
+                for row in rows
+                if _normalize_agent_name(row.decision_agent_name) == SHORT_TERM_DECIDER_AGENT_NAME
+                and row.eligibility_status == ELIGIBILITY_ELIGIBLE
+            ),
+            'short_term_blocked_or_degraded_count': sum(
+                1
+                for row in rows
+                if _normalize_agent_name(row.decision_agent_name) == SHORT_TERM_DECIDER_AGENT_NAME
+                and (
+                    row.eligibility_status == ELIGIBILITY_BLOCKED
+                    or bool(_row_validation_payload(row).get('warnings'))
+                )
+            ),
+            'signal_decider_global_preflight_blocked_count': sum(
+                1
+                for row in rows
+                if _normalize_agent_name(row.decision_agent_name) == SIGNAL_DECIDER_AGENT_NAME
+                and any(
+                    isinstance(reason, dict) and reason.get('code') == 'pykrx_enrichment_preflight_blocked'
+                    for reason in (_row_validation_payload(row).get('blocking_reasons') or [])
+                )
+            ),
         }
         return {
             'target_trade_date': target_trade_date.isoformat(),
             'source_market_date': source_market_date.isoformat(),
             **counts,
+            **({'reason': reason} if reason else {}),
             'execution_enabled': runtime['execution_enabled'],
             'dry_run': runtime['dry_run'],
             'account_targets_configured': runtime['account_targets_configured'],
