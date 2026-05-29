@@ -79,3 +79,45 @@ def test_pykrx_enrichment_preflight_blocks_zero_required_category_coverage():
     assert result['allowed'] is False
     assert result['failed_categories'] == ['investor_flow_symbol', 'short_selling']
     assert result['zero_coverage_categories'] == ['investor_flow_symbol', 'short_selling']
+
+
+def test_pykrx_enrichment_preflight_allows_partial_required_category_coverage_as_warning():
+    result = build_pykrx_enrichment_preflight(
+        market_date='2026-04-29',
+        coverage={
+            'requested_symbol_count': 100,
+            'requested_market_count': 1,
+            'categories': {
+                'sector_classification': {
+                    'scope_type': 'symbol',
+                    'expected_rows': 100,
+                    'present_rows': 100,
+                    'coverage_ratio': 1.0,
+                    'coverage_status': 'complete',
+                },
+                'investor_flow_symbol': {
+                    'scope_type': 'symbol',
+                    'expected_rows': 100,
+                    'present_rows': 3,
+                    'coverage_ratio': 0.03,
+                    'coverage_status': 'partial',
+                },
+                'short_selling': {
+                    'scope_type': 'symbol',
+                    'expected_rows': 100,
+                    'present_rows': 2,
+                    'coverage_ratio': 0.02,
+                    'coverage_status': 'partial',
+                },
+            },
+        },
+    )
+
+    assert result['status'] == 'ready'
+    assert result['allowed'] is True
+    assert result['blocked_categories'] == []
+    assert result['failed_categories'] == []
+    assert [item['category'] for item in result['warning_categories']] == [
+        'investor_flow_symbol',
+        'short_selling',
+    ]

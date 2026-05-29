@@ -236,13 +236,12 @@ def test_inspect_feedback_prerequisites_blocks_missing_pykrx_enrichment_category
             'present_rows': 0,
             'missing_rows': 3,
             'coverage_ratio': 0.0,
-            'min_coverage_ratio': 0.95,
             'reason': 'missing_required_pykrx_enrichment_category',
         }
     ]
 
 
-def test_inspect_feedback_prerequisites_blocks_material_partial_pykrx_enrichment_coverage():
+def test_inspect_feedback_prerequisites_allows_partial_pykrx_enrichment_coverage_as_warning():
     pykrx_stage = _pykrx_enrichment_stage(
         status='completed',
         category_overrides={
@@ -264,14 +263,14 @@ def test_inspect_feedback_prerequisites_blocks_material_partial_pykrx_enrichment
             fs_div='CFS',
         )
 
-    assert result['status'] == 'blocked'
-    assert result['blocked_stage_ids'] == ['pykrx_enrichment']
-    blocking_categories = result['stages']['pykrx_enrichment']['details']['decider_blocking_categories']
-    assert blocking_categories[0]['category'] == 'short_selling'
-    assert blocking_categories[0]['expected_rows'] == 3
-    assert blocking_categories[0]['present_rows'] == 2
-    assert blocking_categories[0]['missing_rows'] == 1
-    assert blocking_categories[0]['reason'] == 'required_pykrx_enrichment_category_below_min_coverage'
+    assert result['status'] == 'ready'
+    assert result['blocked_stage_ids'] == []
+    warning_categories = result['stages']['pykrx_enrichment']['details']['decider_warning_categories']
+    assert warning_categories[0]['category'] == 'short_selling'
+    assert warning_categories[0]['expected_rows'] == 3
+    assert warning_categories[0]['present_rows'] == 2
+    assert warning_categories[0]['missing_rows'] == 1
+    assert warning_categories[0]['reason'] == 'required_pykrx_enrichment_category_near_complete'
 
 
 def test_inspect_feedback_prerequisites_allows_near_complete_pykrx_enrichment_coverage():

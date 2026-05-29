@@ -314,6 +314,29 @@ def _uses_exec_agent_sizing_for_dispatch(decision_agent_name: str) -> bool:
     }
 
 
+def _pykrx_preflight_has_partial_coverage(preflight: dict[str, Any] | None) -> bool:
+    if not isinstance(preflight, dict):
+        return False
+    if preflight.get('warning_categories'):
+        return True
+    category_gates = preflight.get('category_gates')
+    if not isinstance(category_gates, list):
+        return False
+    for item in category_gates:
+        if not isinstance(item, dict):
+            continue
+        coverage_status = _normalize_optional_text(item.get('coverage_status'))
+        if item.get('gate_status') == 'ready' and coverage_status and coverage_status != 'complete':
+            return True
+    return False
+
+
+def _should_inspect_short_term_candidate_pykrx(preflight: dict[str, Any] | None) -> bool:
+    if not isinstance(preflight, dict):
+        return False
+    return not preflight.get('allowed') or _pykrx_preflight_has_partial_coverage(preflight)
+
+
 def _row_validation_payload(row: SignalDeciderExecutionPlanItem) -> dict[str, Any]:
     return row.validation_payload if isinstance(row.validation_payload, dict) else {}
 
@@ -431,10 +454,13 @@ class SignalDeciderNextOpenExecutionService:
         actionable_short_term_symbols = [
             snapshot.symbol for snapshot in snapshots if _is_actionable_short_term_snapshot(snapshot)
         ]
+        inspect_candidate_pykrx = (
+            not force
+            and bool(actionable_short_term_symbols)
+            and _should_inspect_short_term_candidate_pykrx(enrichment_preflight)
+        )
         candidate_enrichment_by_symbol = (
-            {}
-            if not enrichment_preflight_blocked or not actionable_short_term_symbols
-            else self._inspect_candidate_pykrx_enrichment(
+            self._inspect_candidate_pykrx_enrichment(
                 source_market_date=source_market_date,
                 symbols=actionable_short_term_symbols,
                 categories=(
@@ -442,6 +468,8 @@ class SignalDeciderNextOpenExecutionService:
                     or list(REQUIRED_EXEC_DECIDER_PYKRX_ENRICHMENT_CATEGORIES)
                 ),
             )
+            if inspect_candidate_pykrx
+            else {}
         )
         if enrichment_preflight_blocked and not actionable_short_term_symbols:
             self._block_existing_plan_rows_for_enrichment_preflight(
@@ -1215,6 +1243,40 @@ class SignalDeciderNextOpenExecutionService:
                     'Snapshot has specialist disagreement warnings.',
                 )
             )
+        if decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME and candidate_enrichment is not None:
+            missing_categories = (
+                _normalize_text_list(candidate_enrichment.get('missing_categories'))
+                if isinstance(candidate_enrichment, dict)
+                else []
+            )
+            if missing_categories:
+                blocking_reasons.append(
+                    _reason(
+                        'candidate_pykrx_enrichment_missing',
+                        (
+                            'Short-term candidate is missing required symbol-level PyKRX enrichment categories: '
+                            f'{", ".join(str(item) for item in missing_categories)}.'
+                        ),
+                    )
+                )
+            elif isinstance(candidate_enrichment, dict) and candidate_enrichment.get('allowed'):
+                if _should_inspect_short_term_candidate_pykrx(enrichment_preflight):
+                    warnings.append(
+                        _reason(
+                            'global_pykrx_enrichment_preflight_partial',
+                            (
+                                'Global PyKRX enrichment coverage is partial, but required symbol-level enrichment '
+                                'is present for this short-term candidate.'
+                            ),
+                        )
+                    )
+            else:
+                blocking_reasons.append(
+                    _reason(
+                        'candidate_pykrx_enrichment_unavailable',
+                        'Could not verify required symbol-level PyKRX enrichment for this short-term candidate.',
+                    )
+                )
         if enrichment_preflight is not None and not enrichment_preflight.get('allowed'):
             failed_categories = enrichment_preflight.get('failed_categories') or []
             if decision_agent_name == SIGNAL_DECIDER_AGENT_NAME:
@@ -1228,39 +1290,13 @@ class SignalDeciderNextOpenExecutionService:
                         ),
                     )
                 )
-            elif decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME:
-                missing_categories = (
-                    candidate_enrichment.get('missing_categories')
-                    if isinstance(candidate_enrichment, dict)
-                    else None
+            elif decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME and candidate_enrichment is None:
+                blocking_reasons.append(
+                    _reason(
+                        'candidate_pykrx_enrichment_unavailable',
+                        'Could not verify required symbol-level PyKRX enrichment for this short-term candidate.',
+                    )
                 )
-                if missing_categories:
-                    blocking_reasons.append(
-                        _reason(
-                            'candidate_pykrx_enrichment_missing',
-                            (
-                                'Short-term candidate is missing required symbol-level PyKRX enrichment categories: '
-                                f'{", ".join(str(item) for item in missing_categories)}.'
-                            ),
-                        )
-                    )
-                elif isinstance(candidate_enrichment, dict) and candidate_enrichment.get('allowed'):
-                    warnings.append(
-                        _reason(
-                            'global_pykrx_enrichment_preflight_partial',
-                            (
-                                'Global PyKRX enrichment coverage is partial, but required symbol-level enrichment '
-                                'is present for this short-term candidate.'
-                            ),
-                        )
-                    )
-                else:
-                    blocking_reasons.append(
-                        _reason(
-                            'candidate_pykrx_enrichment_unavailable',
-                            'Could not verify required symbol-level PyKRX enrichment for this short-term candidate.',
-                        )
-                    )
 
         estimated_reference_price = price_cache.get(snapshot.symbol)
         if snapshot.symbol not in price_cache:
