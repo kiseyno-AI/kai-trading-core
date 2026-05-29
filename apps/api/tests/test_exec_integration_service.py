@@ -2197,16 +2197,17 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             len(self.client.execution_calls),
             len(self.client.position_calls),
         )
-        board = await self.service.get_runtime_daily_board(
-            market_date=self.target_trade_date,
-            refresh=False,
-            trigger='test',
-        )
-        monitored = await self.service.list_runtime_monitored_symbols(
-            market_date=self.target_trade_date,
-            refresh=False,
-            trigger='test',
-        )
+        with patch.object(self.service, '_load_live_exec_monitoring_symbols', new=AsyncMock(return_value=None)):
+            board = await self.service.get_runtime_daily_board(
+                market_date=self.target_trade_date,
+                refresh=False,
+                trigger='test',
+            )
+            monitored = await self.service.list_runtime_monitored_symbols(
+                market_date=self.target_trade_date,
+                refresh=False,
+                trigger='test',
+            )
 
         self.assertEqual(board['summary']['filled'], 1)
         self.assertEqual(board['summary']['failed'], 0)
@@ -2730,7 +2731,10 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             }
             session.flush()
 
-        with patch('app.orders.exec_integration.kis_realtime_price_service') as price_service:
+        with (
+            patch('app.orders.exec_integration.kis_realtime_price_service') as price_service,
+            patch.object(self.service, '_load_live_exec_monitoring_symbols', new=AsyncMock(return_value=None)),
+        ):
             price_service.price_fields_for_symbol.return_value = {
                 'current_price': None,
                 'price_as_of': None,
@@ -2847,6 +2851,85 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         load_live_holdings.assert_awaited_once_with(trigger='test:dashboard_background_refresh')
         store_caches.assert_called_once()
         self.assertEqual(store_caches.call_args.kwargs['live_holding_symbols'], {self.symbol})
+
+    async def test_dashboard_background_refresh_stores_monitored_cache_with_live_exec_overlay(self) -> None:
+        key = self.service._dashboard_refresh_key(
+            target_trade_date=self.target_trade_date,
+            account_reference=None,
+            symbol=None,
+        )
+        self.client.runtime_response = {
+            'ready': True,
+            'mode': 'mock',
+            'safety': {
+                'paused': False,
+                'kill_switch_enabled': False,
+                'automation_enabled': True,
+            },
+            'liveness': {
+                'autonomous': {
+                    'monitoring': {
+                        'last_cycle': {
+                            'items': [
+                                {
+                                    'symbol': self.symbol,
+                                    'intent': EXEC_INTENT_NEXT_OPEN_BUY,
+                                    'status': 'watch_monitoring_active',
+                                    'source_identity': {
+                                        'source_plan_id': f'live-watch-{self.target_trade_date:%Y%m%d}',
+                                        'strategy_run_id': f'core:{self.target_trade_date.isoformat()}:runtime',
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                }
+            },
+        }
+
+        with (
+            patch('app.orders.exec_integration.kis_realtime_price_service') as price_service,
+            patch.object(
+                self.service,
+                '_load_live_portfolio_holding_symbols',
+                new=AsyncMock(return_value=None),
+            ) as load_live_holdings,
+        ):
+            price_service.price_fields_for_symbol.return_value = {
+                'current_price': 50200,
+                'price_as_of': '2026-04-30T00:07:30+00:00',
+                'price_received_at': '2026-04-30T00:07:31+00:00',
+                'price_source': 'kis_realtime_ws',
+                'price_status': 'available',
+                'realtime_subscribed': True,
+                'realtime_subscription_reason': 'subscribed',
+                'display_price_available': True,
+            }
+            price_service.observe_monitored_symbols.return_value = {'allowed_symbols': [self.symbol]}
+
+            await self.service._refresh_dashboard_read_model(
+                key=key,
+                target_trade_date=self.target_trade_date,
+                account_reference=None,
+                symbol=None,
+                trigger='test',
+                timeout_seconds=1.0,
+            )
+            monitored = await self.service.list_runtime_monitored_symbols(
+                market_date=self.target_trade_date,
+                refresh=False,
+                trigger='test',
+            )
+
+        load_live_holdings.assert_awaited_once_with(trigger='test:dashboard_background_refresh')
+        self.assertTrue(monitored['freshness']['served_from_cache'])
+        item = next(candidate for candidate in monitored['items'] if candidate['symbol'] == self.symbol)
+        self.assertTrue(item['exec_monitoring_active'])
+        self.assertTrue(item['exec_runtime_showable'])
+        self.assertTrue(item['exec_agent_approved'])
+        self.assertEqual(item['exec_runtime_state'], 'exec_approved_watch')
+        self.assertIsNone(item['exec_runtime_exclusion_reason'])
+        self.assertIn('watch_monitoring_active', item['monitoring_statuses'])
 
     async def test_scheduled_exec_readback_refresh_reuses_dashboard_background_state(self) -> None:
         await self.service.dispatch_next_open_plan(
