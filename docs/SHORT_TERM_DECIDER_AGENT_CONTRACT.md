@@ -13,7 +13,7 @@ Evaluate whether a symbol has a supportable 1-3 trading day tactical setup using
 
 The agent must not produce execution instructions, position sizing, leverage guidance, or brokerage/order logic.
 
-Downstream core planning may persist actionable rows and dispatch them to `kai-trading-exec` as decider-identified pending trigger-limit candidates, but that consumer behavior does not change the contract here: the model still produces only decision-support fields, never live order instructions.
+Downstream core planning may persist actionable rows and dispatch them to `kai-trading-exec` as decider-identified guarded handoff candidates, but that consumer behavior does not change the contract here: the model still produces only decision-support fields, never live order instructions. Core maps `scalp_buy_candidate` to `handoff_intent="tactical_buy"` and `watch_for_trigger` to `handoff_intent="intraday_watch_buy"` only after trigger/chase/target/stop and execution-quality gates pass. `avoid_chase`, `wait`, and `reject` stay non-actionable by default.
 
 ## Allowed actions
 

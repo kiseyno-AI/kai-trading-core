@@ -3,7 +3,7 @@
 ## Summary
 Read the same-day execution board from core. The route is dashboard-safe and cache-first: it returns the best local read model immediately from persisted Core planning/readback state and a short in-process snapshot cache. `refresh=true` schedules a bounded, debounced background exec refresh instead of blocking the HTTP request. Consumers should use `freshness` and `refresh` to label stale, partial, or refreshing data honestly.
 
-Each row includes compact `today_activity` facts for the requested `market_date`. Use these side-aware fields for Today bought/sold sections instead of inferring from lifecycle `intent` or aggregate `status`. Buy/sell quantities are counted only from timestamped compact execution/readback facts for the selected date; side facts without timestamps are marked unavailable rather than guessed.
+Each row includes compact `today_activity` facts for the requested `market_date`. Use these side-aware fields for Today bought/sold sections instead of inferring from lifecycle `intent` or aggregate `status`. Buy/sell quantities are counted only from timestamped compact execution/readback facts for the selected date; side facts without timestamps are marked unavailable rather than guessed. Short-term rows also expose raw tactical action, generic action, handoff intent, and approval/monitoring state at the top level.
 
 Price fields are display-oriented and cache-first: realtime websocket prices are preferred, but rows can fall back to local current-quote/cache or recent daily close with explicit source, freshness, and realtime subscription metadata.
 
@@ -71,6 +71,12 @@ GET /execution/runtime/daily-board?market_date=2026-04-30&refresh=true
       "agent_name": "short-term-decider",
       "decision_agent_name": "short-term-decider",
       "intent": "intraday_watch_buy",
+      "raw_action": "watch_for_trigger",
+      "tactical_action": "watch_for_trigger",
+      "generic_action": "buy",
+      "handoff_intent": "intraday_watch_buy",
+      "handoff_active": true,
+      "approval_state": "approved",
       "status": "filled",
       "current_price": 71500,
       "price_as_of": "2026-04-30T00:15:30+00:00",

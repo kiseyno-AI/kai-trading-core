@@ -507,7 +507,11 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                     'warnings': [],
                     'decision_agent_name': 'short-term-decider',
                     'short_term': {
+                        'raw_action': 'watch_for_trigger',
                         'tactical_action': 'watch_for_trigger',
+                        'generic_action': 'buy',
+                        'handoff_intent': 'intraday_watch_buy',
+                        'entry_execution_mode': 'pending_trigger_limit',
                         'trigger_price': trigger_price,
                         'chase_limit_price': chase_limit_price,
                         'target_price': target_price,
@@ -530,7 +534,13 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                     'target_price': target_price,
                     'stop_loss_price': stop_loss_price,
                     'expected_holding_period': '1-2 trading days',
+                    'raw_action': 'watch_for_trigger',
                     'tactical_action': 'watch_for_trigger',
+                    'generic_action': 'buy',
+                    'handoff_intent': 'intraday_watch_buy',
+                    'handoff_active': target_price is not None and stop_loss_price is not None,
+                    'exec_monitoring_active': target_price is not None and stop_loss_price is not None,
+                    'approval_state': 'pending_exec_agent' if target_price is not None and stop_loss_price is not None else 'blocked',
                     'trigger_price': trigger_price,
                     'chase_limit_price': chase_limit_price,
                     'entry_execution_mode': 'pending_trigger_limit',
@@ -974,10 +984,16 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         short_entry = short_payload['items'][0]
         self.assertEqual(short_entry['decision_agent_name'], 'short-term-decider')
         self.assertEqual(short_entry['intent'], EXEC_INTENT_INTRADAY_WATCH_BUY)
+        self.assertEqual(short_entry['handoff_intent'], 'intraday_watch_buy')
+        self.assertEqual(short_entry['raw_action'], 'watch_for_trigger')
+        self.assertEqual(short_entry['tactical_action'], 'watch_for_trigger')
+        self.assertEqual(short_entry['generic_action'], 'buy')
         self.assertEqual(short_entry['trigger_price'], 50500)
         self.assertEqual(short_entry['limit_price'], 51500)
         self.assertEqual(short_entry['risk_context']['agent_name'], 'short-term-decider')
         self.assertEqual(short_entry['risk_context']['decision_agent_name'], 'short-term-decider')
+        self.assertEqual(short_entry['risk_context']['handoff_intent'], 'intraday_watch_buy')
+        self.assertEqual(short_entry['risk_context']['generic_action'], 'buy')
         self.assertEqual(short_entry['risk_context']['entry_execution_mode'], 'pending_trigger_limit')
         self.assertTrue(short_entry['risk_context']['monitoring_candidate'])
         self.assertEqual(short_entry['risk_context']['monitoring_intent'], EXEC_INTENT_INTRADAY_WATCH_BUY)
@@ -1026,6 +1042,9 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(handoff['target_trade_date'], '2026-04-30')
         self.assertEqual(handoff['source_market_date'], '2026-04-29')
         self.assertEqual(handoff['traceability']['decision_snapshot_id'], short_snapshot_id)
+        self.assertEqual(handoff['traceability']['handoff_intent'], 'intraday_watch_buy')
+        self.assertEqual(handoff['decider_output']['generic_action'], 'buy')
+        self.assertEqual(handoff['decider_output']['handoff_intent'], 'intraday_watch_buy')
         self.assertEqual(handoff['traceability']['core_plan_item_id'], short_entry['risk_context']['core_plan_item_id'])
         self.assertEqual(handoff['decider_input_context']['request_payload'], decider_request_payload)
         self.assertEqual(handoff['decider_input_context']['input_feature_snapshot_payload'], decider_input_features)
@@ -1062,7 +1081,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(signal_item['execution_status'], EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING)
         self.assertEqual(result['summary']['delegated_for_exec_agent_sizing_count'], 2)
 
-    async def test_dispatch_next_open_plan_short_term_missing_target_stop_dispatches_entry_only(self) -> None:
+    async def test_dispatch_next_open_plan_short_term_missing_target_stop_skips_watch_handoff(self) -> None:
         short_snapshot_id = self._seed_short_term_snapshot(target_price=None, stop_loss_price=None)
         self._seed_short_term_plan_item(
             snapshot_id=short_snapshot_id,
@@ -1070,7 +1089,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             stop_loss_price=None,
         )
 
-        await self.service.dispatch_next_open_plan(
+        result = await self.service.dispatch_next_open_plan(
             target_trade_date=self.target_trade_date,
             refresh_plan=False,
             dry_run=False,
@@ -1078,16 +1097,14 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             trigger='test',
         )
 
-        short_payload = next(
-            payload for payload in self.client.post_calls if payload['metadata']['decision_agent_name'] == 'short-term-decider'
+        self.assertFalse(
+            any(payload['metadata']['decision_agent_name'] == 'short-term-decider' for payload in self.client.post_calls)
         )
-        self.assertEqual(len(short_payload['items']), 1)
-        self.assertEqual(short_payload['items'][0]['intent'], EXEC_INTENT_INTRADAY_WATCH_BUY)
-        self.assertEqual(short_payload['items'][0]['trigger_price'], 50500)
-        self.assertEqual(short_payload['items'][0]['limit_price'], 51500)
-        self.assertEqual(short_payload['items'][0]['risk_context']['entry_execution_mode'], 'pending_trigger_limit')
-        self.assertTrue(short_payload['items'][0]['risk_context']['monitoring_candidate'])
-        self.assertEqual(short_payload['items'][0]['quantity_policy']['type'], 'exec_agent_sized')
+        short_group = next(
+            group for group in result['dispatch']['groups'] if group['decision_agent_name'] == 'short-term-decider'
+        )
+        self.assertEqual(short_group['dispatch_status'], 'skipped')
+        self.assertEqual(short_group['eligible_count'], 0)
 
     async def test_dispatch_next_open_plan_short_term_idempotent_redispatch_skips_duplicate_payload(self) -> None:
         short_snapshot_id = self._seed_short_term_snapshot()
@@ -1147,6 +1164,14 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             {item['decision_agent_name'] for item in overview['items']},
             {'signal-decider', 'short-term-decider'},
         )
+        short_item = next(item for item in overview['items'] if item['decision_agent_name'] == 'short-term-decider')
+        self.assertEqual(short_item['raw_action'], 'watch_for_trigger')
+        self.assertEqual(short_item['tactical_action'], 'watch_for_trigger')
+        self.assertEqual(short_item['generic_action'], 'buy')
+        self.assertEqual(short_item['handoff_intent'], 'intraday_watch_buy')
+        self.assertEqual(short_item['approval_state'], 'not_dispatched')
+        self.assertFalse(short_item['exec_agent_approved'])
+        self.assertFalse(short_item['exec_monitoring_active'])
 
     async def test_exec_overview_refresh_persists_remote_readback(self) -> None:
         dispatch_result = await self.service.dispatch_next_open_plan(

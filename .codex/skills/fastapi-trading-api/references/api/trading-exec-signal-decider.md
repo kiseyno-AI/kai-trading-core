@@ -3,7 +3,7 @@
 ## Summary
 Read the core-owned aggregated core↔exec view for decider-driven next-open execution. The route name is legacy, but the payload now starts from persisted `signal_decider_execution_plan_items` for both `signal-decider` and actionable `short-term-decider` rows, overlays stored exec dispatch linkage and audit state, and with `refresh=true` calls the exec northbound runtime/order/execution/position APIs before persisting the latest matched readback snapshot back onto the durable plan rows.
 
-Signal-decider and short-term entries dispatched in `SIGNAL_DECIDER_EXEC_INTEGRATION_MODE=dispatch` use the `exec_agent_sized` contract on core→exec translation, so they are routed as candidate entries and exec performs final sizing before materializing a buy. Classic signal-decider rows keep the `next_open_buy` intent. Short-term tactical rows use `intraday_watch_buy` with the decider's trigger and chase-limit prices so exec treats them as monitored intraday candidates, not unconditional next-open orders.
+Signal-decider and short-term entries dispatched in `SIGNAL_DECIDER_EXEC_INTEGRATION_MODE=dispatch` use the `exec_agent_sized` contract on core→exec translation, so they are routed as candidate entries and exec performs final sizing before materializing a buy. Classic signal-decider rows keep the `next_open_buy` intent. Short-term tactical rows use `intraday_watch_buy` with the decider's trigger and chase-limit prices so exec treats them as monitored intraday candidates, not unconditional next-open orders. The overview rows expose `raw_action`, `tactical_action`, `generic_action`, `handoff_intent`, `exec_monitoring_active`, `exec_agent_approved`, and `approval_state` directly so clients do not need to infer tactical state from nested validation payloads.
 
 Each exec item also carries `risk_context.decider_handoff_context`, which preserves execution/risk context, input feature snapshots, pre-decider enrichment context, response payload/summary, normalized tactical output fields, risk/data-quality warnings, and traceability ids. Accepted rows without an agent-approved positive quantity remain delegated sizing candidates in core (`execution_status="delegated_for_exec_agent_sizing"`) until exec readback reports scheduled/submitted/filled/monitoring outcomes.
 
@@ -123,6 +123,14 @@ GET /trading/orders/exec/signal-decider?target_trade_date=2026-04-30&symbol=0059
       "decision_agent_name": "short-term-decider",
       "decision_snapshot_id": 145,
       "execution_status": "delegated_for_exec_agent_sizing",
+      "raw_action": "watch_for_trigger",
+      "tactical_action": "watch_for_trigger",
+      "generic_action": "buy",
+      "handoff_intent": "intraday_watch_buy",
+      "handoff_active": true,
+      "exec_monitoring_active": true,
+      "exec_agent_approved": true,
+      "approval_state": "approved",
       "target_price": 54000,
       "stop_loss_price": 49000,
       "trigger_price": 50500,
