@@ -1652,67 +1652,72 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 'realtime_subscription_reason': 'subscribed',
                 'display_price_available': True,
             }
-            price_service.observe_monitored_symbols.return_value = {'allowed_symbols': ['WATCH']}
+            price_service.observe_monitored_symbols.return_value = {
+                'allowed_symbols': ['WATCHACCEPTED', 'WATCHCREATED', 'WATCHPENDING', 'WATCHQUEUED']
+            }
 
-            accepted_watch = self.service._build_runtime_board_item(
-                item={
-                    'plan_item_id': 9101,
-                    'account_reference': self.account_reference,
-                    'account_label': 'Main',
-                    'symbol': 'WATCH',
-                    'decision_agent_name': 'short-term-decider',
-                    'estimated_reference_price': 2000,
-                    'planned_quantity': '10',
-                    'eligibility_status': 'eligible',
-                    'execution_status': 'delegated_for_exec_agent_sizing',
-                    'dispatch': {
-                        'status': 'accepted',
-                        'plan_id': 'exec-accepted-watch',
-                        'item_links': [
-                            {
-                                'intent': EXEC_INTENT_INTRADAY_WATCH_BUY,
-                                'side': 'buy',
-                                'symbol': 'WATCH',
-                                'remote_status': 'accepted',
-                                'response_item': {
-                                    'status': 'accepted',
-                                    'execution_plan_item_id': 'exec-item-watch',
-                                },
-                            }
-                        ],
-                    },
-                    'trigger_price': '2050',
-                    'chase_limit_price': '2070',
-                    'target_price': '2200',
-                    'stop_loss_price': '1900',
-                },
-                market_date=self.target_trade_date,
-                symbol_metadata_map={'WATCH': {'name': 'Accepted Watch', 'market': 'KOSPI'}},
-                runtime_status='ready',
-            )
+            for entry_status in ('accepted', 'created', 'pending', 'queued'):
+                with self.subTest(entry_status=entry_status):
+                    symbol = f'WATCH{entry_status.upper()}'
+                    accepted_watch = self.service._build_runtime_board_item(
+                        item={
+                            'plan_item_id': 9101,
+                            'account_reference': self.account_reference,
+                            'account_label': 'Main',
+                            'symbol': symbol,
+                            'decision_agent_name': 'short-term-decider',
+                            'estimated_reference_price': 2000,
+                            'planned_quantity': '10',
+                            'eligibility_status': 'eligible',
+                            'execution_status': 'delegated_for_exec_agent_sizing',
+                            'dispatch': {
+                                'status': 'accepted',
+                                'plan_id': f'exec-{entry_status}-watch',
+                                'item_links': [
+                                    {
+                                        'intent': EXEC_INTENT_INTRADAY_WATCH_BUY,
+                                        'side': 'buy',
+                                        'symbol': symbol,
+                                        'remote_status': entry_status,
+                                        'response_item': {
+                                            'status': entry_status,
+                                            'execution_plan_item_id': f'exec-item-watch-{entry_status}',
+                                        },
+                                    }
+                                ],
+                            },
+                            'trigger_price': '2050',
+                            'chase_limit_price': '2070',
+                            'target_price': '2200',
+                            'stop_loss_price': '1900',
+                        },
+                        market_date=self.target_trade_date,
+                        symbol_metadata_map={symbol: {'name': 'Accepted Watch', 'market': 'KOSPI'}},
+                        runtime_status='ready',
+                    )
 
-            payload = self.service._build_runtime_monitored_symbols_payload(
-                board={
-                    'market_date': self.target_trade_date.isoformat(),
-                    'runtime': {'status': 'ready', 'mode': 'mock'},
-                    'items': [accepted_watch],
-                },
-                refresh=False,
-                refresh_state={'requested': False, 'status': 'not_requested'},
-                served_from_cache=False,
-            )
+                    payload = self.service._build_runtime_monitored_symbols_payload(
+                        board={
+                            'market_date': self.target_trade_date.isoformat(),
+                            'runtime': {'status': 'ready', 'mode': 'mock'},
+                            'items': [accepted_watch],
+                        },
+                        refresh=False,
+                        refresh_state={'requested': False, 'status': 'not_requested'},
+                        served_from_cache=False,
+                    )
 
-        item = payload['items'][0]
-        self.assertEqual(item['symbol'], 'WATCH')
-        self.assertTrue(item['exec_runtime_showable'])
-        self.assertTrue(item['exec_monitoring_active'])
-        self.assertTrue(item['exec_agent_approved'])
-        self.assertEqual(item['exec_agent_action'], 'approve')
-        self.assertEqual(item['exec_runtime_state'], 'exec_approved_watch')
-        self.assertIsNone(item['exec_runtime_exclusion_reason'])
-        self.assertIn('accepted', item['monitoring_statuses'])
-        self.assertIn('watch_monitoring_active', item['monitoring_statuses'])
-        self.assertNotEqual(item['exec_runtime_state'], 'core_planned_only')
+                    item = payload['items'][0]
+                    self.assertEqual(item['symbol'], symbol)
+                    self.assertTrue(item['exec_runtime_showable'])
+                    self.assertTrue(item['exec_monitoring_active'])
+                    self.assertTrue(item['exec_agent_approved'])
+                    self.assertEqual(item['exec_agent_action'], 'approve')
+                    self.assertEqual(item['exec_runtime_state'], 'exec_approved_watch')
+                    self.assertIsNone(item['exec_runtime_exclusion_reason'])
+                    self.assertIn(entry_status, item['monitoring_statuses'])
+                    self.assertIn('watch_monitoring_active', item['monitoring_statuses'])
+                    self.assertNotEqual(item['exec_runtime_state'], 'core_planned_only')
 
     async def test_runtime_monitored_symbols_flags_core_only_and_rejected_candidates(self) -> None:
         core_only = self.service._build_runtime_board_item(
