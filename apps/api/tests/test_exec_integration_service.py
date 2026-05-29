@@ -507,7 +507,11 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                     'warnings': [],
                     'decision_agent_name': 'short-term-decider',
                     'short_term': {
+                        'raw_action': 'watch_for_trigger',
                         'tactical_action': 'watch_for_trigger',
+                        'generic_action': 'buy',
+                        'handoff_intent': 'intraday_watch_buy',
+                        'entry_execution_mode': 'pending_trigger_limit',
                         'trigger_price': trigger_price,
                         'chase_limit_price': chase_limit_price,
                         'target_price': target_price,
@@ -530,7 +534,13 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                     'target_price': target_price,
                     'stop_loss_price': stop_loss_price,
                     'expected_holding_period': '1-2 trading days',
+                    'raw_action': 'watch_for_trigger',
                     'tactical_action': 'watch_for_trigger',
+                    'generic_action': 'buy',
+                    'handoff_intent': 'intraday_watch_buy',
+                    'handoff_active': target_price is not None and stop_loss_price is not None,
+                    'exec_monitoring_active': target_price is not None and stop_loss_price is not None,
+                    'approval_state': 'pending_exec_agent' if target_price is not None and stop_loss_price is not None else 'blocked',
                     'trigger_price': trigger_price,
                     'chase_limit_price': chase_limit_price,
                     'entry_execution_mode': 'pending_trigger_limit',
@@ -601,6 +611,70 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['items'][0]['eligibility_status'], 'blocked')
         blocking_codes = [entry['code'] for entry in result['items'][0]['validation']['blocking_reasons']]
         self.assertIn('pykrx_enrichment_preflight_blocked', blocking_codes)
+
+    async def test_dispatch_next_open_plan_continues_for_candidate_enriched_short_term_rows(self) -> None:
+        short_snapshot_id = self._seed_short_term_snapshot()
+        self._seed_short_term_plan_item(snapshot_id=short_snapshot_id)
+        with session_scope() as session:
+            short_row = session.execute(
+                select(SignalDeciderExecutionPlanItem).where(
+                    SignalDeciderExecutionPlanItem.decision_snapshot_id == short_snapshot_id,
+                    SignalDeciderExecutionPlanItem.decision_agent_name == 'short-term-decider',
+                )
+            ).scalar_one()
+            short_validation = dict(short_row.validation_payload or {})
+            short_validation['candidate_pykrx_enrichment'] = {
+                'market_date': self.market_date.isoformat(),
+                'required_categories': ['sector_classification', 'investor_flow_symbol', 'short_selling'],
+                'present_categories': ['sector_classification', 'investor_flow_symbol', 'short_selling'],
+                'missing_categories': [],
+                'allowed': True,
+                'source': 'candidate_symbol_pykrx_enrichment',
+            }
+            short_validation['warnings'] = [
+                {
+                    'code': 'global_pykrx_enrichment_preflight_partial',
+                    'message': 'Global PyKRX enrichment coverage is partial, but this candidate is complete.',
+                }
+            ]
+            short_row.validation_payload = short_validation
+            session.flush()
+        blocked_preflight = {
+            'market_date': self.market_date.isoformat(),
+            'status': 'blocked',
+            'allowed': False,
+            'required_categories': ['sector_classification', 'investor_flow_symbol', 'short_selling'],
+            'failed_categories': ['sector_classification', 'investor_flow_symbol', 'short_selling'],
+            'zero_coverage_categories': [],
+            'category_row_counts': {
+                'sector_classification': 2699,
+                'investor_flow_symbol': 2672,
+                'short_selling': 2806,
+            },
+        }
+
+        with patch('app.orders.next_open_execution.inspect_pykrx_enrichment_preflight', return_value=blocked_preflight):
+            result = await self.service.dispatch_next_open_plan(
+                target_trade_date=self.target_trade_date,
+                refresh_plan=False,
+                dry_run=False,
+                force=False,
+                trigger='test',
+            )
+
+        self.assertTrue(result['summary']['triggered'])
+        self.assertEqual(result['summary']['translated_item_count'], 3)
+        self.assertEqual(result['summary']['dispatched_group_count'], 1)
+        self.assertFalse(result['summary']['enrichment_preflight_allowed'])
+        self.assertIn('dispatch_note', result['enrichment_preflight'])
+        self.assertEqual(len(self.client.post_calls), 1)
+        self.assertEqual(self.client.post_calls[0]['metadata']['decision_agent_name'], 'short-term-decider')
+        groups_by_agent = {group['decision_agent_name']: group for group in result['dispatch']['groups']}
+        self.assertEqual(groups_by_agent['signal-decider']['dispatch_status'], 'skipped')
+        self.assertEqual(groups_by_agent['short-term-decider']['dispatch_status'], 'accepted')
+        items_by_agent = {item['decision_agent_name']: item for item in result['items']}
+        self.assertEqual(items_by_agent['signal-decider']['eligibility_status'], 'blocked')
+        self.assertEqual(items_by_agent['short-term-decider']['execution_status'], EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING)
 
     async def test_dispatch_next_open_plan_translates_and_persists_exec_linkage(self) -> None:
         result = await self.service.dispatch_next_open_plan(
@@ -974,10 +1048,16 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         short_entry = short_payload['items'][0]
         self.assertEqual(short_entry['decision_agent_name'], 'short-term-decider')
         self.assertEqual(short_entry['intent'], EXEC_INTENT_INTRADAY_WATCH_BUY)
+        self.assertEqual(short_entry['handoff_intent'], 'intraday_watch_buy')
+        self.assertEqual(short_entry['raw_action'], 'watch_for_trigger')
+        self.assertEqual(short_entry['tactical_action'], 'watch_for_trigger')
+        self.assertEqual(short_entry['generic_action'], 'buy')
         self.assertEqual(short_entry['trigger_price'], 50500)
         self.assertEqual(short_entry['limit_price'], 51500)
         self.assertEqual(short_entry['risk_context']['agent_name'], 'short-term-decider')
         self.assertEqual(short_entry['risk_context']['decision_agent_name'], 'short-term-decider')
+        self.assertEqual(short_entry['risk_context']['handoff_intent'], 'intraday_watch_buy')
+        self.assertEqual(short_entry['risk_context']['generic_action'], 'buy')
         self.assertEqual(short_entry['risk_context']['entry_execution_mode'], 'pending_trigger_limit')
         self.assertTrue(short_entry['risk_context']['monitoring_candidate'])
         self.assertEqual(short_entry['risk_context']['monitoring_intent'], EXEC_INTENT_INTRADAY_WATCH_BUY)
@@ -1026,6 +1106,9 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(handoff['target_trade_date'], '2026-04-30')
         self.assertEqual(handoff['source_market_date'], '2026-04-29')
         self.assertEqual(handoff['traceability']['decision_snapshot_id'], short_snapshot_id)
+        self.assertEqual(handoff['traceability']['handoff_intent'], 'intraday_watch_buy')
+        self.assertEqual(handoff['decider_output']['generic_action'], 'buy')
+        self.assertEqual(handoff['decider_output']['handoff_intent'], 'intraday_watch_buy')
         self.assertEqual(handoff['traceability']['core_plan_item_id'], short_entry['risk_context']['core_plan_item_id'])
         self.assertEqual(handoff['decider_input_context']['request_payload'], decider_request_payload)
         self.assertEqual(handoff['decider_input_context']['input_feature_snapshot_payload'], decider_input_features)
@@ -1062,7 +1145,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(signal_item['execution_status'], EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING)
         self.assertEqual(result['summary']['delegated_for_exec_agent_sizing_count'], 2)
 
-    async def test_dispatch_next_open_plan_short_term_missing_target_stop_dispatches_entry_only(self) -> None:
+    async def test_dispatch_next_open_plan_short_term_missing_target_stop_skips_watch_handoff(self) -> None:
         short_snapshot_id = self._seed_short_term_snapshot(target_price=None, stop_loss_price=None)
         self._seed_short_term_plan_item(
             snapshot_id=short_snapshot_id,
@@ -1070,7 +1153,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             stop_loss_price=None,
         )
 
-        await self.service.dispatch_next_open_plan(
+        result = await self.service.dispatch_next_open_plan(
             target_trade_date=self.target_trade_date,
             refresh_plan=False,
             dry_run=False,
@@ -1078,16 +1161,14 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             trigger='test',
         )
 
-        short_payload = next(
-            payload for payload in self.client.post_calls if payload['metadata']['decision_agent_name'] == 'short-term-decider'
+        self.assertFalse(
+            any(payload['metadata']['decision_agent_name'] == 'short-term-decider' for payload in self.client.post_calls)
         )
-        self.assertEqual(len(short_payload['items']), 1)
-        self.assertEqual(short_payload['items'][0]['intent'], EXEC_INTENT_INTRADAY_WATCH_BUY)
-        self.assertEqual(short_payload['items'][0]['trigger_price'], 50500)
-        self.assertEqual(short_payload['items'][0]['limit_price'], 51500)
-        self.assertEqual(short_payload['items'][0]['risk_context']['entry_execution_mode'], 'pending_trigger_limit')
-        self.assertTrue(short_payload['items'][0]['risk_context']['monitoring_candidate'])
-        self.assertEqual(short_payload['items'][0]['quantity_policy']['type'], 'exec_agent_sized')
+        short_group = next(
+            group for group in result['dispatch']['groups'] if group['decision_agent_name'] == 'short-term-decider'
+        )
+        self.assertEqual(short_group['dispatch_status'], 'skipped')
+        self.assertEqual(short_group['eligible_count'], 0)
 
     async def test_dispatch_next_open_plan_short_term_idempotent_redispatch_skips_duplicate_payload(self) -> None:
         short_snapshot_id = self._seed_short_term_snapshot()
@@ -1147,6 +1228,14 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             {item['decision_agent_name'] for item in overview['items']},
             {'signal-decider', 'short-term-decider'},
         )
+        short_item = next(item for item in overview['items'] if item['decision_agent_name'] == 'short-term-decider')
+        self.assertEqual(short_item['raw_action'], 'watch_for_trigger')
+        self.assertEqual(short_item['tactical_action'], 'watch_for_trigger')
+        self.assertEqual(short_item['generic_action'], 'buy')
+        self.assertEqual(short_item['handoff_intent'], 'intraday_watch_buy')
+        self.assertEqual(short_item['approval_state'], 'not_dispatched')
+        self.assertFalse(short_item['exec_agent_approved'])
+        self.assertFalse(short_item['exec_monitoring_active'])
 
     async def test_exec_overview_refresh_persists_remote_readback(self) -> None:
         dispatch_result = await self.service.dispatch_next_open_plan(
@@ -1414,7 +1503,10 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             ]
         }
 
-        with patch('app.orders.exec_integration.kis_realtime_price_service') as price_service:
+        with (
+            patch('app.orders.exec_integration.kis_realtime_price_service') as price_service,
+            patch.object(self.service, '_load_live_portfolio_holding_symbols', new=AsyncMock(return_value=None)),
+        ):
             price_service.price_fields_for_symbol.return_value = {
                 'current_price': 50200,
                 'price_as_of': '2026-04-30T00:07:30+00:00',
@@ -1508,7 +1600,10 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             trigger='test',
         )
 
-        with patch('app.orders.exec_integration.kis_realtime_price_service') as price_service:
+        with (
+            patch('app.orders.exec_integration.kis_realtime_price_service') as price_service,
+            patch.object(self.service, '_load_live_portfolio_holding_symbols', new=AsyncMock(return_value=None)),
+        ):
             price_service.price_fields_for_symbol.return_value = {
                 'current_price': 50200,
                 'price_as_of': '2026-04-30T00:07:30+00:00',
@@ -1726,7 +1821,10 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 },
             }
 
-        with patch('app.orders.exec_integration.kis_realtime_price_service') as price_service:
+        with (
+            patch('app.orders.exec_integration.kis_realtime_price_service') as price_service,
+            patch.object(self.service, '_load_live_portfolio_holding_symbols', new=AsyncMock(return_value=None)),
+        ):
             price_service.price_fields_for_symbol.return_value = {
                 'current_price': 50200,
                 'price_as_of': '2026-04-30T00:07:30+00:00',
@@ -1755,6 +1853,34 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(item['position_average_price'], 50100)
         self.assertIn('target_sell_monitoring', item['monitoring_statuses'])
         self.assertIn('stop_sell_monitoring', item['monitoring_statuses'])
+
+        with patch('app.orders.exec_integration.kis_realtime_price_service') as price_service:
+            price_service.price_fields_for_symbol.return_value = {
+                'current_price': None,
+                'price_as_of': None,
+                'price_received_at': None,
+                'price_source': None,
+                'price_status': 'unavailable',
+                'realtime_subscribed': False,
+                'realtime_subscription_reason': 'not_monitored',
+                'display_price_available': False,
+            }
+            price_service.observe_monitored_symbols.return_value = {'allowed_symbols': []}
+
+            monitored_without_live_holding = self.service._build_runtime_monitored_symbols_payload(
+                board={
+                    'market_date': self.target_trade_date.isoformat(),
+                    'runtime': {'status': 'ready', 'mode': 'mock'},
+                    'items': [],
+                },
+                refresh=False,
+                refresh_state={'requested': False, 'status': 'not_requested'},
+                served_from_cache=False,
+                live_holding_symbols=set(),
+            )
+
+        self.assertEqual(monitored_without_live_holding['summary']['items_total'], 0)
+        self.assertEqual(monitored_without_live_holding['items'], [])
 
     async def test_runtime_monitored_symbols_use_cached_display_fallback_when_capacity_limited(self) -> None:
         fallback_symbol = '000660'
@@ -2628,6 +2754,40 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
             self.service.list_signal_decider_exec_overview = original_overview
+
+    async def test_dashboard_background_refresh_stores_monitored_cache_with_live_holding_filter(self) -> None:
+        key = self.service._dashboard_refresh_key(
+            target_trade_date=self.target_trade_date,
+            account_reference=None,
+            symbol=None,
+        )
+
+        with (
+            patch.object(
+                self.service,
+                'list_signal_decider_exec_overview',
+                new=AsyncMock(return_value={'items': [], 'summary': {}}),
+            ) as overview,
+            patch.object(
+                self.service,
+                '_load_live_portfolio_holding_symbols',
+                new=AsyncMock(return_value={self.symbol}),
+            ) as load_live_holdings,
+            patch.object(self.service, '_store_dashboard_caches_from_overview') as store_caches,
+        ):
+            await self.service._refresh_dashboard_read_model(
+                key=key,
+                target_trade_date=self.target_trade_date,
+                account_reference=None,
+                symbol=None,
+                trigger='test',
+                timeout_seconds=1.0,
+            )
+
+        overview.assert_awaited_once()
+        load_live_holdings.assert_awaited_once_with(trigger='test:dashboard_background_refresh')
+        store_caches.assert_called_once()
+        self.assertEqual(store_caches.call_args.kwargs['live_holding_symbols'], {self.symbol})
 
     async def test_scheduled_exec_readback_refresh_reuses_dashboard_background_state(self) -> None:
         await self.service.dispatch_next_open_plan(

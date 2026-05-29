@@ -45,6 +45,17 @@ EXECUTION_STATUS_SUBMIT_FAILED = 'submit_failed'
 EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING = 'delegated_for_exec_agent_sizing'
 ORDER_SOURCE = 'signal_decider_next_open'
 SHORT_TERM_ACTIONABLE_ACTIONS = {'scalp_buy_candidate', 'watch_for_trigger'}
+SHORT_TERM_GENERIC_ACTION_BY_TACTICAL_ACTION = {
+    'scalp_buy_candidate': 'buy',
+    'watch_for_trigger': 'buy',
+    'avoid_chase': 'wait',
+    'wait': 'wait',
+    'reject': 'reject',
+}
+SHORT_TERM_HANDOFF_INTENT_BY_TACTICAL_ACTION = {
+    'scalp_buy_candidate': 'tactical_buy',
+    'watch_for_trigger': 'intraday_watch_buy',
+}
 KRX_EXCHANGE_CALENDAR = xcals.get_calendar('XKRX')
 UNSPECIFIED_ROUTE_ACCOUNT_REFERENCE = 'KIS:00000000-00'
 UNSPECIFIED_ROUTE_ACCOUNT_LABEL = 'UNSPECIFIED_ROUTE'
@@ -240,10 +251,38 @@ def _is_actionable_short_term_snapshot(snapshot: SignalDeciderDecisionSnapshot) 
     return _snapshot_agent_name(snapshot) == SHORT_TERM_DECIDER_AGENT_NAME and _is_actionable_snapshot(snapshot)
 
 
+def _short_term_generic_action(tactical_action: str) -> str:
+    return SHORT_TERM_GENERIC_ACTION_BY_TACTICAL_ACTION.get(tactical_action, 'wait')
+
+
+def _short_term_handoff_intent(tactical_action: str) -> str | None:
+    return SHORT_TERM_HANDOFF_INTENT_BY_TACTICAL_ACTION.get(tactical_action)
+
+
+def _short_term_entry_execution_mode(tactical_action: str) -> str | None:
+    if tactical_action == 'scalp_buy_candidate':
+        return 'guarded_tactical_buy'
+    if tactical_action == 'watch_for_trigger':
+        return 'pending_trigger_limit'
+    return None
+
+
 def _short_term_field_text(snapshot: SignalDeciderDecisionSnapshot, key: str) -> str | None:
     payload = _snapshot_response_payload(snapshot)
     value = payload.get(key)
     return _normalize_optional_text(str(value)) if value is not None else None
+
+
+def _first_blocking_reason(validation_payload: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(validation_payload, dict):
+        return None
+    for reason in validation_payload.get('blocking_reasons') or []:
+        if isinstance(reason, dict):
+            return reason
+        normalized = _normalize_optional_text(reason)
+        if normalized:
+            return {'code': 'blocked', 'message': normalized}
+    return None
 
 
 def _previous_trading_day(value: date) -> date:
@@ -273,6 +312,10 @@ def _uses_exec_agent_sizing_for_dispatch(decision_agent_name: str) -> bool:
         SIGNAL_DECIDER_AGENT_NAME,
         SHORT_TERM_DECIDER_AGENT_NAME,
     }
+
+
+def _row_validation_payload(row: SignalDeciderExecutionPlanItem) -> dict[str, Any]:
+    return row.validation_payload if isinstance(row.validation_payload, dict) else {}
 
 
 @dataclass(frozen=True)
@@ -383,13 +426,14 @@ class SignalDeciderNextOpenExecutionService:
                 trigger=trigger,
             )
         )
+        enrichment_preflight_blocked = not force and not enrichment_preflight.get('allowed')
         snapshots = self._load_latest_snapshots(source_market_date=source_market_date)
         actionable_short_term_symbols = [
             snapshot.symbol for snapshot in snapshots if _is_actionable_short_term_snapshot(snapshot)
         ]
         candidate_enrichment_by_symbol = (
             {}
-            if force or enrichment_preflight.get('allowed') or not actionable_short_term_symbols
+            if not enrichment_preflight_blocked or not actionable_short_term_symbols
             else self._inspect_candidate_pykrx_enrichment(
                 source_market_date=source_market_date,
                 symbols=actionable_short_term_symbols,
@@ -399,7 +443,7 @@ class SignalDeciderNextOpenExecutionService:
                 ),
             )
         )
-        if not force and not enrichment_preflight.get('allowed') and not actionable_short_term_symbols:
+        if enrichment_preflight_blocked and not actionable_short_term_symbols:
             self._block_existing_plan_rows_for_enrichment_preflight(
                 target_trade_date=resolved_target_date,
                 source_market_date=source_market_date,
@@ -418,6 +462,7 @@ class SignalDeciderNextOpenExecutionService:
                         target_trade_date=resolved_target_date,
                         runtime=runtime,
                         source_market_date=source_market_date,
+                        enrichment_preflight=enrichment_preflight,
                     ),
                     'reason': 'pykrx_enrichment_preflight_blocked',
                     'enrichment_preflight_allowed': False,
@@ -539,6 +584,13 @@ class SignalDeciderNextOpenExecutionService:
                             *(validation.get('blocking_reasons') or []),
                             *account_target_blocking_reasons,
                         ]
+                    if enrichment_preflight_blocked:
+                        self._apply_enrichment_preflight_to_validation(
+                            validation=validation,
+                            decision_agent_name=decision_agent_name,
+                            source_market_date=source_market_date,
+                            preflight=enrichment_preflight,
+                        )
                     self._apply_plan_row(
                         row=row,
                         snapshot=snapshot,
@@ -582,6 +634,7 @@ class SignalDeciderNextOpenExecutionService:
                 runtime=runtime,
                 source_market_date=source_market_date,
                 enrichment_preflight=enrichment_preflight,
+                reason='pykrx_enrichment_preflight_blocked' if enrichment_preflight_blocked else None,
             ),
             'enrichment_preflight': enrichment_preflight,
             'items': [self._serialize_row(row) for row in rows],
@@ -710,9 +763,10 @@ class SignalDeciderNextOpenExecutionService:
                     'idempotent_replay_count': 0,
                     'enrichment_preflight_status': enrichment_preflight.get('status'),
                     'enrichment_failed_categories': enrichment_preflight.get('failed_categories') or [],
+                    'refresh_summary': refresh_result.get('summary') if isinstance(refresh_result, dict) else None,
                 },
                 'enrichment_preflight': enrichment_preflight,
-                'items': [],
+                'items': refresh_result.get('items') if isinstance(refresh_result, dict) else [],
             }
         candidate_rows = self._load_plan_rows(
             target_trade_date=resolved_target_date,
@@ -827,8 +881,14 @@ class SignalDeciderNextOpenExecutionService:
         target_trade_date: date,
         source_market_date: date,
         preflight: dict[str, Any],
+        decision_agent_names: Sequence[str] | None = None,
     ) -> None:
         now = _utcnow()
+        normalized_agent_names = (
+            {_normalize_agent_name(name) for name in decision_agent_names}
+            if decision_agent_names is not None
+            else None
+        )
         reason = _reason(
             'pykrx_enrichment_preflight_blocked',
             (
@@ -847,6 +907,11 @@ class SignalDeciderNextOpenExecutionService:
                 )
             ).scalars().all()
             for row in rows:
+                if (
+                    normalized_agent_names is not None
+                    and _normalize_agent_name(row.decision_agent_name) not in normalized_agent_names
+                ):
+                    continue
                 if _is_dispatch_terminal_status(row.execution_status):
                     continue
                 existing = row.validation_payload if isinstance(row.validation_payload, dict) else {}
@@ -872,11 +937,13 @@ class SignalDeciderNextOpenExecutionService:
         target_trade_date: date,
         source_market_date: date,
         preflight: dict[str, Any],
+        decision_agent_names: Sequence[str] | None = None,
     ) -> None:
         self._block_existing_plan_rows_for_enrichment_preflight(
             target_trade_date=target_trade_date,
             source_market_date=source_market_date,
             preflight=preflight,
+            decision_agent_names=decision_agent_names,
         )
 
     def _inspect_candidate_pykrx_enrichment(
@@ -917,6 +984,51 @@ class SignalDeciderNextOpenExecutionService:
                 'source': 'candidate_symbol_pykrx_enrichment',
             }
         return result
+
+    def _apply_enrichment_preflight_to_validation(
+        self,
+        *,
+        validation: dict[str, Any],
+        decision_agent_name: str,
+        source_market_date: date,
+        preflight: dict[str, Any],
+    ) -> None:
+        reason = _reason(
+            'pykrx_enrichment_preflight_blocked',
+            (
+                'PyKRX enrichment coverage is not ready for source_market_date '
+                f'{source_market_date.isoformat()}; failed categories: '
+                f'{", ".join(preflight.get("failed_categories") or []) or "unknown"}.'
+            ),
+        )
+        existing_block_codes = {
+            item.get('code')
+            for item in validation.get('blocking_reasons') or []
+            if isinstance(item, dict)
+        }
+        existing_warning_codes = {
+            item.get('code')
+            for item in validation.get('warnings') or []
+            if isinstance(item, dict)
+        }
+        if decision_agent_name == SIGNAL_DECIDER_AGENT_NAME:
+            if reason['code'] not in existing_block_codes:
+                validation['blocking_reasons'] = [
+                    *(validation.get('blocking_reasons') or []),
+                    reason,
+                ]
+        elif reason['code'] not in existing_warning_codes:
+            validation['warnings'] = [
+                *(validation.get('warnings') or []),
+                {
+                    **reason,
+                    'message': (
+                        f"{reason['message']} Candidate remains visible for conditional "
+                        'exec monitoring; candidate-level trigger/chase/risk validation still applies.'
+                    ),
+                },
+            ]
+        validation['pykrx_enrichment_preflight'] = preflight
 
     def _parse_account_targets(self) -> tuple[list[NextOpenAccountTarget], list[str]]:
         raw_value = settings.signal_decider_next_open_account_targets.strip()
@@ -1029,6 +1141,23 @@ class SignalDeciderNextOpenExecutionService:
         decision_agent_name = _snapshot_agent_name(snapshot)
         response_payload = _snapshot_response_payload(snapshot)
         pre_decider_enrichment_context = _snapshot_pre_decider_enrichment_context(snapshot)
+        short_term_tactical_action = (
+            _short_term_tactical_action(snapshot)
+            if decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
+            else None
+        )
+        generic_action = (
+            _short_term_generic_action(short_term_tactical_action)
+            if short_term_tactical_action is not None
+            else _normalize_action(snapshot.next_day_open_action or snapshot.decision_action)
+        )
+        handoff_intent = (
+            _short_term_handoff_intent(short_term_tactical_action)
+            if short_term_tactical_action is not None
+            else 'next_open_buy'
+            if generic_action == 'buy'
+            else None
+        )
         blocking_reasons: list[dict[str, str]] = []
         warnings: list[dict[str, str]] = []
         gate_checks = (
@@ -1217,17 +1346,17 @@ class SignalDeciderNextOpenExecutionService:
                     )
                 )
             if target_price is None:
-                warnings.append(
+                blocking_reasons.append(
                     _reason(
                         'target_price_missing',
-                        'Short-term dispatch will omit the target sell monitor because target_price is missing.',
+                        'Short-term dispatch requires target_price so exec can attach a guarded target monitor.',
                     )
                 )
             if stop_loss_price is None:
-                warnings.append(
+                blocking_reasons.append(
                     _reason(
                         'stop_loss_price_missing',
-                        'Short-term dispatch will omit the stop-loss monitor because stop_loss_price is missing.',
+                        'Short-term dispatch requires stop_loss_price so exec can attach a guarded stop monitor.',
                     )
                 )
             if target_price is not None and stop_loss_price is not None and target_price <= stop_loss_price:
@@ -1238,6 +1367,13 @@ class SignalDeciderNextOpenExecutionService:
                     )
                 )
             if estimated_reference_price is not None and estimated_reference_price > 0 and chase_limit_price is not None:
+                if Decimal(str(estimated_reference_price)) > chase_limit_price:
+                    blocking_reasons.append(
+                        _reason(
+                            'reference_price_above_chase_limit',
+                            'Latest available reference price is already above short-term chase_limit_price.',
+                        )
+                    )
                 estimated_reference_price = max(int(estimated_reference_price), int(chase_limit_price))
                 estimated_reference_price_basis = 'max(previous_close,chase_limit_price)'
             if bool(gate_checks.get('decision_support_only')) or not bool(gate_checks.get('allow_execution_logic', False)):
@@ -1350,6 +1486,10 @@ class SignalDeciderNextOpenExecutionService:
             'blocking_reasons': blocking_reasons,
             'warnings': warnings,
             'decision_agent_name': decision_agent_name,
+            'raw_action': short_term_tactical_action or generic_action,
+            'tactical_action': short_term_tactical_action,
+            'generic_action': generic_action,
+            'handoff_intent': handoff_intent,
             'pricing_note': pricing_note,
             'policy_context': {
                 'policy_version': snapshot.policy_version,
@@ -1370,6 +1510,25 @@ class SignalDeciderNextOpenExecutionService:
             },
             'pre_decider_enrichment_context': pre_decider_enrichment_context,
             'decision_input_quality_context': decision_input_quality_context,
+            'handoff': {
+                'decision_agent_name': decision_agent_name,
+                'raw_action': short_term_tactical_action or generic_action,
+                'tactical_action': short_term_tactical_action,
+                'generic_action': generic_action,
+                'handoff_intent': handoff_intent,
+                'exec_monitoring_active': bool(
+                    decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
+                    and handoff_intent is not None
+                    and not blocking_reasons
+                ),
+                'approval_state': (
+                    'pending_exec_agent'
+                    if decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME and handoff_intent is not None and not blocking_reasons
+                    else 'blocked'
+                    if blocking_reasons
+                    else None
+                ),
+            },
         }
         if enrichment_preflight is not None:
             validation_payload['pykrx_enrichment_preflight'] = enrichment_preflight
@@ -1377,7 +1536,11 @@ class SignalDeciderNextOpenExecutionService:
             validation_payload['candidate_pykrx_enrichment'] = candidate_enrichment
         if decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME:
             validation_payload['short_term'] = {
-                'tactical_action': _short_term_tactical_action(snapshot),
+                'raw_action': short_term_tactical_action,
+                'tactical_action': short_term_tactical_action,
+                'generic_action': generic_action,
+                'handoff_intent': handoff_intent,
+                'entry_execution_mode': _short_term_entry_execution_mode(short_term_tactical_action or 'wait'),
                 'trigger_price': response_payload.get('trigger_price'),
                 'chase_limit_price': response_payload.get('chase_limit_price'),
                 'target_price': response_payload.get('target_price'),
@@ -1422,6 +1585,42 @@ class SignalDeciderNextOpenExecutionService:
         blocking_reasons = validation_payload.get('blocking_reasons') or []
         decision_agent_name = _snapshot_agent_name(snapshot)
         response_payload = _snapshot_response_payload(snapshot)
+        short_term_tactical_action = (
+            _short_term_tactical_action(snapshot)
+            if decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
+            else None
+        )
+        generic_action = (
+            _short_term_generic_action(short_term_tactical_action)
+            if short_term_tactical_action is not None
+            else _normalize_action(snapshot.next_day_open_action or snapshot.decision_action)
+        )
+        handoff_intent = (
+            _short_term_handoff_intent(short_term_tactical_action)
+            if short_term_tactical_action is not None
+            else 'next_open_buy'
+            if generic_action == 'buy'
+            else None
+        )
+        handoff_active = bool(
+            decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
+            and handoff_intent is not None
+            and not blocking_reasons
+        )
+        validation_payload['raw_action'] = short_term_tactical_action or generic_action
+        validation_payload['tactical_action'] = short_term_tactical_action
+        validation_payload['generic_action'] = generic_action
+        validation_payload['handoff_intent'] = handoff_intent
+        validation_payload['handoff'] = {
+            **(validation_payload.get('handoff') if isinstance(validation_payload.get('handoff'), dict) else {}),
+            'decision_agent_name': decision_agent_name,
+            'raw_action': short_term_tactical_action or generic_action,
+            'tactical_action': short_term_tactical_action,
+            'generic_action': generic_action,
+            'handoff_intent': handoff_intent,
+            'exec_monitoring_active': handoff_active,
+            'approval_state': 'pending_exec_agent' if handoff_active else 'blocked' if blocking_reasons else None,
+        }
         target_price = snapshot.target_price
         stop_loss_price = snapshot.stop_loss_price
         suggested_holding_period = snapshot.suggested_holding_period
@@ -1483,12 +1682,18 @@ class SignalDeciderNextOpenExecutionService:
                 if _uses_exec_agent_sizing_for_dispatch(decision_agent_name)
                 else 'core_fixed_quantity_next_open_candidate'
             ),
+            'raw_action': short_term_tactical_action or generic_action,
+            'tactical_action': short_term_tactical_action,
+            'generic_action': generic_action,
+            'handoff_intent': handoff_intent,
+            'handoff_active': handoff_active,
+            'exec_monitoring_active': handoff_active,
+            'approval_state': 'pending_exec_agent' if handoff_active else 'blocked' if blocking_reasons else None,
             'entry_execution_mode': (
-                'pending_trigger_limit' if decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME else 'next_open_market'
+                _short_term_entry_execution_mode(short_term_tactical_action or 'wait')
+                if decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
+                else 'next_open_market'
             ),
-            'tactical_action': _short_term_tactical_action(snapshot)
-            if decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
-            else None,
             'trigger_price': response_payload.get('trigger_price') if decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME else None,
             'chase_limit_price': response_payload.get('chase_limit_price')
             if decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
@@ -1573,6 +1778,7 @@ class SignalDeciderNextOpenExecutionService:
         runtime: dict[str, Any],
         source_market_date: date | None = None,
         enrichment_preflight: dict[str, Any] | None = None,
+        reason: str | None = None,
     ) -> dict[str, Any]:
         source_market_date = source_market_date or _previous_trading_day(target_trade_date)
         counts = {
@@ -1591,11 +1797,39 @@ class SignalDeciderNextOpenExecutionService:
                     Counter(_normalize_agent_name(row.decision_agent_name) for row in rows).items()
                 )
             ),
+            'short_term_candidates_total': sum(
+                1 for row in rows if _normalize_agent_name(row.decision_agent_name) == SHORT_TERM_DECIDER_AGENT_NAME
+            ),
+            'short_term_watch_active_count': sum(
+                1
+                for row in rows
+                if _normalize_agent_name(row.decision_agent_name) == SHORT_TERM_DECIDER_AGENT_NAME
+                and row.eligibility_status == ELIGIBILITY_ELIGIBLE
+            ),
+            'short_term_blocked_or_degraded_count': sum(
+                1
+                for row in rows
+                if _normalize_agent_name(row.decision_agent_name) == SHORT_TERM_DECIDER_AGENT_NAME
+                and (
+                    row.eligibility_status == ELIGIBILITY_BLOCKED
+                    or bool(_row_validation_payload(row).get('warnings'))
+                )
+            ),
+            'signal_decider_global_preflight_blocked_count': sum(
+                1
+                for row in rows
+                if _normalize_agent_name(row.decision_agent_name) == SIGNAL_DECIDER_AGENT_NAME
+                and any(
+                    isinstance(reason, dict) and reason.get('code') == 'pykrx_enrichment_preflight_blocked'
+                    for reason in (_row_validation_payload(row).get('blocking_reasons') or [])
+                )
+            ),
         }
         return {
             'target_trade_date': target_trade_date.isoformat(),
             'source_market_date': source_market_date.isoformat(),
             **counts,
+            **({'reason': reason} if reason else {}),
             'execution_enabled': runtime['execution_enabled'],
             'dry_run': runtime['dry_run'],
             'account_targets_configured': runtime['account_targets_configured'],
@@ -1613,6 +1847,35 @@ class SignalDeciderNextOpenExecutionService:
         }
 
     def _serialize_row(self, row: SignalDeciderExecutionPlanItem) -> dict[str, Any]:
+        traceability = row.traceability_payload if isinstance(row.traceability_payload, dict) else {}
+        validation = row.validation_payload if isinstance(row.validation_payload, dict) else {}
+        blocker_reason = _first_blocking_reason(validation)
+        decision_agent_name = _normalize_agent_name(row.decision_agent_name)
+        raw_action = traceability.get('raw_action') or traceability.get('tactical_action')
+        generic_action = traceability.get('generic_action')
+        if generic_action is None:
+            if raw_action in {'scalp_buy_candidate', 'watch_for_trigger'}:
+                generic_action = 'buy'
+            elif decision_agent_name == SIGNAL_DECIDER_AGENT_NAME and row.planned_side == 'buy':
+                generic_action = 'buy'
+        handoff_intent = traceability.get('handoff_intent')
+        if handoff_intent is None:
+            if raw_action == 'scalp_buy_candidate':
+                handoff_intent = 'tactical_buy'
+            elif raw_action == 'watch_for_trigger':
+                handoff_intent = 'intraday_watch_buy'
+            elif decision_agent_name == SIGNAL_DECIDER_AGENT_NAME and row.planned_side == 'buy':
+                handoff_intent = 'next_open_buy'
+        handoff_active = bool(traceability.get('handoff_active')) or bool(
+            decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
+            and row.eligibility_status == ELIGIBILITY_ELIGIBLE
+            and handoff_intent in {'tactical_buy', 'intraday_watch_buy'}
+        )
+        exec_monitoring_active = bool(traceability.get('exec_monitoring_active')) or handoff_active
+        approval_state = (
+            traceability.get('approval_state')
+            or ('pending_exec_agent' if handoff_active else 'blocked' if blocker_reason else None)
+        )
         request = (
             load_order_request(
                 account_reference=row.account_reference,
@@ -1641,6 +1904,25 @@ class SignalDeciderNextOpenExecutionService:
             'symbol': row.symbol,
             'policy_version': row.policy_version,
             'decision_snapshot_id': row.decision_snapshot_id,
+            'decision_run_id': traceability.get('decision_run_id'),
+            'source_feedback_id': traceability.get('source_feedback_id') or traceability.get('feedback_id'),
+            'raw_action': raw_action,
+            'tactical_action': traceability.get('tactical_action'),
+            'generic_action': generic_action,
+            'handoff_intent': handoff_intent,
+            'handoff_active': handoff_active,
+            'exec_monitoring_active': exec_monitoring_active,
+            'exec_agent_approved': traceability.get('exec_agent_approved'),
+            'approval_state': approval_state,
+            'trigger_price': traceability.get('trigger_price'),
+            'chase_limit_price': traceability.get('chase_limit_price'),
+            'target_price': traceability.get('target_price'),
+            'stop_loss_price': traceability.get('stop_loss_price'),
+            'expected_holding_period': traceability.get('expected_holding_period')
+            or traceability.get('suggested_holding_period'),
+            'entry_execution_mode': traceability.get('entry_execution_mode'),
+            'blocker_reason': blocker_reason,
+            'data_quality_warnings': traceability.get('data_quality_warnings') or [],
             'planned_side': row.planned_side,
             'planned_order_type': row.planned_order_type,
             'planned_time_in_force': row.planned_time_in_force,
@@ -1653,8 +1935,8 @@ class SignalDeciderNextOpenExecutionService:
             'client_order_id': row.client_order_id,
             'order_request_id': row.order_request_id,
             'broker_order_row_id': row.broker_order_row_id,
-            'validation': row.validation_payload,
-            'traceability': row.traceability_payload,
+            'validation': validation,
+            'traceability': traceability,
             'submission': row.submission_payload,
             'first_ready_at': row.first_ready_at.isoformat() if row.first_ready_at else None,
             'last_evaluated_at': row.last_evaluated_at.isoformat() if row.last_evaluated_at else None,
