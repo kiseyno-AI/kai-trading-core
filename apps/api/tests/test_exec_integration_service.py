@@ -1439,7 +1439,10 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             ]
         }
 
-        with patch('app.orders.exec_integration.kis_realtime_price_service') as price_service:
+        with (
+            patch('app.orders.exec_integration.kis_realtime_price_service') as price_service,
+            patch.object(self.service, '_load_live_portfolio_holding_symbols', new=AsyncMock(return_value=None)),
+        ):
             price_service.price_fields_for_symbol.return_value = {
                 'current_price': 50200,
                 'price_as_of': '2026-04-30T00:07:30+00:00',
@@ -1533,7 +1536,10 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             trigger='test',
         )
 
-        with patch('app.orders.exec_integration.kis_realtime_price_service') as price_service:
+        with (
+            patch('app.orders.exec_integration.kis_realtime_price_service') as price_service,
+            patch.object(self.service, '_load_live_portfolio_holding_symbols', new=AsyncMock(return_value=None)),
+        ):
             price_service.price_fields_for_symbol.return_value = {
                 'current_price': 50200,
                 'price_as_of': '2026-04-30T00:07:30+00:00',
@@ -1751,7 +1757,10 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 },
             }
 
-        with patch('app.orders.exec_integration.kis_realtime_price_service') as price_service:
+        with (
+            patch('app.orders.exec_integration.kis_realtime_price_service') as price_service,
+            patch.object(self.service, '_load_live_portfolio_holding_symbols', new=AsyncMock(return_value=None)),
+        ):
             price_service.price_fields_for_symbol.return_value = {
                 'current_price': 50200,
                 'price_as_of': '2026-04-30T00:07:30+00:00',
@@ -1780,6 +1789,34 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(item['position_average_price'], 50100)
         self.assertIn('target_sell_monitoring', item['monitoring_statuses'])
         self.assertIn('stop_sell_monitoring', item['monitoring_statuses'])
+
+        with patch('app.orders.exec_integration.kis_realtime_price_service') as price_service:
+            price_service.price_fields_for_symbol.return_value = {
+                'current_price': None,
+                'price_as_of': None,
+                'price_received_at': None,
+                'price_source': None,
+                'price_status': 'unavailable',
+                'realtime_subscribed': False,
+                'realtime_subscription_reason': 'not_monitored',
+                'display_price_available': False,
+            }
+            price_service.observe_monitored_symbols.return_value = {'allowed_symbols': []}
+
+            monitored_without_live_holding = self.service._build_runtime_monitored_symbols_payload(
+                board={
+                    'market_date': self.target_trade_date.isoformat(),
+                    'runtime': {'status': 'ready', 'mode': 'mock'},
+                    'items': [],
+                },
+                refresh=False,
+                refresh_state={'requested': False, 'status': 'not_requested'},
+                served_from_cache=False,
+                live_holding_symbols=set(),
+            )
+
+        self.assertEqual(monitored_without_live_holding['summary']['items_total'], 0)
+        self.assertEqual(monitored_without_live_holding['items'], [])
 
     async def test_runtime_monitored_symbols_use_cached_display_fallback_when_capacity_limited(self) -> None:
         fallback_symbol = '000660'
@@ -2653,6 +2690,40 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
             self.service.list_signal_decider_exec_overview = original_overview
+
+    async def test_dashboard_background_refresh_stores_monitored_cache_with_live_holding_filter(self) -> None:
+        key = self.service._dashboard_refresh_key(
+            target_trade_date=self.target_trade_date,
+            account_reference=None,
+            symbol=None,
+        )
+
+        with (
+            patch.object(
+                self.service,
+                'list_signal_decider_exec_overview',
+                new=AsyncMock(return_value={'items': [], 'summary': {}}),
+            ) as overview,
+            patch.object(
+                self.service,
+                '_load_live_portfolio_holding_symbols',
+                new=AsyncMock(return_value={self.symbol}),
+            ) as load_live_holdings,
+            patch.object(self.service, '_store_dashboard_caches_from_overview') as store_caches,
+        ):
+            await self.service._refresh_dashboard_read_model(
+                key=key,
+                target_trade_date=self.target_trade_date,
+                account_reference=None,
+                symbol=None,
+                trigger='test',
+                timeout_seconds=1.0,
+            )
+
+        overview.assert_awaited_once()
+        load_live_holdings.assert_awaited_once_with(trigger='test:dashboard_background_refresh')
+        store_caches.assert_called_once()
+        self.assertEqual(store_caches.call_args.kwargs['live_holding_symbols'], {self.symbol})
 
     async def test_scheduled_exec_readback_refresh_reuses_dashboard_background_state(self) -> None:
         await self.service.dispatch_next_open_plan(
