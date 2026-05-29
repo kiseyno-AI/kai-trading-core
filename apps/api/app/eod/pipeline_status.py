@@ -220,13 +220,13 @@ def _load_daily_pipeline_stage_history(*, market_date: str) -> dict[str, dict[st
                 DailyPipelineStageRun.id.desc(),
             )
         ).all()
-    for run_row, stage_row in rows:
-        if stage_row.stage_id in latest_by_stage:
-            continue
-        latest_by_stage[stage_row.stage_id] = {
-            'run': daily_pipeline_run_state_service._serialize_run(run_row),
-            'stage': daily_pipeline_run_state_service._serialize_stage(stage_row),
-        }
+        for run_row, stage_row in rows:
+            if stage_row.stage_id in latest_by_stage:
+                continue
+            latest_by_stage[stage_row.stage_id] = {
+                'run': daily_pipeline_run_state_service._serialize_run(run_row),
+                'stage': daily_pipeline_run_state_service._serialize_stage(stage_row),
+            }
     return latest_by_stage
 
 

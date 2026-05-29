@@ -236,7 +236,7 @@ def test_inspect_feedback_prerequisites_blocks_missing_pykrx_enrichment_category
             'present_rows': 0,
             'missing_rows': 3,
             'coverage_ratio': 0.0,
-            'min_coverage_ratio': 0.99,
+            'min_coverage_ratio': 0.95,
             'reason': 'missing_required_pykrx_enrichment_category',
         }
     ]
@@ -272,3 +272,38 @@ def test_inspect_feedback_prerequisites_blocks_material_partial_pykrx_enrichment
     assert blocking_categories[0]['present_rows'] == 2
     assert blocking_categories[0]['missing_rows'] == 1
     assert blocking_categories[0]['reason'] == 'required_pykrx_enrichment_category_below_min_coverage'
+
+
+def test_inspect_feedback_prerequisites_allows_near_complete_pykrx_enrichment_coverage():
+    pykrx_stage = _pykrx_enrichment_stage(
+        status='completed',
+        category_overrides={
+            'investor_flow_symbol': {
+                'present_rows': 2679,
+                'expected_rows': 2808,
+                'coverage_ratio': 0.95406,
+                'coverage_status': 'partial',
+            },
+            'valuation_snapshot': {
+                'present_rows': 2701,
+                'expected_rows': 2808,
+                'coverage_ratio': 0.961895,
+                'coverage_status': 'partial',
+            },
+        },
+    )
+
+    with patch(
+        'app.eod.pipeline_status.eod_pipeline_status_service.read',
+        return_value=_pipeline_status(pykrx_stage=pykrx_stage),
+    ):
+        result = AgentFeedbackPrerequisiteService().inspect_feedback_prerequisites(
+            market_date='2026-05-29',
+            fs_div='CFS',
+        )
+
+    assert result['status'] == 'ready'
+    assert result['ready'] is True
+    assert result['blocked_stage_ids'] == []
+    warning_categories = result['stages']['pykrx_enrichment']['details']['decider_warning_categories']
+    assert [item['category'] for item in warning_categories] == ['investor_flow_symbol', 'valuation_snapshot']

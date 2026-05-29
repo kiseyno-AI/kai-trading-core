@@ -10,7 +10,7 @@ REQUIRED_EXEC_DECIDER_PYKRX_ENRICHMENT_CATEGORIES: tuple[str, ...] = (
     'investor_flow_symbol',
     'short_selling',
 )
-EXEC_DECIDER_PYKRX_ENRICHMENT_MIN_COVERAGE_RATIO = 0.99
+EXEC_DECIDER_PYKRX_ENRICHMENT_MIN_COVERAGE_RATIO = 0.95
 
 
 def _normalize_iso_date(value: str | date) -> str:
