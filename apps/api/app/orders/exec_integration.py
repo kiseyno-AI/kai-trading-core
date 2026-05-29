@@ -1294,12 +1294,17 @@ class SignalDeciderExecIntegrationService:
             trigger=trigger,
         )
         live_holding_symbols = await self._load_live_portfolio_holding_symbols(trigger=trigger)
+        live_exec_monitoring_symbols = await self._load_live_exec_monitoring_symbols(
+            market_date=resolved_market_date,
+            trigger=trigger,
+        )
         payload = self._build_runtime_monitored_symbols_payload(
             board=board,
             refresh=refresh,
             refresh_state=refresh_state,
             served_from_cache=False,
             live_holding_symbols=live_holding_symbols,
+            live_exec_monitoring_symbols=live_exec_monitoring_symbols,
         )
         self._observe_runtime_symbols_for_realtime_prices(
             (item.get('symbol') for item in payload['items']),
@@ -1312,6 +1317,49 @@ class SignalDeciderExecIntegrationService:
             payload=payload,
         )
         return payload
+
+    async def _load_live_exec_monitoring_symbols(self, *, market_date: date, trigger: str) -> set[str] | None:
+        integration = self.integration_status()
+        if integration['config_status'] in {REMOTE_FETCH_STATUS_DISABLED, REMOTE_FETCH_STATUS_NOT_CONFIGURED}:
+            return None
+        try:
+            payload = await self.client.get_runtime_status()
+        except SignalDeciderExecClientError:
+            return None
+        return self._extract_live_exec_monitoring_symbols(payload=payload, market_date=market_date)
+
+    @classmethod
+    def _extract_live_exec_monitoring_symbols(cls, *, payload: dict[str, Any], market_date: date) -> set[str]:
+        monitoring = _extract_field(payload, 'liveness', 'autonomous', 'monitoring')
+        if not isinstance(monitoring, dict):
+            return set()
+        last_cycle = monitoring.get('last_cycle') if isinstance(monitoring.get('last_cycle'), dict) else {}
+        items = last_cycle.get('items') if isinstance(last_cycle.get('items'), list) else []
+        symbols: set[str] = set()
+        market_date_text = market_date.isoformat()
+        compact_market_date = market_date.strftime('%Y%m%d')
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            if _normalize_optional_text(item.get('intent'), lowercase=True) not in EXEC_ENTRY_BUY_INTENTS:
+                continue
+            status = _normalize_status(item.get('status'))
+            if status != 'watch_monitoring_active':
+                continue
+            source_identity = item.get('source_identity') if isinstance(item.get('source_identity'), dict) else {}
+            source_plan_id = _normalize_optional_text(source_identity.get('source_plan_id')) or ''
+            core_plan_id = _normalize_optional_text(source_identity.get('core_plan_id')) or ''
+            strategy_run_id = _normalize_optional_text(source_identity.get('strategy_run_id')) or ''
+            if (
+                compact_market_date not in source_plan_id
+                and compact_market_date not in core_plan_id
+                and f':{market_date_text}:' not in strategy_run_id
+            ):
+                continue
+            symbol = _normalize_optional_text(item.get('symbol'))
+            if symbol:
+                symbols.add(symbol)
+        return symbols
 
     async def _load_live_portfolio_holding_symbols(self, *, trigger: str) -> set[str] | None:
         try:
@@ -1598,6 +1646,7 @@ class SignalDeciderExecIntegrationService:
         refresh_state: dict[str, Any],
         served_from_cache: bool,
         live_holding_symbols: set[str] | None = None,
+        live_exec_monitoring_symbols: set[str] | None = None,
     ) -> dict[str, Any]:
         resolved_market_date = date.fromisoformat(str(board['market_date']))
         board_items = list(board.get('items') or [])
@@ -1611,9 +1660,36 @@ class SignalDeciderExecIntegrationService:
             )
         )
         grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        live_exec_monitoring_symbols = live_exec_monitoring_symbols or set()
         for item in board_items:
             symbol = _normalize_optional_text(item.get('symbol'))
             if symbol:
+                item_target_trade_date = _normalize_optional_text(item.get('target_trade_date'))
+                current_day_held_position = (
+                    bool(item.get('held_position'))
+                    and item_target_trade_date is not None
+                    and date.fromisoformat(item_target_trade_date) == resolved_market_date
+                )
+                live_exec_watch = symbol in live_exec_monitoring_symbols and _normalize_optional_text(
+                    item.get('intent'), lowercase=True
+                ) in EXEC_ENTRY_BUY_INTENTS
+                if live_exec_watch or current_day_held_position:
+                    item = {
+                        **item,
+                        'approval_state': 'approved',
+                        'exec_agent_approved': True,
+                        'exec_agent_action': item.get('exec_agent_action') or 'approve',
+                        'exec_monitoring_active': True,
+                        'exec_runtime_showable': True,
+                        'exec_runtime_state': 'exec_approved_watch',
+                        'exec_runtime_exclusion_reason': None,
+                        'monitoring_statuses': sorted(
+                            {
+                                *(item.get('monitoring_statuses') or []),
+                                'watch_monitoring_active',
+                            }
+                        ),
+                    }
                 grouped[symbol].append(item)
 
         included_groups = {
