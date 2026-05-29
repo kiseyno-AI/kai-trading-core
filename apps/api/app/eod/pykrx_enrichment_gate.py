@@ -10,7 +10,6 @@ REQUIRED_EXEC_DECIDER_PYKRX_ENRICHMENT_CATEGORIES: tuple[str, ...] = (
     'investor_flow_symbol',
     'short_selling',
 )
-EXEC_DECIDER_PYKRX_ENRICHMENT_MIN_COVERAGE_RATIO = 0.95
 
 
 def _normalize_iso_date(value: str | date) -> str:
@@ -42,7 +41,6 @@ def _category_gate_item(
     category: str,
     payload: dict[str, Any],
     missing_category_payload: bool,
-    min_coverage_ratio: float,
 ) -> dict[str, Any]:
     expected_rows = _coerce_optional_int(payload.get('expected_rows'))
     present_rows = _coerce_optional_int(payload.get('present_rows')) or 0
@@ -61,9 +59,6 @@ def _category_gate_item(
     elif present_rows <= 0 or coverage_status == 'missing':
         gate_status = 'blocked'
         reason = 'missing_required_pykrx_enrichment_category'
-    elif (coverage_ratio or 0.0) < min_coverage_ratio:
-        gate_status = 'blocked'
-        reason = 'required_pykrx_enrichment_category_below_min_coverage'
     else:
         gate_status = 'ready'
         reason = None if coverage_status == 'complete' else 'required_pykrx_enrichment_category_near_complete'
@@ -77,7 +72,6 @@ def _category_gate_item(
         'present_rows': present_rows,
         'missing_rows': missing_rows,
         'coverage_ratio': coverage_ratio,
-        'min_coverage_ratio': min_coverage_ratio,
         'reason': reason,
     }
 
@@ -87,7 +81,6 @@ def build_pykrx_enrichment_preflight(
     market_date: str | date,
     coverage: dict[str, Any],
     categories: Sequence[str] = REQUIRED_EXEC_DECIDER_PYKRX_ENRICHMENT_CATEGORIES,
-    min_coverage_ratio: float = EXEC_DECIDER_PYKRX_ENRICHMENT_MIN_COVERAGE_RATIO,
 ) -> dict[str, Any]:
     market_date_iso = _normalize_iso_date(market_date)
     category_payloads = dict(coverage.get('categories') if isinstance(coverage.get('categories'), dict) else {})
@@ -100,7 +93,6 @@ def build_pykrx_enrichment_preflight(
                 else {}
             ),
             missing_category_payload=not isinstance(category_payloads.get(category), dict),
-            min_coverage_ratio=min_coverage_ratio,
         )
         for category in categories
     ]
@@ -140,7 +132,6 @@ def build_pykrx_enrichment_preflight(
         'status': status,
         'allowed': allowed,
         'required_categories': list(categories),
-        'min_coverage_ratio': min_coverage_ratio,
         'category_gates': gate_items,
         'blocked_categories': blocked_categories,
         'waiting_categories': waiting_categories,
@@ -160,7 +151,6 @@ def inspect_pykrx_enrichment_preflight(
     markets: Sequence[str] | None = None,
     symbols: Sequence[str] | None = None,
     categories: Sequence[str] = REQUIRED_EXEC_DECIDER_PYKRX_ENRICHMENT_CATEGORIES,
-    min_coverage_ratio: float = EXEC_DECIDER_PYKRX_ENRICHMENT_MIN_COVERAGE_RATIO,
 ) -> dict[str, Any]:
     market_date_iso = _normalize_iso_date(market_date)
     inspection = pykrx_enrichment_service.inspect(
@@ -174,7 +164,6 @@ def inspect_pykrx_enrichment_preflight(
         market_date=market_date_iso,
         coverage=dict(inspection.get('coverage') or {}),
         categories=categories,
-        min_coverage_ratio=min_coverage_ratio,
     )
     return {
         **preflight,

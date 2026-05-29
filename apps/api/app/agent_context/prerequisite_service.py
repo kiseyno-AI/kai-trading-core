@@ -21,7 +21,7 @@ FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER: tuple[str, ...] = (
 )
 PREREQUISITE_WAITING_STATUSES = {'pending', 'running'}
 PREREQUISITE_BLOCKED_STATUSES = {'failed', 'partial', 'blocked'}
-PARTIAL_PREREQUISITE_MIN_COVERAGE_RATIO = 0.95
+GENERIC_PARTIAL_PREREQUISITE_MIN_COVERAGE_RATIO = 0.99
 PYKRX_ENRICHMENT_PREREQUISITE_STAGE_ID = 'pykrx_enrichment'
 PYKRX_DECIDER_ENRICHMENT_REQUIRED_CATEGORIES: tuple[str, ...] = (
     'sector_classification',
@@ -31,7 +31,6 @@ PYKRX_DECIDER_ENRICHMENT_REQUIRED_CATEGORIES: tuple[str, ...] = (
     'short_selling',
     'valuation_snapshot',
 )
-PYKRX_DECIDER_ENRICHMENT_MIN_COVERAGE_RATIO = PARTIAL_PREREQUISITE_MIN_COVERAGE_RATIO
 
 
 def _normalize_market_date(value: str | date) -> date:
@@ -106,9 +105,8 @@ class AgentFeedbackPrerequisiteService:
         if total <= 0 or succeeded <= 0:
             return False
         coverage_ratio = min(succeeded, total) / total
-        if coverage_ratio < PARTIAL_PREREQUISITE_MIN_COVERAGE_RATIO:
+        if coverage_ratio < GENERIC_PARTIAL_PREREQUISITE_MIN_COVERAGE_RATIO:
             return False
-
         retry_cycles_requested = AgentFeedbackPrerequisiteService._coerce_positive_int(
             details.get('retry_cycles_requested'),
         )
@@ -175,9 +173,6 @@ class AgentFeedbackPrerequisiteService:
         elif present_rows <= 0 or coverage_status == 'missing':
             gate_status = 'blocked'
             reason = 'missing_required_pykrx_enrichment_category'
-        elif (coverage_ratio or 0.0) < PYKRX_DECIDER_ENRICHMENT_MIN_COVERAGE_RATIO:
-            gate_status = 'blocked'
-            reason = 'required_pykrx_enrichment_category_below_min_coverage'
         elif coverage_status != 'complete':
             gate_status = 'ready'
             reason = 'required_pykrx_enrichment_category_near_complete'
@@ -194,7 +189,6 @@ class AgentFeedbackPrerequisiteService:
             'present_rows': present_rows,
             'missing_rows': missing_rows,
             'coverage_ratio': coverage_ratio,
-            'min_coverage_ratio': PYKRX_DECIDER_ENRICHMENT_MIN_COVERAGE_RATIO,
             'reason': reason,
         }
 
@@ -242,7 +236,6 @@ class AgentFeedbackPrerequisiteService:
 
         return {
             'decider_required_categories': list(PYKRX_DECIDER_ENRICHMENT_REQUIRED_CATEGORIES),
-            'decider_min_coverage_ratio': PYKRX_DECIDER_ENRICHMENT_MIN_COVERAGE_RATIO,
             'decider_category_gates': gate_items,
             'decider_blocking_categories': blocked_categories,
             'decider_waiting_categories': waiting_categories,
