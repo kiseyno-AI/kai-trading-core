@@ -2666,6 +2666,40 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.gather(*tasks, return_exceptions=True)
             self.service.list_signal_decider_exec_overview = original_overview
 
+    async def test_dashboard_background_refresh_stores_monitored_cache_with_live_holding_filter(self) -> None:
+        key = self.service._dashboard_refresh_key(
+            target_trade_date=self.target_trade_date,
+            account_reference=None,
+            symbol=None,
+        )
+
+        with (
+            patch.object(
+                self.service,
+                'list_signal_decider_exec_overview',
+                new=AsyncMock(return_value={'items': [], 'summary': {}}),
+            ) as overview,
+            patch.object(
+                self.service,
+                '_load_live_portfolio_holding_symbols',
+                new=AsyncMock(return_value={self.symbol}),
+            ) as load_live_holdings,
+            patch.object(self.service, '_store_dashboard_caches_from_overview') as store_caches,
+        ):
+            await self.service._refresh_dashboard_read_model(
+                key=key,
+                target_trade_date=self.target_trade_date,
+                account_reference=None,
+                symbol=None,
+                trigger='test',
+                timeout_seconds=1.0,
+            )
+
+        overview.assert_awaited_once()
+        load_live_holdings.assert_awaited_once_with(trigger='test:dashboard_background_refresh')
+        store_caches.assert_called_once()
+        self.assertEqual(store_caches.call_args.kwargs['live_holding_symbols'], {self.symbol})
+
     async def test_scheduled_exec_readback_refresh_reuses_dashboard_background_state(self) -> None:
         await self.service.dispatch_next_open_plan(
             target_trade_date=self.target_trade_date,

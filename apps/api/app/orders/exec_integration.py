@@ -1957,11 +1957,17 @@ class SignalDeciderExecIntegrationService:
             requested=True,
             status=DASHBOARD_REFRESH_STATUS_SUCCEEDED,
         )
+        live_holding_symbols = None
+        if symbol is None:
+            live_holding_symbols = await self._load_live_portfolio_holding_symbols(
+                trigger=f'{trigger}:dashboard_background_refresh',
+            )
         self._store_dashboard_caches_from_overview(
             market_date=target_trade_date,
             symbol=symbol,
             overview=overview,
             refresh_state=refresh_state,
+            live_holding_symbols=live_holding_symbols,
         )
 
     def _finalize_dashboard_refresh_task(
@@ -1993,6 +1999,7 @@ class SignalDeciderExecIntegrationService:
         symbol: str | None,
         overview: dict[str, Any],
         refresh_state: dict[str, Any],
+        live_holding_symbols: set[str] | None = None,
     ) -> None:
         if symbol:
             detail = self._build_runtime_symbol_detail_payload(
@@ -2029,7 +2036,7 @@ class SignalDeciderExecIntegrationService:
             refresh=True,
             refresh_state=refresh_state,
             served_from_cache=False,
-            live_holding_symbols=None,
+            live_holding_symbols=live_holding_symbols,
         )
         self._store_dashboard_cached_payload(
             endpoint=DASHBOARD_ENDPOINT_MONITORED_SYMBOLS,
