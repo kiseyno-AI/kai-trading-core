@@ -590,11 +590,29 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(by_agent['short-term-decider']['decision_snapshot_id'], short_term_snapshot_id)
         self.assertEqual(by_agent['short-term-decider']['client_order_id'], 'STDE-20260430-005930')
         self.assertEqual(by_agent['short-term-decider']['eligibility_status'], ELIGIBILITY_ELIGIBLE)
+        self.assertEqual(by_agent['short-term-decider']['raw_action'], 'watch_for_trigger')
+        self.assertEqual(by_agent['short-term-decider']['tactical_action'], 'watch_for_trigger')
+        self.assertEqual(by_agent['short-term-decider']['generic_action'], 'buy')
+        self.assertEqual(by_agent['short-term-decider']['handoff_intent'], 'intraday_watch_buy')
+        self.assertTrue(by_agent['short-term-decider']['handoff_active'])
+        self.assertTrue(by_agent['short-term-decider']['exec_monitoring_active'])
+        self.assertEqual(by_agent['short-term-decider']['approval_state'], 'pending_exec_agent')
+        self.assertEqual(by_agent['short-term-decider']['trigger_price'], 50500)
+        self.assertEqual(by_agent['short-term-decider']['chase_limit_price'], 51500)
+        self.assertEqual(by_agent['short-term-decider']['target_price'], 54000)
+        self.assertEqual(by_agent['short-term-decider']['stop_loss_price'], 49000)
 
     def test_refresh_plan_items_dispatches_low_confidence_short_term_watchers_for_monitoring(self) -> None:
         settings.signal_decider_exec_integration_mode = 'dispatch'
         self._seed_short_term_snapshot(symbol='005930', confidence_score_10=6.0)
-        self._seed_short_term_snapshot(symbol='000660', confidence_score_10=5.9)
+        self._seed_short_term_snapshot(
+            symbol='000660',
+            confidence_score_10=5.9,
+            trigger_price=252000,
+            chase_limit_price=255000,
+            target_price=270000,
+            stop_loss_price=245000,
+        )
         service = self._service(state='PREOPEN', server_time='2026-04-30T08:40:00+09:00')
 
         def fake_bars(symbol: str, **_kwargs):
@@ -621,8 +639,10 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             Decimal('5.9'),
         )
         self.assertEqual(items_by_symbol['000660']['validation']['short_term']['tactical_action'], 'watch_for_trigger')
-        self.assertEqual(items_by_symbol['000660']['validation']['short_term']['trigger_price'], 50500)
-        self.assertEqual(items_by_symbol['000660']['validation']['short_term']['chase_limit_price'], 51500)
+        self.assertEqual(items_by_symbol['000660']['validation']['short_term']['handoff_intent'], 'intraday_watch_buy')
+        self.assertEqual(items_by_symbol['000660']['validation']['handoff']['approval_state'], 'pending_exec_agent')
+        self.assertEqual(items_by_symbol['000660']['validation']['short_term']['trigger_price'], 252000)
+        self.assertEqual(items_by_symbol['000660']['validation']['short_term']['chase_limit_price'], 255000)
         self.assertEqual(
             Decimal(str(items_by_symbol['000660']['traceability']['confidence_score_10'])),
             Decimal('5.9'),
@@ -772,7 +792,30 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(item['eligibility_status'], ELIGIBILITY_BLOCKED)
         self.assertEqual(item['validation']['blocking_reasons'][0]['code'], 'trigger_price_missing')
 
-    def test_refresh_plan_items_short_term_missing_target_and_stop_are_warnings(self) -> None:
+    def test_refresh_plan_items_blocks_short_term_rows_above_chase_limit(self) -> None:
+        self._seed_short_term_snapshot(
+            symbol='000660',
+            tactical_action='watch_for_trigger',
+            trigger_price=250000,
+            chase_limit_price=255000,
+            target_price=275000,
+            stop_loss_price=240000,
+        )
+        service = self._service(state='PREOPEN', server_time='2026-04-30T08:40:00+09:00')
+
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[{'trade_date': '2026-04-29', 'close_price': 260000}],
+        ):
+            result = service.refresh_plan_items(target_trade_date=self.target_trade_date, trigger='test')
+
+        item = next(item for item in result['items'] if item['symbol'] == '000660')
+        self.assertEqual(item['decision_agent_name'], 'short-term-decider')
+        self.assertEqual(item['eligibility_status'], ELIGIBILITY_BLOCKED)
+        self.assertFalse(item['handoff_active'])
+        self.assertEqual(item['blocker_reason']['code'], 'reference_price_above_chase_limit')
+
+    def test_refresh_plan_items_short_term_missing_target_and_stop_are_blocked(self) -> None:
         self._seed_short_term_snapshot(
             symbol='000660',
             tactical_action='watch_for_trigger',
@@ -789,10 +832,50 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
 
         item = next(item for item in result['items'] if item['symbol'] == '000660')
         self.assertEqual(item['decision_agent_name'], 'short-term-decider')
+        self.assertEqual(item['eligibility_status'], ELIGIBILITY_BLOCKED)
+        self.assertFalse(item['handoff_active'])
+        self.assertFalse(item['exec_monitoring_active'])
+        self.assertEqual(item['approval_state'], 'blocked')
+        blocking_codes = {reason['code'] for reason in item['validation']['blocking_reasons']}
+        self.assertIn('target_price_missing', blocking_codes)
+        self.assertIn('stop_loss_price_missing', blocking_codes)
+        self.assertEqual(item['blocker_reason']['code'], 'target_price_missing')
+
+    def test_refresh_plan_items_maps_scalp_candidate_to_tactical_buy_handoff(self) -> None:
+        self._seed_short_term_snapshot(symbol='005930', tactical_action='scalp_buy_candidate')
+        service = self._service(state='PREOPEN', server_time='2026-04-30T08:40:00+09:00')
+
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[{'trade_date': '2026-04-29', 'close_price': 50000}],
+        ):
+            result = service.refresh_plan_items(target_trade_date=self.target_trade_date, trigger='test')
+
+        item = result['items'][0]
+        self.assertEqual(item['decision_agent_name'], 'short-term-decider')
         self.assertEqual(item['eligibility_status'], ELIGIBILITY_ELIGIBLE)
-        warning_codes = {warning['code'] for warning in item['validation']['warnings']}
-        self.assertIn('target_price_missing', warning_codes)
-        self.assertIn('stop_loss_price_missing', warning_codes)
+        self.assertEqual(item['raw_action'], 'scalp_buy_candidate')
+        self.assertEqual(item['tactical_action'], 'scalp_buy_candidate')
+        self.assertEqual(item['generic_action'], 'buy')
+        self.assertEqual(item['handoff_intent'], 'tactical_buy')
+        self.assertEqual(item['entry_execution_mode'], 'guarded_tactical_buy')
+        self.assertTrue(item['handoff_active'])
+        self.assertTrue(item['exec_monitoring_active'])
+
+    def test_refresh_plan_items_reuses_short_term_candidate_for_duplicate_refreshes(self) -> None:
+        self._seed_short_term_snapshot(symbol='005930', tactical_action='watch_for_trigger')
+        service = self._service(state='PREOPEN', server_time='2026-04-30T08:40:00+09:00')
+
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[{'trade_date': '2026-04-29', 'close_price': 50000}],
+        ):
+            first = service.refresh_plan_items(target_trade_date=self.target_trade_date, trigger='test')
+            second = service.refresh_plan_items(target_trade_date=self.target_trade_date, trigger='test_retry')
+
+        self.assertEqual(first['summary']['items_total'], 1)
+        self.assertEqual(second['summary']['items_total'], 1)
+        self.assertEqual(first['items'][0]['plan_item_id'], second['items'][0]['plan_item_id'])
 
     async def test_run_market_open_execution_submits_and_prevents_duplicate_replays(self) -> None:
         self._seed_snapshot(symbol='005930')
