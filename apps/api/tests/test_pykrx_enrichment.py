@@ -377,6 +377,69 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
         self.assertEqual(coverage['coverage_ratio'], 1.0)
         self.assertEqual(coverage['coverage_status'], 'complete')
 
+    def test_inspect_uses_latest_eod_run_universe_for_unspecified_symbol_coverage(self):
+        persisted_rows = [
+            {
+                'market_date': '2026-04-21',
+                'market': 'KOSPI',
+                'category': 'short_selling',
+                'scope_type': 'symbol',
+                'scope_key': '005930',
+                'source': 'pykrx',
+                'symbol': '005930',
+                'payload': {},
+                'captured_at': '2026-04-21T15:10:00+09:00',
+            },
+            {
+                'market_date': '2026-04-21',
+                'market': 'KOSPI',
+                'category': 'short_selling',
+                'scope_type': 'symbol',
+                'scope_key': '000660',
+                'source': 'pykrx',
+                'symbol': '000660',
+                'payload': {},
+                'captured_at': '2026-04-21T15:10:00+09:00',
+            },
+        ]
+        symbol_rows = [
+            {'symbol': '005930', 'name_ko': '삼성전자', 'market': 'KOSPI'},
+            {'symbol': '000660', 'name_ko': 'SK하이닉스', 'market': 'KOSPI'},
+        ]
+
+        with (
+            patch('app.eod.pykrx_enrichment.load_latest_eod_collection_run', return_value={'id': 42}),
+            patch('app.eod.pykrx_enrichment.load_eod_run_persisted_symbols', return_value=['005930', '000660']),
+            patch('app.eod.pykrx_enrichment.load_symbols', return_value=symbol_rows) as load_symbols_mock,
+            patch(
+                'app.eod.pykrx_enrichment.load_daily_pykrx_enrichment_rows',
+                side_effect=lambda *, market_date, categories=None, markets=None, symbols=None, **kwargs: _filter_rows(
+                    persisted_rows,
+                    market_date=market_date,
+                    categories=categories,
+                    markets=markets,
+                    symbols=symbols,
+                ),
+            ),
+        ):
+            result = PykrxEnrichmentService().inspect(
+                market_date='2026-04-21',
+                markets=['KOSPI', 'KOSDAQ', 'KONEX'],
+                categories=['short_selling'],
+                limit=10,
+            )
+
+        load_symbols_mock.assert_called_once_with(
+            markets=['KOSPI', 'KOSDAQ', 'KONEX'],
+            symbols=['005930', '000660'],
+            limit=2,
+        )
+        coverage = result['coverage']['categories']['short_selling']
+        self.assertEqual(result['coverage']['requested_symbol_count'], 2)
+        self.assertEqual(coverage['expected_rows'], 2)
+        self.assertEqual(coverage['present_rows'], 2)
+        self.assertEqual(coverage['coverage_ratio'], 1.0)
+
 
 if __name__ == '__main__':
     unittest.main()

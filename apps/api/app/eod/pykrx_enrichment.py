@@ -17,6 +17,7 @@ from app.market_data_store import (
     load_symbols,
     upsert_daily_pykrx_enrichment_rows,
 )
+from app.repositories.eod_run_repository import load_eod_run_persisted_symbols, load_latest_eod_collection_run
 
 logger = logging.getLogger(__name__)
 
@@ -1030,11 +1031,10 @@ class PykrxEnrichmentService:
     ) -> dict[str, Any]:
         normalized_markets = _normalize_markets(markets)
         normalized_symbols = _normalize_symbols(symbols)
-        active_symbol_rows = load_symbols(
-            is_active=True,
-            markets=normalized_markets or None,
-            symbols=normalized_symbols or None,
-            limit=max(len(normalized_symbols), 5000) if normalized_symbols else 5000,
+        active_symbol_rows = self._load_coverage_symbol_rows(
+            market_date=market_date,
+            markets=normalized_markets,
+            symbols=normalized_symbols,
         )
         expected_symbol_count = len(normalized_symbols) if normalized_symbols else len(active_symbol_rows)
         requested_markets = normalized_markets or sorted(
@@ -1124,6 +1124,40 @@ class PykrxEnrichmentService:
             'requested_market_count': expected_market_count,
             'categories': category_summaries,
         }
+
+    def _load_coverage_symbol_rows(
+        self,
+        *,
+        market_date: str,
+        markets: Sequence[str],
+        symbols: Sequence[str],
+    ) -> list[dict[str, Any]]:
+        if symbols:
+            return load_symbols(
+                is_active=True,
+                markets=list(markets) or None,
+                symbols=list(symbols),
+                limit=max(len(symbols), 1),
+            )
+        latest_run = load_latest_eod_collection_run(
+            market='KRX',
+            trade_date=market_date,
+            source='pykrx',
+            statuses=['completed'],
+        )
+        if latest_run is not None:
+            persisted_symbols = load_eod_run_persisted_symbols(int(latest_run['id']))
+            if persisted_symbols:
+                return load_symbols(
+                    markets=list(markets) or None,
+                    symbols=persisted_symbols,
+                    limit=max(len(persisted_symbols), 1),
+                )
+        return load_symbols(
+            is_active=True,
+            markets=list(markets) or None,
+            limit=5000,
+        )
 
 
 pykrx_enrichment_service = PykrxEnrichmentService()
