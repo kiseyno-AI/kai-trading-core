@@ -485,6 +485,59 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             ['investor_flow_symbol', 'short_selling'],
         )
 
+    def test_refresh_plan_items_keeps_short_term_watch_rows_when_pykrx_preflight_blocks_signal_buys(self) -> None:
+        self._seed_snapshot(symbol='900001')
+        for index in range(36):
+            self._seed_short_term_snapshot(symbol=f'{index + 1:06d}', tactical_action='watch_for_trigger')
+        service = self._service(state='PREOPEN', server_time='2026-04-30T08:40:00+09:00')
+        blocked_preflight = {
+            'market_date': self.market_date.isoformat(),
+            'status': 'blocked',
+            'allowed': False,
+            'required_categories': ['sector_classification', 'investor_flow_symbol', 'short_selling'],
+            'failed_categories': ['sector_classification', 'investor_flow_symbol', 'short_selling'],
+            'zero_coverage_categories': [],
+            'category_row_counts': {
+                'sector_classification': 2699,
+                'investor_flow_symbol': 2672,
+                'short_selling': 2806,
+            },
+        }
+
+        with patch('app.orders.next_open_execution.inspect_pykrx_enrichment_preflight', return_value=blocked_preflight):
+            with patch(
+                'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+                return_value=[{'trade_date': '2026-04-29', 'close_price': 50000}],
+            ):
+                result = service.refresh_plan_items(target_trade_date=self.target_trade_date, trigger='test_retry')
+
+        self.assertEqual(result['summary']['reason'], 'pykrx_enrichment_preflight_blocked')
+        self.assertFalse(result['summary']['enrichment_preflight_allowed'])
+        self.assertEqual(result['summary']['items_total'], 37)
+        self.assertEqual(result['summary']['short_term_candidates_total'], 36)
+        self.assertEqual(result['summary']['short_term_watch_active_count'], 36)
+        self.assertEqual(result['summary']['short_term_blocked_or_degraded_count'], 36)
+        self.assertEqual(result['summary']['signal_decider_global_preflight_blocked_count'], 1)
+        items_by_agent = {}
+        for item in result['items']:
+            items_by_agent.setdefault(item['decision_agent_name'], []).append(item)
+        self.assertEqual(len(items_by_agent['short-term-decider']), 36)
+        self.assertEqual(len(items_by_agent['signal-decider']), 1)
+
+        signal_item = items_by_agent['signal-decider'][0]
+        self.assertEqual(signal_item['eligibility_status'], ELIGIBILITY_BLOCKED)
+        signal_block_codes = {reason['code'] for reason in signal_item['validation']['blocking_reasons']}
+        self.assertIn('pykrx_enrichment_preflight_blocked', signal_block_codes)
+
+        short_item = items_by_agent['short-term-decider'][0]
+        self.assertEqual(short_item['eligibility_status'], ELIGIBILITY_ELIGIBLE)
+        short_warning_codes = {warning['code'] for warning in short_item['validation']['warnings']}
+        self.assertIn('pykrx_enrichment_preflight_blocked', short_warning_codes)
+        self.assertEqual(short_item['validation']['short_term']['tactical_action'], 'watch_for_trigger')
+        self.assertEqual(short_item['validation']['short_term']['trigger_price'], 50500)
+        self.assertEqual(short_item['validation']['short_term']['chase_limit_price'], 51500)
+        self.assertEqual(short_item['validation']['pykrx_enrichment_preflight']['status'], 'blocked')
+
     def test_refresh_plan_items_signal_dispatch_does_not_budget_size_quantity(self) -> None:
         settings.signal_decider_exec_integration_mode = 'dispatch'
         self._seed_snapshot(symbol='005930')

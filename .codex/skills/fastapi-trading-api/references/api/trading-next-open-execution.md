@@ -9,7 +9,7 @@ Short-term validation now preserves the decider request's `pre_decider_enrichmen
 
 Validation now also preserves `decision_input_quality_context` for both `signal-decider` and `short-term-decider` rows. This reusable quality-provenance envelope separates data quality, market/setup edge, execution feasibility, and final buy-quality judgment. Stale or fallback quote snapshots and missing raw source turnover appear as hard blocks or major discounts in the envelope; empty news remains neutral secondary context. The envelope is informational in core-local validation and is passed to exec for account-aware sizing/risk decisions in dispatch mode.
 
-Before planning, local submit, or exec dispatch proceeds, Core checks source-market-date PyKRX enrichment coverage for `sector_classification`, `investor_flow_symbol`, and `short_selling`. If any required category is missing or effectively zero coverage, the response uses `reason="pykrx_enrichment_preflight_blocked"`, existing non-terminal rows are marked blocked, and no local order or exec dispatch is attempted unless `force=true` is supplied.
+Before planning, local submit, or exec dispatch proceeds, Core checks source-market-date PyKRX enrichment coverage for `sector_classification`, `investor_flow_symbol`, and `short_selling`. If any required category is missing or effectively zero coverage, classic `signal-decider` immediate next-open buys are blocked with `reason="pykrx_enrichment_preflight_blocked"` and no local signal-decider order is submitted unless `force=true` is supplied. Actionable `short-term-decider` watch rows are still materialized when candidate-level trigger/chase fields exist; the preflight failure is attached as degraded warning metadata so operators can distinguish “watch candidates exist but are degraded” from “no candidates exist.”
 
 In exec-dispatch mode, watcher candidates are not blocked solely because `data_quality_warnings` are present. Core carries those warnings into the validation and exec handoff so the exec-side account-aware agent can make the final sizing/risk decision. Short-term tactical rows are still blocked when required trigger/chase/target/stop levels are missing, when the latest available reference price is already above the chase limit, or when the decision-input quality envelope emits hard blocks.
 
@@ -53,7 +53,11 @@ Content-Type: application/json
     "decision_agent_counts": {
       "short-term-decider": 1,
       "signal-decider": 1
-    }
+    },
+    "short_term_candidates_total": 1,
+    "short_term_watch_active_count": 1,
+    "short_term_blocked_or_degraded_count": 0,
+    "signal_decider_global_preflight_blocked_count": 0
   },
   "enrichment_preflight": {
     "market_date": "2026-04-29",
@@ -207,4 +211,4 @@ Content-Type: application/json
 
 Signal-decider rows keep the existing market-open submit behavior only in core-local mode. `short-term-decider` rows are only mapped when the tactical action is actionable (`scalp_buy_candidate` or `watch_for_trigger`) and all required guarded-entry levels pass. `scalp_buy_candidate` exposes `handoff_intent="tactical_buy"` with `entry_execution_mode="guarded_tactical_buy"`, while `watch_for_trigger` exposes `handoff_intent="intraday_watch_buy"` with `entry_execution_mode="pending_trigger_limit"`. In core-local mode they remain planned-only because trigger/chase semantics are not translated into live market orders locally. In exec dispatch mode, both signal and short-term entry legs are sent at/after 08:00 KST as exec-agent-sized candidates; accepted rows without an agent-approved positive quantity move to `execution_status="delegated_for_exec_agent_sizing"`, and the delegated linkage or audit state is stored under `submission.exec_dispatch` for each item, including decider-aware `plan_id`, remote item ids, last dispatch attempt, and the latest matched readback snapshot.
 
-When the enrichment preflight blocks, the response keeps the same top-level shape with empty dispatch/submission counts, `summary.reason="pykrx_enrichment_preflight_blocked"`, `enrichment_preflight.allowed=false`, and per-row validation details under `validation.pykrx_enrichment_preflight` for rows that were already materialized.
+When the enrichment preflight blocks, the response keeps the same top-level shape with empty dispatch/submission counts, `summary.reason="pykrx_enrichment_preflight_blocked"`, `enrichment_preflight.allowed=false`, and per-row validation details under `validation.pykrx_enrichment_preflight`. Signal-decider rows receive a blocking reason; short-term watch rows remain visible as conditional candidates and receive a warning/degraded reason.
