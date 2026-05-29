@@ -1565,7 +1565,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(monitored['items'][0]['current_price'], 50200)
         self.assertTrue(monitored['items'][0]['exec_monitoring_active'])
         self.assertTrue(monitored['items'][0]['exec_runtime_showable'])
-        self.assertFalse(monitored['items'][0]['exec_agent_approved'])
+        self.assertTrue(monitored['items'][0]['exec_agent_approved'])
         self.assertTrue(monitored['items'][0]['held_position'])
         self.assertEqual(monitored['items'][0]['position_quantity'], 5)
         self.assertEqual(monitored['items'][0]['position_average_price'], 50100)
@@ -1640,6 +1640,85 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(item['approved_notional'], '250000.0000')
         self.assertIn('watch_monitoring_active', item['monitoring_statuses'])
 
+    async def test_runtime_monitored_symbols_treats_accepted_entry_link_as_exec_approved_watch(self) -> None:
+        with patch('app.orders.exec_integration.kis_realtime_price_service') as price_service:
+            price_service.price_fields_for_symbol.return_value = {
+                'current_price': 50200,
+                'price_as_of': '2026-04-30T00:07:30+00:00',
+                'price_received_at': '2026-04-30T00:07:31+00:00',
+                'price_source': 'kis_realtime_ws',
+                'price_status': 'available',
+                'realtime_subscribed': True,
+                'realtime_subscription_reason': 'subscribed',
+                'display_price_available': True,
+            }
+            price_service.observe_monitored_symbols.return_value = {
+                'allowed_symbols': ['WATCHACCEPTED', 'WATCHCREATED', 'WATCHPENDING', 'WATCHQUEUED']
+            }
+
+            for entry_status in ('accepted', 'created', 'pending', 'queued'):
+                with self.subTest(entry_status=entry_status):
+                    symbol = f'WATCH{entry_status.upper()}'
+                    accepted_watch = self.service._build_runtime_board_item(
+                        item={
+                            'plan_item_id': 9101,
+                            'account_reference': self.account_reference,
+                            'account_label': 'Main',
+                            'symbol': symbol,
+                            'decision_agent_name': 'short-term-decider',
+                            'estimated_reference_price': 2000,
+                            'planned_quantity': '10',
+                            'eligibility_status': 'eligible',
+                            'execution_status': 'delegated_for_exec_agent_sizing',
+                            'dispatch': {
+                                'status': 'accepted',
+                                'plan_id': f'exec-{entry_status}-watch',
+                                'item_links': [
+                                    {
+                                        'intent': EXEC_INTENT_INTRADAY_WATCH_BUY,
+                                        'side': 'buy',
+                                        'symbol': symbol,
+                                        'remote_status': entry_status,
+                                        'response_item': {
+                                            'status': entry_status,
+                                            'execution_plan_item_id': f'exec-item-watch-{entry_status}',
+                                        },
+                                    }
+                                ],
+                            },
+                            'trigger_price': '2050',
+                            'chase_limit_price': '2070',
+                            'target_price': '2200',
+                            'stop_loss_price': '1900',
+                        },
+                        market_date=self.target_trade_date,
+                        symbol_metadata_map={symbol: {'name': 'Accepted Watch', 'market': 'KOSPI'}},
+                        runtime_status='ready',
+                    )
+
+                    payload = self.service._build_runtime_monitored_symbols_payload(
+                        board={
+                            'market_date': self.target_trade_date.isoformat(),
+                            'runtime': {'status': 'ready', 'mode': 'mock'},
+                            'items': [accepted_watch],
+                        },
+                        refresh=False,
+                        refresh_state={'requested': False, 'status': 'not_requested'},
+                        served_from_cache=False,
+                    )
+
+                    item = payload['items'][0]
+                    self.assertEqual(item['symbol'], symbol)
+                    self.assertTrue(item['exec_runtime_showable'])
+                    self.assertTrue(item['exec_monitoring_active'])
+                    self.assertTrue(item['exec_agent_approved'])
+                    self.assertEqual(item['exec_agent_action'], 'approve')
+                    self.assertEqual(item['exec_runtime_state'], 'exec_approved_watch')
+                    self.assertIsNone(item['exec_runtime_exclusion_reason'])
+                    self.assertIn(entry_status, item['monitoring_statuses'])
+                    self.assertIn('watch_monitoring_active', item['monitoring_statuses'])
+                    self.assertNotEqual(item['exec_runtime_state'], 'core_planned_only')
+
     async def test_runtime_monitored_symbols_flags_core_only_and_rejected_candidates(self) -> None:
         core_only = self.service._build_runtime_board_item(
             item={
@@ -1698,6 +1777,44 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             symbol_metadata_map={'REJ': {'name': 'Rejected', 'market': 'KOSPI'}},
             runtime_status='ready',
         )
+        accepted_with_false_agent_decision = self.service._build_runtime_board_item(
+            item={
+                'plan_item_id': 9003,
+                'account_reference': self.account_reference,
+                'account_label': 'Main',
+                'symbol': 'RNO',
+                'decision_agent_name': 'short-term-decider',
+                'estimated_reference_price': 3000,
+                'planned_quantity': '10',
+                'eligibility_status': 'eligible',
+                'execution_status': 'delegated_for_exec_agent_sizing',
+                'dispatch': {
+                    'status': 'accepted',
+                    'plan_id': 'exec-rejected-by-agent',
+                    'item_links': [
+                        {
+                            'intent': EXEC_INTENT_INTRADAY_WATCH_BUY,
+                            'side': 'buy',
+                            'symbol': 'RNO',
+                            'remote_status': 'accepted',
+                            'response_item': {
+                                'status': 'accepted',
+                                'agent_sizing': {
+                                    'approved': False,
+                                    'action': 'reject',
+                                    'reason_code': 'liquidity_block',
+                                },
+                            },
+                        }
+                    ],
+                },
+                'target_price': '3300',
+                'stop_loss_price': '2800',
+            },
+            market_date=self.target_trade_date,
+            symbol_metadata_map={'RNO': {'name': 'Rejected Accepted', 'market': 'KOSPI'}},
+            runtime_status='ready',
+        )
 
         with patch('app.orders.exec_integration.kis_realtime_price_service') as price_service:
             price_service.price_fields_for_symbol.return_value = {
@@ -1716,7 +1833,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 board={
                     'market_date': self.target_trade_date.isoformat(),
                     'runtime': {'status': 'ready', 'mode': 'mock'},
-                    'items': [core_only, rejected],
+                    'items': [core_only, rejected, accepted_with_false_agent_decision],
                 },
                 refresh=False,
                 refresh_state={'requested': False, 'status': 'not_requested'},
@@ -1736,6 +1853,12 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(by_symbol['REJ']['exec_runtime_state'], 'exec_agent_rejected')
         self.assertEqual(by_symbol['REJ']['exec_runtime_exclusion_reason'], 'exec_agent_rejected')
         self.assertIn('rejected', by_symbol['REJ']['monitoring_statuses'])
+        self.assertFalse(by_symbol['RNO']['exec_runtime_showable'])
+        self.assertFalse(by_symbol['RNO']['exec_agent_approved'])
+        self.assertEqual(by_symbol['RNO']['exec_agent_action'], 'reject')
+        self.assertEqual(by_symbol['RNO']['exec_agent_reason_code'], 'liquidity_block')
+        self.assertEqual(by_symbol['RNO']['exec_runtime_state'], 'exec_agent_rejected')
+        self.assertEqual(by_symbol['RNO']['exec_runtime_exclusion_reason'], 'exec_agent_rejected')
 
     async def test_runtime_monitored_symbols_include_historical_held_position(self) -> None:
         with session_scope() as session:

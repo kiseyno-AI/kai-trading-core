@@ -174,6 +174,22 @@ EXEC_MONITORING_TERMINAL_STATUSES = {
     'stop_sell_cancelled',
     'target_sell_cancelled',
 }
+EXEC_AGENT_ACCEPTED_ENTRY_STATUSES = {
+    'accepted',
+    'active',
+    'created',
+    'monitoring',
+    'open',
+    'partial',
+    'partial_fill',
+    'partially_filled',
+    'pending',
+    'queued',
+    'scheduled',
+    'submitted',
+    'watch_monitoring_active',
+    'working',
+}
 
 DASHBOARD_ENDPOINT_DAILY_BOARD = 'daily_board'
 DASHBOARD_ENDPOINT_MONITORED_SYMBOLS = 'monitored_symbols'
@@ -3865,6 +3881,53 @@ class SignalDeciderExecIntegrationService:
                     return parsed
         return None
 
+    @staticmethod
+    def _entry_link_statuses(link: dict[str, Any]) -> set[str]:
+        statuses: set[str] = set()
+
+        def add(value: Any) -> None:
+            normalized = _normalize_status(value)
+            if normalized:
+                statuses.add(normalized)
+
+        for key in ('remote_status', 'status', 'plan_item_status', 'decision_status', 'monitoring_status'):
+            add(link.get(key))
+        response_item = link.get('response_item') if isinstance(link.get('response_item'), dict) else {}
+        for key in (
+            'status',
+            'plan_item_status',
+            'decision_status',
+            'monitoring_status',
+            'monitoring_state',
+            'watch_status',
+        ):
+            add(response_item.get(key))
+        for key in ('monitoring_statuses', 'monitoringStatuses', 'statuses'):
+            values = response_item.get(key)
+            if isinstance(values, list):
+                for value in values:
+                    add(value)
+        monitoring = response_item.get('monitoring')
+        if isinstance(monitoring, dict):
+            for key in ('status', 'state', 'monitoring_status', 'monitoring_state', 'watch_status'):
+                add(monitoring.get(key))
+        return statuses
+
+    @classmethod
+    def _has_exec_agent_accepted_entry(cls, item: dict[str, Any]) -> bool:
+        dispatch = item.get('dispatch') if isinstance(item.get('dispatch'), dict) else {}
+        for link in dispatch.get('item_links') or []:
+            if not isinstance(link, dict):
+                continue
+            if _normalize_optional_text(link.get('intent'), lowercase=True) not in EXEC_ENTRY_BUY_INTENTS:
+                continue
+            statuses = cls._entry_link_statuses(link)
+            if statuses & EXEC_MONITORING_TERMINAL_STATUSES:
+                continue
+            if statuses & EXEC_AGENT_ACCEPTED_ENTRY_STATUSES:
+                return True
+        return False
+
     @classmethod
     def _extract_exec_agent_decision(cls, item: dict[str, Any]) -> dict[str, Any]:
         payloads = list(cls._iter_exec_agent_payloads(item))
@@ -3894,6 +3957,8 @@ class SignalDeciderExecIntegrationService:
         approved = any(value is True for value in approval_values)
         rejected = any(value is False for value in approval_values)
         if not approved and approved_quantity is not None and not rejected:
+            approved = True
+        if not approved and not rejected and cls._has_exec_agent_accepted_entry(item):
             approved = True
 
         action = cls._first_agent_text(
