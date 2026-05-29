@@ -9,7 +9,7 @@ Each exec item also carries `risk_context.decider_handoff_context`, which preser
 
 Exec handoffs now include `risk_context.decision_input_quality_context`, `risk_context.execution_feasibility_context`, and the same envelope under `risk_context.decider_handoff_context.decider_input_context.decision_input_quality_context`. The `quantity_policy` for exec-agent-sized buys also carries sizing hints such as `liquidity_tier`, `max_safe_notional_krw`, and `sizing_hints`. Exec should treat stale/fallback quote and missing raw turnover as hard blocks or major discounts, while empty news/disclosures stay neutral secondary context unless separate adverse-event evidence exists.
 
-Core blocks next-open exec dispatch before translation when source-market-date PyKRX enrichment coverage is missing for `sector_classification`, `investor_flow_symbol`, or `short_selling`. Blocked dispatch responses expose `summary.reason="pykrx_enrichment_preflight_blocked"` and the full `enrichment_preflight` payload on `POST /trading/orders/next-open-execution/run-if-due`; this read route then shows the blocked durable rows.
+Core blocks classic signal-decider next-open exec dispatch when source-market-date PyKRX enrichment coverage is missing for `sector_classification`, `investor_flow_symbol`, or `short_selling`. Blocked dispatch responses expose `summary.reason="pykrx_enrichment_preflight_blocked"` and the full `enrichment_preflight` payload on `POST /trading/orders/next-open-execution/run-if-due`; actionable short-term watch candidates remain visible as conditional/degraded rows rather than being erased by the global preflight.
 
 ## Example request
 ```http
