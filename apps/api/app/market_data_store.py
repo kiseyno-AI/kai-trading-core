@@ -2662,6 +2662,93 @@ def load_latest_available_daily_piotroski_filter_result_date(
         return value.isoformat() if value else None
 
 
+def load_agent_feedback_candidate_score_rows(
+    *,
+    market_date: str | date,
+    symbols: list[str] | None = None,
+) -> list[dict]:
+    normalized_market_date = _normalize_trade_date(market_date)
+    with session_scope() as session:
+        stmt = (
+            select(
+                Symbol.symbol,
+                DailyActionSummary.signal_score,
+                DailyActionSummary.action_label,
+                DailyActionSummary.confidence_tier,
+                DailySignalFeature.signal_count,
+                DailySignalFeature.volume_power_rank,
+                DailySignalFeature.overtime_volume_rank,
+                DailySignalFeature.overtime_fluctuation_rank,
+                DailyMomentumFactorResult.momentum_percentile,
+                DailyMomentumFactorResult.passes_momentum_top_percentile,
+                DailyCompositeFactorResult.composite_percentile,
+                DailyCompositeFactorResult.is_composite_eligible,
+            )
+            .select_from(Symbol)
+            .outerjoin(
+                DailyActionSummary,
+                and_(
+                    DailyActionSummary.symbol_id == Symbol.id,
+                    DailyActionSummary.market_date == normalized_market_date,
+                ),
+            )
+            .outerjoin(
+                DailySignalFeature,
+                and_(
+                    DailySignalFeature.symbol_id == Symbol.id,
+                    DailySignalFeature.market_date == normalized_market_date,
+                ),
+            )
+            .outerjoin(
+                DailyMomentumFactorResult,
+                and_(
+                    DailyMomentumFactorResult.symbol_id == Symbol.id,
+                    DailyMomentumFactorResult.market_date == normalized_market_date,
+                ),
+            )
+            .outerjoin(
+                DailyCompositeFactorResult,
+                and_(
+                    DailyCompositeFactorResult.symbol_id == Symbol.id,
+                    DailyCompositeFactorResult.market_date == normalized_market_date,
+                ),
+            )
+        )
+        if symbols:
+            stmt = stmt.where(Symbol.symbol.in_(symbols))
+        rows = session.execute(stmt).all()
+        return [
+            {
+                'symbol': symbol,
+                'signal_score': signal_score,
+                'action_label': action_label,
+                'confidence_tier': confidence_tier,
+                'signal_count': signal_count,
+                'volume_power_rank': volume_power_rank,
+                'overtime_volume_rank': overtime_volume_rank,
+                'overtime_fluctuation_rank': overtime_fluctuation_rank,
+                'momentum_percentile': _round_float(momentum_percentile, 6),
+                'passes_momentum_top_percentile': passes_momentum_top_percentile,
+                'composite_percentile': _round_float(composite_percentile, 6),
+                'is_composite_eligible': is_composite_eligible,
+            }
+            for (
+                symbol,
+                signal_score,
+                action_label,
+                confidence_tier,
+                signal_count,
+                volume_power_rank,
+                overtime_volume_rank,
+                overtime_fluctuation_rank,
+                momentum_percentile,
+                passes_momentum_top_percentile,
+                composite_percentile,
+                is_composite_eligible,
+            ) in rows
+        ]
+
+
 def upsert_daily_low_risk_factor_result(result: dict) -> None:
     refreshed_at = datetime.utcnow()
     with session_scope() as session:

@@ -121,6 +121,84 @@ class AgentFeedbackEligibilityTests(unittest.TestCase):
         self.assertEqual(eligible, [])
         self.assertEqual(skipped, ['005930'])
 
+    def test_default_universe_applies_top_percentile_candidate_cap(self) -> None:
+        symbols = [f'{index:06d}' for index in range(1, 11)]
+        with patch(
+            'app.agent_context.eligibility.load_daily_piotroski_filter_results',
+            return_value=[
+                {'symbol': symbol, 'passed_filter': False, 'is_low_pbr': False, 'filter_payload': {}}
+                for symbol in symbols
+            ],
+        ):
+            with patch(
+                'app.agent_context.eligibility.load_daily_market_risk_filter_results',
+                return_value=[
+                    {'symbol': symbol, 'passed_filter': True, 'filter_payload': {}}
+                    for symbol in symbols
+                ],
+            ):
+                with patch(
+                    'app.agent_context.eligibility.load_agent_feedback_candidate_score_rows',
+                    return_value=[
+                        {'symbol': symbol, 'signal_score': index}
+                        for index, symbol in enumerate(symbols, start=1)
+                    ],
+                ):
+                    with patch(
+                        'app.agent_context.eligibility.settings.openclaw_feedback_candidate_cap_percentile',
+                        0.2,
+                    ):
+                        with patch('app.agent_context.eligibility.settings.openclaw_feedback_candidate_cap_min_symbols', 0):
+                            with patch('app.agent_context.eligibility.settings.openclaw_feedback_candidate_cap_max_symbols', 0):
+                                result = load_agent_feedback_eligible_symbols(
+                                    market_date=date.fromisoformat('2026-04-16'),
+                                )
+                                records = load_agent_feedback_eligibility_records(
+                                    market_date=date.fromisoformat('2026-04-16'),
+                                )
+
+        self.assertEqual(result, ['000010', '000009'])
+        capped = [record['symbol'] for record in records if record.get('cap_excluded')]
+        self.assertEqual(len(capped), 8)
+        top_record = next(record for record in records if record['symbol'] == '000010')
+        self.assertEqual(top_record['candidate_rank'], 1)
+        self.assertEqual(top_record['candidate_cap']['pre_cap_eligible_count'], 10)
+        self.assertEqual(top_record['candidate_cap']['post_cap_dispatched_count'], 2)
+
+    def test_requested_symbol_scope_is_not_percentile_capped(self) -> None:
+        symbols = [f'{index:06d}' for index in range(1, 11)]
+        with patch(
+            'app.agent_context.eligibility.load_daily_piotroski_filter_results',
+            return_value=[
+                {'symbol': symbol, 'passed_filter': False, 'is_low_pbr': False, 'filter_payload': {}}
+                for symbol in symbols
+            ],
+        ):
+            with patch(
+                'app.agent_context.eligibility.load_daily_market_risk_filter_results',
+                return_value=[
+                    {'symbol': symbol, 'passed_filter': True, 'filter_payload': {}}
+                    for symbol in symbols
+                ],
+            ):
+                with patch(
+                    'app.agent_context.eligibility.settings.openclaw_feedback_candidate_cap_percentile',
+                    0.2,
+                ):
+                    with patch('app.agent_context.eligibility.settings.openclaw_feedback_candidate_cap_min_symbols', 0):
+                        with patch('app.agent_context.eligibility.settings.openclaw_feedback_candidate_cap_max_symbols', 0):
+                            result = load_agent_feedback_eligible_symbols(
+                                market_date=date.fromisoformat('2026-04-16'),
+                                requested_symbols=symbols,
+                            )
+                            records = load_agent_feedback_eligibility_records(
+                                market_date=date.fromisoformat('2026-04-16'),
+                                requested_symbols=symbols,
+                            )
+
+        self.assertEqual(result, symbols)
+        self.assertFalse(any(record.get('cap_excluded') for record in records))
+
     def test_requested_symbol_scope_preserves_order_and_explains_hard_vs_soft_results(self) -> None:
         with patch(
             'app.agent_context.eligibility.load_daily_piotroski_filter_results',

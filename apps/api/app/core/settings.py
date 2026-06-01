@@ -147,6 +147,9 @@ class Settings(BaseSettings):
     openclaw_feedback_trigger_after_fundamentals_refresh: bool = False
     openclaw_feedback_retry_max_cycles: int = 3
     openclaw_feedback_retry_outer_batch_size: int = 20
+    openclaw_feedback_candidate_cap_percentile: float = 0.10
+    openclaw_feedback_candidate_cap_min_symbols: int = 150
+    openclaw_feedback_candidate_cap_max_symbols: int = 300
     openclaw_agent_subtask_poll_seconds: float = 2.0
     openclaw_agent_slot_cooldown_seconds: float = 600.0
     openclaw_session_cleanup_batch_limit: int = 100
