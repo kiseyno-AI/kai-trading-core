@@ -1291,7 +1291,7 @@ class AgentContextRouteTests(unittest.TestCase):
         )
         self.assertEqual(
             fake_run_state_service.started[0]['request_payload']['scope'],
-            'requested_symbols_intersected_with_active_pre_filters',
+            'requested_symbols_scored_by_strategy_aware_prefilter',
         )
         self.assertEqual(
             fake_run_state_service.started[0]['request_payload']['eligibility_filters'],
@@ -1299,7 +1299,7 @@ class AgentContextRouteTests(unittest.TestCase):
         )
         self.assertEqual(
             payload['request']['scope'],
-            'requested_symbols_intersected_with_active_pre_filters',
+            'requested_symbols_scored_by_strategy_aware_prefilter',
         )
         self.assertEqual(fake_orchestrator.calls[0]['request_run_id'], request_run_id)
         self.assertEqual(fake_orchestrator.calls[0]['symbols'], ['005930', '000660'])

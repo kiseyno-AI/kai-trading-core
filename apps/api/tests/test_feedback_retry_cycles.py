@@ -188,7 +188,7 @@ class FeedbackRetryCycleTests(unittest.TestCase):
 
         self.assertEqual(result, [])
 
-    def test_load_incomplete_symbols_uses_active_filter_intersection(self):
+    def test_load_incomplete_symbols_uses_feedback_eligible_universe(self):
         service = AgentFeedbackRetryService()
         decisions = {
             '005930': {
@@ -408,7 +408,7 @@ class FeedbackRetryCycleTests(unittest.TestCase):
         self.assertEqual(run_state_service.started[0]['request_payload']['symbols'], ['005930'])
         self.assertEqual(
             run_state_service.started[0]['request_payload']['scope'],
-            'requested_symbols_intersected_with_active_pre_filters',
+            'requested_symbols_scored_by_strategy_aware_prefilter',
         )
         self.assertEqual(result['requested_symbols'], ['005930'])
         self.assertEqual(result['eligible_symbols'], ['005930'])
