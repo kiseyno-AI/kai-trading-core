@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from datetime import date
+from math import ceil
 from typing import Any, Sequence
 
+from app.core.settings import settings
 from app.market_data_store import (
+    load_agent_feedback_candidate_score_rows,
     load_daily_market_risk_filter_results,
     load_daily_piotroski_filter_results,
 )
@@ -13,6 +16,7 @@ AGENT_FEEDBACK_ELIGIBILITY_FILTERS: tuple[str, ...] = (
     'piotroski_filter',
 )
 AGENT_FEEDBACK_ELIGIBILITY_RULE = 'strategy_aware_prefilter_scoring_v1'
+AGENT_FEEDBACK_CANDIDATE_CAP_RULE = 'strategy_aware_prefilter_top_percentile_cap_v1'
 AGENT_FEEDBACK_VALUE_LONG_ONLY_ELIGIBILITY_RULE = 'market_risk_filter_passed_and_piotroski_passed_v1'
 AGENT_FEEDBACK_STRATEGY_SCOPE_SHORT_TERM_MOMENTUM = 'short_term_momentum_breakout'
 AGENT_FEEDBACK_STRATEGY_SCOPE_VALUE_LONG_ONLY = 'value_long_only'
@@ -50,6 +54,24 @@ def _rows_by_symbol(rows: Sequence[dict]) -> dict[str, dict]:
 
 def _as_dict(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, dict) else {}
+
+
+def _as_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_int(value: Any, default: int = 0) -> int:
+    try:
+        if value is None:
+            return default
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _reason(
@@ -291,6 +313,158 @@ def _record_order(
     return ordered
 
 
+def _score_rows_by_symbol(rows: Sequence[dict]) -> dict[str, dict]:
+    mapped: dict[str, dict] = {}
+    for row in rows:
+        symbol = _normalize_symbol(row.get('symbol'))
+        if symbol:
+            mapped[symbol] = dict(row)
+    return mapped
+
+
+def _rank_bonus(rank: Any, *, max_rank: int = 30, weight: float = 2.0) -> float:
+    normalized_rank = _as_int(rank, default=max_rank + 1)
+    if normalized_rank <= 0 or normalized_rank > max_rank:
+        return 0.0
+    return float(max_rank - normalized_rank + 1) * weight
+
+
+def _soft_penalty_score(soft_penalties: Sequence[dict[str, Any]]) -> float:
+    score = 0.0
+    for penalty in soft_penalties:
+        code = str(penalty.get('code') or '')
+        if code.startswith('market_risk_watchlist'):
+            score -= 10.0
+        elif code in {'has_audit_issue', 'has_capital_impairment'}:
+            score -= 20.0
+        elif code in {'piotroski_filter_failed', 'low_piotroski_score'}:
+            score -= 12.0
+        else:
+            score -= 6.0
+    return score
+
+
+def _candidate_score_payload(
+    *,
+    record: dict[str, Any],
+    score_row: dict | None,
+) -> dict[str, Any]:
+    row = score_row or {}
+    signal_score = _as_float(row.get('signal_score'))
+    direct_signal_score = (
+        _as_float(row.get('signal_count')) * 25.0
+        + _rank_bonus(row.get('volume_power_rank'), weight=2.0)
+        + _rank_bonus(row.get('overtime_volume_rank'), weight=1.5)
+        + _rank_bonus(row.get('overtime_fluctuation_rank'), weight=1.5)
+    )
+    momentum_score = _as_float(row.get('momentum_percentile')) * 80.0
+    composite_score = _as_float(row.get('composite_percentile')) * 60.0
+    quality_adjustment = _soft_penalty_score(list(record.get('soft_penalties') or []))
+    total_score = signal_score + direct_signal_score + momentum_score + composite_score + quality_adjustment
+    return {
+        'score': round(total_score, 6),
+        'components': {
+            'action_signal_score': signal_score,
+            'direct_signal_score': round(direct_signal_score, 6),
+            'momentum_score': round(momentum_score, 6),
+            'composite_score': round(composite_score, 6),
+            'soft_penalty_adjustment': round(quality_adjustment, 6),
+        },
+        'source_values': {
+            'action_label': row.get('action_label'),
+            'confidence_tier': row.get('confidence_tier'),
+            'signal_score': row.get('signal_score'),
+            'signal_count': row.get('signal_count'),
+            'volume_power_rank': row.get('volume_power_rank'),
+            'overtime_volume_rank': row.get('overtime_volume_rank'),
+            'overtime_fluctuation_rank': row.get('overtime_fluctuation_rank'),
+            'momentum_percentile': row.get('momentum_percentile'),
+            'passes_momentum_top_percentile': row.get('passes_momentum_top_percentile'),
+            'composite_percentile': row.get('composite_percentile'),
+            'is_composite_eligible': row.get('is_composite_eligible'),
+        },
+    }
+
+
+def _candidate_cap_limit(total: int) -> int:
+    percentile = max(0.0, min(1.0, float(settings.openclaw_feedback_candidate_cap_percentile)))
+    min_symbols = max(0, int(settings.openclaw_feedback_candidate_cap_min_symbols))
+    max_symbols = max(0, int(settings.openclaw_feedback_candidate_cap_max_symbols))
+    if total <= 0 or percentile <= 0:
+        return total
+    target = max(min_symbols, int(ceil(total * percentile)))
+    if max_symbols > 0:
+        target = min(target, max_symbols)
+    return min(total, max(1, target))
+
+
+def _cap_metadata(*, total: int, limit: int, cap_applied: bool) -> dict[str, Any]:
+    return {
+        'rule_version': AGENT_FEEDBACK_CANDIDATE_CAP_RULE,
+        'applied': cap_applied,
+        'pre_cap_eligible_count': total,
+        'post_cap_dispatched_count': limit if cap_applied else total,
+        'percentile': float(settings.openclaw_feedback_candidate_cap_percentile),
+        'min_symbols': int(settings.openclaw_feedback_candidate_cap_min_symbols),
+        'max_symbols': int(settings.openclaw_feedback_candidate_cap_max_symbols),
+    }
+
+
+def _apply_candidate_cap(
+    *,
+    records: list[dict[str, Any]],
+    requested_symbols: Sequence[str] | None,
+) -> list[dict[str, Any]]:
+    dispatchable = [record for record in records if not bool(record.get('hard_blocked'))]
+    if requested_symbols is not None or not dispatchable:
+        metadata = _cap_metadata(total=len(dispatchable), limit=len(dispatchable), cap_applied=False)
+        for record in records:
+            record.setdefault('candidate_cap', dict(metadata))
+            record.setdefault('cap_excluded', False)
+        for index, record in enumerate(dispatchable, start=1):
+            record['candidate_rank'] = index
+            record['candidate_cap'] = dict(metadata)
+        return records
+
+    limit = _candidate_cap_limit(len(dispatchable))
+    cap_applied = limit < len(dispatchable)
+    score_rows = load_agent_feedback_candidate_score_rows(
+        market_date=date.fromisoformat(str(records[0]['market_date'])),
+        symbols=[str(record['symbol']) for record in dispatchable],
+    )
+    score_by_symbol = _score_rows_by_symbol(score_rows)
+    for record in dispatchable:
+        score_payload = _candidate_score_payload(
+            record=record,
+            score_row=score_by_symbol.get(str(record.get('symbol'))),
+        )
+        record['candidate_score'] = score_payload['score']
+        record['candidate_score_payload'] = score_payload
+
+    ranked = sorted(
+        dispatchable,
+        key=lambda record: (
+            -_as_float(record.get('candidate_score')),
+            str(record.get('symbol') or ''),
+        ),
+    )
+    metadata = _cap_metadata(total=len(dispatchable), limit=limit, cap_applied=cap_applied)
+    selected_symbols = {str(record.get('symbol')) for record in ranked[:limit]}
+    for index, record in enumerate(ranked, start=1):
+        record['candidate_rank'] = index
+        record['candidate_cap'] = dict(metadata)
+        if cap_applied and str(record.get('symbol')) not in selected_symbols:
+            record['eligible'] = False
+            record['cap_excluded'] = True
+            record['status'] = 'candidate_cap_excluded'
+        else:
+            record['cap_excluded'] = False
+    for record in records:
+        record.setdefault('candidate_cap', dict(metadata))
+        record.setdefault('cap_excluded', False)
+    return records
+
+
 def _build_eligibility_record(
     *,
     symbol: str,
@@ -359,7 +533,7 @@ def load_agent_feedback_eligibility_records(
     )
     piotroski_by_symbol = _rows_by_symbol(piotroski_rows)
     market_risk_by_symbol = _rows_by_symbol(market_risk_rows)
-    return [
+    records = [
         _build_eligibility_record(
             symbol=symbol,
             market_date=market_date,
@@ -373,6 +547,7 @@ def load_agent_feedback_eligibility_records(
             piotroski_rows=piotroski_rows,
         )
     ]
+    return _apply_candidate_cap(records=records, requested_symbols=symbol_scope if requested_symbols is not None else None)
 
 
 def build_agent_feedback_eligibility_diagnostics(
@@ -382,7 +557,12 @@ def build_agent_feedback_eligibility_diagnostics(
 ) -> dict[str, Any]:
     normalized_requested = _normalize_symbol_scope(requested_symbols)
     hard_blocked = [record for record in records if bool(record.get('hard_blocked'))]
-    dispatched = [record for record in records if not bool(record.get('hard_blocked'))]
+    cap_excluded = [record for record in records if bool(record.get('cap_excluded'))]
+    dispatched = [
+        record
+        for record in records
+        if not bool(record.get('hard_blocked')) and not bool(record.get('cap_excluded'))
+    ]
     soft_penalized = [record for record in dispatched if record.get('soft_penalties')]
     rule_version = records[0].get('rule_version') if records else AGENT_FEEDBACK_ELIGIBILITY_RULE
     strategy_scope = records[0].get('strategy_scope') if records else AGENT_FEEDBACK_DEFAULT_STRATEGY_SCOPE
@@ -393,9 +573,16 @@ def build_agent_feedback_eligibility_diagnostics(
         'evaluated_symbol_count': len(records),
         'dispatched_symbol_count': len(dispatched),
         'hard_blocked_symbol_count': len(hard_blocked),
+        'candidate_cap_excluded_symbol_count': len(cap_excluded),
         'soft_penalized_dispatched_symbol_count': len(soft_penalized),
         'hard_blocked_symbols': [str(record.get('symbol')) for record in hard_blocked],
+        'candidate_cap_excluded_symbols': [str(record.get('symbol')) for record in cap_excluded[:100]],
         'soft_penalized_symbols': [str(record.get('symbol')) for record in soft_penalized],
+        'candidate_cap': (
+            records[0].get('candidate_cap')
+            if records and isinstance(records[0].get('candidate_cap'), dict)
+            else _cap_metadata(total=len(dispatched), limit=len(dispatched), cap_applied=False)
+        ),
         'hard_block_reasons_by_symbol': {
             str(record.get('symbol')): list(record.get('hard_block_reasons') or [])
             for record in hard_blocked
@@ -422,7 +609,16 @@ def load_agent_feedback_eligible_symbols(
         requested_symbols=requested_symbols,
         strategy_scope=strategy_scope,
     )
-    return [str(record['symbol']) for record in records if not bool(record.get('hard_blocked'))]
+    ordered_records = (
+        records
+        if requested_symbols is not None
+        else sorted(records, key=lambda record: (_as_int(record.get('candidate_rank'), default=10**9), str(record.get('symbol'))))
+    )
+    return [
+        str(record['symbol'])
+        for record in ordered_records
+        if not bool(record.get('hard_blocked')) and not bool(record.get('cap_excluded'))
+    ]
 
 
 def split_requested_symbols_by_agent_feedback_eligibility(
@@ -455,7 +651,11 @@ def split_requested_symbols_by_agent_feedback_eligibility_with_diagnostics(
     eligible_symbols = [
         symbol
         for symbol in normalized_requested
-        if symbol in records_by_symbol and not bool(records_by_symbol[symbol].get('hard_blocked'))
+        if (
+            symbol in records_by_symbol
+            and not bool(records_by_symbol[symbol].get('hard_blocked'))
+            and not bool(records_by_symbol[symbol].get('cap_excluded'))
+        )
     ]
     eligible_symbol_set = set(eligible_symbols)
     skipped_symbols = [symbol for symbol in normalized_requested if symbol not in eligible_symbol_set]

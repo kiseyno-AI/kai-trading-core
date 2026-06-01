@@ -13,7 +13,9 @@ from app.agent_context.prerequisite_service import agent_feedback_prerequisite_s
 from app.agent_context.eligibility import (
     AGENT_FEEDBACK_ELIGIBILITY_FILTERS,
     AGENT_FEEDBACK_ELIGIBILITY_RULE,
+    build_agent_feedback_eligibility_diagnostics,
     load_agent_feedback_eligible_symbols,
+    load_agent_feedback_eligibility_records,
     resolve_agent_feedback_scope,
 )
 from app.agent_context.orchestrator import agent_feedback_orchestrator
@@ -593,6 +595,14 @@ class AgentFeedbackRetryService:
             market_date=config.market_date,
             requested_symbols=requested_symbols,
         )
+        eligibility_records = load_agent_feedback_eligibility_records(
+            market_date=config.market_date,
+            requested_symbols=requested_symbols,
+        )
+        eligibility_diagnostics = build_agent_feedback_eligibility_diagnostics(
+            records=eligibility_records,
+            requested_symbols=requested_symbols,
+        )
         skipped_symbols = (
             [symbol for symbol in requested_symbols or () if symbol not in set(eligible_symbols)]
             if requested_symbols is not None
@@ -631,6 +641,7 @@ class AgentFeedbackRetryService:
             'scope': resolve_agent_feedback_scope(requested_symbols=requested_symbols),
             'eligibility_rule': AGENT_FEEDBACK_ELIGIBILITY_RULE,
             'eligibility_filters': list(AGENT_FEEDBACK_ELIGIBILITY_FILTERS),
+            'eligibility_diagnostics': eligibility_diagnostics,
             'skipped_symbols': skipped_symbols,
             'mode': DAILY_RETRY_CYCLE_MODE,
             'resumed_from_run_id': previous_run.get('run_id') if isinstance(previous_run, dict) else None,
