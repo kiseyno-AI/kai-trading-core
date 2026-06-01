@@ -894,18 +894,64 @@ def _reuse_decision(should_dispatch: bool):
     return SimpleNamespace(should_dispatch=should_dispatch)
 
 
-def _passed_filter_rows(*symbols: str) -> list[str]:
-    return list(symbols)
+def _patched_eligibility_split(*allowed_symbols: str):
+    allowed = set(allowed_symbols)
+
+    def split(*, market_date, requested_symbols):
+        eligible = [symbol for symbol in requested_symbols if symbol in allowed]
+        skipped = [symbol for symbol in requested_symbols if symbol not in allowed]
+        records_by_symbol = {
+            symbol: {
+                'symbol': symbol,
+                'market_date': market_date.isoformat(),
+                'rule_version': 'strategy_aware_prefilter_scoring_v1',
+                'strategy_scope': 'short_term_momentum_breakout',
+                'candidate_path': 'short_term_momentum_breakout',
+                'eligible': symbol in allowed,
+                'hard_blocked': symbol not in allowed,
+                'status': 'dispatched' if symbol in allowed else 'hard_blocked',
+                'hard_block_reasons': [] if symbol in allowed else [{'code': 'test_hard_block'}],
+                'soft_penalties': [],
+                'filter_signals': {},
+            }
+            for symbol in requested_symbols
+        }
+        return eligible, skipped, {
+            'rule_version': 'strategy_aware_prefilter_scoring_v1',
+            'strategy_scope': 'short_term_momentum_breakout',
+            'evaluated_symbol_count': len(requested_symbols),
+            'dispatched_symbol_count': len(eligible),
+            'hard_blocked_symbol_count': len(skipped),
+            'soft_penalized_dispatched_symbol_count': 0,
+            'hard_blocked_symbols': skipped,
+            'soft_penalized_symbols': [],
+            'hard_block_reasons_by_symbol': {
+                symbol: [{'code': 'test_hard_block'}]
+                for symbol in skipped
+            },
+            'soft_penalties_by_symbol': {},
+            'records_by_symbol': records_by_symbol,
+        }
+
+    return split
 
 
 @contextmanager
 def _patch_feedback_eligibility(*symbols: str):
     with patch.object(
         orchestrator_module,
-        'load_agent_feedback_eligible_symbols',
-        return_value=_passed_filter_rows(*symbols),
+        '_split_requested_symbols_by_agent_feedback_eligibility_with_diagnostics',
+        side_effect=_patched_eligibility_split(*symbols),
     ):
-        yield
+        with patch.object(
+            orchestrator_module,
+            '_split_requested_symbols_by_agent_feedback_eligibility',
+            side_effect=lambda market_date, requested_symbols: (
+                [symbol for symbol in requested_symbols if symbol in set(symbols)],
+                [symbol for symbol in requested_symbols if symbol not in set(symbols)],
+            ),
+        ):
+            yield
 
 
 class AgentFeedbackOrchestratorTests(unittest.TestCase):
@@ -1281,7 +1327,7 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertEqual(len(cleanup_service.targets), 1)
         self.assertEqual(result['summary']['failed'], 0)
 
-    def test_dispatch_for_symbols_skips_symbols_outside_active_filter_intersection(self):
+    def test_dispatch_for_symbols_skips_hard_blocked_prefilter_symbols(self):
         service = AgentFeedbackOrchestrator()
         client = RecordingBatchClient()
         service.client = client
@@ -1310,6 +1356,84 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertEqual(result['request']['symbols'], ['005930'])
         self.assertEqual(result['request']['skipped_symbols'], ['000660'])
         self.assertEqual(result['summary']['skipped'], 1)
+
+    def test_dispatch_for_symbols_reports_soft_penalized_symbols_without_skipping_them(self):
+        service = AgentFeedbackOrchestrator()
+        client = RecordingBatchClient()
+        service.client = client
+        feedback_service = FakeFeedbackService()
+        cleanup_service = FakeSessionCleanupService()
+        read_service = RecordingAgentContextReadService()
+        fake_settings = SimpleNamespace(openclaw_agent_symbol_chunk_size=1, openclaw_agent_parallel_subtasks=20)
+        soft_record = {
+            'symbol': '066570',
+            'market_date': '2026-05-29',
+            'rule_version': 'strategy_aware_prefilter_scoring_v1',
+            'strategy_scope': 'short_term_momentum_breakout',
+            'candidate_path': 'short_term_momentum_breakout',
+            'eligible': True,
+            'hard_blocked': False,
+            'status': 'soft_penalized_dispatched',
+            'hard_block_reasons': [],
+            'soft_penalties': [{'code': 'not_low_pbr', 'source': 'piotroski_filter'}],
+            'filter_signals': {'piotroski_filter': {'is_low_pbr': False}},
+        }
+        hard_record = {
+            'symbol': '005930',
+            'market_date': '2026-05-29',
+            'rule_version': 'strategy_aware_prefilter_scoring_v1',
+            'strategy_scope': 'short_term_momentum_breakout',
+            'candidate_path': 'short_term_momentum_breakout',
+            'eligible': False,
+            'hard_blocked': True,
+            'status': 'hard_blocked',
+            'hard_block_reasons': [{'code': 'market_risk_trade_halted'}],
+            'soft_penalties': [],
+            'filter_signals': {'market_risk_filter': {'passed_filter': False}},
+        }
+        diagnostics = {
+            'rule_version': 'strategy_aware_prefilter_scoring_v1',
+            'strategy_scope': 'short_term_momentum_breakout',
+            'evaluated_symbol_count': 2,
+            'dispatched_symbol_count': 1,
+            'hard_blocked_symbol_count': 1,
+            'soft_penalized_dispatched_symbol_count': 1,
+            'hard_blocked_symbols': ['005930'],
+            'soft_penalized_symbols': ['066570'],
+            'hard_block_reasons_by_symbol': {'005930': hard_record['hard_block_reasons']},
+            'soft_penalties_by_symbol': {'066570': soft_record['soft_penalties']},
+            'records_by_symbol': {'066570': soft_record, '005930': hard_record},
+        }
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            with patch.object(orchestrator_module, 'agent_context_read_service', read_service):
+                with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
+                    with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
+                        with patch.object(
+                            orchestrator_module,
+                            '_split_requested_symbols_by_agent_feedback_eligibility_with_diagnostics',
+                            return_value=(['066570'], ['005930'], diagnostics),
+                        ):
+                            result = service.dispatch_for_symbols(
+                                market_date='2026-05-29',
+                                symbols=['066570', '005930'],
+                                roles=['eod-summarizer'],
+                                reuse_existing=False,
+                            )
+
+        self.assertEqual(result['request']['symbols'], ['066570'])
+        self.assertEqual(result['request']['skipped_symbols'], ['005930'])
+        self.assertEqual(result['request']['soft_penalized_symbols'], ['066570'])
+        self.assertEqual(result['request']['eligibility_diagnostics']['hard_blocked_symbols'], ['005930'])
+        self.assertEqual(result['request']['eligibility_diagnostics']['soft_penalized_symbols'], ['066570'])
+        self.assertNotIn('records_by_symbol', result['request']['eligibility_diagnostics'])
+        dispatched_item = client.calls[0]['batch_items'][0]
+        self.assertEqual(dispatched_item['symbol'], '066570')
+        self.assertEqual(dispatched_item['agent_feedback_eligibility']['status'], 'soft_penalized_dispatched')
+        self.assertEqual(
+            dispatched_item['agent_feedback_eligibility']['soft_penalties'][0]['code'],
+            'not_low_pbr',
+        )
 
     def test_dispatch_for_symbols_preserves_canonical_role_sequence_when_requested_out_of_order(self):
         service = AgentFeedbackOrchestrator()

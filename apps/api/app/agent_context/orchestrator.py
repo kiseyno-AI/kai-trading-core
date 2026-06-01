@@ -23,8 +23,8 @@ from app.agent_context.prerequisite_service import agent_feedback_prerequisite_s
 from app.agent_context.eligibility import (
     AGENT_FEEDBACK_ELIGIBILITY_FILTERS,
     AGENT_FEEDBACK_ELIGIBILITY_RULE,
-    load_agent_feedback_eligible_symbols,
     resolve_agent_feedback_scope,
+    split_requested_symbols_by_agent_feedback_eligibility_with_diagnostics,
 )
 from app.agent_context.feedback_failure_service import agent_context_feedback_failure_service
 from app.agent_context.orchestrator_helpers import (
@@ -158,13 +158,45 @@ def _split_requested_symbols_by_agent_feedback_eligibility(
     market_date: date,
     requested_symbols: Sequence[str],
 ) -> tuple[list[str], list[str]]:
-    eligible_symbols = load_agent_feedback_eligible_symbols(
+    eligible_symbols, skipped_symbols, _ = _split_requested_symbols_by_agent_feedback_eligibility_with_diagnostics(
         market_date=market_date,
         requested_symbols=requested_symbols,
     )
-    eligible_symbol_set = set(eligible_symbols)
-    skipped_symbols = [symbol for symbol in requested_symbols if symbol not in eligible_symbol_set]
     return eligible_symbols, skipped_symbols
+
+
+def _split_requested_symbols_by_agent_feedback_eligibility_with_diagnostics(
+    *,
+    market_date: date,
+    requested_symbols: Sequence[str],
+) -> tuple[list[str], list[str], dict[str, Any]]:
+    return split_requested_symbols_by_agent_feedback_eligibility_with_diagnostics(
+        market_date=market_date,
+        requested_symbols=requested_symbols,
+    )
+
+
+def _public_eligibility_diagnostics(diagnostics: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in diagnostics.items()
+        if key != 'records_by_symbol'
+    }
+
+
+def _attach_agent_feedback_eligibility_context(
+    *,
+    items: Sequence[dict[str, Any]],
+    diagnostics: dict[str, Any],
+) -> None:
+    records_by_symbol = diagnostics.get('records_by_symbol') if isinstance(diagnostics, dict) else None
+    if not isinstance(records_by_symbol, dict):
+        return
+    for item in items:
+        symbol = str(item.get('symbol') or '').strip().upper()
+        record = records_by_symbol.get(symbol)
+        if isinstance(record, dict):
+            item['agent_feedback_eligibility'] = record
 
 
 DEFAULT_OPENCLAW_AGENT_TIMEOUT_SECONDS = 120.0
@@ -2584,10 +2616,14 @@ class AgentFeedbackOrchestrator:
                 'failures': [],
                 'prerequisites': prerequisites,
             }
-        dispatch_symbols, skipped_symbols = _split_requested_symbols_by_agent_feedback_eligibility(
-            market_date=normalized_market_date,
-            requested_symbols=requested_symbols,
+        dispatch_symbols, skipped_symbols, eligibility_diagnostics = (
+            _split_requested_symbols_by_agent_feedback_eligibility_with_diagnostics(
+                market_date=normalized_market_date,
+                requested_symbols=requested_symbols,
+            )
         )
+        public_eligibility_diagnostics = _public_eligibility_diagnostics(eligibility_diagnostics)
+        soft_penalized_symbols = list(public_eligibility_diagnostics.get('soft_penalized_symbols') or [])
         request_run_id = request_run_id or f'symbol-run-{normalized_market_date.isoformat()}-{uuid.uuid4().hex[:10]}'
         batch_size = max(1, settings.openclaw_agent_symbol_chunk_size)
         role_parallelism = max(1, settings.openclaw_agent_parallel_subtasks)
@@ -2608,6 +2644,8 @@ class AgentFeedbackOrchestrator:
             'eligibility_rule': AGENT_FEEDBACK_ELIGIBILITY_RULE,
             'eligibility_filters': list(AGENT_FEEDBACK_ELIGIBILITY_FILTERS),
             'skipped_symbols': skipped_symbols,
+            'soft_penalized_symbols': soft_penalized_symbols,
+            'eligibility_diagnostics': public_eligibility_diagnostics,
             'mode': 'role_sequential_runtime_buffered',
         }
         state = RuntimeFeedbackRunState(
@@ -2879,6 +2917,10 @@ class AgentFeedbackOrchestrator:
                         symbols=symbols_requiring_context,
                         fs_div=fs_div,
                         disclosures_limit=disclosures_limit,
+                    )
+                    _attach_agent_feedback_eligibility_context(
+                        items=symbol_context.get('items') or [],
+                        diagnostics=eligibility_diagnostics,
                     )
                 self._checkpoint_run_state(
                     market_date=normalized_market_date,
