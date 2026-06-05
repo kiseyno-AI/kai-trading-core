@@ -7,6 +7,8 @@ Canonical semantics for this route and `GET /eod/freshness` live in `docs/EOD_ST
 
 Unlike `GET /eod/freshness`, this route focuses on in-flight work. It reads the first-class durable daily pipeline run state first, merges same-date historical official stage rows when the latest run is only a resumed subset, then falls back to persisted-row and source-run inference for stages with no official stage row. It reports the current stage status from master refresh through signal-decider evaluations for the requested `market_date`.
 
+Automatic `/eod/pykrx/daily/run-if-due` runs publish official daily pipeline run state for their scheduled PyKRX stages and chained follow-ups. The official run remains active until the follow-ups finish or fail. If a currently active auto run has no official rows, the route promotes non-PyKRX follow-up entries from `eod_collection_runs.run_metadata.stage_progress` as live stage progress so `running_stages`, `current_stage`, source run IDs, timestamps, and stale-running threshold metadata are still visible.
+
 The same payload also reports the default-selected filtering, factor/scoring, external-news, agent-feedback, signal-decider, and signal-decider-evaluation stages. Persisted `daily_signal_features`, `external_news_items` classification state, `agent_context_feedback`, and `signal_decider_decision_snapshots` rows can mark omitted same-day stages completed/available so a resumed single-stage run does not make earlier persisted outputs look pending.
 
 The default `market_date` is the current Seoul calendar date from `server_time[:10]`. On weekends, holidays, or other break-days, callers must pass `market_date` explicitly if they want the previous trading day's pipeline view instead of the current calendar date.
@@ -274,6 +276,25 @@ GET /eod/pipeline/status?market_date=2026-04-21&fs_div=CFS
         "reason": "persisted_signal_decider_outputs_available",
         "feedback_rows": 114,
         "decision_snapshots": 228
+      }
+    },
+    "signal_decider_evaluations": {
+      "status": "running",
+      "processed": 14,
+      "total": 228,
+      "failed": 0,
+      "current_step": "signal_decider_evaluations_running",
+      "current_activity": "Running signal-decider evaluation follow-up",
+      "source_run_ids": {
+        "eod_run_id": 311,
+        "signal_decider_evaluation_run_id": "recent-coverage"
+      },
+      "details": {
+        "mode": "eod_collection_run_stage_progress",
+        "progress_source": "live_run_metadata",
+        "eod_run_status": "running",
+        "last_progress_at": "2026-06-05T07:06:00+00:00",
+        "stale_running_threshold_minutes": 30
       }
     },
     "momentum_factors": {

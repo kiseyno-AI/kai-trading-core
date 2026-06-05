@@ -39,6 +39,23 @@ FACTOR_FOLLOWUP_STAGE_ORDER: tuple[str, ...] = (
     'quality_factors',
     'composite_factors',
 )
+AUTO_DAILY_FOLLOWUP_STAGE_ORDER: tuple[str, ...] = (
+    'fundamentals_daily_refresh',
+    *FACTOR_FOLLOWUP_STAGE_ORDER,
+    'external_news_collect',
+    'agent_feedback_summaries',
+    'signal_decider_evaluations',
+)
+AUTO_DAILY_TRACKED_STAGE_ORDER: tuple[str, ...] = (
+    'price_collection',
+    'pykrx_enrichment',
+    'technical_snapshots',
+    'action_summaries',
+    'trending_ranks',
+    'signal_features',
+    'market_risk_filter',
+    *AUTO_DAILY_FOLLOWUP_STAGE_ORDER,
+)
 
 
 @dataclass(frozen=True)
@@ -61,6 +78,291 @@ class PykrxPipelineDependencies:
     settings: Any
     normalize_yyyymmdd: Callable[..., str]
     update_run_stage_metadata: Callable[..., dict]
+    daily_pipeline_run_state_service: Any | None = None
+
+
+def _normalize_stage_status(value: Any) -> str:
+    status = str(value or '').strip().lower()
+    if status == 'completed_with_errors':
+        return 'partial'
+    if status in {'disabled', 'not_configured'}:
+        return 'skipped'
+    return status or 'completed'
+
+
+def _status_activity_prefix(status: str) -> str:
+    if status == 'completed':
+        return 'Completed'
+    if status == 'partial':
+        return 'Completed with errors'
+    if status == 'failed':
+        return 'Failed'
+    if status == 'waiting':
+        return 'Waiting on'
+    if status == 'blocked':
+        return 'Blocked'
+    if status == 'skipped':
+        return 'Skipped'
+    return status.replace('_', ' ').capitalize()
+
+
+def _resolve_result_status(result: dict[str, Any]) -> str:
+    if result.get('triggered') is False:
+        status = _normalize_stage_status(result.get('status'))
+        return status if status in {'waiting', 'blocked', 'failed', 'partial'} else 'skipped'
+    status = _normalize_stage_status(result.get('status'))
+    if status != 'completed' or result.get('status'):
+        return status
+    failed_keys = (
+        'symbols_failed',
+        'events_failed',
+        'results_failed',
+        'features_failed',
+        'snapshots_failed',
+        'action_summaries_failed',
+        'failed_count',
+        'errors_count',
+    )
+    if any(int(result.get(key) or 0) > 0 for key in failed_keys):
+        return 'partial'
+    if result.get('error') or result.get('error_message'):
+        return 'failed'
+    return 'completed'
+
+
+def _extract_result_counts(result: dict[str, Any], *, default_total: int = 0) -> dict[str, int]:
+    def _int(value: Any) -> int:
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    count_pairs = (
+        ('symbols_refreshed', 'symbols_failed'),
+        ('events_captured', 'events_failed'),
+        ('results_persisted', 'results_failed'),
+        ('features_persisted', 'features_failed'),
+        ('snapshots_persisted', 'snapshots_failed'),
+        ('action_summaries_persisted', 'action_summaries_failed'),
+        ('evaluations_upserted', 'failed_count'),
+        ('outcomes_upserted', 'failed_count'),
+        ('completed_count', 'failed_count'),
+    )
+    for succeeded_key, failed_key in count_pairs:
+        if succeeded_key not in result and failed_key not in result:
+            continue
+        succeeded = _int(result.get(succeeded_key))
+        failed = _int(result.get(failed_key))
+        total = _int(result.get('total') or result.get('symbols_total') or result.get('requested_count'))
+        if total <= 0:
+            total = default_total or succeeded + failed
+        return {
+            'processed': min(succeeded + failed, total) if total else succeeded + failed,
+            'total': total,
+            'succeeded': succeeded,
+            'failed': failed,
+        }
+
+    summary = result.get('summary') if isinstance(result.get('summary'), dict) else {}
+    if summary:
+        succeeded = _int(
+            summary.get('completed_count')
+            or summary.get('computed_count')
+            or summary.get('evaluated_count')
+            or summary.get('passed_count')
+        )
+        failed = _int(summary.get('failed_count'))
+        total = _int(summary.get('total') or summary.get('matched_symbol_count') or succeeded + failed)
+        return {
+            'processed': min(succeeded + failed, total) if total else succeeded + failed,
+            'total': total,
+            'succeeded': succeeded,
+            'failed': failed,
+        }
+
+    succeeded = _int(
+        result.get('persisted_count')
+        or result.get('trending_ranks_persisted')
+        or result.get('items_persisted')
+        or result.get('classified_items')
+    )
+    total = default_total or succeeded
+    return {
+        'processed': min(succeeded, total) if total else succeeded,
+        'total': total,
+        'succeeded': succeeded,
+        'failed': 0,
+    }
+
+
+def _compact_result_summary(result: dict[str, Any]) -> dict[str, Any]:
+    omitted_keys = {'items', 'rows', 'payloads', 'results'}
+    return {
+        key: value
+        for key, value in result.items()
+        if key not in omitted_keys and not key.endswith('_payload')
+    }
+
+
+def _resolve_auto_daily_tracked_stages(
+    *,
+    selected_stages: Sequence[str] | None,
+    chain_fundamentals_followup: bool,
+) -> list[str]:
+    requested = list(selected_stages or PYKRX_DAILY_STAGE_ORDER)
+    if chain_fundamentals_followup:
+        requested.extend(AUTO_DAILY_FOLLOWUP_STAGE_ORDER)
+    requested_set = {str(stage_id or '').strip() for stage_id in requested if str(stage_id or '').strip()}
+    return [stage_id for stage_id in AUTO_DAILY_TRACKED_STAGE_ORDER if stage_id in requested_set]
+
+
+class _OfficialDailyPipelineTracker:
+    def __init__(self, *, service: Any | None, log_fetch: Callable[..., None]) -> None:
+        self.service = service
+        self.log_fetch = log_fetch
+        self.pipeline_run_id: int | None = None
+        self.market_date: str | None = None
+        self.eod_run_id: int | None = None
+        self.stage_statuses: dict[str, str] = {}
+        self.enabled = service is not None
+
+    def start(
+        self,
+        *,
+        market_date: str,
+        trigger: str,
+        requested_stages: Sequence[str],
+        resolved_stages: Sequence[str],
+        eod_run_id: int,
+        run_metadata: dict[str, Any],
+    ) -> None:
+        if not self.enabled or self.service is None:
+            return
+        try:
+            run = self.service.start_run(
+                market_date=market_date,
+                trigger=trigger,
+                requested_stages=requested_stages,
+                resolved_stages=resolved_stages,
+                run_metadata={
+                    'entrypoint': 'PYKRX_BACKFILL_SERVICE.run_daily_pipeline_if_due',
+                    'eod_collection_run_id': eod_run_id,
+                    **run_metadata,
+                },
+            )
+            self.pipeline_run_id = int(run['id'])
+            self.market_date = market_date
+            self.eod_run_id = eod_run_id
+        except Exception as exc:  # pragma: no cover - defensive production guard
+            self.enabled = False
+            logger.warning('daily pipeline tracker start failed for auto EOD run %s: %s', eod_run_id, exc)
+            self.log_fetch(
+                'daily_pipeline_tracking',
+                'failed',
+                stage='start_run',
+                run_id=eod_run_id,
+                error_type=type(exc).__name__,
+                error_message=str(exc),
+            )
+
+    def update_stage(
+        self,
+        *,
+        stage: str,
+        status: str,
+        current_step: str,
+        current_activity: str,
+        processed: int | None = None,
+        total: int | None = None,
+        succeeded: int | None = None,
+        failed: int | None = None,
+        current_symbol: str | None = None,
+        current_period: str | None = None,
+        source_run_ids: dict[str, Any] | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        if not self.enabled or self.service is None or self.pipeline_run_id is None or self.market_date is None:
+            return
+        normalized_status = _normalize_stage_status(status)
+        self.stage_statuses[stage] = normalized_status
+        merged_source_run_ids = {'eod_run_id': self.eod_run_id} if self.eod_run_id is not None else {}
+        if source_run_ids:
+            merged_source_run_ids.update(source_run_ids)
+        merged_details = {
+            'mode': 'auto_eod_pipeline_tracking',
+            'progress_source': 'auto_eod_stage_progress',
+            **dict(details or {}),
+        }
+        try:
+            self.service.update_stage(
+                pipeline_run_id=self.pipeline_run_id,
+                stage_id=stage,
+                market_date=self.market_date,
+                status=normalized_status,
+                current_step=current_step,
+                current_activity=current_activity,
+                processed=processed,
+                total=total,
+                succeeded=succeeded,
+                failed=failed,
+                current_symbol=current_symbol,
+                current_period=current_period,
+                source_run_ids=merged_source_run_ids,
+                details=merged_details,
+            )
+        except Exception as exc:  # pragma: no cover - defensive production guard
+            logger.warning('daily pipeline tracker update failed for run %s stage %s: %s', self.eod_run_id, stage, exc)
+            self.log_fetch(
+                'daily_pipeline_tracking',
+                'failed',
+                stage=stage,
+                run_id=self.eod_run_id,
+                error_type=type(exc).__name__,
+                error_message=str(exc),
+            )
+
+    def finish_run(self, *, status: str | None = None, error_message: str | None = None) -> None:
+        if not self.enabled or self.service is None or self.pipeline_run_id is None:
+            return
+        final_status = status or self.resolve_overall_status()
+        try:
+            self.service.finish_run(
+                pipeline_run_id=self.pipeline_run_id,
+                status=final_status,
+                error_message=error_message,
+                run_metadata={
+                    'stage_statuses': dict(self.stage_statuses),
+                    'eod_collection_run_id': self.eod_run_id,
+                },
+            )
+        except Exception as exc:  # pragma: no cover - defensive production guard
+            logger.warning('daily pipeline tracker finish failed for run %s: %s', self.eod_run_id, exc)
+            self.log_fetch(
+                'daily_pipeline_tracking',
+                'failed',
+                stage='finish_run',
+                run_id=self.eod_run_id,
+                error_type=type(exc).__name__,
+                error_message=str(exc),
+            )
+
+    def resolve_overall_status(self) -> str:
+        statuses = set(self.stage_statuses.values())
+        if not statuses:
+            return 'completed'
+        if 'failed' in statuses:
+            return 'failed'
+        if 'blocked' in statuses:
+            return 'blocked'
+        if 'waiting' in statuses:
+            return 'waiting'
+        if 'running' in statuses:
+            return 'running'
+        if 'partial' in statuses:
+            return 'partial'
+        if statuses <= {'completed', 'skipped'}:
+            return 'completed'
+        return 'partial'
 
 
 def _run_daily_factor_followup(*, market_date: str) -> dict[str, Any]:
@@ -330,6 +632,7 @@ def run_market_data_pipeline(
     retry_context: dict | None = None,
     selected_stages: Sequence[str] | None = None,
     chain_fundamentals_followup: bool = True,
+    track_daily_pipeline: bool = False,
 ) -> dict:
     normalized_start = dependencies.normalize_yyyymmdd(start_date)
     normalized_end = dependencies.normalize_yyyymmdd(end_date)
@@ -424,6 +727,29 @@ def run_market_data_pipeline(
         source='pykrx',
         run_metadata=run_metadata,
     )
+    tracked_stages = _resolve_auto_daily_tracked_stages(
+        selected_stages=selected_stages,
+        chain_fundamentals_followup=chain_fundamentals_followup,
+    )
+    daily_pipeline_tracker = _OfficialDailyPipelineTracker(
+        service=dependencies.daily_pipeline_run_state_service if track_daily_pipeline else None,
+        log_fetch=dependencies.log_fetch,
+    )
+    daily_pipeline_tracker.start(
+        market_date=latest_trade_date,
+        trigger=trigger,
+        requested_stages=tracked_stages,
+        resolved_stages=tracked_stages,
+        eod_run_id=run_id,
+        run_metadata={
+            'mode': mode,
+            'trigger': trigger,
+            'markets': list(markets),
+            'selected_stages': list(selected_stages or PYKRX_DAILY_STAGE_ORDER),
+            'chain_fundamentals_followup': chain_fundamentals_followup,
+            'retry': retry_context,
+        },
+    )
 
     symbols_succeeded = 0
     symbols_failed = 0
@@ -442,9 +768,13 @@ def run_market_data_pipeline(
         failed: int | None = None,
         current_symbol: str | None = None,
         current_period: str | None = None,
+        source_run_ids: dict[str, Any] | None = None,
         extra: dict | None = None,
     ) -> None:
         nonlocal run_metadata
+        metadata_extra = dict(extra or {})
+        if source_run_ids:
+            metadata_extra['source_run_ids'] = dict(source_run_ids)
         run_metadata = dependencies.update_run_stage_metadata(
             run_metadata,
             stage=stage,
@@ -457,7 +787,21 @@ def run_market_data_pipeline(
             failed=failed,
             current_symbol=current_symbol,
             current_period=current_period,
-            extra=extra,
+            extra=metadata_extra,
+        )
+        daily_pipeline_tracker.update_stage(
+            stage=stage,
+            status=status,
+            current_step=current_step,
+            current_activity=current_activity,
+            processed=processed,
+            total=total,
+            succeeded=succeeded,
+            failed=failed,
+            current_symbol=current_symbol,
+            current_period=current_period,
+            source_run_ids=source_run_ids,
+            details=metadata_extra,
         )
         try:
             dependencies.update_eod_collection_run_progress(
@@ -481,6 +825,23 @@ def run_market_data_pipeline(
                 error_type=type(exc).__name__,
                 error_message=str(exc),
             )
+
+    persist_stage_progress(
+        stage='price_collection',
+        status='running',
+        current_step='fetch_symbol_ohlcv',
+        current_activity=(
+            f'Collecting pykrx daily prices for {first_symbol}'
+            if first_symbol
+            else 'Collecting pykrx daily prices'
+        ),
+        processed=0,
+        total=len(symbols),
+        succeeded=0,
+        failed=0,
+        current_symbol=first_symbol,
+        extra={'bars_upserted': 0},
+    )
 
     try:
         market_turnover_cache: dict[tuple[str, str], Any] = {}
@@ -615,6 +976,7 @@ def run_market_data_pipeline(
             error_message=str(exc),
             run_metadata=run_metadata,
         )
+        daily_pipeline_tracker.finish_run(status='failed', error_message=str(exc))
         raise
 
     failed_symbol_set = set(failed_symbols)
@@ -793,6 +1155,20 @@ def run_market_data_pipeline(
                     include_current_symbol=True,
                 ),
             )
+            technical_failed = int(technical_snapshot_result.get('snapshots_failed') or 0)
+            technical_succeeded = int(technical_snapshot_result.get('snapshots_persisted') or 0)
+            persist_stage_progress(
+                stage='technical_snapshots',
+                status='completed' if technical_failed == 0 else 'partial',
+                current_step='technical_snapshots_completed',
+                current_activity='Daily technical snapshots computed'
+                if technical_failed == 0
+                else 'Daily technical snapshots completed with errors',
+                processed=technical_succeeded + technical_failed,
+                total=len(symbols),
+                succeeded=technical_succeeded,
+                failed=technical_failed,
+            )
         except Exception as exc:
             technical_snapshot_result = build_stage_failure_result(
                 market_date=latest_trade_date,
@@ -842,6 +1218,20 @@ def run_market_data_pipeline(
                     include_current_symbol=True,
                 ),
             )
+            action_failed = int(action_summary_result.get('action_summaries_failed') or 0)
+            action_succeeded = int(action_summary_result.get('action_summaries_persisted') or 0)
+            persist_stage_progress(
+                stage='action_summaries',
+                status='completed' if action_failed == 0 else 'partial',
+                current_step='action_summaries_completed',
+                current_activity='Daily action summaries computed'
+                if action_failed == 0
+                else 'Daily action summaries completed with errors',
+                processed=action_succeeded + action_failed,
+                total=len(symbols),
+                succeeded=action_succeeded,
+                failed=action_failed,
+            )
         except Exception as exc:
             action_summary_result = build_stage_failure_result(
                 market_date=latest_trade_date,
@@ -889,6 +1279,25 @@ def run_market_data_pipeline(
                     default_activity='Computing daily trending ranks',
                     include_current_period=True,
                 ),
+            )
+            trending_failed = int(trending_rank_result.get('failed_count') or trending_rank_result.get('periods_failed') or 0)
+            trending_succeeded = int(
+                trending_rank_result.get('periods_persisted')
+                or trending_rank_result.get('periods_completed')
+                or (1 if int(trending_rank_result.get('trending_ranks_persisted') or 0) > 0 else 0)
+            )
+            trending_total = int(trending_rank_result.get('total') or trending_succeeded + trending_failed or 0)
+            persist_stage_progress(
+                stage='trending_ranks',
+                status='completed' if trending_failed == 0 else 'partial',
+                current_step='trending_ranks_completed',
+                current_activity='Daily trending ranks computed'
+                if trending_failed == 0
+                else 'Daily trending ranks completed with errors',
+                processed=trending_succeeded + trending_failed,
+                total=trending_total,
+                succeeded=trending_succeeded,
+                failed=trending_failed,
             )
         except Exception as exc:
             trending_rank_result = build_stage_failure_result(
@@ -1143,6 +1552,134 @@ def run_market_data_pipeline(
         'refresh_universe': effective_refresh_universe,
         'universe_snapshot': universe_snapshot,
     }
+
+    def record_followup_start(stage_id: str, activity: str) -> None:
+        persist_stage_progress(
+            stage=stage_id,
+            status='running',
+            current_step=f'{stage_id}_running',
+            current_activity=activity,
+            processed=0,
+            total=0,
+            succeeded=0,
+            failed=0,
+        )
+
+    def record_followup_result(
+        stage_id: str,
+        stage_result: dict[str, Any],
+        *,
+        default_total: int = 0,
+    ) -> None:
+        stage_status = _resolve_result_status(stage_result)
+        counts = _extract_result_counts(stage_result, default_total=default_total)
+        persist_stage_progress(
+            stage=stage_id,
+            status=stage_status,
+            current_step=f'{stage_id}_{stage_status}',
+            current_activity=f'{_status_activity_prefix(stage_status)} {stage_id.replace("_", " ")}',
+            processed=counts['processed'],
+            total=counts['total'],
+            succeeded=counts['succeeded'],
+            failed=counts['failed'],
+            source_run_ids=(
+                stage_result.get('source_run_ids')
+                if isinstance(stage_result.get('source_run_ids'), dict)
+                else None
+            ),
+            extra={'result_summary': _compact_result_summary(stage_result)},
+        )
+
+    def record_followup_failure(stage_id: str, exc: Exception) -> None:
+        persist_stage_progress(
+            stage=stage_id,
+            status='failed',
+            current_step=f'{stage_id}_failed',
+            current_activity=f'{stage_id.replace("_", " ")} failed: {exc}',
+            processed=0,
+            total=0,
+            succeeded=0,
+            failed=1,
+            extra={
+                'error_type': type(exc).__name__,
+                'error_message': str(exc),
+            },
+        )
+
+    def run_followup_stage(
+        stage_id: str,
+        *,
+        activity: str,
+        call: Callable[[], dict[str, Any]],
+        default_total: int = 0,
+    ) -> dict[str, Any]:
+        record_followup_start(stage_id, activity)
+        try:
+            stage_result = call()
+        except Exception as exc:
+            record_followup_failure(stage_id, exc)
+            raise
+        record_followup_result(stage_id, stage_result, default_total=default_total)
+        return stage_result
+
+    def fundamentals_progress_callback(**payload: Any) -> None:
+        details = payload.get('details') if isinstance(payload.get('details'), dict) else {}
+        source_run_ids = payload.get('source_run_ids') if isinstance(payload.get('source_run_ids'), dict) else None
+        persist_stage_progress(
+            stage='fundamentals_daily_refresh',
+            status=str(payload.get('status') or 'running'),
+            current_step=str(payload.get('current_step') or 'fundamentals_daily_refresh_running'),
+            current_activity=str(payload.get('current_activity') or 'Running DART fundamentals daily refresh'),
+            processed=payload.get('processed'),
+            total=payload.get('total'),
+            succeeded=payload.get('succeeded'),
+            failed=payload.get('failed'),
+            current_symbol=payload.get('current_symbol'),
+            current_period=payload.get('current_period'),
+            source_run_ids=source_run_ids,
+            extra=details,
+        )
+
+    def record_factor_followup_result(factor_result: dict[str, Any]) -> None:
+        stage_results = factor_result.get('stages') if isinstance(factor_result.get('stages'), dict) else {}
+        for stage_id in FACTOR_FOLLOWUP_STAGE_ORDER:
+            raw_stage_result = stage_results.get(stage_id) if isinstance(stage_results.get(stage_id), dict) else {}
+            nested_result = (
+                raw_stage_result.get('result')
+                if isinstance(raw_stage_result.get('result'), dict)
+                else {}
+            )
+            stage_status = (
+                _normalize_stage_status(raw_stage_result.get('status'))
+                if raw_stage_result
+                else _resolve_result_status(factor_result)
+            )
+            counts = _extract_result_counts(nested_result, default_total=0)
+            persist_stage_progress(
+                stage=stage_id,
+                status=stage_status,
+                current_step=f'{stage_id}_{stage_status}',
+                current_activity=f'{_status_activity_prefix(stage_status)} {stage_id.replace("_", " ")}',
+                processed=counts['processed'],
+                total=counts['total'],
+                succeeded=counts['succeeded'],
+                failed=counts['failed'],
+                extra={
+                    'factor_scoring_followup_status': factor_result.get('status'),
+                    'result_summary': _compact_result_summary(nested_result or raw_stage_result),
+                },
+            )
+
+    def run_factor_followup() -> dict[str, Any]:
+        record_followup_start('momentum_factors', 'Running daily factor scoring follow-up')
+        try:
+            factor_result = _run_daily_factor_followup(market_date=latest_trade_date)
+        except Exception as exc:
+            record_followup_failure('momentum_factors', exc)
+            raise
+        record_factor_followup_result(factor_result)
+        return factor_result
+
     dart_auto_followup_enabled = bool((dependencies.settings.dart_api_key or '').strip())
     should_chain_fundamentals = (
         chain_fundamentals_followup
@@ -1151,74 +1688,112 @@ def run_market_data_pipeline(
         and mode == 'daily_auto'
         and status in {'completed', 'completed_with_errors'}
     )
-    if should_chain_fundamentals:
-        result['fundamentals_followup'] = asyncio.run(
-            dependencies.dart_fundamentals_capture_service.run_daily_incremental_refresh(
-                market_date=latest_trade_date,
-                capture_limit=500,
-                trigger='eod_pykrx_followup',
-                run_feedback_followup=False,
+    try:
+        if should_chain_fundamentals:
+            result['fundamentals_followup'] = run_followup_stage(
+                'fundamentals_daily_refresh',
+                activity='Running DART fundamentals daily refresh follow-up',
+                call=lambda: asyncio.run(
+                    dependencies.dart_fundamentals_capture_service.run_daily_incremental_refresh(
+                        market_date=latest_trade_date,
+                        capture_limit=500,
+                        trigger='eod_pykrx_followup',
+                        run_feedback_followup=False,
+                        progress_callback=fundamentals_progress_callback,
+                    )
+                ),
             )
-        )
-        fundamentals_status = str(result['fundamentals_followup'].get('status') or '').strip().lower()
-        if fundamentals_status in {'completed', 'partial'}:
-            result['factor_scoring_followup'] = _run_daily_factor_followup(market_date=latest_trade_date)
-            result['external_news_followup'] = _run_daily_external_news_followup(
+            fundamentals_status = str(result['fundamentals_followup'].get('status') or '').strip().lower()
+            if fundamentals_status in {'completed', 'partial'}:
+                result['factor_scoring_followup'] = run_factor_followup()
+                result['external_news_followup'] = run_followup_stage(
+                    'external_news_collect',
+                    activity='Running external news collection follow-up',
+                    call=lambda: _run_daily_external_news_followup(
+                        market_date=latest_trade_date,
+                        enabled=True,
+                    ),
+                )
+            else:
+                result['factor_scoring_followup'] = {
+                    'triggered': False,
+                    'reason': 'fundamentals_followup_incomplete',
+                    'market_date': latest_trade_date,
+                    'fundamentals_status': fundamentals_status or None,
+                }
+                record_factor_followup_result(result['factor_scoring_followup'])
+                result['external_news_followup'] = {
+                    'triggered': False,
+                    'reason': 'factor_scoring_followup_incomplete',
+                    'market_date': latest_trade_date,
+                    'fundamentals_status': fundamentals_status or None,
+                }
+                record_followup_result('external_news_collect', result['external_news_followup'])
+            result['intraday_snapshot_followup'] = _run_daily_intraday_snapshot_followup(
                 market_date=latest_trade_date,
-                enabled=True,
+                enabled=bool(dependencies.settings.kis_intraday_snapshot_enabled),
             )
-        else:
+            result['feedback_followup'] = run_followup_stage(
+                'agent_feedback_summaries',
+                activity='Running agent feedback summary follow-up',
+                call=lambda: _run_daily_feedback_followup(
+                    market_date=latest_trade_date,
+                    enabled=bool(dependencies.settings.openclaw_feedback_trigger_after_fundamentals_refresh),
+                ),
+            )
+            result['signal_decider_evaluation_followup'] = run_followup_stage(
+                'signal_decider_evaluations',
+                activity='Running signal-decider evaluation follow-up',
+                call=lambda: _run_daily_signal_decider_evaluation_followup(
+                    market_date=latest_trade_date,
+                    enabled=True,
+                ),
+            )
+        elif chain_fundamentals_followup and mode == 'daily_auto' and status in {'completed', 'completed_with_errors'}:
+            result['fundamentals_followup'] = {
+                'triggered': False,
+                'reason': 'dart_api_key_not_configured',
+                'market_date': latest_trade_date,
+            }
+            record_followup_result('fundamentals_daily_refresh', result['fundamentals_followup'])
             result['factor_scoring_followup'] = {
                 'triggered': False,
-                'reason': 'fundamentals_followup_incomplete',
+                'reason': 'dart_api_key_not_configured',
                 'market_date': latest_trade_date,
-                'fundamentals_status': fundamentals_status or None,
             }
-            result['external_news_followup'] = {
-                'triggered': False,
-                'reason': 'factor_scoring_followup_incomplete',
-                'market_date': latest_trade_date,
-                'fundamentals_status': fundamentals_status or None,
-            }
-        result['intraday_snapshot_followup'] = _run_daily_intraday_snapshot_followup(
-            market_date=latest_trade_date,
-            enabled=bool(dependencies.settings.kis_intraday_snapshot_enabled),
-        )
-        result['feedback_followup'] = _run_daily_feedback_followup(
-            market_date=latest_trade_date,
-            enabled=bool(dependencies.settings.openclaw_feedback_trigger_after_fundamentals_refresh),
-        )
-        result['signal_decider_evaluation_followup'] = _run_daily_signal_decider_evaluation_followup(
-            market_date=latest_trade_date,
-            enabled=True,
-        )
-    elif chain_fundamentals_followup and mode == 'daily_auto' and status in {'completed', 'completed_with_errors'}:
-        result['fundamentals_followup'] = {
-            'triggered': False,
-            'reason': 'dart_api_key_not_configured',
-            'market_date': latest_trade_date,
-        }
-        result['factor_scoring_followup'] = {
-            'triggered': False,
-            'reason': 'dart_api_key_not_configured',
-            'market_date': latest_trade_date,
-        }
-        result['external_news_followup'] = _run_daily_external_news_followup(
-            market_date=latest_trade_date,
-            enabled=True,
-        )
-        result['intraday_snapshot_followup'] = _run_daily_intraday_snapshot_followup(
-            market_date=latest_trade_date,
-            enabled=bool(dependencies.settings.kis_intraday_snapshot_enabled),
-        )
-        result['feedback_followup'] = _run_daily_feedback_followup(
-            market_date=latest_trade_date,
-            enabled=bool(dependencies.settings.openclaw_feedback_trigger_after_fundamentals_refresh),
-        )
-        result['signal_decider_evaluation_followup'] = _run_daily_signal_decider_evaluation_followup(
-            market_date=latest_trade_date,
-            enabled=True,
-        )
+            record_factor_followup_result(result['factor_scoring_followup'])
+            result['external_news_followup'] = run_followup_stage(
+                'external_news_collect',
+                activity='Running external news collection follow-up',
+                call=lambda: _run_daily_external_news_followup(
+                    market_date=latest_trade_date,
+                    enabled=True,
+                ),
+            )
+            result['intraday_snapshot_followup'] = _run_daily_intraday_snapshot_followup(
+                market_date=latest_trade_date,
+                enabled=bool(dependencies.settings.kis_intraday_snapshot_enabled),
+            )
+            result['feedback_followup'] = run_followup_stage(
+                'agent_feedback_summaries',
+                activity='Running agent feedback summary follow-up',
+                call=lambda: _run_daily_feedback_followup(
+                    market_date=latest_trade_date,
+                    enabled=bool(dependencies.settings.openclaw_feedback_trigger_after_fundamentals_refresh),
+                ),
+            )
+            result['signal_decider_evaluation_followup'] = run_followup_stage(
+                'signal_decider_evaluations',
+                activity='Running signal-decider evaluation follow-up',
+                call=lambda: _run_daily_signal_decider_evaluation_followup(
+                    market_date=latest_trade_date,
+                    enabled=True,
+                ),
+            )
+    except Exception as exc:
+        daily_pipeline_tracker.finish_run(status='failed', error_message=str(exc))
+        raise
+    daily_pipeline_tracker.finish_run()
     if retry_context is not None:
         result['retry'] = retry_context
     dependencies.log_fetch('run_collection', status, **{key: value for key, value in result.items() if key != 'status'})
