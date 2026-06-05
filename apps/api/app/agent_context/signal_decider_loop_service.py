@@ -4,9 +4,7 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from decimal import Decimal
-import exchange_calendars as xcals
 import hashlib
-import pandas as pd
 from typing import Any, Sequence
 
 from sqlalchemy import case, select
@@ -16,6 +14,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from app.agent_context.decision_delta import build_decision_delta
 from app.agent_context.roles import SHORT_TERM_DECIDER_AGENT_NAME, SIGNAL_DECIDER_AGENT_NAME
 from app.agent_context.wait_reason_taxonomy import derive_wait_reason
+from app.market.session import next_krx_trading_date
 from app.db import session_scope
 from app.db_models import (
     AgentContextFeedback,
@@ -184,7 +183,6 @@ SIGNAL_DECIDER_REPLAY_INSIGHT_TAXONOMY: dict[str, dict[str, Any]] = {
         'outcome_tone': 'ambiguous',
     },
 }
-KRX_EXCHANGE_CALENDAR = xcals.get_calendar('XKRX')
 
 
 @dataclass(frozen=True)
@@ -5481,13 +5479,7 @@ class SignalDeciderLoopService:
         }
 
     def _next_trading_session_after(self, *, market_date: date):
-        session = KRX_EXCHANGE_CALENDAR.date_to_session(
-            pd.Timestamp(market_date.isoformat()),
-            direction='next',
-        )
-        if session.date() <= market_date:
-            session = KRX_EXCHANGE_CALENDAR.next_session(session)
-        return session
+        return next_krx_trading_date(market_date)
 
     def _expected_horizon_trade_dates(
         self,
@@ -5497,11 +5489,15 @@ class SignalDeciderLoopService:
     ) -> list[date]:
         if horizon_days < 1:
             return []
-        session = self._next_trading_session_after(market_date=market_date)
-        trade_dates = [session.date()]
+        current_date = self._next_trading_session_after(market_date=market_date)
+        if current_date is None:
+            return []
+        trade_dates = [current_date]
         while len(trade_dates) < horizon_days:
-            session = KRX_EXCHANGE_CALENDAR.next_session(session)
-            trade_dates.append(session.date())
+            current_date = next_krx_trading_date(current_date)
+            if current_date is None:
+                break
+            trade_dates.append(current_date)
         return trade_dates
 
     def _coverage_status_message(

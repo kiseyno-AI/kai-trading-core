@@ -22,6 +22,13 @@ from app.core.settings import settings
 from app.db import session_scope
 from app.db_models import SignalDeciderDecisionSnapshot, SignalDeciderExecutionPlanItem
 from app.market.clock import get_market_state
+from app.market.session import (
+    CALENDAR_SOURCE_EXCHANGE_CALENDARS,
+    CALENDAR_SOURCE_STATUS_FALLBACK,
+    CALENDAR_SOURCE_STATUS_MISSING_DATE,
+    CALENDAR_SOURCE_STATUS_UNAVAILABLE,
+    get_krx_calendar_day,
+)
 from app.orders.exec_payload_slimming import (
     compact_exec_item_link,
     compact_exec_readback,
@@ -40,6 +47,7 @@ from app.orders.next_open_execution import (
     EXECUTION_STATUS_SUBMITTED,
     EXECUTION_WINDOW_NEXT_OPEN,
     _previous_trading_day,
+    normalize_next_open_target_trade_date,
     signal_decider_next_open_execution_service,
 )
 from app.orders.portfolio_summary_service import portfolio_summary_service
@@ -211,6 +219,11 @@ DASHBOARD_TODAY_ACTIVITY_SCHEMA_VERSION = 'execution_runtime_today_activity_v1'
 DASHBOARD_TODAY_ACTIVITY_BROKER_ORDER_ID_LIMIT = 5
 
 MARKET_TIME_ZONE = ZoneInfo('Asia/Seoul')
+CALENDAR_FALLBACK_STATUSES = {
+    CALENDAR_SOURCE_STATUS_FALLBACK,
+    CALENDAR_SOURCE_STATUS_MISSING_DATE,
+    CALENDAR_SOURCE_STATUS_UNAVAILABLE,
+}
 
 
 @dataclass
@@ -239,6 +252,14 @@ def _normalize_date(value: str | date | None) -> date:
         state = get_market_state()
         return date.fromisoformat(state.server_time[:10])
     return date.fromisoformat(str(value))
+
+
+def _calendar_day_requires_operator_override(calendar_day: Any) -> bool:
+    source = _normalize_optional_text(getattr(calendar_day, 'calendar_source', None), lowercase=True)
+    status = _normalize_optional_text(getattr(calendar_day, 'calendar_source_status', None), lowercase=True)
+    if source == CALENDAR_SOURCE_EXCHANGE_CALENDARS:
+        return True
+    return bool(status and status in CALENDAR_FALLBACK_STATUSES)
 
 
 def _safe_decimal(value: Any) -> Decimal | None:
@@ -757,10 +778,54 @@ class SignalDeciderExecIntegrationService:
         trigger: str = 'manual',
     ) -> dict[str, Any]:
         integration = self.integration_status()
-        resolved_target_date = _normalize_date(target_trade_date)
         resolved_account_reference = _normalize_optional_text(account_reference)
         resolved_dry_run = settings.signal_decider_next_open_dry_run if dry_run is None else dry_run
+        default_target_date = _normalize_date(target_trade_date)
+        resolved_target_date = normalize_next_open_target_trade_date(
+            target_trade_date,
+            default=default_target_date,
+            allow_fallback=True,
+        )
+        calendar_day = get_krx_calendar_day(resolved_target_date, allow_fallback=True)
         source_market_date = _previous_trading_day(resolved_target_date)
+
+        if not force and not resolved_dry_run and _calendar_day_requires_operator_override(calendar_day):
+            plan_view = signal_decider_next_open_execution_service.list_plan_items(
+                target_trade_date=resolved_target_date,
+                account_reference=resolved_account_reference,
+                refresh=False,
+            )
+            return {
+                'request': {
+                    'target_trade_date': resolved_target_date.isoformat(),
+                    'account_reference': resolved_account_reference,
+                    'refresh_plan': refresh_plan,
+                    'dry_run': resolved_dry_run,
+                    'force': force,
+                    'trigger': trigger,
+                },
+                'integration': integration,
+                'dispatch': {
+                    'groups': [],
+                    'preview_plans': [],
+                },
+                'summary': {
+                    **(plan_view.get('summary') or {}),
+                    'delegated_to_exec': True,
+                    'triggered': False,
+                    'reason': 'calendar_unavailable',
+                    'dispatch_mode': integration['mode'],
+                    'translated_item_count': 0,
+                    'dispatched_group_count': 0,
+                    'failed_group_count': 0,
+                    'skipped_group_count': 0,
+                    'preview_group_count': 0,
+                    'calendar_source': calendar_day.calendar_source,
+                    'calendar_source_status': calendar_day.calendar_source_status,
+                    'calendar_source_error': calendar_day.calendar_source_error,
+                },
+                'items': plan_view.get('items') or [],
+            }
 
         if not force and not settings.signal_decider_next_open_enabled and not resolved_dry_run:
             plan_view = signal_decider_next_open_execution_service.list_plan_items(

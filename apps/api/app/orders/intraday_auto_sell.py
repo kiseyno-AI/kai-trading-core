@@ -7,8 +7,6 @@ import logging
 import re
 from typing import Any, Callable
 
-import exchange_calendars as xcals
-import pandas as pd
 from sqlalchemy import select
 
 from app.agent_context.roles import SIGNAL_DECIDER_AGENT_NAME
@@ -16,6 +14,14 @@ from app.core.settings import settings
 from app.db import session_scope
 from app.db_models import SignalDeciderDecisionSnapshot, SignalDeciderExecutionPlanItem
 from app.market.clock import MarketState, get_market_state
+from app.market.session import (
+    CALENDAR_SOURCE_EXCHANGE_CALENDARS,
+    CALENDAR_SOURCE_STATUS_FALLBACK,
+    CALENDAR_SOURCE_STATUS_MISSING_DATE,
+    CALENDAR_SOURCE_STATUS_UNAVAILABLE,
+    next_krx_open_date_on_or_after,
+    next_krx_trading_date,
+)
 from app.orders.account_inquiry_service import (
     TradingAccountInquiryService,
     trading_account_inquiry_service,
@@ -65,7 +71,11 @@ FAILED_ORDER_STATUSES = {
 SUCCESS_ORDER_STATUSES = {
     BrokerOrderStatus.FILLED.value,
 }
-KRX_EXCHANGE_CALENDAR = xcals.get_calendar('XKRX')
+CALENDAR_FALLBACK_STATUSES = {
+    CALENDAR_SOURCE_STATUS_FALLBACK,
+    CALENDAR_SOURCE_STATUS_MISSING_DATE,
+    CALENDAR_SOURCE_STATUS_UNAVAILABLE,
+}
 
 
 def _utcnow() -> datetime:
@@ -179,12 +189,24 @@ def _holding_period_bounds(value: Any) -> tuple[int | None, int | None]:
 def _advance_trading_days(start_date: date, trading_days: int | None) -> date | None:
     if trading_days is None or trading_days < 1:
         return None
-    current_session = KRX_EXCHANGE_CALENDAR.date_to_session(pd.Timestamp(start_date.isoformat()), direction='next')
+    current_date = next_krx_open_date_on_or_after(start_date)
+    if current_date is None:
+        return None
     remaining = max(0, trading_days - 1)
     while remaining > 0:
-        current_session = KRX_EXCHANGE_CALENDAR.next_session(current_session)
+        current_date = next_krx_trading_date(current_date)
+        if current_date is None:
+            return None
         remaining -= 1
-    return current_session.date()
+    return current_date
+
+
+def _calendar_requires_operator_override(market_state: MarketState) -> bool:
+    source = _normalize_optional_text(getattr(market_state, 'calendar_source', None), lowercase=True)
+    status = _normalize_optional_text(getattr(market_state, 'calendar_source_status', None), lowercase=True)
+    if source == CALENDAR_SOURCE_EXCHANGE_CALENDARS:
+        return True
+    return bool(status and status in CALENDAR_FALLBACK_STATUSES)
 
 
 def _sort_key_for_order_pair(order_row: dict[str, Any] | None, request_row: dict[str, Any] | None) -> datetime:
@@ -272,6 +294,8 @@ class SignalDeciderIntradayAutoSellService:
             {
                 'market_state': market_state.state,
                 'server_time': market_state.server_time,
+                'calendar_source': getattr(market_state, 'calendar_source', None),
+                'calendar_source_status': getattr(market_state, 'calendar_source_status', None),
             }
         )
         rows = self._load_watch_rows(
@@ -344,6 +368,8 @@ class SignalDeciderIntradayAutoSellService:
             {
                 'market_state': market_state.state,
                 'server_time': market_state.server_time,
+                'calendar_source': getattr(market_state, 'calendar_source', None),
+                'calendar_source_status': getattr(market_state, 'calendar_source_status', None),
                 'account_reference_errors': errors,
             }
         )
@@ -382,6 +408,20 @@ class SignalDeciderIntradayAutoSellService:
                 'trigger': trigger,
             }
         )
+        if not force and not effective_dry_run and _calendar_requires_operator_override(market_state):
+            payload['summary'] = {
+                **payload['summary'],
+                'triggered': False,
+                'reason': 'calendar_unavailable',
+                'selected_count': 0,
+                'submitted_count': 0,
+                'dry_run_count': 0,
+                'failed_count': 0,
+                'idempotent_replay_count': 0,
+                'calendar_source': getattr(market_state, 'calendar_source', None),
+                'calendar_source_status': getattr(market_state, 'calendar_source_status', None),
+            }
+            return payload
         if not force and market_state.state != 'OPEN':
             payload['summary'] = {
                 **payload['summary'],

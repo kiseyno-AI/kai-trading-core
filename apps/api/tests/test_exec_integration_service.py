@@ -18,6 +18,11 @@ from app.db_models import (
     SignalDeciderExecutionPlanItem,
     Symbol,
 )
+from app.market.session import (
+    KisKrxTradingCalendarProvider,
+    reset_krx_calendar_provider,
+    set_krx_calendar_provider,
+)
 from app.orders.exec_integration import (
     EXEC_ENTRY_BUY_INTENTS,
     EXEC_INTENT_INTRADAY_WATCH_BUY,
@@ -120,6 +125,21 @@ class FailingRuntimeExecClient(FakeExecClient):
         )
 
 
+class FakeCalendarClient:
+    def __init__(self, rows: list[dict]) -> None:
+        self.rows = rows
+        self.calls: list[dict] = []
+
+    async def fetch_krx_holiday_calendar(self, **kwargs):
+        self.calls.append(kwargs)
+        return {'output': list(self.rows)}
+
+
+class FailingCalendarClient:
+    async def fetch_krx_holiday_calendar(self, **_kwargs):
+        raise RuntimeError('kis calendar unavailable')
+
+
 class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -174,11 +194,20 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.enrichment_preflight_mock = self.enrichment_preflight_patcher.start()
         self.addCleanup(self.enrichment_preflight_patcher.stop)
+        self.calendar_client = FakeCalendarClient(
+            [
+                {'bass_dt': '20260429', 'opnd_yn': 'Y'},
+                {'bass_dt': '20260430', 'opnd_yn': 'Y'},
+            ]
+        )
+        set_krx_calendar_provider(KisKrxTradingCalendarProvider(client=self.calendar_client))
+        self.addCleanup(reset_krx_calendar_provider)
         self._seed_symbol()
         self.snapshot_id = self._seed_snapshot()
         self.plan_item_id = self._seed_plan_item()
 
     def tearDown(self) -> None:
+        reset_krx_calendar_provider()
         for key, value in self.original_settings.items():
             setattr(settings, key, value)
         with session_scope() as session:
@@ -675,6 +704,24 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         items_by_agent = {item['decision_agent_name']: item for item in result['items']}
         self.assertEqual(items_by_agent['signal-decider']['eligibility_status'], 'blocked')
         self.assertEqual(items_by_agent['short-term-decider']['execution_status'], EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING)
+
+    async def test_dispatch_next_open_plan_fails_closed_on_calendar_fallback(self) -> None:
+        set_krx_calendar_provider(
+            KisKrxTradingCalendarProvider(client=FailingCalendarClient())
+        )
+
+        result = await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=False,
+            dry_run=False,
+            force=False,
+            trigger='test',
+        )
+
+        self.assertFalse(result['summary']['triggered'])
+        self.assertEqual(result['summary']['reason'], 'calendar_unavailable')
+        self.assertEqual(result['summary']['calendar_source'], 'exchange_calendars')
+        self.assertEqual(self.client.post_calls, [])
 
     async def test_dispatch_next_open_plan_translates_and_persists_exec_linkage(self) -> None:
         result = await self.service.dispatch_next_open_plan(

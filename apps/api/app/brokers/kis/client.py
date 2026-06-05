@@ -451,6 +451,60 @@ class KISClient:
             },
         )
 
+    async def fetch_krx_holiday_calendar(
+        self,
+        *,
+        base_date: str,
+        ctx_area_nk: str = '',
+        ctx_area_fk: str = '',
+        tr_cont: str = '',
+        max_pages: int = 10,
+    ) -> dict[str, Any]:
+        normalized_base_date = str(base_date or '').strip()
+        if not normalized_base_date:
+            raise ValueError('base_date is required as YYYYMMDD')
+
+        params = {
+            'BASS_DT': normalized_base_date,
+            'CTX_AREA_NK': str(ctx_area_nk or ''),
+            'CTX_AREA_FK': str(ctx_area_fk or ''),
+        }
+        rows: list[dict[str, Any]] = []
+        pages: list[dict[str, Any]] = []
+        continuation_pending = False
+        next_tr_cont = tr_cont
+
+        for _ in range(max_pages):
+            body, response_tr_cont = await self._get_response(
+                '/uapi/domestic-stock/v1/quotations/chk-holiday',
+                tr_id='CTCA0903R',
+                params=params,
+                tr_cont=next_tr_cont,
+            )
+            pages.append(body)
+            output_rows = body.get('output')
+            if isinstance(output_rows, list):
+                rows.extend(item for item in output_rows if isinstance(item, dict))
+            elif isinstance(output_rows, dict):
+                rows.append(output_rows)
+
+            params['CTX_AREA_NK'] = str(body.get('ctx_area_nk') or body.get('CTX_AREA_NK') or '')
+            params['CTX_AREA_FK'] = str(body.get('ctx_area_fk') or body.get('CTX_AREA_FK') or '')
+            continuation_pending = response_tr_cont in {'M', 'F'}
+            if not continuation_pending:
+                break
+            next_tr_cont = 'N'
+
+        return {
+            'output': rows,
+            'ctx_area_nk': params['CTX_AREA_NK'],
+            'ctx_area_fk': params['CTX_AREA_FK'],
+            'tr_cont': next_tr_cont if continuation_pending else '',
+            'page_count': len(pages),
+            'max_pages_reached': continuation_pending and len(pages) >= max_pages,
+            'raw_pages': pages,
+        }
+
     async def fetch_market_index_price(self, *, index_code: str) -> dict:
         return await self._get(
             '/uapi/domestic-stock/v1/quotations/inquire-index-price',
