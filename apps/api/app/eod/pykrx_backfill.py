@@ -22,6 +22,7 @@ from app.eod.pykrx_pipeline_support import (
     build_daily_skip_result,
 )
 from app.dart.fundamentals_capture_service import dart_fundamentals_capture_service
+from app.eod.daily_pipeline_state import daily_pipeline_run_state_service
 from app.eod.pykrx_enrichment import pykrx_enrichment_service
 from app.eod.action_summaries import daily_action_summary_service
 from app.eod.pykrx_pipeline_runner import PykrxPipelineDependencies, run_market_data_pipeline
@@ -738,6 +739,7 @@ class PykrxBackfillService:
                 retry_context=retry_context,
                 selected_stages=PYKRX_STAGE_SEQUENCE,
                 chain_fundamentals_followup=True,
+                track_daily_pipeline=True,
             )
             result['triggered'] = True
             _log_pykrx_fetch(
@@ -1023,6 +1025,7 @@ class PykrxBackfillService:
         retry_context: dict | None = None,
         selected_stages: Sequence[str] | None = None,
         chain_fundamentals_followup: bool = True,
+        track_daily_pipeline: bool = False,
     ) -> dict:
         return run_market_data_pipeline(
             self,
@@ -1045,6 +1048,7 @@ class PykrxBackfillService:
                 settings=settings,
                 normalize_yyyymmdd=_normalize_yyyymmdd,
                 update_run_stage_metadata=_update_run_stage_metadata,
+                daily_pipeline_run_state_service=daily_pipeline_run_state_service,
             ),
             start_date=start_date,
             end_date=end_date,
@@ -1058,6 +1062,7 @@ class PykrxBackfillService:
             retry_context=retry_context,
             selected_stages=selected_stages,
             chain_fundamentals_followup=chain_fundamentals_followup,
+            track_daily_pipeline=track_daily_pipeline,
         )
 
     def _load_symbol_fundamentals(self, *, symbol: str, start_date: str, end_date: str):

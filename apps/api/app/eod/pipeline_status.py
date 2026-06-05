@@ -78,6 +78,11 @@ FILTER_STAGE_ORDER = (
 PIPELINE_STAGE_ORDER = (
     tuple(stage_id for stage_id in DAILY_STAGE_ORDER if stage_id != 'market_risk_snapshots')
 )
+LIVE_EOD_RUN_PROGRESS_FALLBACK_STAGE_IDS = tuple(
+    stage_id
+    for stage_id in PIPELINE_STAGE_ORDER
+    if stage_id not in {*PYKRX_STAGE_ORDER, 'pykrx_enrichment'}
+)
 FACTOR_STAGE_MODELS = {
     'momentum_factors': DailyMomentumFactorResult,
     'value_factors': DailyValueFactorResult,
@@ -707,6 +712,11 @@ class EODPipelineStatusService:
                 feedback_run=feedback_run,
                 fallback_stage=stages.get('agent_feedback_summaries') or {},
             )
+        stages = self._overlay_live_eod_run_stage_progress(
+            stages=stages,
+            run=pykrx_run,
+            market_date=resolved_market_date,
+        )
         stages = {
             stage_id: stages[stage_id]
             for stage_id in PIPELINE_STAGE_ORDER
@@ -940,6 +950,123 @@ class EODPipelineStatusService:
                 'inspect_routes': list(definition.inspect_routes),
                 'default_selected': definition.default_selected,
             },
+        }
+
+    def _overlay_live_eod_run_stage_progress(
+        self,
+        *,
+        stages: dict[str, dict[str, Any]],
+        run: dict[str, Any] | None,
+        market_date: str,
+    ) -> dict[str, dict[str, Any]]:
+        if not run:
+            return stages
+        run_metadata = get_run_metadata(run)
+        stage_progress = run_metadata.get('stage_progress') if isinstance(run_metadata.get('stage_progress'), dict) else {}
+        if not stage_progress:
+            return stages
+        overlaid = dict(stages)
+        for stage_id in LIVE_EOD_RUN_PROGRESS_FALLBACK_STAGE_IDS:
+            progress = stage_progress.get(stage_id)
+            if not isinstance(progress, dict):
+                continue
+            fallback_stage = stages.get(stage_id) or {}
+            if not self._should_overlay_live_eod_run_stage_progress(
+                fallback_stage=fallback_stage,
+                progress=progress,
+            ):
+                continue
+            overlaid[stage_id] = self._build_live_eod_run_progress_stage(
+                stage_id=stage_id,
+                market_date=market_date,
+                run=run,
+                run_metadata=run_metadata,
+                progress=progress,
+            )
+        return overlaid
+
+    @staticmethod
+    def _should_overlay_live_eod_run_stage_progress(
+        *,
+        fallback_stage: dict[str, Any],
+        progress: dict[str, Any],
+    ) -> bool:
+        progress_status = _normalize_status(str(progress.get('status') or '')) or 'pending'
+        fallback_status = str(fallback_stage.get('status') or '').strip().lower()
+        if progress_status == 'running':
+            return fallback_status != 'running'
+        if fallback_status == 'pending':
+            return True
+        if progress_status in OFFICIAL_STAGE_HISTORY_INCOMPLETE_STATUSES:
+            fallback_details = fallback_stage.get('details') if isinstance(fallback_stage.get('details'), dict) else {}
+            fallback_mode = str(fallback_details.get('mode') or '').strip()
+            return fallback_mode in PERSISTED_OUTPUT_FALLBACK_MODES
+        return False
+
+    def _build_live_eod_run_progress_stage(
+        self,
+        *,
+        stage_id: str,
+        market_date: str,
+        run: dict[str, Any],
+        run_metadata: dict[str, Any],
+        progress: dict[str, Any],
+    ) -> dict[str, Any]:
+        definition = STAGE_DEFINITIONS[stage_id]
+        status = _normalize_status(str(progress.get('status') or '')) or 'pending'
+        counts = build_stage_counts(
+            total=progress.get('total'),
+            succeeded=progress.get('succeeded'),
+            failed=progress.get('failed'),
+            processed=progress.get('processed'),
+        )
+        progress_source_run_ids = progress.get('source_run_ids') if isinstance(progress.get('source_run_ids'), dict) else {}
+        source_run_ids = {
+            'eod_run_id': run.get('id'),
+            **progress_source_run_ids,
+        }
+        last_progress_at = run_metadata.get('last_progress_at') or progress.get('updated_at')
+        stale_reason = run_metadata.get('stale_failure_reason')
+        current_activity = progress.get('current_activity')
+        if status == 'failed' and stale_reason:
+            current_activity = stale_reason
+        details = {
+            **_progress_extras(progress),
+            'mode': 'eod_collection_run_stage_progress',
+            'progress_source': 'live_run_metadata',
+            'eod_run_id': run.get('id'),
+            'eod_run_status': run.get('status'),
+            'eod_run_trigger': run.get('trigger'),
+            'eod_run_started_at': run.get('started_at'),
+            'last_progress_at': last_progress_at,
+            'stale_running_threshold_minutes': settings.eod_auto_pykrx_stale_run_minutes,
+        }
+        if stale_reason:
+            details['stale_failure_reason'] = stale_reason
+            details['stale_failed_at'] = run_metadata.get('stale_failed_at')
+        completed_at = progress.get('completed_at')
+        if completed_at is None and status in {'completed', 'partial', 'failed', 'blocked', 'waiting', 'skipped'}:
+            completed_at = progress.get('updated_at')
+        return {
+            'task': stage_id,
+            'label': definition.label,
+            'status': status,
+            'source_status': progress.get('status') or run.get('status'),
+            'market_date': market_date,
+            'started_at': progress.get('started_at') or run.get('started_at'),
+            'updated_at': progress.get('updated_at') or last_progress_at or run.get('started_at'),
+            'completed_at': completed_at,
+            'processed': counts.processed,
+            'total': counts.total,
+            'succeeded': counts.succeeded,
+            'failed': counts.failed,
+            'remaining': counts.remaining,
+            'current_step': progress.get('current_step'),
+            'current_activity': current_activity or _default_activity(definition.label, status),
+            'current_symbol': progress.get('current_symbol'),
+            'current_period': progress.get('current_period'),
+            'source_run_ids': source_run_ids,
+            'details': details,
         }
 
     def _build_skipped_stage(

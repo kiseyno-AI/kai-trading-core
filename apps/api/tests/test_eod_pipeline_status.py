@@ -522,6 +522,76 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
             'Running decision support decider dispatch',
         )
 
+    def test_read_summarizes_normalized_warning_followup_official_stage_as_partial(self):
+        market_date = '2026-06-05'
+        official_run = {
+            'id': 505,
+            'market_date': market_date,
+            'trigger': 'auto_close_scheduler',
+            'status': 'partial',
+            'current_stage': 'signal_decider_evaluations',
+            'started_at': '2026-06-05T06:41:47+00:00',
+            'updated_at': '2026-06-05T07:08:00+00:00',
+            'completed_at': '2026-06-05T07:08:00+00:00',
+            'error_message': None,
+            'run_metadata': {
+                'mode': 'daily_auto',
+                'stage_statuses': {'signal_decider_evaluations': 'partial'},
+            },
+            'stages': {
+                'signal_decider_evaluations': {
+                    'stage_id': 'signal_decider_evaluations',
+                    'status': 'partial',
+                    'market_date': market_date,
+                    'started_at': '2026-06-05T07:05:30+00:00',
+                    'updated_at': '2026-06-05T07:08:00+00:00',
+                    'completed_at': '2026-06-05T07:08:00+00:00',
+                    'processed': 228,
+                    'total': 228,
+                    'succeeded': 227,
+                    'failed': 1,
+                    'remaining': 0,
+                    'current_step': 'signal_decider_evaluations_partial',
+                    'current_activity': 'Completed with errors signal decider evaluations',
+                    'current_symbol': None,
+                    'current_period': None,
+                    'source_run_ids': {'eod_run_id': 311},
+                    'details': {
+                        'mode': 'auto_eod_pipeline_tracking',
+                        'progress_source': 'auto_eod_stage_progress',
+                        'result_summary': {
+                            'status': 'warning',
+                            'summary': {'not_computed_count': 1},
+                        },
+                    },
+                },
+            },
+        }
+        service = EODPipelineStatusService(
+            market_state_loader=lambda: _FakeMarketState(),
+            pykrx_run_loader=lambda **_: None,
+            pykrx_stage_counts_loader=lambda *_: {},
+            live_symbol_count_loader=lambda: 228,
+            fundamentals_refresh_loader=lambda **_: None,
+            official_run_loader=lambda **_: official_run,
+        )
+
+        result = service.read(market_date=market_date)
+
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['current_stage'], 'signal_decider_evaluations')
+        self.assertEqual(result['current_stage_status'], 'partial')
+        self.assertEqual(result['partial_stages'], 1)
+        self.assertNotIn('warning', result['stage_status_counts'])
+        stage = result['stages']['signal_decider_evaluations']
+        self.assertEqual(stage['status'], 'partial')
+        self.assertEqual(stage['completed_at'], '2026-06-05T07:08:00+00:00')
+        self.assertEqual(stage['details']['progress_source'], 'auto_eod_stage_progress')
+        self.assertEqual(
+            result['official_run']['run_metadata']['stage_statuses'],
+            {'signal_decider_evaluations': 'partial'},
+        )
+
     def test_read_keeps_break_day_default_market_date_on_current_calendar_day(self):
         service = EODPipelineStatusService(
             market_state_loader=lambda: _FakeBreakDayMarketState(),
@@ -678,6 +748,95 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
             'trigger_after_capture_enabled',
             result['stages']['fundamentals_daily_refresh']['details'],
         )
+
+    def test_read_promotes_active_auto_followup_progress_when_official_rows_are_absent(self):
+        market_date = '2026-06-05'
+        pykrx_run = {
+            'id': 311,
+            'market': 'KRX',
+            'trade_date': market_date,
+            'source': 'pykrx',
+            'trigger': 'auto_close_scheduler',
+            'status': 'running',
+            'symbols_total': 2806,
+            'symbols_succeeded': 2806,
+            'symbols_failed': 0,
+            'error_message': None,
+            'started_at': '2026-06-05T06:41:47+00:00',
+            'completed_at': None,
+            'run_metadata': {
+                'mode': 'daily_auto',
+                'latest_available_trade_date': market_date,
+                'markets': ['KOSPI', 'KOSDAQ'],
+                'stage': 'signal_decider_evaluations',
+                'current_step': 'signal_decider_evaluations_running',
+                'current_activity': 'Running signal-decider evaluation follow-up',
+                'last_progress_at': '2026-06-05T07:06:00+00:00',
+                'stage_progress': {
+                    'price_collection': {
+                        'status': 'completed',
+                        'processed': 2806,
+                        'total': 2806,
+                        'succeeded': 2806,
+                        'failed': 0,
+                        'updated_at': '2026-06-05T06:35:00+00:00',
+                    },
+                    'market_risk_filter': {
+                        'status': 'completed',
+                        'processed': 2806,
+                        'total': 2806,
+                        'succeeded': 2806,
+                        'failed': 0,
+                        'updated_at': '2026-06-05T06:55:00+00:00',
+                    },
+                    'signal_decider_evaluations': {
+                        'status': 'running',
+                        'started_at': '2026-06-05T07:05:30+00:00',
+                        'updated_at': '2026-06-05T07:06:00+00:00',
+                        'current_step': 'signal_decider_evaluations_running',
+                        'current_activity': 'Running signal-decider evaluation follow-up',
+                        'processed': 14,
+                        'total': 228,
+                        'succeeded': 14,
+                        'failed': 0,
+                        'source_run_ids': {'signal_decider_evaluation_run_id': 'recent-coverage'},
+                    },
+                },
+            },
+        }
+        service = EODPipelineStatusService(
+            market_state_loader=lambda: _FakeMarketState(),
+            pykrx_run_loader=lambda **_: pykrx_run,
+            pykrx_stage_counts_loader=lambda *_: {
+                'price_collection': {'persisted': 2806, 'updated_at': '2026-06-05T06:35:00+00:00'},
+                'technical_snapshots': {'persisted': 2806, 'updated_at': '2026-06-05T06:45:00+00:00'},
+                'action_summaries': {'persisted': 2806, 'updated_at': '2026-06-05T06:50:00+00:00'},
+                'trending_ranks': {'persisted': 8418, 'periods_persisted': 3, 'updated_at': '2026-06-05T06:52:00+00:00'},
+            },
+            live_symbol_count_loader=lambda: 4480,
+            fundamentals_refresh_loader=lambda **_: None,
+            official_run_loader=lambda **_: None,
+            official_stage_history_loader=lambda **_: {},
+            price_bar_count_loader=lambda **_: 2806,
+        )
+
+        result = service.read(market_date=market_date)
+
+        self.assertIsNone(result['official_run'])
+        self.assertEqual(result['status'], 'running')
+        self.assertEqual(result['running_stages'], 1)
+        self.assertEqual(result['current_stage'], 'signal_decider_evaluations')
+        stage = result['stages']['signal_decider_evaluations']
+        self.assertEqual(stage['status'], 'running')
+        self.assertEqual(stage['processed'], 14)
+        self.assertEqual(stage['total'], 228)
+        self.assertEqual(stage['current_activity'], 'Running signal-decider evaluation follow-up')
+        self.assertEqual(stage['source_run_ids']['eod_run_id'], 311)
+        self.assertEqual(stage['source_run_ids']['signal_decider_evaluation_run_id'], 'recent-coverage')
+        self.assertEqual(stage['details']['mode'], 'eod_collection_run_stage_progress')
+        self.assertEqual(stage['details']['progress_source'], 'live_run_metadata')
+        self.assertEqual(stage['details']['last_progress_at'], '2026-06-05T07:06:00+00:00')
+        self.assertEqual(stage['details']['stale_running_threshold_minutes'], 30)
 
     def test_read_downgrades_failed_pykrx_stage_when_progress_row_was_left_running(self):
         pykrx_run = {
