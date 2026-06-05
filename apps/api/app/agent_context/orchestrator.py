@@ -23,6 +23,7 @@ from app.agent_context.prerequisite_service import agent_feedback_prerequisite_s
 from app.agent_context.eligibility import (
     AGENT_FEEDBACK_ELIGIBILITY_FILTERS,
     AGENT_FEEDBACK_ELIGIBILITY_RULE,
+    build_agent_feedback_role_funnel,
     resolve_agent_feedback_scope,
     split_requested_symbols_by_agent_feedback_eligibility_with_diagnostics,
 )
@@ -197,6 +198,36 @@ def _attach_agent_feedback_eligibility_context(
         record = records_by_symbol.get(symbol)
         if isinstance(record, dict):
             item['agent_feedback_eligibility'] = record
+
+
+def _normalize_role_symbol_scopes(
+    *,
+    roles: Sequence[str],
+    symbols: Sequence[str],
+    role_symbol_scopes: dict[str, Sequence[str]] | None,
+) -> dict[str, list[str]]:
+    fallback_symbols = _normalize_requested_symbols(symbols)
+    normalized: dict[str, list[str]] = {}
+    for role in roles:
+        source = role_symbol_scopes.get(role) if isinstance(role_symbol_scopes, dict) else None
+        if source is None:
+            normalized[role] = list(fallback_symbols)
+        else:
+            normalized[role] = _normalize_requested_symbols(source)
+    return normalized
+
+
+def _ordered_union(values: Sequence[Sequence[str]]) -> list[str]:
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for group in values:
+        for symbol in group:
+            normalized = str(symbol or '').strip().upper()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            ordered.append(normalized)
+    return ordered
 
 
 DEFAULT_OPENCLAW_AGENT_TIMEOUT_SECONDS = 120.0
@@ -2579,9 +2610,13 @@ class AgentFeedbackOrchestrator:
         reuse_existing: bool = True,
         request_run_id: str | None = None,
         force: bool = False,
+        auto_scope: bool = False,
+        role_symbol_scopes: dict[str, Sequence[str]] | None = None,
+        funnel_diagnostics: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         normalized_market_date = market_date if isinstance(market_date, date) else date.fromisoformat(market_date)
         specs = self._select_specs(roles=roles)
+        requested_role_names = [spec.role for spec in specs]
         requested_symbols = _normalize_requested_symbols(symbols)
         prerequisites = agent_feedback_prerequisite_service.inspect_feedback_prerequisites(
             market_date=normalized_market_date,
@@ -2598,10 +2633,12 @@ class AgentFeedbackOrchestrator:
                     'fs_div': fs_div,
                     'disclosures_limit': disclosures_limit,
                     'reuse_existing': reuse_existing,
-                    'scope': resolve_agent_feedback_scope(requested_symbols=requested_symbols),
+                    'scope': resolve_agent_feedback_scope(requested_symbols=None if auto_scope else requested_symbols),
+                    'auto_scope': auto_scope,
                     'eligibility_rule': AGENT_FEEDBACK_ELIGIBILITY_RULE,
                     'eligibility_filters': list(AGENT_FEEDBACK_ELIGIBILITY_FILTERS),
                     'skipped_symbols': [],
+                    'funnel_diagnostics': funnel_diagnostics,
                     'mode': 'role_sequential_runtime_buffered',
                 },
                 'summary': {
@@ -2624,15 +2661,38 @@ class AgentFeedbackOrchestrator:
         )
         public_eligibility_diagnostics = _public_eligibility_diagnostics(eligibility_diagnostics)
         soft_penalized_symbols = list(public_eligibility_diagnostics.get('soft_penalized_symbols') or [])
+        if funnel_diagnostics is None:
+            records_by_symbol = eligibility_diagnostics.get('records_by_symbol') if isinstance(eligibility_diagnostics, dict) else {}
+            funnel_diagnostics = build_agent_feedback_role_funnel(
+                records=list(records_by_symbol.values()) if isinstance(records_by_symbol, dict) else [],
+                roles=requested_role_names,
+                requested_symbols=None if auto_scope else requested_symbols,
+                candidate_symbols=dispatch_symbols,
+            )
+        normalized_role_symbol_scopes = _normalize_role_symbol_scopes(
+            roles=requested_role_names,
+            symbols=dispatch_symbols,
+            role_symbol_scopes=role_symbol_scopes
+            if role_symbol_scopes is not None
+            else (
+                funnel_diagnostics.get('role_symbols')
+                if isinstance(funnel_diagnostics.get('role_symbols'), dict)
+                else None
+            ),
+        )
+        scoped_dispatch_symbols = _ordered_union(
+            [normalized_role_symbol_scopes.get(role, []) for role in requested_role_names]
+        )
         request_run_id = request_run_id or f'symbol-run-{normalized_market_date.isoformat()}-{uuid.uuid4().hex[:10]}'
         batch_size = max(1, settings.openclaw_agent_symbol_chunk_size)
         role_parallelism = max(1, settings.openclaw_agent_parallel_subtasks)
         request_payload = {
             'market_date': normalized_market_date.isoformat(),
-            'symbols': list(dispatch_symbols),
+            'symbols': list(scoped_dispatch_symbols),
+            'broad_symbols': list(dispatch_symbols),
             'requested_symbols': requested_symbols,
             'request_run_id': request_run_id,
-            'roles': [spec.role for spec in specs],
+            'roles': requested_role_names,
             'fs_div': fs_div,
             'disclosures_limit': disclosures_limit,
             'symbol_chunk_size': batch_size,
@@ -2640,24 +2700,33 @@ class AgentFeedbackOrchestrator:
             'role_parallel_subtasks': role_parallelism,
             'total_parallel_subtasks': role_parallelism,
             'reuse_existing': reuse_existing,
-            'scope': resolve_agent_feedback_scope(requested_symbols=requested_symbols),
+            'scope': resolve_agent_feedback_scope(requested_symbols=None if auto_scope else requested_symbols),
+            'auto_scope': auto_scope,
             'eligibility_rule': AGENT_FEEDBACK_ELIGIBILITY_RULE,
             'eligibility_filters': list(AGENT_FEEDBACK_ELIGIBILITY_FILTERS),
             'skipped_symbols': skipped_symbols,
             'soft_penalized_symbols': soft_penalized_symbols,
             'eligibility_diagnostics': public_eligibility_diagnostics,
+            'funnel_diagnostics': funnel_diagnostics,
+            'role_symbol_scopes': normalized_role_symbol_scopes,
+            'role_symbol_counts': {
+                role: len(symbols)
+                for role, symbols in normalized_role_symbol_scopes.items()
+            },
             'mode': 'role_sequential_runtime_buffered',
         }
         state = RuntimeFeedbackRunState(
             run_id=request_run_id,
             market_date=normalized_market_date,
             requested_symbols=dispatch_symbols,
-            requested_roles=[spec.role for spec in specs],
-            role_sequence=[spec.role for spec in specs],
+            requested_roles=requested_role_names,
+            role_sequence=requested_role_names,
             parallel_per_role=role_parallelism,
             batch_size=batch_size,
             started_at=datetime.now(timezone.utc),
             current_role=specs[0].role if specs else None,
+            role_symbol_scopes=normalized_role_symbol_scopes,
+            funnel_diagnostics=funnel_diagnostics,
         )
         runtime_feedback_state_store.start_run(state)
         agent_context_feedback_run_state_service.start_run(
@@ -2678,10 +2747,10 @@ class AgentFeedbackOrchestrator:
             status='started',
             market_date=normalized_market_date.isoformat(),
             request_run_id=request_run_id,
-            batch_symbols=dispatch_symbols,
+            batch_symbols=scoped_dispatch_symbols,
             requested_symbols=dispatch_symbols,
             skipped_symbols=skipped_symbols,
-            requested_roles=[spec.role for spec in specs],
+            requested_roles=requested_role_names,
             request_payload=request_payload,
             runtime_limits={
                 'batch_size': batch_size,
@@ -2869,7 +2938,7 @@ class AgentFeedbackOrchestrator:
         final_flush_result: dict[str, Any] | None = None
 
         try:
-            if not dispatch_symbols:
+            if not scoped_dispatch_symbols:
                 final_status = 'completed'
                 response_payload = {
                     'request': request_payload,
@@ -2888,21 +2957,21 @@ class AgentFeedbackOrchestrator:
                 if reuse_existing:
                     reuse_decisions = agent_context_reuse_service.build_latest_decisions(
                         market_date=normalized_market_date,
-                        symbols=dispatch_symbols,
-                        roles=[spec.role for spec in specs],
+                        symbols=scoped_dispatch_symbols,
+                        roles=requested_role_names,
                     )
                 upstream_reuse_decisions = {}
                 if any(spec.role in DECISION_SUPPORT_AGENT_NAMES for spec in specs):
                     upstream_reuse_decisions = agent_context_reuse_service.build_latest_decisions(
                         market_date=normalized_market_date,
-                        symbols=dispatch_symbols,
+                        symbols=scoped_dispatch_symbols,
                         roles=UPSTREAM_SUMMARY_ROLES,
                     )
-                symbols_requiring_context = dispatch_symbols
+                symbols_requiring_context = scoped_dispatch_symbols
                 if reuse_decisions:
                     symbols_requiring_context = [
                         symbol
-                        for symbol in dispatch_symbols
+                        for symbol in scoped_dispatch_symbols
                         if any(
                             decision is None or decision.should_dispatch
                             for decision in (
@@ -2959,16 +3028,18 @@ class AgentFeedbackOrchestrator:
                         request_run_id=request_run_id,
                         role=role,
                         agent_name=spec.agent_name,
-                        batch_symbols=dispatch_symbols,
+                        batch_symbols=normalized_role_symbol_scopes.get(role, []),
                     )
 
+                    role_scope_symbols = normalized_role_symbol_scopes.get(role, list(scoped_dispatch_symbols))
+                    role_scope_set = set(role_scope_symbols)
                     role_reuse_items = {
                         symbol: reuse_decisions[symbol][role]
-                        for symbol in dispatch_symbols
+                        for symbol in role_scope_symbols
                         if (reuse_decisions.get(symbol, {}).get(role) is not None)
                         and not reuse_decisions[symbol][role].should_dispatch
                     }
-                    for symbol in dispatch_symbols:
+                    for symbol in role_scope_symbols:
                         decision = reuse_decisions.get(symbol, {}).get(role)
                         if decision is None or not decision.should_dispatch:
                             continue
@@ -3004,7 +3075,11 @@ class AgentFeedbackOrchestrator:
                         role=role,
                         market_date=normalized_market_date,
                         request_run_id=request_run_id,
-                        symbol_context_items=symbol_context['items'],
+                        symbol_context_items=[
+                            item
+                            for item in symbol_context['items']
+                            if str(item.get('symbol') or '').strip().upper() in role_scope_set
+                        ],
                         reuse_decisions=reuse_decisions,
                         upstream_reuse_decisions=upstream_reuse_decisions,
                         all_failures=all_failures,
@@ -3454,7 +3529,7 @@ class AgentFeedbackOrchestrator:
                         request_run_id=request_run_id,
                         role=role,
                         agent_name=spec.agent_name,
-                        batch_symbols=dispatch_symbols,
+                        batch_symbols=role_scope_symbols,
                         persistence_result={
                             'feedback_rows_persisted': role_flush_result.get('feedback_rows_persisted'),
                             'failure_rows_persisted': role_flush_result.get('failure_rows_persisted'),
@@ -3518,7 +3593,7 @@ class AgentFeedbackOrchestrator:
             failed_count = len(final_snapshot.buffered_failures) if final_snapshot is not None else 0
             if raised_exception is not None or finalization_error is not None:
                 final_status = 'partial' if (completed_count > 0 or failed_count > 0) else 'failed'
-            elif dispatch_symbols:
+            elif scoped_dispatch_symbols:
                 final_status = _resolve_dispatch_status(completed=completed_count, failed=failed_count)
             else:
                 final_status = 'completed'
@@ -3541,7 +3616,7 @@ class AgentFeedbackOrchestrator:
                 status='reconciled',
                 market_date=normalized_market_date.isoformat(),
                 request_run_id=request_run_id,
-                batch_symbols=dispatch_symbols,
+                batch_symbols=scoped_dispatch_symbols,
                 terminal_status=final_status,
                 persistence_result={
                     'completed_count': completed_count,
@@ -3588,7 +3663,7 @@ class AgentFeedbackOrchestrator:
                 status='finished',
                 market_date=normalized_market_date.isoformat(),
                 request_run_id=request_run_id,
-                batch_symbols=dispatch_symbols,
+                batch_symbols=scoped_dispatch_symbols,
                 terminal_status=final_status,
                 completed_at=final_snapshot.completed_at.isoformat() if final_snapshot and final_snapshot.completed_at else None,
                 persistence_result={
@@ -3600,7 +3675,7 @@ class AgentFeedbackOrchestrator:
                 run_summary=final_snapshot.to_progress_summary() if final_snapshot else None,
             )
 
-            if response_payload is not None and dispatch_symbols:
+            if response_payload is not None and scoped_dispatch_symbols:
                 response_payload['summary']['status'] = final_status
                 response_payload['summary']['completed'] = completed_count
                 response_payload['summary']['failed'] = failed_count

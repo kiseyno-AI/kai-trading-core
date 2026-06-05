@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from typing import Any, Callable, Sequence
 from uuid import uuid4
@@ -14,6 +14,7 @@ from app.agent_context.eligibility import (
     AGENT_FEEDBACK_ELIGIBILITY_FILTERS,
     AGENT_FEEDBACK_ELIGIBILITY_RULE,
     build_agent_feedback_eligibility_diagnostics,
+    build_agent_feedback_role_funnel,
     load_agent_feedback_eligible_symbols,
     load_agent_feedback_eligibility_records,
     resolve_agent_feedback_scope,
@@ -30,6 +31,19 @@ from app.db import session_scope
 from app.db_models import AgentContextFeedback, AgentContextFeedbackFailure
 
 EXPECTED_ROLES: tuple[str, ...] = DEFAULT_AGENT_NAMES
+
+
+def _normalize_optional_symbol_scope(symbols: Sequence[str]) -> list[str]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw_symbol in symbols:
+        for piece in str(raw_symbol or '').split(','):
+            symbol = piece.strip().upper()
+            if not symbol or symbol in seen:
+                continue
+            seen.add(symbol)
+            normalized.append(symbol)
+    return normalized
 
 
 @dataclass(frozen=True)
@@ -61,6 +75,7 @@ class RoleSequenceSnapshot:
     symbols: tuple[str, ...]
     roles: tuple[str, ...]
     role_states: dict[str, RoleSequenceRoleState]
+    role_symbol_scopes: dict[str, tuple[str, ...]] = field(default_factory=dict)
 
     def boundary_pending_roles(self) -> list[str]:
         return [
@@ -187,9 +202,19 @@ class AgentFeedbackRetryService:
         market_date: date,
         roles: Sequence[str],
         eligible_symbols: Sequence[str],
+        role_symbol_scopes: dict[str, Sequence[str]] | None = None,
     ) -> RoleSequenceSnapshot:
         normalized_roles = tuple(roles)
         normalized_symbols = tuple(eligible_symbols)
+        normalized_symbol_set = set(normalized_symbols)
+        normalized_role_scopes = {
+            role: tuple(
+                symbol
+                for symbol in _normalize_optional_symbol_scope(scope)
+                if symbol in normalized_symbol_set
+            )
+            for role, scope in (role_symbol_scopes or {}).items()
+        }
         completed_by_role, failed_by_role = self._load_same_day_terminal_symbols(
             market_date=market_date,
             roles=normalized_roles,
@@ -198,31 +223,32 @@ class AgentFeedbackRetryService:
 
         role_states: dict[str, RoleSequenceRoleState] = {}
         for role in normalized_roles:
-            completed_symbols = tuple(symbol for symbol in normalized_symbols if symbol in completed_by_role.get(role, set()))
+            role_symbols = normalized_role_scopes.get(role, normalized_symbols)
+            completed_symbols = tuple(symbol for symbol in role_symbols if symbol in completed_by_role.get(role, set()))
             failed_symbols = tuple(
                 symbol
-                for symbol in normalized_symbols
+                for symbol in role_symbols
                 if symbol in failed_by_role.get(role, set()) and symbol not in completed_by_role.get(role, set())
             )
             terminal_symbol_set = set(completed_symbols) | set(failed_symbols)
-            boundary_pending_symbols = tuple(symbol for symbol in normalized_symbols if symbol not in terminal_symbol_set)
+            boundary_pending_symbols = tuple(symbol for symbol in role_symbols if symbol not in terminal_symbol_set)
             retry_pending_symbols = tuple(
                 self.load_incomplete_symbols(
                     market_date=market_date,
                     roles=[role],
-                    eligible_symbols=normalized_symbols,
+                    eligible_symbols=role_symbols,
                 )
             )
             role_states[role] = RoleSequenceRoleState(
                 role=role,
-                total_symbols=len(normalized_symbols),
+                total_symbols=len(role_symbols),
                 completed_symbols=completed_symbols,
                 failed_symbols=failed_symbols,
-                terminal_symbols=tuple(symbol for symbol in normalized_symbols if symbol in terminal_symbol_set),
+                terminal_symbols=tuple(symbol for symbol in role_symbols if symbol in terminal_symbol_set),
                 boundary_pending_symbols=boundary_pending_symbols,
                 retry_pending_symbols=retry_pending_symbols,
                 boundary_status=self._classify_role_boundary_status(
-                    total_symbols=len(normalized_symbols),
+                    total_symbols=len(role_symbols),
                     completed_count=len(completed_symbols),
                     failed_count=len(failed_symbols),
                     pending_count=len(boundary_pending_symbols),
@@ -234,6 +260,10 @@ class AgentFeedbackRetryService:
             symbols=normalized_symbols,
             roles=normalized_roles,
             role_states=role_states,
+            role_symbol_scopes={
+                role: normalized_role_scopes.get(role, normalized_symbols)
+                for role in normalized_roles
+            },
         )
 
     @staticmethod
@@ -304,7 +334,16 @@ class AgentFeedbackRetryService:
         cycle_mode: str | None,
         cycle_status: str,
         status: str,
+        funnel_diagnostics: dict[str, Any] | None = None,
     ) -> RuntimeFeedbackRunState | None:
+        role_symbol_scopes = {
+            role: list(scope)
+            for role, scope in snapshot.role_symbol_scopes.items()
+        } if snapshot.role_symbol_scopes else {
+            role: list(snapshot.symbols)
+            for role in snapshot.roles
+        }
+
         def _update(current: RuntimeFeedbackRunState | None) -> None:
             if current is None:
                 return
@@ -350,8 +389,14 @@ class AgentFeedbackRetryService:
                 role: role_state.boundary_status
                 for role, role_state in snapshot.role_states.items()
             }
+            current.role_symbol_scopes = role_symbol_scopes
+            if funnel_diagnostics is not None:
+                current.funnel_diagnostics = funnel_diagnostics
             current.logical_total_symbols = len(snapshot.symbols)
-            current.logical_expected_feedback_count = len(snapshot.symbols) * len(snapshot.roles)
+            current.logical_expected_feedback_count = sum(
+                len(role_symbol_scopes.get(role, list(snapshot.symbols)))
+                for role in snapshot.roles
+            )
             current.logical_completed_feedback_count = sum(
                 len(role_state.completed_symbols)
                 for role_state in snapshot.role_states.values()
@@ -408,6 +453,8 @@ class AgentFeedbackRetryService:
                 for role, role_payload in role_progress.items()
                 if isinstance(role_payload, dict)
             },
+            'role_symbol_counts': progress_summary.get('role_symbol_counts'),
+            'funnel_diagnostics': progress_summary.get('funnel_diagnostics'),
             'progress_summary': progress_summary,
             'cycle_result': cycle_result,
             'resumed_from_run_id': request_payload.get('resumed_from_run_id'),
@@ -603,6 +650,17 @@ class AgentFeedbackRetryService:
             records=eligibility_records,
             requested_symbols=requested_symbols,
         )
+        role_funnel = build_agent_feedback_role_funnel(
+            records=eligibility_records,
+            roles=roles,
+            requested_symbols=requested_symbols,
+            candidate_symbols=eligible_symbols,
+        )
+        role_symbol_scopes = {
+            role: tuple(symbols)
+            for role, symbols in role_funnel.get('role_symbols', {}).items()
+            if isinstance(symbols, list)
+        }
         skipped_symbols = (
             [symbol for symbol in requested_symbols or () if symbol not in set(eligible_symbols)]
             if requested_symbols is not None
@@ -619,6 +677,7 @@ class AgentFeedbackRetryService:
             market_date=config.market_date,
             roles=roles,
             eligible_symbols=eligible_symbols,
+            role_symbol_scopes=role_symbol_scopes,
         )
         next_plan = self._resolve_cycle_plan(
             snapshot=initial_snapshot,
@@ -642,6 +701,15 @@ class AgentFeedbackRetryService:
             'eligibility_rule': AGENT_FEEDBACK_ELIGIBILITY_RULE,
             'eligibility_filters': list(AGENT_FEEDBACK_ELIGIBILITY_FILTERS),
             'eligibility_diagnostics': eligibility_diagnostics,
+            'funnel_diagnostics': role_funnel,
+            'role_symbol_scopes': {
+                role: list(symbols)
+                for role, symbols in role_symbol_scopes.items()
+            },
+            'role_symbol_counts': {
+                role: len(symbols)
+                for role, symbols in role_symbol_scopes.items()
+            },
             'skipped_symbols': skipped_symbols,
             'mode': DAILY_RETRY_CYCLE_MODE,
             'resumed_from_run_id': previous_run.get('run_id') if isinstance(previous_run, dict) else None,
@@ -656,6 +724,11 @@ class AgentFeedbackRetryService:
             batch_size=max(1, config.outer_batch_size),
             started_at=datetime.now(timezone.utc),
             current_role=next_plan.current_role if next_plan is not None else None,
+            role_symbol_scopes={
+                role: list(symbols)
+                for role, symbols in role_symbol_scopes.items()
+            },
+            funnel_diagnostics=role_funnel,
         )
         runtime_feedback_state_store.start_run(logical_state, replace=True, logical=True)
         self._sync_runtime_state(
@@ -671,6 +744,7 @@ class AgentFeedbackRetryService:
             cycle_mode=next_plan.mode if next_plan is not None else None,
             cycle_status='running' if next_plan is not None else 'completed',
             status='running' if next_plan is not None else 'completed',
+            funnel_diagnostics=role_funnel,
         )
 
         state = runtime_feedback_state_store.get_run(config.market_date, run_id=request_run_id, logical=True)
@@ -733,6 +807,7 @@ class AgentFeedbackRetryService:
                         market_date=config.market_date,
                         roles=roles,
                         eligible_symbols=eligible_symbols,
+                        role_symbol_scopes=role_symbol_scopes,
                     )
                     completed_roles_before = tuple(
                         list(active_plan.completed_roles) + list(active_plan.plan_roles[:index])
@@ -751,6 +826,7 @@ class AgentFeedbackRetryService:
                         cycle_mode=active_plan.mode,
                         cycle_status='running',
                         status='running',
+                        funnel_diagnostics=role_funnel,
                     )
 
                     role_state_before = snapshot_before_role.role_states[role]
@@ -794,6 +870,16 @@ class AgentFeedbackRetryService:
                                 roles=[role],
                                 reuse_existing=False if force else config.reuse_existing,
                                 force=force,
+                                auto_scope=requested_symbols is None,
+                                role_symbol_scopes={role: dispatch_symbols},
+                                funnel_diagnostics={
+                                    **role_funnel,
+                                    'role_symbols': {role: list(dispatch_symbols)},
+                                    'role_symbol_counts': {role: len(dispatch_symbols)},
+                                    'role_diagnostics': {
+                                        role: role_funnel.get('role_diagnostics', {}).get(role, {})
+                                    },
+                                },
                             )
                             role_result.update(
                                 {
@@ -823,6 +909,7 @@ class AgentFeedbackRetryService:
                         market_date=config.market_date,
                         roles=roles,
                         eligible_symbols=eligible_symbols,
+                        role_symbol_scopes=role_symbol_scopes,
                     )
                     role_state_after = snapshot_after_role.role_states[role]
                     role_boundary_complete = len(role_state_after.boundary_pending_symbols) == 0
@@ -853,6 +940,7 @@ class AgentFeedbackRetryService:
                         cycle_mode=active_plan.mode,
                         cycle_status=cycle_status,
                         status='running',
+                        funnel_diagnostics=role_funnel,
                     )
                     self._checkpoint_run_state(
                         market_date=config.market_date,
@@ -888,6 +976,7 @@ class AgentFeedbackRetryService:
                     market_date=config.market_date,
                     roles=roles,
                     eligible_symbols=eligible_symbols,
+                    role_symbol_scopes=role_symbol_scopes,
                 )
                 retry_pending_symbols = self._collect_retry_pending_symbols(snapshot_after_cycle)
                 cycle_status = 'blocked' if blocked else ('completed' if not retry_pending_symbols else 'partial')
@@ -926,6 +1015,7 @@ class AgentFeedbackRetryService:
                 market_date=config.market_date,
                 roles=roles,
                 eligible_symbols=eligible_symbols,
+                role_symbol_scopes=role_symbol_scopes,
             )
             final_retry_pending_symbols = self._collect_retry_pending_symbols(final_snapshot)
             final_boundary_pending_roles = final_snapshot.boundary_pending_roles()
@@ -962,6 +1052,7 @@ class AgentFeedbackRetryService:
                 cycle_mode=resume_plan.mode if resume_plan is not None else None,
                 cycle_status=resolved_cycle_status,
                 status=final_status,
+                funnel_diagnostics=role_funnel,
             )
             final_state = runtime_feedback_state_store.get_run(config.market_date, run_id=request_run_id, logical=True)
             if final_state is not None:
@@ -999,6 +1090,7 @@ class AgentFeedbackRetryService:
                 market_date=config.market_date,
                 roles=roles,
                 eligible_symbols=eligible_symbols,
+                role_symbol_scopes=role_symbol_scopes,
             )
         )
 

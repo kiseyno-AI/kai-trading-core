@@ -75,6 +75,8 @@ class RuntimeFeedbackRunState:
     retry_queued_symbols_by_role: dict[str, set[str]] = field(default_factory=dict)
     retry_attempted_symbols_by_role: dict[str, set[str]] = field(default_factory=dict)
     role_boundary_statuses: dict[str, str] = field(default_factory=dict)
+    role_symbol_scopes: dict[str, list[str]] = field(default_factory=dict)
+    funnel_diagnostics: dict[str, Any] = field(default_factory=dict)
     in_flight_slots_by_role: dict[str, dict[int, dict[str, Any]]] = field(default_factory=dict)
     last_activity_at: datetime | None = None
     logical_total_symbols: int | None = None
@@ -88,19 +90,51 @@ class RuntimeFeedbackRunState:
     flushed_feedback_count: int = 0
     flushed_failure_count: int = 0
 
+    def _symbols_for_role(self, role: str) -> list[str]:
+        scoped = self.role_symbol_scopes.get(role)
+        if scoped is None:
+            return list(self.requested_symbols)
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for symbol in scoped:
+            value = str(symbol or '').strip()
+            if not value or value in seen:
+                continue
+            seen.add(value)
+            normalized.append(value)
+        return normalized
+
     def to_progress_summary(self) -> dict[str, Any]:
         role_boundary_complete_statuses = {'completed', 'completed_with_failures', 'failed'}
-        expected_feedback_count = self.logical_expected_feedback_count if self.logical_expected_feedback_count is not None else len(self.requested_symbols) * len(self.requested_roles)
+        role_scopes = {
+            role: self._symbols_for_role(role)
+            for role in self.requested_roles
+        }
+        role_scope_sets = {
+            role: set(symbols)
+            for role, symbols in role_scopes.items()
+        }
+        expected_feedback_count = (
+            self.logical_expected_feedback_count
+            if self.logical_expected_feedback_count is not None
+            else sum(len(symbols) for symbols in role_scopes.values())
+        )
         completed_feedback_count = (
             self.logical_completed_feedback_count
             if self.logical_completed_feedback_count is not None
-            else sum(len(self.completed_symbols_by_role.get(role, set())) for role in self.requested_roles)
+            else sum(
+                len(self.completed_symbols_by_role.get(role, set()) & role_scope_sets.get(role, set()))
+                for role in self.requested_roles
+            )
         )
         failed_items = (
             self.logical_failed_items
             if self.logical_failed_items is not None
             else (
-                sum(len(self.failed_symbols_by_role.get(role, set())) for role in self.requested_roles)
+                sum(
+                    len(self.failed_symbols_by_role.get(role, set()) & role_scope_sets.get(role, set()))
+                    for role in self.requested_roles
+                )
                 or len(self.buffered_failures)
             )
         )
@@ -120,14 +154,22 @@ class RuntimeFeedbackRunState:
                 completed_symbols = len(self.requested_symbols)
             else:
                 for symbol in self.requested_symbols:
-                    completed_roles = {
+                    expected_roles_for_symbol = [
                         role
                         for role in self.requested_roles
+                        if symbol in role_scope_sets.get(role, set())
+                    ]
+                    if not expected_roles_for_symbol:
+                        completed_symbols += 1
+                        continue
+                    completed_roles = {
+                        role
+                        for role in expected_roles_for_symbol
                         if symbol in self.completed_symbols_by_role.get(role, set())
                     }
                     failed_roles = {
                         role
-                        for role in self.requested_roles
+                        for role in expected_roles_for_symbol
                         if symbol in self.failed_symbols_by_role.get(role, set())
                     }
                     has_in_flight_role = any(
@@ -138,7 +180,7 @@ class RuntimeFeedbackRunState:
                         for slot in role_slots.values()
                     )
                     touched_roles = completed_roles | failed_roles
-                    if len(completed_roles) == len(self.requested_roles):
+                    if len(completed_roles) == len(expected_roles_for_symbol):
                         completed_symbols += 1
                     elif touched_roles or has_in_flight_role:
                         in_progress_symbols += 1
@@ -156,21 +198,28 @@ class RuntimeFeedbackRunState:
 
         role_progress: dict[str, dict[str, Any]] = {}
         for role in self.requested_roles:
-            completed_for_role = len(self.completed_symbols_by_role.get(role, set()))
-            failed_for_role = len(self.failed_symbols_by_role.get(role, set()))
-            reused_for_role = len(self.reused_symbols_by_role.get(role, set()))
-            first_pass_completed_for_role = len(self.first_pass_completed_symbols_by_role.get(role, set()))
-            first_pass_failed_for_role = len(self.first_pass_failed_symbols_by_role.get(role, set()))
-            retry_queued_for_role = len(self.retry_queued_symbols_by_role.get(role, set()))
-            retry_attempted_for_role = len(self.retry_attempted_symbols_by_role.get(role, set()))
+            role_symbols = role_scopes.get(role, list(self.requested_symbols))
+            role_symbol_set = role_scope_sets.get(role, set(role_symbols))
+            role_total_symbols = len(role_symbols)
+            completed_for_role = len(self.completed_symbols_by_role.get(role, set()) & role_symbol_set)
+            failed_for_role = len(self.failed_symbols_by_role.get(role, set()) & role_symbol_set)
+            reused_for_role = len(self.reused_symbols_by_role.get(role, set()) & role_symbol_set)
+            first_pass_completed_for_role = len(self.first_pass_completed_symbols_by_role.get(role, set()) & role_symbol_set)
+            first_pass_failed_for_role = len(self.first_pass_failed_symbols_by_role.get(role, set()) & role_symbol_set)
+            retry_queued_for_role = len(self.retry_queued_symbols_by_role.get(role, set()) & role_symbol_set)
+            retry_attempted_for_role = len(self.retry_attempted_symbols_by_role.get(role, set()) & role_symbol_set)
             in_flight_symbols = set()
             for slot in self.in_flight_slots_by_role.get(role, {}).values():
                 for symbol in slot.get('symbols') or []:
-                    if symbol not in self.completed_symbols_by_role.get(role, set()) and symbol not in self.failed_symbols_by_role.get(role, set()):
+                    if (
+                        symbol in role_symbol_set
+                        and symbol not in self.completed_symbols_by_role.get(role, set())
+                        and symbol not in self.failed_symbols_by_role.get(role, set())
+                    ):
                         in_flight_symbols.add(symbol)
-            processed_for_role = min(total_symbols, completed_for_role + len(in_flight_symbols) + failed_for_role)
-            pending_for_role = max(0, total_symbols - processed_for_role)
-            progress_ratio_for_role = (processed_for_role / total_symbols) if total_symbols else 0.0
+            processed_for_role = min(role_total_symbols, completed_for_role + len(in_flight_symbols) + failed_for_role)
+            pending_for_role = max(0, role_total_symbols - processed_for_role)
+            progress_ratio_for_role = (processed_for_role / role_total_symbols) if role_total_symbols else 0.0
             role_status = 'pending'
             if pending_for_role == 0 and not in_flight_symbols:
                 if failed_for_role == 0:
@@ -182,18 +231,18 @@ class RuntimeFeedbackRunState:
             elif processed_for_role > 0 or in_flight_symbols:
                 role_status = 'running'
             role_status = self.role_boundary_statuses.get(role) or role_status
-            retry_pending_symbols = len(self.retry_pending_symbols_by_role.get(role, set()))
+            retry_pending_symbols = len(self.retry_pending_symbols_by_role.get(role, set()) & role_symbol_set)
             role_progress[role] = {
                 'role': role,
                 'status': role_status,
                 'boundary_status': role_status,
-                'total_symbols': total_symbols,
+                'total_symbols': role_total_symbols,
                 'processed_symbols': processed_for_role,
                 'completed_symbols': completed_for_role,
                 'reused_symbols': reused_for_role,
                 'in_progress_symbols': len(in_flight_symbols),
                 'pending_symbols': pending_for_role,
-                'terminal_symbols': min(total_symbols, completed_for_role + failed_for_role),
+                'terminal_symbols': min(role_total_symbols, completed_for_role + failed_for_role),
                 'failed_items': failed_for_role,
                 'retry_pending_symbols': retry_pending_symbols,
                 'first_pass_completed_symbols': first_pass_completed_for_role,
@@ -269,6 +318,16 @@ class RuntimeFeedbackRunState:
             'cycle_mode': self.cycle_mode,
             'cycle_status': cycle_status,
             'parallel_per_role': self.parallel_per_role,
+            'broad_symbol_count': len(self.requested_symbols),
+            'role_symbol_counts': {
+                role: len(symbols)
+                for role, symbols in role_scopes.items()
+            },
+            'role_symbol_scopes': {
+                role: list(symbols)
+                for role, symbols in role_scopes.items()
+            },
+            'funnel_diagnostics': self.funnel_diagnostics or None,
             'first_feedback_at': self.started_at.isoformat(),
             'latest_feedback_at': self.last_activity_at.isoformat() if self.last_activity_at else None,
             'elapsed_seconds': elapsed_seconds,

@@ -6,6 +6,7 @@ from app.agent_context.eligibility import (
     AGENT_FEEDBACK_SCOPE_ALL,
     AGENT_FEEDBACK_SCOPE_REQUESTED,
     AGENT_FEEDBACK_STRATEGY_SCOPE_VALUE_LONG_ONLY,
+    build_agent_feedback_role_funnel,
     load_agent_feedback_eligible_symbols,
     load_agent_feedback_eligibility_records,
     resolve_agent_feedback_scope,
@@ -164,6 +165,7 @@ class AgentFeedbackEligibilityTests(unittest.TestCase):
         self.assertEqual(top_record['candidate_rank'], 1)
         self.assertEqual(top_record['candidate_cap']['pre_cap_eligible_count'], 10)
         self.assertEqual(top_record['candidate_cap']['post_cap_dispatched_count'], 2)
+        self.assertEqual(top_record['candidate_cap']['cap_scope'], 'broad_feedback_universe')
 
     def test_requested_symbol_scope_is_not_percentile_capped(self) -> None:
         symbols = [f'{index:06d}' for index in range(1, 11)]
@@ -198,6 +200,205 @@ class AgentFeedbackEligibilityTests(unittest.TestCase):
 
         self.assertEqual(result, symbols)
         self.assertFalse(any(record.get('cap_excluded') for record in records))
+        self.assertTrue(
+            all(
+                record.get('candidate_selection_reason') == 'requested_symbol_scope_cap_bypass'
+                for record in records
+            )
+        )
+
+    def test_broad_candidate_cap_preserves_forced_symbols_over_rank_cutoff(self) -> None:
+        symbols = [f'{index:06d}' for index in range(1, 6)]
+        forced_reasons = {
+            '000001': [
+                {
+                    'code': 'same_day_disclosure_event',
+                    'source': 'dart_disclosure_events',
+                    'message': 'Same-day disclosure event exists.',
+                }
+            ]
+        }
+        with patch(
+            'app.agent_context.eligibility.load_daily_piotroski_filter_results',
+            return_value=[
+                {'symbol': symbol, 'passed_filter': False, 'is_low_pbr': False, 'filter_payload': {}}
+                for symbol in symbols
+            ],
+        ):
+            with patch(
+                'app.agent_context.eligibility.load_daily_market_risk_filter_results',
+                return_value=[
+                    {'symbol': symbol, 'passed_filter': True, 'filter_payload': {}}
+                    for symbol in symbols
+                ],
+            ):
+                with patch(
+                    'app.agent_context.eligibility.load_agent_feedback_candidate_score_rows',
+                    return_value=[
+                        {'symbol': symbol, 'signal_score': index}
+                        for index, symbol in enumerate(symbols, start=1)
+                    ],
+                ):
+                    with patch(
+                        'app.agent_context.eligibility._load_forced_inclusion_reasons',
+                        return_value=(forced_reasons, {'event_symbols': {'status': 'loaded', 'matched_events': 1}}),
+                    ):
+                        with patch('app.agent_context.eligibility.settings.openclaw_feedback_candidate_cap_percentile', 0.2):
+                            with patch('app.agent_context.eligibility.settings.openclaw_feedback_candidate_cap_min_symbols', 0):
+                                with patch('app.agent_context.eligibility.settings.openclaw_feedback_candidate_cap_max_symbols', 0):
+                                    result = load_agent_feedback_eligible_symbols(
+                                        market_date=date.fromisoformat('2026-04-16'),
+                                    )
+                                    records = load_agent_feedback_eligibility_records(
+                                        market_date=date.fromisoformat('2026-04-16'),
+                                    )
+
+        self.assertEqual(result, ['000005', '000001'])
+        forced_record = next(record for record in records if record['symbol'] == '000001')
+        self.assertTrue(forced_record['forced_included'])
+        self.assertEqual(forced_record['candidate_rank'], 5)
+        self.assertEqual(
+            forced_record['candidate_selection_reason'],
+            'forced_included_over_broad_rank_cap',
+        )
+        self.assertEqual(forced_record['candidate_cap']['post_cap_dispatched_count'], 2)
+        self.assertEqual(forced_record['candidate_cap']['forced_included_count'], 1)
+        self.assertEqual(
+            forced_record['candidate_cap']['forced_source_diagnostics']['event_symbols']['matched_events'],
+            1,
+        )
+
+    def test_role_funnel_applies_role_caps_and_summarizer_gate_to_deciders(self) -> None:
+        records = [
+            {
+                'symbol': '005930',
+                'candidate_rank': 1,
+                'candidate_score': 90,
+                'hard_blocked': False,
+                'cap_excluded': False,
+                'forced_inclusion_reasons': [],
+            },
+            {
+                'symbol': '000660',
+                'candidate_rank': 2,
+                'candidate_score': 80,
+                'hard_blocked': False,
+                'cap_excluded': False,
+                'forced_inclusion_reasons': [],
+            },
+            {
+                'symbol': '035420',
+                'candidate_rank': 3,
+                'candidate_score': 10,
+                'hard_blocked': False,
+                'cap_excluded': False,
+                'forced_inclusion_reasons': [],
+            },
+        ]
+        summarizer_gate = {
+            '035420': {
+                'details': {
+                    'summarizer_gate': {
+                        'candidate_action': 'advance_to_decider',
+                        'priority_score': 0.95,
+                    }
+                }
+            }
+        }
+
+        with patch('app.agent_context.eligibility.settings.openclaw_feedback_role_cap_eod_summarizer', 3):
+            with patch('app.agent_context.eligibility.settings.openclaw_feedback_role_cap_signal_decider', 1):
+                funnel = build_agent_feedback_role_funnel(
+                    records=records,
+                    roles=['eod-summarizer', 'signal-decider'],
+                    summarizer_gate_by_symbol=summarizer_gate,
+                )
+
+        self.assertEqual(funnel['role_symbols']['eod-summarizer'], ['005930', '000660', '035420'])
+        self.assertEqual(funnel['role_symbols']['signal-decider'], ['035420'])
+        self.assertEqual(funnel['role_symbol_counts']['signal-decider'], 1)
+        self.assertTrue(
+            funnel['role_diagnostics']['signal-decider']['role_cap']['applied']
+        )
+        self.assertIn(
+            'summarizer_gate_advance_to_decider',
+            funnel['role_diagnostics']['signal-decider']['selection_reasons_by_symbol']['035420'],
+        )
+
+    def test_role_funnel_keeps_forced_symbols_over_role_cap(self) -> None:
+        records = [
+            {
+                'symbol': '005930',
+                'candidate_rank': 1,
+                'candidate_score': 100,
+                'hard_blocked': False,
+                'cap_excluded': False,
+                'forced_inclusion_reasons': [],
+            },
+            {
+                'symbol': '000660',
+                'candidate_rank': 2,
+                'candidate_score': 90,
+                'hard_blocked': False,
+                'cap_excluded': False,
+                'forced_inclusion_reasons': [],
+            },
+            {
+                'symbol': '035420',
+                'candidate_rank': 3,
+                'candidate_score': 1,
+                'hard_blocked': False,
+                'cap_excluded': False,
+                'forced_inclusion_reasons': [
+                    {
+                        'code': 'active_exec_watch_item',
+                        'source': 'signal_decider_execution_plan_items',
+                    }
+                ],
+            },
+        ]
+
+        with patch('app.agent_context.eligibility.settings.openclaw_feedback_role_cap_signal_decider', 1):
+            funnel = build_agent_feedback_role_funnel(
+                records=records,
+                roles=['signal-decider'],
+            )
+
+        self.assertEqual(funnel['role_symbols']['signal-decider'], ['005930', '035420'])
+        diagnostics = funnel['role_diagnostics']['signal-decider']
+        self.assertEqual(diagnostics['role_cap']['configured_cap'], 1)
+        self.assertEqual(diagnostics['role_cap']['post_cap_symbol_count'], 2)
+        self.assertEqual(diagnostics['role_cap']['forced_included_count'], 1)
+        self.assertIn('035420', diagnostics['forced_included_symbols'])
+        self.assertIn('000660', diagnostics['cap_excluded_symbols'])
+
+    def test_role_funnel_requested_symbol_dispatch_bypasses_role_caps(self) -> None:
+        records = [
+            {
+                'symbol': symbol,
+                'candidate_rank': index,
+                'candidate_score': 100 - index,
+                'hard_blocked': False,
+                'cap_excluded': False,
+            }
+            for index, symbol in enumerate(['005930', '000660', '035420'], start=1)
+        ]
+
+        with patch('app.agent_context.eligibility.settings.openclaw_feedback_role_cap_signal_decider', 1):
+            funnel = build_agent_feedback_role_funnel(
+                records=records,
+                roles=['signal-decider'],
+                requested_symbols=['005930', '000660', '035420'],
+            )
+
+        self.assertEqual(funnel['role_symbols']['signal-decider'], ['005930', '000660', '035420'])
+        diagnostics = funnel['role_diagnostics']['signal-decider']
+        self.assertFalse(diagnostics['role_cap']['applied'])
+        self.assertTrue(diagnostics['role_cap']['requested_scope_bypass'])
+        self.assertEqual(
+            diagnostics['role_cap']['bypass_reason'],
+            'requested_symbol_scope_cap_bypass',
+        )
 
     def test_requested_symbol_scope_preserves_order_and_explains_hard_vs_soft_results(self) -> None:
         with patch(
