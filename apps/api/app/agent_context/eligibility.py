@@ -1,28 +1,97 @@
 from __future__ import annotations
 
+from collections import defaultdict
 from datetime import date
 from math import ceil
 from typing import Any, Sequence
 
+from sqlalchemy import select
+
+from app.agent_context.roles import DECISION_SUPPORT_AGENT_NAMES
 from app.core.settings import settings
+from app.db import session_scope
+from app.db_models import (
+    AgentContextFeedback,
+    BrokerOrder,
+    DartDisclosureEvent,
+    OrderRequest,
+    SignalDeciderExecutionPlanItem,
+)
 from app.market_data_store import (
     load_agent_feedback_candidate_score_rows,
     load_daily_market_risk_filter_results,
     load_daily_piotroski_filter_results,
 )
+from app.orders.domain import BrokerOrderStatus, OrderRequestSubmissionStatus
 
 AGENT_FEEDBACK_ELIGIBILITY_FILTERS: tuple[str, ...] = (
     'market_risk_filter',
     'piotroski_filter',
 )
 AGENT_FEEDBACK_ELIGIBILITY_RULE = 'strategy_aware_prefilter_scoring_v1'
-AGENT_FEEDBACK_CANDIDATE_CAP_RULE = 'strategy_aware_prefilter_top_percentile_cap_v1'
+AGENT_FEEDBACK_CANDIDATE_CAP_RULE = 'strategy_aware_prefilter_broad_top_percentile_cap_v2'
+AGENT_FEEDBACK_ROLE_CAP_RULE = 'agent_feedback_role_scope_cap_v1'
+AGENT_FEEDBACK_FUNNEL_SCHEMA_VERSION = 'agent_feedback_funnel_v1'
 AGENT_FEEDBACK_VALUE_LONG_ONLY_ELIGIBILITY_RULE = 'market_risk_filter_passed_and_piotroski_passed_v1'
 AGENT_FEEDBACK_STRATEGY_SCOPE_SHORT_TERM_MOMENTUM = 'short_term_momentum_breakout'
 AGENT_FEEDBACK_STRATEGY_SCOPE_VALUE_LONG_ONLY = 'value_long_only'
 AGENT_FEEDBACK_DEFAULT_STRATEGY_SCOPE = AGENT_FEEDBACK_STRATEGY_SCOPE_SHORT_TERM_MOMENTUM
 AGENT_FEEDBACK_SCOPE_ALL = 'active_strategy_aware_prefilter_scoring'
 AGENT_FEEDBACK_SCOPE_REQUESTED = 'requested_symbols_scored_by_strategy_aware_prefilter'
+AGENT_FEEDBACK_ROLE_CAP_BYPASS_REASON_REQUESTED = 'requested_symbol_scope_cap_bypass'
+
+_BROAD_CAP_DEFAULTS = {
+    'percentile': 0.10,
+    'min_symbols': 150,
+    'max_symbols': 200,
+}
+_LEGACY_BROAD_CAP_DEFAULTS = {
+    'percentile': 0.10,
+    'min_symbols': 150,
+    'max_symbols': 300,
+}
+_ROLE_CAP_SETTING_BY_ROLE = {
+    'eod-summarizer': 'openclaw_feedback_role_cap_eod_summarizer',
+    'technical-summarizer': 'openclaw_feedback_role_cap_technical_summarizer',
+    'fundamental-summarizer': 'openclaw_feedback_role_cap_fundamental_summarizer',
+    'short-term-decider': 'openclaw_feedback_role_cap_short_term_decider',
+    'signal-decider': 'openclaw_feedback_role_cap_signal_decider',
+}
+_ROLE_CAP_DEFAULT_BY_ROLE = {
+    'eod-summarizer': 200,
+    'technical-summarizer': 150,
+    'fundamental-summarizer': 120,
+    'short-term-decider': 80,
+    'signal-decider': 80,
+}
+_POSITIVE_DECIDER_ACTIONS = {
+    'buy',
+    'watch',
+    'watch_only',
+    'watch_for_trigger',
+    'scalp_buy_candidate',
+    'advance_to_decider',
+}
+_ACTIVE_ORDER_REQUEST_STATUSES = {
+    OrderRequestSubmissionStatus.PENDING_SUBMIT.value,
+    OrderRequestSubmissionStatus.SUBMITTING.value,
+    OrderRequestSubmissionStatus.SUBMITTED.value,
+}
+_ACTIVE_BROKER_ORDER_STATUSES = {
+    BrokerOrderStatus.PENDING_SUBMIT.value,
+    BrokerOrderStatus.SUBMITTED.value,
+    BrokerOrderStatus.ACCEPTED.value,
+    BrokerOrderStatus.CANCEL_PENDING.value,
+    BrokerOrderStatus.REPLACE_PENDING.value,
+    BrokerOrderStatus.PARTIAL_FILL.value,
+    BrokerOrderStatus.RECONCILE_ONLY.value,
+}
+_ACTIVE_EXEC_WATCH_STATUSES = {
+    'planned',
+    'dry_run',
+    'submitted',
+    'delegated_for_exec_agent_sizing',
+}
 
 
 def _normalize_symbol(value: Any) -> str:
@@ -72,6 +141,95 @@ def _as_int(value: Any, default: int = 0) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _normalize_action(value: Any) -> str:
+    return str(value or '').strip().lower().replace('-', '_')
+
+
+def _setting_with_legacy(
+    *,
+    current_name: str,
+    legacy_name: str,
+    current_default: Any,
+    legacy_default: Any,
+) -> Any:
+    value = getattr(settings, current_name, current_default)
+    legacy_value = getattr(settings, legacy_name, legacy_default)
+    if value == current_default and legacy_value != legacy_default:
+        return legacy_value
+    return value
+
+
+def _broad_cap_settings() -> dict[str, int | float]:
+    return {
+        'percentile': float(
+            _setting_with_legacy(
+                current_name='openclaw_feedback_broad_candidate_cap_percentile',
+                legacy_name='openclaw_feedback_candidate_cap_percentile',
+                current_default=_BROAD_CAP_DEFAULTS['percentile'],
+                legacy_default=_LEGACY_BROAD_CAP_DEFAULTS['percentile'],
+            )
+        ),
+        'min_symbols': int(
+            _setting_with_legacy(
+                current_name='openclaw_feedback_broad_candidate_cap_min_symbols',
+                legacy_name='openclaw_feedback_candidate_cap_min_symbols',
+                current_default=_BROAD_CAP_DEFAULTS['min_symbols'],
+                legacy_default=_LEGACY_BROAD_CAP_DEFAULTS['min_symbols'],
+            )
+        ),
+        'max_symbols': int(
+            _setting_with_legacy(
+                current_name='openclaw_feedback_broad_candidate_cap_max_symbols',
+                legacy_name='openclaw_feedback_candidate_cap_max_symbols',
+                current_default=_BROAD_CAP_DEFAULTS['max_symbols'],
+                legacy_default=_LEGACY_BROAD_CAP_DEFAULTS['max_symbols'],
+            )
+        ),
+    }
+
+
+def _role_cap_limit(role: str, total: int) -> int:
+    setting_name = _ROLE_CAP_SETTING_BY_ROLE.get(role)
+    configured = getattr(
+        settings,
+        setting_name,
+        _ROLE_CAP_DEFAULT_BY_ROLE.get(role, total),
+    ) if setting_name else total
+    cap = max(0, _as_int(configured, default=0))
+    if total <= 0 or cap <= 0:
+        return total
+    return min(total, cap)
+
+
+def _append_forced_reason(
+    reasons_by_symbol: dict[str, list[dict[str, Any]]],
+    *,
+    symbol: str,
+    code: str,
+    source: str,
+    message: str,
+    details: dict[str, Any] | None = None,
+) -> None:
+    normalized_symbol = _normalize_symbol(symbol)
+    if not normalized_symbol:
+        return
+    reason: dict[str, Any] = {
+        'code': code,
+        'source': source,
+        'message': message,
+    }
+    if details:
+        reason['details'] = details
+    existing_codes = {
+        str(item.get('code') or '')
+        for item in reasons_by_symbol.get(normalized_symbol, [])
+        if isinstance(item, dict)
+    }
+    if code in existing_codes:
+        return
+    reasons_by_symbol.setdefault(normalized_symbol, []).append(reason)
 
 
 def _reason(
@@ -386,10 +544,348 @@ def _candidate_score_payload(
     }
 
 
+def _feedback_payload_positive_action(payload: dict[str, Any]) -> str | None:
+    for key in (
+        'candidate_action',
+        'preferred_action',
+        'next_day_open_action',
+        'tactical_action',
+        'action',
+    ):
+        action = _normalize_action(payload.get(key))
+        if action in _POSITIVE_DECIDER_ACTIONS:
+            return action
+    return None
+
+
+def _load_prior_positive_decision_reasons(
+    *,
+    market_date: date,
+    symbols: Sequence[str],
+    reasons_by_symbol: dict[str, list[dict[str, Any]]],
+) -> dict[str, Any]:
+    if not bool(getattr(settings, 'openclaw_feedback_force_include_prior_decisions_enabled', True)):
+        return {'status': 'disabled'}
+    if not symbols:
+        return {'status': 'empty_scope'}
+    try:
+        with session_scope() as session:
+            rows = session.execute(
+                select(
+                    AgentContextFeedback.symbol,
+                    AgentContextFeedback.agent_name,
+                    AgentContextFeedback.market_date,
+                    AgentContextFeedback.feedback_payload,
+                    AgentContextFeedback.normalized_feedback_payload,
+                    AgentContextFeedback.received_at,
+                )
+                .where(AgentContextFeedback.market_date < market_date)
+                .where(AgentContextFeedback.symbol.in_(list(symbols)))
+                .where(AgentContextFeedback.agent_name.in_(list(DECISION_SUPPORT_AGENT_NAMES)))
+                .order_by(
+                    AgentContextFeedback.symbol.asc(),
+                    AgentContextFeedback.agent_name.asc(),
+                    AgentContextFeedback.market_date.desc(),
+                    AgentContextFeedback.received_at.desc(),
+                    AgentContextFeedback.id.desc(),
+                )
+            ).all()
+    except Exception as exc:  # noqa: BLE001
+        return {'status': 'source_error', 'error_type': type(exc).__name__, 'message': str(exc)}
+
+    seen: set[tuple[str, str]] = set()
+    matched = 0
+    for row in rows:
+        symbol = _normalize_symbol(row.symbol)
+        agent_name = str(row.agent_name or '')
+        key = (symbol, agent_name)
+        if key in seen:
+            continue
+        seen.add(key)
+        payload = (
+            row.normalized_feedback_payload
+            if isinstance(row.normalized_feedback_payload, dict)
+            else row.feedback_payload
+        )
+        if not isinstance(payload, dict):
+            continue
+        action = _feedback_payload_positive_action(payload)
+        if action is None:
+            continue
+        matched += 1
+        _append_forced_reason(
+            reasons_by_symbol,
+            symbol=symbol,
+            code='prior_positive_decider_action',
+            source='agent_context_feedback',
+            message='Latest prior decider feedback for this symbol carried a positive buy/watch action.',
+            details={
+                'agent_name': agent_name,
+                'source_market_date': row.market_date.isoformat() if row.market_date else None,
+                'action': action,
+                'received_at': row.received_at.isoformat() if row.received_at else None,
+            },
+        )
+    return {'status': 'loaded', 'matched_symbols': matched}
+
+
+def _load_event_symbol_reasons(
+    *,
+    market_date: date,
+    symbols: Sequence[str],
+    reasons_by_symbol: dict[str, list[dict[str, Any]]],
+) -> dict[str, Any]:
+    if not bool(getattr(settings, 'openclaw_feedback_force_include_event_symbols_enabled', True)):
+        return {'status': 'disabled'}
+    if not symbols:
+        return {'status': 'empty_scope'}
+    try:
+        with session_scope() as session:
+            rows = session.execute(
+                select(
+                    DartDisclosureEvent.stock_code,
+                    DartDisclosureEvent.rcept_no,
+                    DartDisclosureEvent.report_nm,
+                    DartDisclosureEvent.receipt_date,
+                )
+                .where(DartDisclosureEvent.receipt_date == market_date)
+                .where(DartDisclosureEvent.stock_code.in_(list(symbols)))
+                .order_by(DartDisclosureEvent.stock_code.asc(), DartDisclosureEvent.id.desc())
+            ).all()
+    except Exception as exc:  # noqa: BLE001
+        return {'status': 'source_error', 'error_type': type(exc).__name__, 'message': str(exc)}
+
+    matched = 0
+    for row in rows:
+        matched += 1
+        _append_forced_reason(
+            reasons_by_symbol,
+            symbol=row.stock_code,
+            code='same_day_disclosure_event',
+            source='dart_disclosure_events',
+            message='Same-day DART disclosure event exists for this symbol.',
+            details={
+                'rcept_no': row.rcept_no,
+                'report_nm': row.report_nm,
+                'receipt_date': row.receipt_date.isoformat() if row.receipt_date else None,
+            },
+        )
+    return {'status': 'loaded', 'matched_events': matched}
+
+
+def _load_active_order_reasons(
+    *,
+    symbols: Sequence[str],
+    reasons_by_symbol: dict[str, list[dict[str, Any]]],
+) -> dict[str, Any]:
+    if not symbols:
+        return {'status': 'empty_scope'}
+    try:
+        with session_scope() as session:
+            request_rows = session.execute(
+                select(OrderRequest.symbol, OrderRequest.client_order_id, OrderRequest.submission_status)
+                .where(OrderRequest.symbol.in_(list(symbols)))
+                .where(OrderRequest.submission_status.in_(list(_ACTIVE_ORDER_REQUEST_STATUSES)))
+                .order_by(OrderRequest.symbol.asc(), OrderRequest.updated_at.desc(), OrderRequest.id.desc())
+            ).all()
+            broker_rows = session.execute(
+                select(BrokerOrder.symbol, BrokerOrder.client_order_id, BrokerOrder.current_status)
+                .where(BrokerOrder.symbol.in_(list(symbols)))
+                .where(BrokerOrder.current_status.in_(list(_ACTIVE_BROKER_ORDER_STATUSES)))
+                .order_by(BrokerOrder.symbol.asc(), BrokerOrder.updated_at.desc(), BrokerOrder.id.desc())
+            ).all()
+    except Exception as exc:  # noqa: BLE001
+        return {'status': 'source_error', 'error_type': type(exc).__name__, 'message': str(exc)}
+
+    matched = 0
+    for row in request_rows:
+        matched += 1
+        _append_forced_reason(
+            reasons_by_symbol,
+            symbol=row.symbol,
+            code='active_order_request',
+            source='order_requests',
+            message='A local order request for this symbol is still active.',
+            details={
+                'client_order_id': row.client_order_id,
+                'submission_status': row.submission_status,
+            },
+        )
+    for row in broker_rows:
+        matched += 1
+        _append_forced_reason(
+            reasons_by_symbol,
+            symbol=row.symbol,
+            code='active_broker_order',
+            source='broker_orders',
+            message='A broker order row for this symbol is still active.',
+            details={
+                'client_order_id': row.client_order_id,
+                'current_status': row.current_status,
+            },
+        )
+    return {'status': 'loaded', 'matched_rows': matched}
+
+
+def _load_active_watch_reasons(
+    *,
+    market_date: date,
+    symbols: Sequence[str],
+    reasons_by_symbol: dict[str, list[dict[str, Any]]],
+) -> dict[str, Any]:
+    if not bool(getattr(settings, 'openclaw_feedback_force_include_active_watch_enabled', True)):
+        return {'status': 'disabled'}
+    if not symbols:
+        return {'status': 'empty_scope'}
+    try:
+        with session_scope() as session:
+            rows = session.execute(
+                select(
+                    SignalDeciderExecutionPlanItem.symbol,
+                    SignalDeciderExecutionPlanItem.decision_agent_name,
+                    SignalDeciderExecutionPlanItem.execution_window,
+                    SignalDeciderExecutionPlanItem.target_trade_date,
+                    SignalDeciderExecutionPlanItem.eligibility_status,
+                    SignalDeciderExecutionPlanItem.execution_status,
+                )
+                .where(SignalDeciderExecutionPlanItem.symbol.in_(list(symbols)))
+                .where(SignalDeciderExecutionPlanItem.target_trade_date >= market_date)
+                .where(SignalDeciderExecutionPlanItem.execution_status.in_(list(_ACTIVE_EXEC_WATCH_STATUSES)))
+                .order_by(
+                    SignalDeciderExecutionPlanItem.symbol.asc(),
+                    SignalDeciderExecutionPlanItem.target_trade_date.desc(),
+                    SignalDeciderExecutionPlanItem.id.desc(),
+                )
+            ).all()
+    except Exception as exc:  # noqa: BLE001
+        return {'status': 'source_error', 'error_type': type(exc).__name__, 'message': str(exc)}
+
+    matched = 0
+    for row in rows:
+        matched += 1
+        _append_forced_reason(
+            reasons_by_symbol,
+            symbol=row.symbol,
+            code='active_exec_watch_item',
+            source='signal_decider_execution_plan_items',
+            message='A local exec/monitoring plan row is still active for this symbol.',
+            details={
+                'decision_agent_name': row.decision_agent_name,
+                'execution_window': row.execution_window,
+                'target_trade_date': row.target_trade_date.isoformat() if row.target_trade_date else None,
+                'eligibility_status': row.eligibility_status,
+                'execution_status': row.execution_status,
+            },
+        )
+    return {'status': 'loaded', 'matched_rows': matched}
+
+
+def _add_score_signal_forced_reasons(
+    *,
+    score_by_symbol: dict[str, dict],
+    reasons_by_symbol: dict[str, list[dict[str, Any]]],
+) -> dict[str, Any]:
+    matched = 0
+    for symbol, row in score_by_symbol.items():
+        signal_count = _as_int(row.get('signal_count'), default=0)
+        rank_fields = {
+            'volume_power_rank': _as_int(row.get('volume_power_rank'), default=10**9),
+            'overtime_volume_rank': _as_int(row.get('overtime_volume_rank'), default=10**9),
+            'overtime_fluctuation_rank': _as_int(row.get('overtime_fluctuation_rank'), default=10**9),
+        }
+        top_rank_fields = {
+            field: rank
+            for field, rank in rank_fields.items()
+            if 0 < rank <= 30
+        }
+        if signal_count <= 0 and not top_rank_fields:
+            continue
+        matched += 1
+        _append_forced_reason(
+            reasons_by_symbol,
+            symbol=symbol,
+            code='abnormal_volume_or_price_signal',
+            source='agent_feedback_candidate_score_rows',
+            message='KIS ranking or direct signal score indicates abnormal volume/price movement.',
+            details={
+                'signal_count': signal_count,
+                'top_rank_fields': top_rank_fields,
+            },
+        )
+    return {'status': 'loaded', 'matched_symbols': matched}
+
+
+def _load_forced_inclusion_reasons(
+    *,
+    market_date: date,
+    symbols: Sequence[str],
+    requested_symbols: Sequence[str] | None,
+    score_by_symbol: dict[str, dict] | None = None,
+) -> tuple[dict[str, list[dict[str, Any]]], dict[str, Any]]:
+    normalized_symbols = _normalize_symbol_scope(symbols) or []
+    reasons_by_symbol: dict[str, list[dict[str, Any]]] = {}
+    source_diagnostics: dict[str, Any] = {
+        'schema_version': AGENT_FEEDBACK_FUNNEL_SCHEMA_VERSION,
+        'holdings': {
+            'status': (
+                'source_unavailable'
+                if bool(getattr(settings, 'openclaw_feedback_force_include_holdings_enabled', True))
+                else 'disabled'
+            ),
+            'message': (
+                'No persisted holdings snapshot table is available in core; '
+                'live portfolio APIs are not called during feedback eligibility.'
+            ),
+        },
+    }
+    if requested_symbols is not None:
+        for symbol in _normalize_symbol_scope(requested_symbols) or []:
+            _append_forced_reason(
+                reasons_by_symbol,
+                symbol=symbol,
+                code='manual_requested_symbol',
+                source='request',
+                message=(
+                    'Symbol was explicitly requested by the caller; '
+                    'percentile and role caps are bypassed for requested-symbol dispatch.'
+                ),
+            )
+        source_diagnostics['manual_requested_symbols'] = {
+            'status': 'loaded',
+            'matched_symbols': len(reasons_by_symbol),
+        }
+
+    source_diagnostics['prior_decisions'] = _load_prior_positive_decision_reasons(
+        market_date=market_date,
+        symbols=normalized_symbols,
+        reasons_by_symbol=reasons_by_symbol,
+    )
+    source_diagnostics['event_symbols'] = _load_event_symbol_reasons(
+        market_date=market_date,
+        symbols=normalized_symbols,
+        reasons_by_symbol=reasons_by_symbol,
+    )
+    source_diagnostics['open_orders'] = _load_active_order_reasons(
+        symbols=normalized_symbols,
+        reasons_by_symbol=reasons_by_symbol,
+    )
+    source_diagnostics['active_watch'] = _load_active_watch_reasons(
+        market_date=market_date,
+        symbols=normalized_symbols,
+        reasons_by_symbol=reasons_by_symbol,
+    )
+    source_diagnostics['abnormal_movement'] = _add_score_signal_forced_reasons(
+        score_by_symbol=score_by_symbol or {},
+        reasons_by_symbol=reasons_by_symbol,
+    )
+    return reasons_by_symbol, source_diagnostics
+
+
 def _candidate_cap_limit(total: int) -> int:
-    percentile = max(0.0, min(1.0, float(settings.openclaw_feedback_candidate_cap_percentile)))
-    min_symbols = max(0, int(settings.openclaw_feedback_candidate_cap_min_symbols))
-    max_symbols = max(0, int(settings.openclaw_feedback_candidate_cap_max_symbols))
+    cap_settings = _broad_cap_settings()
+    percentile = max(0.0, min(1.0, float(cap_settings['percentile'])))
+    min_symbols = max(0, int(cap_settings['min_symbols']))
+    max_symbols = max(0, int(cap_settings['max_symbols']))
     if total <= 0 or percentile <= 0:
         return total
     target = max(min_symbols, int(ceil(total * percentile)))
@@ -398,15 +894,26 @@ def _candidate_cap_limit(total: int) -> int:
     return min(total, max(1, target))
 
 
-def _cap_metadata(*, total: int, limit: int, cap_applied: bool) -> dict[str, Any]:
+def _cap_metadata(
+    *,
+    total: int,
+    limit: int,
+    cap_applied: bool,
+    forced_included_count: int = 0,
+    forced_source_diagnostics: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    cap_settings = _broad_cap_settings()
     return {
         'rule_version': AGENT_FEEDBACK_CANDIDATE_CAP_RULE,
+        'cap_scope': 'broad_feedback_universe',
         'applied': cap_applied,
         'pre_cap_eligible_count': total,
         'post_cap_dispatched_count': limit if cap_applied else total,
-        'percentile': float(settings.openclaw_feedback_candidate_cap_percentile),
-        'min_symbols': int(settings.openclaw_feedback_candidate_cap_min_symbols),
-        'max_symbols': int(settings.openclaw_feedback_candidate_cap_max_symbols),
+        'percentile': float(cap_settings['percentile']),
+        'min_symbols': int(cap_settings['min_symbols']),
+        'max_symbols': int(cap_settings['max_symbols']),
+        'forced_included_count': forced_included_count,
+        'forced_source_diagnostics': forced_source_diagnostics or {},
     }
 
 
@@ -417,17 +924,44 @@ def _apply_candidate_cap(
 ) -> list[dict[str, Any]]:
     dispatchable = [record for record in records if not bool(record.get('hard_blocked'))]
     if requested_symbols is not None or not dispatchable:
-        metadata = _cap_metadata(total=len(dispatchable), limit=len(dispatchable), cap_applied=False)
+        market_date = (
+            date.fromisoformat(str(records[0]['market_date']))
+            if records and records[0].get('market_date')
+            else None
+        )
+        forced_reasons_by_symbol: dict[str, list[dict[str, Any]]] = {}
+        forced_source_diagnostics: dict[str, Any] = {}
+        if market_date is not None:
+            forced_reasons_by_symbol, forced_source_diagnostics = _load_forced_inclusion_reasons(
+                market_date=market_date,
+                symbols=[str(record['symbol']) for record in dispatchable],
+                requested_symbols=requested_symbols,
+            )
+        metadata = _cap_metadata(
+            total=len(dispatchable),
+            limit=len(dispatchable),
+            cap_applied=False,
+            forced_included_count=len(forced_reasons_by_symbol),
+            forced_source_diagnostics=forced_source_diagnostics,
+        )
         for record in records:
             record.setdefault('candidate_cap', dict(metadata))
             record.setdefault('cap_excluded', False)
+            reasons = forced_reasons_by_symbol.get(str(record.get('symbol') or '').strip().upper(), [])
+            record['forced_inclusion_reasons'] = list(reasons)
+            record['forced_included'] = bool(reasons)
+            record['forced_inclusion_reason'] = str(reasons[0].get('code')) if reasons else None
         for index, record in enumerate(dispatchable, start=1):
             record['candidate_rank'] = index
             record['candidate_cap'] = dict(metadata)
+            record['candidate_selection_reason'] = (
+                AGENT_FEEDBACK_ROLE_CAP_BYPASS_REASON_REQUESTED
+                if requested_symbols is not None
+                else 'uncapped_broad_universe'
+            )
         return records
 
     limit = _candidate_cap_limit(len(dispatchable))
-    cap_applied = limit < len(dispatchable)
     score_rows = load_agent_feedback_candidate_score_rows(
         market_date=date.fromisoformat(str(records[0]['market_date'])),
         symbols=[str(record['symbol']) for record in dispatchable],
@@ -441,6 +975,12 @@ def _apply_candidate_cap(
         record['candidate_score'] = score_payload['score']
         record['candidate_score_payload'] = score_payload
 
+    forced_reasons_by_symbol, forced_source_diagnostics = _load_forced_inclusion_reasons(
+        market_date=date.fromisoformat(str(records[0]['market_date'])),
+        symbols=[str(record['symbol']) for record in dispatchable],
+        requested_symbols=None,
+        score_by_symbol=score_by_symbol,
+    )
     ranked = sorted(
         dispatchable,
         key=lambda record: (
@@ -448,20 +988,57 @@ def _apply_candidate_cap(
             str(record.get('symbol') or ''),
         ),
     )
-    metadata = _cap_metadata(total=len(dispatchable), limit=limit, cap_applied=cap_applied)
-    selected_symbols = {str(record.get('symbol')) for record in ranked[:limit]}
+    forced_symbols = {
+        symbol
+        for symbol, reasons in forced_reasons_by_symbol.items()
+        if reasons
+    }
+    selected_symbols: set[str] = set()
+    for record in ranked:
+        if len(selected_symbols) >= limit and limit > 0:
+            break
+        selected_symbols.add(str(record.get('symbol')))
+    selected_symbols.update(forced_symbols)
+    if limit <= 0:
+        selected_symbols = {str(record.get('symbol')) for record in ranked}
+    cap_applied = len(selected_symbols) < len(dispatchable)
+    metadata = _cap_metadata(
+        total=len(dispatchable),
+        limit=len(selected_symbols),
+        cap_applied=cap_applied,
+        forced_included_count=len(forced_symbols),
+        forced_source_diagnostics=forced_source_diagnostics,
+    )
     for index, record in enumerate(ranked, start=1):
+        symbol = str(record.get('symbol'))
+        forced_reasons = forced_reasons_by_symbol.get(symbol, [])
         record['candidate_rank'] = index
         record['candidate_cap'] = dict(metadata)
-        if cap_applied and str(record.get('symbol')) not in selected_symbols:
+        record['forced_inclusion_reasons'] = list(forced_reasons)
+        record['forced_included'] = bool(forced_reasons)
+        record['forced_inclusion_reason'] = str(forced_reasons[0].get('code')) if forced_reasons else None
+        if cap_applied and symbol not in selected_symbols:
             record['eligible'] = False
             record['cap_excluded'] = True
             record['status'] = 'candidate_cap_excluded'
+            record['candidate_selection_reason'] = 'broad_rank_cap_excluded'
         else:
             record['cap_excluded'] = False
+            record['candidate_selection_reason'] = (
+                'forced_included_over_broad_rank_cap'
+                if forced_reasons and index > limit
+                else 'broad_rank_within_cap'
+            )
+            if forced_reasons and record['status'] == 'dispatched':
+                record['status'] = 'forced_included'
+            elif forced_reasons and record['status'] == 'soft_penalized_dispatched':
+                record['status'] = 'soft_penalized_forced_included'
     for record in records:
         record.setdefault('candidate_cap', dict(metadata))
         record.setdefault('cap_excluded', False)
+        record.setdefault('forced_inclusion_reasons', [])
+        record.setdefault('forced_included', False)
+        record.setdefault('forced_inclusion_reason', None)
     return records
 
 
@@ -547,7 +1124,285 @@ def load_agent_feedback_eligibility_records(
             piotroski_rows=piotroski_rows,
         )
     ]
-    return _apply_candidate_cap(records=records, requested_symbols=symbol_scope if requested_symbols is not None else None)
+    return _apply_candidate_cap(
+        records=records,
+        requested_symbols=symbol_scope if requested_symbols is not None else None,
+    )
+
+
+def _ordered_dispatchable_records(
+    *,
+    records: Sequence[dict[str, Any]],
+    candidate_symbols: Sequence[str] | None = None,
+) -> list[dict[str, Any]]:
+    normalized_candidate_symbols = _normalize_symbol_scope(candidate_symbols) or []
+    candidate_order = {
+        symbol: index
+        for index, symbol in enumerate(normalized_candidate_symbols)
+    }
+    if not records and normalized_candidate_symbols:
+        return [
+            {
+                'symbol': symbol,
+                'eligible': True,
+                'hard_blocked': False,
+                'cap_excluded': False,
+                'candidate_rank': index,
+                'candidate_score': 0.0,
+                'forced_inclusion_reasons': [],
+                'forced_included': False,
+                'forced_inclusion_reason': None,
+            }
+            for index, symbol in enumerate(normalized_candidate_symbols, start=1)
+        ]
+
+    def order_key(record: dict[str, Any]) -> tuple[int, int, int, str]:
+        symbol = str(record.get('symbol') or '').strip().upper()
+        if symbol in candidate_order:
+            return (0, candidate_order[symbol], _as_int(record.get('candidate_rank'), default=10**9), symbol)
+        return (1, _as_int(record.get('candidate_rank'), default=10**9), 0, symbol)
+
+    ordered = sorted(
+        [
+            dict(record)
+            for record in records
+            if not bool(record.get('hard_blocked')) and not bool(record.get('cap_excluded'))
+        ],
+        key=order_key,
+    )
+    for index, record in enumerate(ordered, start=1):
+        if record.get('candidate_rank') is None:
+            record['candidate_rank'] = index
+    return ordered
+
+
+def _summarizer_gate_payload(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    details = value.get('details') if isinstance(value.get('details'), dict) else {}
+    nested_gate = details.get('summarizer_gate') if isinstance(details.get('summarizer_gate'), dict) else {}
+    payload = {**nested_gate}
+    for key in (
+        'priority_score',
+        'candidate_action',
+        'gate_reason',
+        'data_quality_blockers',
+        'positive_catalysts',
+        'negative_risks',
+        'time_horizon_fit',
+    ):
+        if key in value:
+            payload[key] = value[key]
+    return payload
+
+
+def _summarizer_gate_score(gate: dict[str, Any]) -> float:
+    score = _as_float(gate.get('priority_score'), default=0.0) * 100.0
+    action = _normalize_action(gate.get('candidate_action'))
+    if action == 'advance_to_decider':
+        score += 10_000.0
+    elif action in {'watch_only', 'watch'}:
+        score += 1_000.0
+    elif action == 'reject':
+        score -= 10_000.0
+    return score
+
+
+def _merge_forced_reasons(
+    *,
+    record: dict[str, Any],
+    forced_inclusion_reasons_by_symbol: dict[str, list[dict[str, Any]]] | None,
+) -> list[dict[str, Any]]:
+    symbol = str(record.get('symbol') or '').strip().upper()
+    merged: list[dict[str, Any]] = []
+    seen_codes: set[str] = set()
+    for source in (
+        record.get('forced_inclusion_reasons'),
+        (forced_inclusion_reasons_by_symbol or {}).get(symbol),
+    ):
+        if not isinstance(source, list):
+            continue
+        for item in source:
+            if not isinstance(item, dict):
+                continue
+            code = str(item.get('code') or '')
+            if code in seen_codes:
+                continue
+            seen_codes.add(code)
+            merged.append(dict(item))
+    return merged
+
+
+def _role_ranked_records(
+    *,
+    role: str,
+    records: Sequence[dict[str, Any]],
+    summarizer_gate_by_symbol: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    gate_by_symbol = summarizer_gate_by_symbol or {}
+
+    def role_score(record: dict[str, Any]) -> tuple[float, int, str]:
+        symbol = str(record.get('symbol') or '').strip().upper()
+        score = _as_float(record.get('candidate_score'), default=0.0)
+        if role in DECISION_SUPPORT_AGENT_NAMES:
+            gate = _summarizer_gate_payload(gate_by_symbol.get(symbol))
+            score += _summarizer_gate_score(gate)
+        elif role == 'fundamental-summarizer':
+            score_payload = (
+                record.get('candidate_score_payload')
+                if isinstance(record.get('candidate_score_payload'), dict)
+                else {}
+            )
+            source_values = (
+                score_payload.get('source_values')
+                if isinstance(score_payload.get('source_values'), dict)
+                else {}
+            )
+            score += _as_float(source_values.get('composite_percentile'), default=0.0) * 25.0
+        return (
+            -score,
+            _as_int(record.get('candidate_rank'), default=10**9),
+            symbol,
+        )
+
+    return sorted([dict(record) for record in records], key=role_score)
+
+
+def _role_cap_metadata(
+    *,
+    role: str,
+    total: int,
+    selected_count: int,
+    cap_limit: int,
+    cap_applied: bool,
+    requested_scope_bypass: bool,
+    forced_included_count: int,
+) -> dict[str, Any]:
+    return {
+        'rule_version': AGENT_FEEDBACK_ROLE_CAP_RULE,
+        'role': role,
+        'configured_cap': cap_limit,
+        'applied': cap_applied,
+        'requested_scope_bypass': requested_scope_bypass,
+        'bypass_reason': AGENT_FEEDBACK_ROLE_CAP_BYPASS_REASON_REQUESTED if requested_scope_bypass else None,
+        'pre_cap_symbol_count': total,
+        'post_cap_symbol_count': selected_count,
+        'forced_included_count': forced_included_count,
+    }
+
+
+def build_agent_feedback_role_funnel(
+    *,
+    records: Sequence[dict[str, Any]],
+    roles: Sequence[str],
+    requested_symbols: Sequence[str] | None = None,
+    candidate_symbols: Sequence[str] | None = None,
+    summarizer_gate_by_symbol: dict[str, Any] | None = None,
+    forced_inclusion_reasons_by_symbol: dict[str, list[dict[str, Any]]] | None = None,
+) -> dict[str, Any]:
+    requested_scope_bypass = requested_symbols is not None
+    dispatchable_records = _ordered_dispatchable_records(
+        records=records,
+        candidate_symbols=candidate_symbols,
+    )
+    broad_symbols = [str(record.get('symbol') or '').strip().upper() for record in dispatchable_records]
+    role_symbols: dict[str, list[str]] = {}
+    role_diagnostics: dict[str, Any] = {}
+    seen_roles: list[str] = []
+    for raw_role in roles:
+        role = str(raw_role or '').strip()
+        if not role or role in seen_roles:
+            continue
+        seen_roles.append(role)
+        ranked = _role_ranked_records(
+            role=role,
+            records=dispatchable_records,
+            summarizer_gate_by_symbol=summarizer_gate_by_symbol,
+        )
+        forced_reasons_by_symbol: dict[str, list[dict[str, Any]]] = {}
+        for record in ranked:
+            symbol = str(record.get('symbol') or '').strip().upper()
+            forced_reasons = _merge_forced_reasons(
+                record=record,
+                forced_inclusion_reasons_by_symbol=forced_inclusion_reasons_by_symbol,
+            )
+            if forced_reasons:
+                forced_reasons_by_symbol[symbol] = forced_reasons
+
+        if requested_scope_bypass:
+            selected_symbols = {str(record.get('symbol') or '').strip().upper() for record in ranked}
+            cap_limit = len(selected_symbols)
+        else:
+            cap_limit = _role_cap_limit(role, len(ranked))
+            selected_symbols = set()
+            for record in ranked:
+                if len(selected_symbols) >= cap_limit and cap_limit > 0:
+                    break
+                selected_symbols.add(str(record.get('symbol') or '').strip().upper())
+            selected_symbols.update(forced_reasons_by_symbol)
+            if cap_limit <= 0:
+                selected_symbols = {str(record.get('symbol') or '').strip().upper() for record in ranked}
+
+        ordered_selected = [
+            str(record.get('symbol') or '').strip().upper()
+            for record in ranked
+            if str(record.get('symbol') or '').strip().upper() in selected_symbols
+        ]
+        cap_excluded = [
+            str(record.get('symbol') or '').strip().upper()
+            for record in ranked
+            if str(record.get('symbol') or '').strip().upper() not in selected_symbols
+        ]
+        cap_applied = len(ordered_selected) < len(ranked)
+        selection_reasons_by_symbol: dict[str, list[str]] = defaultdict(list)
+        rank_by_symbol: dict[str, int] = {}
+        for index, record in enumerate(ranked, start=1):
+            symbol = str(record.get('symbol') or '').strip().upper()
+            rank_by_symbol[symbol] = index
+            if symbol not in selected_symbols:
+                continue
+            if requested_scope_bypass:
+                selection_reasons_by_symbol[symbol].append(AGENT_FEEDBACK_ROLE_CAP_BYPASS_REASON_REQUESTED)
+            elif index <= cap_limit:
+                selection_reasons_by_symbol[symbol].append('rank_within_role_cap')
+            gate = _summarizer_gate_payload((summarizer_gate_by_symbol or {}).get(symbol))
+            if _normalize_action(gate.get('candidate_action')) == 'advance_to_decider':
+                selection_reasons_by_symbol[symbol].append('summarizer_gate_advance_to_decider')
+            for reason in forced_reasons_by_symbol.get(symbol, []):
+                selection_reasons_by_symbol[symbol].append(f"forced:{reason.get('code')}")
+        role_symbols[role] = ordered_selected
+        role_diagnostics[role] = {
+            'role': role,
+            'symbols': ordered_selected,
+            'role_cap': _role_cap_metadata(
+                role=role,
+                total=len(ranked),
+                selected_count=len(ordered_selected),
+                cap_limit=cap_limit,
+                cap_applied=cap_applied,
+                requested_scope_bypass=requested_scope_bypass,
+                forced_included_count=len(forced_reasons_by_symbol),
+            ),
+            'cap_excluded_symbols': cap_excluded[:200],
+            'cap_excluded_symbol_count': len(cap_excluded),
+            'forced_included_symbols': sorted(forced_reasons_by_symbol),
+            'forced_inclusion_reasons_by_symbol': forced_reasons_by_symbol,
+            'selection_reasons_by_symbol': {
+                symbol: reasons
+                for symbol, reasons in selection_reasons_by_symbol.items()
+            },
+            'role_rank_by_symbol': rank_by_symbol,
+        }
+    return {
+        'schema_version': AGENT_FEEDBACK_FUNNEL_SCHEMA_VERSION,
+        'broad_symbol_count': len(broad_symbols),
+        'broad_symbols': broad_symbols,
+        'requested_symbol_count': len(_normalize_symbol_scope(requested_symbols) or []),
+        'requested_scope_bypass': requested_scope_bypass,
+        'role_symbols': role_symbols,
+        'role_symbol_counts': {role: len(symbols) for role, symbols in role_symbols.items()},
+        'role_diagnostics': role_diagnostics,
+    }
 
 
 def build_agent_feedback_eligibility_diagnostics(
@@ -558,6 +1413,7 @@ def build_agent_feedback_eligibility_diagnostics(
     normalized_requested = _normalize_symbol_scope(requested_symbols)
     hard_blocked = [record for record in records if bool(record.get('hard_blocked'))]
     cap_excluded = [record for record in records if bool(record.get('cap_excluded'))]
+    forced_included = [record for record in records if bool(record.get('forced_included'))]
     dispatched = [
         record
         for record in records
@@ -574,9 +1430,11 @@ def build_agent_feedback_eligibility_diagnostics(
         'dispatched_symbol_count': len(dispatched),
         'hard_blocked_symbol_count': len(hard_blocked),
         'candidate_cap_excluded_symbol_count': len(cap_excluded),
+        'forced_included_symbol_count': len(forced_included),
         'soft_penalized_dispatched_symbol_count': len(soft_penalized),
         'hard_blocked_symbols': [str(record.get('symbol')) for record in hard_blocked],
         'candidate_cap_excluded_symbols': [str(record.get('symbol')) for record in cap_excluded[:100]],
+        'forced_included_symbols': [str(record.get('symbol')) for record in forced_included],
         'soft_penalized_symbols': [str(record.get('symbol')) for record in soft_penalized],
         'candidate_cap': (
             records[0].get('candidate_cap')
@@ -590,6 +1448,10 @@ def build_agent_feedback_eligibility_diagnostics(
         'soft_penalties_by_symbol': {
             str(record.get('symbol')): list(record.get('soft_penalties') or [])
             for record in soft_penalized
+        },
+        'forced_inclusion_reasons_by_symbol': {
+            str(record.get('symbol')): list(record.get('forced_inclusion_reasons') or [])
+            for record in forced_included
         },
     }
 
@@ -612,7 +1474,13 @@ def load_agent_feedback_eligible_symbols(
     ordered_records = (
         records
         if requested_symbols is not None
-        else sorted(records, key=lambda record: (_as_int(record.get('candidate_rank'), default=10**9), str(record.get('symbol'))))
+        else sorted(
+            records,
+            key=lambda record: (
+                _as_int(record.get('candidate_rank'), default=10**9),
+                str(record.get('symbol')),
+            ),
+        )
     )
     return [
         str(record['symbol'])

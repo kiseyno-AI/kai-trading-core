@@ -1694,6 +1694,86 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertEqual(market_context_builder.calls, ['2026-04-14', '2026-04-14'])
         self.assertEqual(result['summary']['completed'], 5)
 
+    def test_auto_scoped_symbol_dispatch_applies_smaller_decider_role_caps(self):
+        service = AgentFeedbackOrchestrator()
+        client = SignalDeciderBatchClient()
+        service.client = client
+        feedback_service = FakeFeedbackService()
+        cleanup_service = FakeSessionCleanupService()
+        symbols = ['005930', '000660', '035420', '051910']
+        fake_settings = SimpleNamespace(openclaw_agent_symbol_chunk_size=10, openclaw_agent_parallel_subtasks=1)
+        reuse_service = SimpleNamespace(build_latest_decisions=lambda **kwargs: {})
+        market_context_builder = FakeMarketContextBuilder(
+            {
+                'status': 'ready',
+                'market_date': '2026-04-14',
+                'summary': {'market_bias': 'risk_on'},
+                'flows': {},
+                'missing_fields': [],
+            }
+        )
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            with patch.object(orchestrator_module, 'agent_context_read_service', DeciderReadyAgentContextReadService()):
+                with patch.object(orchestrator_module, 'agent_context_reuse_service', reuse_service):
+                    with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
+                        with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
+                            with patch.object(
+                                orchestrator_module,
+                                'signal_decider_market_context_builder',
+                                market_context_builder,
+                            ):
+                                with patch(
+                                    'app.agent_context.eligibility.settings.openclaw_feedback_role_cap_eod_summarizer',
+                                    4,
+                                ):
+                                    with patch(
+                                        'app.agent_context.eligibility.settings.openclaw_feedback_role_cap_technical_summarizer',
+                                        4,
+                                    ):
+                                        with patch(
+                                            'app.agent_context.eligibility.settings.openclaw_feedback_role_cap_fundamental_summarizer',
+                                            4,
+                                        ):
+                                            with patch(
+                                                'app.agent_context.eligibility.settings.openclaw_feedback_role_cap_short_term_decider',
+                                                1,
+                                            ):
+                                                with patch(
+                                                    'app.agent_context.eligibility.settings.openclaw_feedback_role_cap_signal_decider',
+                                                    1,
+                                                ):
+                                                    with _patch_feedback_eligibility(*symbols):
+                                                        result = service.dispatch_for_symbols(
+                                                            market_date='2026-04-14',
+                                                            symbols=symbols,
+                                                            reuse_existing=False,
+                                                            auto_scope=True,
+                                                        )
+
+        symbols_by_role = {
+            call['spec'].role: [item['symbol'] for item in call['batch_items']]
+            for call in client.calls
+        }
+
+        self.assertEqual(symbols_by_role['eod-summarizer'], symbols)
+        self.assertEqual(symbols_by_role['technical-summarizer'], symbols)
+        self.assertEqual(symbols_by_role['fundamental-summarizer'], symbols)
+        self.assertEqual(len(symbols_by_role['short-term-decider']), 1)
+        self.assertEqual(len(symbols_by_role['signal-decider']), 1)
+        self.assertEqual(result['request']['broad_symbols'], symbols)
+        self.assertEqual(result['request']['role_symbol_counts']['eod-summarizer'], 4)
+        self.assertEqual(result['request']['role_symbol_counts']['short-term-decider'], 1)
+        self.assertEqual(result['request']['role_symbol_counts']['signal-decider'], 1)
+        self.assertEqual(
+            result['request']['funnel_diagnostics']['role_symbol_counts']['signal-decider'],
+            1,
+        )
+        self.assertTrue(
+            result['request']['funnel_diagnostics']['role_diagnostics']['signal-decider']['role_cap']['applied']
+        )
+        self.assertEqual(result['summary']['completed'], 14)
+
     def test_requested_short_term_decider_builds_tactical_payload_from_upstream_summaries(self):
         service = AgentFeedbackOrchestrator()
         client = SignalDeciderBatchClient()

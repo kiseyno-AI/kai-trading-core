@@ -147,9 +147,39 @@ class Settings(BaseSettings):
     openclaw_feedback_trigger_after_fundamentals_refresh: bool = False
     openclaw_feedback_retry_max_cycles: int = 3
     openclaw_feedback_retry_outer_batch_size: int = 20
+    openclaw_feedback_broad_candidate_cap_percentile: float = Field(
+        default=0.10,
+        validation_alias=AliasChoices(
+            'OPENCLAW_FEEDBACK_BROAD_CANDIDATE_CAP_PERCENTILE',
+            'OPENCLAW_FEEDBACK_CANDIDATE_CAP_PERCENTILE',
+        ),
+    )
+    openclaw_feedback_broad_candidate_cap_min_symbols: int = Field(
+        default=150,
+        validation_alias=AliasChoices(
+            'OPENCLAW_FEEDBACK_BROAD_CANDIDATE_CAP_MIN_SYMBOLS',
+            'OPENCLAW_FEEDBACK_CANDIDATE_CAP_MIN_SYMBOLS',
+        ),
+    )
+    openclaw_feedback_broad_candidate_cap_max_symbols: int = Field(
+        default=200,
+        validation_alias=AliasChoices(
+            'OPENCLAW_FEEDBACK_BROAD_CANDIDATE_CAP_MAX_SYMBOLS',
+            'OPENCLAW_FEEDBACK_CANDIDATE_CAP_MAX_SYMBOLS',
+        ),
+    )
     openclaw_feedback_candidate_cap_percentile: float = 0.10
     openclaw_feedback_candidate_cap_min_symbols: int = 150
     openclaw_feedback_candidate_cap_max_symbols: int = 300
+    openclaw_feedback_role_cap_eod_summarizer: int = 200
+    openclaw_feedback_role_cap_technical_summarizer: int = 150
+    openclaw_feedback_role_cap_fundamental_summarizer: int = 120
+    openclaw_feedback_role_cap_short_term_decider: int = 80
+    openclaw_feedback_role_cap_signal_decider: int = 80
+    openclaw_feedback_force_include_holdings_enabled: bool = True
+    openclaw_feedback_force_include_active_watch_enabled: bool = True
+    openclaw_feedback_force_include_prior_decisions_enabled: bool = True
+    openclaw_feedback_force_include_event_symbols_enabled: bool = True
     openclaw_agent_subtask_poll_seconds: float = 2.0
     openclaw_agent_slot_cooldown_seconds: float = 600.0
     openclaw_session_cleanup_batch_limit: int = 100
