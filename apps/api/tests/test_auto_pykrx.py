@@ -10,6 +10,7 @@ import pandas as pd
 
 from app.eod.auto_pykrx import AutoPykrxEODScheduler
 from app.eod.pykrx_backfill import PYKRX_STAGE_SEQUENCE, PykrxBackfillService, PykrxSymbol
+from app.eod.pykrx_pipeline_runner import _OfficialDailyPipelineTracker, _normalize_stage_status
 from app.market.clock import KST, MarketState
 
 
@@ -71,6 +72,47 @@ class _FakeDailyPipelineRunStateService:
 
 
 class PykrxBackfillServiceTests(TestCase):
+    def test_auto_tracker_normalizes_warning_followup_status_to_terminal_partial(self) -> None:
+        fake_run_state_service = _FakeDailyPipelineRunStateService()
+        log_events: list[dict] = []
+        tracker = _OfficialDailyPipelineTracker(
+            service=fake_run_state_service,
+            log_fetch=lambda operation, status, **kwargs: log_events.append(
+                {'operation': operation, 'status': status, **kwargs}
+            ),
+        )
+
+        tracker.start(
+            market_date='2026-04-03',
+            trigger='auto_close_scheduler',
+            requested_stages=['signal_decider_evaluations'],
+            resolved_stages=['signal_decider_evaluations'],
+            eod_run_id=12,
+            run_metadata={'mode': 'daily_auto'},
+        )
+        tracker.update_stage(
+            stage='signal_decider_evaluations',
+            status='warning',
+            current_step='signal_decider_evaluations_partial',
+            current_activity='Completed signal-decider evaluation follow-up with mature coverage gaps',
+            processed=4,
+            total=4,
+            succeeded=3,
+            failed=1,
+            details={'result_summary': {'status': 'warning', 'summary': {'not_computed_count': 1}}},
+        )
+        tracker.finish_run()
+
+        self.assertEqual(_normalize_stage_status('warning'), 'partial')
+        self.assertEqual(log_events, [])
+        self.assertEqual(fake_run_state_service.stage_updates[-1]['status'], 'partial')
+        self.assertEqual(tracker.stage_statuses['signal_decider_evaluations'], 'partial')
+        self.assertEqual(fake_run_state_service.finish_runs[-1]['status'], 'partial')
+        self.assertEqual(
+            fake_run_state_service.finish_runs[-1]['run_metadata']['stage_statuses'],
+            {'signal_decider_evaluations': 'partial'},
+        )
+
     def test_fetch_recent_universe_uses_index_when_market_frame_columns_change(self) -> None:
         service = PykrxBackfillService()
         service.name_pause_seconds = 0

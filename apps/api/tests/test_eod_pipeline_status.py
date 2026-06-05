@@ -522,6 +522,76 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
             'Running decision support decider dispatch',
         )
 
+    def test_read_summarizes_normalized_warning_followup_official_stage_as_partial(self):
+        market_date = '2026-06-05'
+        official_run = {
+            'id': 505,
+            'market_date': market_date,
+            'trigger': 'auto_close_scheduler',
+            'status': 'partial',
+            'current_stage': 'signal_decider_evaluations',
+            'started_at': '2026-06-05T06:41:47+00:00',
+            'updated_at': '2026-06-05T07:08:00+00:00',
+            'completed_at': '2026-06-05T07:08:00+00:00',
+            'error_message': None,
+            'run_metadata': {
+                'mode': 'daily_auto',
+                'stage_statuses': {'signal_decider_evaluations': 'partial'},
+            },
+            'stages': {
+                'signal_decider_evaluations': {
+                    'stage_id': 'signal_decider_evaluations',
+                    'status': 'partial',
+                    'market_date': market_date,
+                    'started_at': '2026-06-05T07:05:30+00:00',
+                    'updated_at': '2026-06-05T07:08:00+00:00',
+                    'completed_at': '2026-06-05T07:08:00+00:00',
+                    'processed': 228,
+                    'total': 228,
+                    'succeeded': 227,
+                    'failed': 1,
+                    'remaining': 0,
+                    'current_step': 'signal_decider_evaluations_partial',
+                    'current_activity': 'Completed with errors signal decider evaluations',
+                    'current_symbol': None,
+                    'current_period': None,
+                    'source_run_ids': {'eod_run_id': 311},
+                    'details': {
+                        'mode': 'auto_eod_pipeline_tracking',
+                        'progress_source': 'auto_eod_stage_progress',
+                        'result_summary': {
+                            'status': 'warning',
+                            'summary': {'not_computed_count': 1},
+                        },
+                    },
+                },
+            },
+        }
+        service = EODPipelineStatusService(
+            market_state_loader=lambda: _FakeMarketState(),
+            pykrx_run_loader=lambda **_: None,
+            pykrx_stage_counts_loader=lambda *_: {},
+            live_symbol_count_loader=lambda: 228,
+            fundamentals_refresh_loader=lambda **_: None,
+            official_run_loader=lambda **_: official_run,
+        )
+
+        result = service.read(market_date=market_date)
+
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['current_stage'], 'signal_decider_evaluations')
+        self.assertEqual(result['current_stage_status'], 'partial')
+        self.assertEqual(result['partial_stages'], 1)
+        self.assertNotIn('warning', result['stage_status_counts'])
+        stage = result['stages']['signal_decider_evaluations']
+        self.assertEqual(stage['status'], 'partial')
+        self.assertEqual(stage['completed_at'], '2026-06-05T07:08:00+00:00')
+        self.assertEqual(stage['details']['progress_source'], 'auto_eod_stage_progress')
+        self.assertEqual(
+            result['official_run']['run_metadata']['stage_statuses'],
+            {'signal_decider_evaluations': 'partial'},
+        )
+
     def test_read_keeps_break_day_default_market_date_on_current_calendar_day(self):
         service = EODPipelineStatusService(
             market_state_loader=lambda: _FakeBreakDayMarketState(),

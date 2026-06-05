@@ -83,7 +83,7 @@ class PykrxPipelineDependencies:
 
 def _normalize_stage_status(value: Any) -> str:
     status = str(value or '').strip().lower()
-    if status == 'completed_with_errors':
+    if status in {'completed_with_errors', 'warning'}:
         return 'partial'
     if status in {'disabled', 'not_configured'}:
         return 'skipped'
