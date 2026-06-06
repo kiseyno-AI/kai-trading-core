@@ -6,7 +6,7 @@ from app.brokers.kis.client import KISClientError, KISConfigurationError
 from app.fx.service import KoreaEximRateNotFoundError
 from app.integrations.fx.client import KoreaEximAPIError, KoreaEximConfigurationError
 from app.market_data_store import persist_market_status_snapshot
-from app.market.clock import get_market_state
+from app.market.clock import async_get_market_state
 from app.market.snapshot import (
     MarketSnapshotConfigurationError,
     MarketSnapshotUnavailableError,
@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 @router.get('/status')
 async def market_status() -> dict:
-    state = get_market_state()
+    state = await async_get_market_state()
     try:
         persist_market_status_snapshot(state, source='api')
     except Exception as exc:

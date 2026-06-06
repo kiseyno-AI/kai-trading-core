@@ -161,7 +161,7 @@ class KISIntradaySnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch(
-                'app.market.kis_intraday_snapshots.get_market_state',
+                'app.market.kis_intraday_snapshots.async_get_market_state',
                 return_value=SimpleNamespace(state='OPEN', server_time='2026-05-07T10:15:35+09:00'),
             ),
             patch('app.market.kis_intraday_snapshots.persist_kis_intraday_snapshot') as persist_snapshot,

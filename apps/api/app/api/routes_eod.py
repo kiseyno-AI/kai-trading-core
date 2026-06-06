@@ -18,8 +18,8 @@ from app.eod.master_state import master_refresh_state
 from app.eod.service import EOD_SERVICE
 from app.eod.state import job_state
 from app.eod.technical_snapshots import daily_technical_snapshot_service
-from app.market.clock import get_market_state
-from app.market.session import build_market_session_metadata
+from app.market.clock import async_get_market_state
+from app.market.session import async_build_market_session_metadata
 from app.signals.advanced_value_factor import (
     ADVANCED_VALUE_FACTOR_SOURCE,
     daily_advanced_value_factor_service,
@@ -68,13 +68,13 @@ class EODPipelineRunRequest(BaseModel):
 
 @router.get('/status')
 async def get_eod_status() -> dict:
-    market_state = get_market_state()
+    market_state = await async_get_market_state()
     return {
         'job': job_state.snapshot(),
         'master': master_refresh_state.snapshot(),
         'pykrx_auto': auto_pykrx_eod_scheduler.snapshot(),
         'market': market_state.__dict__,
-        'market_session': build_market_session_metadata(
+        'market_session': await async_build_market_session_metadata(
             requested_date=(market_state.current_calendar_date or market_state.server_time[:10]),
             current_state=market_state,
         ),
@@ -228,9 +228,12 @@ async def run_pykrx_daily_if_due(
 ) -> dict:
     try:
         parsed_markets = tuple(item.strip().upper() for item in (markets or settings.eod_auto_pykrx_markets).split(',') if item.strip())
+        resolved_market_date = market_date
+        if resolved_market_date is None:
+            resolved_market_date = (await async_get_market_state()).server_time[:10]
         return await asyncio.to_thread(
             PYKRX_BACKFILL_SERVICE.run_daily_pipeline_if_due,
-            market_date=market_date or get_market_state().server_time[:10],
+            market_date=resolved_market_date,
             markets=parsed_markets or DEFAULT_MARKETS,
             trigger='manual_daily_api',
             refresh_universe=settings.eod_auto_pykrx_refresh_universe if refresh_universe is None else refresh_universe,

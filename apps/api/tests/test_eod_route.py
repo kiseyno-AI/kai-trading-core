@@ -1088,7 +1088,7 @@ class EODRouteTests(unittest.TestCase):
                 self.market_session = 'holiday'
 
         client = TestClient(self.app)
-        with patch('app.api.routes_eod.get_market_state', return_value=_FakeMarketState()):
+        with patch('app.api.routes_eod.async_get_market_state', return_value=_FakeMarketState()):
             response = client.get('/eod/status')
 
         self.assertEqual(response.status_code, 200)

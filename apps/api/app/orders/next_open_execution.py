@@ -4,6 +4,7 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
+import inspect
 import logging
 from typing import Any, Callable, Sequence
 
@@ -19,12 +20,14 @@ from app.eod.pykrx_enrichment_gate import (
     REQUIRED_EXEC_DECIDER_PYKRX_ENRICHMENT_CATEGORIES,
     inspect_pykrx_enrichment_preflight,
 )
-from app.market.clock import MarketState, get_market_state
+from app.market.clock import MarketState, async_get_market_state, get_market_state
 from app.market.session import (
     CALENDAR_SOURCE_EXCHANGE_CALENDARS,
     CALENDAR_SOURCE_STATUS_FALLBACK,
     CALENDAR_SOURCE_STATUS_MISSING_DATE,
     CALENDAR_SOURCE_STATUS_UNAVAILABLE,
+    async_next_krx_open_date_on_or_after,
+    async_previous_krx_trading_date,
     next_krx_open_date_on_or_after,
     previous_krx_trading_date,
 )
@@ -308,8 +311,28 @@ def normalize_next_open_target_trade_date(
     return normalized
 
 
+async def async_normalize_next_open_target_trade_date(
+    value: str | date | None,
+    *,
+    default: date,
+    allow_fallback: bool = True,
+) -> date:
+    candidate = _normalize_date(value, default=default)
+    normalized = await async_next_krx_open_date_on_or_after(candidate, allow_fallback=allow_fallback)
+    if normalized is None:
+        raise ValueError(f'Could not resolve next KRX open date on or after {candidate.isoformat()}')
+    return normalized
+
+
 def _previous_trading_day(value: date, *, allow_fallback: bool = True) -> date:
     previous = previous_krx_trading_date(value, allow_fallback=allow_fallback)
+    if previous is None:
+        raise ValueError(f'Could not resolve previous KRX trading date before {value.isoformat()}')
+    return previous
+
+
+async def _async_previous_trading_day(value: date, *, allow_fallback: bool = True) -> date:
+    previous = await async_previous_krx_trading_date(value, allow_fallback=allow_fallback)
     if previous is None:
         raise ValueError(f'Could not resolve previous KRX trading date before {value.isoformat()}')
     return previous
@@ -384,10 +407,11 @@ class SignalDeciderNextOpenExecutionService:
         self,
         *,
         order_service: TradingOrderService | None = None,
-        market_state_getter: Callable[[], MarketState] = get_market_state,
+        market_state_getter: Callable[[], Any] | None = None,
     ) -> None:
         self.order_service = order_service or trading_order_service
-        self.market_state_getter = market_state_getter
+        self.market_state_getter = market_state_getter or get_market_state
+        self._uses_default_market_state_getter = market_state_getter is None
 
     def runtime_status(self) -> dict[str, Any]:
         targets, errors = self._parse_account_targets()
@@ -416,6 +440,14 @@ class SignalDeciderNextOpenExecutionService:
                 'require_target_and_stop': bool(settings.signal_decider_next_open_require_target_and_stop),
             },
         }
+
+    async def _get_market_state_async(self) -> MarketState:
+        if self._uses_default_market_state_getter:
+            return await async_get_market_state()
+        result = self.market_state_getter()
+        if inspect.isawaitable(result):
+            return await result
+        return result
 
     def list_plan_items(
         self,
@@ -707,12 +739,16 @@ class SignalDeciderNextOpenExecutionService:
         force: bool = False,
         trigger: str = 'manual',
     ) -> dict[str, Any]:
-        market_state = self.market_state_getter()
+        market_state = await self._get_market_state_async()
         effective_dry_run = settings.signal_decider_next_open_dry_run if dry_run is None else dry_run
         runtime = self.runtime_status()
         if not force and not effective_dry_run and _calendar_requires_operator_override(market_state):
             default_date = date.fromisoformat(market_state.server_time[:10])
-            resolved_target_date = _normalize_date(target_trade_date, default=default_date)
+            resolved_target_date = await async_normalize_next_open_target_trade_date(
+                target_trade_date,
+                default=default_date,
+                allow_fallback=True,
+            )
             return {
                 'request': {
                     'target_trade_date': resolved_target_date.isoformat(),
@@ -741,7 +777,7 @@ class SignalDeciderNextOpenExecutionService:
                 },
                 'items': [],
             }
-        resolved_target_date = self._resolve_target_trade_date(
+        resolved_target_date = await self._resolve_target_trade_date_async(
             target_trade_date,
             market_state=market_state,
         )
@@ -947,6 +983,21 @@ class SignalDeciderNextOpenExecutionService:
         state = market_state or self.market_state_getter()
         default_date = date.fromisoformat(state.server_time[:10])
         return normalize_next_open_target_trade_date(
+            target_trade_date,
+            default=default_date,
+            allow_fallback=allow_fallback,
+        )
+
+    async def _resolve_target_trade_date_async(
+        self,
+        target_trade_date: str | date | None,
+        *,
+        market_state: MarketState | None = None,
+        allow_fallback: bool = True,
+    ) -> date:
+        state = market_state or await self._get_market_state_async()
+        default_date = date.fromisoformat(state.server_time[:10])
+        return await async_normalize_next_open_target_trade_date(
             target_trade_date,
             default=default_date,
             allow_fallback=allow_fallback,

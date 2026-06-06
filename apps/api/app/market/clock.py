@@ -4,7 +4,12 @@ from dataclasses import dataclass
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from app.market.session import get_krx_calendar_day, latest_krx_trading_date
+from app.market.session import (
+    async_get_krx_calendar_day,
+    async_latest_krx_trading_date,
+    get_krx_calendar_day,
+    latest_krx_trading_date,
+)
 
 KST = ZoneInfo('Asia/Seoul')
 
@@ -29,12 +34,23 @@ class MarketState:
 
 def get_market_state(now: datetime | None = None) -> MarketState:
     now = now.astimezone(KST) if now else datetime.now(KST)
+    calendar_day = get_krx_calendar_day(now.date(), allow_fallback=True)
+    latest_valid_date = latest_krx_trading_date(now.date(), allow_fallback=True)
+    return _build_market_state(now, calendar_day=calendar_day, latest_valid_date=latest_valid_date)
+
+
+async def async_get_market_state(now: datetime | None = None) -> MarketState:
+    now = now.astimezone(KST) if now else datetime.now(KST)
+    calendar_day = await async_get_krx_calendar_day(now.date(), allow_fallback=True)
+    latest_valid_date = await async_latest_krx_trading_date(now.date(), allow_fallback=True)
+    return _build_market_state(now, calendar_day=calendar_day, latest_valid_date=latest_valid_date)
+
+
+def _build_market_state(now: datetime, *, calendar_day, latest_valid_date) -> MarketState:
     current_calendar_date = now.date().isoformat()
     weekday = now.weekday()
     session_open = now.replace(hour=9, minute=0, second=0, microsecond=0)
     session_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
-    calendar_day = get_krx_calendar_day(now.date(), allow_fallback=True)
-    latest_valid_date = latest_krx_trading_date(now.date(), allow_fallback=True)
     latest_valid_trading_date = latest_valid_date.isoformat() if latest_valid_date is not None else None
 
     if not calendar_day.is_open:

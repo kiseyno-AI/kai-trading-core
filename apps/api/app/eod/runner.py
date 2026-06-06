@@ -8,7 +8,7 @@ from datetime import datetime, time
 from app.core.settings import settings
 from app.eod.auto_pykrx import auto_pykrx_eod_scheduler
 from app.eod.master import refresh_master_if_due
-from app.market.clock import get_market_state
+from app.market.clock import async_get_market_state
 from app.market.snapshot import market_snapshot_service
 from app.orders.exec_integration import signal_decider_exec_integration_service
 from app.orders.intraday_auto_sell import signal_decider_intraday_auto_sell_service
@@ -103,7 +103,7 @@ class EODBackgroundRunner:
     async def _run_loop(self) -> None:
         while self._running:
             try:
-                market = get_market_state()
+                market = await async_get_market_state()
                 if market.state == 'PREOPEN':
                     await self._run_blocking_step('refresh_master_if_due', refresh_master_if_due)
                     await self._run_blocking_step(

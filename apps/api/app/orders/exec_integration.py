@@ -21,13 +21,13 @@ from app.core.audit_logging import request_with_audit
 from app.core.settings import settings
 from app.db import session_scope
 from app.db_models import SignalDeciderDecisionSnapshot, SignalDeciderExecutionPlanItem
-from app.market.clock import get_market_state
+from app.market.clock import async_get_market_state, get_market_state
 from app.market.session import (
     CALENDAR_SOURCE_EXCHANGE_CALENDARS,
     CALENDAR_SOURCE_STATUS_FALLBACK,
     CALENDAR_SOURCE_STATUS_MISSING_DATE,
     CALENDAR_SOURCE_STATUS_UNAVAILABLE,
-    get_krx_calendar_day,
+    async_get_krx_calendar_day,
 )
 from app.orders.exec_payload_slimming import (
     compact_exec_item_link,
@@ -46,8 +46,8 @@ from app.orders.next_open_execution import (
     EXECUTION_STATUS_SUBMIT_FAILED,
     EXECUTION_STATUS_SUBMITTED,
     EXECUTION_WINDOW_NEXT_OPEN,
-    _previous_trading_day,
-    normalize_next_open_target_trade_date,
+    _async_previous_trading_day,
+    async_normalize_next_open_target_trade_date,
     signal_decider_next_open_execution_service,
 )
 from app.orders.portfolio_summary_service import portfolio_summary_service
@@ -780,14 +780,17 @@ class SignalDeciderExecIntegrationService:
         integration = self.integration_status()
         resolved_account_reference = _normalize_optional_text(account_reference)
         resolved_dry_run = settings.signal_decider_next_open_dry_run if dry_run is None else dry_run
-        default_target_date = _normalize_date(target_trade_date)
-        resolved_target_date = normalize_next_open_target_trade_date(
+        if target_trade_date is None:
+            default_target_date = date.fromisoformat((await async_get_market_state()).server_time[:10])
+        else:
+            default_target_date = _normalize_date(target_trade_date)
+        resolved_target_date = await async_normalize_next_open_target_trade_date(
             target_trade_date,
             default=default_target_date,
             allow_fallback=True,
         )
-        calendar_day = get_krx_calendar_day(resolved_target_date, allow_fallback=True)
-        source_market_date = _previous_trading_day(resolved_target_date)
+        calendar_day = await async_get_krx_calendar_day(resolved_target_date, allow_fallback=True)
+        source_market_date = await _async_previous_trading_day(resolved_target_date)
 
         if not force and not resolved_dry_run and _calendar_day_requires_operator_override(calendar_day):
             plan_view = signal_decider_next_open_execution_service.list_plan_items(

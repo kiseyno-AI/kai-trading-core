@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
+import inspect
 import logging
 import re
 from typing import Any, Callable
@@ -13,7 +14,7 @@ from app.agent_context.roles import SIGNAL_DECIDER_AGENT_NAME
 from app.core.settings import settings
 from app.db import session_scope
 from app.db_models import SignalDeciderDecisionSnapshot, SignalDeciderExecutionPlanItem
-from app.market.clock import MarketState, get_market_state
+from app.market.clock import MarketState, async_get_market_state, get_market_state
 from app.market.session import (
     CALENDAR_SOURCE_EXCHANGE_CALENDARS,
     CALENDAR_SOURCE_STATUS_FALLBACK,
@@ -242,16 +243,25 @@ class SignalDeciderIntradayAutoSellService:
         account_inquiry_service: TradingAccountInquiryService | None = None,
         quote_service: QuoteService | None = None,
         order_service: TradingOrderService | None = None,
-        market_state_getter: Callable[[], MarketState] = get_market_state,
+        market_state_getter: Callable[[], Any] | None = None,
     ) -> None:
         self.account_inquiry_service = account_inquiry_service or trading_account_inquiry_service
         self.quote_service = quote_service or QuoteService()
         self.order_service = order_service or trading_order_service
-        self.market_state_getter = market_state_getter
+        self.market_state_getter = market_state_getter or get_market_state
+        self._uses_default_market_state_getter = market_state_getter is None
 
     def _current_time(self, market_state: MarketState | None = None) -> datetime:
         state = market_state or self.market_state_getter()
         return _as_utc(_parse_datetime(state.server_time)) or _utcnow()
+
+    async def _get_market_state_async(self) -> MarketState:
+        if self._uses_default_market_state_getter:
+            return await async_get_market_state()
+        result = self.market_state_getter()
+        if inspect.isawaitable(result):
+            return await result
+        return result
 
     def runtime_status(self, *, account_reference: str | None = None) -> dict[str, Any]:
         accounts, errors, account_source = self._resolve_accounts(account_reference=account_reference)
@@ -288,7 +298,7 @@ class SignalDeciderIntradayAutoSellService:
                 trigger='route_refresh',
             )
 
-        market_state = self.market_state_getter()
+        market_state = await self._get_market_state_async()
         runtime = self.runtime_status(account_reference=account_reference)
         runtime.update(
             {
@@ -323,7 +333,7 @@ class SignalDeciderIntradayAutoSellService:
         trigger: str = 'manual',
     ) -> dict[str, Any]:
         normalized_symbol = _normalize_optional_text(symbol, uppercase=True)
-        market_state = self.market_state_getter()
+        market_state = await self._get_market_state_async()
         runtime = self.runtime_status(account_reference=account_reference)
         accounts, errors, _account_source = self._resolve_accounts(account_reference=account_reference)
         items: list[dict[str, Any]] = []
@@ -399,7 +409,7 @@ class SignalDeciderIntradayAutoSellService:
             symbol=symbol,
             trigger=f'{trigger}_refresh',
         )
-        market_state = self.market_state_getter()
+        market_state = await self._get_market_state_async()
         effective_dry_run = settings.signal_decider_intraday_auto_sell_dry_run if dry_run is None else dry_run
         payload['request'].update(
             {

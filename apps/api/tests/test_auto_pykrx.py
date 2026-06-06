@@ -1632,7 +1632,7 @@ class AutoPykrxEODSchedulerTests(IsolatedAsyncioTestCase):
             session_close_at=close_at.isoformat(),
         )
 
-        with patch('app.eod.auto_pykrx.get_market_state', return_value=market):
+        with patch('app.eod.auto_pykrx.async_get_market_state', return_value=market):
             await scheduler.schedule_daily_pipeline_if_due()
 
         snapshot = scheduler.snapshot()
@@ -1654,7 +1654,7 @@ class AutoPykrxEODSchedulerTests(IsolatedAsyncioTestCase):
             session_close_at=close_at.isoformat(),
         )
 
-        with patch('app.eod.auto_pykrx.get_market_state', return_value=market), patch.object(
+        with patch('app.eod.auto_pykrx.async_get_market_state', return_value=market), patch.object(
             scheduler,
             '_run_scheduled_daily_pipeline',
             new=AsyncMock(return_value=None),

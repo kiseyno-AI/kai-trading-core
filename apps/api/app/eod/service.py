@@ -10,7 +10,7 @@ from app.eod.sink import snapshot_sink
 from app.eod.state import job_state
 from app.eod.universe import UniverseSymbol, universe_service
 from app.market_data_store import complete_eod_collection_run, create_eod_collection_run
-from app.market.clock import get_market_state
+from app.market.clock import async_get_market_state
 
 
 @dataclass
@@ -36,7 +36,7 @@ class EODService:
     batch_pause_seconds = 0.2
 
     async def capture_if_due(self, now: Optional[datetime] = None, *, trigger: str = 'manual') -> dict:
-        market = get_market_state(now)
+        market = await async_get_market_state(now)
         market_date = market.server_time[:10]
 
         if market.state != 'CLOSED':

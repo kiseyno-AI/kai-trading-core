@@ -4,7 +4,7 @@ import asyncio
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 import inspect
-from threading import Lock, Thread
+from threading import Lock
 from typing import Any, Protocol
 
 import exchange_calendars as xcals
@@ -154,6 +154,35 @@ class KisKrxTradingCalendarProvider:
             )
         raise KrxCalendarUnavailableError(message)
 
+    async def lookup_day_async(self, value: date, *, allow_fallback: bool = True) -> KrxCalendarDay:
+        cached = self.cache.load_day(value)
+        if cached is not None:
+            return cached
+
+        try:
+            await self._fetch_and_cache_async(value)
+        except Exception as exc:
+            if allow_fallback:
+                return self._exchange_calendar_fallback(
+                    value,
+                    status=CALENDAR_SOURCE_STATUS_FALLBACK,
+                    error=str(exc),
+                )
+            raise KrxCalendarUnavailableError(f'KIS KRX calendar unavailable for {value.isoformat()}: {exc}') from exc
+
+        cached = self.cache.load_day(value)
+        if cached is not None:
+            return cached
+
+        message = f'KIS chk-holiday response did not include {value.isoformat()}'
+        if allow_fallback:
+            return self._exchange_calendar_fallback(
+                value,
+                status=CALENDAR_SOURCE_STATUS_MISSING_DATE,
+                error=message,
+            )
+        raise KrxCalendarUnavailableError(message)
+
     def clear_cache(self) -> None:
         self.cache.clear()
 
@@ -170,6 +199,18 @@ class KisKrxTradingCalendarProvider:
             max_pages=self.max_pages,
         )
         payload = _run_maybe_async(result)
+        self._cache_payload(payload)
+
+    async def _fetch_and_cache_async(self, value: date) -> None:
+        client = self._client_for_request()
+        result = client.fetch_krx_holiday_calendar(
+            base_date=value.strftime('%Y%m%d'),
+            max_pages=self.max_pages,
+        )
+        payload = await _await_maybe_async(result)
+        self._cache_payload(payload)
+
+    def _cache_payload(self, payload: Any) -> None:
         rows = _extract_kis_calendar_rows(payload)
         fetched_at = datetime.now(timezone.utc).isoformat()
         records = [
@@ -193,24 +234,20 @@ def _run_maybe_async(value: Any) -> Any:
     if not inspect.isawaitable(value):
         return value
     try:
-        asyncio.get_running_loop()
+        running_loop = asyncio.get_running_loop()
     except RuntimeError:
         return asyncio.run(value)
+    if running_loop.is_running():
+        if inspect.iscoroutine(value):
+            value.close()
+        raise RuntimeError('KIS KRX calendar lookup must be awaited from async callers')
+    return asyncio.run(value)
 
-    result: dict[str, Any] = {}
 
-    def run_in_thread() -> None:
-        try:
-            result['value'] = asyncio.run(value)
-        except BaseException as exc:  # pragma: no cover - re-raised in caller thread
-            result['error'] = exc
-
-    thread = Thread(target=run_in_thread, name='kis-krx-calendar-request', daemon=True)
-    thread.start()
-    thread.join()
-    if 'error' in result:
-        raise result['error']
-    return result.get('value')
+async def _await_maybe_async(value: Any) -> Any:
+    if inspect.isawaitable(value):
+        return await value
+    return value
 
 
 def _extract_kis_calendar_rows(payload: Any) -> list[dict[str, Any]]:
@@ -318,8 +355,16 @@ def get_krx_calendar_day(value: date | str, *, allow_fallback: bool = True) -> K
     return _calendar_provider.lookup_day(_normalize_date(value), allow_fallback=allow_fallback)
 
 
+async def async_get_krx_calendar_day(value: date | str, *, allow_fallback: bool = True) -> KrxCalendarDay:
+    return await _calendar_provider.lookup_day_async(_normalize_date(value), allow_fallback=allow_fallback)
+
+
 def is_krx_trading_day(value: date | str, *, allow_fallback: bool = True) -> bool:
     return get_krx_calendar_day(value, allow_fallback=allow_fallback).is_open
+
+
+async def async_is_krx_trading_day(value: date | str, *, allow_fallback: bool = True) -> bool:
+    return (await async_get_krx_calendar_day(value, allow_fallback=allow_fallback)).is_open
 
 
 def latest_krx_trading_date(
@@ -332,6 +377,20 @@ def latest_krx_trading_date(
     for offset in range(max_scan_days + 1):
         candidate = normalized - timedelta(days=offset)
         if is_krx_trading_day(candidate, allow_fallback=allow_fallback):
+            return candidate
+    return None
+
+
+async def async_latest_krx_trading_date(
+    value: date | str,
+    *,
+    allow_fallback: bool = True,
+    max_scan_days: int = DEFAULT_KRX_CALENDAR_SCAN_DAYS,
+) -> date | None:
+    normalized = _normalize_date(value)
+    for offset in range(max_scan_days + 1):
+        candidate = normalized - timedelta(days=offset)
+        if await async_is_krx_trading_day(candidate, allow_fallback=allow_fallback):
             return candidate
     return None
 
@@ -350,6 +409,20 @@ def previous_krx_trading_date(
     return None
 
 
+async def async_previous_krx_trading_date(
+    value: date | str,
+    *,
+    allow_fallback: bool = True,
+    max_scan_days: int = DEFAULT_KRX_CALENDAR_SCAN_DAYS,
+) -> date | None:
+    normalized = _normalize_date(value)
+    for offset in range(1, max_scan_days + 1):
+        candidate = normalized - timedelta(days=offset)
+        if await async_is_krx_trading_day(candidate, allow_fallback=allow_fallback):
+            return candidate
+    return None
+
+
 def next_krx_trading_date(
     value: date | str,
     *,
@@ -360,6 +433,20 @@ def next_krx_trading_date(
     for offset in range(1, max_scan_days + 1):
         candidate = normalized + timedelta(days=offset)
         if is_krx_trading_day(candidate, allow_fallback=allow_fallback):
+            return candidate
+    return None
+
+
+async def async_next_krx_trading_date(
+    value: date | str,
+    *,
+    allow_fallback: bool = True,
+    max_scan_days: int = DEFAULT_KRX_CALENDAR_SCAN_DAYS,
+) -> date | None:
+    normalized = _normalize_date(value)
+    for offset in range(1, max_scan_days + 1):
+        candidate = normalized + timedelta(days=offset)
+        if await async_is_krx_trading_day(candidate, allow_fallback=allow_fallback):
             return candidate
     return None
 
@@ -380,9 +467,34 @@ def next_krx_open_date_on_or_after(
     )
 
 
+async def async_next_krx_open_date_on_or_after(
+    value: date | str,
+    *,
+    allow_fallback: bool = True,
+    max_scan_days: int = DEFAULT_KRX_CALENDAR_SCAN_DAYS,
+) -> date | None:
+    normalized = _normalize_date(value)
+    if await async_is_krx_trading_day(normalized, allow_fallback=allow_fallback):
+        return normalized
+    return await async_next_krx_trading_date(
+        normalized,
+        allow_fallback=allow_fallback,
+        max_scan_days=max_scan_days,
+    )
+
+
 def market_session_status_for_date(value: date | str) -> str:
     normalized = _normalize_date(value)
     if is_krx_trading_day(normalized):
+        return MARKET_SESSION_CLOSED
+    if normalized.weekday() >= 5:
+        return MARKET_SESSION_WEEKEND
+    return MARKET_SESSION_HOLIDAY
+
+
+async def async_market_session_status_for_date(value: date | str) -> str:
+    normalized = _normalize_date(value)
+    if await async_is_krx_trading_day(normalized):
         return MARKET_SESSION_CLOSED
     if normalized.weekday() >= 5:
         return MARKET_SESSION_WEEKEND
@@ -417,6 +529,75 @@ def build_market_session_metadata(
         reason = current_market_reason
     else:
         status = market_session_status_for_date(normalized_requested_date)
+        reason = 'historical_requested_date' if status == MARKET_SESSION_CLOSED else status
+
+    intraday_data_expected = requested_is_trading_day and (
+        not requested_is_current_calendar_date or bool(getattr(current_state, 'is_open', False))
+    )
+    quote_data_expected = intraday_data_expected
+    recommendation_basis = (
+        RECOMMENDATION_BASIS_LIVE_INTRADAY
+        if requested_is_current_calendar_date
+        and requested_is_trading_day
+        and bool(getattr(current_state, 'is_open', False))
+        else RECOMMENDATION_BASIS_LATEST_COMPLETED_EOD
+    )
+
+    return {
+        'requested_date': normalized_requested_date.isoformat(),
+        'current_calendar_date': current_calendar_date.isoformat(),
+        'latest_valid_trading_date': (
+            latest_valid_trading_date.isoformat() if latest_valid_trading_date is not None else None
+        ),
+        'requested_date_is_current_calendar_date': requested_is_current_calendar_date,
+        'is_trading_day': requested_is_trading_day,
+        'requested_date_is_trading_day': requested_is_trading_day,
+        'current_calendar_date_is_trading_day': bool(getattr(current_state, 'is_trading_day', False)),
+        'status': status,
+        'market_state': current_market_state if requested_is_current_calendar_date else None,
+        'current_market_state': current_market_state,
+        'current_market_session': current_market_session,
+        'reason': reason,
+        'intraday_data_expected': intraday_data_expected,
+        'quote_data_expected': quote_data_expected,
+        'recommendation_basis': recommendation_basis,
+        'calendar_source': requested_lookup.calendar_source,
+        'calendar_source_status': requested_lookup.calendar_source_status,
+        'calendar_source_error': requested_lookup.calendar_source_error,
+        'current_calendar_source': getattr(current_state, 'calendar_source', None),
+        'current_calendar_source_status': getattr(current_state, 'calendar_source_status', None),
+        'current_calendar_source_error': getattr(current_state, 'calendar_source_error', None),
+    }
+
+
+async def async_build_market_session_metadata(
+    *,
+    requested_date: date | str,
+    current_state: Any,
+) -> dict[str, Any]:
+    normalized_requested_date = _normalize_date(requested_date)
+    current_calendar_date = date.fromisoformat(
+        str(
+            getattr(current_state, 'current_calendar_date', None)
+            or str(getattr(current_state, 'server_time', ''))[:10]
+        )
+    )
+    requested_is_current_calendar_date = normalized_requested_date == current_calendar_date
+    requested_lookup = await async_get_krx_calendar_day(normalized_requested_date)
+    requested_is_trading_day = requested_lookup.is_open
+    latest_valid_trading_date = await async_latest_krx_trading_date(normalized_requested_date)
+
+    current_market_state = str(getattr(current_state, 'state', '') or '')
+    current_market_reason = str(getattr(current_state, 'reason', '') or '') or None
+    current_market_session = str(getattr(current_state, 'market_session', None) or '')
+    if not current_market_session:
+        current_market_session = await async_market_session_status_for_date(current_calendar_date)
+
+    if requested_is_current_calendar_date:
+        status = current_market_session
+        reason = current_market_reason
+    else:
+        status = await async_market_session_status_for_date(normalized_requested_date)
         reason = 'historical_requested_date' if status == MARKET_SESSION_CLOSED else status
 
     intraday_data_expected = requested_is_trading_day and (
