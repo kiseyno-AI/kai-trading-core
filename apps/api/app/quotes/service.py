@@ -5,7 +5,7 @@ from datetime import date, datetime
 
 from app.brokers.kis.provider import kis_client
 from app.market_data_store import load_current_quote, load_daily_bars_for_symbol, persist_quote_snapshot
-from app.market.clock import get_market_state
+from app.market.clock import async_get_market_state
 from app.quotes.cache import quote_cache
 from app.quotes.names import SymbolNameService
 from app.scanner.state import scanner_state
@@ -228,7 +228,7 @@ class QuoteService:
         )
 
     async def get_quote(self, symbol: str) -> dict:
-        market = get_market_state()
+        market = await async_get_market_state()
         market_date = _market_calendar_date(market.server_time)
 
         if market.is_open:
@@ -272,7 +272,7 @@ class QuoteService:
         )
 
     async def get_tracked_quotes(self) -> dict:
-        market = get_market_state()
+        market = await async_get_market_state()
         symbols = list(scanner_state.tracked_symbols)
         items = []
         for symbol in symbols:

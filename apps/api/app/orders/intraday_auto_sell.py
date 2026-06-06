@@ -3,19 +3,26 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
+import inspect
 import logging
 import re
 from typing import Any, Callable
 
-import exchange_calendars as xcals
-import pandas as pd
 from sqlalchemy import select
 
 from app.agent_context.roles import SIGNAL_DECIDER_AGENT_NAME
 from app.core.settings import settings
 from app.db import session_scope
 from app.db_models import SignalDeciderDecisionSnapshot, SignalDeciderExecutionPlanItem
-from app.market.clock import MarketState, get_market_state
+from app.market.clock import MarketState, async_get_market_state, get_market_state
+from app.market.session import (
+    CALENDAR_SOURCE_EXCHANGE_CALENDARS,
+    CALENDAR_SOURCE_STATUS_FALLBACK,
+    CALENDAR_SOURCE_STATUS_MISSING_DATE,
+    CALENDAR_SOURCE_STATUS_UNAVAILABLE,
+    next_krx_open_date_on_or_after,
+    next_krx_trading_date,
+)
 from app.orders.account_inquiry_service import (
     TradingAccountInquiryService,
     trading_account_inquiry_service,
@@ -65,7 +72,11 @@ FAILED_ORDER_STATUSES = {
 SUCCESS_ORDER_STATUSES = {
     BrokerOrderStatus.FILLED.value,
 }
-KRX_EXCHANGE_CALENDAR = xcals.get_calendar('XKRX')
+CALENDAR_FALLBACK_STATUSES = {
+    CALENDAR_SOURCE_STATUS_FALLBACK,
+    CALENDAR_SOURCE_STATUS_MISSING_DATE,
+    CALENDAR_SOURCE_STATUS_UNAVAILABLE,
+}
 
 
 def _utcnow() -> datetime:
@@ -179,12 +190,24 @@ def _holding_period_bounds(value: Any) -> tuple[int | None, int | None]:
 def _advance_trading_days(start_date: date, trading_days: int | None) -> date | None:
     if trading_days is None or trading_days < 1:
         return None
-    current_session = KRX_EXCHANGE_CALENDAR.date_to_session(pd.Timestamp(start_date.isoformat()), direction='next')
+    current_date = next_krx_open_date_on_or_after(start_date)
+    if current_date is None:
+        return None
     remaining = max(0, trading_days - 1)
     while remaining > 0:
-        current_session = KRX_EXCHANGE_CALENDAR.next_session(current_session)
+        current_date = next_krx_trading_date(current_date)
+        if current_date is None:
+            return None
         remaining -= 1
-    return current_session.date()
+    return current_date
+
+
+def _calendar_requires_operator_override(market_state: MarketState) -> bool:
+    source = _normalize_optional_text(getattr(market_state, 'calendar_source', None), lowercase=True)
+    status = _normalize_optional_text(getattr(market_state, 'calendar_source_status', None), lowercase=True)
+    if source == CALENDAR_SOURCE_EXCHANGE_CALENDARS:
+        return True
+    return bool(status and status in CALENDAR_FALLBACK_STATUSES)
 
 
 def _sort_key_for_order_pair(order_row: dict[str, Any] | None, request_row: dict[str, Any] | None) -> datetime:
@@ -220,16 +243,25 @@ class SignalDeciderIntradayAutoSellService:
         account_inquiry_service: TradingAccountInquiryService | None = None,
         quote_service: QuoteService | None = None,
         order_service: TradingOrderService | None = None,
-        market_state_getter: Callable[[], MarketState] = get_market_state,
+        market_state_getter: Callable[[], Any] | None = None,
     ) -> None:
         self.account_inquiry_service = account_inquiry_service or trading_account_inquiry_service
         self.quote_service = quote_service or QuoteService()
         self.order_service = order_service or trading_order_service
-        self.market_state_getter = market_state_getter
+        self.market_state_getter = market_state_getter or get_market_state
+        self._uses_default_market_state_getter = market_state_getter is None
 
     def _current_time(self, market_state: MarketState | None = None) -> datetime:
         state = market_state or self.market_state_getter()
         return _as_utc(_parse_datetime(state.server_time)) or _utcnow()
+
+    async def _get_market_state_async(self) -> MarketState:
+        if self._uses_default_market_state_getter:
+            return await async_get_market_state()
+        result = self.market_state_getter()
+        if inspect.isawaitable(result):
+            return await result
+        return result
 
     def runtime_status(self, *, account_reference: str | None = None) -> dict[str, Any]:
         accounts, errors, account_source = self._resolve_accounts(account_reference=account_reference)
@@ -266,12 +298,14 @@ class SignalDeciderIntradayAutoSellService:
                 trigger='route_refresh',
             )
 
-        market_state = self.market_state_getter()
+        market_state = await self._get_market_state_async()
         runtime = self.runtime_status(account_reference=account_reference)
         runtime.update(
             {
                 'market_state': market_state.state,
                 'server_time': market_state.server_time,
+                'calendar_source': getattr(market_state, 'calendar_source', None),
+                'calendar_source_status': getattr(market_state, 'calendar_source_status', None),
             }
         )
         rows = self._load_watch_rows(
@@ -299,7 +333,7 @@ class SignalDeciderIntradayAutoSellService:
         trigger: str = 'manual',
     ) -> dict[str, Any]:
         normalized_symbol = _normalize_optional_text(symbol, uppercase=True)
-        market_state = self.market_state_getter()
+        market_state = await self._get_market_state_async()
         runtime = self.runtime_status(account_reference=account_reference)
         accounts, errors, _account_source = self._resolve_accounts(account_reference=account_reference)
         items: list[dict[str, Any]] = []
@@ -344,6 +378,8 @@ class SignalDeciderIntradayAutoSellService:
             {
                 'market_state': market_state.state,
                 'server_time': market_state.server_time,
+                'calendar_source': getattr(market_state, 'calendar_source', None),
+                'calendar_source_status': getattr(market_state, 'calendar_source_status', None),
                 'account_reference_errors': errors,
             }
         )
@@ -373,7 +409,7 @@ class SignalDeciderIntradayAutoSellService:
             symbol=symbol,
             trigger=f'{trigger}_refresh',
         )
-        market_state = self.market_state_getter()
+        market_state = await self._get_market_state_async()
         effective_dry_run = settings.signal_decider_intraday_auto_sell_dry_run if dry_run is None else dry_run
         payload['request'].update(
             {
@@ -382,6 +418,20 @@ class SignalDeciderIntradayAutoSellService:
                 'trigger': trigger,
             }
         )
+        if not force and not effective_dry_run and _calendar_requires_operator_override(market_state):
+            payload['summary'] = {
+                **payload['summary'],
+                'triggered': False,
+                'reason': 'calendar_unavailable',
+                'selected_count': 0,
+                'submitted_count': 0,
+                'dry_run_count': 0,
+                'failed_count': 0,
+                'idempotent_replay_count': 0,
+                'calendar_source': getattr(market_state, 'calendar_source', None),
+                'calendar_source_status': getattr(market_state, 'calendar_source_status', None),
+            }
+            return payload
         if not force and market_state.state != 'OPEN':
             payload['summary'] = {
                 **payload['summary'],

@@ -27,7 +27,7 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
             runner._running = False
 
         with (
-            patch('app.eod.runner.get_market_state', return_value=market_state),
+            patch('app.eod.runner.async_get_market_state', return_value=market_state),
             patch('app.eod.runner.refresh_master_if_due') as refresh_master,
             patch('app.eod.runner.signal_decider_next_open_execution_service.refresh_plan_if_due') as refresh_plan,
             patch(
@@ -63,7 +63,7 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch('app.eod.runner.asyncio.to_thread', side_effect=run_inline) as to_thread,
-            patch('app.eod.runner.get_market_state', return_value=market_state),
+            patch('app.eod.runner.async_get_market_state', return_value=market_state),
             patch('app.eod.runner.refresh_master_if_due'),
             patch('app.eod.runner.signal_decider_next_open_execution_service.refresh_plan_if_due'),
             patch(
@@ -93,7 +93,7 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
             runner._running = False
 
         with (
-            patch('app.eod.runner.get_market_state', return_value=market_state),
+            patch('app.eod.runner.async_get_market_state', return_value=market_state),
             patch(
                 'app.eod.runner.signal_decider_next_open_execution_service.run_market_open_execution_if_due',
                 new=AsyncMock(),
@@ -131,7 +131,7 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
             runner._running = False
 
         with (
-            patch('app.eod.runner.get_market_state', return_value=market_state),
+            patch('app.eod.runner.async_get_market_state', return_value=market_state),
             patch('app.eod.runner.refresh_master_if_due'),
             patch('app.eod.runner.signal_decider_next_open_execution_service.refresh_plan_if_due'),
             patch('app.eod.runner.signal_decider_exec_integration_service.should_delegate_execution', return_value=True),
@@ -170,7 +170,7 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
             runner._running = False
 
         with (
-            patch('app.eod.runner.get_market_state', return_value=market_state),
+            patch('app.eod.runner.async_get_market_state', return_value=market_state),
             patch('app.eod.runner.refresh_master_if_due'),
             patch('app.eod.runner.signal_decider_next_open_execution_service.refresh_plan_if_due'),
             patch('app.eod.runner.signal_decider_exec_integration_service.should_delegate_execution', return_value=True),
@@ -228,7 +228,7 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
             runner._running = False
 
         with (
-            patch('app.eod.runner.get_market_state', return_value=market_state),
+            patch('app.eod.runner.async_get_market_state', return_value=market_state),
             patch('app.eod.runner.signal_decider_exec_integration_service.should_delegate_execution', return_value=True),
             patch(
                 'app.eod.runner.signal_decider_exec_integration_service.schedule_signal_decider_exec_readback_refresh',
@@ -311,7 +311,7 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
 
         try:
             with (
-                patch('app.eod.runner.get_market_state', return_value=market_state),
+                patch('app.eod.runner.async_get_market_state', return_value=market_state),
                 patch('app.eod.runner.signal_decider_exec_integration_service', fake_service),
                 patch(
                     'app.eod.runner.trading_order_reconciliation_service.run_periodic_if_due',

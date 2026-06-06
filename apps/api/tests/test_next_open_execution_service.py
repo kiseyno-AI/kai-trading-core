@@ -17,6 +17,11 @@ from app.db_models import (
     SignalDeciderPolicyVersion,
 )
 from app.market.clock import MarketState
+from app.market.session import (
+    KisKrxTradingCalendarProvider,
+    reset_krx_calendar_provider,
+    set_krx_calendar_provider,
+)
 from app.orders.next_open_execution import (
     EXECUTION_STATUS_DRY_RUN,
     EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING,
@@ -87,6 +92,16 @@ class FakeOrderService:
         }
 
 
+class FakeCalendarClient:
+    def __init__(self, rows: list[dict]) -> None:
+        self.rows = rows
+        self.calls: list[dict] = []
+
+    async def fetch_krx_holiday_calendar(self, **kwargs):
+        self.calls.append(kwargs)
+        return {'output': list(self.rows)}
+
+
 class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -143,9 +158,18 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.enrichment_preflight_mock = self.enrichment_preflight_patcher.start()
         self.addCleanup(self.enrichment_preflight_patcher.stop)
+        self.calendar_client = FakeCalendarClient(
+            [
+                {'bass_dt': '20260429', 'opnd_yn': 'Y'},
+                {'bass_dt': '20260430', 'opnd_yn': 'Y'},
+            ]
+        )
+        set_krx_calendar_provider(KisKrxTradingCalendarProvider(client=self.calendar_client))
+        self.addCleanup(reset_krx_calendar_provider)
         self._seed_policy_version()
 
     def tearDown(self) -> None:
+        reset_krx_calendar_provider()
         for key, value in self.original_settings.items():
             setattr(settings, key, value)
         with session_scope() as session:
@@ -407,8 +431,40 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
-    def test_previous_trading_day_uses_exchange_calendar(self) -> None:
+    def test_previous_trading_day_uses_kis_calendar_helper(self) -> None:
+        set_krx_calendar_provider(
+            KisKrxTradingCalendarProvider(
+                client=FakeCalendarClient(
+                    [
+                        {'bass_dt': '20260101', 'opnd_yn': 'N'},
+                        {'bass_dt': '20251231', 'opnd_yn': 'N'},
+                        {'bass_dt': '20251230', 'opnd_yn': 'Y'},
+                    ]
+                )
+            )
+        )
+
         self.assertEqual(_previous_trading_day(date(2026, 1, 2)), date(2025, 12, 30))
+
+    def test_list_plan_items_rolls_requested_non_open_date_forward(self) -> None:
+        set_krx_calendar_provider(
+            KisKrxTradingCalendarProvider(
+                client=FakeCalendarClient(
+                    [
+                        {'bass_dt': '20260602', 'opnd_yn': 'Y'},
+                        {'bass_dt': '20260603', 'opnd_yn': 'N'},
+                        {'bass_dt': '20260604', 'opnd_yn': 'Y'},
+                    ]
+                )
+            )
+        )
+        service = self._service(state='PREOPEN', server_time='2026-06-03T08:40:00+09:00')
+
+        result = service.list_plan_items(target_trade_date=date(2026, 6, 3))
+
+        self.assertEqual(result['request']['target_trade_date'], '2026-06-04')
+        self.assertEqual(result['summary']['target_trade_date'], '2026-06-04')
+        self.assertEqual(result['summary']['source_market_date'], '2026-06-02')
 
     def test_refresh_plan_items_persists_eligible_and_blocked_buy_candidates(self) -> None:
         eligible_snapshot_id = self._seed_snapshot(symbol='005930')
@@ -1099,6 +1155,35 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(fake_order_service.calls), 0)
         self.assertEqual(result['items'][0]['execution_status'], EXECUTION_STATUS_DRY_RUN)
         self.assertEqual(result['items'][0]['submission']['mode'], 'dry_run')
+
+    async def test_run_market_open_execution_fails_closed_on_calendar_fallback(self) -> None:
+        fake_order_service = FakeOrderService()
+        fallback_market_state = MarketState(
+            market='KRX',
+            state='OPEN',
+            is_trading_day=True,
+            is_open=True,
+            server_time='2026-04-30T09:01:00+09:00',
+            session_open_at='2026-04-30T09:00:00+09:00',
+            session_close_at='2026-04-30T15:30:00+09:00',
+            calendar_source='exchange_calendars',
+            calendar_source_status='fallback',
+            calendar_source_error='kis calendar unavailable',
+        )
+        service = SignalDeciderNextOpenExecutionService(
+            order_service=fake_order_service,
+            market_state_getter=lambda: fallback_market_state,
+        )
+
+        result = await service.run_market_open_execution_if_due(
+            target_trade_date=self.target_trade_date,
+            trigger='test',
+        )
+
+        self.assertFalse(result['summary']['triggered'])
+        self.assertEqual(result['summary']['reason'], 'calendar_unavailable')
+        self.assertEqual(result['summary']['calendar_source'], 'exchange_calendars')
+        self.assertEqual(len(fake_order_service.calls), 0)
 
     async def test_refresh_plan_items_does_not_mutate_submitted_rows(self) -> None:
         original_snapshot_id = self._seed_snapshot(symbol='005930')

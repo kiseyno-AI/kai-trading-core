@@ -1,7 +1,7 @@
 # GET /market/status
 
 ## Summary
-Returns the current KRX market clock state used by web and operators, including the latest valid trading date and explicit weekend or holiday session semantics.
+Returns the current KRX market clock state used by web and operators, including the latest valid trading date, KIS-backed calendar source metadata, and explicit weekend or holiday session semantics.
 
 ## Example request
 ```http
@@ -21,6 +21,9 @@ GET /market/status
   "reason": null,
   "current_calendar_date": "2026-04-16",
   "latest_valid_trading_date": "2026-04-16",
-  "market_session": "open"
+  "market_session": "open",
+  "calendar_source": "kis_chk_holiday",
+  "calendar_source_status": "ok",
+  "calendar_source_error": null
 }
 ```

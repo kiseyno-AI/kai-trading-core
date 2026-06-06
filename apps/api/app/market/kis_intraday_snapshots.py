@@ -7,7 +7,7 @@ from typing import Any, Sequence
 
 from app.brokers.kis.provider import kis_client
 from app.core.settings import settings
-from app.market.clock import get_market_state
+from app.market.clock import async_get_market_state
 from app.market_data_store import (
     load_current_kis_intraday_snapshots,
     load_symbols,
@@ -835,7 +835,7 @@ class KISIntradaySnapshotService:
             }
 
         normalized_market_code = _normalize_market_code(market_code or settings.kis_intraday_snapshot_market_code or DEFAULT_MARKET_CODE)
-        market_state = get_market_state()
+        market_state = await async_get_market_state()
         market_date = market_state.server_time[:10]
         ranking_pages = max(1, int(max_ranking_pages or settings.kis_intraday_snapshot_max_ranking_pages or DEFAULT_MAX_RANKING_PAGES))
         news_limit = max(0, int(max_news_items or settings.kis_intraday_snapshot_news_limit or DEFAULT_MAX_NEWS_ITEMS))

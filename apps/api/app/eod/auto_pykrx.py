@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 
 from app.core.settings import settings
 from app.eod.pykrx_backfill import DEFAULT_MARKETS, PYKRX_BACKFILL_SERVICE
-from app.market.clock import KST, get_market_state
+from app.market.clock import KST, async_get_market_state
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +75,7 @@ class AutoPykrxEODScheduler:
 
     async def schedule_daily_pipeline_if_due(self) -> None:
         self._state.enabled = settings.eod_auto_pykrx_enabled
-        market = get_market_state()
+        market = await async_get_market_state()
         self._state.last_checked_at = _utcnow()
         self._state.last_market_state = market.state
         self._state.last_market_date = market.server_time[:10]

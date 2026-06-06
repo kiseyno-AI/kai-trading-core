@@ -42,7 +42,7 @@ class QuoteServiceTests(unittest.IsolatedAsyncioTestCase):
         resolve_company_name = AsyncMock(return_value='Samsung Electronics')
 
         with (
-            patch('app.quotes.service.get_market_state', return_value=market_state),
+            patch('app.quotes.service.async_get_market_state', return_value=market_state),
             patch.object(service, '_resolve_company_name', new=resolve_company_name),
             patch('app.quotes.service.load_daily_bars_for_symbol', return_value=[
                 {
@@ -102,7 +102,7 @@ class QuoteServiceTests(unittest.IsolatedAsyncioTestCase):
         resolve_company_name = AsyncMock(return_value='Samsung Electronics')
 
         with (
-            patch('app.quotes.service.get_market_state', return_value=market_state),
+            patch('app.quotes.service.async_get_market_state', return_value=market_state),
             patch.object(service, '_resolve_company_name', new=resolve_company_name),
             patch('app.quotes.service.load_daily_bars_for_symbol', return_value=[]),
             patch('app.quotes.service.load_current_quote', return_value={
@@ -140,7 +140,7 @@ class QuoteServiceTests(unittest.IsolatedAsyncioTestCase):
         resolve_company_name = AsyncMock(return_value='Samsung Electronics')
 
         with (
-            patch('app.quotes.service.get_market_state', return_value=market_state),
+            patch('app.quotes.service.async_get_market_state', return_value=market_state),
             patch.object(service, '_resolve_company_name', new=resolve_company_name),
             patch('app.quotes.service.load_daily_bars_for_symbol', return_value=[
                 {
@@ -183,7 +183,7 @@ class QuoteServiceTests(unittest.IsolatedAsyncioTestCase):
         resolve_company_name = AsyncMock(return_value='Samsung Electronics')
 
         with (
-            patch('app.quotes.service.get_market_state', return_value=market_state),
+            patch('app.quotes.service.async_get_market_state', return_value=market_state),
             patch.object(service, '_resolve_company_name', new=resolve_company_name),
             patch('app.quotes.service.load_daily_bars_for_symbol', return_value=[
                 {
@@ -221,7 +221,7 @@ class QuoteServiceTests(unittest.IsolatedAsyncioTestCase):
         resolve_company_name = AsyncMock(return_value='Samsung Electronics')
 
         with (
-            patch('app.quotes.service.get_market_state', return_value=market_state),
+            patch('app.quotes.service.async_get_market_state', return_value=market_state),
             patch.object(service, '_resolve_company_name', new=resolve_company_name),
             patch.object(
                 service.client,

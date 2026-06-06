@@ -4,11 +4,10 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
+import inspect
 import logging
 from typing import Any, Callable, Sequence
 
-import exchange_calendars as xcals
-import pandas as pd
 from sqlalchemy import select
 
 from app.agent_context.decision_input_quality import build_decision_input_quality_envelope
@@ -21,7 +20,17 @@ from app.eod.pykrx_enrichment_gate import (
     REQUIRED_EXEC_DECIDER_PYKRX_ENRICHMENT_CATEGORIES,
     inspect_pykrx_enrichment_preflight,
 )
-from app.market.clock import MarketState, get_market_state
+from app.market.clock import MarketState, async_get_market_state, get_market_state
+from app.market.session import (
+    CALENDAR_SOURCE_EXCHANGE_CALENDARS,
+    CALENDAR_SOURCE_STATUS_FALLBACK,
+    CALENDAR_SOURCE_STATUS_MISSING_DATE,
+    CALENDAR_SOURCE_STATUS_UNAVAILABLE,
+    async_next_krx_open_date_on_or_after,
+    async_previous_krx_trading_date,
+    next_krx_open_date_on_or_after,
+    previous_krx_trading_date,
+)
 from app.market_data_store import load_daily_bars_for_symbol_range, load_daily_pykrx_enrichment_rows
 from app.orders.account_scope import parse_kis_account_reference
 from app.orders.signal_decider_execution_outcomes import signal_decider_execution_outcome_service
@@ -56,10 +65,14 @@ SHORT_TERM_HANDOFF_INTENT_BY_TACTICAL_ACTION = {
     'scalp_buy_candidate': 'tactical_buy',
     'watch_for_trigger': 'intraday_watch_buy',
 }
-KRX_EXCHANGE_CALENDAR = xcals.get_calendar('XKRX')
 UNSPECIFIED_ROUTE_ACCOUNT_REFERENCE = 'KIS:00000000-00'
 UNSPECIFIED_ROUTE_ACCOUNT_LABEL = 'UNSPECIFIED_ROUTE'
 UNSPECIFIED_ROUTE_ACCOUNT_BUDGET_KRW = Decimal('0')
+CALENDAR_FALLBACK_STATUSES = {
+    CALENDAR_SOURCE_STATUS_FALLBACK,
+    CALENDAR_SOURCE_STATUS_MISSING_DATE,
+    CALENDAR_SOURCE_STATUS_UNAVAILABLE,
+}
 # Short-term candidates are no longer blocked when account routing is omitted.
 # They still need a concrete row shape for exec routing; this synthetic rail
 # is treated as a routing/budget placeholder and does not drive fixed sizing.
@@ -285,11 +298,52 @@ def _first_blocking_reason(validation_payload: dict[str, Any] | None) -> dict[st
     return None
 
 
-def _previous_trading_day(value: date) -> date:
-    session_label = pd.Timestamp(value.isoformat())
-    if KRX_EXCHANGE_CALENDAR.is_session(session_label):
-        return KRX_EXCHANGE_CALENDAR.previous_session(session_label).date()
-    return KRX_EXCHANGE_CALENDAR.date_to_session(session_label, direction='previous').date()
+def normalize_next_open_target_trade_date(
+    value: str | date | None,
+    *,
+    default: date,
+    allow_fallback: bool = True,
+) -> date:
+    candidate = _normalize_date(value, default=default)
+    normalized = next_krx_open_date_on_or_after(candidate, allow_fallback=allow_fallback)
+    if normalized is None:
+        raise ValueError(f'Could not resolve next KRX open date on or after {candidate.isoformat()}')
+    return normalized
+
+
+async def async_normalize_next_open_target_trade_date(
+    value: str | date | None,
+    *,
+    default: date,
+    allow_fallback: bool = True,
+) -> date:
+    candidate = _normalize_date(value, default=default)
+    normalized = await async_next_krx_open_date_on_or_after(candidate, allow_fallback=allow_fallback)
+    if normalized is None:
+        raise ValueError(f'Could not resolve next KRX open date on or after {candidate.isoformat()}')
+    return normalized
+
+
+def _previous_trading_day(value: date, *, allow_fallback: bool = True) -> date:
+    previous = previous_krx_trading_date(value, allow_fallback=allow_fallback)
+    if previous is None:
+        raise ValueError(f'Could not resolve previous KRX trading date before {value.isoformat()}')
+    return previous
+
+
+async def _async_previous_trading_day(value: date, *, allow_fallback: bool = True) -> date:
+    previous = await async_previous_krx_trading_date(value, allow_fallback=allow_fallback)
+    if previous is None:
+        raise ValueError(f'Could not resolve previous KRX trading date before {value.isoformat()}')
+    return previous
+
+
+def _calendar_requires_operator_override(market_state: MarketState) -> bool:
+    source = _normalize_optional_text(getattr(market_state, 'calendar_source', None))
+    status = _normalize_optional_text(getattr(market_state, 'calendar_source_status', None))
+    if source == CALENDAR_SOURCE_EXCHANGE_CALENDARS:
+        return True
+    return bool(status and status in CALENDAR_FALLBACK_STATUSES)
 
 
 def _reason(code: str, message: str) -> dict[str, str]:
@@ -353,10 +407,11 @@ class SignalDeciderNextOpenExecutionService:
         self,
         *,
         order_service: TradingOrderService | None = None,
-        market_state_getter: Callable[[], MarketState] = get_market_state,
+        market_state_getter: Callable[[], Any] | None = None,
     ) -> None:
         self.order_service = order_service or trading_order_service
-        self.market_state_getter = market_state_getter
+        self.market_state_getter = market_state_getter or get_market_state
+        self._uses_default_market_state_getter = market_state_getter is None
 
     def runtime_status(self) -> dict[str, Any]:
         targets, errors = self._parse_account_targets()
@@ -385,6 +440,14 @@ class SignalDeciderNextOpenExecutionService:
                 'require_target_and_stop': bool(settings.signal_decider_next_open_require_target_and_stop),
             },
         }
+
+    async def _get_market_state_async(self) -> MarketState:
+        if self._uses_default_market_state_getter:
+            return await async_get_market_state()
+        result = self.market_state_getter()
+        if inspect.isawaitable(result):
+            return await result
+        return result
 
     def list_plan_items(
         self,
@@ -676,13 +739,48 @@ class SignalDeciderNextOpenExecutionService:
         force: bool = False,
         trigger: str = 'manual',
     ) -> dict[str, Any]:
-        market_state = self.market_state_getter()
-        resolved_target_date = self._resolve_target_trade_date(
+        market_state = await self._get_market_state_async()
+        effective_dry_run = settings.signal_decider_next_open_dry_run if dry_run is None else dry_run
+        runtime = self.runtime_status()
+        if not force and not effective_dry_run and _calendar_requires_operator_override(market_state):
+            default_date = date.fromisoformat(market_state.server_time[:10])
+            resolved_target_date = await async_normalize_next_open_target_trade_date(
+                target_trade_date,
+                default=default_date,
+                allow_fallback=True,
+            )
+            return {
+                'request': {
+                    'target_trade_date': resolved_target_date.isoformat(),
+                    'dry_run': effective_dry_run,
+                    'force': force,
+                    'trigger': trigger,
+                },
+                'runtime': {
+                    **runtime,
+                    'market_state': market_state.state,
+                    'server_time': market_state.server_time,
+                    'calendar_source': getattr(market_state, 'calendar_source', None),
+                    'calendar_source_status': getattr(market_state, 'calendar_source_status', None),
+                    'calendar_source_error': getattr(market_state, 'calendar_source_error', None),
+                },
+                'summary': {
+                    'triggered': False,
+                    'reason': 'calendar_unavailable',
+                    'selected_count': 0,
+                    'submitted_count': 0,
+                    'dry_run_count': 0,
+                    'failed_count': 0,
+                    'idempotent_replay_count': 0,
+                    'calendar_source': getattr(market_state, 'calendar_source', None),
+                    'calendar_source_status': getattr(market_state, 'calendar_source_status', None),
+                },
+                'items': [],
+            }
+        resolved_target_date = await self._resolve_target_trade_date_async(
             target_trade_date,
             market_state=market_state,
         )
-        effective_dry_run = settings.signal_decider_next_open_dry_run if dry_run is None else dry_run
-        runtime = self.runtime_status()
         if not force:
             today = date.fromisoformat(market_state.server_time[:10])
             if market_state.state != 'OPEN':
@@ -697,6 +795,8 @@ class SignalDeciderNextOpenExecutionService:
                         **runtime,
                         'market_state': market_state.state,
                         'server_time': market_state.server_time,
+                        'calendar_source': getattr(market_state, 'calendar_source', None),
+                        'calendar_source_status': getattr(market_state, 'calendar_source_status', None),
                     },
                     'summary': {
                         'triggered': False,
@@ -721,6 +821,8 @@ class SignalDeciderNextOpenExecutionService:
                         **runtime,
                         'market_state': market_state.state,
                         'server_time': market_state.server_time,
+                        'calendar_source': getattr(market_state, 'calendar_source', None),
+                        'calendar_source_status': getattr(market_state, 'calendar_source_status', None),
                     },
                     'summary': {
                         'triggered': False,
@@ -745,6 +847,8 @@ class SignalDeciderNextOpenExecutionService:
                         **runtime,
                         'market_state': market_state.state,
                         'server_time': market_state.server_time,
+                        'calendar_source': getattr(market_state, 'calendar_source', None),
+                        'calendar_source_status': getattr(market_state, 'calendar_source_status', None),
                     },
                     'summary': {
                         'triggered': False,
@@ -780,6 +884,8 @@ class SignalDeciderNextOpenExecutionService:
                     **runtime,
                     'market_state': market_state.state,
                     'server_time': market_state.server_time,
+                    'calendar_source': getattr(market_state, 'calendar_source', None),
+                    'calendar_source_status': getattr(market_state, 'calendar_source_status', None),
                 },
                 'summary': {
                     'triggered': False,
@@ -853,6 +959,8 @@ class SignalDeciderNextOpenExecutionService:
                 **runtime,
                 'market_state': market_state.state,
                 'server_time': market_state.server_time,
+                'calendar_source': getattr(market_state, 'calendar_source', None),
+                'calendar_source_status': getattr(market_state, 'calendar_source_status', None),
             },
             'summary': {
                 'triggered': True,
@@ -870,10 +978,30 @@ class SignalDeciderNextOpenExecutionService:
         target_trade_date: str | date | None,
         *,
         market_state: MarketState | None = None,
+        allow_fallback: bool = True,
     ) -> date:
         state = market_state or self.market_state_getter()
         default_date = date.fromisoformat(state.server_time[:10])
-        return _normalize_date(target_trade_date, default=default_date)
+        return normalize_next_open_target_trade_date(
+            target_trade_date,
+            default=default_date,
+            allow_fallback=allow_fallback,
+        )
+
+    async def _resolve_target_trade_date_async(
+        self,
+        target_trade_date: str | date | None,
+        *,
+        market_state: MarketState | None = None,
+        allow_fallback: bool = True,
+    ) -> date:
+        state = market_state or await self._get_market_state_async()
+        default_date = date.fromisoformat(state.server_time[:10])
+        return await async_normalize_next_open_target_trade_date(
+            target_trade_date,
+            default=default_date,
+            allow_fallback=allow_fallback,
+        )
 
     def inspect_source_market_enrichment_preflight(
         self,

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, time
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
-import pandas as pd
-
-from app.market.session import KRX_EXCHANGE_CALENDAR
+from app.market.session import (
+    async_get_krx_calendar_day,
+    async_latest_krx_trading_date,
+    get_krx_calendar_day,
+    latest_krx_trading_date,
+)
 
 KST = ZoneInfo('Asia/Seoul')
 
@@ -24,56 +27,51 @@ class MarketState:
     current_calendar_date: str | None = None
     latest_valid_trading_date: str | None = None
     market_session: str | None = None
+    calendar_source: str | None = None
+    calendar_source_status: str | None = None
+    calendar_source_error: str | None = None
 
 
 def get_market_state(now: datetime | None = None) -> MarketState:
     now = now.astimezone(KST) if now else datetime.now(KST)
+    calendar_day = get_krx_calendar_day(now.date(), allow_fallback=True)
+    latest_valid_date = latest_krx_trading_date(now.date(), allow_fallback=True)
+    return _build_market_state(now, calendar_day=calendar_day, latest_valid_date=latest_valid_date)
+
+
+async def async_get_market_state(now: datetime | None = None) -> MarketState:
+    now = now.astimezone(KST) if now else datetime.now(KST)
+    calendar_day = await async_get_krx_calendar_day(now.date(), allow_fallback=True)
+    latest_valid_date = await async_latest_krx_trading_date(now.date(), allow_fallback=True)
+    return _build_market_state(now, calendar_day=calendar_day, latest_valid_date=latest_valid_date)
+
+
+def _build_market_state(now: datetime, *, calendar_day, latest_valid_date) -> MarketState:
     current_calendar_date = now.date().isoformat()
     weekday = now.weekday()
     session_open = now.replace(hour=9, minute=0, second=0, microsecond=0)
     session_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
-    current_label = pd.Timestamp(current_calendar_date)
+    latest_valid_trading_date = latest_valid_date.isoformat() if latest_valid_date is not None else None
 
-    latest_valid_trading_date = None
-    try:
-        if KRX_EXCHANGE_CALENDAR.is_session(current_label):
-            latest_valid_trading_date = current_calendar_date
-        else:
-            latest_valid_trading_date = KRX_EXCHANGE_CALENDAR.date_to_session(
-                current_label,
-                direction='previous',
-            ).date().isoformat()
-    except Exception:
-        latest_valid_trading_date = None
-
-    if weekday >= 5:
+    if not calendar_day.is_open:
+        state = 'WEEKEND' if weekday >= 5 else 'HOLIDAY'
+        reason = 'weekend' if weekday >= 5 else 'holiday'
+        market_session = 'weekend' if weekday >= 5 else 'holiday'
         return MarketState(
             market='KRX',
-            state='WEEKEND',
+            state=state,
             is_trading_day=False,
             is_open=False,
             server_time=now.isoformat(),
             session_open_at=None,
             session_close_at=None,
-            reason='weekend',
+            reason=reason,
             current_calendar_date=current_calendar_date,
             latest_valid_trading_date=latest_valid_trading_date,
-            market_session='weekend',
-        )
-
-    if not KRX_EXCHANGE_CALENDAR.is_session(current_label):
-        return MarketState(
-            market='KRX',
-            state='HOLIDAY',
-            is_trading_day=False,
-            is_open=False,
-            server_time=now.isoformat(),
-            session_open_at=None,
-            session_close_at=None,
-            reason='holiday',
-            current_calendar_date=current_calendar_date,
-            latest_valid_trading_date=latest_valid_trading_date,
-            market_session='holiday',
+            market_session=market_session,
+            calendar_source=calendar_day.calendar_source,
+            calendar_source_status=calendar_day.calendar_source_status,
+            calendar_source_error=calendar_day.calendar_source_error,
         )
 
     if now < session_open:
@@ -100,4 +98,7 @@ def get_market_state(now: datetime | None = None) -> MarketState:
         current_calendar_date=current_calendar_date,
         latest_valid_trading_date=latest_valid_trading_date,
         market_session=market_session,
+        calendar_source=calendar_day.calendar_source,
+        calendar_source_status=calendar_day.calendar_source_status,
+        calendar_source_error=calendar_day.calendar_source_error,
     )
