@@ -906,6 +906,11 @@ class PykrxEnrichmentService:
                     date=market_date_yyyymmdd,
                     market=market,
                 )
+            except Exception as exc:
+                errors.append({'market': market, 'operation': 'valuation_market_cap', 'error': str(exc)})
+                continue
+
+            try:
                 fundamental_frame = self._fetch_frame(
                     cache=cache,
                     cache_key=('valuation_fundamentals', market_date_yyyymmdd, market),
@@ -915,8 +920,8 @@ class PykrxEnrichmentService:
                     market=market,
                 )
             except Exception as exc:
-                errors.append({'market': market, 'error': str(exc)})
-                continue
+                errors.append({'market': market, 'operation': 'valuation_fundamentals', 'error': str(exc)})
+                fundamental_frame = pd.DataFrame()
 
             symbols_for_market = {
                 str(item).strip().upper().zfill(6) if str(item).strip().isdigit() else str(item).strip().upper()

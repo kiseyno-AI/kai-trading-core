@@ -245,6 +245,52 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
         self.assertEqual(rows[0]['payload']['short_volume']['total_value'], 1400000000)
         self.assertEqual(rows[0]['payload']['short_volume']['short_value_ratio_pct'], 5.0)
 
+    @patch('app.eod.pykrx_enrichment.stock.get_market_fundamental_by_ticker')
+    @patch('app.eod.pykrx_enrichment.stock.get_market_cap_by_ticker')
+    def test_collect_valuation_snapshot_keeps_market_cap_rows_when_fundamentals_fail(
+        self,
+        get_market_cap_by_ticker_mock,
+        get_market_fundamental_by_ticker_mock,
+    ):
+        get_market_cap_by_ticker_mock.return_value = pd.DataFrame(
+            {
+                '종가': [71000],
+                '시가총액': [420000000000],
+                '거래량': [1000000],
+                '거래대금': [71000000000],
+                '상장주식수': [5969782550],
+            },
+            index=['005930'],
+        )
+        get_market_fundamental_by_ticker_mock.side_effect = KeyError(
+            "None of [Index(['BPS', 'PER', 'PBR', 'EPS', 'DIV', 'DPS'], dtype='object')] are in the [columns]"
+        )
+
+        service = PykrxEnrichmentService()
+        service._request_pause_seconds = 0.0
+        service._retry_count = 0
+        rows, details = service._collect_valuation_snapshot_rows(
+            market_date_iso='2026-06-09',
+            market_date_yyyymmdd='20260609',
+            markets=['KOSPI'],
+            symbol_filter={'005930'},
+            symbol_meta={
+                '005930': {
+                    'symbol': '005930',
+                    'name_ko': '삼성전자',
+                    'market': 'KOSPI',
+                    'standard_code': 'KR7005930003',
+                }
+            },
+            cache={},
+        )
+
+        self.assertEqual(details['rows_prepared'], 1)
+        self.assertEqual(details['errors'][0]['operation'], 'valuation_fundamentals')
+        self.assertEqual(rows[0]['symbol'], '005930')
+        self.assertEqual(rows[0]['payload']['market_cap'], 420000000000)
+        self.assertIsNone(rows[0]['payload']['per'])
+
     @patch('app.eod.pykrx_enrichment.load_symbols')
     def test_inspect_reports_partial_coverage_for_missing_categories(self, load_symbols_mock):
         load_symbols_mock.return_value = [
