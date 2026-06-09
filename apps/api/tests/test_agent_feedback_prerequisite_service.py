@@ -306,3 +306,52 @@ def test_inspect_feedback_prerequisites_allows_near_complete_pykrx_enrichment_co
     assert result['blocked_stage_ids'] == []
     warning_categories = result['stages']['pykrx_enrichment']['details']['decider_warning_categories']
     assert [item['category'] for item in warning_categories] == ['investor_flow_symbol', 'valuation_snapshot']
+
+
+def test_pykrx_prerequisite_uses_category_row_counts_when_category_payloads_missing():
+    stage = {
+        'task': 'pykrx_enrichment',
+        'status': 'partial',
+        'processed': 7,
+        'total': 7,
+        'succeeded': 6,
+        'details': {
+            'category_row_counts': {
+                'sector_classification': 2699,
+                'market_breadth': 3,
+                'investor_flow_market': 3,
+                'investor_flow_symbol': 2666,
+                'short_selling': 2805,
+                'valuation_snapshot': 2699,
+                'foreign_ownership': 2805,
+            },
+            'failed_categories': ['valuation_snapshot'],
+        },
+    }
+
+    augmented = AgentFeedbackPrerequisiteService._augment_pykrx_enrichment_prerequisite_stage(stage)
+
+    assert augmented['details']['decider_category_gate_status'] == 'ready'
+    assert augmented['details']['decider_waiting_categories'] == []
+    assert augmented['details']['decider_blocking_categories'] == []
+    warning_categories = {
+        item['category']
+        for item in augmented['details']['decider_warning_categories']
+    }
+    assert warning_categories == {'valuation_snapshot'}
+
+
+def test_pykrx_prerequisite_preserves_existing_gate_details():
+    stage = {
+        'task': 'pykrx_enrichment',
+        'status': 'partial',
+        'details': {
+            'decider_category_gate_status': 'ready',
+            'decider_category_gates': [{'category': 'sector_classification'}],
+        },
+    }
+
+    augmented = AgentFeedbackPrerequisiteService._augment_pykrx_enrichment_prerequisite_stage(stage)
+
+    assert augmented['details']['decider_category_gate_status'] == 'ready'
+    assert augmented['details']['decider_category_gates'] == [{'category': 'sector_classification'}]
