@@ -162,6 +162,18 @@ class PykrxBackfillServiceTests(TestCase):
             [PykrxSymbol(symbol='005930', market='KOSPI', name_ko='005930')],
         )
 
+    def test_resolve_reference_trade_date_falls_back_to_krx_calendar_when_pykrx_probe_fails(self) -> None:
+        service = PykrxBackfillService()
+
+        with (
+            patch('app.eod.pykrx_backfill._get_market_ohlcv_by_date', side_effect=ConnectionError('naver reset')),
+            patch('app.eod.pykrx_backfill.latest_krx_trading_date', return_value=datetime(2026, 6, 9).date()) as latest,
+        ):
+            result = service.resolve_latest_trade_date(end_date='20260609')
+
+        self.assertEqual(result, '2026-06-09')
+        latest.assert_called_once()
+
     def test_fetch_recent_universe_falls_back_per_market_when_pykrx_market_ohlcv_breaks(self) -> None:
         service = PykrxBackfillService()
         service.name_pause_seconds = 0

@@ -26,6 +26,7 @@ from app.eod.daily_pipeline_state import daily_pipeline_run_state_service
 from app.eod.pykrx_enrichment import pykrx_enrichment_service
 from app.eod.action_summaries import daily_action_summary_service
 from app.eod.pykrx_pipeline_runner import PykrxPipelineDependencies, run_market_data_pipeline
+from app.market.session import latest_krx_trading_date
 from app.eod.technical_snapshots import daily_technical_snapshot_service
 from app.signals.daily_signal_features import daily_signal_feature_service
 from app.signals.market_risk_filter import daily_market_risk_filter_service
@@ -584,10 +585,21 @@ class PykrxBackfillService:
         normalized_end = _normalize_yyyymmdd(end_date, default=date.today().strftime('%Y%m%d'))
         end_dt = datetime.strptime(normalized_end, '%Y%m%d')
         start_dt = end_dt - timedelta(days=lookback_days)
-        frame = _get_market_ohlcv_by_date(start_dt.strftime('%Y%m%d'), normalized_end, probe_symbol)
-        if frame.empty:
-            raise RuntimeError(f'Unable to resolve a recent pykrx trading day on or before {normalized_end}.')
-        return frame.index.max().strftime('%Y%m%d')
+        try:
+            frame = _get_market_ohlcv_by_date(start_dt.strftime('%Y%m%d'), normalized_end, probe_symbol)
+            if frame.empty:
+                raise RuntimeError(f'Unable to resolve a recent pykrx trading day on or before {normalized_end}.')
+            return frame.index.max().strftime('%Y%m%d')
+        except Exception as exc:
+            fallback_date = latest_krx_trading_date(end_dt.date(), allow_fallback=True)
+            if fallback_date is None:
+                raise
+            logger.warning(
+                'Falling back to KRX calendar latest trade date for %s after PyKRX reference lookup failed: %s',
+                normalized_end,
+                exc,
+            )
+            return fallback_date.strftime('%Y%m%d')
 
     def run_backfill(
         self,
