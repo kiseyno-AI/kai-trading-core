@@ -28,6 +28,7 @@ from app.agent_context.eligibility import (
     split_requested_symbols_by_agent_feedback_eligibility_with_diagnostics,
 )
 from app.agent_context.feedback_failure_service import agent_context_feedback_failure_service
+from app.agent_context.feedback_failure_taxonomy import FeedbackFailureKind, classify_feedback_failure
 from app.agent_context.orchestrator_helpers import (
     build_completed_dispatch_item as _build_completed_dispatch_item,
     build_failed_dispatch_item as _build_failed_dispatch_item,
@@ -370,6 +371,79 @@ class OpenClawAgentClient:
         }:
             return 'invalid_json'
         return str(failure_mode)
+
+    @staticmethod
+    def _response_text_excerpt(response: httpx.Response | None, *, limit: int = 1000) -> str | None:
+        if response is None:
+            return None
+        try:
+            text = str(response.text or '')
+        except Exception:  # noqa: BLE001
+            return None
+        text = text.strip()
+        if not text:
+            return None
+        return text[:limit]
+
+    def _build_dispatch_exception_details(
+        self,
+        *,
+        exc: Exception,
+        response: httpx.Response | None,
+        request_run_id: str | None,
+        dispatch_id: str,
+        attempt_id: str | None,
+        request_session_key: str,
+        request_marker: str,
+        slot: int | None,
+        batch_symbols: Sequence[str],
+        session_reuse_mode: str | None,
+    ) -> dict[str, Any]:
+        error_type = type(exc).__name__
+        response_text_excerpt = self._response_text_excerpt(response)
+        response_status_code = response.status_code if response is not None else None
+        response_json_decode_error = isinstance(exc, json.JSONDecodeError) or error_type == 'JSONDecodeError'
+        summary = {
+            'origin': 'openclaw_batch_dispatch',
+            'exception_type': error_type,
+            'error': str(exc),
+            'response_status_code': response_status_code,
+            'response_json_decode_error': response_json_decode_error,
+        }
+        context = {
+            'request_run_id': request_run_id,
+            'dispatch_id': dispatch_id,
+            'attempt_id': attempt_id,
+            'session_key': request_session_key,
+            'request_marker': request_marker,
+            'slot': slot,
+            'batch_symbols': list(batch_symbols),
+            'session_reuse_mode': session_reuse_mode,
+            'response_status_code': response_status_code,
+            'response_text_excerpt': response_text_excerpt,
+        }
+        classification = classify_feedback_failure(
+            failure_kind=(
+                FeedbackFailureKind.OPENCLAW_RESPONSE_INVALID_JSON.value
+                if response_json_decode_error
+                else None
+            ),
+            summary=summary,
+            context=context,
+            error=str(exc),
+            exception_type=error_type,
+        )
+        return {
+            **context,
+            'failure_kind': classification.failure_kind,
+            'failure_status': classification.failure_status,
+            'failure_category': classification.failure_category,
+            'failure_classification': classification.as_payload(),
+            'failure_mode': classification.failure_kind,
+            'exception_type': error_type,
+            'error_message': str(exc),
+            'response_json_decode_error': response_json_decode_error,
+        }
 
     @staticmethod
     def _build_structured_fallback_batch_response(
@@ -1019,6 +1093,7 @@ class OpenClawAgentClient:
         }
         attempt = 0
         last_error: Exception | None = None
+        last_error_details: dict[str, Any] | None = None
         while attempt <= self.max_retries:
             attempt += 1
             started_at = datetime.now(timezone.utc)
@@ -1646,7 +1721,24 @@ class OpenClawAgentClient:
                 last_error = exc
                 error_type = type(exc).__name__
                 error_message = str(exc)
-                error_details = exc.details if isinstance(exc, AgentDispatchError) else {}
+                raw_error_details = exc.details if isinstance(exc, AgentDispatchError) else {}
+                error_details = (
+                    raw_error_details
+                    if isinstance(raw_error_details, dict) and raw_error_details.get('failure_kind')
+                    else self._build_dispatch_exception_details(
+                        exc=exc,
+                        response=response,
+                        request_run_id=request_run_id,
+                        dispatch_id=dispatch_id,
+                        attempt_id=attempt_id,
+                        request_session_key=request_session_key,
+                        request_marker=request_marker,
+                        slot=slot,
+                        batch_symbols=batch_symbols,
+                        session_reuse_mode=session_reuse_mode,
+                    )
+                )
+                last_error_details = error_details
                 log_agent_feedback_event(
                     'dispatch_batch_response_error',
                     status='retryable' if attempt <= self.max_retries else 'failed',
@@ -1702,9 +1794,12 @@ class OpenClawAgentClient:
                     break
                 if self.retry_backoff_seconds > 0:
                     time.sleep(self.retry_backoff_seconds * attempt)
-        if isinstance(last_error, AgentDispatchError):
+        if isinstance(last_error, AgentDispatchError) and last_error.details:
             raise last_error
-        raise AgentDispatchRetryableError(str(last_error) if last_error else 'unknown batch dispatch failure')
+        raise AgentDispatchRetryableError(
+            str(last_error) if last_error else 'unknown batch dispatch failure',
+            details=last_error_details or {},
+        )
 
 
 class AgentFeedbackOrchestrator:
@@ -1805,8 +1900,11 @@ class AgentFeedbackOrchestrator:
             )
             if missing_roles:
                 error = f"missing_decider_upstream_summaries:{','.join(missing_roles)}"
+                failure_kind = FeedbackFailureKind.DEPENDENCY_MISSING_UPSTREAM.value
                 dependency_context = {
                     'dependency_status': 'blocked_missing_upstream_summaries',
+                    'failure_status': 'dependency/missing-upstream',
+                    'failure_kind': failure_kind,
                     'dependency_policy': 'record_failure_and_continue',
                     'missing_roles': missing_roles,
                 }
@@ -1816,10 +1914,11 @@ class AgentFeedbackOrchestrator:
                     symbol=symbol,
                     error=error,
                     retryable=True,
+                    failure_kind=failure_kind,
                     context=dependency_context,
                 )
                 all_failures.append(failure)
-                buffer_failure(role, symbol, error, True, context=dependency_context)
+                buffer_failure(role, symbol, error, True, failure_kind=failure_kind, context=dependency_context)
                 log_agent_feedback_event(
                     'decider_prerequisite_missing',
                     status='blocked',

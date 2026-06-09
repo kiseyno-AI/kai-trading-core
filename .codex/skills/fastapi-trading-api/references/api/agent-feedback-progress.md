@@ -14,6 +14,8 @@ The response is now a stable coverage and liveness snapshot:
 - `boundary_progress_ratio` and `boundary_progress_percent` keep the separate symbol-boundary coverage signal that used to drive the top-level percentage
 - `terminal_feedback_count` shows how many expected feedback items are already terminal via either stored feedback or stored failure rows
 - `run_status` indicates whether feedback appears to be actively moving, stalled, pending, or completed
+- completed terminal partial runs report inactive incomplete symbols as `partial_symbols`; `in_progress_symbols` is reserved for live runtime work only
+- `failure_groups` groups unresolved stored failures by status, including `dependency/missing-upstream`, `transport/timeout`, `response/invalid-json`, `response/assistant-non-json`, and `response/contract`
 - when prerequisites are not ready and no live or durable run exists yet, `run_status` can be `waiting` or `blocked`, and the top-level `prerequisites` block explains which upstream stages still gate dispatch
 - prerequisite stage items preserve pipeline gate diagnostics (`gate_status`, `severity`, `blocking_status`, and `gate_reason`) so a partial upstream row-count stage can be shown as non-blocking degraded coverage instead of a feedback failure
 - `latest_feedback_at` and `seconds_since_last_feedback` help operators tell whether a run is still alive
@@ -89,7 +91,8 @@ GET /agent-context/feedback/progress?market_date=2026-04-16&run_id=feedback-cycl
     },
     "processed_symbols": 140,
     "completed_symbols": 0,
-    "in_progress_symbols": 140,
+    "in_progress_symbols": 0,
+    "partial_symbols": 140,
     "pending_symbols": 60,
     "terminal_feedback_count": 402,
     "progress_ratio": 0.638095,
@@ -99,6 +102,19 @@ GET /agent-context/feedback/progress?market_date=2026-04-16&run_id=feedback-cycl
     "failed_items": 0,
     "completed_feedback_count": 402,
     "expected_feedback_count": 630,
+    "failure_groups": {
+      "transport/timeout": {
+        "failure_status": "transport/timeout",
+        "failure_category": "transport",
+        "count": 2,
+        "retryable_count": 2,
+        "agents": {
+          "technical-summarizer": 2
+        },
+        "symbols_sample": ["005930", "000660"],
+        "failure_kinds": ["openclaw_transport_timeout"]
+      }
+    },
     "completed_feedback_per_minute": 3.81,
     "completed_symbols_per_minute": 0.0,
     "estimated_remaining_seconds": 198267,

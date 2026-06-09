@@ -1,5 +1,6 @@
 from contextlib import contextmanager
 from datetime import date
+import httpx
 import json
 from pathlib import Path
 import tempfile
@@ -710,6 +711,15 @@ class FakeHTTPResponse:
         return self._payload
 
 
+class InvalidJSONHTTPResponse:
+    def __init__(self, status_code: int, text: str):
+        self.status_code = status_code
+        self.text = text
+
+    def json(self):
+        raise json.JSONDecodeError('Expecting value', self.text, 0)
+
+
 class FakeHTTPClient:
     def __init__(self, *, response: FakeHTTPResponse, calls: list[dict], **kwargs):
         self.response = response
@@ -725,6 +735,23 @@ class FakeHTTPClient:
     def post(self, url, json):
         self.calls.append({'url': url, 'json': json, 'kwargs': self.kwargs})
         return self.response
+
+
+class RaisingHTTPClient:
+    def __init__(self, *, exc: Exception, calls: list[dict], **kwargs):
+        self.exc = exc
+        self.calls = calls
+        self.kwargs = kwargs
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def post(self, url, json):
+        self.calls.append({'url': url, 'json': json, 'kwargs': self.kwargs})
+        raise self.exc
 
 
 class FakeFeedbackService:
@@ -1974,11 +2001,17 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
             failure_service.recorded[0]['context'],
             {
                 'dependency_status': 'blocked_missing_upstream_summaries',
+                'failure_status': 'dependency/missing-upstream',
+                'failure_kind': 'dependency_missing_upstream',
                 'dependency_policy': 'record_failure_and_continue',
                 'missing_roles': ['eod-summarizer', 'technical-summarizer', 'fundamental-summarizer'],
             },
         )
-        self.assertIn('missing_decider_upstream_summaries', failure_service.recorded[0]['failure_kind'])
+        self.assertEqual(failure_service.recorded[0]['failure_kind'], 'dependency_missing_upstream')
+        self.assertIn(
+            'missing_decider_upstream_summaries',
+            failure_service.recorded[0]['summary']['error'],
+        )
 
     def test_dispatch_for_symbols_scopes_runtime_mutation_to_explicit_request_run_id(self):
         service = AgentFeedbackOrchestrator()
@@ -2570,6 +2603,117 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertEqual(result['response_correlation']['decoded_source'], 'core_structured_fallback')
         self.assertEqual(result['response_correlation']['missing_symbols'], [])
         self.assertNotIn('batch_response_symbol_mismatch', [entry['stage'] for entry in captured_logs])
+
+    def test_openclaw_batch_dispatch_classifies_read_timeout(self):
+        dispatch_id = 'symbol-run-2026-04-14-abc123:eod-summarizer:slot-1:batch-1'
+        http_calls = []
+        captured_logs = []
+        fake_settings = SimpleNamespace(
+            openclaw_base_url='https://openclaw.example',
+            openclaw_gateway_token='gateway-token',
+            openclaw_agent_timeout_seconds=30,
+            openclaw_agent_max_retries=0,
+            openclaw_agent_retry_backoff_seconds=0,
+            openclaw_agent_max_prompt_chars=0,
+            openclaw_state_dir='/tmp/openclaw-test-state',
+        )
+
+        def fake_client_factory(*args, **kwargs):
+            return RaisingHTTPClient(
+                exc=httpx.ReadTimeout('read timed out'),
+                calls=http_calls,
+                **kwargs,
+            )
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            with patch('app.agent_context.orchestrator.httpx.Client', side_effect=fake_client_factory):
+                with patch.object(
+                    orchestrator_module,
+                    'log_agent_feedback_event',
+                    side_effect=lambda stage, **payload: captured_logs.append({'stage': stage, **payload}),
+                ):
+                    client = OpenClawAgentClient()
+                    with self.assertRaises(orchestrator_module.AgentDispatchRetryableError) as raised:
+                        client.dispatch_batch(
+                            spec=orchestrator_module.DISPATCH_SPECS[0],
+                            market_date=orchestrator_module.date.fromisoformat('2026-04-14'),
+                            batch_items=[
+                                {
+                                    'symbol': '005930',
+                                    'market_date': '2026-04-14',
+                                    'request_run_id': 'symbol-run-2026-04-14-abc123',
+                                    'dispatch_id': dispatch_id,
+                                    'session_slot': 1,
+                                    'session_key': 'agent:eod-summarizer:feedback/eod-summarizer/slot-01',
+                                    'session_reuse_mode': 'fresh_per_batch',
+                                }
+                            ],
+                        )
+
+        details = raised.exception.details
+        self.assertEqual(details['failure_kind'], 'openclaw_transport_timeout')
+        self.assertEqual(details['failure_status'], 'transport/timeout')
+        self.assertEqual(details['failure_category'], 'transport')
+        self.assertEqual(details['exception_type'], 'ReadTimeout')
+        error_log = next(entry for entry in captured_logs if entry['stage'] == 'dispatch_batch_response_error')
+        self.assertEqual(error_log['failure_kind'], 'openclaw_transport_timeout')
+        self.assertEqual(error_log['failure_mode'], 'openclaw_transport_timeout')
+
+    def test_openclaw_batch_dispatch_classifies_non_json_http_response(self):
+        dispatch_id = 'symbol-run-2026-04-14-abc123:eod-summarizer:slot-1:batch-1'
+        http_calls = []
+        captured_logs = []
+        fake_settings = SimpleNamespace(
+            openclaw_base_url='https://openclaw.example',
+            openclaw_gateway_token='gateway-token',
+            openclaw_agent_timeout_seconds=30,
+            openclaw_agent_max_retries=0,
+            openclaw_agent_retry_backoff_seconds=0,
+            openclaw_agent_max_prompt_chars=0,
+            openclaw_state_dir='/tmp/openclaw-test-state',
+        )
+
+        def fake_client_factory(*args, **kwargs):
+            return FakeHTTPClient(
+                response=InvalidJSONHTTPResponse(200, '<html>gateway</html>'),
+                calls=http_calls,
+                **kwargs,
+            )
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            with patch('app.agent_context.orchestrator.httpx.Client', side_effect=fake_client_factory):
+                with patch.object(
+                    orchestrator_module,
+                    'log_agent_feedback_event',
+                    side_effect=lambda stage, **payload: captured_logs.append({'stage': stage, **payload}),
+                ):
+                    client = OpenClawAgentClient()
+                    with self.assertRaises(orchestrator_module.AgentDispatchRetryableError) as raised:
+                        client.dispatch_batch(
+                            spec=orchestrator_module.DISPATCH_SPECS[0],
+                            market_date=orchestrator_module.date.fromisoformat('2026-04-14'),
+                            batch_items=[
+                                {
+                                    'symbol': '005930',
+                                    'market_date': '2026-04-14',
+                                    'request_run_id': 'symbol-run-2026-04-14-abc123',
+                                    'dispatch_id': dispatch_id,
+                                    'session_slot': 1,
+                                    'session_key': 'agent:eod-summarizer:feedback/eod-summarizer/slot-01',
+                                    'session_reuse_mode': 'fresh_per_batch',
+                                }
+                            ],
+                        )
+
+        details = raised.exception.details
+        self.assertEqual(details['failure_kind'], 'openclaw_response_invalid_json')
+        self.assertEqual(details['failure_status'], 'response/invalid-json')
+        self.assertEqual(details['failure_category'], 'response')
+        self.assertEqual(details['response_status_code'], 200)
+        self.assertEqual(details['response_text_excerpt'], '<html>gateway</html>')
+        error_log = next(entry for entry in captured_logs if entry['stage'] == 'dispatch_batch_response_error')
+        self.assertEqual(error_log['failure_kind'], 'openclaw_response_invalid_json')
+        self.assertEqual(error_log['failure_mode'], 'openclaw_response_invalid_json')
 
     def test_openclaw_batch_dispatch_recovers_from_trajectory_when_session_history_is_missing(self):
         dispatch_id = 'symbol-run-2026-04-14-abc123:signal-decider:slot-1:batch-1'

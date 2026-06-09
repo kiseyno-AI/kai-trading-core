@@ -8,6 +8,7 @@ from typing import Any, Sequence
 from sqlalchemy import select
 
 from app.agent_context.eligibility import load_agent_feedback_eligible_symbols
+from app.agent_context.feedback_failure_taxonomy import build_failure_groups
 from app.agent_context.feedback_service import _normalize_market_date, _normalize_symbols
 from app.agent_context.prerequisite_service import agent_feedback_prerequisite_service
 from app.agent_context.run_modes import DAILY_RETRY_CYCLE_MODE
@@ -144,6 +145,7 @@ class AgentContextProgressService:
                 'prerequisites_ready': False,
                 'missing_prerequisites': prerequisites['missing_prerequisites'],
             }
+        summary_payload = self._sanitize_inactive_terminal_summary(summary_payload)
         summary_payload = self._self_heal_completed_summary(
             summary=summary_payload,
             fallback_summary=persisted_progress['summary'],
@@ -297,6 +299,11 @@ class AgentContextProgressService:
             'pending_failure_count',
             'flushed_feedback_count',
             'flushed_failure_count',
+            'processed_symbols',
+            'completed_symbols',
+            'in_progress_symbols',
+            'partial_symbols',
+            'pending_symbols',
         ):
             if runtime_summary.get(key) is not None:
                 merged[key] = runtime_summary[key]
@@ -349,6 +356,11 @@ class AgentContextProgressService:
             'pending_failure_count',
             'flushed_feedback_count',
             'flushed_failure_count',
+            'processed_symbols',
+            'completed_symbols',
+            'in_progress_symbols',
+            'partial_symbols',
+            'pending_symbols',
         ):
             value = live_summary.get(key)
             if value is None and key in payload:
@@ -487,6 +499,88 @@ class AgentContextProgressService:
         return merged_role_progress
 
     @staticmethod
+    def _is_terminal_summary(summary: dict[str, Any]) -> bool:
+        terminal_statuses = {'completed', 'partial', 'failed', 'skipped', 'cancelled', 'canceled'}
+        for key in ('run_status', 'run_table_status', 'cycle_status'):
+            status = str(summary.get(key) or '').strip().lower()
+            if status in terminal_statuses:
+                return True
+        if summary.get('run_completed_at') is not None:
+            return True
+        return False
+
+    @staticmethod
+    def _sanitize_inactive_terminal_summary(summary: dict[str, Any]) -> dict[str, Any]:
+        if not AgentContextProgressService._is_terminal_summary(summary):
+            return summary
+
+        normalized = dict(summary)
+        total_symbols = int(normalized.get('total_symbols') or 0)
+        completed_symbols = int(normalized.get('completed_symbols') or 0)
+        processed_symbols = int(normalized.get('processed_symbols') or 0)
+        stale_in_progress_symbols = int(normalized.get('in_progress_symbols') or 0)
+        partial_symbols = max(
+            int(normalized.get('partial_symbols') or 0),
+            stale_in_progress_symbols,
+            processed_symbols - completed_symbols,
+        )
+        if total_symbols > 0:
+            partial_symbols = min(partial_symbols, max(0, total_symbols - completed_symbols))
+        normalized['is_live'] = False
+        normalized['current_role'] = None
+        normalized['in_progress_symbols'] = 0
+        normalized['partial_symbols'] = max(0, partial_symbols)
+        normalized['processed_symbols'] = min(
+            total_symbols,
+            max(processed_symbols, completed_symbols + normalized['partial_symbols']),
+        ) if total_symbols else max(processed_symbols, completed_symbols + normalized['partial_symbols'])
+        normalized['pending_symbols'] = max(
+            0,
+            total_symbols - int(normalized.get('completed_symbols') or 0) - int(normalized.get('partial_symbols') or 0),
+        )
+
+        role_progress = normalized.get('role_progress')
+        if isinstance(role_progress, dict):
+            sanitized_role_progress: dict[str, Any] = {}
+            for role, role_summary in role_progress.items():
+                if not isinstance(role_summary, dict):
+                    sanitized_role_progress[role] = role_summary
+                    continue
+                role_payload = dict(role_summary)
+                role_total = int(role_payload.get('total_symbols') or total_symbols or 0)
+                role_completed = int(role_payload.get('completed_symbols') or 0)
+                role_processed = int(role_payload.get('processed_symbols') or 0)
+                role_failed = int(role_payload.get('failed_items') or 0)
+                role_stale_in_progress = int(role_payload.get('in_progress_symbols') or 0)
+                role_partial = max(
+                    int(role_payload.get('partial_symbols') or 0),
+                    role_stale_in_progress,
+                    role_processed - role_completed,
+                    role_failed,
+                )
+                if role_total > 0:
+                    role_partial = min(role_partial, max(0, role_total - role_completed))
+                role_payload['in_progress_symbols'] = 0
+                role_payload['partial_symbols'] = max(0, role_partial)
+                role_payload['processed_symbols'] = min(
+                    role_total,
+                    max(role_processed, role_completed + role_payload['partial_symbols']),
+                ) if role_total else max(role_processed, role_completed + role_payload['partial_symbols'])
+                role_payload['pending_symbols'] = max(
+                    0,
+                    role_total - role_completed - role_payload['partial_symbols'],
+                )
+                role_status = str(role_payload.get('status') or '').strip().lower()
+                if role_status in {'running', 'in_progress'}:
+                    role_payload['status'] = 'partial' if role_payload['processed_symbols'] else 'pending'
+                boundary_status = str(role_payload.get('boundary_status') or '').strip().lower()
+                if boundary_status in {'running', 'in_progress'}:
+                    role_payload['boundary_status'] = role_payload.get('status')
+                sanitized_role_progress[role] = role_payload
+            normalized['role_progress'] = sanitized_role_progress
+        return normalized
+
+    @staticmethod
     def _normalize_summary_progress_fields(summary: dict[str, Any]) -> dict[str, Any]:
         normalized = dict(summary)
         normalized.update(
@@ -530,6 +624,10 @@ class AgentContextProgressService:
                         AgentContextFeedbackFailure.symbol,
                         AgentContextFeedbackFailure.agent_name,
                         AgentContextFeedbackFailure.received_at,
+                        AgentContextFeedbackFailure.failure_kind,
+                        AgentContextFeedbackFailure.retryable,
+                        AgentContextFeedbackFailure.summary_payload,
+                        AgentContextFeedbackFailure.context_payload,
                     )
                     .where(AgentContextFeedbackFailure.market_date == market_date)
                     .where(AgentContextFeedbackFailure.symbol.in_(scoped_symbols))
@@ -545,6 +643,7 @@ class AgentContextProgressService:
                 if row.received_at is not None:
                     feedback_received_at.append(row.received_at)
 
+            unresolved_failures: list[dict[str, Any]] = []
             for row in failure_rows:
                 symbol = str(row.symbol)
                 agent_name = str(row.agent_name)
@@ -553,6 +652,19 @@ class AgentContextProgressService:
                 if symbol in completed_by_role[agent_name]:
                     continue
                 failed_by_role[agent_name].add(symbol)
+                unresolved_failures.append(
+                    {
+                        'symbol': symbol,
+                        'agent_name': agent_name,
+                        'failure_kind': str(getattr(row, 'failure_kind', '') or 'dispatch_failed'),
+                        'retryable': bool(getattr(row, 'retryable', True)),
+                        'summary_payload': getattr(row, 'summary_payload', None),
+                        'context_payload': getattr(row, 'context_payload', None),
+                        'received_at': getattr(row, 'received_at', None),
+                    }
+                )
+        else:
+            unresolved_failures = []
 
         first_feedback_at = min(feedback_received_at) if feedback_received_at else None
         latest_feedback_at = max(feedback_received_at) if feedback_received_at else None
@@ -571,6 +683,7 @@ class AgentContextProgressService:
                 failed_by_role=failed_by_role,
                 first_feedback_at=first_feedback_at,
                 latest_feedback_at=latest_feedback_at,
+                unresolved_failures=unresolved_failures,
             ),
         }
 
@@ -760,11 +873,13 @@ class AgentContextProgressService:
         failed_by_role: dict[str, set[str]],
         first_feedback_at: datetime | None,
         latest_feedback_at: datetime | None,
+        unresolved_failures: Sequence[dict[str, Any]],
     ) -> dict[str, Any]:
         requested_count = len(requested_symbols)
         expected_feedback_count = requested_count * len(expected_agents)
         completed_feedback_count = sum(len(completed_by_role.get(agent_name, set())) for agent_name in expected_agents)
         failed_items = sum(len(failed_by_role.get(agent_name, set())) for agent_name in expected_agents)
+        failure_groups = build_failure_groups(unresolved_failures)
 
         completed_roles_by_symbol: dict[str, set[str]] = defaultdict(set)
         failed_roles_by_symbol: dict[str, set[str]] = defaultdict(set)
@@ -776,16 +891,17 @@ class AgentContextProgressService:
                 failed_roles_by_symbol[symbol].add(agent_name)
 
         completed_symbols = 0
-        in_progress_symbols = 0
+        partial_symbols = 0
         for symbol in requested_symbols:
             completed_roles = completed_roles_by_symbol.get(symbol, set())
             failed_roles = failed_roles_by_symbol.get(symbol, set())
             if len(completed_roles) == len(expected_agents) and expected_agents:
                 completed_symbols += 1
             elif completed_roles or failed_roles:
-                in_progress_symbols += 1
-        pending_symbols = max(0, requested_count - completed_symbols - in_progress_symbols)
-        processed_symbols = completed_symbols + in_progress_symbols
+                partial_symbols += 1
+        in_progress_symbols = 0
+        pending_symbols = max(0, requested_count - completed_symbols - partial_symbols)
+        processed_symbols = completed_symbols + partial_symbols
         progress_fields = _build_top_level_progress_fields(
             processed_symbols=processed_symbols,
             total_symbols=requested_count,
@@ -824,6 +940,7 @@ class AgentContextProgressService:
                 'processed_symbols': processed_for_role,
                 'completed_symbols': completed_for_role,
                 'in_progress_symbols': 0,
+                'partial_symbols': max(0, processed_for_role - completed_for_role),
                 'pending_symbols': pending_for_role,
                 'failed_items': failed_for_role,
                 'progress_ratio': round(progress_ratio_for_role, 6),
@@ -879,6 +996,7 @@ class AgentContextProgressService:
             'processed_symbols': processed_symbols,
             'completed_symbols': completed_symbols,
             'in_progress_symbols': in_progress_symbols,
+            'partial_symbols': partial_symbols,
             'pending_symbols': pending_symbols,
             'terminal_feedback_count': progress_fields['terminal_feedback_count'],
             'boundary_progress_ratio': progress_fields['boundary_progress_ratio'],
@@ -886,6 +1004,7 @@ class AgentContextProgressService:
             'progress_ratio': progress_fields['progress_ratio'],
             'progress_percent': progress_fields['progress_percent'],
             'failed_items': failed_items,
+            'failure_groups': failure_groups,
             'completed_feedback_count': completed_feedback_count,
             'expected_feedback_count': expected_feedback_count,
             'completed_feedback_per_minute': completed_feedback_per_minute,

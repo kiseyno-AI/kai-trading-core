@@ -203,7 +203,9 @@ class AgentContextProgressServiceTests(unittest.TestCase):
 
         self.assertEqual(result['summary']['run_id'], 'run-durable')
         self.assertEqual(result['summary']['run_table_status'], 'partial')
-        self.assertEqual(result['summary']['current_role'], 'fundamental-summarizer')
+        self.assertIsNone(result['summary']['current_role'])
+        self.assertFalse(result['summary']['is_live'])
+        self.assertEqual(result['summary']['in_progress_symbols'], 0)
         self.assertEqual(result['summary']['completed_roles'], ['eod-summarizer'])
         self.assertEqual(result['summary']['remaining_roles'], ['fundamental-summarizer'])
         self.assertEqual(result['summary']['cycle_number'], 1)
@@ -1023,7 +1025,10 @@ class AgentContextProgressServiceTests(unittest.TestCase):
                     )
 
         self.assertEqual(result['summary']['run_id'], 'retry-run')
-        self.assertEqual(result['summary']['current_role'], 'signal-decider')
+        self.assertIsNone(result['summary']['current_role'])
+        self.assertFalse(result['summary']['is_live'])
+        self.assertEqual(result['summary']['in_progress_symbols'], 0)
+        self.assertEqual(result['summary']['partial_symbols'], 1)
         self.assertEqual(result['summary']['completed_roles'], ['eod-summarizer', 'technical-summarizer', 'fundamental-summarizer'])
         self.assertEqual(result['summary']['remaining_roles'], ['signal-decider'])
         self.assertEqual(result['summary']['cycle_mode'], 'retry_followup')
@@ -1269,7 +1274,8 @@ class AgentContextProgressServiceTests(unittest.TestCase):
 
         summary = result['summary']
         self.assertEqual(summary['completed_symbols'], 0)
-        self.assertEqual(summary['in_progress_symbols'], 1)
+        self.assertEqual(summary['in_progress_symbols'], 0)
+        self.assertEqual(summary['partial_symbols'], 1)
         self.assertEqual(summary['pending_symbols'], 0)
         self.assertEqual(summary['terminal_feedback_count'], 1)
         self.assertEqual(summary['boundary_progress_ratio'], 1.0)
@@ -1281,6 +1287,58 @@ class AgentContextProgressServiceTests(unittest.TestCase):
             result['result']['roles']['technical-summarizer'],
             {'requested_count': 1, 'completed_count': 0, 'error_count': 1},
         )
+
+    def test_feedback_progress_groups_timeout_and_invalid_json_failures(self):
+        fake_session = FakeProgressSession()
+        fake_session.feedback_rows = []
+        fake_session.failure_rows = [
+            SimpleNamespace(
+                symbol='005930',
+                agent_name='technical-summarizer',
+                run_id='timeout-run',
+                failure_kind='openclaw_transport_timeout',
+                retryable=True,
+                summary_payload={
+                    'exception_type': 'ReadTimeout',
+                    'error': '',
+                    'failure_classification': {
+                        'failure_kind': 'openclaw_transport_timeout',
+                        'failure_status': 'transport/timeout',
+                        'failure_category': 'transport',
+                        'reason': 'OpenClaw HTTP request timed out before a usable response was received',
+                    },
+                },
+                context_payload={'dispatch_id': 'dispatch-timeout'},
+                received_at=datetime(2026, 4, 14, 1, 8, tzinfo=timezone.utc),
+                id=10,
+            ),
+            SimpleNamespace(
+                symbol='000660',
+                agent_name='fundamental-summarizer',
+                run_id='invalid-json-run',
+                failure_kind='openclaw_response_invalid_json',
+                retryable=True,
+                summary_payload={
+                    'exception_type': 'JSONDecodeError',
+                    'response_json_decode_error': True,
+                },
+                context_payload={'response_status_code': 200, 'response_text_excerpt': '<html>bad gateway</html>'},
+                received_at=datetime(2026, 4, 14, 1, 9, tzinfo=timezone.utc),
+                id=11,
+            ),
+        ]
+
+        result = self._call_service(
+            fake_session,
+            symbols=['005930', '000660'],
+            expected_agents=['technical-summarizer', 'fundamental-summarizer'],
+        )
+
+        groups = result['summary']['failure_groups']
+        self.assertEqual(groups['transport/timeout']['count'], 1)
+        self.assertEqual(groups['transport/timeout']['agents'], {'technical-summarizer': 1})
+        self.assertEqual(groups['response/invalid-json']['count'], 1)
+        self.assertEqual(groups['response/invalid-json']['agents'], {'fundamental-summarizer': 1})
 
 
 if __name__ == '__main__':
