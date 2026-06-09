@@ -195,12 +195,50 @@ class AgentFeedbackPrerequisiteService:
     @classmethod
     def _augment_pykrx_enrichment_prerequisite_stage(cls, stage_payload: dict[str, Any]) -> dict[str, Any]:
         details = dict(stage_payload.get('details') if isinstance(stage_payload.get('details'), dict) else {})
-        category_payloads = dict(details.get('categories') if isinstance(details.get('categories'), dict) else {})
+        if (
+            str(details.get('decider_category_gate_status') or '').strip().lower()
+            in {'ready', 'blocked', 'waiting'}
+            and isinstance(details.get('decider_category_gates'), list)
+        ):
+            return {
+                **stage_payload,
+                'details': details,
+            }
+        category_payloads = cls._resolve_pykrx_category_payloads(details=details)
         details.update(cls.build_pykrx_enrichment_gate_details(category_payloads=category_payloads))
         return {
             **stage_payload,
             'details': details,
         }
+
+    @classmethod
+    def _resolve_pykrx_category_payloads(cls, *, details: dict[str, Any]) -> dict[str, Any]:
+        categories = details.get('categories')
+        if isinstance(categories, dict) and categories:
+            return dict(categories)
+
+        row_counts = details.get('category_row_counts')
+        if not isinstance(row_counts, dict) or not row_counts:
+            return {}
+
+        payloads: dict[str, dict[str, Any]] = {}
+        failed_categories = {
+            str(category)
+            for category in details.get('failed_categories', [])
+            if str(category or '').strip()
+        }
+        for category in PYKRX_DECIDER_ENRICHMENT_REQUIRED_CATEGORIES:
+            present_rows = cls._coerce_optional_int(row_counts.get(category)) or 0
+            if present_rows <= 0:
+                continue
+            payloads[category] = {
+                'present_rows': present_rows,
+                'expected_rows': present_rows,
+                'coverage_ratio': 1.0,
+                'coverage_status': 'partial' if category in failed_categories else 'complete',
+                'reason': 'derived_from_category_row_counts',
+            }
+        return payloads
 
     @classmethod
     def build_pykrx_enrichment_gate_details(
