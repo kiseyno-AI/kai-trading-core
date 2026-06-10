@@ -75,6 +75,31 @@ def _string_values(*values: Any) -> Iterable[str]:
             yield text
 
 
+def _coerce_status_code(value: Any) -> int | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        value = value.strip()
+        if value.isdigit():
+            return int(value)
+    return None
+
+
+def _status_code_values(*values: Any) -> Iterable[int]:
+    for value in values:
+        if not isinstance(value, Mapping):
+            continue
+        for key in ('response_status_code', 'status_code', 'http_status', 'http_status_code'):
+            status_code = _coerce_status_code(value.get(key))
+            if status_code is not None:
+                yield status_code
+        nested_context = value.get('dispatch_diagnostics') or value.get('failure_classification')
+        if isinstance(nested_context, Mapping):
+            yield from _status_code_values(nested_context)
+
+
 def classify_feedback_failure(
     *,
     failure_kind: str | None,
@@ -87,6 +112,7 @@ def classify_feedback_failure(
     haystack = ' '.join(texts).lower()
     context_payload = context if isinstance(context, Mapping) else {}
     summary_payload = summary if isinstance(summary, Mapping) else {}
+    status_codes = set(_status_code_values(summary_payload, context_payload))
 
     missing_roles = context_payload.get('missing_roles')
     if (
@@ -108,6 +134,7 @@ def classify_feedback_failure(
         or 'pooltimeout' in haystack
         or 'timeoutexception' in haystack
         or 'timed out' in haystack
+        or 408 in status_codes
     ):
         return FeedbackFailureClassification(
             failure_kind=FeedbackFailureKind.OPENCLAW_TRANSPORT_TIMEOUT.value,

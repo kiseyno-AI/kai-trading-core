@@ -2659,6 +2659,61 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertEqual(error_log['failure_kind'], 'openclaw_transport_timeout')
         self.assertEqual(error_log['failure_mode'], 'openclaw_transport_timeout')
 
+    def test_openclaw_batch_dispatch_classifies_http_408_as_timeout(self):
+        dispatch_id = 'symbol-run-2026-04-14-abc123:eod-summarizer:slot-1:batch-1'
+        http_calls = []
+        captured_logs = []
+        fake_settings = SimpleNamespace(
+            openclaw_base_url='https://openclaw.example',
+            openclaw_gateway_token='gateway-token',
+            openclaw_agent_timeout_seconds=30,
+            openclaw_agent_max_retries=0,
+            openclaw_agent_retry_backoff_seconds=0,
+            openclaw_agent_max_prompt_chars=0,
+            openclaw_state_dir='/tmp/openclaw-test-state',
+        )
+
+        def fake_client_factory(*args, **kwargs):
+            return FakeHTTPClient(
+                response=FakeHTTPResponse(408, {}),
+                calls=http_calls,
+                **kwargs,
+            )
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            with patch('app.agent_context.orchestrator.httpx.Client', side_effect=fake_client_factory):
+                with patch.object(
+                    orchestrator_module,
+                    'log_agent_feedback_event',
+                    side_effect=lambda stage, **payload: captured_logs.append({'stage': stage, **payload}),
+                ):
+                    client = OpenClawAgentClient()
+                    with self.assertRaises(orchestrator_module.AgentDispatchRetryableError) as raised:
+                        client.dispatch_batch(
+                            spec=orchestrator_module.DISPATCH_SPECS[0],
+                            market_date=orchestrator_module.date.fromisoformat('2026-04-14'),
+                            batch_items=[
+                                {
+                                    'symbol': '005930',
+                                    'market_date': '2026-04-14',
+                                    'request_run_id': 'symbol-run-2026-04-14-abc123',
+                                    'dispatch_id': dispatch_id,
+                                    'session_slot': 1,
+                                    'session_key': 'agent:eod-summarizer:feedback/eod-summarizer/slot-01',
+                                    'session_reuse_mode': 'fresh_per_batch',
+                                }
+                            ],
+                        )
+
+        details = raised.exception.details
+        self.assertEqual(details['failure_kind'], 'openclaw_transport_timeout')
+        self.assertEqual(details['failure_status'], 'transport/timeout')
+        self.assertEqual(details['failure_category'], 'transport')
+        self.assertEqual(details['response_status_code'], 408)
+        error_log = next(entry for entry in captured_logs if entry['stage'] == 'dispatch_batch_response_error')
+        self.assertEqual(error_log['failure_kind'], 'openclaw_transport_timeout')
+        self.assertEqual(error_log['failure_mode'], 'openclaw_transport_timeout')
+
     def test_openclaw_batch_dispatch_classifies_non_json_http_response(self):
         dispatch_id = 'symbol-run-2026-04-14-abc123:eod-summarizer:slot-1:batch-1'
         http_calls = []
