@@ -203,7 +203,9 @@ class AgentContextProgressServiceTests(unittest.TestCase):
 
         self.assertEqual(result['summary']['run_id'], 'run-durable')
         self.assertEqual(result['summary']['run_table_status'], 'partial')
-        self.assertEqual(result['summary']['current_role'], 'fundamental-summarizer')
+        self.assertIsNone(result['summary']['current_role'])
+        self.assertFalse(result['summary']['is_live'])
+        self.assertEqual(result['summary']['in_progress_symbols'], 0)
         self.assertEqual(result['summary']['completed_roles'], ['eod-summarizer'])
         self.assertEqual(result['summary']['remaining_roles'], ['fundamental-summarizer'])
         self.assertEqual(result['summary']['cycle_number'], 1)
@@ -795,6 +797,136 @@ class AgentContextProgressServiceTests(unittest.TestCase):
             {'requested_count': 2, 'completed_count': 1, 'error_count': 0},
         )
 
+    def test_feedback_progress_keeps_running_retry_cycle_checkpoint_live_when_cycle_completed(self):
+        fake_session = FakeProgressSession()
+        fake_session.feedback_rows = [
+            SimpleNamespace(
+                symbol='005930',
+                agent_name='eod-summarizer',
+                run_id='retry-run',
+                received_at=datetime(2026, 4, 14, 1, 0, tzinfo=timezone.utc),
+                id=1,
+            ),
+            SimpleNamespace(
+                symbol='000660',
+                agent_name='eod-summarizer',
+                run_id='retry-run',
+                received_at=datetime(2026, 4, 14, 1, 1, tzinfo=timezone.utc),
+                id=2,
+            ),
+            SimpleNamespace(
+                symbol='005930',
+                agent_name='signal-decider',
+                run_id='retry-run',
+                received_at=datetime(2026, 4, 14, 1, 2, tzinfo=timezone.utc),
+                id=3,
+            ),
+        ]
+        fake_session.failure_rows = [
+            SimpleNamespace(
+                symbol='000660',
+                agent_name='signal-decider',
+                run_id='retry-run',
+                failure_kind='openclaw_transport_timeout',
+                retryable=True,
+                summary_payload=None,
+                context_payload=None,
+                received_at=datetime(2026, 4, 14, 1, 3, tzinfo=timezone.utc),
+                id=10,
+            )
+        ]
+        runtime_state = RuntimeFeedbackRunState(
+            run_id='retry-run',
+            market_date=datetime(2026, 4, 14, tzinfo=timezone.utc).date(),
+            requested_symbols=['005930', '000660'],
+            requested_roles=['eod-summarizer', 'signal-decider'],
+            role_sequence=['eod-summarizer', 'signal-decider'],
+            parallel_per_role=2,
+            batch_size=2,
+            started_at=datetime(2026, 4, 14, 1, 0, tzinfo=timezone.utc),
+            status='running',
+            current_role=None,
+            completed_roles=['eod-summarizer', 'signal-decider'],
+            remaining_roles=[],
+            cycle_number=1,
+            completed_cycles=0,
+            max_cycles=3,
+            cycle_mode='daily_retry_cycle_role_sequenced',
+            cycle_status='completed',
+        )
+        runtime_state.completed_symbols_by_role = {
+            'eod-summarizer': {'005930', '000660'},
+            'signal-decider': {'005930'},
+        }
+        runtime_state.failed_symbols_by_role = {'signal-decider': {'000660'}}
+        runtime_state.role_boundary_statuses = {
+            'eod-summarizer': 'completed',
+            'signal-decider': 'completed_with_failures',
+        }
+        runtime_state.last_activity_at = datetime(2026, 4, 14, 1, 3, tzinfo=timezone.utc)
+        run_snapshot = {
+            'run_id': 'retry-run',
+            'status': 'running',
+            'symbols_total': 2,
+            'started_at': datetime(2026, 4, 14, 1, 0, tzinfo=timezone.utc),
+            'completed_at': None,
+            'summary_payload': {
+                'mode': 'daily_retry_cycle_role_sequenced',
+                'progress_summary': {
+                    'run_id': 'retry-run',
+                    'run_status': 'running',
+                    'run_table_status': 'running',
+                    'is_live': True,
+                    'current_role': None,
+                    'completed_roles': ['eod-summarizer', 'signal-decider'],
+                    'remaining_roles': [],
+                    'cycle_number': 1,
+                    'completed_cycles': 0,
+                    'max_cycles': 3,
+                    'cycle_mode': 'daily_retry_cycle_role_sequenced',
+                    'cycle_status': 'completed',
+                },
+            },
+            'request_payload': {
+                'mode': 'daily_retry_cycle_role_sequenced',
+                'symbols': ['005930', '000660'],
+                'requested_symbols': ['005930', '000660'],
+                'roles': ['eod-summarizer', 'signal-decider'],
+            },
+        }
+
+        @contextmanager
+        def fake_session_scope():
+            yield fake_session
+
+        with patch('app.agent_context.progress_service.session_scope', fake_session_scope):
+            with patch('app.agent_context.progress_service.runtime_feedback_state_store.get_run', return_value=runtime_state):
+                with patch(
+                    'app.agent_context.progress_service.agent_context_feedback_run_state_service.find_latest_run',
+                    return_value=run_snapshot,
+                ):
+                    result = AgentContextProgressService().get_feedback_progress(
+                        market_date='2026-04-14',
+                        symbols=None,
+                    )
+
+        summary = result['summary']
+        self.assertEqual(summary['run_id'], 'retry-run')
+        self.assertEqual(summary['run_status'], 'running')
+        self.assertEqual(summary['run_table_status'], 'running')
+        self.assertTrue(summary['is_live'])
+        self.assertEqual(summary['cycle_status'], 'completed')
+        self.assertIsNone(summary['current_role'])
+        self.assertEqual(summary['completed_symbols'], 1)
+        self.assertEqual(summary['in_progress_symbols'], 1)
+        self.assertEqual(summary['processed_symbols'], 2)
+        self.assertEqual(summary['terminal_feedback_count'], 4)
+        self.assertEqual(summary['progress_ratio'], 1.0)
+        self.assertEqual(
+            result['result']['roles']['signal-decider'],
+            {'requested_count': 2, 'completed_count': 1, 'error_count': 1},
+        )
+
     def _call_service(self, fake_session, *, symbols, expected_agents=None):
         @contextmanager
         def fake_session_scope():
@@ -1023,7 +1155,10 @@ class AgentContextProgressServiceTests(unittest.TestCase):
                     )
 
         self.assertEqual(result['summary']['run_id'], 'retry-run')
-        self.assertEqual(result['summary']['current_role'], 'signal-decider')
+        self.assertIsNone(result['summary']['current_role'])
+        self.assertFalse(result['summary']['is_live'])
+        self.assertEqual(result['summary']['in_progress_symbols'], 0)
+        self.assertEqual(result['summary']['partial_symbols'], 1)
         self.assertEqual(result['summary']['completed_roles'], ['eod-summarizer', 'technical-summarizer', 'fundamental-summarizer'])
         self.assertEqual(result['summary']['remaining_roles'], ['signal-decider'])
         self.assertEqual(result['summary']['cycle_mode'], 'retry_followup')
@@ -1269,7 +1404,8 @@ class AgentContextProgressServiceTests(unittest.TestCase):
 
         summary = result['summary']
         self.assertEqual(summary['completed_symbols'], 0)
-        self.assertEqual(summary['in_progress_symbols'], 1)
+        self.assertEqual(summary['in_progress_symbols'], 0)
+        self.assertEqual(summary['partial_symbols'], 1)
         self.assertEqual(summary['pending_symbols'], 0)
         self.assertEqual(summary['terminal_feedback_count'], 1)
         self.assertEqual(summary['boundary_progress_ratio'], 1.0)
@@ -1281,6 +1417,58 @@ class AgentContextProgressServiceTests(unittest.TestCase):
             result['result']['roles']['technical-summarizer'],
             {'requested_count': 1, 'completed_count': 0, 'error_count': 1},
         )
+
+    def test_feedback_progress_groups_timeout_and_invalid_json_failures(self):
+        fake_session = FakeProgressSession()
+        fake_session.feedback_rows = []
+        fake_session.failure_rows = [
+            SimpleNamespace(
+                symbol='005930',
+                agent_name='technical-summarizer',
+                run_id='timeout-run',
+                failure_kind='openclaw_transport_timeout',
+                retryable=True,
+                summary_payload={
+                    'exception_type': 'ReadTimeout',
+                    'error': '',
+                    'failure_classification': {
+                        'failure_kind': 'openclaw_transport_timeout',
+                        'failure_status': 'transport/timeout',
+                        'failure_category': 'transport',
+                        'reason': 'OpenClaw HTTP request timed out before a usable response was received',
+                    },
+                },
+                context_payload={'dispatch_id': 'dispatch-timeout'},
+                received_at=datetime(2026, 4, 14, 1, 8, tzinfo=timezone.utc),
+                id=10,
+            ),
+            SimpleNamespace(
+                symbol='000660',
+                agent_name='fundamental-summarizer',
+                run_id='invalid-json-run',
+                failure_kind='openclaw_response_invalid_json',
+                retryable=True,
+                summary_payload={
+                    'exception_type': 'JSONDecodeError',
+                    'response_json_decode_error': True,
+                },
+                context_payload={'response_status_code': 200, 'response_text_excerpt': '<html>bad gateway</html>'},
+                received_at=datetime(2026, 4, 14, 1, 9, tzinfo=timezone.utc),
+                id=11,
+            ),
+        ]
+
+        result = self._call_service(
+            fake_session,
+            symbols=['005930', '000660'],
+            expected_agents=['technical-summarizer', 'fundamental-summarizer'],
+        )
+
+        groups = result['summary']['failure_groups']
+        self.assertEqual(groups['transport/timeout']['count'], 1)
+        self.assertEqual(groups['transport/timeout']['agents'], {'technical-summarizer': 1})
+        self.assertEqual(groups['response/invalid-json']['count'], 1)
+        self.assertEqual(groups['response/invalid-json']['agents'], {'fundamental-summarizer': 1})
 
 
 if __name__ == '__main__':

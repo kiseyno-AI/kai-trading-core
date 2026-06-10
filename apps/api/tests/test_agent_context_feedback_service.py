@@ -128,6 +128,30 @@ class AgentContextFeedbackServiceTests(unittest.TestCase):
 
         self.assertEqual([item['symbol'] for item in deduped], ['005930', '000660', '035420'])
 
+    def test_dedupe_feedback_items_for_upsert_keeps_retry_result_for_same_symbol_agent(self):
+        items = [
+            {
+                'market_date': date(2026, 4, 14),
+                'symbol': '005930',
+                'agent_name': 'technical-summarizer',
+                'run_id': 'timeout-run',
+                'summary_payload': {'attempt': 'timed-out'},
+            },
+            {
+                'market_date': date(2026, 4, 14),
+                'symbol': '005930',
+                'agent_name': 'technical-summarizer',
+                'run_id': 'retry-run',
+                'summary_payload': {'attempt': 'retry-success'},
+            },
+        ]
+
+        deduped = _dedupe_feedback_items_for_upsert(items)
+
+        self.assertEqual(len(deduped), 1)
+        self.assertEqual(deduped[0]['run_id'], 'retry-run')
+        self.assertEqual(deduped[0]['summary_payload'], {'attempt': 'retry-success'})
+
     def test_submit_feedback_normalizes_and_persists_json_payload(self):
         repository = FakeFeedbackRepository()
         loop_service = FakeSignalDeciderLoopService()

@@ -7,6 +7,7 @@ from typing import Any
 from sqlalchemy.dialects.postgresql import insert
 
 from app.agent_context.feedback_service import _normalize_agent_name, _normalize_json_object, _normalize_market_date, _normalize_optional_text, _normalize_symbol
+from app.agent_context.feedback_failure_taxonomy import classify_feedback_failure
 from app.db import session_scope
 from app.db_models import AgentContextFeedbackFailure
 
@@ -51,9 +52,34 @@ class AgentContextFeedbackFailureService:
         market_date_value = _normalize_market_date(market_date)
         symbol_value = _normalize_symbol(symbol)
         agent_name_value = _normalize_agent_name(agent_name)
-        failure_kind_value = self._normalize_failure_kind(failure_kind)
         summary_payload = _normalize_json_object(summary, field_name='summary')
         context_payload = _normalize_json_object(context, field_name='context') if context is not None else None
+        raw_failure_kind = self._normalize_failure_kind(failure_kind)
+        classification = classify_feedback_failure(
+            failure_kind=raw_failure_kind,
+            summary=summary_payload,
+            context=context_payload,
+            error=str(summary_payload.get('error') or '') or None,
+            exception_type=str(summary_payload.get('exception_type') or '') or None,
+        )
+        failure_kind_value = self._normalize_failure_kind(classification.failure_kind)
+        failure_classification = classification.as_payload()
+        summary_payload = {
+            **summary_payload,
+            'failure_kind': failure_kind_value,
+            'raw_failure_kind': raw_failure_kind,
+            'failure_status': classification.failure_status,
+            'failure_category': classification.failure_category,
+            'failure_classification': failure_classification,
+        }
+        context_payload = (
+            {
+                **context_payload,
+                'failure_classification': failure_classification,
+            }
+            if isinstance(context_payload, dict)
+            else {'failure_classification': failure_classification}
+        )
         run_id_value = _normalize_optional_text(run_id, field_name='run_id', max_length=128)
         received_at = datetime.now(timezone.utc)
         with session_scope() as session:
