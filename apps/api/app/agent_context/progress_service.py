@@ -501,11 +501,22 @@ class AgentContextProgressService:
     @staticmethod
     def _is_terminal_summary(summary: dict[str, Any]) -> bool:
         terminal_statuses = {'completed', 'partial', 'failed', 'skipped', 'cancelled', 'canceled'}
-        for key in ('run_status', 'run_table_status', 'cycle_status'):
-            status = str(summary.get(key) or '').strip().lower()
-            if status in terminal_statuses:
-                return True
+        active_statuses = {'running', 'in_progress'}
+        run_table_status = str(summary.get('run_table_status') or '').strip().lower()
+        run_status = str(summary.get('run_status') or '').strip().lower()
+        if run_table_status in terminal_statuses:
+            return True
         if summary.get('run_completed_at') is not None:
+            return True
+        if run_status in terminal_statuses and run_table_status not in active_statuses:
+            return True
+        cycle_status = str(summary.get('cycle_status') or '').strip().lower()
+        run_is_active = (
+            run_table_status in active_statuses
+            or run_status in active_statuses
+            or summary.get('is_live') is True
+        )
+        if cycle_status in terminal_statuses and not run_is_active:
             return True
         return False
 
