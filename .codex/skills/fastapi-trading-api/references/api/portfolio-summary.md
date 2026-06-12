@@ -50,8 +50,9 @@ GET /portfolio/summary?refresh=false
         "investedValue": {"amount": 572000, "currency": "KRW"},
         "pnl": {
           "unrealized": {"amount": 22000, "currency": "KRW"},
-          "total": {"amount": 22000, "currency": "KRW"},
-          "totalPercent": 4.0
+          "day": {"amount": 20366, "currency": "KRW"},
+          "total": {"amount": 20366, "currency": "KRW"},
+          "totalPercent": 0.66
         }
       },
       "holdings": [
@@ -86,6 +87,7 @@ GET /portfolio/summary?refresh=false
 ## Notes
 - `refresh=true` forces an immediate live rebuild of the portfolio summary. The default `refresh=false` path serves the cached snapshot when available and falls back to stale-while-revalidate behavior once the cache TTL expires.
 - `freshness` exposes whether the response was served from cache, whether the cache is currently stale, the cache TTL, the last refresh attempt/success timestamps, and any last refresh error.
+- `summary.pnl.unrealized` and holding `unrealizedPnl` remain KIS holding-evaluation PnL. `summary.pnl.day` maps KIS `asst_icdc_amt` when available, and `summary.pnl.total` follows that day value for dashboard compatibility; when the broker omits `asst_icdc_amt`, both `day` and `total` fall back to unrealized PnL.
 - `PORTFOLIO_ACCOUNT_REFERENCES` accepts `KIS:<account_number>-<product_code>` entries, with optional `Label=...` prefixes.
 - Production portfolio aggregation also requires `KIS_APP_KEY`, `KIS_APP_SECRET`, and `KIS_USE_MOCK=false`.
 - When the deployment is still missing portfolio configuration, the route returns `200` with `sync.status = "not_configured"` and explicit notices instead of pretending the portfolio is empty.

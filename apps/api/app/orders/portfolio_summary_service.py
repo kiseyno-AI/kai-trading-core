@@ -529,6 +529,15 @@ class PortfolioSummaryService:
     def _normalize_account_summary(self, data: dict[str, Any]) -> dict[str, Any]:
         cash = data.get('cash') or {}
         valuation = data.get('valuation') or {}
+        unrealized_pnl_amount = valuation.get('pnl_amount')
+        raw_day_pnl_amount = valuation.get('day_pnl_amount')
+        has_day_pnl_amount = _safe_decimal(raw_day_pnl_amount) is not None
+        day_pnl_amount = raw_day_pnl_amount if has_day_pnl_amount else unrealized_pnl_amount
+        total_pnl_pct = (
+            valuation.get('day_pnl_pct')
+            if has_day_pnl_amount
+            else valuation.get('pnl_pct')
+        )
         return {
             'totalAssets': self._money(valuation.get('total_asset_value')),
             'totalEquity': self._money(valuation.get('total_asset_value')),
@@ -536,9 +545,10 @@ class PortfolioSummaryService:
             'buyingPower': self._money(cash.get('orderable_cash')),
             'investedValue': self._money(valuation.get('securities_value')),
             'pnl': {
-                'unrealized': self._money(valuation.get('pnl_amount')),
-                'total': self._money(valuation.get('pnl_amount')),
-                'totalPercent': _to_percent(valuation.get('pnl_pct')),
+                'unrealized': self._money(unrealized_pnl_amount),
+                'day': self._money(day_pnl_amount),
+                'total': self._money(day_pnl_amount),
+                'totalPercent': _to_percent(total_pnl_pct),
             },
         }
 

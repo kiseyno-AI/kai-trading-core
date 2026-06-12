@@ -85,7 +85,39 @@ class PortfolioSummaryServiceTests(unittest.IsolatedAsyncioTestCase):
         as_of: str = '2026-04-29T01:23:45+00:00',
         total_asset_value: int = 3072000,
         market_value: int = 572000,
+        pnl_amount: int = 22000,
+        pnl_pct: float = 0.04,
+        day_pnl_amount: int | None = None,
+        day_pnl_pct: float | None = None,
+        holdings: list[dict] | None = None,
+        recent_order_side: str = 'buy',
     ) -> None:
+        valuation = {
+            'securities_value': market_value,
+            'total_asset_value': total_asset_value,
+            'pnl_amount': pnl_amount,
+            'pnl_pct': pnl_pct,
+        }
+        if day_pnl_amount is not None:
+            valuation['day_pnl_amount'] = day_pnl_amount
+        if day_pnl_pct is not None:
+            valuation['day_pnl_pct'] = day_pnl_pct
+
+        if holdings is None:
+            holdings = [
+                {
+                    'symbol': '005930',
+                    'name': 'Samsung Electronics',
+                    'quantity': 10,
+                    'average_price': 55000,
+                    'last_price': 57200,
+                    'market_value': market_value,
+                    'pnl_amount': pnl_amount,
+                    'pnl_pct': pnl_pct,
+                    'weight_pct': 0.1862,
+                }
+            ]
+
         self.inquiry_service.summary_results[account_reference] = {
             'account_reference': account_reference,
             'as_of': as_of,
@@ -94,29 +126,12 @@ class PortfolioSummaryServiceTests(unittest.IsolatedAsyncioTestCase):
                 'withdrawable_cash': 2400000,
                 'orderable_cash': 2500000,
             },
-            'valuation': {
-                'securities_value': market_value,
-                'total_asset_value': total_asset_value,
-                'pnl_amount': 22000,
-                'pnl_pct': 0.04,
-            },
+            'valuation': valuation,
         }
         self.inquiry_service.positions_results[account_reference] = {
             'account_reference': account_reference,
             'as_of': as_of,
-            'items': [
-                {
-                    'symbol': '005930',
-                    'name': 'Samsung Electronics',
-                    'quantity': 10,
-                    'average_price': 55000,
-                    'last_price': 57200,
-                    'market_value': market_value,
-                    'pnl_amount': 22000,
-                    'pnl_pct': 0.04,
-                    'weight_pct': 0.1862,
-                }
-            ],
+            'items': holdings,
         }
         self.order_service.order_lists[account_reference] = {
             'count': 1,
@@ -125,7 +140,7 @@ class PortfolioSummaryServiceTests(unittest.IsolatedAsyncioTestCase):
                     'id': 11,
                     'client_order_id': 'ORDER-1',
                     'symbol': '005930',
-                    'side': 'buy',
+                    'side': recent_order_side,
                     'current_status': 'filled',
                     'requested_quantity': 5,
                     'filled_quantity': 5,
@@ -154,6 +169,8 @@ class PortfolioSummaryServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(account['summary']['totalAssets']['amount'], 3072000)
         self.assertEqual(account['summary']['cash']['amount'], 2400000)
         self.assertEqual(account['summary']['buyingPower']['amount'], 2500000)
+        self.assertEqual(account['summary']['pnl']['day']['amount'], 22000)
+        self.assertEqual(account['summary']['pnl']['total']['amount'], 22000)
         self.assertEqual(account['summary']['pnl']['totalPercent'], 4.0)
         self.assertEqual(account['holdings'][0]['unrealizedPnlPercent'], 4.0)
         self.assertEqual(account['holdings'][0]['allocationPercent'], 18.62)
@@ -161,6 +178,59 @@ class PortfolioSummaryServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(account['recentActivity'][0]['id'], 'ORDER-1')
         self.assertEqual(account['recentActivity'][0]['status'], 'filled')
         self.assertEqual(result['notices'], [])
+
+    async def test_portfolio_summary_uses_kis_day_pnl_and_keeps_unrealized_separate(self) -> None:
+        self._seed_synced_account(
+            pnl_amount=-5000,
+            pnl_pct=-0.01,
+            day_pnl_amount=20366,
+            day_pnl_pct=0.0066,
+            recent_order_side='sell',
+        )
+        service = self._build_service()
+
+        result = await service.get_portfolio_summary()
+
+        account = result['accounts'][0]
+        self.assertEqual(account['summary']['pnl']['unrealized']['amount'], -5000)
+        self.assertEqual(account['summary']['pnl']['day']['amount'], 20366)
+        self.assertEqual(account['summary']['pnl']['total']['amount'], 20366)
+        self.assertEqual(account['summary']['pnl']['totalPercent'], 0.66)
+        self.assertEqual(account['holdings'][0]['unrealizedPnl']['amount'], -5000)
+        self.assertEqual(account['recentActivity'][0]['side'], 'sell')
+
+    async def test_sold_position_missing_from_holdings_does_not_drive_day_pnl_negative(self) -> None:
+        self._seed_synced_account(
+            market_value=0,
+            pnl_amount=-12000,
+            pnl_pct=-0.03,
+            day_pnl_amount=20366,
+            day_pnl_pct=0.0066,
+            holdings=[],
+            recent_order_side='sell',
+        )
+        service = self._build_service()
+
+        result = await service.get_portfolio_summary()
+
+        account = result['accounts'][0]
+        self.assertEqual(account['holdings'], [])
+        self.assertEqual(account['allocation'], [])
+        self.assertEqual(account['summary']['pnl']['unrealized']['amount'], -12000)
+        self.assertEqual(account['summary']['pnl']['day']['amount'], 20366)
+        self.assertEqual(account['summary']['pnl']['total']['amount'], 20366)
+
+    async def test_portfolio_summary_falls_back_to_unrealized_pnl_when_day_pnl_absent(self) -> None:
+        self._seed_synced_account(pnl_amount=22000, pnl_pct=0.04)
+        service = self._build_service()
+
+        result = await service.get_portfolio_summary()
+
+        pnl = result['accounts'][0]['summary']['pnl']
+        self.assertEqual(pnl['unrealized']['amount'], 22000)
+        self.assertEqual(pnl['day']['amount'], 22000)
+        self.assertEqual(pnl['total']['amount'], 22000)
+        self.assertEqual(pnl['totalPercent'], 4.0)
 
     async def test_repeated_reads_use_cached_summary_until_ttl_expires(self) -> None:
         self._seed_synced_account()

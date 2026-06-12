@@ -108,6 +108,24 @@ class TradingAccountInquiryServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['valuation']['estimated_d2_deposit'], 2480000)
         self.assertEqual(result['raw']['source_api'], 'inquire-balance|inquire-account-balance')
 
+    async def test_get_account_summary_parses_day_pnl_from_asset_summary(self) -> None:
+        self.client.asset_summary_payload['output2']['asst_icdc_amt'] = '20366'
+        self.client.asset_summary_payload['output2']['asst_icdc_erng_rt'] = '0.66'
+
+        result = await self.service.get_account_summary(account_reference=self.account_reference)
+
+        self.assertEqual(result['valuation']['day_pnl_amount'], 20366)
+        self.assertAlmostEqual(result['valuation']['day_pnl_pct'], 0.0066)
+
+    async def test_get_account_summary_falls_back_to_balance_day_pnl_field(self) -> None:
+        self.client.balance_payload['output2']['asst_icdc_amt'] = '20366'
+        self.client.balance_payload['output2']['asst_icdc_erng_rt'] = '0.66'
+
+        result = await self.service.get_account_summary(account_reference=self.account_reference)
+
+        self.assertEqual(result['valuation']['day_pnl_amount'], 20366)
+        self.assertAlmostEqual(result['valuation']['day_pnl_pct'], 0.0066)
+
     async def test_get_positions_filters_zero_rows_by_default_and_derives_weights(self) -> None:
         result = await self.service.get_positions(account_reference=self.account_reference)
 

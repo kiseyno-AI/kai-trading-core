@@ -28,6 +28,8 @@ GET /trading/accounts/KIS:12345678-01/buying-power?symbol=005930&price=57000&ord
     "total_asset_value": 3072000,
     "pnl_amount": 22000,
     "pnl_pct": 0.04,
+    "day_pnl_amount": 20366,
+    "day_pnl_pct": 0.0066,
     "estimated_d2_deposit": 2480000
   },
   "raw": {
@@ -36,6 +38,8 @@ GET /trading/accounts/KIS:12345678-01/buying-power?symbol=005930&price=57000&ord
   }
 }
 ```
+
+`valuation.pnl_amount` and `valuation.pnl_pct` come from KIS holding evaluation fields. `valuation.day_pnl_amount` maps KIS `asst_icdc_amt` when the broker account asset summary or balance payload provides it, so realized same-day sell profit can remain visible after the sold holding leaves the positions list.
 
 ## Example positions response
 ```json
