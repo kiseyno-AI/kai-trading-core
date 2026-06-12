@@ -752,7 +752,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(warnings, [])
         self.assertEqual(feature_snapshot['signal_decider_crosscheck']['action'], 'wait')
 
-    async def test_short_term_entry_quality_blocks_low_buy_quality_score(self) -> None:
+    async def test_short_term_entry_quality_warns_low_buy_quality_score(self) -> None:
         short_snapshot_id = self._seed_short_term_snapshot(
             request_payload={
                 'symbol_day_context': {
@@ -788,11 +788,11 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 tactical_action='watch_for_trigger',
             )
 
-        self.assertIn('short_term_buy_quality_score_block', {entry['code'] for entry in blocks})
-        self.assertEqual(warnings, [])
+        self.assertEqual(blocks, [])
+        self.assertIn('short_term_buy_quality_score_warning', {entry['code'] for entry in warnings})
         self.assertEqual(Decimal(str(feature_snapshot['buy_quality_score'])), Decimal('59'))
 
-    async def test_short_term_entry_quality_blocks_missing_objective_selection_data(self) -> None:
+    async def test_short_term_entry_quality_warns_missing_objective_selection_data(self) -> None:
         short_snapshot_id = self._seed_short_term_snapshot(
             response_payload_extra={
                 'trigger_conditions': ['눌림 후 VWAP 재돌파 확인.'],
@@ -806,21 +806,21 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 tactical_action='watch_for_trigger',
             )
 
-        codes = {entry['code'] for entry in blocks}
-        self.assertIn('short_term_relative_strength_unverified', codes)
-        self.assertIn('short_term_relative_volume_unverified', codes)
-        self.assertIn('short_term_liquidity_unverified', codes)
-        self.assertEqual(warnings, [])
+        self.assertEqual(blocks, [])
+        codes = {entry['code'] for entry in warnings}
+        self.assertIn('short_term_relative_strength_unverified_warning', codes)
+        self.assertIn('short_term_relative_volume_unverified_warning', codes)
+        self.assertIn('short_term_liquidity_unverified_warning', codes)
         self.assertIsNone(feature_snapshot['return_percentile'])
         self.assertIsNone(feature_snapshot['volume_percentile'])
 
-    async def test_short_term_entry_quality_blocks_weak_relative_strength(self) -> None:
+    async def test_short_term_entry_quality_warns_weak_relative_strength(self) -> None:
         short_snapshot_id = self._seed_short_term_snapshot(
             request_payload={
                 'symbol_day_context': {
                     'market_relative_context': {
                         'relative_strength': {
-                            'return_percentile': 0.42,
+                            'return_percentile': 0.55,
                             'volume_percentile': 0.88,
                         },
                     },
@@ -844,9 +844,43 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 tactical_action='watch_for_trigger',
             )
 
-        self.assertIn('short_term_weak_relative_strength_block', {entry['code'] for entry in blocks})
+        self.assertEqual(blocks, [])
+        self.assertIn('short_term_weak_relative_strength_warning', {entry['code'] for entry in warnings})
+        self.assertEqual(Decimal(str(feature_snapshot['return_percentile'])), Decimal('0.55'))
+
+    async def test_short_term_entry_quality_blocks_very_weak_relative_strength(self) -> None:
+        short_snapshot_id = self._seed_short_term_snapshot(
+            request_payload={
+                'symbol_day_context': {
+                    'market_relative_context': {
+                        'relative_strength': {
+                            'return_percentile': 0.22,
+                            'volume_percentile': 0.88,
+                        },
+                    },
+                    'liquidity_context': {
+                        'turnover': {
+                            'trading_value_source': 'raw',
+                            'raw_trading_value_krw': 12_000_000_000,
+                        },
+                    },
+                },
+            },
+            response_payload_extra={
+                'trigger_conditions': ['눌림 후 VWAP 재돌파 확인.'],
+            },
+        )
+        with session_scope() as session:
+            snapshot = session.get(SignalDeciderDecisionSnapshot, short_snapshot_id)
+            blocks, warnings, feature_snapshot = _short_term_entry_quality_blocks(
+                snapshot=snapshot,
+                signal_decider_crosscheck={'action': 'buy'},
+                tactical_action='watch_for_trigger',
+            )
+
+        self.assertIn('short_term_very_weak_relative_strength_block', {entry['code'] for entry in blocks})
         self.assertEqual(warnings, [])
-        self.assertEqual(Decimal(str(feature_snapshot['return_percentile'])), Decimal('0.42'))
+        self.assertEqual(Decimal(str(feature_snapshot['return_percentile'])), Decimal('0.22'))
 
     async def test_short_term_entry_quality_blocks_poor_reward_risk(self) -> None:
         short_snapshot_id = self._seed_short_term_snapshot(
