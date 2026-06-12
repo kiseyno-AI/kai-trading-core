@@ -508,6 +508,8 @@ def build_contract_prompt_suffix(*, role: str | None = None) -> str:
             'traceability.symbol must exactly match symbol, and both must match the assigned item symbol. '
             'tactical_action and preferred_action must be one of scalp_buy_candidate, watch_for_trigger, avoid_chase, wait, reject exactly as written. '
             'Use scalp_buy_candidate only when momentum, participation, liquidity, and trigger/risk levels are all supportable; otherwise prefer watch_for_trigger, avoid_chase, wait, or reject. '
+            'Prioritize symbols with clear market-relative leadership, sufficient raw trading value, constructive relative volume, and a pullback/reclaim/breakout-continuation setup; do not recommend short-term buys merely because a symbol looks cheap or has fallen a lot. '
+            'For scalp_buy_candidate or watch_for_trigger, target_price versus trigger_price must offer materially more upside than trigger_price versus stop_loss_price offers downside; weak reward/risk should become avoid_chase, wait, or reject. '
             f'wait_reason must be an object with code and summary when tactical_action/preferred_action is watch_for_trigger, avoid_chase, or wait; otherwise use null. Valid wait_reason.code values are: {wait_reason_codes}. '
             'wait_reason.summary must be a concise Korean explanation that names the concrete blocker. '
             'Do not use vague wait text such as insufficient information, need more data, or wait for more confirmation unless the same summary explicitly names the concrete blocker. '

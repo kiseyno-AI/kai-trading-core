@@ -80,6 +80,30 @@ SHORT_TERM_CONFIRMATION_REQUIRED_MARKERS = (
     'do not chase',
     'pullback',
 )
+SHORT_TERM_MIN_RETURN_PERCENTILE = Decimal('0.60')
+SHORT_TERM_MIN_VOLUME_PERCENTILE = Decimal('0.45')
+SHORT_TERM_MIN_RAW_TRADING_VALUE_KRW = Decimal('3000000000')
+SHORT_TERM_MIN_REWARD_RISK_RATIO = Decimal('1.80')
+SHORT_TERM_MIN_BUY_QUALITY_SCORE = Decimal('60')
+SHORT_TERM_CONTINUATION_SETUP_MARKERS = (
+    '눌림',
+    '재상승',
+    '재돌파',
+    '돌파',
+    '지지',
+    '회복',
+    '반등',
+    '거래량',
+    '수급',
+    'vwap',
+    'pullback',
+    'reclaim',
+    'breakout',
+    'continuation',
+    'support',
+    'volume',
+    'relative strength',
+)
 UNSPECIFIED_ROUTE_ACCOUNT_REFERENCE = 'KIS:00000000-00'
 UNSPECIFIED_ROUTE_ACCOUNT_LABEL = 'UNSPECIFIED_ROUTE'
 UNSPECIFIED_ROUTE_ACCOUNT_BUDGET_KRW = Decimal('0')
@@ -384,6 +408,40 @@ def _flatten_text_feature(payload: Any, keys: set[str]) -> str | None:
     return None
 
 
+def _as_unit_percentile(value: Decimal | None) -> Decimal | None:
+    if value is None:
+        return None
+    if value > Decimal('1'):
+        return value / Decimal('100')
+    return value
+
+
+def _short_term_setup_text(snapshot: SignalDeciderDecisionSnapshot) -> str:
+    payload = _snapshot_response_payload(snapshot)
+    parts = [
+        snapshot.thesis_summary or '',
+        ' '.join(str(item) for item in (snapshot.supporting_evidence_payload or [])),
+        ' '.join(str(item) for item in (snapshot.decision_risks_payload or [])),
+        ' '.join(str(item) for item in (snapshot.invalidation_conditions_payload or [])),
+    ]
+    for key in (
+        'thesis_summary',
+        'summary',
+        'trigger_conditions',
+        'supporting_evidence',
+        'tactical_risks',
+        'risk_flags',
+        'details',
+        'decision_delta',
+    ):
+        value = payload.get(key)
+        if isinstance(value, list):
+            parts.append(' '.join(str(item) for item in value))
+        elif value is not None:
+            parts.append(str(value))
+    return ' '.join(parts).lower()
+
+
 def _short_term_entry_quality_blocks(
     *,
     snapshot: SignalDeciderDecisionSnapshot,
@@ -399,13 +457,55 @@ def _short_term_entry_quality_blocks(
     atr_pct = _flatten_numeric_feature(feature_payload, {'atr_pct_14', 'atr_pct', 'atr14_pct', 'atr_percent'})
     ret20 = _flatten_numeric_feature(feature_payload, {'ret20', 'ret_20d', 'return_20d', 'pct_change_20d'})
     ret5 = _flatten_numeric_feature(feature_payload, {'ret5', 'ret_5d', 'return_5d', 'pct_change_5d'})
+    return_percentile = _as_unit_percentile(
+        _flatten_numeric_feature(
+            feature_payload,
+            {'return_percentile', 'relative_return_percentile', 'market_relative_return_percentile'},
+        )
+    )
+    volume_percentile = _as_unit_percentile(
+        _flatten_numeric_feature(
+            feature_payload,
+            {'volume_percentile', 'relative_volume_percentile', 'market_relative_volume_percentile'},
+        )
+    )
+    raw_trading_value_krw = _flatten_numeric_feature(
+        feature_payload,
+        {'raw_trading_value_krw', 'provider_turnover_krw', 'trading_value_krw'},
+    )
+    buy_quality_score = _flatten_numeric_feature(feature_payload, {'buy_quality_score'})
+    decision_band = _flatten_text_feature(feature_payload, {'decision_band'})
+    trading_value_source = _flatten_text_feature(
+        feature_payload,
+        {'trading_value_source', 'trading_value_source_detail', 'turnover_source'},
+    )
+    trigger_price = _to_decimal(_flatten_numeric_feature(feature_payload, {'trigger_price'}))
+    target_price = _to_decimal(snapshot.target_price) or _to_decimal(
+        _flatten_numeric_feature(feature_payload, {'target_price'})
+    )
+    stop_loss_price = _to_decimal(snapshot.stop_loss_price) or _to_decimal(
+        _flatten_numeric_feature(feature_payload, {'stop_loss_price'})
+    )
     trend_state = _flatten_text_feature(feature_payload, {'trend_state', 'technical_trend', 'market_regime'})
     setup_state = _flatten_text_feature(feature_payload, {'setup_state', 'breakdown_state', 'pattern_state'})
+    reward_risk_ratio: Decimal | None = None
+    if trigger_price is not None and target_price is not None and stop_loss_price is not None:
+        upside = target_price - trigger_price
+        downside = trigger_price - stop_loss_price
+        if upside > 0 and downside > 0:
+            reward_risk_ratio = upside / downside
     feature_snapshot = {
-        'schema_version': 'short_term_entry_quality_v1',
+        'schema_version': 'short_term_entry_quality_v2',
         'atr_pct_14': _to_json_safe(atr_pct),
         'ret20': _to_json_safe(ret20),
         'ret5': _to_json_safe(ret5),
+        'return_percentile': _to_json_safe(return_percentile),
+        'volume_percentile': _to_json_safe(volume_percentile),
+        'raw_trading_value_krw': _to_json_safe(raw_trading_value_krw),
+        'buy_quality_score': _to_json_safe(buy_quality_score),
+        'decision_band': decision_band,
+        'trading_value_source': trading_value_source,
+        'reward_risk_ratio': _to_json_safe(reward_risk_ratio),
         'trend_state': trend_state,
         'setup_state': setup_state,
         'signal_decider_crosscheck': signal_decider_crosscheck,
@@ -462,6 +562,79 @@ def _short_term_entry_quality_blocks(
             _reason(
                 'short_term_high_atr_chase_block',
                 '5-day return is already extended while ATR is high; avoid chasing the spike.',
+            )
+        )
+    if buy_quality_score is not None and buy_quality_score < SHORT_TERM_MIN_BUY_QUALITY_SCORE:
+        blocks.append(
+            _reason(
+                'short_term_buy_quality_score_block',
+                'Decision input buy-quality score is below the minimum threshold for short-term buys.',
+            )
+        )
+    if return_percentile is None:
+        blocks.append(
+            _reason(
+                'short_term_relative_strength_unverified',
+                'Short-term buys require objective market-relative return evidence.',
+            )
+        )
+    elif return_percentile < SHORT_TERM_MIN_RETURN_PERCENTILE:
+        blocks.append(
+            _reason(
+                'short_term_weak_relative_strength_block',
+                'Short-term buys require market-relative leadership; return percentile is below the required threshold.',
+            )
+        )
+    if volume_percentile is None:
+        blocks.append(
+            _reason(
+                'short_term_relative_volume_unverified',
+                'Short-term buys require objective market-relative participation evidence.',
+            )
+        )
+    elif volume_percentile < SHORT_TERM_MIN_VOLUME_PERCENTILE:
+        blocks.append(
+            _reason(
+                'short_term_weak_relative_volume_block',
+                'Short-term buys require participation; volume percentile is below the required threshold.',
+            )
+        )
+    if raw_trading_value_krw is not None and raw_trading_value_krw < SHORT_TERM_MIN_RAW_TRADING_VALUE_KRW:
+        blocks.append(
+            _reason(
+                'short_term_liquidity_floor_block',
+                'Raw trading value is below the short-term liquidity floor for reliable entry and exit.',
+            )
+        )
+    elif raw_trading_value_krw is None:
+        blocks.append(
+            _reason(
+                'short_term_liquidity_unverified',
+                'Short-term buys require objective trading-value evidence before exec handoff.',
+            )
+        )
+    if reward_risk_ratio is not None and reward_risk_ratio < SHORT_TERM_MIN_REWARD_RISK_RATIO:
+        blocks.append(
+            _reason(
+                'short_term_reward_risk_ratio_block',
+                'Short-term candidate does not offer enough upside versus stop distance.',
+            )
+        )
+    setup_text = _short_term_setup_text(snapshot)
+    has_continuation_setup = any(marker in setup_text for marker in SHORT_TERM_CONTINUATION_SETUP_MARKERS)
+    feature_snapshot['continuation_setup_detected'] = has_continuation_setup
+    if tactical_action == 'scalp_buy_candidate' and not has_continuation_setup:
+        blocks.append(
+            _reason(
+                'short_term_scalp_requires_continuation_setup',
+                'Immediate scalp buy requires explicit pullback, reclaim, breakout, support, volume, or relative-strength continuation evidence.',
+            )
+        )
+    elif tactical_action == 'watch_for_trigger' and not has_continuation_setup:
+        warnings.append(
+            _reason(
+                'short_term_watch_needs_continuation_confirmation',
+                'Watch buy lacks explicit continuation setup language; exec must require strict trigger-time confirmation.',
             )
         )
     return blocks, warnings, feature_snapshot
