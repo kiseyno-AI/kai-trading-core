@@ -65,6 +65,21 @@ SHORT_TERM_HANDOFF_INTENT_BY_TACTICAL_ACTION = {
     'scalp_buy_candidate': 'tactical_buy',
     'watch_for_trigger': 'intraday_watch_buy',
 }
+SHORT_TERM_CONFIRMATION_REQUIRED_MARKERS = (
+    '확인',
+    '재돌파',
+    '돌파 확인',
+    '추격 금지',
+    '기다',
+    'wait',
+    'confirm',
+    'confirmation',
+    'reclaim',
+    'breakout confirmation',
+    'avoid chase',
+    'do not chase',
+    'pullback',
+)
 UNSPECIFIED_ROUTE_ACCOUNT_REFERENCE = 'KIS:00000000-00'
 UNSPECIFIED_ROUTE_ACCOUNT_LABEL = 'UNSPECIFIED_ROUTE'
 UNSPECIFIED_ROUTE_ACCOUNT_BUDGET_KRW = Decimal('0')
@@ -247,8 +262,34 @@ def _short_term_tactical_action(snapshot: SignalDeciderDecisionSnapshot) -> str:
     )
     action = action.lower() if action else 'wait'
     if action in SHORT_TERM_ACTIONABLE_ACTIONS or action in {'avoid_chase', 'wait', 'reject'}:
-        return action
+        return _coerce_short_term_action_for_confirmation(snapshot=snapshot, tactical_action=action)
     return 'wait'
+
+
+def _coerce_short_term_action_for_confirmation(
+    *,
+    snapshot: SignalDeciderDecisionSnapshot,
+    tactical_action: str,
+) -> str:
+    if tactical_action != 'scalp_buy_candidate':
+        return tactical_action
+    payload = _snapshot_response_payload(snapshot)
+    text_parts = [
+        snapshot.thesis_summary or '',
+        ' '.join(str(item) for item in (snapshot.supporting_evidence_payload or [])),
+        ' '.join(str(item) for item in (snapshot.decision_risks_payload or [])),
+        ' '.join(str(item) for item in (snapshot.invalidation_conditions_payload or [])),
+    ]
+    for key in ('thesis_summary', 'summary', 'trigger_conditions', 'tactical_risks', 'decision_risks'):
+        value = payload.get(key)
+        if isinstance(value, list):
+            text_parts.append(' '.join(str(item) for item in value))
+        elif value is not None:
+            text_parts.append(str(value))
+    joined = ' '.join(text_parts).lower()
+    if any(marker in joined for marker in SHORT_TERM_CONFIRMATION_REQUIRED_MARKERS):
+        return 'watch_for_trigger'
+    return tactical_action
 
 
 def _is_actionable_snapshot(snapshot: SignalDeciderDecisionSnapshot) -> bool:
@@ -284,6 +325,146 @@ def _short_term_field_text(snapshot: SignalDeciderDecisionSnapshot, key: str) ->
     payload = _snapshot_response_payload(snapshot)
     value = payload.get(key)
     return _normalize_optional_text(str(value)) if value is not None else None
+
+
+def _latest_signal_decider_action_by_symbol(
+    snapshots: Sequence[SignalDeciderDecisionSnapshot],
+) -> dict[str, dict[str, Any]]:
+    actions: dict[str, dict[str, Any]] = {}
+    for snapshot in snapshots:
+        if _snapshot_agent_name(snapshot) != SIGNAL_DECIDER_AGENT_NAME:
+            continue
+        if snapshot.symbol in actions:
+            continue
+        actions[snapshot.symbol] = {
+            'action': _normalize_action(snapshot.next_day_open_action or snapshot.decision_action),
+            'decision_snapshot_id': snapshot.id,
+            'policy_version': snapshot.policy_version,
+            'confidence_score_10': _to_json_safe(snapshot.confidence_score_10),
+            'conviction_score_10': _to_json_safe(snapshot.conviction_score_10),
+        }
+    return actions
+
+
+def _flatten_numeric_feature(payload: Any, keys: set[str]) -> Decimal | None:
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            normalized_key = str(key or '').strip().lower()
+            if normalized_key in keys:
+                parsed = _to_decimal(value)
+                if parsed is not None:
+                    return parsed
+            found = _flatten_numeric_feature(value, keys)
+            if found is not None:
+                return found
+    elif isinstance(payload, list):
+        for item in payload:
+            found = _flatten_numeric_feature(item, keys)
+            if found is not None:
+                return found
+    return None
+
+
+def _flatten_text_feature(payload: Any, keys: set[str]) -> str | None:
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            normalized_key = str(key or '').strip().lower()
+            if normalized_key in keys and value is not None:
+                text = str(value).strip()
+                if text:
+                    return text
+            found = _flatten_text_feature(value, keys)
+            if found is not None:
+                return found
+    elif isinstance(payload, list):
+        for item in payload:
+            found = _flatten_text_feature(item, keys)
+            if found is not None:
+                return found
+    return None
+
+
+def _short_term_entry_quality_blocks(
+    *,
+    snapshot: SignalDeciderDecisionSnapshot,
+    signal_decider_crosscheck: dict[str, Any] | None,
+    tactical_action: str | None,
+) -> tuple[list[dict[str, str]], list[dict[str, str]], dict[str, Any]]:
+    payloads = [
+        snapshot.input_feature_snapshot_payload if isinstance(snapshot.input_feature_snapshot_payload, dict) else {},
+        snapshot.request_payload if isinstance(snapshot.request_payload, dict) else {},
+        snapshot.response_payload if isinstance(snapshot.response_payload, dict) else {},
+    ]
+    feature_payload = {'sources': payloads}
+    atr_pct = _flatten_numeric_feature(feature_payload, {'atr_pct_14', 'atr_pct', 'atr14_pct', 'atr_percent'})
+    ret20 = _flatten_numeric_feature(feature_payload, {'ret20', 'ret_20d', 'return_20d', 'pct_change_20d'})
+    ret5 = _flatten_numeric_feature(feature_payload, {'ret5', 'ret_5d', 'return_5d', 'pct_change_5d'})
+    trend_state = _flatten_text_feature(feature_payload, {'trend_state', 'technical_trend', 'market_regime'})
+    setup_state = _flatten_text_feature(feature_payload, {'setup_state', 'breakdown_state', 'pattern_state'})
+    feature_snapshot = {
+        'schema_version': 'short_term_entry_quality_v1',
+        'atr_pct_14': _to_json_safe(atr_pct),
+        'ret20': _to_json_safe(ret20),
+        'ret5': _to_json_safe(ret5),
+        'trend_state': trend_state,
+        'setup_state': setup_state,
+        'signal_decider_crosscheck': signal_decider_crosscheck,
+    }
+    blocks: list[dict[str, str]] = []
+    warnings: list[dict[str, str]] = []
+    signal_action = str((signal_decider_crosscheck or {}).get('action') or '').lower()
+    if signal_action == 'reject':
+        blocks.append(
+            _reason(
+                'signal_decider_reject_veto',
+                'Same-day signal-decider rejected the setup; short-term buy handoff is blocked.',
+            )
+        )
+    elif signal_action == 'wait' and tactical_action == 'scalp_buy_candidate':
+        blocks.append(
+            _reason(
+                'signal_decider_wait_blocks_scalp_buy',
+                'Same-day signal-decider is wait; immediate scalp buy is blocked and should be monitored only after a new trigger.',
+            )
+        )
+    elif signal_action == 'wait':
+        warnings.append(
+            _reason(
+                'signal_decider_wait_requires_trigger_confirmation',
+                'Same-day signal-decider is wait; exec must require live trigger-time confirmation before buying.',
+            )
+        )
+
+    trend_text = f'{trend_state or ""} {setup_state or ""}'.lower()
+    if any(marker in trend_text for marker in ('downtrend', 'bearish', 'breakdown_20d', 'breakdown')):
+        blocks.append(
+            _reason(
+                'short_term_downtrend_or_breakdown_block',
+                'Short-term candidate is in a downtrend/bearish/breakdown setup.',
+            )
+        )
+    if ret20 is not None and ret20 < Decimal('-10'):
+        blocks.append(
+            _reason(
+                'short_term_ret20_deep_negative_block',
+                '20-day return is deeply negative for a short-term buy candidate.',
+            )
+        )
+    if atr_pct is not None and atr_pct >= Decimal('9') and ret20 is not None and ret20 <= Decimal('0'):
+        blocks.append(
+            _reason(
+                'short_term_high_atr_weak_trend_block',
+                'ATR is high while 20-day return is non-positive; recent stop-loss history shows this pattern is fragile.',
+            )
+        )
+    if atr_pct is not None and atr_pct > Decimal('9') and ret5 is not None and ret5 > Decimal('15'):
+        blocks.append(
+            _reason(
+                'short_term_high_atr_chase_block',
+                '5-day return is already extended while ATR is high; avoid chasing the spike.',
+            )
+        )
+    return blocks, warnings, feature_snapshot
 
 
 def _first_blocking_reason(validation_payload: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -514,6 +695,7 @@ class SignalDeciderNextOpenExecutionService:
         )
         enrichment_preflight_blocked = not force and not enrichment_preflight.get('allowed')
         snapshots = self._load_latest_snapshots(source_market_date=source_market_date)
+        signal_decider_action_by_symbol = _latest_signal_decider_action_by_symbol(snapshots)
         actionable_short_term_symbols = [
             snapshot.symbol for snapshot in snapshots if _is_actionable_short_term_snapshot(snapshot)
         ]
@@ -669,6 +851,11 @@ class SignalDeciderNextOpenExecutionService:
                         price_cache=price_cache,
                         enrichment_preflight=enrichment_preflight,
                         candidate_enrichment=candidate_enrichment_by_symbol.get(snapshot.symbol),
+                        signal_decider_crosscheck=(
+                            signal_decider_action_by_symbol.get(snapshot.symbol)
+                            if decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
+                            else None
+                        ),
                     )
                     if account_target_blocking_reasons:
                         validation['blocking_reasons'] = [
@@ -1293,6 +1480,7 @@ class SignalDeciderNextOpenExecutionService:
         price_cache: dict[str, int | None],
         enrichment_preflight: dict[str, Any] | None = None,
         candidate_enrichment: dict[str, Any] | None = None,
+        signal_decider_crosscheck: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         decision_agent_name = _snapshot_agent_name(snapshot)
         response_payload = _snapshot_response_payload(snapshot)
@@ -1480,6 +1668,13 @@ class SignalDeciderNextOpenExecutionService:
                     )
                 )
         else:
+            entry_quality_blocks, entry_quality_warnings, entry_quality_snapshot = _short_term_entry_quality_blocks(
+                snapshot=snapshot,
+                signal_decider_crosscheck=signal_decider_crosscheck,
+                tactical_action=short_term_tactical_action,
+            )
+            blocking_reasons.extend(entry_quality_blocks)
+            warnings.extend(entry_quality_warnings)
             trigger_price = _to_decimal(response_payload.get('trigger_price'))
             chase_limit_price = _to_decimal(response_payload.get('chase_limit_price'))
             target_price = _to_decimal(
@@ -1728,6 +1923,7 @@ class SignalDeciderNextOpenExecutionService:
                 'expected_holding_period': _short_term_field_text(snapshot, 'expected_holding_period')
                 or snapshot.suggested_holding_period,
             }
+            validation_payload['short_term_entry_quality'] = entry_quality_snapshot
         return validation_payload, {
             'estimated_reference_price': estimated_reference_price,
             'planned_quantity': planned_quantity,
