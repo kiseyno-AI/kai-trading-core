@@ -37,7 +37,12 @@ from app.orders.exec_payload_slimming import (
     cleanup_signal_decider_exec_submission_payloads,
     json_size_bytes,
 )
-from app.orders.next_open_execution import EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING, EXECUTION_STATUS_SUBMITTED
+from app.orders.next_open_execution import (
+    EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING,
+    EXECUTION_STATUS_SUBMITTED,
+    _short_term_entry_quality_blocks,
+    signal_decider_next_open_execution_service,
+)
 
 
 class FakeExecClient:
@@ -704,6 +709,30 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         items_by_agent = {item['decision_agent_name']: item for item in result['items']}
         self.assertEqual(items_by_agent['signal-decider']['eligibility_status'], 'blocked')
         self.assertEqual(items_by_agent['short-term-decider']['execution_status'], EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING)
+
+    async def test_short_term_entry_quality_blocks_scalp_when_signal_decider_waits(self) -> None:
+        short_snapshot_id = self._seed_short_term_snapshot(
+            tactical_action='scalp_buy_candidate',
+            response_payload_extra={
+                'thesis_summary': 'Immediate scalp setup with momentum expansion.',
+            },
+        )
+        with session_scope() as session:
+            snapshot = session.get(SignalDeciderDecisionSnapshot, short_snapshot_id)
+            blocks, warnings, feature_snapshot = _short_term_entry_quality_blocks(
+                snapshot=snapshot,
+                signal_decider_crosscheck={
+                    'action': 'wait',
+                    'decision_snapshot_id': self.snapshot_id,
+                    'policy_version': self.policy_version,
+                },
+                tactical_action='scalp_buy_candidate',
+            )
+
+        blocking_codes = {entry['code'] for entry in blocks}
+        self.assertIn('signal_decider_wait_blocks_scalp_buy', blocking_codes)
+        self.assertEqual(warnings, [])
+        self.assertEqual(feature_snapshot['signal_decider_crosscheck']['action'], 'wait')
 
     async def test_dispatch_next_open_plan_fails_closed_on_calendar_fallback(self) -> None:
         set_krx_calendar_provider(

@@ -15,6 +15,7 @@ from app.db_models import (
     BrokerOrder,
     DartDisclosureEvent,
     OrderRequest,
+    SignalDeciderEvaluation,
     SignalDeciderExecutionPlanItem,
 )
 from app.market_data_store import (
@@ -629,6 +630,76 @@ def _load_prior_positive_decision_reasons(
     return {'status': 'loaded', 'matched_symbols': matched}
 
 
+def _load_prior_missed_opportunity_reasons(
+    *,
+    market_date: date,
+    symbols: Sequence[str],
+    reasons_by_symbol: dict[str, list[dict[str, Any]]],
+) -> dict[str, Any]:
+    if not bool(getattr(settings, 'openclaw_feedback_force_include_prior_missed_opportunities_enabled', True)):
+        return {'status': 'disabled'}
+    if not symbols:
+        return {'status': 'empty_scope'}
+    try:
+        with session_scope() as session:
+            rows = session.execute(
+                select(
+                    SignalDeciderEvaluation.symbol,
+                    SignalDeciderEvaluation.market_date,
+                    SignalDeciderEvaluation.decision_action,
+                    SignalDeciderEvaluation.horizon_days,
+                    SignalDeciderEvaluation.grade_label,
+                    SignalDeciderEvaluation.grade_score,
+                    SignalDeciderEvaluation.evaluation_version,
+                    SignalDeciderEvaluation.evaluated_at,
+                )
+                .where(SignalDeciderEvaluation.market_date < market_date)
+                .where(SignalDeciderEvaluation.symbol.in_(list(symbols)))
+                .where(SignalDeciderEvaluation.evaluation_status == 'graded')
+                .where(SignalDeciderEvaluation.missed_opportunity.is_(True))
+                .where(
+                    SignalDeciderEvaluation.grade_label.in_(
+                        ['missed_opportunity_after_wait', 'missed_opportunity_after_reject']
+                    )
+                )
+                .order_by(
+                    SignalDeciderEvaluation.symbol.asc(),
+                    SignalDeciderEvaluation.market_date.desc(),
+                    SignalDeciderEvaluation.horizon_days.asc(),
+                    SignalDeciderEvaluation.evaluated_at.desc(),
+                    SignalDeciderEvaluation.id.desc(),
+                )
+            ).all()
+    except Exception as exc:  # noqa: BLE001
+        return {'status': 'source_error', 'error_type': type(exc).__name__, 'message': str(exc)}
+
+    seen: set[str] = set()
+    matched = 0
+    for row in rows:
+        symbol = _normalize_symbol(row.symbol)
+        if not symbol or symbol in seen:
+            continue
+        seen.add(symbol)
+        matched += 1
+        _append_forced_reason(
+            reasons_by_symbol,
+            symbol=symbol,
+            code='prior_missed_opportunity_after_wait_or_reject',
+            source='signal_decider_evaluations',
+            message='Recent signal-decider evaluation marked this symbol as a missed opportunity after waiting/rejecting.',
+            details={
+                'source_market_date': row.market_date.isoformat() if row.market_date else None,
+                'decision_action': row.decision_action,
+                'horizon_days': row.horizon_days,
+                'grade_label': row.grade_label,
+                'grade_score': _as_float(row.grade_score, default=0.0),
+                'evaluation_version': row.evaluation_version,
+                'evaluated_at': row.evaluated_at.isoformat() if row.evaluated_at else None,
+            },
+        )
+    return {'status': 'loaded', 'matched_symbols': matched}
+
+
 def _load_event_symbol_reasons(
     *,
     market_date: date,
@@ -856,6 +927,11 @@ def _load_forced_inclusion_reasons(
         }
 
     source_diagnostics['prior_decisions'] = _load_prior_positive_decision_reasons(
+        market_date=market_date,
+        symbols=normalized_symbols,
+        reasons_by_symbol=reasons_by_symbol,
+    )
+    source_diagnostics['prior_missed_opportunities'] = _load_prior_missed_opportunity_reasons(
         market_date=market_date,
         symbols=normalized_symbols,
         reasons_by_symbol=reasons_by_symbol,
