@@ -147,6 +147,18 @@ class TradingAccountInquiryService:
             asset_totals,
             ('evlu_pfls_amt_smtl', 'evlu_pfls_amt'),
         )
+        day_pnl_amount = self._first_decimal(
+            asset_totals,
+            ('asst_icdc_amt',),
+            balance_totals,
+            ('asst_icdc_amt',),
+        )
+        day_pnl_pct = self._first_decimal(
+            asset_totals,
+            ('asst_icdc_erng_rt',),
+            balance_totals,
+            ('asst_icdc_erng_rt',),
+        )
 
         return {
             'account_reference': scope.account_reference,
@@ -179,6 +191,8 @@ class TradingAccountInquiryService:
                 ),
                 'pnl_amount': _to_json_number(pnl_amount),
                 'pnl_pct': _ratio(pnl_amount, purchase_amount),
+                'day_pnl_amount': _to_json_number(day_pnl_amount),
+                'day_pnl_pct': _ratio_from_percent(day_pnl_pct),
                 'estimated_d2_deposit': _to_json_number(
                     self._first_decimal(balance_totals, ('prvs_rcdl_excc_amt', 'nxdy_excc_amt'))
                 ),
