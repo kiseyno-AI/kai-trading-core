@@ -713,6 +713,16 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_short_term_entry_quality_blocks_scalp_when_signal_decider_waits(self) -> None:
         short_snapshot_id = self._seed_short_term_snapshot(
             tactical_action='scalp_buy_candidate',
+            request_payload={
+                'symbol_day_context': {
+                    'market_relative_context': {
+                        'relative_strength': {
+                            'return_percentile': 0.82,
+                            'volume_percentile': 0.76,
+                        },
+                    },
+                },
+            },
             input_feature_snapshot_payload={
                 'liquidity_context': {
                     'turnover': {
@@ -741,6 +751,68 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('signal_decider_wait_blocks_scalp_buy', blocking_codes)
         self.assertEqual(warnings, [])
         self.assertEqual(feature_snapshot['signal_decider_crosscheck']['action'], 'wait')
+
+    async def test_short_term_entry_quality_blocks_low_buy_quality_score(self) -> None:
+        short_snapshot_id = self._seed_short_term_snapshot(
+            request_payload={
+                'symbol_day_context': {
+                    'market_relative_context': {
+                        'relative_strength': {
+                            'return_percentile': 0.86,
+                            'volume_percentile': 0.80,
+                        },
+                    },
+                    'decision_input_quality_context': {
+                        'final_judgment': {
+                            'buy_quality_score': 59,
+                            'decision_band': 'small_probe',
+                        },
+                    },
+                    'liquidity_context': {
+                        'turnover': {
+                            'trading_value_source': 'raw',
+                            'raw_trading_value_krw': 12_000_000_000,
+                        },
+                    },
+                },
+            },
+            response_payload_extra={
+                'trigger_conditions': ['눌림 후 VWAP 재돌파 확인.'],
+            },
+        )
+        with session_scope() as session:
+            snapshot = session.get(SignalDeciderDecisionSnapshot, short_snapshot_id)
+            blocks, warnings, feature_snapshot = _short_term_entry_quality_blocks(
+                snapshot=snapshot,
+                signal_decider_crosscheck={'action': 'buy'},
+                tactical_action='watch_for_trigger',
+            )
+
+        self.assertIn('short_term_buy_quality_score_block', {entry['code'] for entry in blocks})
+        self.assertEqual(warnings, [])
+        self.assertEqual(Decimal(str(feature_snapshot['buy_quality_score'])), Decimal('59'))
+
+    async def test_short_term_entry_quality_blocks_missing_objective_selection_data(self) -> None:
+        short_snapshot_id = self._seed_short_term_snapshot(
+            response_payload_extra={
+                'trigger_conditions': ['눌림 후 VWAP 재돌파 확인.'],
+            },
+        )
+        with session_scope() as session:
+            snapshot = session.get(SignalDeciderDecisionSnapshot, short_snapshot_id)
+            blocks, warnings, feature_snapshot = _short_term_entry_quality_blocks(
+                snapshot=snapshot,
+                signal_decider_crosscheck={'action': 'buy'},
+                tactical_action='watch_for_trigger',
+            )
+
+        codes = {entry['code'] for entry in blocks}
+        self.assertIn('short_term_relative_strength_unverified', codes)
+        self.assertIn('short_term_relative_volume_unverified', codes)
+        self.assertIn('short_term_liquidity_unverified', codes)
+        self.assertEqual(warnings, [])
+        self.assertIsNone(feature_snapshot['return_percentile'])
+        self.assertIsNone(feature_snapshot['volume_percentile'])
 
     async def test_short_term_entry_quality_blocks_weak_relative_strength(self) -> None:
         short_snapshot_id = self._seed_short_term_snapshot(
@@ -1156,7 +1228,32 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                         'trading_value_krw': 9_870_000_000,
                     },
                 },
-                'liquidity_context': {'turnover': {'status': 'available'}},
+                'market_relative_context': {
+                    'relative_strength': {
+                        'return_percentile': 0.82,
+                        'volume_percentile': 0.76,
+                    },
+                },
+                'liquidity_context': {
+                    'turnover': {
+                        'status': 'available',
+                        'trading_value_source': 'raw',
+                        'raw_trading_value_krw': 9_870_000_000,
+                    },
+                },
+                'decision_input_quality_context': {
+                    'schema_version': 'decision_input_quality_v1',
+                    'execution_feasibility': {
+                        'status': 'usable',
+                        'liquidity_tier': 'medium',
+                        'max_safe_notional_krw': 49350000,
+                        'sizing_hints': [{'code': 'max_safe_notional', 'max_safe_notional_krw': 49350000}],
+                    },
+                    'final_judgment': {
+                        'buy_quality_score': 66,
+                        'decision_band': 'small_probe',
+                    },
+                },
             },
             'orchestration': {'run_id': 'symbol-run-1'},
         }

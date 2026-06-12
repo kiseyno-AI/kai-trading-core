@@ -84,6 +84,7 @@ SHORT_TERM_MIN_RETURN_PERCENTILE = Decimal('0.60')
 SHORT_TERM_MIN_VOLUME_PERCENTILE = Decimal('0.45')
 SHORT_TERM_MIN_RAW_TRADING_VALUE_KRW = Decimal('3000000000')
 SHORT_TERM_MIN_REWARD_RISK_RATIO = Decimal('1.80')
+SHORT_TERM_MIN_BUY_QUALITY_SCORE = Decimal('60')
 SHORT_TERM_CONTINUATION_SETUP_MARKERS = (
     '눌림',
     '재상승',
@@ -472,6 +473,8 @@ def _short_term_entry_quality_blocks(
         feature_payload,
         {'raw_trading_value_krw', 'provider_turnover_krw', 'trading_value_krw'},
     )
+    buy_quality_score = _flatten_numeric_feature(feature_payload, {'buy_quality_score'})
+    decision_band = _flatten_text_feature(feature_payload, {'decision_band'})
     trading_value_source = _flatten_text_feature(
         feature_payload,
         {'trading_value_source', 'trading_value_source_detail', 'turnover_source'},
@@ -499,6 +502,8 @@ def _short_term_entry_quality_blocks(
         'return_percentile': _to_json_safe(return_percentile),
         'volume_percentile': _to_json_safe(volume_percentile),
         'raw_trading_value_krw': _to_json_safe(raw_trading_value_krw),
+        'buy_quality_score': _to_json_safe(buy_quality_score),
+        'decision_band': decision_band,
         'trading_value_source': trading_value_source,
         'reward_risk_ratio': _to_json_safe(reward_risk_ratio),
         'trend_state': trend_state,
@@ -559,14 +564,35 @@ def _short_term_entry_quality_blocks(
                 '5-day return is already extended while ATR is high; avoid chasing the spike.',
             )
         )
-    if return_percentile is not None and return_percentile < SHORT_TERM_MIN_RETURN_PERCENTILE:
+    if buy_quality_score is not None and buy_quality_score < SHORT_TERM_MIN_BUY_QUALITY_SCORE:
+        blocks.append(
+            _reason(
+                'short_term_buy_quality_score_block',
+                'Decision input buy-quality score is below the minimum threshold for short-term buys.',
+            )
+        )
+    if return_percentile is None:
+        blocks.append(
+            _reason(
+                'short_term_relative_strength_unverified',
+                'Short-term buys require objective market-relative return evidence.',
+            )
+        )
+    elif return_percentile < SHORT_TERM_MIN_RETURN_PERCENTILE:
         blocks.append(
             _reason(
                 'short_term_weak_relative_strength_block',
                 'Short-term buys require market-relative leadership; return percentile is below the required threshold.',
             )
         )
-    if volume_percentile is not None and volume_percentile < SHORT_TERM_MIN_VOLUME_PERCENTILE:
+    if volume_percentile is None:
+        blocks.append(
+            _reason(
+                'short_term_relative_volume_unverified',
+                'Short-term buys require objective market-relative participation evidence.',
+            )
+        )
+    elif volume_percentile < SHORT_TERM_MIN_VOLUME_PERCENTILE:
         blocks.append(
             _reason(
                 'short_term_weak_relative_volume_block',
@@ -581,10 +607,10 @@ def _short_term_entry_quality_blocks(
             )
         )
     elif raw_trading_value_krw is None:
-        warnings.append(
+        blocks.append(
             _reason(
                 'short_term_liquidity_unverified',
-                'Trading value is unavailable; exec-agent must treat sizing as conservative until live liquidity is confirmed.',
+                'Short-term buys require objective trading-value evidence before exec handoff.',
             )
         )
     if reward_risk_ratio is not None and reward_risk_ratio < SHORT_TERM_MIN_REWARD_RISK_RATIO:
