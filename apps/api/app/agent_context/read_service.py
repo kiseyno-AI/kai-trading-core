@@ -1129,6 +1129,40 @@ def _market_session_context_fields(
     }
 
 
+def _build_market_data_phase_contract(
+    *,
+    requested_market_date: date,
+    market_session: dict[str, Any] | None,
+) -> dict[str, Any]:
+    market_session_payload = _maybe_dict(market_session)
+    recommendation_basis = str(market_session_payload.get('recommendation_basis') or '').strip()
+    quote_data_expected = bool(market_session_payload.get('quote_data_expected'))
+    intraday_data_expected = bool(market_session_payload.get('intraday_data_expected'))
+    realtime_required = quote_data_expected or intraday_data_expected
+    eod_reference_price_accepted = recommendation_basis == 'latest_completed_eod'
+    return {
+        'schema_version': 'market_data_phase_contract_v1',
+        'requested_market_date': requested_market_date.isoformat(),
+        'current_calendar_date': market_session_payload.get('current_calendar_date'),
+        'latest_valid_trading_date': market_session_payload.get('latest_valid_trading_date'),
+        'market_session_status': market_session_payload.get('status'),
+        'current_market_session': market_session_payload.get('current_market_session'),
+        'current_market_state': market_session_payload.get('current_market_state'),
+        'recommendation_basis': recommendation_basis or None,
+        'quote_data_expected': quote_data_expected,
+        'intraday_data_expected': intraday_data_expected,
+        'realtime_quote_orderbook_required': realtime_required,
+        'eod_reference_price_accepted': eod_reference_price_accepted,
+        'not_applicable_realtime_is_expected': eod_reference_price_accepted and not realtime_required,
+        'agent_guidance': {
+            'daily_process_agents_use_completed_eod': eod_reference_price_accepted,
+            'intraday_agents_use_live_quote_orderbook': realtime_required,
+            'missing_live_realtime_is_blocking': realtime_required,
+            'closed_market_realtime_not_applicable_is_normal': eod_reference_price_accepted and not realtime_required,
+        },
+    }
+
+
 def _build_not_applicable_freshness_provenance(
     *,
     requested_market_date: date,
@@ -1762,6 +1796,10 @@ def _build_pre_decider_enrichment_context(
     market_breadth_context: dict[str, Any],
     market_breadth_provenance: dict[str, Any],
 ) -> dict[str, Any]:
+    market_data_phase_contract = _build_market_data_phase_contract(
+        requested_market_date=requested_market_date,
+        market_session=market_session,
+    )
     quote_snapshot = _build_pre_decider_quote_orderbook_snapshot(
         requested_market_date=requested_market_date,
         market_session=market_session,
@@ -1804,6 +1842,7 @@ def _build_pre_decider_enrichment_context(
         'schema_version': PRE_DECIDER_ENRICHMENT_SCHEMA_VERSION,
         'status': status,
         'market_date': requested_market_date.isoformat(),
+        'market_data_phase_contract': market_data_phase_contract,
         'quote_orderbook_snapshot': quote_snapshot,
         'trading_value': {
             'status': trading_value_status,
@@ -5174,6 +5213,7 @@ class AgentContextReadService:
                     'symbol': symbol,
                     'market_date': normalized_market_date.isoformat(),
                     'market_session': request_market_session,
+                    'market_data_phase_contract': pre_decider_enrichment_context.get('market_data_phase_contract'),
                     'company': company,
                     'quote_context': quote_context,
                     'price_context': price_context,

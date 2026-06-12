@@ -468,6 +468,7 @@ def _compact_symbol_day_context_for_decider(context: dict[str, Any]) -> dict[str
         'market_date',
         'company',
         'market_session',
+        'market_data_phase_contract',
         'quote_context',
         'price_context',
         'technical_snapshot',

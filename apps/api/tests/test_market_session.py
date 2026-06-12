@@ -295,6 +295,30 @@ class MarketSessionTests(unittest.TestCase):
         self.assertTrue(result['quote_data_expected'])
         self.assertEqual(result['recommendation_basis'], RECOMMENDATION_BASIS_LIVE_INTRADAY)
 
+    def test_historical_trading_day_uses_completed_eod_not_live_intraday(self):
+        current_state = SimpleNamespace(
+            state='OPEN',
+            is_trading_day=True,
+            is_open=True,
+            reason=None,
+            server_time='2026-04-30T10:05:00+09:00',
+            current_calendar_date='2026-04-30',
+            latest_valid_trading_date='2026-04-30',
+            market_session='open',
+        )
+
+        result = build_market_session_metadata(
+            requested_date='2026-04-29',
+            current_state=current_state,
+        )
+
+        self.assertEqual(result['status'], 'closed')
+        self.assertFalse(result['requested_date_is_current_calendar_date'])
+        self.assertTrue(result['requested_date_is_trading_day'])
+        self.assertFalse(result['intraday_data_expected'])
+        self.assertFalse(result['quote_data_expected'])
+        self.assertEqual(result['recommendation_basis'], RECOMMENDATION_BASIS_LATEST_COMPLETED_EOD)
+
 
 if __name__ == '__main__':
     unittest.main()

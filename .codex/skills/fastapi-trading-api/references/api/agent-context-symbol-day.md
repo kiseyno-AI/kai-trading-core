@@ -13,6 +13,8 @@ Expected decider-facing context blocks are status-first even when the requested-
 
 The payload now also includes `market_session` metadata at the top level, under `summary.market_session`, and under each item. It keeps `requested_date`, `current_calendar_date`, `latest_valid_trading_date`, `status`, `is_trading_day`, `intraday_data_expected`, `quote_data_expected`, and `recommendation_basis` explicit so downstream agents can tell an actual trading-data gap from a weekend, holiday, or after-close read.
 
+Each item also includes `market_data_phase_contract` and the same block is repeated under `pre_decider_enrichment_context.market_data_phase_contract`. When `recommendation_basis="latest_completed_eod"`, daily/EOD agents should use completed daily bars and EOD reference prices; live quote/orderbook rows are not required and `stale_eod` reference pricing is not a live-data quality penalty. When `recommendation_basis="live_intraday"`, missing or stale live quote/orderbook rows remain execution-quality issues.
+
 When live quote or intraday data is not expected for the requested date, `quote_context`, `intraday_execution_context`, liquidity intraday rollups, and decider intraday quality blocks now use `status="not_applicable"` with `reason="closed_market"` and repeat the relevant market-session fields instead of presenting a misleading unavailable or missing status.
 
 The response also includes a compact `decider_data_quality_context` block per symbol/day. This is the decider-facing availability and provenance summary over factor-score coverage, liquidity/turnover, intraday freshness, financial/cash-flow detail, disclosures/news, investor flow and short-selling, sector/relative-strength context, and technical evidence. It keeps `available`, `partial`, `stale`, `empty`, `unavailable`, and `provider_error` semantics explicit so downstream deciders can distinguish no recent items from provider/storage failures, and it now adds `decision_priority` plus per-block `decision_guidance` so deciders can separate core execution blockers from auxiliary confidence-only gaps.
@@ -44,6 +46,13 @@ GET /agent-context/symbol-day?market_date=2026-04-15&symbols=005930&fs_div=CFS&d
         "latest_valid_trading_date": "2026-04-10",
         "status": "weekend"
       },
+      "market_data_phase_contract": {
+        "recommendation_basis": "latest_completed_eod",
+        "quote_data_expected": false,
+        "intraday_data_expected": false,
+        "realtime_quote_orderbook_required": false,
+        "eod_reference_price_accepted": true
+      },
       "quote_context": {
         "status": "not_applicable",
         "reason": "closed_market",
@@ -55,6 +64,11 @@ GET /agent-context/symbol-day?market_date=2026-04-15&symbols=005930&fs_div=CFS&d
         "market_session_status": "weekend"
       },
       "pre_decider_enrichment_context": {
+        "market_data_phase_contract": {
+          "recommendation_basis": "latest_completed_eod",
+          "realtime_quote_orderbook_required": false,
+          "eod_reference_price_accepted": true
+        },
         "quote_orderbook_snapshot": {
           "status": "stale_eod",
           "snapshot_type": "eod_stale",
