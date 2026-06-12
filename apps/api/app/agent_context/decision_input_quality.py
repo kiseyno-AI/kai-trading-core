@@ -229,18 +229,47 @@ def _quote_context(pre_decider_enrichment_context: dict[str, Any]) -> dict[str, 
     return _as_dict(pre_decider_enrichment_context.get('quote_orderbook_snapshot'))
 
 
+def _market_data_phase_contract(pre_decider_enrichment_context: dict[str, Any]) -> dict[str, Any]:
+    return _as_dict(pre_decider_enrichment_context.get('market_data_phase_contract'))
+
+
 def _trading_value_context(pre_decider_enrichment_context: dict[str, Any]) -> dict[str, Any]:
     return _as_dict(pre_decider_enrichment_context.get('trading_value'))
 
 
-def _is_quote_stale_or_fallback(quote: dict[str, Any]) -> tuple[bool, list[str]]:
+def _eod_reference_price_is_expected(
+    quote: dict[str, Any],
+    market_data_phase_contract: dict[str, Any],
+) -> bool:
+    recommendation_basis = str(
+        market_data_phase_contract.get('recommendation_basis')
+        or quote.get('recommendation_basis')
+        or ''
+    ).strip().lower()
+    if recommendation_basis != 'latest_completed_eod':
+        return False
+    if market_data_phase_contract.get('realtime_quote_orderbook_required') is True:
+        return False
+    if market_data_phase_contract.get('eod_reference_price_accepted') is False:
+        return False
+    snapshot_type = str(quote.get('snapshot_type') or '').strip().lower()
+    return snapshot_type in {'eod_stale', 'closed_market_no_eod_price'}
+
+
+def _is_quote_stale_or_fallback(
+    quote: dict[str, Any],
+    *,
+    market_data_phase_contract: dict[str, Any] | None = None,
+) -> tuple[bool, list[str]]:
+    phase_contract = _as_dict(market_data_phase_contract)
     status = str(quote.get('status') or '').strip().lower()
     snapshot_type = str(quote.get('snapshot_type') or '').strip().lower()
     quote_freshness_status = str(quote.get('quote_freshness_status') or '').strip().lower()
     reasons: list[str] = []
-    if status in {'stale', 'stale_eod'} or quote_freshness_status in {'stale', 'available_but_old'}:
+    eod_reference_expected = _eod_reference_price_is_expected(quote, phase_contract)
+    if (status in {'stale', 'stale_eod'} or quote_freshness_status in {'stale', 'available_but_old'}) and not eod_reference_expected:
         reasons.append('quote_orderbook_snapshot is stale.')
-    if 'fallback' in snapshot_type or snapshot_type in {'eod_stale'}:
+    if 'fallback' in snapshot_type or (snapshot_type in {'eod_stale'} and not eod_reference_expected):
         reasons.append(f'quote_orderbook_snapshot uses {snapshot_type} pricing context.')
     freshness = _as_dict(quote.get('freshness'))
     for nested in freshness.values():
@@ -291,6 +320,7 @@ def _execution_feasibility(
     planned_notional_krw: Decimal | None,
 ) -> dict[str, Any]:
     quote = _quote_context(pre_decider_enrichment_context)
+    phase_contract = _market_data_phase_contract(pre_decider_enrichment_context)
     trading_value = _trading_value_context(pre_decider_enrichment_context)
     liquidity_block = _as_dict(_as_dict(decider_data_quality_context.get('blocks')).get('liquidity_turnover'))
     liquidity_ranking = _as_dict(liquidity_block.get('liquidity_ranking'))
@@ -333,7 +363,10 @@ def _execution_feasibility(
         }.get(liquidity_tier)
 
     blocking_reasons: list[dict[str, Any]] = []
-    quote_degraded, quote_reasons = _is_quote_stale_or_fallback(quote)
+    quote_degraded, quote_reasons = _is_quote_stale_or_fallback(
+        quote,
+        market_data_phase_contract=phase_contract,
+    )
     if quote_degraded:
         blocking_reasons.append(
             {
@@ -414,6 +447,7 @@ def _execution_feasibility(
             'avg_trading_value_20d': avg_trading_value_20d,
             'quote_status': quote.get('status'),
             'quote_snapshot_type': quote.get('snapshot_type'),
+            'market_data_phase_contract': phase_contract or None,
             'allocation_budget_krw': str(allocation_budget_krw) if allocation_budget_krw is not None else None,
             'planned_notional_krw': str(planned_notional_krw) if planned_notional_krw is not None else None,
             'estimated_reference_price': str(estimated_reference_price) if estimated_reference_price is not None else None,

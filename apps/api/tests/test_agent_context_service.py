@@ -1494,11 +1494,16 @@ class AgentContextReadServiceTests(unittest.TestCase):
         )
 
         snapshot = context['quote_orderbook_snapshot']
+        phase_contract = context['market_data_phase_contract']
         self.assertEqual(snapshot['status'], 'stale_eod')
         self.assertEqual(snapshot['snapshot_type'], 'eod_stale')
         self.assertEqual(snapshot['current_price'], 71000)
         self.assertEqual(snapshot['quote_freshness_timestamp'], '2026-04-10T15:30:00+09:00')
         self.assertEqual(snapshot['freshness']['quote_context']['freshness_status'], 'not_applicable')
+        self.assertEqual(phase_contract['recommendation_basis'], 'latest_completed_eod')
+        self.assertFalse(phase_contract['realtime_quote_orderbook_required'])
+        self.assertTrue(phase_contract['eod_reference_price_accepted'])
+        self.assertTrue(phase_contract['agent_guidance']['daily_process_agents_use_completed_eod'])
 
     def test_get_symbol_day_context_marks_liquidity_context_storage_unavailable_when_price_context_store_fails(self):
         class EmptyFundamentalsRepository:

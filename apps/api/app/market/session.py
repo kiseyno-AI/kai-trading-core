@@ -531,8 +531,10 @@ def build_market_session_metadata(
         status = market_session_status_for_date(normalized_requested_date)
         reason = 'historical_requested_date' if status == MARKET_SESSION_CLOSED else status
 
-    intraday_data_expected = requested_is_trading_day and (
-        not requested_is_current_calendar_date or bool(getattr(current_state, 'is_open', False))
+    intraday_data_expected = (
+        requested_is_current_calendar_date
+        and requested_is_trading_day
+        and bool(getattr(current_state, 'is_open', False))
     )
     quote_data_expected = intraday_data_expected
     recommendation_basis = (
@@ -600,8 +602,10 @@ async def async_build_market_session_metadata(
         status = await async_market_session_status_for_date(normalized_requested_date)
         reason = 'historical_requested_date' if status == MARKET_SESSION_CLOSED else status
 
-    intraday_data_expected = requested_is_trading_day and (
-        not requested_is_current_calendar_date or bool(getattr(current_state, 'is_open', False))
+    intraday_data_expected = (
+        requested_is_current_calendar_date
+        and requested_is_trading_day
+        and bool(getattr(current_state, 'is_open', False))
     )
     quote_data_expected = intraday_data_expected
     recommendation_basis = (

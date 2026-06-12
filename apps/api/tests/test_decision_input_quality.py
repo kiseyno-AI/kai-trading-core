@@ -133,6 +133,43 @@ class DecisionInputQualityTests(unittest.TestCase):
         self.assertTrue(feasibility['sizing_hints'][0]['budget_exceeds_safe_notional'])
         self.assertEqual(feasibility['sizing_hints'][0]['max_safe_quantity'], 25)
 
+    def test_eod_phase_accepts_eod_reference_price_without_live_quote_penalty(self) -> None:
+        result = build_decision_input_quality_envelope(
+            symbol='005930',
+            market_date='2026-04-29',
+            decider_data_quality_context=_quality_context(intraday_status='not_applicable'),
+            pre_decider_enrichment_context={
+                'market_data_phase_contract': {
+                    'recommendation_basis': 'latest_completed_eod',
+                    'quote_data_expected': False,
+                    'intraday_data_expected': False,
+                    'realtime_quote_orderbook_required': False,
+                    'eod_reference_price_accepted': True,
+                    'not_applicable_realtime_is_expected': True,
+                },
+                'quote_orderbook_snapshot': {
+                    'status': 'stale_eod',
+                    'snapshot_type': 'eod_stale',
+                    'quote_freshness_status': 'stale',
+                    'recommendation_basis': 'latest_completed_eod',
+                },
+                'trading_value': {
+                    'status': 'available',
+                    'source': 'raw',
+                    'raw_trading_value_krw': 8_000_000_000,
+                    'trading_value_krw': 8_000_000_000,
+                },
+            },
+        )
+
+        penalty_codes = {penalty['code'] for penalty in result['final_judgment']['quality_penalties']}
+        self.assertNotIn('quote_stale_or_fallback', penalty_codes)
+        self.assertFalse(result['execution_feasibility']['blocking_reasons'])
+        self.assertEqual(
+            result['execution_feasibility']['inputs']['market_data_phase_contract']['recommendation_basis'],
+            'latest_completed_eod',
+        )
+
     def test_missing_news_is_neutral_secondary_context(self) -> None:
         result = build_decision_input_quality_envelope(
             symbol='005930',
