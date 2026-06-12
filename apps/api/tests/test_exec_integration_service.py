@@ -713,6 +713,14 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_short_term_entry_quality_blocks_scalp_when_signal_decider_waits(self) -> None:
         short_snapshot_id = self._seed_short_term_snapshot(
             tactical_action='scalp_buy_candidate',
+            input_feature_snapshot_payload={
+                'liquidity_context': {
+                    'turnover': {
+                        'trading_value_source': 'raw',
+                        'raw_trading_value_krw': 9_000_000_000,
+                    },
+                },
+            },
             response_payload_extra={
                 'thesis_summary': 'Immediate scalp setup with momentum expansion.',
             },
@@ -733,6 +741,78 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('signal_decider_wait_blocks_scalp_buy', blocking_codes)
         self.assertEqual(warnings, [])
         self.assertEqual(feature_snapshot['signal_decider_crosscheck']['action'], 'wait')
+
+    async def test_short_term_entry_quality_blocks_weak_relative_strength(self) -> None:
+        short_snapshot_id = self._seed_short_term_snapshot(
+            request_payload={
+                'symbol_day_context': {
+                    'market_relative_context': {
+                        'relative_strength': {
+                            'return_percentile': 0.42,
+                            'volume_percentile': 0.88,
+                        },
+                    },
+                    'liquidity_context': {
+                        'turnover': {
+                            'trading_value_source': 'raw',
+                            'raw_trading_value_krw': 12_000_000_000,
+                        },
+                    },
+                },
+            },
+            response_payload_extra={
+                'trigger_conditions': ['눌림 후 VWAP 재돌파 확인.'],
+            },
+        )
+        with session_scope() as session:
+            snapshot = session.get(SignalDeciderDecisionSnapshot, short_snapshot_id)
+            blocks, warnings, feature_snapshot = _short_term_entry_quality_blocks(
+                snapshot=snapshot,
+                signal_decider_crosscheck={'action': 'buy'},
+                tactical_action='watch_for_trigger',
+            )
+
+        self.assertIn('short_term_weak_relative_strength_block', {entry['code'] for entry in blocks})
+        self.assertEqual(warnings, [])
+        self.assertEqual(Decimal(str(feature_snapshot['return_percentile'])), Decimal('0.42'))
+
+    async def test_short_term_entry_quality_blocks_poor_reward_risk(self) -> None:
+        short_snapshot_id = self._seed_short_term_snapshot(
+            trigger_price=50500,
+            chase_limit_price=50800,
+            target_price=52000,
+            stop_loss_price=49200,
+            request_payload={
+                'symbol_day_context': {
+                    'market_relative_context': {
+                        'relative_strength': {
+                            'return_percentile': 0.82,
+                            'volume_percentile': 0.76,
+                        },
+                    },
+                    'liquidity_context': {
+                        'turnover': {
+                            'trading_value_source': 'raw',
+                            'raw_trading_value_krw': 15_000_000_000,
+                        },
+                    },
+                },
+            },
+            response_payload_extra={
+                'trigger_conditions': ['거래량 동반 재돌파 확인.'],
+            },
+        )
+        with session_scope() as session:
+            snapshot = session.get(SignalDeciderDecisionSnapshot, short_snapshot_id)
+            blocks, warnings, feature_snapshot = _short_term_entry_quality_blocks(
+                snapshot=snapshot,
+                signal_decider_crosscheck={'action': 'buy'},
+                tactical_action='watch_for_trigger',
+            )
+
+        self.assertIn('short_term_reward_risk_ratio_block', {entry['code'] for entry in blocks})
+        self.assertEqual(warnings, [])
+        self.assertLess(Decimal(str(feature_snapshot['reward_risk_ratio'])), Decimal('1.80'))
 
     async def test_dispatch_next_open_plan_fails_closed_on_calendar_fallback(self) -> None:
         set_krx_calendar_provider(
