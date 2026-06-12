@@ -87,6 +87,7 @@ SHORT_TERM_MIN_RAW_TRADING_VALUE_KRW = Decimal('3000000000')
 SHORT_TERM_MIN_REWARD_RISK_RATIO = Decimal('1.80')
 SHORT_TERM_MIN_BUY_QUALITY_SCORE = Decimal('60')
 SHORT_TERM_HARD_MIN_BUY_QUALITY_SCORE = Decimal('50')
+SHORT_TERM_RELAXED_DECISION_INPUT_HARD_BLOCK_CODES = frozenset({'source_turnover_missing'})
 SHORT_TERM_CONTINUATION_SETUP_MARKERS = (
     '눌림',
     '재상승',
@@ -718,6 +719,22 @@ def _calendar_requires_operator_override(market_state: MarketState) -> bool:
 
 def _reason(code: str, message: str) -> dict[str, str]:
     return {'code': code, 'message': message}
+
+
+def _should_relax_short_term_decision_input_hard_block(
+    *,
+    decision_agent_name: str,
+    handoff_intent: str | None,
+    hard_block: dict[str, Any],
+    warnings: Sequence[dict[str, str]],
+) -> bool:
+    if decision_agent_name != SHORT_TERM_DECIDER_AGENT_NAME or handoff_intent is None:
+        return False
+    code = str(hard_block.get('code') or '').strip()
+    if code not in SHORT_TERM_RELAXED_DECISION_INPUT_HARD_BLOCK_CODES:
+        return False
+    warning_codes = {str(warning.get('code') or '').strip() for warning in warnings if isinstance(warning, dict)}
+    return 'short_term_liquidity_unverified_warning' in warning_codes
 
 
 def _exec_agent_sizing_dispatch_enabled() -> bool:
@@ -2019,6 +2036,13 @@ class SignalDeciderNextOpenExecutionService:
                 continue
             code = f"decision_input_quality_{hard_block.get('code') or 'hard_block'}"
             if code in existing_block_codes:
+                continue
+            if _should_relax_short_term_decision_input_hard_block(
+                decision_agent_name=decision_agent_name,
+                handoff_intent=handoff_intent,
+                hard_block=hard_block,
+                warnings=warnings,
+            ):
                 continue
             raw_reasons = hard_block.get('reasons') if isinstance(hard_block.get('reasons'), list) else []
             reason_text = '; '.join(str(reason) for reason in raw_reasons if str(reason).strip())

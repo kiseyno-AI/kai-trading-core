@@ -344,11 +344,27 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         stop_loss_price: int | None = 49000,
         data_warnings: list[str] | None = None,
         pre_decider_enrichment_context: dict[str, object] | None = None,
+        decider_data_quality_context: dict[str, object] | None = None,
+        include_decider_data_quality_context: bool = True,
         confidence_score_10: float = 7.1,
     ) -> int:
         generic_action = 'buy' if tactical_action in {'scalp_buy_candidate', 'watch_for_trigger'} else tactical_action
         if generic_action not in {'buy', 'wait', 'reject'}:
             generic_action = 'wait'
+        request_payload = {
+            'orchestration': {'required_upstream_roles': ['technical-summarizer']},
+            'pre_decider_enrichment_context': (
+                self._pre_decider_context()
+                if pre_decider_enrichment_context is None
+                else pre_decider_enrichment_context
+            ),
+        }
+        if include_decider_data_quality_context:
+            request_payload['decider_data_quality_context'] = (
+                self._quality_context()
+                if decider_data_quality_context is None
+                else decider_data_quality_context
+            )
         with session_scope() as session:
             row = SignalDeciderDecisionSnapshot(
                 feedback_id=None,
@@ -389,11 +405,7 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
                     },
                 },
                 input_feature_snapshot_payload={'meta': {'source_agent_name': 'short-term-decider'}},
-                request_payload={
-                    'orchestration': {'required_upstream_roles': ['technical-summarizer']},
-                    'decider_data_quality_context': self._quality_context(),
-                    'pre_decider_enrichment_context': pre_decider_enrichment_context or self._pre_decider_context(),
-                },
+                request_payload=request_payload,
                 response_payload={
                     'role': 'short-term-decider',
                     'agent_name': 'short-term-decider',
@@ -933,6 +945,59 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(item['validation']['blocking_reasons'], [])
         warning_codes = {warning['code'] for warning in item['validation']['warnings']}
         self.assertIn('data_quality_warnings_present', warning_codes)
+
+    def test_refresh_plan_items_keeps_short_term_missing_liquidity_as_warning(self) -> None:
+        self._seed_short_term_snapshot(
+            symbol='005930',
+            include_decider_data_quality_context=False,
+            pre_decider_enrichment_context={'schema_version': 'pre_decider_enrichment_v1'},
+        )
+        service = self._service(state='PREOPEN', server_time='2026-04-30T08:40:00+09:00')
+
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[{'trade_date': '2026-04-29', 'close_price': 50000}],
+        ):
+            result = service.refresh_plan_items(target_trade_date=self.target_trade_date, trigger='test')
+
+        item = result['items'][0]
+        self.assertEqual(item['decision_agent_name'], 'short-term-decider')
+        self.assertEqual(item['eligibility_status'], ELIGIBILITY_ELIGIBLE)
+        self.assertEqual(item['validation']['blocking_reasons'], [])
+        warning_codes = {warning['code'] for warning in item['validation']['warnings']}
+        self.assertIn('short_term_liquidity_unverified_warning', warning_codes)
+        quality_context = item['validation']['decision_input_quality_context']
+        quality_hard_codes = {block['code'] for block in quality_context['final_judgment']['hard_blocks']}
+        self.assertIn('source_turnover_missing', quality_hard_codes)
+        block_codes = {reason['code'] for reason in item['validation']['blocking_reasons']}
+        self.assertNotIn('decision_input_quality_source_turnover_missing', block_codes)
+        self.assertEqual(item['validation']['handoff']['approval_state'], 'pending_exec_agent')
+
+    def test_refresh_plan_items_still_blocks_short_term_explicit_quality_hard_blocks(self) -> None:
+        self._seed_short_term_snapshot(
+            symbol='005930',
+            decider_data_quality_context=self._quality_context(
+                trading_value_source='missing',
+                trading_value_krw=None,
+            ),
+            pre_decider_enrichment_context={'schema_version': 'pre_decider_enrichment_v1'},
+        )
+        service = self._service(state='PREOPEN', server_time='2026-04-30T08:40:00+09:00')
+
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[{'trade_date': '2026-04-29', 'close_price': 50000}],
+        ):
+            result = service.refresh_plan_items(target_trade_date=self.target_trade_date, trigger='test')
+
+        item = result['items'][0]
+        self.assertEqual(item['decision_agent_name'], 'short-term-decider')
+        self.assertEqual(item['eligibility_status'], ELIGIBILITY_BLOCKED)
+        warning_codes = {warning['code'] for warning in item['validation']['warnings']}
+        self.assertIn('short_term_liquidity_unverified_warning', warning_codes)
+        block_codes = {reason['code'] for reason in item['validation']['blocking_reasons']}
+        self.assertIn('decision_input_quality_liquidity_turnover_hard_block', block_codes)
+        self.assertNotIn('decision_input_quality_source_turnover_missing', block_codes)
 
     def test_refresh_plan_items_short_term_rows_created_without_account_targets(self) -> None:
         self._seed_snapshot(symbol='005930')
