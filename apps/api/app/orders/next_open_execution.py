@@ -81,10 +81,13 @@ SHORT_TERM_CONFIRMATION_REQUIRED_MARKERS = (
     'pullback',
 )
 SHORT_TERM_MIN_RETURN_PERCENTILE = Decimal('0.60')
+SHORT_TERM_HARD_MIN_RETURN_PERCENTILE = Decimal('0.50')
 SHORT_TERM_MIN_VOLUME_PERCENTILE = Decimal('0.45')
 SHORT_TERM_MIN_RAW_TRADING_VALUE_KRW = Decimal('3000000000')
 SHORT_TERM_MIN_REWARD_RISK_RATIO = Decimal('1.80')
 SHORT_TERM_MIN_BUY_QUALITY_SCORE = Decimal('60')
+SHORT_TERM_HARD_MIN_BUY_QUALITY_SCORE = Decimal('50')
+SHORT_TERM_RELAXED_DECISION_INPUT_HARD_BLOCK_CODES = frozenset({'source_turnover_missing'})
 SHORT_TERM_CONTINUATION_SETUP_MARKERS = (
     '눌림',
     '재상승',
@@ -564,39 +567,53 @@ def _short_term_entry_quality_blocks(
                 '5-day return is already extended while ATR is high; avoid chasing the spike.',
             )
         )
-    if buy_quality_score is not None and buy_quality_score < SHORT_TERM_MIN_BUY_QUALITY_SCORE:
+    if buy_quality_score is not None and buy_quality_score < SHORT_TERM_HARD_MIN_BUY_QUALITY_SCORE:
         blocks.append(
             _reason(
                 'short_term_buy_quality_score_block',
-                'Decision input buy-quality score is below the minimum threshold for short-term buys.',
+                'Decision input buy-quality score is too weak for short-term buy handoff.',
+            )
+        )
+    elif buy_quality_score is not None and buy_quality_score < SHORT_TERM_MIN_BUY_QUALITY_SCORE:
+        warnings.append(
+            _reason(
+                'short_term_buy_quality_score_warning',
+                'Decision input buy-quality score is below the preferred threshold; exec should size conservatively.',
             )
         )
     if return_percentile is None:
+        warnings.append(
+            _reason(
+                'short_term_relative_strength_unverified_warning',
+                'Market-relative return evidence is missing; exec should require stricter trigger-time confirmation.',
+            )
+        )
+    elif return_percentile < SHORT_TERM_HARD_MIN_RETURN_PERCENTILE:
         blocks.append(
             _reason(
-                'short_term_relative_strength_unverified',
-                'Short-term buys require objective market-relative return evidence.',
+                'short_term_very_weak_relative_strength_block',
+                'Short-term buy candidate has very weak market-relative return evidence.',
             )
         )
     elif return_percentile < SHORT_TERM_MIN_RETURN_PERCENTILE:
-        blocks.append(
+        warnings.append(
             _reason(
-                'short_term_weak_relative_strength_block',
-                'Short-term buys require market-relative leadership; return percentile is below the required threshold.',
+                'short_term_weak_relative_strength_warning',
+                'Market-relative return percentile is below the preferred leadership threshold; exec should size conservatively.',
             )
         )
     if volume_percentile is None:
-        blocks.append(
+        warnings.append(
             _reason(
-                'short_term_relative_volume_unverified',
-                'Short-term buys require objective market-relative participation evidence.',
+                'short_term_relative_volume_unverified_warning',
+                'Market-relative participation evidence is missing; exec should require stricter trigger-time confirmation.',
             )
         )
     elif volume_percentile < SHORT_TERM_MIN_VOLUME_PERCENTILE:
-        blocks.append(
+        warnings.append(
             _reason(
-                'short_term_weak_relative_volume_block',
-                'Short-term buys require participation; volume percentile is below the required threshold.',
+                'short_term_weak_relative_volume_warning',
+                'Market-relative volume percentile is below the preferred participation threshold; exec should size conservatively.',
             )
         )
     if raw_trading_value_krw is not None and raw_trading_value_krw < SHORT_TERM_MIN_RAW_TRADING_VALUE_KRW:
@@ -607,10 +624,10 @@ def _short_term_entry_quality_blocks(
             )
         )
     elif raw_trading_value_krw is None:
-        blocks.append(
+        warnings.append(
             _reason(
-                'short_term_liquidity_unverified',
-                'Short-term buys require objective trading-value evidence before exec handoff.',
+                'short_term_liquidity_unverified_warning',
+                'Objective trading-value evidence is missing; exec should size conservatively and require live liquidity confirmation.',
             )
         )
     if reward_risk_ratio is not None and reward_risk_ratio < SHORT_TERM_MIN_REWARD_RISK_RATIO:
@@ -702,6 +719,22 @@ def _calendar_requires_operator_override(market_state: MarketState) -> bool:
 
 def _reason(code: str, message: str) -> dict[str, str]:
     return {'code': code, 'message': message}
+
+
+def _should_relax_short_term_decision_input_hard_block(
+    *,
+    decision_agent_name: str,
+    handoff_intent: str | None,
+    hard_block: dict[str, Any],
+    warnings: Sequence[dict[str, str]],
+) -> bool:
+    if decision_agent_name != SHORT_TERM_DECIDER_AGENT_NAME or handoff_intent is None:
+        return False
+    code = str(hard_block.get('code') or '').strip()
+    if code not in SHORT_TERM_RELAXED_DECISION_INPUT_HARD_BLOCK_CODES:
+        return False
+    warning_codes = {str(warning.get('code') or '').strip() for warning in warnings if isinstance(warning, dict)}
+    return 'short_term_liquidity_unverified_warning' in warning_codes
 
 
 def _exec_agent_sizing_dispatch_enabled() -> bool:
@@ -2003,6 +2036,13 @@ class SignalDeciderNextOpenExecutionService:
                 continue
             code = f"decision_input_quality_{hard_block.get('code') or 'hard_block'}"
             if code in existing_block_codes:
+                continue
+            if _should_relax_short_term_decision_input_hard_block(
+                decision_agent_name=decision_agent_name,
+                handoff_intent=handoff_intent,
+                hard_block=hard_block,
+                warnings=warnings,
+            ):
                 continue
             raw_reasons = hard_block.get('reasons') if isinstance(hard_block.get('reasons'), list) else []
             reason_text = '; '.join(str(reason) for reason in raw_reasons if str(reason).strip())
