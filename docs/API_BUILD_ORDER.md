@@ -44,6 +44,7 @@
 41. Core-owned exec runtime dashboard read APIs
 42. Core-owned realtime monitored price fan-out read/stream APIs
 43. Read-only Upbit crypto market-data routes for paper/research strategy inputs
+44. BTC/ETH Upbit crypto strategy context read route for paper/research decision support
 
 ## Current routes
 - `POST /broker/kis/token`
@@ -89,6 +90,7 @@
 - `GET /market-data/crypto/tickers?markets=KRW-BTC,KRW-ETH`
 - `GET /market-data/crypto/candles?market=KRW-BTC&interval=day&count=30`
 - `GET /market-data/crypto/candles?market=KRW-BTC&interval=minute&unit=15&count=30`
+- `GET /market-data/crypto/strategy-context?markets=KRW-BTC,KRW-ETH&count=30`
 - `GET /scanner/tracked-symbols`
 - `GET /scanner/realtime-trending?limit=20&market_code=J&sources=volume-rank,fluctuation,hts-top-view`
 - `POST /scanner/tracked-symbols`
@@ -220,6 +222,7 @@
 ## Crypto market-data notes
 - `GET /market-data/crypto/markets`, `GET /market-data/crypto/tickers`, and `GET /market-data/crypto/candles` expose read-only Upbit public quotation data for the explicit crypto whitelist (`KRW-BTC`, `KRW-ETH` by default).
 - Crypto payloads carry `provider="upbit"`, `venue="UPBIT"`, `asset_class="crypto"`, `instrument_type="spot_crypto_pair"`, quote/base currency fields, `usage_scope="paper_research_only"`, and `trading_enabled_in_core=false` so consumers can distinguish them from KRX/KIS equity flows.
+- `GET /market-data/crypto/strategy-context` derives deterministic BTC/ETH paper-research context from public Upbit ticker and daily-candle data only. The read model labels `decision_support_only=true`, `private_api_used=false`, and `account_data_used=false`; missing or incomplete candles/tickers produce explicit `partial` or `unavailable` states instead of fabricated trend, momentum, volatility, liquidity, drawdown, or level fields.
 - Core does not add Upbit account, balance, order, cancel, amend, deposit, or withdrawal calls. Crypto data is strategy/research input only; live crypto execution remains outside `kai-trading-core`.
 
 ## Trading order adapter notes
