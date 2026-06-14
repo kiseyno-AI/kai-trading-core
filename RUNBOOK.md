@@ -28,6 +28,7 @@ What it does:
 - `GET /market-data/crypto/tickers?markets=KRW-BTC,KRW-ETH`
 - `GET /market-data/crypto/candles?market=KRW-BTC&interval=day&count=30`
 - `GET /market-data/crypto/candles?market=KRW-BTC&interval=minute&unit=15&count=30`
+- `GET /market-data/crypto/strategy-context?markets=KRW-BTC,KRW-ETH&count=30`
 - `POST /broker/kis/intraday-snapshots/collect?symbols=005930`
 - `GET /broker/kis/intraday-snapshots?symbols=005930&limit=5`
 - `GET /portfolio/summary`

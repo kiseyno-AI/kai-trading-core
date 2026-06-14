@@ -36,14 +36,43 @@ class FakeCryptoMarketDataService:
             'items': [{'market': market, 'close': 145831000}],
         }
 
+    async def get_strategy_context(self, *, markets=None, count=30):
+        return {
+            'provider': 'upbit',
+            'asset_class': 'crypto',
+            'venue': 'UPBIT',
+            'status': 'available',
+            'requested_markets': ['KRW-BTC'] if markets else ['KRW-BTC', 'KRW-ETH'],
+            'requested_count': count,
+            'trading_enabled_in_core': False,
+            'decision_support_only': True,
+            'items': [
+                {
+                    'symbol': 'KRW-BTC',
+                    'asset_class': 'crypto',
+                    'venue': 'UPBIT',
+                    'quote_currency': 'KRW',
+                    'trend_state': 'uptrend',
+                    'momentum_score': 32.5,
+                    'status': 'available',
+                }
+            ],
+        }
+
 
 class InvalidCryptoMarketDataService(FakeCryptoMarketDataService):
     async def get_tickers(self, *, markets=None):
         raise CryptoMarketDataValidationError('Unsupported crypto market(s): KRW-XRP. Allowed: KRW-BTC, KRW-ETH')
 
+    async def get_strategy_context(self, *, markets=None, count=30):
+        raise CryptoMarketDataValidationError('Unsupported crypto market(s): KRW-XRP. Allowed: KRW-BTC, KRW-ETH')
+
 
 class UpstreamErrorCryptoMarketDataService(FakeCryptoMarketDataService):
     async def list_markets(self):
+        raise UpbitQuotationAPIError('Upbit quotation request failed [500]: upstream down')
+
+    async def get_strategy_context(self, *, markets=None, count=30):
         raise UpbitQuotationAPIError('Upbit quotation request failed [500]: upstream down')
 
 
@@ -52,10 +81,13 @@ class CryptoMarketDataRouteTests(unittest.TestCase):
         self.app = FastAPI()
         self.app.include_router(routes_crypto.router)
         self.original_service = routes_crypto.crypto_market_data_service
+        self.original_strategy_service = routes_crypto.crypto_strategy_context_service
         routes_crypto.crypto_market_data_service = FakeCryptoMarketDataService()
+        routes_crypto.crypto_strategy_context_service = FakeCryptoMarketDataService()
 
     def tearDown(self) -> None:
         routes_crypto.crypto_market_data_service = self.original_service
+        routes_crypto.crypto_strategy_context_service = self.original_strategy_service
 
     def test_markets_route_returns_read_only_crypto_payload(self) -> None:
         client = TestClient(self.app)
@@ -87,8 +119,23 @@ class CryptoMarketDataRouteTests(unittest.TestCase):
         self.assertEqual(payload['unit'], 15)
         self.assertFalse(payload['trading_enabled_in_core'])
 
+    def test_strategy_context_route_returns_read_only_decision_support_payload(self) -> None:
+        client = TestClient(self.app)
+        response = client.get('/market-data/crypto/strategy-context?markets=KRW-BTC&count=30')
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload['provider'], 'upbit')
+        self.assertEqual(payload['asset_class'], 'crypto')
+        self.assertEqual(payload['venue'], 'UPBIT')
+        self.assertEqual(payload['requested_markets'], ['KRW-BTC'])
+        self.assertFalse(payload['trading_enabled_in_core'])
+        self.assertTrue(payload['decision_support_only'])
+        self.assertEqual(payload['items'][0]['trend_state'], 'uptrend')
+
     def test_validation_errors_map_to_400(self) -> None:
         routes_crypto.crypto_market_data_service = InvalidCryptoMarketDataService()
+        routes_crypto.crypto_strategy_context_service = InvalidCryptoMarketDataService()
 
         client = TestClient(self.app)
         response = client.get('/market-data/crypto/tickers?markets=KRW-XRP')
@@ -96,14 +143,23 @@ class CryptoMarketDataRouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn('Unsupported crypto market', response.json()['detail'])
 
+        strategy_response = client.get('/market-data/crypto/strategy-context?markets=KRW-XRP')
+        self.assertEqual(strategy_response.status_code, 400)
+        self.assertIn('Unsupported crypto market', strategy_response.json()['detail'])
+
     def test_upbit_errors_map_to_502(self) -> None:
         routes_crypto.crypto_market_data_service = UpstreamErrorCryptoMarketDataService()
+        routes_crypto.crypto_strategy_context_service = UpstreamErrorCryptoMarketDataService()
 
         client = TestClient(self.app)
         response = client.get('/market-data/crypto/markets')
 
         self.assertEqual(response.status_code, 502)
         self.assertIn('Upbit market data request failed', response.json()['detail'])
+
+        strategy_response = client.get('/market-data/crypto/strategy-context?markets=KRW-BTC')
+        self.assertEqual(strategy_response.status_code, 502)
+        self.assertIn('Upbit market data request failed', strategy_response.json()['detail'])
 
 
 if __name__ == '__main__':

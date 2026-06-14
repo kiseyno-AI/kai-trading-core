@@ -5,6 +5,7 @@ from typing import Literal
 from fastapi import APIRouter, HTTPException, Query
 
 from app.crypto.market_data import CryptoMarketDataValidationError, crypto_market_data_service
+from app.crypto.strategy_context import crypto_strategy_context_service
 from app.integrations.upbit.client import UpbitQuotationAPIError
 
 router = APIRouter(prefix='/market-data/crypto', tags=['market-data:crypto'])
@@ -56,3 +57,21 @@ async def get_crypto_candles(
         raise HTTPException(status_code=502, detail=f'Upbit market data request failed: {exc}') from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f'Crypto candle read failed: {exc}') from exc
+
+
+@router.get('/strategy-context')
+async def get_crypto_strategy_context(
+    markets: str | None = Query(default=None, description='Comma-separated whitelisted Upbit market codes. Defaults to the crypto whitelist.'),
+    count: int = Query(default=30, ge=5, le=60, description='Number of daily candles to use for deterministic strategy context.'),
+) -> dict:
+    try:
+        return await crypto_strategy_context_service.get_strategy_context(
+            markets=markets,
+            count=count,
+        )
+    except CryptoMarketDataValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except UpbitQuotationAPIError as exc:
+        raise HTTPException(status_code=502, detail=f'Upbit market data request failed: {exc}') from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'Crypto strategy context read failed: {exc}') from exc
