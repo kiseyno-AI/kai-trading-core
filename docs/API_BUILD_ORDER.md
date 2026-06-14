@@ -43,6 +43,7 @@
 40. Signal-decider replay review calendar routes
 41. Core-owned exec runtime dashboard read APIs
 42. Core-owned realtime monitored price fan-out read/stream APIs
+43. Read-only Upbit crypto market-data routes for paper/research strategy inputs
 
 ## Current routes
 - `POST /broker/kis/token`
@@ -84,6 +85,10 @@
 - `GET /quotes/realtime/monitored?refresh_symbols=false`
 - `GET /quotes/realtime/monitored/stream`
 - `GET /quotes/005930`
+- `GET /market-data/crypto/markets`
+- `GET /market-data/crypto/tickers?markets=KRW-BTC,KRW-ETH`
+- `GET /market-data/crypto/candles?market=KRW-BTC&interval=day&count=30`
+- `GET /market-data/crypto/candles?market=KRW-BTC&interval=minute&unit=15&count=30`
 - `GET /scanner/tracked-symbols`
 - `GET /scanner/realtime-trending?limit=20&market_code=J&sources=volume-rank,fluctuation,hts-top-view`
 - `POST /scanner/tracked-symbols`
@@ -211,6 +216,11 @@
 - Core now persists the latest usable Korea Exim FX row in `current_fx_rate_snapshots`, keyed by `provider + currency_pair`, so USD/KRW fallback survives process restarts independently of the broader market snapshot cache payload.
 - `usd_krw` now exposes `status`, `source`, `stale_reason`, `detail`, and `captured_at`. Korea Exim `result=4` reuses the latest durable USD/KRW snapshot when available (`status=stale`, `source=cache`) and otherwise returns a partial snapshot with `usd_krw.status=missing`.
 - Korea Exim quota exhaustion is now sticky for the same search date within the persisted refresh state: once a refresh records `result=4`, later due refreshes reuse cached or missing USD/KRW state for that date instead of retrying Korea Exim immediately.
+
+## Crypto market-data notes
+- `GET /market-data/crypto/markets`, `GET /market-data/crypto/tickers`, and `GET /market-data/crypto/candles` expose read-only Upbit public quotation data for the explicit crypto whitelist (`KRW-BTC`, `KRW-ETH` by default).
+- Crypto payloads carry `provider="upbit"`, `venue="UPBIT"`, `asset_class="crypto"`, `instrument_type="spot_crypto_pair"`, quote/base currency fields, `usage_scope="paper_research_only"`, and `trading_enabled_in_core=false` so consumers can distinguish them from KRX/KIS equity flows.
+- Core does not add Upbit account, balance, order, cancel, amend, deposit, or withdrawal calls. Crypto data is strategy/research input only; live crypto execution remains outside `kai-trading-core`.
 
 ## Trading order adapter notes
 - `POST /trading/orders/buy` and `POST /trading/orders/sell` are the internal order-control submit routes for the first KIS domestic cash adapter.

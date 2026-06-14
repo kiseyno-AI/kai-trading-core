@@ -103,6 +103,10 @@ class Settings(BaseSettings):
     koreaexim_base_url: str = 'https://oapi.koreaexim.go.kr/site/program/financial/exchangeJSON'
     koreaexim_fallback_days: int = 2
 
+    upbit_base_url: str = 'https://api.upbit.com'
+    upbit_request_timeout_seconds: float = 10.0
+    upbit_market_whitelist: str = 'KRW-BTC,KRW-ETH'
+
     naver_search_client_id: str = ''
     naver_search_client_secret: str = ''
     naver_search_base_url: str = 'https://openapi.naver.com/v1/search/news.json'
