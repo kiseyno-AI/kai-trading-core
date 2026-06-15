@@ -279,6 +279,19 @@ class DailyMarketRiskSnapshotService:
             message = str(exc)
             return '초당 거래건수' in message or 'rate limit' in message.lower()
 
+        def _is_timeout_error(exc: Exception) -> bool:
+            exc_type = type(exc).__name__.lower()
+            message = str(exc).lower()
+            return (
+                isinstance(exc, TimeoutError)
+                or 'timeout' in exc_type
+                or 'timed out' in message
+                or 'timeout' in message
+            )
+
+        def _is_retryable_fetch_error(exc: Exception) -> bool:
+            return _is_rate_limit_error(exc) or _is_timeout_error(exc)
+
         async def _fetch_symbol(item: MarketRiskSymbolInput) -> dict[str, Any]:
             nonlocal processed_count, succeeded_count, failed_count
             async with semaphore:
@@ -320,7 +333,7 @@ class DailyMarketRiskSnapshotService:
                         return payload
                     except Exception as exc:
                         last_error = exc
-                        if not _is_rate_limit_error(exc) or attempt_index >= len(RATE_LIMIT_RETRY_DELAYS_SECONDS):
+                        if not _is_retryable_fetch_error(exc) or attempt_index >= len(RATE_LIMIT_RETRY_DELAYS_SECONDS):
                             break
                         await asyncio.sleep(RATE_LIMIT_RETRY_DELAYS_SECONDS[attempt_index])
                 payload = {
