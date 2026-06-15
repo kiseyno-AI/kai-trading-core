@@ -165,6 +165,72 @@ class DailyMarketRiskSnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(upsert.call_count, 1)
         self.assertTrue(any(call.args[0] == 1.0 for call in sleep.call_args_list))
 
+    async def test_collect_for_market_date_retries_kis_timeout_errors(self) -> None:
+        client = FakeKISRiskClient(
+            responses={
+                '272110': {
+                    'output': {
+                        'mrkt_warn_cls_code': '00',
+                        'mang_issu_yn': 'N',
+                        'invt_caful_yn': 'N',
+                        'short_over_yn': 'N',
+                        'ssts_hot_yn': 'N',
+                        'vi_cls_code': '00',
+                        'insn_pbnt_yn': 'N',
+                        'trht_yn': 'N',
+                    }
+                }
+            },
+            errors={
+                '272110': [
+                    RuntimeError('KIS request timed out for /uapi/domestic-stock/v1/quotations/inquire-price-2'),
+                    None,
+                ]
+            },
+        )
+        service = DailyMarketRiskSnapshotService(client=client)
+        inputs = [MarketRiskSymbolInput(symbol='272110', name_ko='케이엔제이', market='KOSDAQ')]
+
+        with (
+            patch.object(service, '_load_symbol_rows', return_value=(inputs, ['272110'], [])),
+            patch('app.signals.market_risk_snapshot.asyncio.sleep', return_value=None) as sleep,
+            patch('app.signals.market_risk_snapshot.upsert_daily_market_risk_snapshot') as upsert,
+        ):
+            result = await service.collect_for_market_date(market_date='2026-06-15')
+
+        self.assertEqual(client.calls, ['272110', '272110'])
+        self.assertEqual(result['snapshots_persisted'], 1)
+        self.assertEqual(result['snapshots_failed'], 0)
+        self.assertEqual(upsert.call_count, 1)
+        self.assertTrue(any(call.args[0] == 1.0 for call in sleep.call_args_list))
+
+    async def test_collect_for_market_date_reports_timeout_after_retry_exhaustion(self) -> None:
+        timeout_error = RuntimeError(
+            'KIS request timed out for /uapi/domestic-stock/v1/quotations/inquire-price-2'
+        )
+        client = FakeKISRiskClient(
+            responses={},
+            errors={'272110': [timeout_error, timeout_error, timeout_error, timeout_error]},
+        )
+        service = DailyMarketRiskSnapshotService(client=client)
+        inputs = [MarketRiskSymbolInput(symbol='272110', name_ko='케이엔제이', market='KOSDAQ')]
+
+        with (
+            patch.object(service, '_load_symbol_rows', return_value=(inputs, ['272110'], [])),
+            patch('app.signals.market_risk_snapshot.asyncio.sleep', return_value=None) as sleep,
+            patch('app.signals.market_risk_snapshot.upsert_daily_market_risk_snapshot') as upsert,
+        ):
+            result = await service.collect_for_market_date(market_date='2026-06-15')
+
+        self.assertEqual(client.calls, ['272110', '272110', '272110', '272110'])
+        self.assertEqual(result['snapshots_persisted'], 0)
+        self.assertEqual(result['snapshots_failed'], 1)
+        self.assertEqual(result['failed_symbols'], ['272110'])
+        self.assertIn('KIS request timed out', result['failed_symbol_errors'][0]['error'])
+        self.assertEqual(upsert.call_count, 0)
+        retry_delays = [call.args[0] for call in sleep.call_args_list if call.args[0] >= 1.0]
+        self.assertEqual(retry_delays, [1.0, 2.0, 4.0])
+
     def test_inspect_resolves_latest_on_or_before_requested_market_date(self) -> None:
         service = DailyMarketRiskSnapshotService()
         stored_items = [
