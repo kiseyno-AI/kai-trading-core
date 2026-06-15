@@ -414,6 +414,98 @@ class FeedbackRetryCycleTests(unittest.TestCase):
         self.assertEqual(result['eligible_symbols'], ['005930'])
         self.assertEqual(result['skipped_symbols'], [])
 
+    def test_run_retry_cycles_dispatches_role_symbols_in_outer_batches(self):
+        service = AgentFeedbackRetryService()
+        run_state_service = RecordingRunStateService()
+        roles = ('eod-summarizer',)
+        symbols = ('000020', '000040', '000050', '000070', '000080')
+        snapshots = SnapshotSequence(
+            [
+                _snapshot(
+                    symbols=symbols,
+                    role_states={
+                        'eod-summarizer': _role_state(
+                            role='eod-summarizer',
+                            symbols=symbols,
+                            boundary_pending=symbols,
+                            retry_pending=symbols,
+                        )
+                    },
+                ),
+                _snapshot(
+                    symbols=symbols,
+                    role_states={
+                        'eod-summarizer': _role_state(
+                            role='eod-summarizer',
+                            symbols=symbols,
+                            boundary_pending=symbols,
+                            retry_pending=symbols,
+                        )
+                    },
+                ),
+                _snapshot(
+                    symbols=symbols,
+                    role_states={
+                        'eod-summarizer': _role_state(
+                            role='eod-summarizer',
+                            symbols=symbols,
+                            completed=symbols,
+                        )
+                    },
+                ),
+            ]
+        )
+        dispatch_calls = []
+
+        def dispatch_for_symbols(**kwargs):
+            dispatch_calls.append(kwargs)
+            return {
+                'request': {'roles': kwargs['roles'], 'symbols': kwargs['symbols']},
+                'summary': {'status': 'completed', 'completed': len(kwargs['symbols']), 'failed': 0},
+            }
+
+        progress = {'request': {'expected_agents': list(roles)}, 'summary': {'cycle_status': 'completed'}}
+
+        with patch.object(service, '_load_eligible_symbols', return_value=list(symbols)):
+            with patch.object(service, '_build_role_sequence_snapshot', side_effect=snapshots):
+                with patch('app.agent_context.retry_service.agent_context_feedback_run_state_service', run_state_service):
+                    with patch(
+                        'app.agent_context.retry_service.agent_feedback_orchestrator.dispatch_for_symbols',
+                        side_effect=dispatch_for_symbols,
+                    ):
+                        with patch(
+                            'app.agent_context.retry_service.agent_context_progress_service.get_feedback_progress',
+                            return_value=progress,
+                        ):
+                            result = service.run_retry_cycles(
+                                config=SimpleNamespace(
+                                    market_date=date.fromisoformat('2026-04-16'),
+                                    roles=roles,
+                                    max_cycles=1,
+                                    outer_batch_size=2,
+                                    reuse_existing=True,
+                                )
+                            )
+
+        self.assertEqual(
+            [call['symbols'] for call in dispatch_calls],
+            [['000020', '000040'], ['000050', '000070'], ['000080']],
+        )
+        self.assertEqual(
+            [call['role_symbol_scopes']['eod-summarizer'] for call in dispatch_calls],
+            [['000020', '000040'], ['000050', '000070'], ['000080']],
+        )
+        self.assertEqual(
+            [call['funnel_diagnostics']['dispatch_chunk'] for call in dispatch_calls],
+            [
+                {'index': 1, 'total': 3, 'outer_batch_size': 2},
+                {'index': 2, 'total': 3, 'outer_batch_size': 2},
+                {'index': 3, 'total': 3, 'outer_batch_size': 2},
+            ],
+        )
+        self.assertTrue(result['completed'])
+        self.assertEqual(result['cycles'][0]['role_batches'][0]['summary']['chunks'], 3)
+
     def test_run_retry_cycles_returns_waiting_gate_when_prerequisites_are_not_ready(self):
         service = AgentFeedbackRetryService()
         run_state_service = RecordingRunStateService()

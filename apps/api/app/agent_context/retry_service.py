@@ -601,6 +601,31 @@ class AgentFeedbackRetryService:
             for role_state in snapshot.role_states.values()
         )
 
+    @staticmethod
+    def _symbol_chunks(symbols: Sequence[str], *, batch_size: int) -> list[list[str]]:
+        resolved_batch_size = max(1, int(batch_size or 1))
+        return [
+            list(symbols[index:index + resolved_batch_size])
+            for index in range(0, len(symbols), resolved_batch_size)
+        ]
+
+    @staticmethod
+    def _aggregate_dispatch_summaries(dispatch_results: Sequence[dict[str, Any]]) -> dict[str, Any]:
+        summaries = [
+            result.get('summary') if isinstance(result.get('summary'), dict) else {}
+            for result in dispatch_results
+        ]
+        completed = sum(int(summary.get('completed') or 0) for summary in summaries)
+        failed = sum(int(summary.get('failed') or 0) for summary in summaries)
+        statuses = {str(summary.get('status') or '').strip().lower() for summary in summaries}
+        status = 'partial' if failed > 0 or statuses.intersection({'failed', 'partial', 'blocked'}) else 'completed'
+        return {
+            'status': status,
+            'completed': completed,
+            'failed': failed,
+            'chunks': len(dispatch_results),
+        }
+
     def run_retry_cycles(self, *, config: FeedbackRetryCycleConfig, force: bool = False) -> dict[str, Any]:
         roles = tuple(config.roles)
         progress_callback = getattr(config, 'progress_callback', None)
@@ -864,28 +889,52 @@ class AgentFeedbackRetryService:
                     role_exception: Exception | None = None
                     if dispatch_symbols:
                         try:
-                            dispatch_result = agent_feedback_orchestrator.dispatch_for_symbols(
-                                market_date=config.market_date,
-                                symbols=dispatch_symbols,
-                                roles=[role],
-                                reuse_existing=False if force else config.reuse_existing,
-                                force=force,
-                                auto_scope=requested_symbols is None,
-                                role_symbol_scopes={role: dispatch_symbols},
-                                funnel_diagnostics={
-                                    **role_funnel,
-                                    'role_symbols': {role: list(dispatch_symbols)},
-                                    'role_symbol_counts': {role: len(dispatch_symbols)},
-                                    'role_diagnostics': {
-                                        role: role_funnel.get('role_diagnostics', {}).get(role, {})
-                                    },
-                                },
+                            dispatch_results: list[dict[str, Any]] = []
+                            dispatch_chunks = self._symbol_chunks(
+                                dispatch_symbols,
+                                batch_size=config.outer_batch_size,
                             )
+                            for chunk_index, dispatch_chunk in enumerate(dispatch_chunks, start=1):
+                                dispatch_result = agent_feedback_orchestrator.dispatch_for_symbols(
+                                    market_date=config.market_date,
+                                    symbols=dispatch_chunk,
+                                    roles=[role],
+                                    reuse_existing=False if force else config.reuse_existing,
+                                    force=force,
+                                    auto_scope=requested_symbols is None,
+                                    role_symbol_scopes={role: dispatch_chunk},
+                                    funnel_diagnostics={
+                                        **role_funnel,
+                                        'role_symbols': {role: list(dispatch_chunk)},
+                                        'role_symbol_counts': {role: len(dispatch_chunk)},
+                                        'role_diagnostics': {
+                                            role: role_funnel.get('role_diagnostics', {}).get(role, {})
+                                        },
+                                        'dispatch_chunk': {
+                                            'index': chunk_index,
+                                            'total': len(dispatch_chunks),
+                                            'outer_batch_size': max(1, int(config.outer_batch_size or 1)),
+                                        },
+                                    },
+                                )
+                                dispatch_results.append(dispatch_result)
+                            aggregate_summary = self._aggregate_dispatch_summaries(dispatch_results)
                             role_result.update(
                                 {
-                                    'status': dispatch_result['summary']['status'],
-                                    'summary': dispatch_result['summary'],
-                                    'request': dispatch_result['request'],
+                                    'status': aggregate_summary['status'],
+                                    'summary': aggregate_summary,
+                                    'request': {
+                                        'roles': [role],
+                                        'symbols': list(dispatch_symbols),
+                                        'chunks': len(dispatch_results),
+                                    },
+                                    'chunk_results': [
+                                        {
+                                            'request': result.get('request'),
+                                            'summary': result.get('summary'),
+                                        }
+                                        for result in dispatch_results
+                                    ],
                                 }
                             )
                         except Exception as exc:  # noqa: BLE001
