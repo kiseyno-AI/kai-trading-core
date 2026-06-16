@@ -6,6 +6,7 @@ from app.agent_context.eligibility import (
     AGENT_FEEDBACK_SCOPE_ALL,
     AGENT_FEEDBACK_SCOPE_REQUESTED,
     AGENT_FEEDBACK_STRATEGY_SCOPE_VALUE_LONG_ONLY,
+    _load_forced_inclusion_reasons,
     build_agent_feedback_role_funnel,
     load_agent_feedback_eligible_symbols,
     load_agent_feedback_eligibility_records,
@@ -207,6 +208,99 @@ class AgentFeedbackEligibilityTests(unittest.TestCase):
             )
         )
 
+    def test_large_requested_symbol_scope_is_ranked_and_candidate_capped(self) -> None:
+        symbols = [f'{index:06d}' for index in range(1, 11)]
+        with patch(
+            'app.agent_context.eligibility.load_daily_piotroski_filter_results',
+            return_value=[
+                {'symbol': symbol, 'passed_filter': False, 'is_low_pbr': False, 'filter_payload': {}}
+                for symbol in symbols
+            ],
+        ):
+            with patch(
+                'app.agent_context.eligibility.load_daily_market_risk_filter_results',
+                return_value=[
+                    {'symbol': symbol, 'passed_filter': True, 'filter_payload': {}}
+                    for symbol in symbols
+                ],
+            ):
+                with patch(
+                    'app.agent_context.eligibility.load_agent_feedback_candidate_score_rows',
+                    return_value=[
+                        {'symbol': symbol, 'signal_score': index}
+                        for index, symbol in enumerate(symbols, start=1)
+                    ],
+                ):
+                    with patch(
+                        'app.agent_context.eligibility.settings.openclaw_feedback_requested_scope_cap_bypass_max_symbols',
+                        3,
+                    ):
+                        with patch('app.agent_context.eligibility.settings.openclaw_feedback_candidate_cap_percentile', 0.2):
+                            with patch('app.agent_context.eligibility.settings.openclaw_feedback_candidate_cap_min_symbols', 0):
+                                with patch('app.agent_context.eligibility.settings.openclaw_feedback_candidate_cap_max_symbols', 0):
+                                    result = load_agent_feedback_eligible_symbols(
+                                        market_date=date.fromisoformat('2026-04-16'),
+                                        requested_symbols=symbols,
+                                    )
+                                    records = load_agent_feedback_eligibility_records(
+                                        market_date=date.fromisoformat('2026-04-16'),
+                                        requested_symbols=symbols,
+                                    )
+
+        self.assertEqual(result, ['000009', '000010'])
+        self.assertEqual(len([record for record in records if record.get('cap_excluded')]), 8)
+        self.assertTrue(
+            all(
+                record.get('candidate_selection_reason') != 'requested_symbol_scope_cap_bypass'
+                for record in records
+            )
+        )
+
+    def test_large_requested_symbol_scope_skips_prior_missed_forced_inclusion(self) -> None:
+        symbols = ['005930', '000660', '035420']
+        with patch(
+            'app.agent_context.eligibility.settings.openclaw_feedback_requested_scope_cap_bypass_max_symbols',
+            2,
+        ):
+            with patch(
+                'app.agent_context.eligibility.settings.openclaw_feedback_force_include_prior_missed_opportunities_broad_scope_enabled',
+                False,
+            ):
+                with patch(
+                    'app.agent_context.eligibility._load_prior_positive_decision_reasons',
+                    return_value={'status': 'loaded', 'matched_symbols': 0},
+                ):
+                    with patch(
+                        'app.agent_context.eligibility._load_prior_missed_opportunity_reasons',
+                        return_value={'status': 'loaded', 'matched_symbols': 3},
+                    ) as load_prior_missed:
+                        with patch(
+                            'app.agent_context.eligibility._load_event_symbol_reasons',
+                            return_value={'status': 'loaded', 'matched_events': 0},
+                        ):
+                            with patch(
+                                'app.agent_context.eligibility._load_active_order_reasons',
+                                return_value={'status': 'loaded', 'matched_rows': 0},
+                            ):
+                                with patch(
+                                    'app.agent_context.eligibility._load_active_watch_reasons',
+                                    return_value={'status': 'loaded', 'matched_rows': 0},
+                                ):
+                                    with patch(
+                                        'app.agent_context.eligibility._add_score_signal_forced_reasons',
+                                        return_value={'status': 'loaded', 'matched_symbols': 0},
+                                    ):
+                                        forced, diagnostics = _load_forced_inclusion_reasons(
+                                            market_date=date.fromisoformat('2026-04-16'),
+                                            symbols=symbols,
+                                            requested_symbols=None,
+                                            score_by_symbol={},
+                                        )
+
+        load_prior_missed.assert_not_called()
+        self.assertEqual(forced, {})
+        self.assertEqual(diagnostics['prior_missed_opportunities']['status'], 'skipped_broad_scope')
+
     def test_broad_candidate_cap_preserves_forced_symbols_over_rank_cutoff(self) -> None:
         symbols = [f'{index:06d}' for index in range(1, 6)]
         forced_reasons = {
@@ -399,6 +493,32 @@ class AgentFeedbackEligibilityTests(unittest.TestCase):
             diagnostics['role_cap']['bypass_reason'],
             'requested_symbol_scope_cap_bypass',
         )
+
+    def test_role_funnel_large_requested_symbol_scope_still_applies_role_caps(self) -> None:
+        records = [
+            {
+                'symbol': symbol,
+                'candidate_rank': index,
+                'candidate_score': 100 - index,
+                'hard_blocked': False,
+                'cap_excluded': False,
+            }
+            for index, symbol in enumerate(['005930', '000660', '035420'], start=1)
+        ]
+
+        with patch('app.agent_context.eligibility.settings.openclaw_feedback_requested_scope_cap_bypass_max_symbols', 2):
+            with patch('app.agent_context.eligibility.settings.openclaw_feedback_role_cap_signal_decider', 1):
+                funnel = build_agent_feedback_role_funnel(
+                    records=records,
+                    roles=['signal-decider'],
+                    requested_symbols=['005930', '000660', '035420'],
+                )
+
+        self.assertEqual(funnel['role_symbols']['signal-decider'], ['005930'])
+        diagnostics = funnel['role_diagnostics']['signal-decider']
+        self.assertTrue(diagnostics['role_cap']['applied'])
+        self.assertFalse(diagnostics['role_cap']['requested_scope_bypass'])
+        self.assertEqual(diagnostics['cap_excluded_symbols'], ['000660', '035420'])
 
     def test_requested_symbol_scope_preserves_order_and_explains_hard_vs_soft_results(self) -> None:
         with patch(

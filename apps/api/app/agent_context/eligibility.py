@@ -204,6 +204,19 @@ def _role_cap_limit(role: str, total: int) -> int:
     return min(total, cap)
 
 
+def _requested_scope_bypasses_caps(requested_symbols: Sequence[str] | None) -> bool:
+    if requested_symbols is None:
+        return False
+    bypass_limit = max(
+        0,
+        _as_int(
+            getattr(settings, 'openclaw_feedback_requested_scope_cap_bypass_max_symbols', 50),
+            default=50,
+        ),
+    )
+    return len(_normalize_symbol_scope(requested_symbols) or []) <= bypass_limit
+
+
 def _append_forced_reason(
     reasons_by_symbol: dict[str, list[dict[str, Any]]],
     *,
@@ -910,6 +923,7 @@ def _load_forced_inclusion_reasons(
         },
     }
     if requested_symbols is not None:
+        requested_cap_bypass = _requested_scope_bypasses_caps(requested_symbols)
         for symbol in _normalize_symbol_scope(requested_symbols) or []:
             _append_forced_reason(
                 reasons_by_symbol,
@@ -917,13 +931,21 @@ def _load_forced_inclusion_reasons(
                 code='manual_requested_symbol',
                 source='request',
                 message=(
-                    'Symbol was explicitly requested by the caller; '
-                    'percentile and role caps are bypassed for requested-symbol dispatch.'
+                    'Symbol was explicitly requested by the caller; small requested scopes bypass caps, '
+                    'while large requested scopes are still ranked and capped.'
                 ),
             )
         source_diagnostics['manual_requested_symbols'] = {
             'status': 'loaded',
             'matched_symbols': len(reasons_by_symbol),
+            'cap_bypass_enabled': requested_cap_bypass,
+            'cap_bypass_max_symbols': max(
+                0,
+                _as_int(
+                    getattr(settings, 'openclaw_feedback_requested_scope_cap_bypass_max_symbols', 50),
+                    default=50,
+                ),
+            ),
         }
 
     source_diagnostics['prior_decisions'] = _load_prior_positive_decision_reasons(
@@ -931,11 +953,24 @@ def _load_forced_inclusion_reasons(
         symbols=normalized_symbols,
         reasons_by_symbol=reasons_by_symbol,
     )
-    source_diagnostics['prior_missed_opportunities'] = _load_prior_missed_opportunity_reasons(
-        market_date=market_date,
-        symbols=normalized_symbols,
-        reasons_by_symbol=reasons_by_symbol,
+    prior_missed_broad_scope_enabled = bool(
+        getattr(settings, 'openclaw_feedback_force_include_prior_missed_opportunities_broad_scope_enabled', False)
     )
+    prior_missed_allowed = prior_missed_broad_scope_enabled or _requested_scope_bypasses_caps(requested_symbols)
+    if prior_missed_allowed:
+        source_diagnostics['prior_missed_opportunities'] = _load_prior_missed_opportunity_reasons(
+            market_date=market_date,
+            symbols=normalized_symbols,
+            reasons_by_symbol=reasons_by_symbol,
+        )
+    else:
+        source_diagnostics['prior_missed_opportunities'] = {
+            'status': 'skipped_broad_scope',
+            'message': (
+                'Prior missed opportunities are not force-included for broad feedback scopes because '
+                'that source can cover most of the universe and defeat candidate caps.'
+            ),
+        }
     source_diagnostics['event_symbols'] = _load_event_symbol_reasons(
         market_date=market_date,
         symbols=normalized_symbols,
@@ -999,7 +1034,8 @@ def _apply_candidate_cap(
     requested_symbols: Sequence[str] | None,
 ) -> list[dict[str, Any]]:
     dispatchable = [record for record in records if not bool(record.get('hard_blocked'))]
-    if requested_symbols is not None or not dispatchable:
+    requested_cap_bypass = _requested_scope_bypasses_caps(requested_symbols)
+    if requested_cap_bypass or not dispatchable:
         market_date = (
             date.fromisoformat(str(records[0]['market_date']))
             if records and records[0].get('market_date')
@@ -1032,7 +1068,7 @@ def _apply_candidate_cap(
             record['candidate_cap'] = dict(metadata)
             record['candidate_selection_reason'] = (
                 AGENT_FEEDBACK_ROLE_CAP_BYPASS_REASON_REQUESTED
-                if requested_symbols is not None
+                if requested_cap_bypass
                 else 'uncapped_broad_universe'
             )
         return records
@@ -1054,7 +1090,7 @@ def _apply_candidate_cap(
     forced_reasons_by_symbol, forced_source_diagnostics = _load_forced_inclusion_reasons(
         market_date=date.fromisoformat(str(records[0]['market_date'])),
         symbols=[str(record['symbol']) for record in dispatchable],
-        requested_symbols=None,
+        requested_symbols=requested_symbols if requested_cap_bypass else None,
         score_by_symbol=score_by_symbol,
     )
     ranked = sorted(
@@ -1376,7 +1412,7 @@ def build_agent_feedback_role_funnel(
     summarizer_gate_by_symbol: dict[str, Any] | None = None,
     forced_inclusion_reasons_by_symbol: dict[str, list[dict[str, Any]]] | None = None,
 ) -> dict[str, Any]:
-    requested_scope_bypass = requested_symbols is not None
+    requested_scope_bypass = _requested_scope_bypasses_caps(requested_symbols)
     dispatchable_records = _ordered_dispatchable_records(
         records=records,
         candidate_symbols=candidate_symbols,
