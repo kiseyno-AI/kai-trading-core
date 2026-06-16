@@ -180,9 +180,12 @@ class Settings(BaseSettings):
     openclaw_feedback_role_cap_fundamental_summarizer: int = 120
     openclaw_feedback_role_cap_short_term_decider: int = 80
     openclaw_feedback_role_cap_signal_decider: int = 80
+    openclaw_feedback_requested_scope_cap_bypass_max_symbols: int = 50
     openclaw_feedback_force_include_holdings_enabled: bool = True
     openclaw_feedback_force_include_active_watch_enabled: bool = True
     openclaw_feedback_force_include_prior_decisions_enabled: bool = True
+    openclaw_feedback_force_include_prior_missed_opportunities_enabled: bool = True
+    openclaw_feedback_force_include_prior_missed_opportunities_broad_scope_enabled: bool = False
     openclaw_feedback_force_include_event_symbols_enabled: bool = True
     openclaw_agent_subtask_poll_seconds: float = 2.0
     openclaw_agent_slot_cooldown_seconds: float = 600.0
