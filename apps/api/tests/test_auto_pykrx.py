@@ -1304,6 +1304,80 @@ class PykrxBackfillServiceTests(TestCase):
             run_metadata=ANY,
         )
 
+    def test_run_market_data_pipeline_treats_minor_stage_gaps_as_success(self) -> None:
+        service = PykrxBackfillService()
+        symbols = [
+            PykrxSymbol(symbol=f'{index:06d}', market='KOSPI', name_ko=f'Symbol {index}')
+            for index in range(1, 21)
+        ]
+        symbol_codes = [item.symbol for item in symbols]
+
+        with (
+            patch.object(service, 'load_active_universe', return_value=symbols),
+            patch.object(service, 'resolve_latest_trade_date', return_value='2026-04-03'),
+            patch.object(service, '_map_symbol_bars', return_value=[{
+                'trade_date': '2026-04-03',
+                'open_price': 1,
+                'high_price': 2,
+                'low_price': 1,
+                'close_price': 2,
+                'volume': 3,
+                'turnover': 4,
+            }]),
+            patch('app.eod.pykrx_backfill.create_eod_collection_run', return_value=12),
+            patch('app.eod.pykrx_backfill._get_market_ohlcv_by_date', return_value=SimpleNamespace(empty=False)),
+            patch('app.eod.pykrx_backfill.persist_daily_price_bars', return_value=1),
+            patch('app.eod.pykrx_backfill.update_eod_collection_run_progress'),
+            patch(
+                'app.eod.pykrx_backfill.daily_price_context_service.rebuild_for_market_date',
+                return_value={'contexts_persisted': 20, 'contexts_failed': 0, 'failed_symbols': []},
+            ),
+            patch(
+                'app.eod.pykrx_backfill.daily_technical_snapshot_service.rebuild_for_market_date',
+                return_value={'snapshots_persisted': 20, 'snapshots_failed': 0, 'failed_symbols': []},
+            ),
+            patch(
+                'app.eod.pykrx_backfill.daily_action_summary_service.rebuild_for_market_date',
+                return_value={'action_summaries_persisted': 20, 'action_summaries_failed': 0, 'failed_symbols': []},
+            ),
+            patch(
+                'app.eod.pykrx_backfill.compute_and_persist_daily_trending_ranks',
+                return_value={'trending_ranks_persisted': 3},
+            ),
+            patch(
+                'app.eod.pykrx_backfill.daily_signal_feature_service.refresh_for_market_date',
+                return_value={'features_persisted': 19, 'features_failed': 1, 'failed_symbols': ['000020']},
+            ),
+            patch(
+                'app.eod.pykrx_backfill.daily_market_risk_filter_service.rebuild_for_market_date',
+                return_value={
+                    'matched_symbols': symbol_codes,
+                    'results_persisted': 19,
+                    'results_failed': 1,
+                    'failed_symbols': ['000020'],
+                    'summary': {'passed_count': 19, 'watchlist_count': 0},
+                },
+            ),
+            patch('app.eod.pykrx_backfill.complete_eod_collection_run') as complete_run,
+        ):
+            result = service.run_backfill(
+                start_date='20260403',
+                end_date='20260403',
+                refresh_universe=False,
+            )
+
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['signal_features']['features_failed'], 1)
+        self.assertEqual(result['market_risk_filter']['results_failed'], 1)
+        complete_run.assert_called_once_with(
+            12,
+            status='completed',
+            symbols_succeeded=20,
+            symbols_failed=0,
+            error_message=None,
+            run_metadata=ANY,
+        )
+
     def test_run_market_data_pipeline_preserves_price_collection_counts_in_result(self) -> None:
         service = PykrxBackfillService()
 

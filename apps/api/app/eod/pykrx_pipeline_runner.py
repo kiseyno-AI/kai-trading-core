@@ -56,6 +56,7 @@ AUTO_DAILY_TRACKED_STAGE_ORDER: tuple[str, ...] = (
     'market_risk_filter',
     *AUTO_DAILY_FOLLOWUP_STAGE_ORDER,
 )
+MAX_NON_BLOCKING_STAGE_MISSING_RATIO = 0.10
 
 
 @dataclass(frozen=True)
@@ -104,6 +105,32 @@ def _status_activity_prefix(status: str) -> str:
     if status == 'skipped':
         return 'Skipped'
     return status.replace('_', ' ').capitalize()
+
+
+def _missing_ratio(*, failed: int, total: int) -> float | None:
+    if total <= 0:
+        return None
+    return max(failed, 0) / total
+
+
+def _is_non_blocking_gap(*, failed: int, total: int) -> bool:
+    ratio = _missing_ratio(failed=failed, total=total)
+    return failed > 0 and ratio is not None and ratio < MAX_NON_BLOCKING_STAGE_MISSING_RATIO
+
+
+def _completion_status_for_gap(*, failed: int, total: int) -> str:
+    if failed <= 0:
+        return 'completed'
+    return 'completed' if _is_non_blocking_gap(failed=failed, total=total) else 'partial'
+
+
+def _gap_policy_details(*, failed: int, total: int) -> dict[str, Any]:
+    ratio = _missing_ratio(failed=failed, total=total)
+    return {
+        'max_non_blocking_missing_ratio': MAX_NON_BLOCKING_STAGE_MISSING_RATIO,
+        'missing_ratio': round(ratio, 6) if ratio is not None else None,
+        'minor_missing_gap_treated_as_success': _is_non_blocking_gap(failed=failed, total=total),
+    }
 
 
 def _resolve_result_status(result: dict[str, Any]) -> str:
@@ -908,7 +935,9 @@ def run_market_data_pipeline(
                 next_symbol = symbols[index + 1].symbol if index + 1 < len(symbols) else None
                 persist_stage_progress(
                     stage='price_collection',
-                    status='running' if next_symbol is not None else ('completed' if not failed_symbols else 'partial'),
+                    status='running'
+                    if next_symbol is not None
+                    else _completion_status_for_gap(failed=symbols_failed, total=len(symbols)),
                     current_step='fetch_symbol_ohlcv' if next_symbol is not None else 'price_collection_completed',
                     current_activity=(
                         f'Collecting pykrx daily prices for {next_symbol}'
@@ -920,7 +949,10 @@ def run_market_data_pipeline(
                     succeeded=symbols_succeeded,
                     failed=symbols_failed,
                     current_symbol=next_symbol,
-                    extra={'bars_upserted': bars_upserted},
+                    extra={
+                        'bars_upserted': bars_upserted,
+                        **_gap_policy_details(failed=symbols_failed, total=len(symbols)),
+                    },
                 )
             except Exception as exc:
                 logger.warning('pykrx progress update failed for run %s after %s: %s', run_id, item.symbol, exc)
@@ -1063,14 +1095,42 @@ def run_market_data_pipeline(
                 for category, details in category_results.items()
                 if isinstance(details, dict)
             }
+            coverage_categories = (
+                pykrx_enrichment_result.get('coverage', {}).get('categories')
+                if isinstance(pykrx_enrichment_result.get('coverage'), dict)
+                and isinstance(pykrx_enrichment_result.get('coverage', {}).get('categories'), dict)
+                else {}
+            )
+            blocking_failed_categories: list[str] = []
+            tolerated_failed_categories: list[str] = []
+            for category in failed_categories:
+                coverage_payload = (
+                    dict(coverage_categories.get(category))
+                    if isinstance(coverage_categories.get(category), dict)
+                    else {}
+                )
+                expected_rows = int(coverage_payload.get('expected_rows') or 0)
+                present_rows = int(coverage_payload.get('present_rows') or 0)
+                missing_rows = max(expected_rows - present_rows, 0)
+                if (
+                    expected_rows > 0
+                    and missing_rows > 0
+                    and _is_non_blocking_gap(failed=missing_rows, total=expected_rows)
+                    and preflight.get('allowed')
+                ):
+                    tolerated_failed_categories.append(category)
+                else:
+                    blocking_failed_categories.append(category)
             stage_status = (
                 'completed'
-                if pykrx_enrichment_result.get('status') == 'completed' and preflight.get('allowed')
+                if pykrx_enrichment_result.get('status') == 'completed'
+                and preflight.get('allowed')
+                and not blocking_failed_categories
                 else 'partial'
             )
-            if failed_categories:
+            if blocking_failed_categories:
                 pykrx_enrichment_error_message = (
-                    'PyKRX enrichment incomplete for categories: ' + ','.join(failed_categories)
+                    'PyKRX enrichment incomplete for categories: ' + ','.join(blocking_failed_categories)
                 )
             persist_stage_progress(
                 stage='pykrx_enrichment',
@@ -1083,12 +1143,17 @@ def run_market_data_pipeline(
                 ),
                 processed=len(DEFAULT_PYKRX_ENRICHMENT_CATEGORIES),
                 total=len(DEFAULT_PYKRX_ENRICHMENT_CATEGORIES),
-                succeeded=max(len(DEFAULT_PYKRX_ENRICHMENT_CATEGORIES) - len(failed_categories), 0),
-                failed=len(failed_categories),
+                succeeded=max(len(DEFAULT_PYKRX_ENRICHMENT_CATEGORIES) - len(blocking_failed_categories), 0),
+                failed=len(blocking_failed_categories),
                 extra={
                     'categories_requested': pykrx_enrichment_result.get('categories_requested'),
                     'category_row_counts': category_row_counts,
                     'failed_categories': failed_categories,
+                    'blocking_failed_categories': blocking_failed_categories,
+                    'tolerated_failed_categories': tolerated_failed_categories,
+                    'minor_missing_gap_policy': {
+                        'max_non_blocking_missing_ratio': MAX_NON_BLOCKING_STAGE_MISSING_RATIO,
+                    },
                     'downstream_preflight_status': preflight.get('status'),
                     'downstream_allowed': bool(preflight.get('allowed')),
                     'zero_coverage_categories': preflight.get('zero_coverage_categories'),
@@ -1102,6 +1167,8 @@ def run_market_data_pipeline(
                 categories_requested=pykrx_enrichment_result.get('categories_requested'),
                 category_row_counts=category_row_counts,
                 failed_categories=failed_categories,
+                blocking_failed_categories=blocking_failed_categories,
+                tolerated_failed_categories=tolerated_failed_categories,
                 downstream_preflight_status=preflight.get('status'),
                 downstream_allowed=bool(preflight.get('allowed')),
             )
@@ -1157,17 +1224,20 @@ def run_market_data_pipeline(
             )
             technical_failed = int(technical_snapshot_result.get('snapshots_failed') or 0)
             technical_succeeded = int(technical_snapshot_result.get('snapshots_persisted') or 0)
+            technical_total = technical_succeeded + technical_failed
+            technical_status = _completion_status_for_gap(failed=technical_failed, total=technical_total)
             persist_stage_progress(
                 stage='technical_snapshots',
-                status='completed' if technical_failed == 0 else 'partial',
+                status=technical_status,
                 current_step='technical_snapshots_completed',
                 current_activity='Daily technical snapshots computed'
-                if technical_failed == 0
+                if technical_status == 'completed'
                 else 'Daily technical snapshots completed with errors',
-                processed=technical_succeeded + technical_failed,
+                processed=technical_total,
                 total=len(symbols),
                 succeeded=technical_succeeded,
                 failed=technical_failed,
+                extra=_gap_policy_details(failed=technical_failed, total=technical_total),
             )
         except Exception as exc:
             technical_snapshot_result = build_stage_failure_result(
@@ -1220,17 +1290,20 @@ def run_market_data_pipeline(
             )
             action_failed = int(action_summary_result.get('action_summaries_failed') or 0)
             action_succeeded = int(action_summary_result.get('action_summaries_persisted') or 0)
+            action_total = action_succeeded + action_failed
+            action_status = _completion_status_for_gap(failed=action_failed, total=action_total)
             persist_stage_progress(
                 stage='action_summaries',
-                status='completed' if action_failed == 0 else 'partial',
+                status=action_status,
                 current_step='action_summaries_completed',
                 current_activity='Daily action summaries computed'
-                if action_failed == 0
+                if action_status == 'completed'
                 else 'Daily action summaries completed with errors',
-                processed=action_succeeded + action_failed,
+                processed=action_total,
                 total=len(symbols),
                 succeeded=action_succeeded,
                 failed=action_failed,
+                extra=_gap_policy_details(failed=action_failed, total=action_total),
             )
         except Exception as exc:
             action_summary_result = build_stage_failure_result(
@@ -1287,17 +1360,19 @@ def run_market_data_pipeline(
                 or (1 if int(trending_rank_result.get('trending_ranks_persisted') or 0) > 0 else 0)
             )
             trending_total = int(trending_rank_result.get('total') or trending_succeeded + trending_failed or 0)
+            trending_status = _completion_status_for_gap(failed=trending_failed, total=trending_total)
             persist_stage_progress(
                 stage='trending_ranks',
-                status='completed' if trending_failed == 0 else 'partial',
+                status=trending_status,
                 current_step='trending_ranks_completed',
                 current_activity='Daily trending ranks computed'
-                if trending_failed == 0
+                if trending_status == 'completed'
                 else 'Daily trending ranks completed with errors',
                 processed=trending_succeeded + trending_failed,
                 total=trending_total,
                 succeeded=trending_succeeded,
                 failed=trending_failed,
+                extra=_gap_policy_details(failed=trending_failed, total=trending_total),
             )
         except Exception as exc:
             trending_rank_result = build_stage_failure_result(
@@ -1351,11 +1426,13 @@ def run_market_data_pipeline(
                 signal_feature_result.get('features_failed', 0)
             )
             signal_source_errors = signal_feature_result.get('source_errors') or {}
+            signal_failed = int(signal_feature_result.get('features_failed') or 0)
+            signal_status = _completion_status_for_gap(failed=signal_failed, total=signal_total)
+            if signal_source_errors:
+                signal_status = 'partial'
             persist_stage_progress(
                 stage='signal_features',
-                status='completed'
-                if not signal_feature_result.get('features_failed') and not signal_source_errors
-                else 'partial',
+                status=signal_status,
                 current_step='signal_features_completed',
                 current_activity='Daily KIS signal features collected',
                 processed=signal_total,
@@ -1367,6 +1444,7 @@ def run_market_data_pipeline(
                     'source_counts': signal_feature_result.get('source_counts'),
                     'source_errors': signal_source_errors,
                     'coverage': signal_feature_result.get('coverage'),
+                    **_gap_policy_details(failed=signal_failed, total=signal_total),
                 },
             )
         except Exception as exc:
@@ -1427,9 +1505,10 @@ def run_market_data_pipeline(
             )
             market_risk_total = len(market_risk_filter_result.get('matched_symbols') or [])
             market_risk_failed = int(market_risk_filter_result.get('results_failed') or 0)
+            market_risk_status = _completion_status_for_gap(failed=market_risk_failed, total=market_risk_total)
             persist_stage_progress(
                 stage='market_risk_filter',
-                status='completed' if market_risk_failed == 0 else 'partial',
+                status=market_risk_status,
                 current_step='market_risk_filter_completed',
                 current_activity='Daily KIS market risk filter computed',
                 processed=(int(market_risk_filter_result.get('results_persisted') or 0) + market_risk_failed),
@@ -1442,6 +1521,7 @@ def run_market_data_pipeline(
                     ),
                     'passed_count': market_risk_filter_result.get('summary', {}).get('passed_count'),
                     'watchlist_count': market_risk_filter_result.get('summary', {}).get('watchlist_count'),
+                    **_gap_policy_details(failed=market_risk_failed, total=market_risk_total),
                 },
             )
         except Exception as exc:
@@ -1476,7 +1556,7 @@ def run_market_data_pipeline(
         }
 
     run_errors: list[str] = []
-    if failed_symbols:
+    if failed_symbols and not _is_non_blocking_gap(failed=len(failed_symbols), total=len(symbols)):
         run_errors.append(f'Failed symbols: {",".join(failed_symbols[:20])}')
     append_stage_error(
         run_errors,
@@ -1485,6 +1565,8 @@ def run_market_data_pipeline(
         failed_key='contexts_failed',
         incomplete_prefix='Price context persistence incomplete for symbols: ',
         exclude_symbols=failed_symbol_set,
+        total_keys=('requested_symbols', 'contexts_persisted'),
+        max_non_blocking_missing_ratio=MAX_NON_BLOCKING_STAGE_MISSING_RATIO,
     )
     append_stage_error(run_errors, direct_error=pykrx_enrichment_error_message)
     append_stage_error(
@@ -1493,6 +1575,8 @@ def run_market_data_pipeline(
         result=technical_snapshot_result,
         failed_key='snapshots_failed',
         incomplete_prefix='Technical snapshot persistence incomplete for symbols: ',
+        total_keys=('requested_symbols', 'snapshots_persisted'),
+        max_non_blocking_missing_ratio=MAX_NON_BLOCKING_STAGE_MISSING_RATIO,
     )
     append_stage_error(
         run_errors,
@@ -1500,6 +1584,8 @@ def run_market_data_pipeline(
         result=action_summary_result,
         failed_key='action_summaries_failed',
         incomplete_prefix='Action summary persistence incomplete for symbols: ',
+        total_keys=('requested_symbols', 'action_summaries_persisted'),
+        max_non_blocking_missing_ratio=MAX_NON_BLOCKING_STAGE_MISSING_RATIO,
     )
     append_stage_error(run_errors, direct_error=trending_rank_error_message)
     append_stage_error(
@@ -1508,6 +1594,8 @@ def run_market_data_pipeline(
         result=signal_feature_result,
         failed_key='features_failed',
         incomplete_prefix='Daily signal feature persistence incomplete for symbols: ',
+        total_keys=('features_total', 'features_persisted'),
+        max_non_blocking_missing_ratio=MAX_NON_BLOCKING_STAGE_MISSING_RATIO,
     )
     append_stage_error(
         run_errors,
@@ -1515,6 +1603,8 @@ def run_market_data_pipeline(
         result=market_risk_filter_result,
         failed_key='results_failed',
         incomplete_prefix='Market risk filter persistence incomplete for symbols: ',
+        total_keys=('matched_symbols', 'matched_symbol_count', 'requested_symbol_count', 'results_persisted'),
+        max_non_blocking_missing_ratio=MAX_NON_BLOCKING_STAGE_MISSING_RATIO,
     )
 
     status = 'completed' if not run_errors else 'completed_with_errors'
