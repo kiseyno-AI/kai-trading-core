@@ -106,6 +106,8 @@ def append_stage_error(
     incomplete_prefix: str | None = None,
     failed_symbols_key: str = 'failed_symbols',
     exclude_symbols: Iterable[str] | None = None,
+    total_keys: Sequence[str] = (),
+    max_non_blocking_missing_ratio: float | None = None,
 ) -> None:
     if direct_error:
         errors.append(direct_error)
@@ -116,6 +118,11 @@ def append_stage_error(
     failed_count = int(result.get(failed_key) or 0)
     if failed_count <= 0:
         return
+
+    if max_non_blocking_missing_ratio is not None:
+        total_count = _resolve_total_count(result=result, total_keys=total_keys)
+        if total_count > 0 and failed_count / total_count < max_non_blocking_missing_ratio:
+            return
 
     failed_symbols = [
         str(symbol)
@@ -129,3 +136,20 @@ def append_stage_error(
             return
 
     errors.append(incomplete_prefix + ','.join(failed_symbols[:20]))
+
+
+def _resolve_total_count(*, result: Mapping[str, Any], total_keys: Sequence[str]) -> int:
+    for key in total_keys:
+        value = result.get(key)
+        if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+            parsed = len(value)
+            if parsed > 0:
+                return parsed
+            continue
+        try:
+            parsed = int(value or 0)
+        except (TypeError, ValueError):
+            continue
+        if parsed > 0:
+            return parsed
+    return 0
