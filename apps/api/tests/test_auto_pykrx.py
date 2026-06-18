@@ -10,7 +10,7 @@ import pandas as pd
 
 from app.eod.auto_pykrx import AutoPykrxEODScheduler
 from app.eod.pykrx_backfill import PYKRX_STAGE_SEQUENCE, PykrxBackfillService, PykrxSymbol
-from app.eod.pykrx_pipeline_runner import _OfficialDailyPipelineTracker, _normalize_stage_status
+from app.eod.pykrx_pipeline_runner import _OfficialDailyPipelineTracker, _extract_result_counts, _normalize_stage_status
 from app.market.clock import KST, MarketState
 
 
@@ -72,6 +72,30 @@ class _FakeDailyPipelineRunStateService:
 
 
 class PykrxBackfillServiceTests(TestCase):
+    def test_extract_result_counts_reads_agent_feedback_progress_summary(self) -> None:
+        result = {
+            'status': 'partial',
+            'progress': {
+                'summary': {
+                    'completed_feedback_count': 60,
+                    'failed_items': 0,
+                    'expected_feedback_count': 986,
+                }
+            },
+        }
+
+        counts = _extract_result_counts(result)
+
+        self.assertEqual(
+            counts,
+            {
+                'processed': 60,
+                'total': 986,
+                'succeeded': 60,
+                'failed': 0,
+            },
+        )
+
     def test_auto_tracker_normalizes_warning_followup_status_to_terminal_partial(self) -> None:
         fake_run_state_service = _FakeDailyPipelineRunStateService()
         log_events: list[dict] = []
@@ -777,7 +801,11 @@ class PykrxBackfillServiceTests(TestCase):
         )
         factor_followup.assert_called_once_with(market_date='2026-04-03')
         external_news_followup.assert_called_once_with(market_date='2026-04-03', enabled=True)
-        feedback_followup.assert_called_once_with(market_date='2026-04-03', enabled=False)
+        feedback_followup.assert_called_once_with(
+            market_date='2026-04-03',
+            enabled=False,
+            progress_callback=ANY,
+        )
         evaluation_followup.assert_called_once_with(market_date='2026-04-03', enabled=True)
         self.assertEqual(
             result['factor_scoring_followup'],

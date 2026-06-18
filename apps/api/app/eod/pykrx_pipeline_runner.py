@@ -207,6 +207,27 @@ def _extract_result_counts(result: dict[str, Any], *, default_total: int = 0) ->
             'failed': failed,
         }
 
+    progress = result.get('progress') if isinstance(result.get('progress'), dict) else {}
+    progress_summary = progress.get('summary') if isinstance(progress.get('summary'), dict) else {}
+    if progress_summary:
+        succeeded = _int(
+            progress_summary.get('completed_feedback_count')
+            or progress_summary.get('completed_symbols')
+            or progress_summary.get('processed_symbols')
+        )
+        failed = _int(progress_summary.get('failed_items') or progress_summary.get('failed_symbols'))
+        total = _int(
+            progress_summary.get('expected_feedback_count')
+            or progress_summary.get('total_expected_feedback')
+            or progress_summary.get('total_symbols')
+        )
+        return {
+            'processed': min(succeeded + failed, total) if total else succeeded + failed,
+            'total': total,
+            'succeeded': succeeded,
+            'failed': failed,
+        }
+
     succeeded = _int(
         result.get('persisted_count')
         or result.get('trending_ranks_persisted')
@@ -584,7 +605,12 @@ def _run_daily_intraday_snapshot_followup(*, market_date: str, enabled: bool) ->
     return {'triggered': True, 'market_date': market_date, **result}
 
 
-def _run_daily_feedback_followup(*, market_date: str, enabled: bool) -> dict[str, Any]:
+def _run_daily_feedback_followup(
+    *,
+    market_date: str,
+    enabled: bool,
+    progress_callback: Callable[..., None] | None = None,
+) -> dict[str, Any]:
     if not enabled:
         return {
             'triggered': False,
@@ -617,6 +643,7 @@ def _run_daily_feedback_followup(*, market_date: str, enabled: bool) -> dict[str
             max_cycles=settings.openclaw_feedback_retry_max_cycles,
             outer_batch_size=settings.openclaw_feedback_retry_outer_batch_size,
             reuse_existing=True,
+            progress_callback=progress_callback,
         )
     )
     return {
@@ -1730,6 +1757,23 @@ def run_market_data_pipeline(
             extra=details,
         )
 
+    def feedback_progress_callback(**payload: Any) -> None:
+        details = payload.get('details') if isinstance(payload.get('details'), dict) else {}
+        source_run_ids = payload.get('source_run_ids') if isinstance(payload.get('source_run_ids'), dict) else None
+        persist_stage_progress(
+            stage='agent_feedback_summaries',
+            status=str(payload.get('status') or 'running'),
+            current_step=str(payload.get('current_step') or 'agent_feedback_summaries_running'),
+            current_activity=str(payload.get('current_activity') or 'Running agent feedback summary follow-up'),
+            processed=payload.get('processed'),
+            total=payload.get('total'),
+            succeeded=payload.get('succeeded'),
+            failed=payload.get('failed'),
+            current_period=payload.get('current_period'),
+            source_run_ids=source_run_ids,
+            extra=details,
+        )
+
     def record_factor_followup_result(factor_result: dict[str, Any]) -> None:
         stage_results = factor_result.get('stages') if isinstance(factor_result.get('stages'), dict) else {}
         for stage_id in FACTOR_FOLLOWUP_STAGE_ORDER:
@@ -1829,6 +1873,7 @@ def run_market_data_pipeline(
                 call=lambda: _run_daily_feedback_followup(
                     market_date=latest_trade_date,
                     enabled=bool(dependencies.settings.openclaw_feedback_trigger_after_fundamentals_refresh),
+                    progress_callback=feedback_progress_callback,
                 ),
             )
             result['signal_decider_evaluation_followup'] = run_followup_stage(
@@ -1870,6 +1915,7 @@ def run_market_data_pipeline(
                 call=lambda: _run_daily_feedback_followup(
                     market_date=latest_trade_date,
                     enabled=bool(dependencies.settings.openclaw_feedback_trigger_after_fundamentals_refresh),
+                    progress_callback=feedback_progress_callback,
                 ),
             )
             result['signal_decider_evaluation_followup'] = run_followup_stage(

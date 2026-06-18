@@ -161,12 +161,27 @@ class AgentFeedbackSessionCleanupService:
         cmd = [
             'openclaw', 'gateway', 'call', 'sessions.delete', '--token', token, '--params', params,
         ]
-        completed = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=min(10, max(1, int(settings.openclaw_agent_timeout_seconds))),
-        )
+        timeout_seconds = max(1.0, float(settings.openclaw_session_cleanup_timeout_seconds or 30.0))
+        try:
+            completed = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout_seconds,
+            )
+        except subprocess.TimeoutExpired as exc:
+            stdout = (exc.stdout or '').strip() if isinstance(exc.stdout, str) else ''
+            stderr = (exc.stderr or '').strip() if isinstance(exc.stderr, str) else ''
+            return {
+                'ok': False,
+                'deleted': False,
+                'returncode': None,
+                'stdout': stdout,
+                'stderr': stderr,
+                'parsed': None,
+                'timeout_seconds': timeout_seconds,
+                'error': f'sessions.delete timed out after {timeout_seconds:g}s',
+            }
         stdout = completed.stdout.strip()
         stderr = completed.stderr.strip()
         parsed = self._extract_json(stdout) if stdout else None
