@@ -2205,13 +2205,29 @@ class AgentFeedbackOrchestrator:
             feedback=serializable_response.get('normalized_feedback') if isinstance(serializable_response, dict) else None,
             context=serializable_context,
         )
-        cleanup_result = self._cleanup_feedback_session(
-            market_date=market_date,
-            symbol=str(payload.get('symbol') or ''),
-            agent_name=agent_name,
-            run_id=run_id,
-            response=response,
-        )
+        cleanup_result = None
+        try:
+            cleanup_result = self._cleanup_feedback_session(
+                market_date=market_date,
+                symbol=str(payload.get('symbol') or ''),
+                agent_name=agent_name,
+                run_id=run_id,
+                response=response,
+            )
+        except Exception as exc:  # noqa: BLE001
+            cleanup_result = {
+                'status': 'deferred',
+                'reason': 'cleanup_failed_after_feedback_persisted',
+                'error_type': type(exc).__name__,
+                'error': str(exc),
+            }
+            logger.warning(
+                'agent feedback session cleanup failed after feedback persisted for %s/%s/%s: %s',
+                market_date,
+                agent_name,
+                payload.get('symbol'),
+                exc,
+            )
         if cleanup_result is not None:
             result['item']['session_cleanup'] = cleanup_result
         return result['item']
@@ -3607,11 +3623,28 @@ class AgentFeedbackOrchestrator:
                         request_run_id=request_run_id,
                         reason=f'role_completed:{role}',
                     )
-                    self._cleanup_persisted_run_sessions(
-                        market_date=normalized_market_date,
-                        request_run_id=request_run_id,
-                        role=role,
-                    )
+                    try:
+                        role_cleanup_result = self._cleanup_persisted_run_sessions(
+                            market_date=normalized_market_date,
+                            request_run_id=request_run_id,
+                            role=role,
+                        )
+                    except Exception as cleanup_exc:  # noqa: BLE001
+                        role_cleanup_result = [
+                            {
+                                'status': 'deferred',
+                                'reason': 'role_cleanup_failed_after_role_persisted',
+                                'error_type': type(cleanup_exc).__name__,
+                                'error': str(cleanup_exc),
+                            }
+                        ]
+                        logger.warning(
+                            'agent feedback role session cleanup failed after role persisted for %s/%s/%s: %s',
+                            normalized_market_date,
+                            request_run_id,
+                            role,
+                            cleanup_exc,
+                        )
                     self._checkpoint_run_state(
                         market_date=normalized_market_date,
                         request_run_id=request_run_id,
@@ -3619,7 +3652,10 @@ class AgentFeedbackOrchestrator:
                         lifecycle_stage='role_completed',
                         current_role=role,
                         status='running',
-                        flush_result=role_flush_result,
+                        flush_result={
+                            **role_flush_result,
+                            'session_cleanup': role_cleanup_result,
+                        },
                     )
                     log_agent_feedback_event(
                         'role_completed',

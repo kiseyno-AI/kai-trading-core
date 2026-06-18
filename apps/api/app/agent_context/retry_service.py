@@ -547,6 +547,12 @@ class AgentFeedbackRetryService:
                 'max_cycles': progress_summary.get('max_cycles') or summary_payload.get('max_cycles'),
                 'completed_roles': list(progress_summary.get('completed_roles') or summary_payload.get('completed_roles') or []),
                 'remaining_roles': list(progress_summary.get('remaining_roles') or summary_payload.get('remaining_roles') or []),
+                'expected_feedback_count': total,
+                'completed_feedback_count': completed_count,
+                'failed_items': failed_count,
+                'role_progress': progress_summary.get('role_progress') if isinstance(progress_summary.get('role_progress'), dict) else {},
+                'role_symbol_counts': progress_summary.get('role_symbol_counts') or summary_payload.get('role_symbol_counts'),
+                'current_role': current_role,
                 'cycle_result': cycle_result,
             },
         )

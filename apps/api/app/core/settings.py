@@ -189,6 +189,7 @@ class Settings(BaseSettings):
     openclaw_feedback_force_include_event_symbols_enabled: bool = True
     openclaw_agent_subtask_poll_seconds: float = 2.0
     openclaw_agent_slot_cooldown_seconds: float = 600.0
+    openclaw_session_cleanup_timeout_seconds: float = 30.0
     openclaw_session_cleanup_batch_limit: int = 100
 
 
