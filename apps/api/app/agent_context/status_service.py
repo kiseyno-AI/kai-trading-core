@@ -11,6 +11,7 @@ from app.agent_context.prerequisite_service import agent_feedback_prerequisite_s
 from app.agent_context.feedback_service import _normalize_market_date, _normalize_symbols
 from app.agent_context.run_modes import DAILY_RETRY_CYCLE_MODE
 from app.agent_context.run_state_service import agent_context_feedback_run_state_service
+from app.agent_context.reuse_service import FUNDAMENTAL_REUSE_STALE_REASONS, agent_context_reuse_service
 from app.db import session_scope
 from app.db_models import AgentContextFeedback, AgentContextFeedbackFailure
 
@@ -141,12 +142,22 @@ class AgentContextStatusService:
 
         grouped = _group_feedback_rows(rows)
         failures_by_symbol = _group_latest_failures(failure_rows)
+        try:
+            reuse_decisions = agent_context_reuse_service.build_latest_decisions(
+                market_date=normalized_market_date,
+                symbols=normalized_symbols,
+                roles=list(EXPECTED_AGENT_NAMES),
+            )
+        except Exception:  # noqa: BLE001
+            reuse_decisions = {}
         items: list[dict[str, Any]] = []
         completed_symbols = 0
         in_progress_symbols = 0
         partial_symbols = 0
         failed_symbols = 0
         pending_symbols = 0
+        reused_feedback_count = 0
+        stale_feedback_count = 0
         unresolved_failures: list[dict[str, Any]] = []
 
         for symbol in normalized_symbols:
@@ -159,11 +170,29 @@ class AgentContextStatusService:
                 if row['agent_name'] in EXPECTED_AGENT_SET and row['agent_name'] not in agent_map:
                     agent_map[row['agent_name']] = row
 
-            completed_agents = sorted(agent_map.keys())
+            computed_agents = sorted(agent_map.keys())
+            reused_agent_map = {
+                agent_name: decision
+                for agent_name, decision in reuse_decisions.get(symbol, {}).items()
+                if agent_name not in agent_map and not decision.should_dispatch
+            }
+            reused_agents = sorted(reused_agent_map.keys())
+            stale_agent_map = {
+                agent_name: decision
+                for agent_name, decision in reuse_decisions.get(symbol, {}).items()
+                if agent_name not in agent_map
+                and decision.should_dispatch
+                and str(decision.reason or '') in FUNDAMENTAL_REUSE_STALE_REASONS
+            }
+            stale_agents = sorted(stale_agent_map.keys())
+            completed_agents = sorted(set(computed_agents) | set(reused_agents))
+            reused_feedback_count += len(reused_agents)
+            stale_feedback_count += len(stale_agents)
             symbol_failure_map = {
                 agent_name: failure
                 for agent_name, failure in failures_by_symbol.get(symbol, {}).items()
                 if agent_name not in agent_map
+                and agent_name not in reused_agent_map
             }
             failed_agents = sorted(symbol_failure_map.keys())
             symbol_failures = [symbol_failure_map[agent_name] for agent_name in failed_agents]
@@ -172,6 +201,7 @@ class AgentContextStatusService:
                 name
                 for name in EXPECTED_AGENT_NAMES
                 if name not in agent_map and name not in symbol_failure_map
+                and name not in reused_agent_map
             ]
             if len(completed_agents) == len(EXPECTED_AGENT_NAMES):
                 status = 'completed'
@@ -193,11 +223,44 @@ class AgentContextStatusService:
                     'status': status,
                     'latest_run_id': latest_run_id,
                     'completed_agents': completed_agents,
+                    'computed_agents': computed_agents,
+                    'reused_agents': reused_agents,
+                    'stale_agents': stale_agents,
                     'failed_agents': failed_agents,
                     'pending_agents': pending_agents,
                     'completed_count': len(completed_agents),
+                    'computed_count': len(computed_agents),
+                    'reused_count': len(reused_agents),
+                    'stale_count': len(stale_agents),
                     'failed_count': len(failed_agents),
                     'expected_count': len(EXPECTED_AGENT_NAMES),
+                    'reuse': {
+                        agent_name: {
+                            'reason': decision.reason,
+                            'latest_feedback_id': decision.latest_feedback_id,
+                            'latest_feedback_market_date': (
+                                decision.latest_feedback.get('market_date')
+                                if isinstance(decision.latest_feedback, dict)
+                                else None
+                            ),
+                            'latest_feedback_received_at': decision.latest_feedback_received_at,
+                            'input_fingerprint': decision.input_fingerprint,
+                            'stored_input_fingerprint': decision.stored_input_fingerprint,
+                            'reuse_policy_version': decision.reuse_policy_version,
+                        }
+                        for agent_name, decision in reused_agent_map.items()
+                    },
+                    'stale_feedback': {
+                        agent_name: {
+                            'reason': decision.reason,
+                            'latest_feedback_id': decision.latest_feedback_id,
+                            'latest_feedback_received_at': decision.latest_feedback_received_at,
+                            'input_fingerprint': decision.input_fingerprint,
+                            'stored_input_fingerprint': decision.stored_input_fingerprint,
+                            'reuse_policy_version': decision.reuse_policy_version,
+                        }
+                        for agent_name, decision in stale_agent_map.items()
+                    },
                     'failures': [
                         {
                             'agent_name': failure['agent_name'],
@@ -249,6 +312,9 @@ class AgentContextStatusService:
                 'failed_symbol_count': failed_symbols,
                 'pending_symbol_count': pending_symbols,
                 'completed_feedback_count': len(rows),
+                'computed_feedback_count': len(rows),
+                'reused_feedback_count': reused_feedback_count,
+                'stale_feedback_count': stale_feedback_count,
                 'failed_feedback_count': len(unresolved_failures),
                 'expected_feedback_count': len(normalized_symbols) * len(EXPECTED_AGENT_NAMES),
                 'failure_groups': build_failure_groups(unresolved_failures),

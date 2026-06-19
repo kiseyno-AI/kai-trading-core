@@ -13,6 +13,7 @@ The response is now a stable coverage and liveness snapshot:
 - top-level `progress_ratio` and `progress_percent` represent whole-cycle completion across all expected symbol-role feedback items
 - `boundary_progress_ratio` and `boundary_progress_percent` keep the separate symbol-boundary coverage signal that used to drive the top-level percentage
 - `terminal_feedback_count` shows how many expected feedback items are already terminal via either stored feedback or stored failure rows
+- `computed_feedback_count`, `reused_feedback_count`, and `stale_feedback_count` split terminal work from fingerprint reuse and dispatch-required stale/changed inputs
 - `run_status` indicates whether feedback appears to be actively moving, stalled, pending, or completed
 - completed terminal partial runs report inactive incomplete symbols as `partial_symbols`; `in_progress_symbols` is reserved for live runtime work only
 - `failure_groups` groups unresolved stored failures by status, including `dependency/missing-upstream`, `transport/timeout`, `response/invalid-json`, `response/assistant-non-json`, and `response/contract`
@@ -103,6 +104,9 @@ GET /agent-context/feedback/progress?market_date=2026-04-16&run_id=feedback-cycl
     "boundary_progress_percent": 90.0,
     "failed_items": 0,
     "completed_feedback_count": 260,
+    "computed_feedback_count": 246,
+    "reused_feedback_count": 14,
+    "stale_feedback_count": 3,
     "expected_feedback_count": 400,
     "failure_groups": {
       "transport/timeout": {

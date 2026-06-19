@@ -634,6 +634,7 @@ def run_agent_feedback_retry_cycles(
     outer_batch_size: int = 20,
     reuse_existing: bool = True,
     force: bool = False,
+    force_recompute: bool = False,
 ) -> dict[str, Any]:
     bootstrap_runtime()
     parsed_symbols = tuple(item.strip() for item in symbols.split(',') if item.strip()) if symbols else None
@@ -647,6 +648,7 @@ def run_agent_feedback_retry_cycles(
             max_cycles=max_cycles,
             outer_batch_size=outer_batch_size,
             reuse_existing=reuse_existing,
+            force_recompute=force_recompute,
         ),
         force=force,
     )
@@ -1036,6 +1038,7 @@ def _build_parser() -> argparse.ArgumentParser:
     feedback_retry_parser.add_argument('--outer-batch-size', type=int, default=20)
     feedback_retry_parser.add_argument('--reuse-existing', choices=('true', 'false'), default='true')
     feedback_retry_parser.add_argument('--force', action='store_true')
+    feedback_retry_parser.add_argument('--force-recompute', action='store_true')
 
     feedback_data_gap_summary_parser = subparsers.add_parser(
         'agent-feedback-data-gap-summary',
@@ -1318,6 +1321,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             outer_batch_size=args.outer_batch_size,
             reuse_existing=args.reuse_existing == 'true',
             force=args.force,
+            force_recompute=args.force_recompute,
         )
     elif args.command in {'agent-feedback-data-gap-summary', 'agent-feedback-data-gap-quality-report'}:
         payload = get_agent_feedback_data_gap_summary(

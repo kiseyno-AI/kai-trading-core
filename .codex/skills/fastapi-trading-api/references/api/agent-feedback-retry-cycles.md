@@ -12,6 +12,8 @@ Default automatic caps are broad top 10%, minimum 150, maximum 200 symbols, then
 The response includes cycle and batch details plus a fresh `progress` snapshot using the same response shape as `GET /agent-context/feedback/progress`. Consumers can read `progress.summary.first_feedback_at`, `elapsed_seconds`, rate fields, and ETA fields immediately after the retry request completes.
 Retry cycles now also enforce the same-day feedback prerequisites by default. If PyKRX enrichment, fundamentals, filtering, or factor/scoring stages are still pending or blocked, the route returns a gated `waiting` or `blocked` response with a `prerequisites` block and does not create a new durable run. Operators can bypass that safety check only with `force=true`.
 
+`fundamental-summarizer` can reuse the latest prior feedback across trading dates when the stored fundamental input fingerprint matches the current DART/disclosure/valuation input fingerprint. `force_recompute=true` explicitly bypasses reuse for debugging, model upgrades, or prompt/schema changes while keeping `force=true` available for prerequisite override/full refresh flows.
+
 ## Example request
 ```http
 POST /agent-context/feedback/retry-cycles
@@ -31,6 +33,7 @@ Content-Type: application/json
   "max_cycles": 3,
   "outer_batch_size": 20,
   "reuse_existing": true,
+  "force_recompute": false,
   "force": false
 }
 ```
@@ -52,6 +55,7 @@ Content-Type: application/json
   "max_cycles": 3,
   "outer_batch_size": 20,
   "reuse_existing": true,
+  "force_recompute": false,
   "feedback_scope_mode": "decider_scope_fast_path",
   "cycles": [
     {
@@ -99,6 +103,9 @@ Content-Type: application/json
       "pending_symbols": 8,
       "progress_percent": 52.5,
       "completed_feedback_count": 210,
+      "computed_feedback_count": 196,
+      "reused_feedback_count": 14,
+      "stale_feedback_count": 3,
       "expected_feedback_count": 400,
       "completed_feedback_per_minute": 42.0,
       "completed_symbols_per_minute": 14.0,

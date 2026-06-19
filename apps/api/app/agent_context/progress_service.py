@@ -14,6 +14,7 @@ from app.agent_context.prerequisite_service import agent_feedback_prerequisite_s
 from app.agent_context.run_modes import DAILY_RETRY_CYCLE_MODE
 from app.agent_context.run_state_service import agent_context_feedback_run_state_service
 from app.agent_context.status_service import EXPECTED_AGENT_NAMES
+from app.agent_context.reuse_service import FUNDAMENTAL_REUSE_STALE_REASONS, agent_context_reuse_service
 from app.agent_context.runtime_state import _build_top_level_progress_fields, runtime_feedback_state_store
 from app.db import session_scope
 from app.db_models import AgentContextFeedback, AgentContextFeedbackFailure, DailyPriceBar, Symbol
@@ -508,7 +509,9 @@ class AgentContextProgressService:
         progress_ratio = (processed_symbols / total_symbols) if total_symbols else 0.0
 
         for key in (
+            'computed_symbols',
             'reused_symbols',
+            'stale_symbols',
             'retry_pending_symbols',
             'first_pass_completed_symbols',
             'first_pass_failed_symbols',
@@ -654,6 +657,8 @@ class AgentContextProgressService:
         scoped_symbol_set = set(scoped_symbols)
         completed_by_role: dict[str, set[str]] = {agent_name: set() for agent_name in expected_agents}
         failed_by_role: dict[str, set[str]] = {agent_name: set() for agent_name in expected_agents}
+        reused_by_role: dict[str, set[str]] = {agent_name: set() for agent_name in expected_agents}
+        stale_by_role: dict[str, set[str]] = {agent_name: set() for agent_name in expected_agents}
         feedback_received_at: list[datetime] = []
 
         if scoped_symbols:
@@ -712,6 +717,27 @@ class AgentContextProgressService:
                         'received_at': getattr(row, 'received_at', None),
                     }
                 )
+
+            try:
+                reuse_decisions = agent_context_reuse_service.build_latest_decisions(
+                    market_date=market_date,
+                    symbols=scoped_symbols,
+                    roles=expected_agents,
+                )
+            except Exception:  # noqa: BLE001
+                reuse_decisions = {}
+            for symbol in scoped_symbols:
+                for agent_name in expected_agents:
+                    if symbol in completed_by_role.get(agent_name, set()) or symbol in failed_by_role.get(agent_name, set()):
+                        continue
+                    decision = reuse_decisions.get(symbol, {}).get(agent_name)
+                    if decision is None:
+                        continue
+                    if not decision.should_dispatch:
+                        completed_by_role[agent_name].add(symbol)
+                        reused_by_role[agent_name].add(symbol)
+                    elif str(decision.reason or '') in FUNDAMENTAL_REUSE_STALE_REASONS:
+                        stale_by_role[agent_name].add(symbol)
         else:
             unresolved_failures = []
 
@@ -730,6 +756,8 @@ class AgentContextProgressService:
                 expected_agents=expected_agents,
                 completed_by_role=completed_by_role,
                 failed_by_role=failed_by_role,
+                reused_by_role=reused_by_role,
+                stale_by_role=stale_by_role,
                 first_feedback_at=first_feedback_at,
                 latest_feedback_at=latest_feedback_at,
                 unresolved_failures=unresolved_failures,
@@ -923,6 +951,8 @@ class AgentContextProgressService:
         expected_agents: Sequence[str],
         completed_by_role: dict[str, set[str]],
         failed_by_role: dict[str, set[str]],
+        reused_by_role: dict[str, set[str]],
+        stale_by_role: dict[str, set[str]],
         first_feedback_at: datetime | None,
         latest_feedback_at: datetime | None,
         unresolved_failures: Sequence[dict[str, Any]],
@@ -930,6 +960,9 @@ class AgentContextProgressService:
         requested_count = len(requested_symbols)
         expected_feedback_count = requested_count * len(expected_agents)
         completed_feedback_count = sum(len(completed_by_role.get(agent_name, set())) for agent_name in expected_agents)
+        reused_feedback_count = sum(len(reused_by_role.get(agent_name, set())) for agent_name in expected_agents)
+        computed_feedback_count = max(0, completed_feedback_count - reused_feedback_count)
+        stale_feedback_count = sum(len(stale_by_role.get(agent_name, set())) for agent_name in expected_agents)
         failed_items = sum(len(failed_by_role.get(agent_name, set())) for agent_name in expected_agents)
         failure_groups = build_failure_groups(unresolved_failures)
 
@@ -968,6 +1001,9 @@ class AgentContextProgressService:
         for agent_name in expected_agents:
             completed_for_role = len(completed_by_role.get(agent_name, set()))
             failed_for_role = len(failed_by_role.get(agent_name, set()))
+            reused_for_role = len(reused_by_role.get(agent_name, set()))
+            computed_for_role = max(0, completed_for_role - reused_for_role)
+            stale_for_role = len(stale_by_role.get(agent_name, set()))
             processed_for_role = min(requested_count, completed_for_role + failed_for_role)
             pending_for_role = max(0, requested_count - processed_for_role)
             progress_ratio_for_role = (processed_for_role / requested_count) if requested_count else 0.0
@@ -991,6 +1027,9 @@ class AgentContextProgressService:
                 'total_symbols': requested_count,
                 'processed_symbols': processed_for_role,
                 'completed_symbols': completed_for_role,
+                'computed_symbols': computed_for_role,
+                'reused_symbols': reused_for_role,
+                'stale_symbols': stale_for_role,
                 'in_progress_symbols': 0,
                 'partial_symbols': max(0, processed_for_role - completed_for_role),
                 'pending_symbols': pending_for_role,
@@ -1058,6 +1097,9 @@ class AgentContextProgressService:
             'failed_items': failed_items,
             'failure_groups': failure_groups,
             'completed_feedback_count': completed_feedback_count,
+            'computed_feedback_count': computed_feedback_count,
+            'reused_feedback_count': reused_feedback_count,
+            'stale_feedback_count': stale_feedback_count,
             'expected_feedback_count': expected_feedback_count,
             'completed_feedback_per_minute': completed_feedback_per_minute,
             'completed_symbols_per_minute': completed_symbols_per_minute,

@@ -70,6 +70,7 @@ class RuntimeFeedbackRunState:
     completed_symbols_by_role: dict[str, set[str]] = field(default_factory=dict)
     failed_symbols_by_role: dict[str, set[str]] = field(default_factory=dict)
     reused_symbols_by_role: dict[str, set[str]] = field(default_factory=dict)
+    stale_symbols_by_role: dict[str, set[str]] = field(default_factory=dict)
     retry_pending_symbols_by_role: dict[str, set[str]] = field(default_factory=dict)
     first_pass_completed_symbols_by_role: dict[str, set[str]] = field(default_factory=dict)
     first_pass_failed_symbols_by_role: dict[str, set[str]] = field(default_factory=dict)
@@ -138,6 +139,15 @@ class RuntimeFeedbackRunState:
                 )
                 or len(self.buffered_failures)
             )
+        )
+        reused_feedback_count = sum(
+            len(self.reused_symbols_by_role.get(role, set()) & role_scope_sets.get(role, set()))
+            for role in self.requested_roles
+        )
+        computed_feedback_count = max(0, int(completed_feedback_count) - int(reused_feedback_count))
+        stale_feedback_count = sum(
+            len(self.stale_symbols_by_role.get(role, set()) & role_scope_sets.get(role, set()))
+            for role in self.requested_roles
         )
         total_symbols = self.logical_total_symbols if self.logical_total_symbols is not None else len(self.requested_symbols)
 
@@ -211,6 +221,8 @@ class RuntimeFeedbackRunState:
             completed_for_role = len(self.completed_symbols_by_role.get(role, set()) & role_symbol_set)
             failed_for_role = len(self.failed_symbols_by_role.get(role, set()) & role_symbol_set)
             reused_for_role = len(self.reused_symbols_by_role.get(role, set()) & role_symbol_set)
+            computed_for_role = max(0, completed_for_role - reused_for_role)
+            stale_for_role = len(self.stale_symbols_by_role.get(role, set()) & role_symbol_set)
             first_pass_completed_for_role = len(self.first_pass_completed_symbols_by_role.get(role, set()) & role_symbol_set)
             first_pass_failed_for_role = len(self.first_pass_failed_symbols_by_role.get(role, set()) & role_symbol_set)
             retry_queued_for_role = len(self.retry_queued_symbols_by_role.get(role, set()) & role_symbol_set)
@@ -246,7 +258,9 @@ class RuntimeFeedbackRunState:
                 'total_symbols': role_total_symbols,
                 'processed_symbols': processed_for_role,
                 'completed_symbols': completed_for_role,
+                'computed_symbols': computed_for_role,
                 'reused_symbols': reused_for_role,
+                'stale_symbols': stale_for_role,
                 'in_progress_symbols': len(in_flight_symbols),
                 'pending_symbols': pending_for_role,
                 'terminal_symbols': min(role_total_symbols, completed_for_role + failed_for_role),
@@ -353,6 +367,9 @@ class RuntimeFeedbackRunState:
             'progress_percent': progress_fields['progress_percent'],
             'failed_items': failed_items,
             'completed_feedback_count': completed_feedback_count,
+            'computed_feedback_count': computed_feedback_count,
+            'reused_feedback_count': reused_feedback_count,
+            'stale_feedback_count': stale_feedback_count,
             'expected_feedback_count': expected_feedback_count,
             'buffered_feedback_count': len(self.buffered_feedback_rows),
             'buffered_failure_count': len(self.buffered_failures),
