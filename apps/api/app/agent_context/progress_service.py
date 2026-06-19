@@ -64,15 +64,24 @@ class AgentContextProgressService:
         )
         if scoped_symbols is None and prerequisites['ready']:
             scoped_symbols = load_agent_feedback_eligible_symbols(market_date=normalized_market_date)
+        resolved_run_mode = self._resolve_run_mode(resolved_run)
+        persisted_child_run_id = self._resolve_persisted_child_run_id(
+            resolved_run=resolved_run,
+            resolved_run_mode=resolved_run_mode,
+        )
         persisted_progress = self._build_persisted_progress(
             market_date=normalized_market_date,
             symbols=scoped_symbols,
             expected_agents=expected_agent_names,
+            child_run_id=persisted_child_run_id,
+            include_reuse=self._should_include_prior_feedback_reuse(
+                resolved_run=resolved_run,
+                child_run_id=persisted_child_run_id,
+            ),
         )
 
         result_payload = persisted_progress['result']
         summary_payload = persisted_progress['summary']
-        resolved_run_mode = self._resolve_run_mode(resolved_run)
         resolved_feedback_scope_mode = (
             self._resolve_feedback_scope_mode(resolved_run)
             or getattr(state, 'feedback_scope_mode', None)
@@ -205,6 +214,38 @@ class AgentContextProgressService:
         if mode is None:
             mode = summary_payload.get('mode')
         return str(mode).strip() if mode is not None else None
+
+    def _resolve_persisted_child_run_id(
+        self,
+        *,
+        resolved_run: dict[str, Any] | None,
+        resolved_run_mode: str | None,
+    ) -> str | None:
+        if (
+            not isinstance(resolved_run, dict)
+            or not self._is_live_run_snapshot(resolved_run)
+            or resolved_run_mode == DAILY_RETRY_CYCLE_MODE
+        ):
+            return None
+        run_id = str(resolved_run.get('run_id') or '').strip()
+        return run_id or None
+
+    @staticmethod
+    def _should_include_prior_feedback_reuse(
+        *,
+        resolved_run: dict[str, Any] | None,
+        child_run_id: str | None,
+    ) -> bool:
+        if child_run_id is None or not isinstance(resolved_run, dict):
+            return True
+        request_payload = (
+            resolved_run.get('request_payload')
+            if isinstance(resolved_run.get('request_payload'), dict)
+            else {}
+        )
+        reuse_existing = bool(request_payload.get('reuse_existing', True))
+        force_recompute = bool(request_payload.get('force_recompute', False))
+        return reuse_existing and not force_recompute
 
     @staticmethod
     def _resolve_feedback_scope_mode(run_snapshot: dict[str, Any] | None) -> str | None:
@@ -651,6 +692,8 @@ class AgentContextProgressService:
         market_date: date,
         symbols: Sequence[str] | None,
         expected_agents: Sequence[str],
+        child_run_id: str | None = None,
+        include_reuse: bool = True,
     ) -> dict[str, Any]:
         scoped_symbols = list(symbols) if symbols is not None else self._load_market_date_symbols(market_date)
         scoped_symbol_set = set(scoped_symbols)
@@ -663,20 +706,22 @@ class AgentContextProgressService:
 
         if scoped_symbols:
             with session_scope() as session:
-                feedback_rows = session.execute(
+                feedback_query = (
                     select(
                         AgentContextFeedback.symbol,
                         AgentContextFeedback.agent_name,
+                        AgentContextFeedback.run_id,
                         AgentContextFeedback.received_at,
                     )
                     .where(AgentContextFeedback.market_date == market_date)
                     .where(AgentContextFeedback.symbol.in_(scoped_symbols))
                     .where(AgentContextFeedback.agent_name.in_(expected_agents))
-                ).all()
-                failure_rows = session.execute(
+                )
+                failure_query = (
                     select(
                         AgentContextFeedbackFailure.symbol,
                         AgentContextFeedbackFailure.agent_name,
+                        AgentContextFeedbackFailure.run_id,
                         AgentContextFeedbackFailure.received_at,
                         AgentContextFeedbackFailure.failure_kind,
                         AgentContextFeedbackFailure.retryable,
@@ -686,11 +731,18 @@ class AgentContextProgressService:
                     .where(AgentContextFeedbackFailure.market_date == market_date)
                     .where(AgentContextFeedbackFailure.symbol.in_(scoped_symbols))
                     .where(AgentContextFeedbackFailure.agent_name.in_(expected_agents))
-                ).all()
+                )
+                if child_run_id is not None:
+                    feedback_query = feedback_query.where(AgentContextFeedback.run_id == child_run_id)
+                    failure_query = failure_query.where(AgentContextFeedbackFailure.run_id == child_run_id)
+                feedback_rows = session.execute(feedback_query).all()
+                failure_rows = session.execute(failure_query).all()
 
             for row in feedback_rows:
                 symbol = str(row.symbol)
                 agent_name = str(row.agent_name)
+                if child_run_id is not None and str(getattr(row, 'run_id', '') or '') != child_run_id:
+                    continue
                 if symbol not in scoped_symbol_set or agent_name not in completed_by_role:
                     continue
                 completed_by_role[agent_name].add(symbol)
@@ -701,6 +753,8 @@ class AgentContextProgressService:
             for row in failure_rows:
                 symbol = str(row.symbol)
                 agent_name = str(row.agent_name)
+                if child_run_id is not None and str(getattr(row, 'run_id', '') or '') != child_run_id:
+                    continue
                 if symbol not in scoped_symbol_set or agent_name not in failed_by_role:
                     continue
                 if symbol in completed_by_role[agent_name]:
@@ -720,14 +774,16 @@ class AgentContextProgressService:
                     }
                 )
 
-            try:
-                reuse_decisions = agent_context_reuse_service.build_latest_decisions(
-                    market_date=market_date,
-                    symbols=scoped_symbols,
-                    roles=expected_agents,
-                )
-            except Exception:  # noqa: BLE001
-                reuse_decisions = {}
+            reuse_decisions = {}
+            if include_reuse:
+                try:
+                    reuse_decisions = agent_context_reuse_service.build_latest_decisions(
+                        market_date=market_date,
+                        symbols=scoped_symbols,
+                        roles=expected_agents,
+                    )
+                except Exception:  # noqa: BLE001
+                    reuse_decisions = {}
             for symbol in scoped_symbols:
                 for agent_name in expected_agents:
                     if symbol in completed_by_role.get(agent_name, set()) or symbol in failed_by_role.get(agent_name, set()):

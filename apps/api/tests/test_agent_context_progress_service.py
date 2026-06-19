@@ -895,6 +895,126 @@ class AgentContextProgressServiceTests(unittest.TestCase):
         self.assertEqual(summary['role_progress']['eod-summarizer']['completed_symbols'], 2)
         self.assertEqual(summary['role_progress']['technical-summarizer']['failed_items'], 1)
 
+    def test_feedback_progress_live_non_retry_run_ignores_prior_child_rows_from_other_run(self):
+        fake_session = FakeProgressSession()
+        fake_session.market_universe_symbols = ['005930', '000660']
+        fake_session.feedback_rows = [
+            SimpleNamespace(
+                symbol='005930',
+                agent_name='eod-summarizer',
+                run_id='older-symbol-run',
+                received_at=datetime(2026, 6, 19, 9, 30, tzinfo=timezone.utc),
+                id=1,
+            ),
+            SimpleNamespace(
+                symbol='000660',
+                agent_name='eod-summarizer',
+                run_id='older-symbol-run',
+                received_at=datetime(2026, 6, 19, 9, 39, tzinfo=timezone.utc),
+                id=2,
+            ),
+        ]
+        fake_session.failure_rows = [
+            SimpleNamespace(
+                symbol='000660',
+                agent_name='technical-summarizer',
+                run_id='older-symbol-run',
+                failure_kind='openclaw_transport_timeout',
+                retryable=True,
+                summary_payload={'error': 'ReadTimeout'},
+                context_payload={'dispatch_id': 'older-timeout'},
+                received_at=datetime(2026, 6, 19, 9, 38, tzinfo=timezone.utc),
+                id=10,
+            )
+        ]
+        run_snapshot = {
+            'run_id': 'active-symbol-run',
+            'status': 'running',
+            'symbols_total': 2,
+            'completed_count': 0,
+            'failed_count': 0,
+            'started_at': datetime(2026, 6, 19, 10, 0, tzinfo=timezone.utc),
+            'completed_at': None,
+            'request_payload': {
+                'mode': 'role_sequential_runtime_buffered',
+                'symbols': ['005930', '000660'],
+                'requested_symbols': ['005930', '000660'],
+                'roles': ['eod-summarizer', 'technical-summarizer'],
+                'reuse_existing': False,
+            },
+            'summary_payload': {
+                'progress_summary': {
+                    'run_id': 'active-symbol-run',
+                    'run_status': 'running',
+                    'run_table_status': 'running',
+                    'is_live': True,
+                    'current_role': 'eod-summarizer',
+                    'total_symbols': 2,
+                    'processed_symbols': 0,
+                    'completed_symbols': 0,
+                    'in_progress_symbols': 0,
+                    'pending_symbols': 2,
+                    'completed_feedback_count': 0,
+                    'failed_items': 0,
+                    'expected_feedback_count': 4,
+                    'latest_feedback_at': None,
+                    'role_progress': {
+                        'eod-summarizer': {
+                            'role': 'eod-summarizer',
+                            'status': 'running',
+                            'total_symbols': 2,
+                            'processed_symbols': 0,
+                            'completed_symbols': 0,
+                            'in_progress_symbols': 0,
+                            'pending_symbols': 2,
+                            'failed_items': 0,
+                        },
+                        'technical-summarizer': {
+                            'role': 'technical-summarizer',
+                            'status': 'pending',
+                            'total_symbols': 2,
+                            'processed_symbols': 0,
+                            'completed_symbols': 0,
+                            'in_progress_symbols': 0,
+                            'pending_symbols': 2,
+                            'failed_items': 0,
+                        },
+                    },
+                }
+            },
+        }
+
+        @contextmanager
+        def fake_session_scope():
+            yield fake_session
+
+        with patch('app.agent_context.progress_service.session_scope', fake_session_scope):
+            with patch('app.agent_context.progress_service.runtime_feedback_state_store.get_run', return_value=None):
+                with patch(
+                    'app.agent_context.progress_service.agent_context_feedback_run_state_service.get_run',
+                    return_value=run_snapshot,
+                ):
+                    result = AgentContextProgressService().get_feedback_progress(
+                        market_date='2026-06-19',
+                        run_id='active-symbol-run',
+                    )
+
+        feedback_sql = fake_session._compile(fake_session.statements[0])
+        failure_sql = fake_session._compile(fake_session.statements[1])
+        self.assertIn("agent_context_feedback.run_id = 'active-symbol-run'", feedback_sql)
+        self.assertIn("agent_context_feedback_failures.run_id = 'active-symbol-run'", failure_sql)
+
+        summary = result['summary']
+        self.assertEqual(summary['run_id'], 'active-symbol-run')
+        self.assertEqual(summary['run_status'], 'running')
+        self.assertEqual(summary['completed_feedback_count'], 0)
+        self.assertEqual(summary['failed_items'], 0)
+        self.assertEqual(summary['expected_feedback_count'], 4)
+        self.assertEqual(summary['latest_feedback_at'], None)
+        self.assertEqual(summary['latest_failed_feedback_at'], None)
+        self.assertEqual(summary['role_progress']['eod-summarizer']['completed_symbols'], 0)
+        self.assertEqual(summary['role_progress']['technical-summarizer']['failed_items'], 0)
+
     def test_feedback_progress_keeps_running_retry_cycle_checkpoint_live_when_cycle_completed(self):
         fake_session = FakeProgressSession()
         fake_session.feedback_rows = [
