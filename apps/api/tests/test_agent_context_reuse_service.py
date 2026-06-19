@@ -1,4 +1,5 @@
 import unittest
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -32,6 +33,32 @@ def _decision(*, should_dispatch: bool, reason: str, fingerprint: str = 'sha256:
         stored_input_fingerprint_payload={'fingerprint': fingerprint},
         reuse_policy_version='fundamental_summary_reuse_policy_v1',
     )
+
+
+class _EmptyScalars:
+    def all(self):
+        return []
+
+
+class _ReuseExecuteResult:
+    def all(self):
+        return [SimpleNamespace(id=101, symbol='005930')]
+
+    def scalars(self):
+        return _EmptyScalars()
+
+    def scalar_one(self):
+        return None
+
+
+class _ReuseSession:
+    def execute(self, _statement):
+        return _ReuseExecuteResult()
+
+
+@contextmanager
+def _reuse_session_scope():
+    yield _ReuseSession()
 
 
 class FundamentalReuseServiceTests(unittest.TestCase):
@@ -74,6 +101,21 @@ class FundamentalReuseServiceTests(unittest.TestCase):
         )
 
         self.assertEqual(payload['fingerprint'], 'sha256:stored')
+
+    def test_build_latest_decisions_non_signal_role_does_not_raise_unbound_valid(self):
+        service = AgentContextReuseService()
+
+        with patch('app.agent_context.reuse_service.session_scope', _reuse_session_scope):
+            decisions = service.build_latest_decisions(
+                market_date='2026-04-16',
+                symbols=['005930'],
+                roles=['eod-summarizer'],
+            )
+
+        decision = decisions['005930']['eod-summarizer']
+        self.assertTrue(decision.should_dispatch)
+        self.assertEqual(decision.reason, 'missing_feedback')
+        self.assertIsNone(decision.latest_source_updated_at)
 
     def test_retry_snapshot_treats_reused_fundamental_as_completed_boundary(self):
         service = AgentFeedbackRetryService()

@@ -448,7 +448,7 @@ class AgentContextReuseService:
                     )
                 ).scalar_one()
             )
-            valid = [item for item in timestamps if item is not None]
+        valid = [item for item in timestamps if item is not None]
         return max(valid) if valid else None
 
     def _build_fundamental_input_fingerprint_payload(
