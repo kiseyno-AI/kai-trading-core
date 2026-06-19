@@ -1096,6 +1096,12 @@ class AgentContextProgressServiceTests(unittest.TestCase):
             'status': 'partial',
             'started_at': datetime(2026, 4, 14, 1, 0, tzinfo=timezone.utc),
             'completed_at': datetime(2026, 4, 14, 1, 10, tzinfo=timezone.utc),
+            'request_payload': {
+                'mode': 'daily_retry_cycle_role_sequenced',
+                'feedback_scope_mode': 'decider_scope_fast_path',
+                'roles': ['eod-summarizer', 'technical-summarizer', 'fundamental-summarizer', 'short-term-decider', 'signal-decider'],
+                'symbols': ['005930', '000660'],
+            },
             'summary_payload': {
                 'progress_summary': {
                     'run_id': 'retry-run',
@@ -1110,6 +1116,7 @@ class AgentContextProgressServiceTests(unittest.TestCase):
                     'max_cycles': 3,
                     'cycle_mode': 'retry_followup',
                     'cycle_status': 'partial',
+                    'feedback_scope_mode': 'decider_scope_fast_path',
                     'total_symbols': 2,
                     'processed_symbols': 2,
                     'completed_symbols': 1,
@@ -1162,6 +1169,8 @@ class AgentContextProgressServiceTests(unittest.TestCase):
         self.assertEqual(result['summary']['completed_roles'], ['eod-summarizer', 'technical-summarizer', 'fundamental-summarizer'])
         self.assertEqual(result['summary']['remaining_roles'], ['signal-decider'])
         self.assertEqual(result['summary']['cycle_mode'], 'retry_followup')
+        self.assertEqual(result['request']['feedback_scope_mode'], 'decider_scope_fast_path')
+        self.assertEqual(result['summary']['feedback_scope_mode'], 'decider_scope_fast_path')
         self.assertEqual(result['summary']['cycle_number'], 2)
         self.assertEqual(result['summary']['role_progress']['signal-decider']['retry_pending_symbols'], 1)
         self.assertEqual(result['summary']['terminal_feedback_count'], 8)

@@ -27,6 +27,10 @@ from app.agent_context.progress_service import agent_context_progress_service
 from app.agent_context.reuse_service import agent_context_reuse_service
 from app.agent_context.read_service import agent_context_read_service
 from app.agent_context.run_state_service import agent_context_feedback_run_state_service
+from app.agent_context.run_modes import (
+    FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
+    FEEDBACK_SCOPE_MODES,
+)
 from app.agent_context.session_cleanup_service import agent_feedback_session_cleanup_service
 from app.agent_context.signal_decider_calibration_service import signal_decider_calibration_service
 from app.agent_context.signal_decider_calendar_review_service import signal_decider_calendar_review_service
@@ -92,10 +96,20 @@ class AgentFeedbackRetryCyclesRequest(BaseModel):
     market_date: date
     symbols: list[str] | None = Field(default=None, min_length=1, max_length=500)
     roles: list[str] | None = None
+    feedback_scope_mode: str = Field(default=FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH)
     max_cycles: int = Field(default=3, ge=1, le=20)
     outer_batch_size: int = Field(default=20, ge=1, le=200)
     reuse_existing: bool = True
     force: bool = False
+
+    @model_validator(mode='after')
+    def validate_feedback_scope_mode(self) -> 'AgentFeedbackRetryCyclesRequest':
+        if self.feedback_scope_mode not in FEEDBACK_SCOPE_MODES:
+            raise ValueError(
+                'feedback_scope_mode must be one of: '
+                + ', '.join(FEEDBACK_SCOPE_MODES)
+            )
+        return self
 
 
 class AgentFeedbackFollowupRequest(BaseModel):
@@ -104,10 +118,20 @@ class AgentFeedbackFollowupRequest(BaseModel):
     market_date: date
     symbols: list[str] | None = Field(default=None, min_length=1, max_length=500)
     roles: list[str] | None = None
+    feedback_scope_mode: str = Field(default=FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH)
     max_cycles: int = Field(default=3, ge=1, le=20)
     outer_batch_size: int = Field(default=20, ge=1, le=500)
     reuse_existing: bool = True
     force: bool = False
+
+    @model_validator(mode='after')
+    def validate_feedback_scope_mode(self) -> 'AgentFeedbackFollowupRequest':
+        if self.feedback_scope_mode not in FEEDBACK_SCOPE_MODES:
+            raise ValueError(
+                'feedback_scope_mode must be one of: '
+                + ', '.join(FEEDBACK_SCOPE_MODES)
+            )
+        return self
 
 
 class AgentFeedbackCleanupRunRequest(BaseModel):
@@ -890,6 +914,7 @@ async def run_agent_feedback_retry_cycles(payload: AgentFeedbackRetryCyclesReque
             market_date=payload.market_date,
             roles=tuple(payload.roles or EXPECTED_ROLES),
             symbols=tuple(payload.symbols) if payload.symbols is not None else None,
+            feedback_scope_mode=payload.feedback_scope_mode,
             max_cycles=payload.max_cycles,
             outer_batch_size=payload.outer_batch_size,
             reuse_existing=payload.reuse_existing,
@@ -912,6 +937,7 @@ async def run_agent_feedback_followup(payload: AgentFeedbackFollowupRequest) -> 
             market_date=payload.market_date,
             roles=tuple(payload.roles or EXPECTED_ROLES),
             symbols=tuple(payload.symbols) if payload.symbols is not None else None,
+            feedback_scope_mode=payload.feedback_scope_mode,
             max_cycles=payload.max_cycles,
             outer_batch_size=payload.outer_batch_size,
             reuse_existing=payload.reuse_existing,

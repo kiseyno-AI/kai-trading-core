@@ -9,6 +9,8 @@ from app.agent_context.feedback_failure_taxonomy import build_failure_groups, cl
 from app.agent_context.roles import DEFAULT_AGENT_NAMES
 from app.agent_context.prerequisite_service import agent_feedback_prerequisite_service
 from app.agent_context.feedback_service import _normalize_market_date, _normalize_symbols
+from app.agent_context.run_modes import DAILY_RETRY_CYCLE_MODE
+from app.agent_context.run_state_service import agent_context_feedback_run_state_service
 from app.db import session_scope
 from app.db_models import AgentContextFeedback, AgentContextFeedbackFailure
 
@@ -36,6 +38,29 @@ def _group_latest_failures(rows: Sequence[dict[str, Any]]) -> dict[str, dict[str
 
 
 class AgentContextStatusService:
+    @staticmethod
+    def _feedback_scope_mode_from_run(run_snapshot: dict[str, Any] | None) -> str | None:
+        if not isinstance(run_snapshot, dict):
+            return None
+        payloads: list[dict[str, Any]] = []
+        request_payload = run_snapshot.get('request_payload') if isinstance(run_snapshot.get('request_payload'), dict) else None
+        summary_payload = run_snapshot.get('summary_payload') if isinstance(run_snapshot.get('summary_payload'), dict) else None
+        if request_payload is not None:
+            payloads.append(request_payload)
+        if summary_payload is not None:
+            payloads.append(summary_payload)
+            progress_summary = summary_payload.get('progress_summary')
+            if isinstance(progress_summary, dict):
+                payloads.append(progress_summary)
+        for payload in payloads:
+            value = payload.get('feedback_scope_mode')
+            if value is None:
+                continue
+            mode = str(value).strip()
+            if mode:
+                return mode
+        return None
+
     def get_feedback_status(
         self,
         *,
@@ -49,6 +74,16 @@ class AgentContextStatusService:
         prerequisites = agent_feedback_prerequisite_service.inspect_feedback_prerequisites(
             market_date=normalized_market_date,
         )
+        try:
+            latest_run = agent_context_feedback_run_state_service.find_latest_run(
+                market_date=normalized_market_date,
+                requested_symbols=None,
+                requested_roles=list(EXPECTED_AGENT_NAMES),
+                request_modes=[DAILY_RETRY_CYCLE_MODE],
+            )
+        except Exception:  # noqa: BLE001
+            latest_run = None
+        latest_run_scope_mode = self._feedback_scope_mode_from_run(latest_run)
 
         with session_scope() as session:
             orm_rows = session.execute(
@@ -200,9 +235,13 @@ class AgentContextStatusService:
                 'market_date': normalized_market_date.isoformat(),
                 'symbols': normalized_symbols,
                 'expected_agents': list(EXPECTED_AGENT_NAMES),
+                'latest_run_id': latest_run.get('run_id') if isinstance(latest_run, dict) else None,
+                'feedback_scope_mode': latest_run_scope_mode,
             },
             'summary': {
                 'status': overall_status,
+                'latest_run_id': latest_run.get('run_id') if isinstance(latest_run, dict) else None,
+                'feedback_scope_mode': latest_run_scope_mode,
                 'requested_symbol_count': len(normalized_symbols),
                 'completed_symbol_count': completed_symbols,
                 'in_progress_symbol_count': in_progress_symbols,

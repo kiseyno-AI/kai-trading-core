@@ -3,6 +3,8 @@
 ## Summary
 Reports latest-run workflow status for the default five-role symbol feedback workflow.
 
+When a durable retry-cycle run exists for the date, the response includes `latest_run_id` and `feedback_scope_mode` so operators can distinguish `decider_scope_fast_path` morning-readiness runs from `broad_feedback_universe` enrichment runs.
+
 When upstream PyKRX enrichment, fundamentals, filtering, or factor/scoring stages are not ready yet, symbol items surface `waiting` or `blocked` instead of a generic `pending`, and the response includes a top-level `prerequisites` block describing the missing same-day stages. PyKRX enrichment prerequisite details include expected and present row counts for decider-required categories such as investor flow, short selling, sector classification, market breadth, and valuation snapshots.
 
 Persisted incomplete terminal work is reported as `partial` or `failed`, not `in_progress`. Stored failure rows include `failure_groups` so clients can distinguish dependency blocks (`dependency/missing-upstream`) from OpenClaw transport timeouts (`transport/timeout`) and response-shape failures (`response/invalid-json`, `response/assistant-non-json`, `response/contract`).
@@ -18,6 +20,8 @@ GET /agent-context/feedback/status?market_date=2026-04-15&symbols=005930&symbols
   "request": {
     "market_date": "2026-04-15",
     "symbols": ["005930"],
+    "latest_run_id": "feedback-cycle-2026-04-15-ab12cd34ef",
+    "feedback_scope_mode": "decider_scope_fast_path",
     "expected_agents": [
       "eod-summarizer",
       "technical-summarizer",
@@ -28,6 +32,8 @@ GET /agent-context/feedback/status?market_date=2026-04-15&symbols=005930&symbols
   },
   "summary": {
     "status": "partial",
+    "latest_run_id": "feedback-cycle-2026-04-15-ab12cd34ef",
+    "feedback_scope_mode": "decider_scope_fast_path",
     "requested_symbol_count": 1,
     "completed_symbol_count": 0,
     "in_progress_symbol_count": 0,

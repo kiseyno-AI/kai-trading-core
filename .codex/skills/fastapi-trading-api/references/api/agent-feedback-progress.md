@@ -8,7 +8,7 @@ The response is now a stable coverage and liveness snapshot:
 - `result.market_date` echoes the requested market date, and `result.roles[role]` reports durable persisted `requested_count`, `completed_count`, and `error_count`
 - `run_id` is optional and lets operators inspect the exact durable run returned by dispatch or retry endpoints
 - dispatch and retry run scopes now reflect the intersection of the active pre-filters, not Piotroski alone
-- retry-cycle run scopes now separate `broad_symbol_count` from per-role `role_symbol_counts`; `role_symbol_scopes` and `funnel_diagnostics` explain role caps, requested-symbol bypasses, and forced-inclusion reasons
+- retry-cycle run scopes now separate `feedback_scope_mode`, `broad_symbol_count`, and per-role `role_symbol_counts`; `decider_scope_fast_path` progress totals use the decider candidate scope while `broad_feedback_universe` keeps independent wider summarizer scopes for offline enrichment
 - when a matching retry-cycle `agent_context_feedback_runs` row exists, aggregate counts stay grounded in persisted feedback and failure rows while live lifecycle fields such as `current_role`, `completed_roles`, and `cycle_status` still come from the active run metadata
 - top-level `progress_ratio` and `progress_percent` represent whole-cycle completion across all expected symbol-role feedback items
 - `boundary_progress_ratio` and `boundary_progress_percent` keep the separate symbol-boundary coverage signal that used to drive the top-level percentage
@@ -40,24 +40,25 @@ GET /agent-context/feedback/progress?market_date=2026-04-16&run_id=feedback-cycl
       "short-term-decider",
       "signal-decider"
     ],
-    "run_id": "feedback-cycle-2026-04-16-ab12cd34ef"
+    "run_id": "feedback-cycle-2026-04-16-ab12cd34ef",
+    "feedback_scope_mode": "decider_scope_fast_path"
   },
   "result": {
     "market_date": "2026-04-16",
     "roles": {
       "eod-summarizer": {
-        "requested_count": 200,
-        "completed_count": 134,
+        "requested_count": 80,
+        "completed_count": 80,
         "error_count": 0
       },
       "technical-summarizer": {
-        "requested_count": 150,
-        "completed_count": 130,
+        "requested_count": 80,
+        "completed_count": 72,
         "error_count": 2
       },
       "fundamental-summarizer": {
-        "requested_count": 120,
-        "completed_count": 100,
+        "requested_count": 80,
+        "completed_count": 68,
         "error_count": 1
       },
       "short-term-decider": {
@@ -80,28 +81,29 @@ GET /agent-context/feedback/progress?market_date=2026-04-16&run_id=feedback-cycl
     "elapsed_seconds": 6330,
     "seconds_since_last_feedback": 5231,
     "stalled_threshold_seconds": 300,
-    "total_symbols": 200,
+    "feedback_scope_mode": "decider_scope_fast_path",
+    "total_symbols": 80,
     "broad_symbol_count": 200,
     "role_symbol_counts": {
-      "eod-summarizer": 200,
-      "technical-summarizer": 150,
-      "fundamental-summarizer": 120,
+      "eod-summarizer": 80,
+      "technical-summarizer": 80,
+      "fundamental-summarizer": 80,
       "short-term-decider": 80,
       "signal-decider": 80
     },
-    "processed_symbols": 140,
+    "processed_symbols": 72,
     "completed_symbols": 0,
     "in_progress_symbols": 0,
-    "partial_symbols": 140,
-    "pending_symbols": 60,
-    "terminal_feedback_count": 402,
-    "progress_ratio": 0.638095,
-    "progress_percent": 63.81,
-    "boundary_progress_ratio": 0.7,
-    "boundary_progress_percent": 70.0,
+    "partial_symbols": 72,
+    "pending_symbols": 8,
+    "terminal_feedback_count": 260,
+    "progress_ratio": 0.65,
+    "progress_percent": 65.0,
+    "boundary_progress_ratio": 0.9,
+    "boundary_progress_percent": 90.0,
     "failed_items": 0,
-    "completed_feedback_count": 402,
-    "expected_feedback_count": 630,
+    "completed_feedback_count": 260,
+    "expected_feedback_count": 400,
     "failure_groups": {
       "transport/timeout": {
         "failure_status": "transport/timeout",
@@ -122,7 +124,13 @@ GET /agent-context/feedback/progress?market_date=2026-04-16&run_id=feedback-cycl
     "eta_confidence": "medium",
     "funnel_diagnostics": {
       "schema_version": "agent_feedback_funnel_v1",
+      "feedback_scope_mode": "decider_scope_fast_path",
       "broad_symbol_count": 200,
+      "decider_scope": {
+        "mode": "decider_scope_fast_path",
+        "applied": true,
+        "symbol_count": 80
+      },
       "requested_scope_bypass": false,
       "role_symbol_counts": {
         "short-term-decider": 80,

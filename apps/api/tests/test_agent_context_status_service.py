@@ -68,12 +68,22 @@ class AgentContextStatusServiceTests(unittest.TestCase):
                 'app.agent_context.status_service.agent_feedback_prerequisite_service.inspect_feedback_prerequisites',
                 return_value={'ready': True, 'status': 'ready', 'missing_prerequisites': []},
             ):
-                result = AgentContextStatusService().get_feedback_status(
-                    market_date='2026-04-14',
-                    symbols=['005930'],
-                )
+                with patch(
+                    'app.agent_context.status_service.agent_context_feedback_run_state_service.find_latest_run',
+                    return_value={
+                        'run_id': 'retry-run',
+                        'request_payload': {'feedback_scope_mode': 'decider_scope_fast_path'},
+                        'summary_payload': {},
+                    },
+                ):
+                    result = AgentContextStatusService().get_feedback_status(
+                        market_date='2026-04-14',
+                        symbols=['005930'],
+                    )
 
         self.assertEqual(result['summary']['status'], 'partial')
+        self.assertEqual(result['summary']['latest_run_id'], 'retry-run')
+        self.assertEqual(result['summary']['feedback_scope_mode'], 'decider_scope_fast_path')
         self.assertEqual(result['summary']['in_progress_symbol_count'], 0)
         self.assertEqual(result['summary']['partial_symbol_count'], 1)
         self.assertEqual(result['summary']['failure_groups']['dependency/missing-upstream']['count'], 1)

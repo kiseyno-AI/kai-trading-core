@@ -15,6 +15,7 @@ from app.agent_context.missing_data_report_service import agent_context_missing_
 from app.agent_context.orchestrator import agent_feedback_orchestrator
 from app.agent_context.prerequisite_service import agent_feedback_prerequisite_service
 from app.agent_context.retry_service import EXPECTED_ROLES, FeedbackRetryCycleConfig, agent_feedback_retry_service
+from app.agent_context.run_modes import FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH, FEEDBACK_SCOPE_MODES
 from app.agent_context.session_cleanup_service import agent_feedback_session_cleanup_service
 from app.agent_context.signal_decider_evaluation_maintenance_service import (
     signal_decider_evaluation_maintenance_service,
@@ -628,6 +629,7 @@ def run_agent_feedback_retry_cycles(
     market_date: str,
     symbols: str | None = None,
     roles: str | None = None,
+    feedback_scope_mode: str = FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
     max_cycles: int = 3,
     outer_batch_size: int = 20,
     reuse_existing: bool = True,
@@ -641,6 +643,7 @@ def run_agent_feedback_retry_cycles(
             market_date=__import__('datetime').date.fromisoformat(market_date),
             roles=parsed_roles,
             symbols=parsed_symbols,
+            feedback_scope_mode=feedback_scope_mode,
             max_cycles=max_cycles,
             outer_batch_size=outer_batch_size,
             reuse_existing=reuse_existing,
@@ -1024,6 +1027,11 @@ def _build_parser() -> argparse.ArgumentParser:
     feedback_retry_parser.add_argument('--market-date', required=True)
     feedback_retry_parser.add_argument('--symbols')
     feedback_retry_parser.add_argument('--roles')
+    feedback_retry_parser.add_argument(
+        '--feedback-scope-mode',
+        choices=FEEDBACK_SCOPE_MODES,
+        default=FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
+    )
     feedback_retry_parser.add_argument('--max-cycles', type=int, default=3)
     feedback_retry_parser.add_argument('--outer-batch-size', type=int, default=20)
     feedback_retry_parser.add_argument('--reuse-existing', choices=('true', 'false'), default='true')
@@ -1305,6 +1313,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             market_date=args.market_date,
             symbols=args.symbols,
             roles=args.roles,
+            feedback_scope_mode=args.feedback_scope_mode,
             max_cycles=args.max_cycles,
             outer_batch_size=args.outer_batch_size,
             reuse_existing=args.reuse_existing == 'true',

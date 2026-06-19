@@ -72,6 +72,10 @@ class AgentContextProgressService:
         result_payload = persisted_progress['result']
         summary_payload = persisted_progress['summary']
         resolved_run_mode = self._resolve_run_mode(resolved_run)
+        resolved_feedback_scope_mode = (
+            self._resolve_feedback_scope_mode(resolved_run)
+            or getattr(state, 'feedback_scope_mode', None)
+        )
         if state is not None:
             runtime_summary = state.to_progress_summary()
             if resolved_run is not None and resolved_run_mode == DAILY_RETRY_CYCLE_MODE and scope_resolved_from_run:
@@ -158,6 +162,7 @@ class AgentContextProgressService:
                 'symbols': normalized_symbols,
                 'expected_agents': list(expected_agent_names),
                 'run_id': run_id,
+                'feedback_scope_mode': resolved_feedback_scope_mode or summary_payload.get('feedback_scope_mode'),
             },
             'result': result_payload,
             'summary': summary_payload,
@@ -200,6 +205,29 @@ class AgentContextProgressService:
         if mode is None:
             mode = summary_payload.get('mode')
         return str(mode).strip() if mode is not None else None
+
+    @staticmethod
+    def _resolve_feedback_scope_mode(run_snapshot: dict[str, Any] | None) -> str | None:
+        if not isinstance(run_snapshot, dict):
+            return None
+        payloads: list[dict[str, Any]] = []
+        request_payload = run_snapshot.get('request_payload') if isinstance(run_snapshot.get('request_payload'), dict) else None
+        summary_payload = run_snapshot.get('summary_payload') if isinstance(run_snapshot.get('summary_payload'), dict) else None
+        if request_payload is not None:
+            payloads.append(request_payload)
+        if summary_payload is not None:
+            payloads.append(summary_payload)
+            progress_summary = summary_payload.get('progress_summary')
+            if isinstance(progress_summary, dict):
+                payloads.append(progress_summary)
+        for payload in payloads:
+            value = payload.get('feedback_scope_mode')
+            if value is None:
+                continue
+            mode = str(value).strip()
+            if mode:
+                return mode
+        return None
 
     @staticmethod
     def _resolve_run_requested_agents(run_snapshot: dict[str, Any]) -> list[str] | None:
@@ -290,7 +318,12 @@ class AgentContextProgressService:
             'max_cycles',
             'cycle_mode',
             'cycle_status',
+            'feedback_scope_mode',
             'parallel_per_role',
+            'broad_symbol_count',
+            'role_symbol_counts',
+            'role_symbol_scopes',
+            'funnel_diagnostics',
             'seconds_since_last_feedback',
             'expected_feedback_count',
             'buffered_feedback_count',
@@ -347,7 +380,12 @@ class AgentContextProgressService:
             'max_cycles',
             'cycle_mode',
             'cycle_status',
+            'feedback_scope_mode',
             'parallel_per_role',
+            'broad_symbol_count',
+            'role_symbol_counts',
+            'role_symbol_scopes',
+            'funnel_diagnostics',
             'seconds_since_last_feedback',
             'expected_feedback_count',
             'buffered_feedback_count',
@@ -803,9 +841,12 @@ class AgentContextProgressService:
     @staticmethod
     def _merge_run_table_metadata(*, summary: dict[str, Any], run_snapshot: dict[str, Any]) -> dict[str, Any]:
         merged = dict(summary)
+        request_payload = run_snapshot.get('request_payload') if isinstance(run_snapshot.get('request_payload'), dict) else {}
         started_at = run_snapshot.get('started_at')
         completed_at = run_snapshot.get('completed_at')
         merged['run_id'] = run_snapshot.get('run_id')
+        if merged.get('feedback_scope_mode') is None and request_payload.get('feedback_scope_mode') is not None:
+            merged['feedback_scope_mode'] = request_payload.get('feedback_scope_mode')
         merged['run_status'] = merged.get('run_status') or run_snapshot.get('status')
         merged['run_table_status'] = run_snapshot.get('status')
         merged['is_live'] = merged.get('is_live') if merged.get('is_live') is not None else run_snapshot.get('status') == 'running'

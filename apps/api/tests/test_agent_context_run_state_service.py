@@ -136,6 +136,56 @@ class AgentContextFeedbackRunStateServiceTests(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(result['run_id'], 'retry-cycle-run')
 
+    def test_find_latest_run_filters_by_feedback_scope_mode(self):
+        service = AgentContextFeedbackRunStateService()
+        market_date = date.fromisoformat('2026-04-14')
+        fake_session = FakeRunStateSession(
+            [
+                _build_run_row(
+                    row_id=2,
+                    run_id='newer-broad-run',
+                    market_date=market_date,
+                    started_at=datetime(2026, 4, 14, 1, 5, tzinfo=timezone.utc),
+                    request_payload={
+                        'symbols': ['005930'],
+                        'requested_symbols': ['005930'],
+                        'roles': ['signal-decider'],
+                        'mode': 'daily_retry_cycle_role_sequenced',
+                        'feedback_scope_mode': 'broad_feedback_universe',
+                    },
+                ),
+                _build_run_row(
+                    row_id=1,
+                    run_id='matching-fast-path-run',
+                    market_date=market_date,
+                    started_at=datetime(2026, 4, 14, 1, 0, tzinfo=timezone.utc),
+                    request_payload={
+                        'symbols': ['005930'],
+                        'requested_symbols': ['005930'],
+                        'roles': ['signal-decider'],
+                        'mode': 'daily_retry_cycle_role_sequenced',
+                        'feedback_scope_mode': 'decider_scope_fast_path',
+                    },
+                ),
+            ]
+        )
+
+        @contextmanager
+        def fake_session_scope():
+            yield fake_session
+
+        with patch('app.agent_context.run_state_service.session_scope', fake_session_scope):
+            result = service.find_latest_run(
+                market_date=market_date,
+                requested_symbols=['005930'],
+                requested_roles=['signal-decider'],
+                request_modes=['daily_retry_cycle_role_sequenced'],
+                feedback_scope_mode='decider_scope_fast_path',
+            )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result['run_id'], 'matching-fast-path-run')
+
     def test_find_latest_run_matches_requested_symbol_scope_when_run_tracks_eligible_subset(self):
         service = AgentContextFeedbackRunStateService()
         market_date = date.fromisoformat('2026-04-14')

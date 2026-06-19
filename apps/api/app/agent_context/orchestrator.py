@@ -2784,6 +2784,11 @@ class AgentFeedbackOrchestrator:
                 requested_symbols=None if auto_scope else requested_symbols,
                 candidate_symbols=dispatch_symbols,
             )
+        feedback_scope_mode = (
+            str(funnel_diagnostics.get('feedback_scope_mode')).strip()
+            if isinstance(funnel_diagnostics, dict) and funnel_diagnostics.get('feedback_scope_mode') is not None
+            else None
+        )
         normalized_role_symbol_scopes = _normalize_role_symbol_scopes(
             roles=requested_role_names,
             symbols=dispatch_symbols,
@@ -2829,6 +2834,7 @@ class AgentFeedbackOrchestrator:
                 for role, symbols in normalized_role_symbol_scopes.items()
             },
             'mode': 'role_sequential_runtime_buffered',
+            'feedback_scope_mode': feedback_scope_mode,
         }
         state = RuntimeFeedbackRunState(
             run_id=request_run_id,
@@ -2842,6 +2848,7 @@ class AgentFeedbackOrchestrator:
             current_role=specs[0].role if specs else None,
             role_symbol_scopes=normalized_role_symbol_scopes,
             funnel_diagnostics=funnel_diagnostics,
+            feedback_scope_mode=feedback_scope_mode,
         )
         runtime_feedback_state_store.start_run(state)
         agent_context_feedback_run_state_service.start_run(

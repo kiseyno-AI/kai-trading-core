@@ -6,6 +6,7 @@ import os
 from datetime import date
 
 from app.agent_context.retry_service import EXPECTED_ROLES, FeedbackRetryCycleConfig, agent_feedback_retry_service
+from app.agent_context.run_modes import FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH, FEEDBACK_SCOPE_MODES
 
 MAX_CYCLES = 3
 OUTER_BATCH_SIZE = 20
@@ -36,6 +37,12 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument('--max-cycles', type=int, default=MAX_CYCLES)
     parser.add_argument('--outer-batch-size', type=int, default=OUTER_BATCH_SIZE)
+    parser.add_argument(
+        '--feedback-scope-mode',
+        choices=FEEDBACK_SCOPE_MODES,
+        default=FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
+        help='Scope mode for role targets. Defaults to decider_scope_fast_path for morning/operator readiness.',
+    )
     return parser.parse_args()
 
 
@@ -46,6 +53,7 @@ def main() -> None:
             market_date=args.market_date,
             roles=EXPECTED_ROLES,
             symbols=tuple(args.symbols) if args.symbols else None,
+            feedback_scope_mode=args.feedback_scope_mode,
             max_cycles=args.max_cycles,
             outer_batch_size=args.outer_batch_size,
             reuse_existing=True,
