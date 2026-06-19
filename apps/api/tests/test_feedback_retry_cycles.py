@@ -798,6 +798,104 @@ class FeedbackRetryCycleTests(unittest.TestCase):
         self.assertEqual(role_progress['retry_queued_symbols'], 1)
         self.assertEqual(role_progress['retry_attempted_symbols'], 1)
 
+    def test_decider_fast_path_retry_does_not_resume_from_prior_broad_scope_run(self):
+        service = AgentFeedbackRetryService()
+        run_state_service = RecordingRunStateService()
+        roles = ('signal-decider',)
+        symbols = ('005930',)
+        retry_completed = {'value': False}
+        dispatch_calls = []
+        find_latest_calls = []
+        previous_broad_run = {
+            'run_id': 'prior-broad-retry-run',
+            'request_payload': {
+                'symbols': list(symbols),
+                'requested_symbols': list(symbols),
+                'roles': list(roles),
+                'mode': 'daily_retry_cycle_role_sequenced',
+                'feedback_scope_mode': 'broad_feedback_universe',
+            },
+            'summary_payload': {
+                'feedback_scope_mode': 'broad_feedback_universe',
+                'progress_summary': {
+                    'cycle_number': 1,
+                    'completed_cycles': 1,
+                },
+            },
+        }
+
+        def find_latest_run(**kwargs):
+            find_latest_calls.append(kwargs)
+            if kwargs.get('feedback_scope_mode') in (None, 'broad_feedback_universe'):
+                return previous_broad_run
+            return None
+
+        def build_snapshot(**kwargs):
+            if retry_completed['value']:
+                role_state = _role_state(
+                    role='signal-decider',
+                    symbols=symbols,
+                    completed=symbols,
+                )
+            else:
+                role_state = _role_state(
+                    role='signal-decider',
+                    symbols=symbols,
+                    failed=symbols,
+                    retry_pending=symbols,
+                )
+            return _snapshot(
+                symbols=symbols,
+                role_states={'signal-decider': role_state},
+            )
+
+        def dispatch_for_symbols(**kwargs):
+            dispatch_calls.append(kwargs)
+            retry_completed['value'] = True
+            return {
+                'request': {'roles': kwargs['roles'], 'symbols': kwargs['symbols']},
+                'summary': {'status': 'completed', 'completed': len(kwargs['symbols']), 'failed': 0},
+            }
+
+        progress = {'request': {'expected_agents': list(roles)}, 'summary': {'cycle_status': 'completed'}}
+        run_state_service.find_latest_run = find_latest_run
+
+        with patch.object(service, '_load_eligible_symbols', return_value=list(symbols)):
+            with patch(
+                'app.agent_context.retry_service.load_agent_feedback_eligibility_records',
+                return_value=[],
+            ):
+                with patch.object(service, '_build_role_sequence_snapshot', side_effect=build_snapshot):
+                    with patch('app.agent_context.retry_service.agent_context_feedback_run_state_service', run_state_service):
+                        with patch(
+                            'app.agent_context.retry_service.agent_feedback_orchestrator.dispatch_for_symbols',
+                            side_effect=dispatch_for_symbols,
+                        ):
+                            with patch(
+                                'app.agent_context.retry_service.agent_context_progress_service.get_feedback_progress',
+                                return_value=progress,
+                            ):
+                                result = service.run_retry_cycles(
+                                    config=SimpleNamespace(
+                                        market_date=date.fromisoformat('2026-04-16'),
+                                        roles=roles,
+                                        symbols=symbols,
+                                        max_cycles=1,
+                                        outer_batch_size=20,
+                                        reuse_existing=True,
+                                        feedback_scope_mode='decider_scope_fast_path',
+                                    )
+                                )
+
+        self.assertEqual(find_latest_calls[0]['feedback_scope_mode'], 'decider_scope_fast_path')
+        self.assertIsNone(run_state_service.started[0]['request_payload']['resumed_from_run_id'])
+        self.assertEqual(
+            [(call['roles'][0], call['symbols']) for call in dispatch_calls],
+            [('signal-decider', ['005930'])],
+        )
+        self.assertEqual(result['cycles'][0]['mode'], 'retry_followup')
+        self.assertTrue(result['completed'])
+
     def test_run_retry_cycles_resumes_from_durable_role_boundary_without_redoing_completed_roles(self):
         service = AgentFeedbackRetryService()
         run_state_service = RecordingRunStateService()

@@ -53,6 +53,32 @@ class AgentContextFeedbackRunStateService:
                 scopes.append(comparable_scope)
         return scopes
 
+    @staticmethod
+    def _collect_run_feedback_scope_modes(run_snapshot: dict[str, Any]) -> list[str]:
+        payloads: list[dict[str, Any]] = []
+        request_payload = run_snapshot.get('request_payload') if isinstance(run_snapshot.get('request_payload'), dict) else None
+        summary_payload = run_snapshot.get('summary_payload') if isinstance(run_snapshot.get('summary_payload'), dict) else None
+        if request_payload is not None:
+            payloads.append(request_payload)
+        if summary_payload is not None:
+            payloads.append(summary_payload)
+            progress_summary = summary_payload.get('progress_summary')
+            if isinstance(progress_summary, dict):
+                payloads.append(progress_summary)
+            summary_request = summary_payload.get('request')
+            if isinstance(summary_request, dict):
+                payloads.append(summary_request)
+
+        modes: list[str] = []
+        for payload in payloads:
+            value = payload.get('feedback_scope_mode')
+            if value is None:
+                continue
+            mode = str(value).strip()
+            if mode and mode not in modes:
+                modes.append(mode)
+        return modes
+
     def resolve_run_requested_symbols(self, *, run_snapshot: dict[str, Any]) -> list[str] | None:
         payloads = self._iter_scope_payloads(run_snapshot)
         if not payloads:
@@ -207,6 +233,7 @@ class AgentContextFeedbackRunStateService:
         requested_symbols: list[str] | None = None,
         requested_roles: list[str] | None = None,
         request_modes: list[str] | tuple[str, ...] | None = None,
+        feedback_scope_mode: str | None = None,
     ) -> dict[str, Any] | None:
         with session_scope() as session:
             serialized_rows = [
@@ -221,6 +248,7 @@ class AgentContextFeedbackRunStateService:
         normalized_symbols = self._normalize_scope(requested_symbols)
         normalized_roles = self._normalize_scope(requested_roles)
         normalized_modes = set(self._normalize_scope(list(request_modes) if request_modes is not None else None))
+        normalized_feedback_scope_mode = str(feedback_scope_mode or '').strip()
         for row in serialized_rows:
             request_payload = row.get('request_payload') if isinstance(row.get('request_payload'), dict) else {}
             run_symbol_scopes = self._collect_run_symbol_scopes(row)
@@ -234,6 +262,9 @@ class AgentContextFeedbackRunStateService:
                     continue
             if normalized_modes and run_mode not in normalized_modes:
                 continue
+            if normalized_feedback_scope_mode:
+                if normalized_feedback_scope_mode not in self._collect_run_feedback_scope_modes(row):
+                    continue
             return row
         return None
 

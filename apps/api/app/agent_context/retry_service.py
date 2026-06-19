@@ -727,6 +727,7 @@ class AgentFeedbackRetryService:
             requested_symbols=list(requested_symbols) if requested_symbols is not None else None,
             requested_roles=list(roles),
             request_modes=[DAILY_RETRY_CYCLE_MODE],
+            feedback_scope_mode=feedback_scope_mode,
         )
         previous_cycle_number, previous_completed_cycles = self._extract_prior_cycle_state(previous_run)
         initial_snapshot = self._build_role_sequence_snapshot(
