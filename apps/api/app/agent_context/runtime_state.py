@@ -60,6 +60,7 @@ class RuntimeFeedbackRunState:
     max_cycles: int | None = None
     cycle_mode: str | None = None
     cycle_status: str | None = None
+    feedback_scope_mode: str | None = None
     completed_at: datetime | None = None
     buffered_feedback_rows: list[dict[str, Any]] = field(default_factory=list)
     buffered_failures: list[dict[str, Any]] = field(default_factory=list)
@@ -195,6 +196,12 @@ class RuntimeFeedbackRunState:
             expected_feedback_count=expected_feedback_count,
             failed_items=failed_items,
         )
+        funnel_broad_symbol_count = None
+        if isinstance(self.funnel_diagnostics, dict):
+            try:
+                funnel_broad_symbol_count = int(self.funnel_diagnostics.get('broad_symbol_count'))
+            except (TypeError, ValueError):
+                funnel_broad_symbol_count = None
 
         role_progress: dict[str, dict[str, Any]] = {}
         for role in self.requested_roles:
@@ -317,8 +324,9 @@ class RuntimeFeedbackRunState:
             'max_cycles': self.max_cycles,
             'cycle_mode': self.cycle_mode,
             'cycle_status': cycle_status,
+            'feedback_scope_mode': self.feedback_scope_mode,
             'parallel_per_role': self.parallel_per_role,
-            'broad_symbol_count': len(self.requested_symbols),
+            'broad_symbol_count': funnel_broad_symbol_count if funnel_broad_symbol_count is not None else len(self.requested_symbols),
             'role_symbol_counts': {
                 role: len(symbols)
                 for role, symbols in role_scopes.items()

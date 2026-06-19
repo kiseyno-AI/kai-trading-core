@@ -443,6 +443,7 @@ class InternalOpsTests(unittest.TestCase):
                 market_date='2026-04-14',
                 symbols='005930,000660',
                 roles='technical-summarizer',
+                feedback_scope_mode='broad_feedback_universe',
                 max_cycles=2,
                 outer_batch_size=10,
                 reuse_existing=False,
@@ -454,6 +455,7 @@ class InternalOpsTests(unittest.TestCase):
         self.assertEqual(config.market_date.isoformat(), '2026-04-14')
         self.assertEqual(config.symbols, ('005930', '000660'))
         self.assertEqual(config.roles, ('technical-summarizer',))
+        self.assertEqual(config.feedback_scope_mode, 'broad_feedback_universe')
         self.assertEqual(config.max_cycles, 2)
         self.assertEqual(config.outer_batch_size, 10)
         self.assertFalse(config.reuse_existing)

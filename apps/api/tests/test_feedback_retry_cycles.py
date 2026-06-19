@@ -410,6 +410,12 @@ class FeedbackRetryCycleTests(unittest.TestCase):
             run_state_service.started[0]['request_payload']['scope'],
             'requested_symbols_scored_by_strategy_aware_prefilter',
         )
+        self.assertEqual(run_state_service.started[0]['request_payload']['feedback_scope_mode'], 'decider_scope_fast_path')
+        self.assertEqual(
+            run_state_service.finished[0]['summary_payload']['feedback_scope_mode'],
+            'decider_scope_fast_path',
+        )
+        self.assertEqual(result['feedback_scope_mode'], 'decider_scope_fast_path')
         self.assertEqual(result['requested_symbols'], ['005930'])
         self.assertEqual(result['eligible_symbols'], ['005930'])
         self.assertEqual(result['skipped_symbols'], [])

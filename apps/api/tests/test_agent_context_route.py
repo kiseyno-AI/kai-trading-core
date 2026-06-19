@@ -198,6 +198,7 @@ class FakeAgentFeedbackRetryService:
             'max_cycles': config.max_cycles,
             'outer_batch_size': config.outer_batch_size,
             'reuse_existing': config.reuse_existing,
+            'feedback_scope_mode': config.feedback_scope_mode,
             'force': force,
             'cycles': [],
             'final_pending': 0,
@@ -1208,6 +1209,7 @@ class AgentContextRouteTests(unittest.TestCase):
                     'roles': ['technical-summarizer'],
                     'max_cycles': 2,
                     'outer_batch_size': 10,
+                    'feedback_scope_mode': 'broad_feedback_universe',
                     'reuse_existing': False,
                 },
             )
@@ -1220,7 +1222,9 @@ class AgentContextRouteTests(unittest.TestCase):
         self.assertEqual(fake_service.last_config.roles, ('technical-summarizer',))
         self.assertEqual(fake_service.last_config.max_cycles, 2)
         self.assertEqual(fake_service.last_config.outer_batch_size, 10)
+        self.assertEqual(fake_service.last_config.feedback_scope_mode, 'broad_feedback_universe')
         self.assertFalse(fake_service.last_config.reuse_existing)
+        self.assertEqual(response.json()['feedback_scope_mode'], 'broad_feedback_universe')
         self.assertEqual(response.json()['requested_symbols'], ['005930'])
         summary = response.json()['progress']['summary']
         self.assertEqual(summary['first_feedback_at'], '2026-04-14T01:00:00+00:00')

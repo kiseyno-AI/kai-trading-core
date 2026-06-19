@@ -8,6 +8,10 @@ from typing import Any, Callable, Sequence
 from app.agent_context.retry_service import FeedbackRetryCycleConfig, agent_feedback_retry_service
 from app.agent_context.prerequisite_service import agent_feedback_prerequisite_service
 from app.agent_context.roles import DECISION_SUPPORT_AGENT_NAMES, SUMMARIZER_AGENT_NAMES
+from app.agent_context.run_modes import (
+    FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE,
+    FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
+)
 from app.agent_context.signal_decider_loop_service import (
     DEFAULT_SIGNAL_DECIDER_EVALUATION_LOOKBACK_DAYS,
     signal_decider_loop_service,
@@ -1023,6 +1027,11 @@ class DailyPipelineStageService:
                     market_date=date.fromisoformat(market_date),
                     roles=roles,
                     symbols=tuple(symbols) if symbols else None,
+                    feedback_scope_mode=(
+                        FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE
+                        if stage_id == 'agent_feedback_summaries'
+                        else FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH
+                    ),
                     max_cycles=feedback_max_cycles,
                     outer_batch_size=feedback_outer_batch_size,
                     reuse_existing=reuse_existing_feedback,

@@ -7,7 +7,12 @@ from typing import Any, Sequence
 
 from sqlalchemy import select
 
-from app.agent_context.roles import DECISION_SUPPORT_AGENT_NAMES
+from app.agent_context.roles import DECISION_SUPPORT_AGENT_NAMES, SUMMARIZER_AGENT_NAMES
+from app.agent_context.run_modes import (
+    FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE,
+    FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
+    normalize_feedback_scope_mode,
+)
 from app.core.settings import settings
 from app.db import session_scope
 from app.db_models import (
@@ -1403,6 +1408,182 @@ def _role_cap_metadata(
     }
 
 
+def _build_role_scope_selection(
+    *,
+    role: str,
+    records: Sequence[dict[str, Any]],
+    requested_scope_bypass: bool,
+    summarizer_gate_by_symbol: dict[str, Any] | None,
+    forced_inclusion_reasons_by_symbol: dict[str, list[dict[str, Any]]] | None,
+    feedback_scope_mode: str,
+    decider_scope_symbols: Sequence[str] | None = None,
+) -> tuple[list[str], dict[str, Any]]:
+    ranked = _role_ranked_records(
+        role=role,
+        records=records,
+        summarizer_gate_by_symbol=summarizer_gate_by_symbol,
+    )
+    forced_reasons_by_symbol: dict[str, list[dict[str, Any]]] = {}
+    for record in ranked:
+        symbol = str(record.get('symbol') or '').strip().upper()
+        forced_reasons = _merge_forced_reasons(
+            record=record,
+            forced_inclusion_reasons_by_symbol=forced_inclusion_reasons_by_symbol,
+        )
+        if forced_reasons:
+            forced_reasons_by_symbol[symbol] = forced_reasons
+
+    if requested_scope_bypass:
+        selected_symbols = {str(record.get('symbol') or '').strip().upper() for record in ranked}
+        cap_limit = len(selected_symbols)
+    else:
+        cap_limit = _role_cap_limit(role, len(ranked))
+        selected_symbols = set()
+        for record in ranked:
+            if len(selected_symbols) >= cap_limit and cap_limit > 0:
+                break
+            selected_symbols.add(str(record.get('symbol') or '').strip().upper())
+        selected_symbols.update(forced_reasons_by_symbol)
+        if cap_limit <= 0:
+            selected_symbols = {str(record.get('symbol') or '').strip().upper() for record in ranked}
+
+    role_cap_selected_symbols = set(selected_symbols)
+    decider_scope_applied = decider_scope_symbols is not None
+    normalized_decider_scope = _normalize_symbol_scope(decider_scope_symbols) or []
+    if decider_scope_applied:
+        selected_symbols = set(normalized_decider_scope)
+
+    if decider_scope_applied:
+        ranked_symbol_set = {
+            str(record.get('symbol') or '').strip().upper()
+            for record in ranked
+        }
+        ordered_selected = [
+            symbol
+            for symbol in normalized_decider_scope
+            if symbol in ranked_symbol_set
+        ]
+    else:
+        ordered_selected = [
+            str(record.get('symbol') or '').strip().upper()
+            for record in ranked
+            if str(record.get('symbol') or '').strip().upper() in selected_symbols
+        ]
+    cap_excluded = [
+        str(record.get('symbol') or '').strip().upper()
+        for record in ranked
+        if str(record.get('symbol') or '').strip().upper() not in selected_symbols
+    ]
+    cap_applied = len(ordered_selected) < len(ranked)
+    selection_reasons_by_symbol: dict[str, list[str]] = defaultdict(list)
+    rank_by_symbol: dict[str, int] = {}
+    for index, record in enumerate(ranked, start=1):
+        symbol = str(record.get('symbol') or '').strip().upper()
+        rank_by_symbol[symbol] = index
+        if symbol not in selected_symbols:
+            continue
+        if requested_scope_bypass and symbol in role_cap_selected_symbols:
+            selection_reasons_by_symbol[symbol].append(AGENT_FEEDBACK_ROLE_CAP_BYPASS_REASON_REQUESTED)
+        elif symbol in role_cap_selected_symbols and index <= cap_limit:
+            selection_reasons_by_symbol[symbol].append('rank_within_role_cap')
+        gate = _summarizer_gate_payload((summarizer_gate_by_symbol or {}).get(symbol))
+        if _normalize_action(gate.get('candidate_action')) == 'advance_to_decider':
+            selection_reasons_by_symbol[symbol].append('summarizer_gate_advance_to_decider')
+        if decider_scope_applied:
+            selection_reasons_by_symbol[symbol].append(FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH)
+        for reason in forced_reasons_by_symbol.get(symbol, []):
+            selection_reasons_by_symbol[symbol].append(f"forced:{reason.get('code')}")
+
+    diagnostics = {
+        'role': role,
+        'symbols': ordered_selected,
+        'feedback_scope_mode': feedback_scope_mode,
+        'role_cap': _role_cap_metadata(
+            role=role,
+            total=len(ranked),
+            selected_count=len(ordered_selected),
+            cap_limit=cap_limit,
+            cap_applied=cap_applied,
+            requested_scope_bypass=requested_scope_bypass,
+            forced_included_count=len(forced_reasons_by_symbol),
+        ),
+        'scope_alignment': {
+            'mode': feedback_scope_mode,
+            'applied': decider_scope_applied,
+            'decider_scope_symbol_count': len(ordered_selected) if decider_scope_applied else None,
+        },
+        'cap_excluded_symbols': cap_excluded[:200],
+        'cap_excluded_symbol_count': len(cap_excluded),
+        'forced_included_symbols': sorted(forced_reasons_by_symbol),
+        'forced_inclusion_reasons_by_symbol': forced_reasons_by_symbol,
+        'selection_reasons_by_symbol': {
+            symbol: reasons
+            for symbol, reasons in selection_reasons_by_symbol.items()
+        },
+        'role_rank_by_symbol': rank_by_symbol,
+    }
+    return ordered_selected, diagnostics
+
+
+def _decider_scope_roles(roles: Sequence[str]) -> list[str]:
+    requested_decider_roles = [
+        role
+        for role in roles
+        if role in DECISION_SUPPORT_AGENT_NAMES
+    ]
+    return requested_decider_roles or list(DECISION_SUPPORT_AGENT_NAMES)
+
+
+def _build_decider_scope_fast_path(
+    *,
+    roles: Sequence[str],
+    records: Sequence[dict[str, Any]],
+    requested_scope_bypass: bool,
+    summarizer_gate_by_symbol: dict[str, Any] | None,
+    forced_inclusion_reasons_by_symbol: dict[str, list[dict[str, Any]]] | None,
+) -> dict[str, Any]:
+    source_roles = _decider_scope_roles(roles)
+    candidate_scopes: list[tuple[str, list[str], dict[str, Any]]] = []
+    for role in source_roles:
+        symbols, diagnostics = _build_role_scope_selection(
+            role=role,
+            records=records,
+            requested_scope_bypass=requested_scope_bypass,
+            summarizer_gate_by_symbol=summarizer_gate_by_symbol,
+            forced_inclusion_reasons_by_symbol=forced_inclusion_reasons_by_symbol,
+            feedback_scope_mode=FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
+        )
+        candidate_scopes.append((role, symbols, diagnostics))
+
+    if not candidate_scopes:
+        return {
+            'mode': FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
+            'applied': True,
+            'source_roles': [],
+            'reference_role': None,
+            'symbol_count': 0,
+            'symbols': [],
+            'candidate_role_symbol_counts': {},
+        }
+
+    reference_role, reference_symbols, _ = min(
+        candidate_scopes,
+        key=lambda item: (len(item[1]), source_roles.index(item[0])),
+    )
+    return {
+        'mode': FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
+        'applied': True,
+        'source_roles': source_roles,
+        'reference_role': reference_role,
+        'symbol_count': len(reference_symbols),
+        'symbols': list(reference_symbols),
+        'candidate_role_symbol_counts': {
+            role: len(symbols)
+            for role, symbols, _ in candidate_scopes
+        },
+    }
+
+
 def build_agent_feedback_role_funnel(
     *,
     records: Sequence[dict[str, Any]],
@@ -1411,7 +1592,9 @@ def build_agent_feedback_role_funnel(
     candidate_symbols: Sequence[str] | None = None,
     summarizer_gate_by_symbol: dict[str, Any] | None = None,
     forced_inclusion_reasons_by_symbol: dict[str, list[dict[str, Any]]] | None = None,
+    feedback_scope_mode: str = FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE,
 ) -> dict[str, Any]:
+    normalized_feedback_scope_mode = normalize_feedback_scope_mode(feedback_scope_mode)
     requested_scope_bypass = _requested_scope_bypasses_caps(requested_symbols)
     dispatchable_records = _ordered_dispatchable_records(
         records=records,
@@ -1421,94 +1604,53 @@ def build_agent_feedback_role_funnel(
     role_symbols: dict[str, list[str]] = {}
     role_diagnostics: dict[str, Any] = {}
     seen_roles: list[str] = []
+    decider_scope = (
+        _build_decider_scope_fast_path(
+            roles=roles,
+            records=dispatchable_records,
+            requested_scope_bypass=requested_scope_bypass,
+            summarizer_gate_by_symbol=summarizer_gate_by_symbol,
+            forced_inclusion_reasons_by_symbol=forced_inclusion_reasons_by_symbol,
+        )
+        if normalized_feedback_scope_mode == FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH
+        else {
+            'mode': FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE,
+            'applied': False,
+            'source_roles': [],
+            'reference_role': None,
+            'symbol_count': None,
+            'symbols': None,
+            'candidate_role_symbol_counts': {},
+        }
+    )
     for raw_role in roles:
         role = str(raw_role or '').strip()
         if not role or role in seen_roles:
             continue
         seen_roles.append(role)
-        ranked = _role_ranked_records(
+        fast_path_scope_symbols = (
+            decider_scope.get('symbols')
+            if normalized_feedback_scope_mode == FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH
+            and role in (*SUMMARIZER_AGENT_NAMES, *DECISION_SUPPORT_AGENT_NAMES)
+            else None
+        )
+        selected, diagnostics = _build_role_scope_selection(
             role=role,
             records=dispatchable_records,
+            requested_scope_bypass=requested_scope_bypass,
             summarizer_gate_by_symbol=summarizer_gate_by_symbol,
+            forced_inclusion_reasons_by_symbol=forced_inclusion_reasons_by_symbol,
+            feedback_scope_mode=normalized_feedback_scope_mode,
+            decider_scope_symbols=fast_path_scope_symbols,
         )
-        forced_reasons_by_symbol: dict[str, list[dict[str, Any]]] = {}
-        for record in ranked:
-            symbol = str(record.get('symbol') or '').strip().upper()
-            forced_reasons = _merge_forced_reasons(
-                record=record,
-                forced_inclusion_reasons_by_symbol=forced_inclusion_reasons_by_symbol,
-            )
-            if forced_reasons:
-                forced_reasons_by_symbol[symbol] = forced_reasons
-
-        if requested_scope_bypass:
-            selected_symbols = {str(record.get('symbol') or '').strip().upper() for record in ranked}
-            cap_limit = len(selected_symbols)
-        else:
-            cap_limit = _role_cap_limit(role, len(ranked))
-            selected_symbols = set()
-            for record in ranked:
-                if len(selected_symbols) >= cap_limit and cap_limit > 0:
-                    break
-                selected_symbols.add(str(record.get('symbol') or '').strip().upper())
-            selected_symbols.update(forced_reasons_by_symbol)
-            if cap_limit <= 0:
-                selected_symbols = {str(record.get('symbol') or '').strip().upper() for record in ranked}
-
-        ordered_selected = [
-            str(record.get('symbol') or '').strip().upper()
-            for record in ranked
-            if str(record.get('symbol') or '').strip().upper() in selected_symbols
-        ]
-        cap_excluded = [
-            str(record.get('symbol') or '').strip().upper()
-            for record in ranked
-            if str(record.get('symbol') or '').strip().upper() not in selected_symbols
-        ]
-        cap_applied = len(ordered_selected) < len(ranked)
-        selection_reasons_by_symbol: dict[str, list[str]] = defaultdict(list)
-        rank_by_symbol: dict[str, int] = {}
-        for index, record in enumerate(ranked, start=1):
-            symbol = str(record.get('symbol') or '').strip().upper()
-            rank_by_symbol[symbol] = index
-            if symbol not in selected_symbols:
-                continue
-            if requested_scope_bypass:
-                selection_reasons_by_symbol[symbol].append(AGENT_FEEDBACK_ROLE_CAP_BYPASS_REASON_REQUESTED)
-            elif index <= cap_limit:
-                selection_reasons_by_symbol[symbol].append('rank_within_role_cap')
-            gate = _summarizer_gate_payload((summarizer_gate_by_symbol or {}).get(symbol))
-            if _normalize_action(gate.get('candidate_action')) == 'advance_to_decider':
-                selection_reasons_by_symbol[symbol].append('summarizer_gate_advance_to_decider')
-            for reason in forced_reasons_by_symbol.get(symbol, []):
-                selection_reasons_by_symbol[symbol].append(f"forced:{reason.get('code')}")
-        role_symbols[role] = ordered_selected
-        role_diagnostics[role] = {
-            'role': role,
-            'symbols': ordered_selected,
-            'role_cap': _role_cap_metadata(
-                role=role,
-                total=len(ranked),
-                selected_count=len(ordered_selected),
-                cap_limit=cap_limit,
-                cap_applied=cap_applied,
-                requested_scope_bypass=requested_scope_bypass,
-                forced_included_count=len(forced_reasons_by_symbol),
-            ),
-            'cap_excluded_symbols': cap_excluded[:200],
-            'cap_excluded_symbol_count': len(cap_excluded),
-            'forced_included_symbols': sorted(forced_reasons_by_symbol),
-            'forced_inclusion_reasons_by_symbol': forced_reasons_by_symbol,
-            'selection_reasons_by_symbol': {
-                symbol: reasons
-                for symbol, reasons in selection_reasons_by_symbol.items()
-            },
-            'role_rank_by_symbol': rank_by_symbol,
-        }
+        role_symbols[role] = selected
+        role_diagnostics[role] = diagnostics
     return {
         'schema_version': AGENT_FEEDBACK_FUNNEL_SCHEMA_VERSION,
+        'feedback_scope_mode': normalized_feedback_scope_mode,
         'broad_symbol_count': len(broad_symbols),
         'broad_symbols': broad_symbols,
+        'decider_scope': decider_scope,
         'requested_symbol_count': len(_normalize_symbol_scope(requested_symbols) or []),
         'requested_scope_bypass': requested_scope_bypass,
         'role_symbols': role_symbols,

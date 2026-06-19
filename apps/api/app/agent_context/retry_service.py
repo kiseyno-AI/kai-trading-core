@@ -23,7 +23,11 @@ from app.agent_context.orchestrator import agent_feedback_orchestrator
 from app.agent_context.progress_service import agent_context_progress_service
 from app.agent_context.reuse_service import agent_context_reuse_service
 from app.agent_context.roles import DEFAULT_AGENT_NAMES, SIGNAL_DECIDER_AGENT_NAME
-from app.agent_context.run_modes import DAILY_RETRY_CYCLE_MODE
+from app.agent_context.run_modes import (
+    DAILY_RETRY_CYCLE_MODE,
+    FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
+    normalize_feedback_scope_mode,
+)
 from app.agent_context.run_state_service import agent_context_feedback_run_state_service
 from app.agent_context.runtime_state import RuntimeFeedbackRunState, runtime_feedback_state_store
 from app.core.settings import settings
@@ -46,11 +50,24 @@ def _normalize_optional_symbol_scope(symbols: Sequence[str]) -> list[str]:
     return normalized
 
 
+def _ordered_symbol_union(symbol_scopes: Sequence[Sequence[str]]) -> list[str]:
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for scope in symbol_scopes:
+        for symbol in _normalize_optional_symbol_scope(scope):
+            if symbol in seen:
+                continue
+            seen.add(symbol)
+            ordered.append(symbol)
+    return ordered
+
+
 @dataclass(frozen=True)
 class FeedbackRetryCycleConfig:
     market_date: date
     roles: tuple[str, ...]
     symbols: tuple[str, ...] | None = None
+    feedback_scope_mode: str = FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH
     max_cycles: int = 3
     outer_batch_size: int = 20
     reuse_existing: bool = True
@@ -433,6 +450,7 @@ class AgentFeedbackRetryService:
             'market_date': market_date.isoformat(),
             'request': request_payload,
             'mode': DAILY_RETRY_CYCLE_MODE,
+            'feedback_scope_mode': state.feedback_scope_mode or request_payload.get('feedback_scope_mode'),
             'lifecycle_stage': lifecycle_stage,
             'current_role': progress_summary.get('current_role'),
             'completed_roles': list(progress_summary.get('completed_roles') or []),
@@ -552,6 +570,7 @@ class AgentFeedbackRetryService:
                 'failed_items': failed_count,
                 'role_progress': progress_summary.get('role_progress') if isinstance(progress_summary.get('role_progress'), dict) else {},
                 'role_symbol_counts': progress_summary.get('role_symbol_counts') or summary_payload.get('role_symbol_counts'),
+                'feedback_scope_mode': progress_summary.get('feedback_scope_mode') or summary_payload.get('feedback_scope_mode'),
                 'current_role': current_role,
                 'cycle_result': cycle_result,
             },
@@ -635,6 +654,7 @@ class AgentFeedbackRetryService:
     def run_retry_cycles(self, *, config: FeedbackRetryCycleConfig, force: bool = False) -> dict[str, Any]:
         roles = tuple(config.roles)
         progress_callback = getattr(config, 'progress_callback', None)
+        feedback_scope_mode = normalize_feedback_scope_mode(getattr(config, 'feedback_scope_mode', None))
         raw_requested_symbols = getattr(config, 'symbols', None)
         requested_symbols = (
             tuple(_normalize_requested_symbols(raw_requested_symbols))
@@ -657,6 +677,7 @@ class AgentFeedbackRetryService:
                 'max_cycles': config.max_cycles,
                 'outer_batch_size': config.outer_batch_size,
                 'reuse_existing': config.reuse_existing,
+                'feedback_scope_mode': feedback_scope_mode,
                 'requested_symbols': list(requested_symbols) if requested_symbols is not None else None,
                 'eligible_symbols': None,
                 'skipped_symbols': [],
@@ -686,12 +707,16 @@ class AgentFeedbackRetryService:
             roles=roles,
             requested_symbols=requested_symbols,
             candidate_symbols=eligible_symbols,
+            feedback_scope_mode=feedback_scope_mode,
         )
         role_symbol_scopes = {
             role: tuple(symbols)
             for role, symbols in role_funnel.get('role_symbols', {}).items()
             if isinstance(symbols, list)
         }
+        scoped_feedback_symbols = _ordered_symbol_union(
+            [role_symbol_scopes.get(role, ()) for role in roles]
+        ) or list(eligible_symbols)
         skipped_symbols = (
             [symbol for symbol in requested_symbols or () if symbol not in set(eligible_symbols)]
             if requested_symbols is not None
@@ -707,7 +732,7 @@ class AgentFeedbackRetryService:
         initial_snapshot = self._build_role_sequence_snapshot(
             market_date=config.market_date,
             roles=roles,
-            eligible_symbols=eligible_symbols,
+            eligible_symbols=scoped_feedback_symbols,
             role_symbol_scopes=role_symbol_scopes,
         )
         next_plan = self._resolve_cycle_plan(
@@ -720,8 +745,10 @@ class AgentFeedbackRetryService:
         request_run_id = f"feedback-cycle-{config.market_date.isoformat()}-{uuid4().hex[:10]}"
         request_payload = {
             'market_date': config.market_date.isoformat(),
-            'symbols': list(eligible_symbols),
-            'requested_symbols': list(requested_symbols) if requested_symbols is not None else list(eligible_symbols),
+            'symbols': list(scoped_feedback_symbols),
+            'broad_symbols': list(eligible_symbols),
+            'broad_symbol_count': len(eligible_symbols),
+            'requested_symbols': list(requested_symbols) if requested_symbols is not None else list(scoped_feedback_symbols),
             'request_run_id': request_run_id,
             'roles': list(roles),
             'max_cycles': config.max_cycles,
@@ -729,6 +756,7 @@ class AgentFeedbackRetryService:
             'parallel_subtasks': max(1, int(settings.openclaw_agent_parallel_subtasks)),
             'reuse_existing': config.reuse_existing,
             'scope': resolve_agent_feedback_scope(requested_symbols=requested_symbols),
+            'feedback_scope_mode': feedback_scope_mode,
             'eligibility_rule': AGENT_FEEDBACK_ELIGIBILITY_RULE,
             'eligibility_filters': list(AGENT_FEEDBACK_ELIGIBILITY_FILTERS),
             'eligibility_diagnostics': eligibility_diagnostics,
@@ -748,7 +776,7 @@ class AgentFeedbackRetryService:
         logical_state = RuntimeFeedbackRunState(
             run_id=request_run_id,
             market_date=config.market_date,
-            requested_symbols=list(eligible_symbols),
+            requested_symbols=list(scoped_feedback_symbols),
             requested_roles=list(roles),
             role_sequence=list(roles),
             parallel_per_role=max(1, int(settings.openclaw_agent_parallel_subtasks)),
@@ -760,6 +788,7 @@ class AgentFeedbackRetryService:
                 for role, symbols in role_symbol_scopes.items()
             },
             funnel_diagnostics=role_funnel,
+            feedback_scope_mode=feedback_scope_mode,
         )
         runtime_feedback_state_store.start_run(logical_state, replace=True, logical=True)
         self._sync_runtime_state(
@@ -784,7 +813,7 @@ class AgentFeedbackRetryService:
         agent_context_feedback_run_state_service.start_run(
             run_id=request_run_id,
             market_date=config.market_date,
-            symbols_total=len(eligible_symbols),
+            symbols_total=len(scoped_feedback_symbols),
             request_payload=request_payload,
             summary_payload=self._build_run_summary_payload(
                 market_date=config.market_date,
@@ -837,7 +866,7 @@ class AgentFeedbackRetryService:
                     snapshot_before_role = self._build_role_sequence_snapshot(
                         market_date=config.market_date,
                         roles=roles,
-                        eligible_symbols=eligible_symbols,
+                        eligible_symbols=scoped_feedback_symbols,
                         role_symbol_scopes=role_symbol_scopes,
                     )
                     completed_roles_before = tuple(
@@ -963,7 +992,7 @@ class AgentFeedbackRetryService:
                     snapshot_after_role = self._build_role_sequence_snapshot(
                         market_date=config.market_date,
                         roles=roles,
-                        eligible_symbols=eligible_symbols,
+                        eligible_symbols=scoped_feedback_symbols,
                         role_symbol_scopes=role_symbol_scopes,
                     )
                     role_state_after = snapshot_after_role.role_states[role]
@@ -1030,7 +1059,7 @@ class AgentFeedbackRetryService:
                 snapshot_after_cycle = self._build_role_sequence_snapshot(
                     market_date=config.market_date,
                     roles=roles,
-                    eligible_symbols=eligible_symbols,
+                    eligible_symbols=scoped_feedback_symbols,
                     role_symbol_scopes=role_symbol_scopes,
                 )
                 retry_pending_symbols = self._collect_retry_pending_symbols(snapshot_after_cycle)
@@ -1069,7 +1098,7 @@ class AgentFeedbackRetryService:
             final_snapshot = self._build_role_sequence_snapshot(
                 market_date=config.market_date,
                 roles=roles,
-                eligible_symbols=eligible_symbols,
+                eligible_symbols=scoped_feedback_symbols,
                 role_symbol_scopes=role_symbol_scopes,
             )
             final_retry_pending_symbols = self._collect_retry_pending_symbols(final_snapshot)
@@ -1144,7 +1173,7 @@ class AgentFeedbackRetryService:
             self._build_role_sequence_snapshot(
                 market_date=config.market_date,
                 roles=roles,
-                eligible_symbols=eligible_symbols,
+                eligible_symbols=scoped_feedback_symbols,
                 role_symbol_scopes=role_symbol_scopes,
             )
         )
@@ -1155,6 +1184,7 @@ class AgentFeedbackRetryService:
             'max_cycles': config.max_cycles,
             'outer_batch_size': config.outer_batch_size,
             'reuse_existing': config.reuse_existing,
+            'feedback_scope_mode': feedback_scope_mode,
             'requested_symbols': list(requested_symbols) if requested_symbols is not None else None,
             'eligible_symbols': list(eligible_symbols) if requested_symbols is not None else None,
             'skipped_symbols': skipped_symbols,
