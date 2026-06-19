@@ -9,7 +9,7 @@ The response is now a stable coverage and liveness snapshot:
 - `run_id` is optional and lets operators inspect the exact durable run returned by dispatch or retry endpoints
 - dispatch and retry run scopes now reflect the intersection of the active pre-filters, not Piotroski alone
 - retry-cycle run scopes now separate `feedback_scope_mode`, `broad_symbol_count`, and per-role `role_symbol_counts`; `decider_scope_fast_path` progress totals use the decider candidate scope while `broad_feedback_universe` keeps independent wider summarizer scopes for offline enrichment
-- when a matching retry-cycle `agent_context_feedback_runs` row exists, aggregate counts stay grounded in persisted feedback and failure rows while live lifecycle fields such as `current_role`, `completed_roles`, and `cycle_status` still come from the active run metadata
+- when a matching live `agent_context_feedback_runs` row exists, aggregate counts stay grounded in persisted feedback and failure rows while live lifecycle fields such as `current_role`, `completed_roles`, and `cycle_status` still come from the active run metadata
 - top-level `progress_ratio` and `progress_percent` represent whole-cycle completion across all expected symbol-role feedback items
 - `boundary_progress_ratio` and `boundary_progress_percent` keep the separate symbol-boundary coverage signal that used to drive the top-level percentage
 - `terminal_feedback_count` shows how many expected feedback items are already terminal via either stored feedback or stored failure rows
@@ -19,7 +19,7 @@ The response is now a stable coverage and liveness snapshot:
 - `failure_groups` groups unresolved stored failures by status, including `dependency/missing-upstream`, `transport/timeout`, `response/invalid-json`, `response/assistant-non-json`, and `response/contract`
 - when prerequisites are not ready and no live or durable run exists yet, `run_status` can be `waiting` or `blocked`, and the top-level `prerequisites` block explains which upstream stages still gate dispatch
 - prerequisite stage items preserve pipeline gate diagnostics (`gate_status`, `severity`, `blocking_status`, and `gate_reason`) so a partial upstream row-count stage can be shown as non-blocking degraded coverage instead of a feedback failure
-- `latest_feedback_at` and `seconds_since_last_feedback` help operators tell whether a run is still alive
+- `latest_feedback_at`, `latest_failed_feedback_at`, and `seconds_since_last_feedback` help operators tell whether a run is still alive
 - `first_feedback_at`, `elapsed_seconds`, rates, and ETA fields are calculated only from feedback rows for the same target symbol universe used by the progress counts
 - `estimated_completion_at` is an ETA for active runs and the latest feedback timestamp for already completed runs
 
@@ -79,6 +79,7 @@ GET /agent-context/feedback/progress?market_date=2026-04-16&run_id=feedback-cycl
     "is_live": false,
     "first_feedback_at": "2026-04-17T06:58:10.141902+09:00",
     "latest_feedback_at": "2026-04-17T07:16:28.988041+09:00",
+    "latest_failed_feedback_at": "2026-04-17T07:10:12.441902+09:00",
     "elapsed_seconds": 6330,
     "seconds_since_last_feedback": 5231,
     "stalled_threshold_seconds": 300,
