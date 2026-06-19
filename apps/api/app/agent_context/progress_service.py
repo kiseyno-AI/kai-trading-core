@@ -108,11 +108,10 @@ class AgentContextProgressService:
                 summary_payload = persisted_progress['summary']
                 result_payload = persisted_progress['result']
             elif (
-                resolved_run_mode == DAILY_RETRY_CYCLE_MODE
+                self._is_live_run_snapshot(resolved_run)
                 and scope_resolved_from_run
-                and self._is_live_run_snapshot(resolved_run)
             ):
-                summary_payload = self._merge_live_retry_run_snapshot_with_persisted_progress(
+                summary_payload = self._merge_live_run_snapshot_with_persisted_progress(
                     persisted_summary=persisted_progress['summary'],
                     run_snapshot=resolved_run,
                 )
@@ -359,7 +358,7 @@ class AgentContextProgressService:
             merged['role_progress'] = role_progress
         return merged
 
-    def _merge_live_retry_run_snapshot_with_persisted_progress(
+    def _merge_live_run_snapshot_with_persisted_progress(
         self,
         *,
         persisted_summary: dict[str, Any],
@@ -660,6 +659,7 @@ class AgentContextProgressService:
         reused_by_role: dict[str, set[str]] = {agent_name: set() for agent_name in expected_agents}
         stale_by_role: dict[str, set[str]] = {agent_name: set() for agent_name in expected_agents}
         feedback_received_at: list[datetime] = []
+        failure_received_at: list[datetime] = []
 
         if scoped_symbols:
             with session_scope() as session:
@@ -706,6 +706,8 @@ class AgentContextProgressService:
                 if symbol in completed_by_role[agent_name]:
                     continue
                 failed_by_role[agent_name].add(symbol)
+                if row.received_at is not None:
+                    failure_received_at.append(row.received_at)
                 unresolved_failures.append(
                     {
                         'symbol': symbol,
@@ -743,6 +745,8 @@ class AgentContextProgressService:
 
         first_feedback_at = min(feedback_received_at) if feedback_received_at else None
         latest_feedback_at = max(feedback_received_at) if feedback_received_at else None
+        first_failed_feedback_at = min(failure_received_at) if failure_received_at else None
+        latest_failed_feedback_at = max(failure_received_at) if failure_received_at else None
         return {
             'result': self._build_result(
                 market_date=market_date,
@@ -760,6 +764,8 @@ class AgentContextProgressService:
                 stale_by_role=stale_by_role,
                 first_feedback_at=first_feedback_at,
                 latest_feedback_at=latest_feedback_at,
+                first_failed_feedback_at=first_failed_feedback_at,
+                latest_failed_feedback_at=latest_failed_feedback_at,
                 unresolved_failures=unresolved_failures,
             ),
         }
@@ -955,6 +961,8 @@ class AgentContextProgressService:
         stale_by_role: dict[str, set[str]],
         first_feedback_at: datetime | None,
         latest_feedback_at: datetime | None,
+        first_failed_feedback_at: datetime | None,
+        latest_failed_feedback_at: datetime | None,
         unresolved_failures: Sequence[dict[str, Any]],
     ) -> dict[str, Any]:
         requested_count = len(requested_symbols)
@@ -1080,6 +1088,8 @@ class AgentContextProgressService:
             'parallel_per_role': None,
             'first_feedback_at': first_feedback_at.isoformat() if first_feedback_at else None,
             'latest_feedback_at': latest_feedback_at.isoformat() if latest_feedback_at else None,
+            'first_failed_feedback_at': first_failed_feedback_at.isoformat() if first_failed_feedback_at else None,
+            'latest_failed_feedback_at': latest_failed_feedback_at.isoformat() if latest_failed_feedback_at else None,
             'elapsed_seconds': elapsed_seconds,
             'seconds_since_last_feedback': seconds_since_last_feedback,
             'stalled_threshold_seconds': 300,

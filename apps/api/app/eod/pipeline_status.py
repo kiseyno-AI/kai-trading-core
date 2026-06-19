@@ -478,6 +478,43 @@ def _coerce_int(*values: Any, default: int = 0) -> int:
     return default
 
 
+def _coerce_iso_timestamp(value: Any) -> str | None:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, str):
+        stripped = value.strip()
+        return stripped or None
+    return None
+
+
+def _parse_iso_timestamp(value: str) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _latest_iso_timestamp(*values: Any) -> str | None:
+    latest_text: str | None = None
+    latest_value: datetime | None = None
+    for value in values:
+        timestamp = _coerce_iso_timestamp(value)
+        if timestamp is None:
+            continue
+        parsed = _parse_iso_timestamp(timestamp)
+        if parsed is None:
+            if latest_value is None and (latest_text is None or timestamp > latest_text):
+                latest_text = timestamp
+            continue
+        if latest_value is None or parsed > latest_value:
+            latest_value = parsed
+            latest_text = timestamp
+    return latest_text
+
+
 def _progress_summary_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
     progress_summary = payload.get('progress_summary')
     if isinstance(progress_summary, dict):
@@ -514,15 +551,39 @@ def _load_latest_feedback_run_summary(*, market_date: str) -> dict[str, Any] | N
     if run_snapshot is None:
         return None
 
+    requested_symbols = agent_context_feedback_run_state_service.resolve_run_requested_symbols(
+        run_snapshot=run_snapshot,
+    )
+    try:
+        from app.agent_context.progress_service import agent_context_progress_service
+
+        progress = agent_context_progress_service.get_feedback_progress(
+            market_date=normalized_market_date,
+            symbols=requested_symbols,
+            run_id=run_snapshot.get('run_id'),
+        )
+    except Exception:
+        progress = None
+    if isinstance(progress, dict) and isinstance(progress.get('summary'), dict):
+        summary = dict(progress['summary'])
+        status = str(summary.get('run_status') or run_snapshot.get('status') or '').strip().lower()
+        if not status:
+            status = 'running' if run_snapshot.get('completed_at') is None else 'partial'
+        return {
+            'source': 'agent_context_feedback_runs',
+            'run_id': run_snapshot.get('run_id'),
+            'status': status,
+            'requested_symbols': requested_symbols or [],
+            'summary': summary,
+            'run_snapshot': run_snapshot,
+        }
+
     summary_payload = (
         dict(run_snapshot.get('summary_payload'))
         if isinstance(run_snapshot.get('summary_payload'), dict)
         else {}
     )
     summary = _progress_summary_from_payload(summary_payload)
-    requested_symbols = agent_context_feedback_run_state_service.resolve_run_requested_symbols(
-        run_snapshot=run_snapshot,
-    )
     status = str(summary.get('run_status') or run_snapshot.get('status') or '').strip().lower()
     if not status:
         status = 'running' if run_snapshot.get('completed_at') is None else 'partial'
@@ -1353,6 +1414,32 @@ class EODPipelineStatusService:
             )
         except (TypeError, ValueError):
             stalled = False
+        role_progress = summary.get('role_progress') if isinstance(summary.get('role_progress'), dict) else {}
+        current_role_name = str(current_role or '').strip()
+        active_roles = [
+            role
+            for role, role_payload in role_progress.items()
+            if isinstance(role_payload, dict)
+            and str(role_payload.get('status') or '').strip().lower() in {'running', 'in_progress'}
+        ]
+        if current_role_name and current_role_name not in active_roles:
+            active_roles.insert(0, current_role_name)
+        target_symbols = _coerce_int(
+            summary.get('total_symbols'),
+            len(requested_symbols),
+        )
+        completed_symbols = _coerce_int(summary.get('completed_symbols'))
+        partial_symbols = _coerce_int(summary.get('partial_symbols'))
+        in_progress_symbols = _coerce_int(summary.get('in_progress_symbols'))
+        pending_symbols = _coerce_int(summary.get('pending_symbols'))
+        latest_successful_feedback_at = summary.get('latest_feedback_at')
+        latest_failed_feedback_at = summary.get('latest_failed_feedback_at')
+        latest_child_activity_at = _latest_iso_timestamp(
+            latest_successful_feedback_at,
+            latest_failed_feedback_at,
+            summary.get('last_activity_at'),
+            fallback_stage.get('updated_at'),
+        )
         details = {
             'mode': 'agent_feedback_run_state',
             'depends_on': list(definition.depends_on),
@@ -1364,14 +1451,26 @@ class EODPipelineStatusService:
             'run_status': run_status,
             'run_table_status': summary.get('run_table_status'),
             'current_role': current_role,
+            'current_active_roles': active_roles,
             'requested_symbol_count': len(requested_symbols),
+            'target_symbols': target_symbols,
+            'completed_symbols': completed_symbols,
+            'partial_symbols': partial_symbols,
+            'in_progress_symbols': in_progress_symbols,
+            'pending_symbols': pending_symbols,
+            'failed_symbols_count': failed_items,
+            'failed_batches': summary.get('failure_groups') if isinstance(summary.get('failure_groups'), dict) else {},
             'failed_items': failed_items,
             'completed_feedback_count': completed_feedback_count,
             'expected_feedback_count': expected_feedback_count,
-            'role_progress': summary.get('role_progress') if isinstance(summary.get('role_progress'), dict) else {},
+            'role_progress': role_progress,
             'role_symbol_counts': summary.get('role_symbol_counts') if isinstance(summary.get('role_symbol_counts'), dict) else {},
             'completed_roles': summary.get('completed_roles') if isinstance(summary.get('completed_roles'), list) else [],
             'remaining_roles': summary.get('remaining_roles') if isinstance(summary.get('remaining_roles'), list) else [],
+            'latest_successful_feedback_at': latest_successful_feedback_at,
+            'latest_feedback_at': latest_successful_feedback_at,
+            'latest_failed_feedback_at': latest_failed_feedback_at,
+            'latest_child_activity_at': latest_child_activity_at,
             'active_feedback_running': status == 'running',
             'feedback_failure_status': 'failures_present' if failed_items > 0 else 'no_failures',
             'feedback_health': 'stalled' if stalled else status,
@@ -1385,7 +1484,7 @@ class EODPipelineStatusService:
             'source_status': run_status,
             'market_date': market_date,
             'started_at': summary.get('run_started_at') or fallback_stage.get('started_at'),
-            'updated_at': summary.get('latest_feedback_at') or fallback_stage.get('updated_at'),
+            'updated_at': latest_child_activity_at,
             'completed_at': summary.get('run_completed_at') if status != 'running' else None,
             'processed': counts.processed,
             'total': counts.total,
@@ -1395,7 +1494,7 @@ class EODPipelineStatusService:
             'current_step': 'agent_feedback_running' if status == 'running' else None,
             'current_activity': activity,
             'current_symbol': None,
-            'current_period': None,
+            'current_period': current_role,
             'source_run_ids': {'feedback_run_id': feedback_run.get('run_id')},
             'gate_status': 'waiting' if status == 'running' else ('ready' if status == 'completed' else status),
             'severity': 'degraded' if status == 'partial' else status,

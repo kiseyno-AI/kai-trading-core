@@ -5,6 +5,7 @@ from app.eod.pipeline_status import (
     DEFAULT_FACTOR_STAGE_ORDER,
     DEFAULT_PYKRX_ENRICHMENT_CATEGORIES,
     EODPipelineStatusService,
+    _load_latest_feedback_run_summary,
     _load_latest_pipeline_pykrx_run,
 )
 
@@ -1501,6 +1502,142 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
         self.assertEqual(feedback_stage['status'], 'running')
         self.assertEqual(feedback_stage['failed'], 0)
         self.assertEqual(feedback_stage['details']['feedback_failure_status'], 'no_failures')
+
+    def test_read_reconciles_agent_feedback_stage_from_child_progress_when_run_snapshot_is_stale(self):
+        roles = [
+            'eod-summarizer',
+            'technical-summarizer',
+            'fundamental-summarizer',
+            'short-term-decider',
+            'signal-decider',
+        ]
+        stale_run_snapshot = {
+            'run_id': 'symbol-run-2026-06-19-stale',
+            'status': 'running',
+            'symbols_total': 2,
+            'completed_count': 0,
+            'failed_count': 0,
+            'started_at': '2026-06-19T07:53:00+00:00',
+            'completed_at': None,
+            'request_payload': {
+                'mode': 'role_sequential_runtime_buffered',
+                'symbols': ['005930', '000660'],
+                'requested_symbols': ['005930', '000660'],
+                'roles': roles,
+            },
+            'summary_payload': {
+                'progress_summary': {
+                    'run_id': 'symbol-run-2026-06-19-stale',
+                    'run_status': 'running',
+                    'run_table_status': 'running',
+                    'current_role': 'eod-summarizer',
+                    'completed_feedback_count': 0,
+                    'failed_items': 0,
+                    'expected_feedback_count': 10,
+                    'latest_feedback_at': '2026-06-19T07:53:00+00:00',
+                },
+            },
+        }
+        reconciled_progress = {
+            'summary': {
+                'run_id': 'symbol-run-2026-06-19-stale',
+                'run_status': 'running',
+                'run_table_status': 'running',
+                'is_live': True,
+                'run_started_at': '2026-06-19T07:53:00+00:00',
+                'current_role': 'eod-summarizer',
+                'completed_roles': [],
+                'remaining_roles': roles,
+                'total_symbols': 2,
+                'processed_symbols': 2,
+                'completed_symbols': 0,
+                'partial_symbols': 2,
+                'in_progress_symbols': 0,
+                'pending_symbols': 0,
+                'completed_feedback_count': 2,
+                'failed_items': 1,
+                'expected_feedback_count': 10,
+                'latest_feedback_at': '2026-06-19T09:39:03+00:00',
+                'latest_failed_feedback_at': '2026-06-19T09:38:00+00:00',
+                'failure_groups': {
+                    'transport/timeout': {
+                        'failure_status': 'transport/timeout',
+                        'count': 1,
+                        'symbols_sample': ['000660'],
+                    },
+                },
+                'role_progress': {
+                    'eod-summarizer': {
+                        'role': 'eod-summarizer',
+                        'status': 'completed',
+                        'total_symbols': 2,
+                        'processed_symbols': 2,
+                        'completed_symbols': 2,
+                        'pending_symbols': 0,
+                        'failed_items': 0,
+                    },
+                    'technical-summarizer': {
+                        'role': 'technical-summarizer',
+                        'status': 'partial',
+                        'total_symbols': 2,
+                        'processed_symbols': 1,
+                        'completed_symbols': 0,
+                        'pending_symbols': 1,
+                        'failed_items': 1,
+                    },
+                    'fundamental-summarizer': {'role': 'fundamental-summarizer', 'status': 'pending', 'total_symbols': 2},
+                    'short-term-decider': {'role': 'short-term-decider', 'status': 'pending', 'total_symbols': 2},
+                    'signal-decider': {'role': 'signal-decider', 'status': 'pending', 'total_symbols': 2},
+                },
+            },
+        }
+        service = EODPipelineStatusService(
+            market_state_loader=lambda: _FakeMarketState(),
+            pykrx_run_loader=lambda **_: None,
+            pykrx_stage_counts_loader=lambda *_: {},
+            pykrx_enrichment_loader=lambda **_: {},
+            live_symbol_count_loader=lambda: 2,
+            fundamentals_refresh_loader=lambda **_: None,
+            official_run_loader=lambda **_: None,
+            official_stage_history_loader=lambda **_: {},
+            row_count_stage_counts_loader=lambda **_: {},
+            price_bar_count_loader=lambda **_: 0,
+            signal_feature_counts_loader=lambda **_: {},
+            external_news_counts_loader=lambda **_: {},
+            signal_decider_counts_loader=lambda **_: {},
+            feedback_run_loader=_load_latest_feedback_run_summary,
+        )
+
+        with patch(
+            'app.agent_context.runtime_state.runtime_feedback_state_store.get_run',
+            return_value=None,
+        ), patch(
+            'app.agent_context.run_state_service.agent_context_feedback_run_state_service.find_latest_run',
+            return_value=stale_run_snapshot,
+        ), patch(
+            'app.agent_context.progress_service.agent_context_progress_service.get_feedback_progress',
+            return_value=reconciled_progress,
+        ) as progress_loader:
+            result = service.read(market_date='2026-06-19')
+
+        progress_loader.assert_called_once()
+        stage = result['stages']['agent_feedback_summaries']
+        self.assertEqual(stage['status'], 'running')
+        self.assertEqual(stage['updated_at'], '2026-06-19T09:39:03+00:00')
+        self.assertEqual(stage['processed'], 3)
+        self.assertEqual(stage['total'], 10)
+        self.assertEqual(stage['succeeded'], 2)
+        self.assertEqual(stage['failed'], 1)
+        self.assertEqual(stage['details']['current_active_roles'], ['eod-summarizer'])
+        self.assertEqual(stage['details']['target_symbols'], 2)
+        self.assertEqual(stage['details']['completed_symbols'], 0)
+        self.assertEqual(stage['details']['failed_symbols_count'], 1)
+        self.assertEqual(stage['details']['latest_successful_feedback_at'], '2026-06-19T09:39:03+00:00')
+        self.assertEqual(stage['details']['latest_failed_feedback_at'], '2026-06-19T09:38:00+00:00')
+        self.assertEqual(stage['details']['role_progress']['eod-summarizer']['completed_symbols'], 2)
+        self.assertIn('fundamental-summarizer', stage['details']['role_progress'])
+        self.assertIn('short-term-decider', stage['details']['role_progress'])
+        self.assertIn('signal-decider', stage['details']['role_progress'])
 
     def test_read_treats_stored_full_coverage_as_completed_after_scoped_retry_run(self):
         pykrx_run = {

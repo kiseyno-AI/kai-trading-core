@@ -21,6 +21,8 @@ Row-count-derived stages expose missing-row diagnostics when they are partial. F
 
 When a same-day feedback run is active, `agent_feedback_summaries` reflects the run from feedback runtime/durable state even if no official daily pipeline stage row exists. That keeps active feedback progress separate from upstream degraded coverage.
 
+For `agent_feedback_summaries`, the status reader reconciles stale durable run summaries with persisted child feedback and failure rows. The stage `updated_at` follows the latest successful or failed child activity, and `details` exposes `current_active_roles`, `target_symbols`, `completed_symbols`, `failed_symbols_count`, `role_progress`, `latest_successful_feedback_at`, and `latest_failed_feedback_at` when failures exist.
+
 Pre-open/global stages such as `master_refresh` and `pykrx_universe_refresh` may be `skipped` with reason metadata once same-date downstream output exists and there is no active/pre-open official stage row. This prevents `current_stage` from pointing at `master_refresh` after a resumed EOD or agent-stage recovery has already completed.
 
 ## Example request
