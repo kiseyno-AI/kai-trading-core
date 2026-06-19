@@ -8,6 +8,8 @@ Explicit requested-symbol dispatch bypasses the automatic broad and role caps us
 Each normal dispatch also creates a durable `agent_context_feedback_runs` row, checkpoints role progress as the run advances, and finalizes that run row even when the cycle exits partially. When `wait_for_completion=false`, Core now creates the durable queued run row before returning and reuses the same `request_run_id` when the background work starts.
 Normal dispatch now also gates on same-day feedback prerequisites: PyKRX enrichment coverage, DART fundamentals refresh, market-risk filter, Piotroski filter, and the factor/scoring stages must all be terminal and successful enough for agent context. The PyKRX gate includes decider-required category details with expected and present row counts. When prerequisites are still running or incomplete, the route returns `summary.status=waiting|blocked`, `summary.gated=true`, and a `prerequisites` block instead of starting dispatch. Operators can bypass that guard only with `force=true`.
 
+For `fundamental-summarizer`, `reuse_existing=true` reuses a prior trading date only when the stored fundamental input fingerprint matches the current DART/disclosure/valuation input fingerprint. `force_recompute=true` bypasses reuse explicitly without changing the prerequisite gate behavior.
+
 ## Example request
 ```http
 POST /agent-context/feedback/dispatch/symbols
@@ -24,6 +26,7 @@ Content-Type: application/json
     "signal-decider"
   ],
   "reuse_existing": true,
+  "force_recompute": false,
   "wait_for_completion": false,
   "force": false
 }
@@ -68,6 +71,7 @@ Content-Type: application/json
         }
       }
     },
+    "force_recompute": false,
     "wait_for_completion": false
   },
   "summary": {
@@ -90,6 +94,22 @@ When `wait_for_completion=true`, the completed dispatch response also includes `
       "hard_blocked_symbols": ["005930"],
       "soft_penalized_symbols": ["000660"]
     }
+  }
+}
+```
+
+Completed synchronous responses include reuse accounting in `summary`:
+
+```json
+{
+  "summary": {
+    "status": "completed",
+    "completed": 1,
+    "computed_count": 1,
+    "reused_count": 1,
+    "stale_count": 0,
+    "failed": 0,
+    "flushed_to_db": 1
   }
 }
 ```

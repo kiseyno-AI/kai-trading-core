@@ -857,7 +857,16 @@ def build_upstream_feedback_bundle(
         latest_feedback = decision.latest_feedback if decision is not None else None
         feedback_payload = latest_feedback.get('feedback_payload') if isinstance(latest_feedback, dict) else None
         feedback_market_date = latest_feedback.get('market_date') if isinstance(latest_feedback, dict) else None
-        if isinstance(feedback_payload, dict) and feedback_market_date == market_date.isoformat():
+        reuse_reason = str(getattr(decision, 'reason', '') or '')
+        fingerprint_reuse_allowed = (
+            role == 'fundamental-summarizer'
+            and reuse_reason == 'reuse_unchanged_fundamental_inputs'
+            and decision is not None
+            and not bool(decision.should_dispatch)
+        )
+        if isinstance(feedback_payload, dict) and (
+            feedback_market_date == market_date.isoformat() or fingerprint_reuse_allowed
+        ):
             upstream_summaries[role] = feedback_payload
             upstream_traceability[role] = {
                 'agent_name': role,
@@ -865,7 +874,10 @@ def build_upstream_feedback_bundle(
                 'market_date': feedback_market_date,
                 'received_at': latest_feedback.get('received_at'),
                 'feedback_id': latest_feedback.get('id'),
-                'source': 'persisted_feedback',
+                'source': 'persisted_feedback_fingerprint_reuse' if fingerprint_reuse_allowed else 'persisted_feedback',
+                'reuse_reason': reuse_reason if fingerprint_reuse_allowed else None,
+                'input_fingerprint': getattr(decision, 'input_fingerprint', None) if fingerprint_reuse_allowed else None,
+                'stored_input_fingerprint': getattr(decision, 'stored_input_fingerprint', None) if fingerprint_reuse_allowed else None,
             }
             continue
 

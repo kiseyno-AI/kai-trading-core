@@ -88,6 +88,7 @@ class AgentSymbolFeedbackDispatchRequest(BaseModel):
     reuse_existing: bool = True
     wait_for_completion: bool = True
     force: bool = False
+    force_recompute: bool = False
 
 
 class AgentFeedbackRetryCyclesRequest(BaseModel):
@@ -101,6 +102,7 @@ class AgentFeedbackRetryCyclesRequest(BaseModel):
     outer_batch_size: int = Field(default=20, ge=1, le=200)
     reuse_existing: bool = True
     force: bool = False
+    force_recompute: bool = False
 
     @model_validator(mode='after')
     def validate_feedback_scope_mode(self) -> 'AgentFeedbackRetryCyclesRequest':
@@ -123,6 +125,7 @@ class AgentFeedbackFollowupRequest(BaseModel):
     outer_batch_size: int = Field(default=20, ge=1, le=500)
     reuse_existing: bool = True
     force: bool = False
+    force_recompute: bool = False
 
     @model_validator(mode='after')
     def validate_feedback_scope_mode(self) -> 'AgentFeedbackFollowupRequest':
@@ -722,6 +725,7 @@ async def dispatch_symbol_agent_feedback(
                 disclosures_limit=payload.disclosures_limit,
                 reuse_existing=payload.reuse_existing,
                 force=payload.force,
+                force_recompute=payload.force_recompute,
             )
 
         requested_roles = list(payload.roles or EXPECTED_ROLES)
@@ -740,6 +744,7 @@ async def dispatch_symbol_agent_feedback(
             'fs_div': payload.fs_div,
             'disclosures_limit': payload.disclosures_limit,
             'reuse_existing': payload.reuse_existing,
+            'force_recompute': payload.force_recompute,
             'scope': resolve_agent_feedback_scope(requested_symbols=requested_symbols),
             'eligibility_rule': AGENT_FEEDBACK_ELIGIBILITY_RULE,
             'eligibility_filters': list(AGENT_FEEDBACK_ELIGIBILITY_FILTERS),
@@ -852,6 +857,7 @@ async def dispatch_symbol_agent_feedback(
                     reuse_existing=payload.reuse_existing,
                     request_run_id=request_run_id,
                     force=payload.force,
+                    force_recompute=payload.force_recompute,
                 )
             except Exception as exc:  # noqa: BLE001
                 try:
@@ -890,6 +896,7 @@ async def dispatch_symbol_agent_feedback(
                 'fs_div': payload.fs_div,
                 'disclosures_limit': payload.disclosures_limit,
                 'reuse_existing': payload.reuse_existing,
+                'force_recompute': payload.force_recompute,
                 'scope': resolve_agent_feedback_scope(requested_symbols=requested_symbols),
                 'eligibility_rule': AGENT_FEEDBACK_ELIGIBILITY_RULE,
                 'eligibility_filters': list(AGENT_FEEDBACK_ELIGIBILITY_FILTERS),
@@ -918,6 +925,7 @@ async def run_agent_feedback_retry_cycles(payload: AgentFeedbackRetryCyclesReque
             max_cycles=payload.max_cycles,
             outer_batch_size=payload.outer_batch_size,
             reuse_existing=payload.reuse_existing,
+            force_recompute=payload.force_recompute,
         )
         return await run_in_threadpool(
             agent_feedback_retry_service.run_retry_cycles,
@@ -941,6 +949,7 @@ async def run_agent_feedback_followup(payload: AgentFeedbackFollowupRequest) -> 
             max_cycles=payload.max_cycles,
             outer_batch_size=payload.outer_batch_size,
             reuse_existing=payload.reuse_existing,
+            force_recompute=payload.force_recompute,
         )
         return await run_in_threadpool(
             agent_feedback_retry_service.run_retry_cycles,

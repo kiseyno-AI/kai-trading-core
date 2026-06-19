@@ -9,6 +9,8 @@ When upstream PyKRX enrichment, fundamentals, filtering, or factor/scoring stage
 
 Persisted incomplete terminal work is reported as `partial` or `failed`, not `in_progress`. Stored failure rows include `failure_groups` so clients can distinguish dependency blocks (`dependency/missing-upstream`) from OpenClaw transport timeouts (`transport/timeout`) and response-shape failures (`response/invalid-json`, `response/assistant-non-json`, `response/contract`).
 
+For `fundamental-summarizer`, status treats fingerprint-matched prior-date feedback as completed but exposes it separately in `reused_agents` and `reused_feedback_count`. Changed or missing fingerprints appear under `stale_agents` / `stale_feedback_count` so operators can see why new OpenClaw work is required.
+
 ## Example request
 ```http
 GET /agent-context/feedback/status?market_date=2026-04-15&symbols=005930&symbols=000660
@@ -41,6 +43,9 @@ GET /agent-context/feedback/status?market_date=2026-04-15&symbols=005930&symbols
     "failed_symbol_count": 0,
     "pending_symbol_count": 0,
     "completed_feedback_count": 1,
+    "computed_feedback_count": 1,
+    "reused_feedback_count": 1,
+    "stale_feedback_count": 0,
     "failed_feedback_count": 1,
     "expected_feedback_count": 5,
     "failure_groups": {
@@ -65,16 +70,29 @@ GET /agent-context/feedback/status?market_date=2026-04-15&symbols=005930&symbols
     {
       "symbol": "005930",
       "status": "partial",
-      "completed_agents": ["eod-summarizer"],
+      "completed_agents": ["eod-summarizer", "fundamental-summarizer"],
+      "computed_agents": ["eod-summarizer"],
+      "reused_agents": ["fundamental-summarizer"],
+      "stale_agents": [],
       "failed_agents": ["signal-decider"],
-      "completed_count": 1,
+      "completed_count": 2,
+      "computed_count": 1,
+      "reused_count": 1,
+      "stale_count": 0,
       "failed_count": 1,
       "expected_count": 5,
       "pending_agents": [
         "technical-summarizer",
-        "fundamental-summarizer",
         "short-term-decider"
       ],
+      "reuse": {
+        "fundamental-summarizer": {
+          "reason": "reuse_unchanged_fundamental_inputs",
+          "latest_feedback_id": 42,
+          "latest_feedback_market_date": "2026-04-14",
+          "input_fingerprint": "sha256:..."
+        }
+      },
       "failure_groups": {
         "dependency/missing-upstream": {
           "failure_status": "dependency/missing-upstream",

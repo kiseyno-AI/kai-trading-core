@@ -43,6 +43,11 @@ def _parse_args() -> argparse.Namespace:
         default=FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
         help='Scope mode for role targets. Defaults to decider_scope_fast_path for morning/operator readiness.',
     )
+    parser.add_argument(
+        '--force-recompute',
+        action='store_true',
+        help='Bypass existing feedback reuse and recompute requested roles for debugging/model or prompt upgrades.',
+    )
     return parser.parse_args()
 
 
@@ -57,6 +62,7 @@ def main() -> None:
             max_cycles=args.max_cycles,
             outer_batch_size=args.outer_batch_size,
             reuse_existing=True,
+            force_recompute=args.force_recompute,
         )
     )
     print(json.dumps(result, ensure_ascii=False))

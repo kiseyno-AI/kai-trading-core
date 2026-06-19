@@ -218,6 +218,7 @@ class FeedbackRetryCycleTests(unittest.TestCase):
             market_date=date.fromisoformat('2026-04-16'),
             symbols=['005930'],
             roles=EXPECTED_ROLES,
+            force_recompute=False,
         )
         self.assertEqual(result, ['005930'])
 
@@ -262,6 +263,13 @@ class FeedbackRetryCycleTests(unittest.TestCase):
             args = run_feedback_retry_cycles._parse_args()
 
         self.assertEqual(args.symbols, ['005930,000660', '035420'])
+        self.assertFalse(args.force_recompute)
+
+    def test_parse_args_accepts_force_recompute(self):
+        with patch('sys.argv', ['run_feedback_retry_cycles.py', '--force-recompute']):
+            args = run_feedback_retry_cycles._parse_args()
+
+        self.assertTrue(args.force_recompute)
 
     def test_run_retry_cycles_includes_progress_response_fields(self):
         service = AgentFeedbackRetryService()

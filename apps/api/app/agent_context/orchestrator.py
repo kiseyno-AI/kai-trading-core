@@ -75,7 +75,11 @@ from app.agent_context.read_service import agent_context_read_service
 from app.agent_context.roles import DEFAULT_AGENT_NAMES, DECISION_SUPPORT_AGENT_NAMES, SHORT_TERM_DECIDER_AGENT_NAME, SIGNAL_DECIDER_AGENT_NAME, SUMMARIZER_AGENT_NAMES
 from app.agent_context.run_state_service import agent_context_feedback_run_state_service
 from app.agent_context.response_contract import build_contract_prompt_suffix, normalize_agent_response
-from app.agent_context.reuse_service import agent_context_reuse_service
+from app.agent_context.reuse_service import (
+    FUNDAMENTAL_SUMMARIZER_AGENT_NAME,
+    FUNDAMENTAL_SUMMARY_REUSE_POLICY_VERSION,
+    agent_context_reuse_service,
+)
 from app.agent_context.session_cleanup_service import SessionCleanupTarget, agent_feedback_session_cleanup_service
 from app.agent_context.signal_decider_market_context import signal_decider_market_context_builder
 from app.agent_context.signal_decider_loop_service import signal_decider_loop_service
@@ -2725,6 +2729,7 @@ class AgentFeedbackOrchestrator:
         reuse_existing: bool = True,
         request_run_id: str | None = None,
         force: bool = False,
+        force_recompute: bool = False,
         auto_scope: bool = False,
         role_symbol_scopes: dict[str, Sequence[str]] | None = None,
         funnel_diagnostics: dict[str, Any] | None = None,
@@ -2748,6 +2753,7 @@ class AgentFeedbackOrchestrator:
                     'fs_div': fs_div,
                     'disclosures_limit': disclosures_limit,
                     'reuse_existing': reuse_existing,
+                    'force_recompute': force_recompute,
                     'scope': resolve_agent_feedback_scope(requested_symbols=None if auto_scope else requested_symbols),
                     'auto_scope': auto_scope,
                     'eligibility_rule': AGENT_FEEDBACK_ELIGIBILITY_RULE,
@@ -2820,6 +2826,7 @@ class AgentFeedbackOrchestrator:
             'role_parallel_subtasks': role_parallelism,
             'total_parallel_subtasks': role_parallelism,
             'reuse_existing': reuse_existing,
+            'force_recompute': force_recompute,
             'scope': resolve_agent_feedback_scope(requested_symbols=None if auto_scope else requested_symbols),
             'auto_scope': auto_scope,
             'eligibility_rule': AGENT_FEEDBACK_ELIGIBILITY_RULE,
@@ -2851,6 +2858,7 @@ class AgentFeedbackOrchestrator:
             feedback_scope_mode=feedback_scope_mode,
         )
         runtime_feedback_state_store.start_run(state)
+        reuse_decisions: dict[str, dict[str, Any]] = {}
         agent_context_feedback_run_state_service.start_run(
             run_id=request_run_id,
             market_date=normalized_market_date,
@@ -2931,12 +2939,47 @@ class AgentFeedbackOrchestrator:
                     persistence_result={
                         'latest_feedback_id': getattr(decision, 'latest_feedback_id', None),
                         'latest_feedback_received_at': getattr(decision, 'latest_feedback_received_at', None),
+                        'input_fingerprint': getattr(decision, 'input_fingerprint', None),
+                        'stored_input_fingerprint': getattr(decision, 'stored_input_fingerprint', None),
                     },
                     reuse_reason=getattr(decision, 'reason', None),
+                    reuse_policy_version=getattr(decision, 'reuse_policy_version', None),
                 )
 
         def buffer_success(role: str, symbol: str, context: dict[str, Any], response: dict[str, Any]) -> None:
             normalized_feedback = response.get('normalized_feedback')
+            storage_context = context
+            storage_response = response
+            decision = reuse_decisions.get(symbol, {}).get(role) if isinstance(reuse_decisions, dict) else None
+            input_fingerprint_payload = getattr(decision, 'input_fingerprint_payload', None)
+            if role == FUNDAMENTAL_SUMMARIZER_AGENT_NAME and not isinstance(input_fingerprint_payload, dict):
+                try:
+                    fingerprint_decision = agent_context_reuse_service.build_latest_decisions(
+                        market_date=normalized_market_date,
+                        symbols=[symbol],
+                        roles=[role],
+                        force_recompute=True,
+                    ).get(symbol, {}).get(role)
+                    input_fingerprint_payload = getattr(fingerprint_decision, 'input_fingerprint_payload', None)
+                except Exception:  # noqa: BLE001
+                    input_fingerprint_payload = None
+            if role == FUNDAMENTAL_SUMMARIZER_AGENT_NAME and isinstance(input_fingerprint_payload, dict):
+                reuse_metadata = {
+                    'status': 'computed',
+                    'reuse_policy_version': FUNDAMENTAL_SUMMARY_REUSE_POLICY_VERSION,
+                    'input_fingerprint': input_fingerprint_payload,
+                    'force_recompute': force_recompute,
+                }
+                storage_context = {
+                    **context,
+                    'fundamental_summary_input_fingerprint': input_fingerprint_payload,
+                    'reuse_metadata': reuse_metadata,
+                }
+                storage_response = {
+                    **response,
+                    'fundamental_summary_input_fingerprint': input_fingerprint_payload,
+                    'reuse_metadata': reuse_metadata,
+                }
 
             def _update(current: RuntimeFeedbackRunState) -> None:
                 current.last_activity_at = datetime.now(timezone.utc)
@@ -2946,8 +2989,8 @@ class AgentFeedbackOrchestrator:
                         symbol=symbol,
                         agent_name=role,
                         run_id=request_run_id,
-                        response=response,
-                        context=context,
+                        response=storage_response,
+                        context=storage_context,
                     )
                 )
 
@@ -3081,6 +3124,7 @@ class AgentFeedbackOrchestrator:
                         market_date=normalized_market_date,
                         symbols=scoped_dispatch_symbols,
                         roles=requested_role_names,
+                        force_recompute=force_recompute,
                     )
                 upstream_reuse_decisions = {}
                 if any(spec.role in DECISION_SUPPORT_AGENT_NAMES for spec in specs):
@@ -3088,6 +3132,7 @@ class AgentFeedbackOrchestrator:
                         market_date=normalized_market_date,
                         symbols=scoped_dispatch_symbols,
                         roles=UPSTREAM_SUMMARY_ROLES,
+                        force_recompute=force_recompute,
                     )
                 symbols_requiring_context = scoped_dispatch_symbols
                 if reuse_decisions:
@@ -3682,12 +3727,16 @@ class AgentFeedbackOrchestrator:
                 final_snapshot = runtime_feedback_state_store.get_run(normalized_market_date, run_id=request_run_id) or state
                 completed_count = len(final_snapshot.buffered_feedback_rows)
                 failed_count = len(final_snapshot.buffered_failures)
+                progress_counts = final_snapshot.to_progress_summary()
                 final_status = _resolve_dispatch_status(completed=completed_count, failed=failed_count)
                 response_payload = {
                     'request': request_payload,
                     'summary': {
                         'status': final_status,
                         'completed': completed_count,
+                        'computed_count': int(progress_counts.get('computed_feedback_count') or completed_count),
+                        'reused_count': int(progress_counts.get('reused_feedback_count') or 0),
+                        'stale_count': int(progress_counts.get('stale_feedback_count') or 0),
                         'failed': failed_count,
                         'skipped': len(skipped_symbols),
                         'flushed_to_db': final_snapshot.flushed_feedback_count,
@@ -3818,8 +3867,12 @@ class AgentFeedbackOrchestrator:
             )
 
             if response_payload is not None and scoped_dispatch_symbols:
+                progress_counts = final_snapshot.to_progress_summary() if final_snapshot else {}
                 response_payload['summary']['status'] = final_status
                 response_payload['summary']['completed'] = completed_count
+                response_payload['summary']['computed_count'] = int(progress_counts.get('computed_feedback_count') or completed_count)
+                response_payload['summary']['reused_count'] = int(progress_counts.get('reused_feedback_count') or 0)
+                response_payload['summary']['stale_count'] = int(progress_counts.get('stale_feedback_count') or 0)
                 response_payload['summary']['failed'] = failed_count
                 response_payload['summary']['flushed_to_db'] = final_snapshot.flushed_feedback_count if final_snapshot else 0
 

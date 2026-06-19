@@ -71,6 +71,7 @@ class FeedbackRetryCycleConfig:
     max_cycles: int = 3
     outer_batch_size: int = 20
     reuse_existing: bool = True
+    force_recompute: bool = False
     progress_callback: Callable[..., Any] | None = None
 
 
@@ -84,6 +85,8 @@ class RoleSequenceRoleState:
     boundary_pending_symbols: tuple[str, ...]
     retry_pending_symbols: tuple[str, ...]
     boundary_status: str
+    reused_symbols: tuple[str, ...] = ()
+    stale_symbols: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -138,6 +141,7 @@ class AgentFeedbackRetryService:
         market_date: date,
         roles: Sequence[str],
         eligible_symbols: Sequence[str] | None = None,
+        force_recompute: bool = False,
     ) -> list[str]:
         expected_roles = tuple(roles)
         symbols = list(eligible_symbols) if eligible_symbols is not None else self._load_eligible_symbols(market_date=market_date)
@@ -148,6 +152,7 @@ class AgentFeedbackRetryService:
             market_date=market_date,
             symbols=symbols,
             roles=expected_roles,
+            force_recompute=force_recompute,
         )
         incomplete: list[str] = []
         for symbol in symbols:
@@ -220,6 +225,7 @@ class AgentFeedbackRetryService:
         roles: Sequence[str],
         eligible_symbols: Sequence[str],
         role_symbol_scopes: dict[str, Sequence[str]] | None = None,
+        force_recompute: bool = False,
     ) -> RoleSequenceSnapshot:
         normalized_roles = tuple(roles)
         normalized_symbols = tuple(eligible_symbols)
@@ -237,15 +243,58 @@ class AgentFeedbackRetryService:
             roles=normalized_roles,
             symbols=normalized_symbols,
         )
+        reuse_decisions = (
+            agent_context_reuse_service.build_latest_decisions(
+                market_date=market_date,
+                symbols=normalized_symbols,
+                roles=normalized_roles,
+                force_recompute=force_recompute,
+            )
+            if normalized_symbols and normalized_roles
+            else {}
+        )
 
         role_states: dict[str, RoleSequenceRoleState] = {}
         for role in normalized_roles:
             role_symbols = normalized_role_scopes.get(role, normalized_symbols)
-            completed_symbols = tuple(symbol for symbol in role_symbols if symbol in completed_by_role.get(role, set()))
+            completed_same_day_symbols = (
+                ()
+                if force_recompute
+                else tuple(symbol for symbol in role_symbols if symbol in completed_by_role.get(role, set()))
+            )
+            reused_symbols = (
+                ()
+                if force_recompute
+                else tuple(
+                    symbol
+                    for symbol in role_symbols
+                    if symbol not in set(completed_same_day_symbols)
+                    and (reuse_decisions.get(symbol, {}).get(role) is not None)
+                    and not reuse_decisions[symbol][role].should_dispatch
+                )
+            )
+            completed_symbols = tuple(dict.fromkeys([*completed_same_day_symbols, *reused_symbols]))
             failed_symbols = tuple(
                 symbol
                 for symbol in role_symbols
-                if symbol in failed_by_role.get(role, set()) and symbol not in completed_by_role.get(role, set())
+                if not force_recompute
+                and symbol in failed_by_role.get(role, set())
+                and symbol not in set(completed_symbols)
+            )
+            stale_symbols = tuple(
+                symbol
+                for symbol in role_symbols
+                if (reuse_decisions.get(symbol, {}).get(role) is not None)
+                and reuse_decisions[symbol][role].should_dispatch
+                and str(getattr(reuse_decisions[symbol][role], 'reason', '') or '')
+                in {
+                    'forced_recompute',
+                    'fundamental_input_fingerprint_changed',
+                    'fundamental_input_fingerprint_missing',
+                    'stored_fundamental_input_fingerprint_missing',
+                    'source_updated',
+                    'stale_market_feedback',
+                }
             )
             terminal_symbol_set = set(completed_symbols) | set(failed_symbols)
             boundary_pending_symbols = tuple(symbol for symbol in role_symbols if symbol not in terminal_symbol_set)
@@ -254,6 +303,7 @@ class AgentFeedbackRetryService:
                     market_date=market_date,
                     roles=[role],
                     eligible_symbols=role_symbols,
+                    force_recompute=force_recompute,
                 )
             )
             role_states[role] = RoleSequenceRoleState(
@@ -261,6 +311,8 @@ class AgentFeedbackRetryService:
                 total_symbols=len(role_symbols),
                 completed_symbols=completed_symbols,
                 failed_symbols=failed_symbols,
+                reused_symbols=reused_symbols,
+                stale_symbols=stale_symbols,
                 terminal_symbols=tuple(symbol for symbol in role_symbols if symbol in terminal_symbol_set),
                 boundary_pending_symbols=boundary_pending_symbols,
                 retry_pending_symbols=retry_pending_symbols,
@@ -382,6 +434,16 @@ class AgentFeedbackRetryService:
                 role: set(role_state.failed_symbols)
                 for role, role_state in snapshot.role_states.items()
                 if role_state.failed_symbols
+            }
+            current.reused_symbols_by_role = {
+                role: set(role_state.reused_symbols)
+                for role, role_state in snapshot.role_states.items()
+                if role_state.reused_symbols
+            }
+            current.stale_symbols_by_role = {
+                role: set(role_state.stale_symbols)
+                for role, role_state in snapshot.role_states.items()
+                if role_state.stale_symbols
             }
             current.retry_pending_symbols_by_role = {
                 role: set(self._retry_symbols_for_role(role_state))
@@ -655,6 +717,7 @@ class AgentFeedbackRetryService:
         roles = tuple(config.roles)
         progress_callback = getattr(config, 'progress_callback', None)
         feedback_scope_mode = normalize_feedback_scope_mode(getattr(config, 'feedback_scope_mode', None))
+        effective_force_recompute = bool(force or getattr(config, 'force_recompute', False))
         raw_requested_symbols = getattr(config, 'symbols', None)
         requested_symbols = (
             tuple(_normalize_requested_symbols(raw_requested_symbols))
@@ -677,6 +740,7 @@ class AgentFeedbackRetryService:
                 'max_cycles': config.max_cycles,
                 'outer_batch_size': config.outer_batch_size,
                 'reuse_existing': config.reuse_existing,
+                'force_recompute': effective_force_recompute,
                 'feedback_scope_mode': feedback_scope_mode,
                 'requested_symbols': list(requested_symbols) if requested_symbols is not None else None,
                 'eligible_symbols': None,
@@ -735,6 +799,7 @@ class AgentFeedbackRetryService:
             roles=roles,
             eligible_symbols=scoped_feedback_symbols,
             role_symbol_scopes=role_symbol_scopes,
+            force_recompute=effective_force_recompute,
         )
         next_plan = self._resolve_cycle_plan(
             snapshot=initial_snapshot,
@@ -756,6 +821,7 @@ class AgentFeedbackRetryService:
             'outer_batch_size': config.outer_batch_size,
             'parallel_subtasks': max(1, int(settings.openclaw_agent_parallel_subtasks)),
             'reuse_existing': config.reuse_existing,
+            'force_recompute': effective_force_recompute,
             'scope': resolve_agent_feedback_scope(requested_symbols=requested_symbols),
             'feedback_scope_mode': feedback_scope_mode,
             'eligibility_rule': AGENT_FEEDBACK_ELIGIBILITY_RULE,
@@ -892,7 +958,9 @@ class AgentFeedbackRetryService:
 
                     role_state_before = snapshot_before_role.role_states[role]
                     dispatch_symbols = list(
-                        role_state_before.boundary_pending_symbols
+                        role_symbol_scopes.get(role, scoped_feedback_symbols)
+                        if effective_force_recompute
+                        else role_state_before.boundary_pending_symbols
                         if active_plan.mode == 'boundary_resume'
                         else self._retry_symbols_for_role(role_state_before)
                     )
@@ -935,8 +1003,9 @@ class AgentFeedbackRetryService:
                                     market_date=config.market_date,
                                     symbols=dispatch_chunk,
                                     roles=[role],
-                                    reuse_existing=False if force else config.reuse_existing,
+                                    reuse_existing=False if effective_force_recompute else config.reuse_existing,
                                     force=force,
+                                    force_recompute=effective_force_recompute,
                                     auto_scope=requested_symbols is None,
                                     role_symbol_scopes={role: dispatch_chunk},
                                     funnel_diagnostics={
@@ -1185,6 +1254,7 @@ class AgentFeedbackRetryService:
             'max_cycles': config.max_cycles,
             'outer_batch_size': config.outer_batch_size,
             'reuse_existing': config.reuse_existing,
+            'force_recompute': effective_force_recompute,
             'feedback_scope_mode': feedback_scope_mode,
             'requested_symbols': list(requested_symbols) if requested_symbols is not None else None,
             'eligible_symbols': list(eligible_symbols) if requested_symbols is not None else None,
