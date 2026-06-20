@@ -188,12 +188,17 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         self.assertIn('composite_factors', payload['default_daily_stage_order'])
         self.assertIn('external_news_collect', payload['default_daily_stage_order'])
         self.assertIn('external_news_enrich', payload['default_daily_stage_order'])
+        self.assertIn('macro_context_refresh', payload['default_daily_stage_order'])
         self.assertLess(
             payload['default_daily_stage_order'].index('external_news_collect'),
             payload['default_daily_stage_order'].index('external_news_enrich'),
         )
         self.assertLess(
             payload['default_daily_stage_order'].index('external_news_enrich'),
+            payload['default_daily_stage_order'].index('macro_context_refresh'),
+        )
+        self.assertLess(
+            payload['default_daily_stage_order'].index('macro_context_refresh'),
             payload['default_daily_stage_order'].index('signal_decider'),
         )
         self.assertIn('signal_decider', payload['default_daily_stage_order'])
@@ -257,6 +262,12 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             if stage['id'] == 'external_news_enrich'
         )
         self.assertEqual(external_news_enrich_stage['depends_on'], ['external_news_collect'])
+        macro_context_stage = next(
+            stage
+            for stage in payload['stages']
+            if stage['id'] == 'macro_context_refresh'
+        )
+        self.assertEqual(macro_context_stage['depends_on'], ['external_news_enrich'])
         agent_feedback_stage = next(
             stage
             for stage in payload['stages']
@@ -264,10 +275,18 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         )
         self.assertEqual(
             agent_feedback_stage['depends_on'],
-            ['market_risk_filter', 'piotroski_filter', *FACTOR_STAGE_ORDER, 'external_news_collect', 'external_news_enrich'],
+            [
+                'market_risk_filter',
+                'piotroski_filter',
+                *FACTOR_STAGE_ORDER,
+                'external_news_collect',
+                'external_news_enrich',
+                'macro_context_refresh',
+            ],
         )
         self.assertTrue(external_news_stage['default_selected'])
         self.assertTrue(external_news_enrich_stage['default_selected'])
+        self.assertTrue(macro_context_stage['default_selected'])
 
     def test_run_reorders_requested_subset_and_splits_feedback_stages(self) -> None:
         pykrx_runner = _FakePykrxStageRunner()
@@ -364,6 +383,7 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         )
         self.assertEqual(executed_stage_ids[13], 'external_news_collect')
         self.assertEqual(executed_stage_ids[14], 'external_news_enrich')
+        self.assertEqual(executed_stage_ids[15], 'macro_context_refresh')
 
     def test_run_resume_from_market_risk_filter_preserves_upstream_outputs_by_not_rerunning_them(self) -> None:
         service = DailyPipelineStageService()
@@ -575,6 +595,38 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         )
 
         self.assertEqual(status, 'partial')
+
+    def test_execute_stage_routes_macro_context_refresh_to_service(self) -> None:
+        service = DailyPipelineStageService()
+
+        with patch(
+            'app.eod.daily_pipeline_stages.macro_context_service.refresh_context',
+            return_value={'status': 'completed', 'observations_upserted': 3, 'observations_failed': 0},
+        ) as refresh_context:
+            result = service._execute_stage(
+                stage_id='macro_context_refresh',
+                market_date='2026-04-24',
+                symbols=['005930', '000660'],
+                markets=None,
+                force=True,
+                fs_div='CFS',
+                symbol_limit=None,
+                symbol_offset=0,
+                capture_limit=500,
+                retry_cycles=None,
+                feedback_max_cycles=3,
+                feedback_outer_batch_size=20,
+                reuse_existing_feedback=True,
+            )
+
+        self.assertEqual(result['observations_upserted'], 3)
+        self.assertEqual(
+            refresh_context.call_args.kwargs,
+            {
+                'force': True,
+                'trigger': 'daily_pipeline_stage',
+            },
+        )
 
     def test_execute_stage_routes_unified_value_factor_stage_to_service(self) -> None:
         service = DailyPipelineStageService()

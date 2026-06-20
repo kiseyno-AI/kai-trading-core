@@ -55,6 +55,7 @@ from app.eod.run_stage_support import (
     select_preferred_eod_run,
 )
 from app.external_news.classifier import external_news_classification_has_contract
+from app.macro_context.service import macro_context_service
 from app.market.clock import get_market_state
 from app.market.session import build_market_session_metadata
 from app.market_data_store import (
@@ -270,6 +271,38 @@ def _load_signal_feature_counts(*, market_date: str) -> dict[str, Any]:
     return {
         'persisted': int(persisted or 0),
         'updated_at': updated_at.isoformat() if updated_at else None,
+    }
+
+
+def _load_macro_context_counts(*, market_date: str) -> dict[str, Any]:
+    context = macro_context_service.get_context(as_of_date=market_date)
+    series = context.get('series') if isinstance(context.get('series'), list) else []
+    available_series = [
+        item
+        for item in series
+        if isinstance(item, dict) and str(item.get('status') or '').strip().lower() in {'available', 'stale'}
+    ]
+    missing_series = [
+        item.get('series_id')
+        for item in series
+        if isinstance(item, dict) and str(item.get('status') or '').strip().lower() == 'missing'
+    ]
+    stale_series = [
+        item.get('series_id')
+        for item in series
+        if isinstance(item, dict) and str(item.get('status') or '').strip().lower() == 'stale'
+    ]
+    return {
+        'persisted': len(available_series),
+        'required_series_count': len(series),
+        'updated_at': context.get('latest_fetched_at'),
+        'context_status': context.get('status'),
+        'source_statuses': context.get('source_statuses') or {},
+        'macro_regime_summary': context.get('macro_regime_summary') or {},
+        'usage_policy': context.get('usage_policy') or {},
+        'missing_series': [series_id for series_id in missing_series if series_id],
+        'stale_series': [series_id for series_id in stale_series if series_id],
+        'freshness': context.get('freshness') or {},
     }
 
 
@@ -632,6 +665,7 @@ class EODPipelineStatusService:
     feedback_run_loader: Callable = _noop_feedback_run_loader
     signal_feature_counts_loader: Callable = _noop_persisted_output_counts_loader
     external_news_counts_loader: Callable = _noop_persisted_output_counts_loader
+    macro_context_counts_loader: Callable = _noop_persisted_output_counts_loader
     signal_decider_counts_loader: Callable = _noop_persisted_output_counts_loader
     row_count_scope_gap_loader: Callable = _noop_row_count_scope_gap_loader
 
@@ -761,6 +795,10 @@ class EODPipelineStatusService:
             market_date=resolved_market_date,
             aggregate=external_news_counts,
             collect_stage=stages['external_news_collect'],
+        )
+        stages['macro_context_refresh'] = self._build_macro_context_stage(
+            market_date=resolved_market_date,
+            aggregate=dict(self.macro_context_counts_loader(market_date=resolved_market_date) or {}),
         )
         stages['signal_decider'] = self._build_signal_decider_stage(
             market_date=resolved_market_date,
@@ -1652,6 +1690,83 @@ class EODPipelineStatusService:
             'current_period': None,
             'source_run_ids': {},
             'details': details,
+        }
+
+    def _build_macro_context_stage(
+        self,
+        *,
+        market_date: str,
+        aggregate: dict[str, Any],
+    ) -> dict[str, Any]:
+        definition = STAGE_DEFINITIONS['macro_context_refresh']
+        persisted = int(aggregate.get('persisted') or 0)
+        required_series_count = int(aggregate.get('required_series_count') or persisted or 0)
+        context_status = str(aggregate.get('context_status') or 'unavailable').strip().lower()
+        missing_series = list(aggregate.get('missing_series') or [])
+        stale_series = list(aggregate.get('stale_series') or [])
+        if context_status == 'available':
+            status = 'completed'
+            source_status = 'stored_macro_context_fresh'
+        elif context_status in {'partial', 'stale'} and persisted > 0:
+            status = 'partial'
+            source_status = 'stored_macro_context_partial' if context_status == 'partial' else 'stored_macro_context_stale'
+        else:
+            status = 'pending'
+            source_status = None
+        counts = build_stage_counts(
+            total=max(required_series_count, persisted + len(missing_series)),
+            succeeded=persisted,
+            failed=0,
+            processed=persisted,
+        )
+        reason = (
+            'persisted_macro_context_available'
+            if status == 'completed'
+            else 'persisted_macro_context_stale_or_partial'
+            if status == 'partial'
+            else 'no_persisted_macro_context_available'
+        )
+        return {
+            'task': 'macro_context_refresh',
+            'label': definition.label,
+            'status': status,
+            'source_status': source_status,
+            'market_date': market_date,
+            'started_at': None,
+            'updated_at': aggregate.get('updated_at'),
+            'completed_at': aggregate.get('updated_at') if status in {'completed', 'partial'} else None,
+            'processed': counts.processed,
+            'total': counts.total,
+            'succeeded': counts.succeeded,
+            'failed': counts.failed,
+            'remaining': counts.remaining,
+            'current_step': None,
+            'current_activity': _default_activity(definition.label, status),
+            'current_symbol': None,
+            'current_period': None,
+            'source_run_ids': {},
+            'details': {
+                'mode': 'derived_from_macro_context_observations',
+                'depends_on': list(definition.depends_on),
+                'reason': reason,
+                'context_status': context_status,
+                'required_series_count': required_series_count,
+                'persisted_series_count': persisted,
+                'missing_series': missing_series,
+                'stale_series': stale_series,
+                'source_statuses': aggregate.get('source_statuses') or {},
+                'macro_regime_summary': aggregate.get('macro_regime_summary') or {},
+                'freshness': aggregate.get('freshness') or {},
+                'usage_policy': {
+                    **dict(aggregate.get('usage_policy') or {}),
+                    'contextual_input_only': True,
+                    'direct_buy_sell_signal': False,
+                    'llm_generated': False,
+                },
+                'output_tables': list(definition.output_tables),
+                'inspect_routes': list(definition.inspect_routes),
+                'default_selected': definition.default_selected,
+            },
         }
 
     @staticmethod
@@ -2592,6 +2707,7 @@ eod_pipeline_status_service = EODPipelineStatusService(
     official_stage_history_loader=_load_daily_pipeline_stage_history,
     signal_feature_counts_loader=_load_signal_feature_counts,
     external_news_counts_loader=_load_external_news_counts,
+    macro_context_counts_loader=_load_macro_context_counts,
     signal_decider_counts_loader=_load_signal_decider_output_counts,
     row_count_scope_gap_loader=_load_row_count_stage_scope_gap,
     price_bar_count_loader=lambda *, market_date: count_daily_price_bars_for_date(market_date),

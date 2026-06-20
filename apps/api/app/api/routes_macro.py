@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query
 
 from app.integrations.bok.client import ECOSAPIError, ECOSClient, ECOSConfigurationError
 from app.integrations.bok.series_catalog import list_series_aliases, resolve_series_alias
+from app.macro_context.service import macro_context_service
 
 router = APIRouter(prefix='/macro')
 ecos_client = ECOSClient()
@@ -137,6 +139,31 @@ async def get_bok_series(
         end_row=end_row,
         lang=lang,
     )
+
+
+@router.get('/context', tags=['macro:context'])
+async def get_macro_context(
+    as_of_date: Optional[str] = None,
+) -> dict:
+    try:
+        return await asyncio.to_thread(
+            macro_context_service.get_context,
+            as_of_date=as_of_date,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post('/context/refresh', tags=['macro:context'])
+async def refresh_macro_context(force: bool = False) -> dict:
+    try:
+        return await asyncio.to_thread(
+            macro_context_service.refresh_context,
+            force=force,
+            trigger='manual_api',
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 def _resolve_series_request(

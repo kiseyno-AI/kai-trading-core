@@ -38,6 +38,7 @@ from app.eod.pykrx_enrichment import pykrx_enrichment_service
 from app.external_news.classifier import ACCESS_STATUS_VALUES, MATERIALITY_VALUES
 from app.external_news.provider import NAVER_NEWS_PROVIDER, NaverNewsSearchProvider
 from app.external_news.store import list_recent_external_news_for_symbols
+from app.macro_context.service import macro_context_service
 from app.market.clock import get_market_state
 from app.market.session import build_market_session_metadata
 from app.market_data_store import (
@@ -4828,6 +4829,33 @@ class AgentContextReadService:
                     'status': 'storage_unavailable',
                     'reason': 'external_news_storage_unavailable',
                 }
+        macro_context = macro_context_service.get_context(as_of_date=normalized_market_date)
+        macro_context_status = str(macro_context.get('status') or 'unavailable').strip().lower()
+        macro_context_available = macro_context_status in {'available', 'partial', 'stale'}
+        macro_context_completeness = {
+            'status': macro_context_status,
+            'missing_fields': [] if macro_context_available else ['series'],
+            'unavailable_reason': (
+                (macro_context.get('freshness') or {}).get('reason')
+                if isinstance(macro_context.get('freshness'), dict)
+                else None
+            ),
+        }
+        macro_context_provenance = {
+            'freshness_status': (
+                (macro_context.get('freshness') or {}).get('status')
+                if isinstance(macro_context.get('freshness'), dict)
+                else macro_context_status
+            ),
+            'provenance_status': (
+                PROVENANCE_STATUS_PROVIDER_SOURCED
+                if macro_context_available
+                else 'external_provider_unavailable'
+            ),
+            'as_of_market_date': normalized_market_date.isoformat(),
+            'source_tables': ['macro_context_observations'],
+            'source_statuses': macro_context.get('source_statuses') or {},
+        }
 
         symbol_map = {item['symbol']: item for item in symbol_rows}
         technical_map = {item['symbol']: item for item in technical_rows}
@@ -5046,6 +5074,7 @@ class AgentContextReadService:
                     'missing_fields': [] if recent_external_news.get('status') == 'available' else ['items'],
                     'unavailable_reason': recent_external_news.get('reason'),
                 },
+                'macro_context': macro_context_completeness,
             }
             disclosure_context = _build_disclosure_context(
                 disclosures=recent_disclosures,
@@ -5340,8 +5369,14 @@ class AgentContextReadService:
                 'recent_disclosures': bool(recent_disclosures),
                 'recent_dart_events': recent_dart_events.get('status') == 'available',
                 'recent_external_news': recent_external_news.get('status') == 'available',
+                'macro_context': macro_context_available,
             }
-            if any(availability.values()):
+            symbol_scoped_availability = {
+                key: value
+                for key, value in availability.items()
+                if key != 'macro_context'
+            }
+            if any(symbol_scoped_availability.values()):
                 matched_symbols.append(symbol)
             else:
                 missing_symbols.append(symbol)
@@ -5367,6 +5402,7 @@ class AgentContextReadService:
                     'market_relative_context': market_relative_context,
                     'sector_peer_context': sector_peer_context,
                     'market_breadth_context': market_breadth_context,
+                    'macro_context': macro_context,
                     'investor_flow_context': investor_flow_context,
                     'short_selling_context': short_selling_context,
                     'valuation_context': valuation_context,
@@ -5396,6 +5432,7 @@ class AgentContextReadService:
                         'signal_features': signal_features_provenance,
                         'sector_peer_context': sector_peer_context_provenance,
                         'market_breadth_context': market_breadth_context_provenance,
+                        'macro_context': macro_context_provenance,
                         'investor_flow_context': investor_flow_context_provenance,
                         'short_selling_context': short_selling_context_provenance,
                         'valuation_context': valuation_context_provenance,
@@ -5604,6 +5641,13 @@ class AgentContextReadService:
                 ),
                 'provider_status': external_news_provider_status,
             },
+            'macro_context': {
+                'status': macro_context_status,
+                'available': macro_context_available,
+                'source_statuses': macro_context.get('source_statuses') or {},
+                'coverage_status': 'available' if macro_context_available else 'unavailable',
+                'policy': 'contextual_input_only_not_buy_sell_signal',
+            },
         }
         for item in items:
             item['context_completeness']['requested_symbol_coverage'] = requested_symbol_coverage
@@ -5676,9 +5720,12 @@ class AgentContextReadService:
                     1 for item in items if item['recent_external_news']['status'] == 'available'
                 ),
                 'external_news_provider': external_news_provider_status,
+                'macro_context_status': macro_context_status,
+                'macro_context_source_statuses': macro_context.get('source_statuses') or {},
                 'factor_row_counts': factor_row_counts,
                 'context_completeness': requested_symbol_coverage,
             },
+            'macro_context': macro_context,
             'items': items,
         }
 

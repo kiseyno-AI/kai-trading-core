@@ -9,7 +9,7 @@ Unlike `GET /eod/freshness`, this route focuses on in-flight work. It reads the 
 
 Automatic `/eod/pykrx/daily/run-if-due` runs publish official daily pipeline run state for their scheduled PyKRX stages and chained follow-ups. The official run remains active until the follow-ups finish or fail. If a currently active auto run has no official rows, the route promotes non-PyKRX follow-up entries from `eod_collection_runs.run_metadata.stage_progress` as live stage progress so `running_stages`, `current_stage`, source run IDs, timestamps, and stale-running threshold metadata are still visible.
 
-The same payload also reports the default-selected filtering, factor/scoring, external-news, agent-feedback, signal-decider, and signal-decider-evaluation stages. Persisted `daily_signal_features`, `external_news_items` classification state, `agent_context_feedback`, and `signal_decider_decision_snapshots` rows can mark omitted same-day stages completed/available so a resumed single-stage run does not make earlier persisted outputs look pending.
+The same payload also reports the default-selected filtering, factor/scoring, external-news, macro-context, agent-feedback, signal-decider, and signal-decider-evaluation stages. Persisted `daily_signal_features`, `external_news_items` classification state, `macro_context_observations`, `agent_context_feedback`, and `signal_decider_decision_snapshots` rows can mark omitted same-day stages completed/available so a resumed single-stage run does not make earlier persisted outputs look pending.
 
 The default `market_date` is the current Seoul calendar date from `server_time[:10]`. On weekends, holidays, or other break-days, callers must pass `market_date` explicitly if they want the previous trading day's pipeline view instead of the current calendar date.
 
@@ -20,6 +20,8 @@ The `pykrx_enrichment` stage is also the operator status source for the decider 
 Row-count-derived stages expose missing-row diagnostics when they are partial. For example, `market_risk_filter.details.missing_count` and `missing_symbols_sample` show the full-universe coverage gap, while `gate_status`, `severity`, and `blocking_status` tell feedback/dashboard consumers whether that gap blocks the active feedback scope.
 
 When a same-day feedback run is active, `agent_feedback_summaries` reflects the run from feedback runtime/durable state even if no official daily pipeline stage row exists. That keeps active feedback progress separate from upstream degraded coverage.
+
+`macro_context_refresh` reports persisted slow-moving macro context availability from `macro_context_observations`. `available` context maps to a completed stage, stale or partial context maps to partial, and missing context remains pending. Source statuses preserve World Bank availability and optional FRED disabled/missing-key state without blocking the whole pipeline.
 
 For `agent_feedback_summaries`, the status reader reconciles stale durable run summaries with persisted child feedback and failure rows. The stage `updated_at` follows the latest successful or failed child activity, and `details` exposes `current_active_roles`, `target_symbols`, `completed_symbols`, `failed_symbols_count`, `role_progress`, `latest_successful_feedback_at`, and `latest_failed_feedback_at` when failures exist.
 
