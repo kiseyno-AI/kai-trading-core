@@ -21,6 +21,7 @@
 - **`app/integrations/`** — BOK, FX (Korea Exim), etc.
 - **`app/fx/`** — Korea Exim FX service-level normalization, filtering, and date fallback behavior.
 - **`app/macro_context/`** — persisted slow-moving macro context refresh/read model for decider inputs; contextual only, not a direct trading signal.
+- **`app/external_context/`** — foundational provider registry/service for slow-moving external context keys with TTL, minimum refresh interval, source status, freshness, and last-good cache metadata. It is internal-only until a concrete macro/news/research provider is explicitly wired.
 - **`app/quotes/`**, **`app/market/`**, **`app/scanner/`**, **`app/eod/`**, **`app/signals/`** — domain services and background behavior, including pykrx-based historical EOD backfill and daily KIS ranking signal features.
 
 ## Documentation
