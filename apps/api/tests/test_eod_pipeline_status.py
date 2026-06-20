@@ -2051,6 +2051,34 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
         self.assertEqual(enrich_stage['details']['classified_items'], 0)
         self.assertEqual(enrich_stage['details']['reason'], 'external_news_items_need_classification')
 
+    def test_read_reports_external_news_enrich_partial_when_only_some_items_have_contract_classification(self):
+        service = EODPipelineStatusService(
+            market_state_loader=lambda: _FakeMarketState(),
+            pykrx_run_loader=lambda **_: None,
+            pykrx_stage_counts_loader=lambda *_: {},
+            live_symbol_count_loader=lambda: 10,
+            fundamentals_refresh_loader=lambda **_: None,
+            external_news_counts_loader=lambda **_: {
+                'items': 7,
+                'symbols': 3,
+                'contract_classified_items': 4,
+                'legacy_classified_items': 2,
+                'updated_at': '2026-05-28T06:40:00+00:00',
+            },
+        )
+
+        result = service.read(market_date='2026-05-28')
+
+        enrich_stage = result['stages']['external_news_enrich']
+        self.assertEqual(enrich_stage['status'], 'partial')
+        self.assertEqual(enrich_stage['source_status'], 'stored_external_news_partially_classified')
+        self.assertEqual(enrich_stage['processed'], 4)
+        self.assertEqual(enrich_stage['total'], 7)
+        self.assertEqual(enrich_stage['details']['classified_items'], 4)
+        self.assertEqual(enrich_stage['details']['contract_classified_items'], 4)
+        self.assertEqual(enrich_stage['details']['legacy_classified_items'], 2)
+        self.assertEqual(enrich_stage['details']['classification_coverage_ratio'], 0.571429)
+
     def test_read_includes_pykrx_enrichment_stage_from_coverage(self):
         coverage = {
             'requested_symbol_count': 2,

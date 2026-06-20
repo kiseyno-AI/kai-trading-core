@@ -678,6 +678,17 @@ def trim_batch_item_for_prompt(item: dict[str, Any]) -> dict[str, Any]:
             recent_dart_events['item_count'] = min(recent_dart_events.get('item_count', len(items)), len(recent_dart_events['items']))
     recent_external_news = trimmed.get('recent_external_news')
     if isinstance(recent_external_news, dict):
+        for key in ('material_items', 'unknown_items'):
+            grouped_items = recent_external_news.get(key)
+            if isinstance(grouped_items, list):
+                recent_external_news[key] = grouped_items[:3]
+        noise_filter = recent_external_news.get('noise_filter')
+        if isinstance(noise_filter, dict):
+            noise_items = noise_filter.get('items')
+            if isinstance(noise_items, list):
+                noise_filter['items'] = noise_items[:2]
+                noise_filter['included_count'] = min(int(noise_filter.get('included_count') or len(noise_items)), len(noise_filter['items']))
+                noise_filter['omitted_count'] = max(0, int(noise_filter.get('item_count') or len(noise_items)) - len(noise_filter['items']))
         items = recent_external_news.get('items')
         if isinstance(items, list):
             recent_external_news['items'] = items[:3]
@@ -1069,6 +1080,15 @@ def build_signal_decider_payload(
                 ],
                 'trading_value_source_values': ['raw', 'estimated', 'missing'],
                 'do_not_emit_missing_warning_when_pre_decider_block_available': True,
+            },
+            'external_news_contract': {
+                'materiality_values': ['material', 'noise', 'unknown'],
+                'access_status_values': ['full_text', 'headline_only', 'paywalled', 'fetch_failed'],
+                'material_items_first': True,
+                'bounded_noise_filter_required': True,
+                'source_evidence_required_for_claims': True,
+                'price_forecast_from_news_alone_prohibited': True,
+                'headline_only_or_paywalled_not_full_text': True,
             },
         },
         'signal_decider_policy': resolved_signal_decider_policy,

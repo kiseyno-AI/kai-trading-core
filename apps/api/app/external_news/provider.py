@@ -171,6 +171,8 @@ class NaverNewsSearchProvider:
                     payload={
                         'provider': self.provider_name,
                         'query': query,
+                        'access_status': 'headline_only',
+                        'content_basis': 'search_result_title_and_snippet',
                         'raw': raw,
                     },
                 )

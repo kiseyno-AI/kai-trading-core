@@ -54,6 +54,7 @@ from app.eod.run_stage_support import (
     resolve_run_updated_at,
     select_preferred_eod_run,
 )
+from app.external_news.classifier import external_news_classification_has_contract
 from app.market.clock import get_market_state
 from app.market.session import build_market_session_metadata
 from app.market_data_store import (
@@ -287,19 +288,24 @@ def _load_external_news_counts(*, market_date: str) -> dict[str, Any]:
             .where(ExternalNewsItem.collected_at < end)
         ).all()
     symbol_ids = {row.symbol_id for row in rows if row.symbol_id is not None}
-    classified_count = 0
+    contract_classified_count = 0
+    legacy_classified_count = 0
     latest_collected_at = None
     for row in rows:
         payload = row.payload if isinstance(row.payload, dict) else {}
         classification = payload.get('classification') if isinstance(payload.get('classification'), dict) else {}
-        if classification.get('classifier'):
-            classified_count += 1
+        if external_news_classification_has_contract(classification):
+            contract_classified_count += 1
+        elif classification.get('classifier'):
+            legacy_classified_count += 1
         if row.collected_at and (latest_collected_at is None or row.collected_at > latest_collected_at):
             latest_collected_at = row.collected_at
     return {
         'items': len(rows),
         'symbols': len(symbol_ids),
-        'classified_items': classified_count,
+        'classified_items': contract_classified_count,
+        'contract_classified_items': contract_classified_count,
+        'legacy_classified_items': legacy_classified_count,
         'updated_at': latest_collected_at.isoformat() if latest_collected_at else None,
     }
 
@@ -1568,7 +1574,14 @@ class EODPipelineStatusService:
     ) -> dict[str, Any]:
         definition = STAGE_DEFINITIONS['external_news_enrich']
         item_count = int(aggregate.get('items') or aggregate.get('items_persisted') or 0)
-        classified_count = int(aggregate.get('classified_items') or aggregate.get('classified') or 0)
+        classified_count = int(
+            aggregate.get('contract_classified_items')
+            if aggregate.get('contract_classified_items') is not None
+            else aggregate.get('classified_items')
+            or aggregate.get('classified')
+            or 0
+        )
+        legacy_classified_count = int(aggregate.get('legacy_classified_items') or 0)
         if item_count <= 0:
             status = 'pending'
             source_status = None
@@ -1603,6 +1616,8 @@ class EODPipelineStatusService:
             ),
             'items_persisted': item_count,
             'classified_items': classified_count,
+            'contract_classified_items': classified_count,
+            'legacy_classified_items': legacy_classified_count,
             'classification_coverage_ratio': coverage_ratio,
             'symbols_with_news': int(aggregate.get('symbols') or aggregate.get('symbol_count') or 0),
             'reason': (

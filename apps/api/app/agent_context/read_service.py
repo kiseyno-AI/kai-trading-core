@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from calendar import monthrange
 from collections import Counter
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Any, Sequence
 
 from sqlalchemy import func, select
@@ -35,6 +35,7 @@ from app.dart.service import (
 )
 from app.dart.store import DartSyncRepository, dart_sync_repository
 from app.eod.pykrx_enrichment import pykrx_enrichment_service
+from app.external_news.classifier import ACCESS_STATUS_VALUES, MATERIALITY_VALUES
 from app.external_news.provider import NAVER_NEWS_PROVIDER, NaverNewsSearchProvider
 from app.external_news.store import list_recent_external_news_for_symbols
 from app.market.clock import get_market_state
@@ -3874,6 +3875,17 @@ def _build_decider_disclosures_news_quality_context(
                 'source_status': recent_external_news.get('status'),
                 'reason': recent_external_news.get('reason'),
                 'item_count': recent_external_news.get('item_count'),
+                'material_item_count': len(recent_external_news.get('material_items') or []),
+                'noise_item_count': _maybe_dict(recent_external_news.get('noise_filter')).get('item_count'),
+                'materiality_counts': _maybe_dict(
+                    _maybe_dict(recent_external_news.get('classification_summary')).get('materiality_counts')
+                ),
+                'access_status_counts': _maybe_dict(
+                    _maybe_dict(recent_external_news.get('classification_summary')).get('access_status_counts')
+                ),
+                'price_forecast_prohibited': _maybe_dict(recent_external_news.get('contract')).get(
+                    'price_forecast_prohibited'
+                ),
                 'latest_published_at': recent_external_news_provenance.get('latest_available_timestamp'),
                 'provider_status': external_news_provider.get('status'),
                 'provider_reason': external_news_provider.get('reason'),
@@ -4382,6 +4394,107 @@ def _external_news_provider_status() -> dict[str, Any]:
     return NaverNewsSearchProvider().status().as_dict()
 
 
+def _normalize_external_news_materiality(value: Any) -> str:
+    normalized = str(value or '').strip().lower()
+    return normalized if normalized in MATERIALITY_VALUES else 'unknown'
+
+
+def _normalize_external_news_access_status(value: Any) -> str:
+    normalized = str(value or '').strip().lower()
+    return normalized if normalized in ACCESS_STATUS_VALUES else 'headline_only'
+
+
+def _external_news_sort_key(item: dict[str, Any]) -> tuple[int, float]:
+    materiality = _normalize_external_news_materiality(item.get('materiality'))
+    rank = {'material': 0, 'unknown': 1, 'noise': 2}.get(materiality, 1)
+    try:
+        score = float(item.get('materiality_score') or 0.0)
+    except (TypeError, ValueError):
+        score = 0.0
+    return rank, -score
+
+
+def _latest_external_news_published_at(items: Sequence[dict[str, Any]]) -> str | None:
+    latest_value: datetime | None = None
+    latest_text: str | None = None
+    for item in items:
+        raw_published_at = item.get('published_at')
+        parsed = (
+            raw_published_at
+            if isinstance(raw_published_at, datetime)
+            else _parse_iso_datetime(str(raw_published_at) if raw_published_at is not None else None)
+        )
+        if parsed is None:
+            continue
+        comparable = (
+            parsed.astimezone(timezone.utc)
+            if parsed.tzinfo is not None and parsed.utcoffset() is not None
+            else parsed.replace(tzinfo=timezone.utc)
+        )
+        if latest_value is None or comparable > latest_value:
+            latest_value = comparable
+            latest_text = parsed.isoformat()
+    return latest_text
+
+
+def _compact_external_news_context_item(item: dict[str, Any]) -> dict[str, Any]:
+    classification = item.get('classification') if isinstance(item.get('classification'), dict) else {}
+    source_evidence = (
+        item.get('source_evidence')
+        if isinstance(item.get('source_evidence'), dict)
+        else classification.get('source_evidence')
+        if isinstance(classification.get('source_evidence'), dict)
+        else {}
+    )
+    source_evidence = {
+        'url': source_evidence.get('url') or item.get('url'),
+        'source_url': source_evidence.get('source_url') or item.get('source_url'),
+        'publication': source_evidence.get('publication'),
+        'published_at': source_evidence.get('published_at') or item.get('published_at'),
+    }
+    access_status = _normalize_external_news_access_status(item.get('access_status') or classification.get('access_status'))
+    materiality = _normalize_external_news_materiality(item.get('materiality') or classification.get('materiality'))
+    event_type = str(item.get('event_type') or classification.get('event_type') or 'generic_commentary').strip()
+    materiality_reason = str(
+        item.get('materiality_reason')
+        or classification.get('materiality_reason')
+        or 'No contract classification was available; treat materiality as unknown.'
+    ).strip()
+    snippet = item.get('description')
+    return {
+        'provider': item.get('provider'),
+        'title': item.get('title'),
+        'description': snippet,
+        'snippet': snippet,
+        'url': item.get('url'),
+        'published_at': item.get('published_at'),
+        'collected_at': item.get('collected_at'),
+        'event_tags': list(item.get('event_tags') or classification.get('event_tags') or []),
+        'event_type': event_type or 'generic_commentary',
+        'sentiment': item.get('sentiment') or classification.get('sentiment'),
+        'materiality': materiality,
+        'materiality_reason': materiality_reason,
+        'materiality_score': item.get('materiality_score') or classification.get('materiality_score'),
+        'materiality_bucket': item.get('materiality_bucket') or classification.get('materiality_bucket'),
+        'source_evidence': source_evidence,
+        'access_status': access_status,
+        'content_basis': item.get('content_basis') or classification.get('content_basis') or (
+            'full_text' if access_status == 'full_text' else 'headline_or_snippet_only'
+        ),
+        'full_text_read': access_status == 'full_text',
+        'price_forecast_prohibited': bool(
+            item.get('price_forecast_prohibited')
+            if item.get('price_forecast_prohibited') is not None
+            else classification.get('price_forecast_prohibited', True)
+        ),
+        'summary_policy': classification.get('summary_policy')
+        or (
+            'Use only as source-backed context. Do not infer price reaction from news alone. When access_status is not '
+            'full_text, full article text was not read; headline-only or paywalled items are not full-text summaries.'
+        ),
+    }
+
+
 def _build_recent_external_news_context(items: list[dict[str, Any]], *, provider_status: dict[str, Any]) -> dict[str, Any]:
     provider_enabled = bool(provider_status.get('enabled'))
     if not provider_enabled:
@@ -4393,7 +4506,15 @@ def _build_recent_external_news_context(items: list[dict[str, Any]], *, provider
     else:
         status = 'empty'
         reason = 'no_recent_external_news_found'
-    limited_items = items[: settings.external_news_context_limit]
+    context_limit = max(1, int(settings.external_news_context_limit or 1))
+    compact_items = [_compact_external_news_context_item(item) for item in items]
+    latest_published_at = _latest_external_news_published_at(compact_items)
+    sorted_items = sorted(compact_items, key=_external_news_sort_key)
+    limited_items = sorted_items[:context_limit]
+    material_items = [item for item in sorted_items if item['materiality'] == 'material']
+    unknown_items = [item for item in sorted_items if item['materiality'] == 'unknown']
+    noise_items = [item for item in sorted_items if item['materiality'] == 'noise']
+    noise_limit = min(context_limit, 2)
     event_tag_counts = Counter(
         tag
         for item in limited_items
@@ -4404,6 +4525,9 @@ def _build_recent_external_news_context(items: list[dict[str, Any]], *, provider
         for item in limited_items
         if item.get('sentiment')
     )
+    materiality_counts = Counter(item['materiality'] for item in compact_items)
+    event_type_counts = Counter(item['event_type'] for item in compact_items)
+    access_status_counts = Counter(item['access_status'] for item in compact_items)
     max_materiality = max(
         (float(item.get('materiality_score') or 0.0) for item in limited_items),
         default=None,
@@ -4414,27 +4538,40 @@ def _build_recent_external_news_context(items: list[dict[str, Any]], *, provider
         'provider': provider_status,
         'lookback_days': settings.external_news_context_lookback_days,
         'item_count': len(items),
+        'latest_published_at': latest_published_at,
+        'contract': {
+            'schema_version': 'recent_external_news_context_v2',
+            'materiality_values': ['material', 'noise', 'unknown'],
+            'access_status_values': ['full_text', 'headline_only', 'paywalled', 'fetch_failed'],
+            'price_forecast_prohibited': True,
+            'news_alone_is_not_price_forecast': True,
+            'headline_only_or_paywalled_policy': (
+                'Do not summarize or cite headline-only, paywalled, or fetch-failed items as if full article text was read.'
+            ),
+            'material_items_first': True,
+            'noise_filter_bounded': True,
+        },
         'classification_summary': {
             'event_tag_counts': dict(event_tag_counts),
+            'event_type_counts': dict(event_type_counts),
+            'materiality_counts': dict(materiality_counts),
+            'access_status_counts': dict(access_status_counts),
             'sentiment_counts': dict(sentiment_counts),
             'max_materiality_score': max_materiality,
-            'classifier': 'rule_based_external_news_v1' if limited_items else None,
+            'classifier': 'rule_based_external_news_contract_v1' if limited_items else None,
         },
-        'items': [
-            {
-                'provider': item.get('provider'),
-                'title': item.get('title'),
-                'description': item.get('description'),
-                'url': item.get('url'),
-                'published_at': item.get('published_at'),
-                'collected_at': item.get('collected_at'),
-                'event_tags': list(item.get('event_tags') or []),
-                'sentiment': item.get('sentiment'),
-                'materiality_score': item.get('materiality_score'),
-                'materiality_bucket': item.get('materiality_bucket'),
-            }
-            for item in limited_items
-        ],
+        'material_items': material_items[:context_limit],
+        'unknown_items': unknown_items[:context_limit],
+        'noise_filter': {
+            'status': 'available' if noise_items else 'empty',
+            'bounded': True,
+            'item_count': len(noise_items),
+            'included_count': min(len(noise_items), noise_limit),
+            'omitted_count': max(0, len(noise_items) - noise_limit),
+            'items': noise_items[:noise_limit],
+            'policy': 'Bounded background/noise items are retained only to explain what was filtered out.',
+        },
+        'items': limited_items,
     }
 
 
@@ -4454,6 +4591,7 @@ def _build_external_news_freshness_provenance(
         freshness_status = FRESHNESS_STATUS_MISSING
         provenance_status = 'external_provider_unavailable'
     items = context.get('items') if isinstance(context.get('items'), list) else []
+    latest_published_at = context.get('latest_published_at') or _latest_external_news_published_at(items)
     return _build_freshness_provenance(
         requested_market_date=requested_market_date,
         freshness_status=freshness_status,
@@ -4461,7 +4599,7 @@ def _build_external_news_freshness_provenance(
         source_tables=('external_news_items',),
         source_provider=str((context.get('provider') or {}).get('provider') or NAVER_NEWS_PROVIDER),
         reason=context.get('reason'),
-        latest_available_timestamp=items[0].get('published_at') if items else None,
+        latest_available_timestamp=latest_published_at,
         history_row_count=int(context.get('item_count') or 0),
         extra={
             'provider_status': context.get('provider'),

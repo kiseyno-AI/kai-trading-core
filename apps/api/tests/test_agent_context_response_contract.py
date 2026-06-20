@@ -17,6 +17,8 @@ class AgentContextResponseContractTests(unittest.TestCase):
         self.assertIn('Immediately before sending, validate the final raw JSON text again', suffix)
         self.assertIn('Operator-facing free-text fields must be written in Korean', suffix)
         self.assertIn('Empty recent news means no captured recent news and is neutral', suffix)
+        self.assertIn('Do not forecast price reaction from news alone', suffix)
+        self.assertIn('Do not summarize headline-only, paywalled, or fetch-failed news as if the full article text was read', suffix)
         self.assertIn('Do not classify a symbol as untradeable solely because auxiliary news or financial detail is absent.', suffix)
         self.assertIn('If only auxiliary context is absent, a buy decision may still be valid', suffix)
         self.assertIn('wait_reason must be an object with code and summary when preferred_action/next_day_open_action is wait; otherwise use null.', suffix)
@@ -34,6 +36,8 @@ class AgentContextResponseContractTests(unittest.TestCase):
         self.assertIn('trigger_price, chase_limit_price', suffix)
         self.assertIn('agent_name should equal short-term-decider', suffix)
         self.assertIn('Empty recent news means no captured recent news and is neutral', suffix)
+        self.assertIn('Do not forecast price reaction from news alone', suffix)
+        self.assertIn('Do not summarize headline-only, paywalled, or fetch-failed news as if the full article text was read', suffix)
         self.assertIn('If only auxiliary context is absent, a structured scalp_buy_candidate or watch_for_trigger decision may still be valid', suffix)
         self.assertIn('wait_reason must be an object with code and summary when tactical_action/preferred_action is watch_for_trigger, avoid_chase, or wait; otherwise use null.', suffix)
 
