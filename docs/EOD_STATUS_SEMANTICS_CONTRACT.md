@@ -156,7 +156,7 @@ It freezes the behavior currently shipped on `main` so future web work, core ref
 
 - `signal_features` can be inferred as `completed` from same-date `daily_signal_features` rows.
 - `external_news_collect` can be inferred as `completed` from same-date `external_news_items` collected rows.
-- `external_news_enrich` is based on the classification state of those stored news rows: fully classified rows are `completed`, partially classified rows are `partial`, and unclassified stored rows keep the enrich stage `pending` with reason metadata.
+- `external_news_enrich` is based on the current material/noise/source-status contract in stored news rows: fully contract-classified rows are `completed`, partially contract-classified rows are `partial`, and rows that only have legacy or missing classifier payloads keep the enrich stage `pending` with reason metadata. Status details include contract-classified and legacy-classified counts.
 - `signal_decider` can be inferred as `completed` from same-date `agent_context_feedback` rows for `agent_name=signal-decider` and/or same-date `signal_decider_decision_snapshots`.
 - These persisted-output inferences are storage availability signals. They do not silently relax prerequisite gates.
 

@@ -1693,6 +1693,21 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
                 'quarterly_financial_detail_confidence_only_unless_thesis_depends_on_it'
             ]
         )
+        self.assertTrue(
+            decider_payload['decision_support_constraints']['external_news_contract'][
+                'price_forecast_from_news_alone_prohibited'
+            ]
+        )
+        self.assertTrue(
+            decider_payload['decision_support_constraints']['external_news_contract'][
+                'headline_only_or_paywalled_not_full_text'
+            ]
+        )
+        self.assertTrue(
+            decider_payload['decision_support_constraints']['external_news_contract'][
+                'bounded_noise_filter_required'
+            ]
+        )
         self.assertEqual(decider_payload['output_contract']['assigned_symbol'], '005930')
         self.assertTrue(decider_payload['output_contract']['batch_envelope_required'])
         self.assertTrue(decider_payload['output_contract']['symbol_identity']['exact_match_required'])

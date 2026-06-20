@@ -171,6 +171,7 @@ class NaverNewsProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(items[0].title, '삼성전자 강세')
         self.assertEqual(items[0].description, 'AI & 반도체 기대')
         self.assertEqual(items[0].url, 'https://news.example/1')
+        self.assertEqual(items[0].payload['access_status'], 'headline_only')
         self.assertEqual(items[0].published_at.isoformat(), '2026-05-08T00:00:00+00:00')
 
 
@@ -184,9 +185,54 @@ class ExternalNewsClassifierTests(unittest.TestCase):
 
         self.assertIn('contract', classification['event_tags'])
         self.assertIn('earnings', classification['event_tags'])
+        self.assertEqual(classification['event_type'], 'earnings')
         self.assertEqual(classification['sentiment'], 'positive')
+        self.assertEqual(classification['materiality'], 'material')
+        self.assertIn('material event', classification['materiality_reason'])
         self.assertGreaterEqual(classification['materiality_score'], 0.5)
-        self.assertEqual(classification['classifier'], 'rule_based_external_news_v1')
+        self.assertEqual(classification['access_status'], 'headline_only')
+        self.assertTrue(classification['price_forecast_prohibited'])
+        self.assertEqual(classification['classifier'], 'rule_based_external_news_contract_v1')
+
+    def test_rule_based_classifier_labels_noise_event(self) -> None:
+        classification = classify_external_news_item(
+            title='삼성전자 주가 흐름 두고 시장 관심',
+            description='전문가들은 업종 전반의 투자심리를 점검했다.',
+        )
+
+        self.assertEqual(classification['event_type'], 'generic_commentary')
+        self.assertEqual(classification['materiality'], 'noise')
+        self.assertIn('background commentary', classification['materiality_reason'])
+        self.assertEqual(classification['access_status'], 'headline_only')
+
+    def test_rule_based_classifier_preserves_paywalled_headline_only_status(self) -> None:
+        classification = classify_external_news_item(
+            title='삼성전자 목표주가 상향 리포트',
+            description='구독자 전용 리포트에서 실적 전망을 다뤘다.',
+            payload={'access_status': 'paywalled'},
+            url='https://research.example.test/report/1',
+            source_url='https://search.example.test/report/1',
+            published_at=datetime(2026, 5, 8, 0, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(classification['access_status'], 'paywalled')
+        self.assertFalse(classification['content_basis'] == 'full_text')
+        self.assertEqual(classification['source_evidence']['url'], 'https://research.example.test/report/1')
+        self.assertEqual(classification['source_evidence']['publication'], 'research.example.test')
+        self.assertEqual(classification['source_evidence']['published_at'], '2026-05-08T00:00:00+00:00')
+        self.assertIn('full article text was not read', classification['summary_policy'])
+
+    def test_rule_based_classifier_handles_missing_source_evidence(self) -> None:
+        classification = classify_external_news_item(
+            title='삼성전자 실적 발표',
+            description='매출과 영업이익이 공개됐다.',
+            payload={},
+        )
+
+        self.assertEqual(classification['materiality'], 'material')
+        self.assertIsNone(classification['source_evidence']['url'])
+        self.assertIsNone(classification['source_evidence']['publication'])
+        self.assertIsNone(classification['source_evidence']['published_at'])
 
 
 class ExternalNewsContextTests(unittest.TestCase):
@@ -222,24 +268,86 @@ class ExternalNewsContextTests(unittest.TestCase):
             [
                 {
                     'provider': 'fake_news',
+                    'title': '삼성전자 주가 흐름 시장 관심',
+                    'description': '업종 전반의 심리 점검 기사',
+                    'url': 'https://example.test/news/noise',
+                    'published_at': '2026-05-08T00:02:00+00:00',
+                    'collected_at': '2026-05-08T00:03:00+00:00',
+                    'event_tags': ['general_news'],
+                    'event_type': 'generic_commentary',
+                    'sentiment': 'neutral',
+                    'materiality': 'noise',
+                    'materiality_reason': 'No company-specific material event keywords were detected.',
+                    'materiality_score': 0.1,
+                    'materiality_bucket': 'low',
+                    'access_status': 'headline_only',
+                    'source_evidence': {
+                        'url': 'https://example.test/news/noise',
+                        'publication': 'example.test',
+                        'published_at': '2026-05-08T00:02:00+00:00',
+                    },
+                },
+                {
+                    'provider': 'fake_news',
                     'title': '삼성전자 공급 계약',
                     'description': '실적 개선 기대',
                     'url': 'https://example.test/news/1',
                     'published_at': '2026-05-08T00:00:00+00:00',
                     'collected_at': '2026-05-08T00:01:00+00:00',
                     'event_tags': ['contract', 'earnings'],
+                    'event_type': 'contract',
                     'sentiment': 'positive',
+                    'materiality': 'material',
+                    'materiality_reason': 'Detected company-specific material event type "contract".',
                     'materiality_score': 0.62,
                     'materiality_bucket': 'medium',
+                    'access_status': 'full_text',
+                    'source_evidence': {
+                        'url': 'https://example.test/news/1',
+                        'publication': 'example.test',
+                        'published_at': '2026-05-08T00:00:00+00:00',
+                    },
+                },
+                {
+                    'provider': 'fake_news',
+                    'title': '삼성전자 프리미엄 리포트',
+                    'description': '구독자 전용 기사',
+                    'url': None,
+                    'published_at': None,
+                    'collected_at': '2026-05-08T00:04:00+00:00',
+                    'event_tags': ['analyst'],
+                    'event_type': 'analyst_rating',
+                    'sentiment': 'neutral',
+                    'materiality': 'unknown',
+                    'materiality_reason': 'No URL/publication date was available for source-backed classification.',
+                    'materiality_score': 0.2,
+                    'materiality_bucket': 'low',
+                    'access_status': 'paywalled',
+                    'source_evidence': {
+                        'url': None,
+                        'publication': None,
+                        'published_at': None,
+                    },
                 }
             ],
             provider_status={'provider': 'fake_news', 'enabled': True, 'status': 'available', 'reason': None},
         )
 
         self.assertEqual(context['status'], 'available')
+        self.assertTrue(context['contract']['price_forecast_prohibited'])
+        self.assertEqual(context['items'][0]['materiality'], 'material')
         self.assertEqual(context['items'][0]['event_tags'], ['contract', 'earnings'])
         self.assertEqual(context['items'][0]['sentiment'], 'positive')
+        self.assertEqual(context['items'][0]['source_evidence']['url'], 'https://example.test/news/1')
+        self.assertEqual(context['material_items'][0]['title'], '삼성전자 공급 계약')
+        self.assertEqual(context['unknown_items'][0]['access_status'], 'paywalled')
+        self.assertEqual(context['unknown_items'][0]['source_evidence']['url'], None)
+        self.assertEqual(context['noise_filter']['item_count'], 1)
+        self.assertEqual(context['noise_filter']['items'][0]['materiality'], 'noise')
         self.assertEqual(context['classification_summary']['event_tag_counts']['contract'], 1)
+        self.assertEqual(context['classification_summary']['materiality_counts']['material'], 1)
+        self.assertEqual(context['classification_summary']['materiality_counts']['noise'], 1)
+        self.assertEqual(context['classification_summary']['access_status_counts']['paywalled'], 1)
         self.assertEqual(context['classification_summary']['max_materiality_score'], 0.62)
 
     def test_decider_quality_context_distinguishes_empty_disclosures_from_news_provider_error(self) -> None:

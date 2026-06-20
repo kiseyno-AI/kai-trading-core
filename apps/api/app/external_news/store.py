@@ -7,7 +7,11 @@ from sqlalchemy import desc, or_, select
 
 from app.db import session_scope
 from app.db_models import ExternalNewsItem, Symbol
-from app.external_news.classifier import classify_external_news_item
+from app.external_news.classifier import (
+    classify_external_news_item,
+    external_news_classification_has_contract,
+    external_news_materiality_sort_key,
+)
 from app.external_news.provider import ExternalNewsItem as ProviderNewsItem
 
 
@@ -28,6 +32,9 @@ def _payload_with_classification(item: ProviderNewsItem) -> dict[str, Any]:
         title=item.title,
         description=item.description,
         payload=payload,
+        url=item.url,
+        source_url=item.source_url,
+        published_at=item.published_at,
     )
     return payload
 
@@ -50,9 +57,16 @@ def _serialize(row: ExternalNewsItem, *, symbol: str, name_ko: str | None, marke
         'published_at': row.published_at.isoformat() if row.published_at else None,
         'collected_at': row.collected_at.isoformat() if row.collected_at else None,
         'event_tags': list(classification.get('event_tags') or []),
+        'event_type': classification.get('event_type'),
         'sentiment': classification.get('sentiment'),
         'materiality_score': classification.get('materiality_score'),
         'materiality_bucket': classification.get('materiality_bucket'),
+        'materiality': classification.get('materiality'),
+        'materiality_reason': classification.get('materiality_reason'),
+        'source_evidence': classification.get('source_evidence'),
+        'access_status': classification.get('access_status'),
+        'content_basis': classification.get('content_basis'),
+        'price_forecast_prohibited': classification.get('price_forecast_prohibited'),
         'classification': classification,
         'payload': payload,
     }
@@ -166,12 +180,15 @@ def enrich_recent_external_news_classification(
             inspected += 1
             payload = dict(row.payload or {})
             existing = payload.get('classification') if isinstance(payload.get('classification'), dict) else None
-            if existing and existing.get('classifier') == 'rule_based_external_news_v1':
+            if external_news_classification_has_contract(existing):
                 continue
             payload['classification'] = classify_external_news_item(
                 title=row.title,
                 description=row.description,
                 payload=payload,
+                url=row.url,
+                source_url=row.source_url,
+                published_at=row.published_at,
             )
             row.payload = payload
             updated += 1
@@ -194,9 +211,16 @@ def list_recent_external_news_for_symbols(
     output = {symbol: [] for symbol in symbols}
     if not symbols:
         return output
-    rows = list_external_news_items(symbols=symbols, limit=max(len(symbols) * limit_per_symbol * 3, 100), published_since=since)
+    candidate_limit_per_symbol = max(limit_per_symbol * 4, limit_per_symbol)
+    rows = list_external_news_items(
+        symbols=symbols,
+        limit=max(len(symbols) * candidate_limit_per_symbol * 2, 100),
+        published_since=since,
+    )
     for row in rows:
         bucket = output.setdefault(row['symbol'], [])
-        if len(bucket) < limit_per_symbol:
+        if len(bucket) < candidate_limit_per_symbol:
             bucket.append(row)
+    for symbol, bucket in output.items():
+        output[symbol] = sorted(bucket, key=external_news_materiality_sort_key)[:limit_per_symbol]
     return output

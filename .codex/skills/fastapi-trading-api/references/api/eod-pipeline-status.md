@@ -204,6 +204,8 @@ GET /eod/pipeline/status?market_date=2026-04-21&fs_div=CFS
         "reason": "persisted_external_news_classification_available",
         "items_persisted": 1091,
         "classified_items": 1091,
+        "contract_classified_items": 1091,
+        "legacy_classified_items": 0,
         "classification_coverage_ratio": 1.0
       }
     },
