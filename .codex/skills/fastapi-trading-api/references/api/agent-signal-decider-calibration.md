@@ -7,6 +7,8 @@ Only mature rows with `coverage.status_reason=computed` and `evaluation_status=g
 
 The route is read-only. It does not change prompts, policies, or scores in production. `review_boundary.manual_review_only=true` and every hint includes `auto_apply=false`.
 
+The response also includes `rule_candidates`, a backward-compatible section of deterministic, replay-only policy-rule candidates derived from negative condition clusters. These candidates are not active policy; every item defaults to `activation_status="needs_replay"` and includes a structured predicate plus replay configuration for later validation.
+
 ## Example request
 ```http
 GET /agent-context/signal-decider/calibration?market_date_from=2026-04-20&market_date_to=2026-04-29&symbols=005930&symbols=000660&policy_version=signal_decider_policy_v1&horizon_days=5&evaluation_version=signal_decider_eval_v1&min_sample_size=3&cluster_limit=10
@@ -177,6 +179,93 @@ GET /agent-context/signal-decider/calibration?market_date_from=2026-04-20&market
             "label": "Wait reason: Stale quote/orderbook freshness"
           }
         ]
+      }
+    ]
+  },
+  "rule_candidates": {
+    "schema_version": "signal_decider_calibration_rule_candidates_v1",
+    "status": "generated",
+    "summary": {
+      "candidate_count": 1,
+      "candidate_type_counts": {
+        "prompt_warning": 1
+      },
+      "activation_status_counts": {
+        "needs_replay": 1
+      },
+      "active_policy_count": 0,
+      "manual_review_only": true
+    },
+    "thresholds": {
+      "min_sample_size": 3,
+      "bad_buy_rate_for_downsize": 0.7,
+      "bad_buy_rate_for_veto": 0.85,
+      "missed_opportunity_rate_for_prompt_warning": 0.6
+    },
+    "items": [
+      {
+        "candidate_id": "signal_decider_missed_opportunity_cluster_h5_abc123def456",
+        "candidate_type": "prompt_warning",
+        "target_decider": "signal-decider",
+        "predicate": {
+          "schema_version": "signal_decider_rule_predicate_v1",
+          "operator": "all",
+          "conditions": [
+            {
+              "field": "decision.action",
+              "operator": "eq",
+              "value": "wait"
+            },
+            {
+              "field": "wait_reason.code",
+              "operator": "eq",
+              "value": "stale_quote_orderbook"
+            }
+          ]
+        },
+        "reason": "3/3 matching wait/reject decisions missed opportunity on the 5d replay horizon.",
+        "support_sample_count": 3,
+        "evaluated_sample_count": 3,
+        "negative_rate": 1.0,
+        "missed_opportunity_rate": 1.0,
+        "example_symbols": ["005930", "000660"],
+        "recommended_replay_config": {
+          "schema_version": "signal_decider_rule_candidate_replay_config_v1",
+          "source": "calibration_report",
+          "candidate_id": "signal_decider_missed_opportunity_cluster_h5_abc123def456",
+          "candidate_type": "prompt_warning",
+          "candidate_scope": "missed_opportunity_cluster",
+          "target_decider": "signal-decider",
+          "market_date_from": "2026-04-20",
+          "market_date_to": "2026-04-29",
+          "horizon_days": 5,
+          "evaluation_version": "signal_decider_eval_v1",
+          "predicate": {
+            "schema_version": "signal_decider_rule_predicate_v1",
+            "operator": "all",
+            "conditions": [
+              {
+                "field": "decision.action",
+                "operator": "eq",
+                "value": "wait"
+              },
+              {
+                "field": "wait_reason.code",
+                "operator": "eq",
+                "value": "stale_quote_orderbook"
+              }
+            ]
+          },
+          "primary_metric": "missed_opportunity_rate",
+          "minimum_support_sample_count": 3,
+          "observed_support_sample_count": 3,
+          "observed_evaluated_sample_count": 3,
+          "observed_negative_rate": 1.0,
+          "activation_requires_replay": true
+        },
+        "activation_status": "needs_replay",
+        "manual_review_only": true,
+        "active_policy": false
       }
     ]
   },

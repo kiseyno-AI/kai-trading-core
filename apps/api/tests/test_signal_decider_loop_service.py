@@ -866,6 +866,95 @@ def _build_signal_decider_calibration_fixture():
     return loop_service, calibration_service, bars_by_symbol
 
 
+def _build_rule_candidate_calibration_fixture(
+    *,
+    outcome_kind: str,
+    sample_count: int = 3,
+):
+    if outcome_kind not in {'bad_buy', 'missed_opportunity'}:
+        raise ValueError('outcome_kind must be bad_buy or missed_opportunity')
+
+    symbols = [f'90{index:04d}' for index in range(1, sample_count + 1)]
+    rows = []
+    bars_by_symbol = {}
+    for index, symbol in enumerate(symbols, start=1):
+        action = 'buy' if outcome_kind == 'bad_buy' else 'wait'
+        row = _feedback_row(
+            feedback_id=400 + index,
+            snapshot_id=900 + index,
+            market_date='2026-04-20',
+            symbol=symbol,
+            action=action,
+            target_price=105 if outcome_kind == 'bad_buy' else 55,
+            stop_loss_price=96 if outcome_kind == 'bad_buy' else 47,
+        )
+        _apply_calibration_context(
+            row,
+            confidence_score_10=8.4 if outcome_kind == 'bad_buy' else 5.2,
+            signal_score=82.0,
+            close_location_ratio=0.86 if outcome_kind == 'bad_buy' else 0.48,
+            unified_value_score=0.72,
+            momentum_score=0.88,
+            quality_score=0.73,
+            liquidity_percentile=0.84,
+            passes_liquidity_floor=True,
+        )
+        rows.append(row)
+        if outcome_kind == 'bad_buy':
+            bars_by_symbol[symbol] = [
+                {'trade_date': '2026-04-20', 'open_price': 99, 'high_price': 100, 'low_price': 98, 'close_price': 99, 'volume': 1000},
+                {'trade_date': '2026-04-21', 'open_price': 100, 'high_price': 101, 'low_price': 95, 'close_price': 96, 'volume': 1000},
+                {'trade_date': '2026-04-22', 'open_price': 96, 'high_price': 98, 'low_price': 94, 'close_price': 95, 'volume': 1000},
+                {'trade_date': '2026-04-23', 'open_price': 95, 'high_price': 97, 'low_price': 93, 'close_price': 94, 'volume': 1000},
+                {'trade_date': '2026-04-24', 'open_price': 94, 'high_price': 96, 'low_price': 92, 'close_price': 93, 'volume': 1000},
+                {'trade_date': '2026-04-27', 'open_price': 93, 'high_price': 95, 'low_price': 91, 'close_price': 92, 'volume': 1000},
+            ]
+        else:
+            bars_by_symbol[symbol] = [
+                {'trade_date': '2026-04-20', 'open_price': 49, 'high_price': 50, 'low_price': 48, 'close_price': 49, 'volume': 900},
+                {'trade_date': '2026-04-21', 'open_price': 50, 'high_price': 56, 'low_price': 49, 'close_price': 55, 'volume': 900},
+                {'trade_date': '2026-04-22', 'open_price': 55, 'high_price': 57, 'low_price': 54, 'close_price': 56, 'volume': 900},
+                {'trade_date': '2026-04-23', 'open_price': 56, 'high_price': 58, 'low_price': 55, 'close_price': 57, 'volume': 900},
+                {'trade_date': '2026-04-24', 'open_price': 57, 'high_price': 59, 'low_price': 56, 'close_price': 58, 'volume': 900},
+                {'trade_date': '2026-04-27', 'open_price': 58, 'high_price': 60, 'low_price': 57, 'close_price': 59, 'volume': 900},
+            ]
+
+    repository = FakeSignalDeciderLoopRepository(rows)
+    loop_service = SignalDeciderLoopService(repository=repository)
+    calibration_service = SignalDeciderCalibrationService(loop_service=loop_service)
+    return loop_service, calibration_service, bars_by_symbol
+
+
+def _build_rule_candidate_report(
+    *,
+    outcome_kind: str,
+    sample_count: int = 3,
+    min_sample_size: int = 3,
+) -> dict:
+    loop_service, calibration_service, bars_by_symbol = _build_rule_candidate_calibration_fixture(
+        outcome_kind=outcome_kind,
+        sample_count=sample_count,
+    )
+    with patch(
+        'app.agent_context.signal_decider_loop_service.load_daily_bars_for_symbol_range',
+        side_effect=lambda symbol, **kwargs: bars_by_symbol[symbol],
+    ):
+        loop_service.compute_evaluations(
+            market_date_from='2026-04-20',
+            market_date_to='2026-04-20',
+            horizons=[5],
+            evaluation_version='signal_decider_eval_test',
+        )
+        return calibration_service.build_report(
+            market_date_from='2026-04-20',
+            market_date_to='2026-04-20',
+            horizon_days=5,
+            evaluation_version='signal_decider_eval_test',
+            min_sample_size=min_sample_size,
+            cluster_limit=10,
+        )
+
+
 class SignalDeciderLoopServiceTests(unittest.TestCase):
     def test_build_signal_decider_feature_snapshot_marks_owned_fallback_signal_rows(self):
         snapshot = build_signal_decider_feature_snapshot(
@@ -3543,6 +3632,109 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
         self.assertTrue(all_hints)
         self.assertTrue(all(hint['manual_review_only'] is True for hint in all_hints))
         self.assertTrue(all(hint['auto_apply'] is False for hint in all_hints))
+
+    def test_signal_decider_calibration_rule_candidates_skip_low_sample_clusters(self):
+        result = _build_rule_candidate_report(
+            outcome_kind='bad_buy',
+            sample_count=2,
+            min_sample_size=2,
+        )
+
+        self.assertEqual(result['rule_candidates']['summary']['candidate_count'], 0)
+        self.assertEqual(result['rule_candidates']['status'], 'empty')
+        self.assertEqual(result['rule_candidates']['thresholds']['min_sample_size'], 3)
+
+    def test_signal_decider_calibration_rule_candidates_include_bad_buy_veto_or_downsize(self):
+        result = _build_rule_candidate_report(outcome_kind='bad_buy')
+
+        candidates = list(result['rule_candidates']['items'])
+        risk_candidates = [
+            candidate
+            for candidate in candidates
+            if candidate['candidate_type'] in {'veto', 'downsize'}
+        ]
+        self.assertTrue(risk_candidates)
+        candidate = risk_candidates[0]
+        self.assertEqual(candidate['target_decider'], 'signal-decider')
+        self.assertEqual(candidate['support_sample_count'], 3)
+        self.assertEqual(candidate['negative_rate'], 1.0)
+        self.assertEqual(candidate['bad_buy_rate'], 1.0)
+        self.assertEqual(candidate['activation_status'], 'needs_replay')
+        self.assertEqual(candidate['recommended_replay_config']['candidate_id'], candidate['candidate_id'])
+        self.assertEqual(candidate['recommended_replay_config']['candidate_type'], candidate['candidate_type'])
+        self.assertEqual(candidate['recommended_replay_config']['primary_metric'], 'bad_buy_rate')
+        self.assertFalse(candidate['active_policy'])
+        self.assertTrue(
+            any(
+                condition['field'] == 'decision.action'
+                and condition['operator'] == 'eq'
+                and condition['value'] == 'buy'
+                for condition in candidate['predicate']['conditions']
+            )
+        )
+
+    def test_signal_decider_calibration_rule_candidates_warn_on_missed_opportunity_cluster(self):
+        result = _build_rule_candidate_report(outcome_kind='missed_opportunity')
+
+        warning_candidates = [
+            candidate
+            for candidate in result['rule_candidates']['items']
+            if candidate['candidate_type'] == 'prompt_warning'
+            and candidate.get('missed_opportunity_rate') == 1.0
+        ]
+        self.assertTrue(warning_candidates)
+        candidate = warning_candidates[0]
+        self.assertEqual(candidate['support_sample_count'], 3)
+        self.assertEqual(candidate['negative_rate'], 1.0)
+        self.assertEqual(candidate['recommended_replay_config']['primary_metric'], 'missed_opportunity_rate')
+        self.assertNotIn(candidate['candidate_type'], {'veto', 'downsize'})
+        self.assertTrue(
+            any(
+                condition['field'] == 'decision.action'
+                and condition['operator'] == 'eq'
+                and condition['value'] == 'wait'
+                for condition in candidate['predicate']['conditions']
+            )
+        )
+
+    def test_signal_decider_calibration_rule_candidate_ids_are_deterministic(self):
+        loop_service, calibration_service, bars_by_symbol = _build_rule_candidate_calibration_fixture(
+            outcome_kind='bad_buy',
+            sample_count=3,
+        )
+
+        with patch(
+            'app.agent_context.signal_decider_loop_service.load_daily_bars_for_symbol_range',
+            side_effect=lambda symbol, **kwargs: bars_by_symbol[symbol],
+        ):
+            loop_service.compute_evaluations(
+                market_date_from='2026-04-20',
+                market_date_to='2026-04-20',
+                horizons=[5],
+                evaluation_version='signal_decider_eval_test',
+            )
+            first = calibration_service.build_report(
+                market_date_from='2026-04-20',
+                market_date_to='2026-04-20',
+                horizon_days=5,
+                evaluation_version='signal_decider_eval_test',
+                min_sample_size=3,
+                cluster_limit=10,
+            )
+            second = calibration_service.build_report(
+                market_date_from='2026-04-20',
+                market_date_to='2026-04-20',
+                horizon_days=5,
+                evaluation_version='signal_decider_eval_test',
+                min_sample_size=3,
+                cluster_limit=10,
+            )
+
+        first_ids = [candidate['candidate_id'] for candidate in first['rule_candidates']['items']]
+        second_ids = [candidate['candidate_id'] for candidate in second['rule_candidates']['items']]
+        self.assertTrue(first_ids)
+        self.assertEqual(first_ids, second_ids)
+        self.assertEqual(len(first_ids), len(set(first_ids)))
 
 
 if __name__ == '__main__':

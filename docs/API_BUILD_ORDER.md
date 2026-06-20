@@ -202,6 +202,7 @@
 - `GET /agent-context/signal-decider/policy-candidates?status=generated&evaluation_version=signal_decider_eval_v1`
 
 ## Agent context notes
+- `GET /agent-context/signal-decider/calibration` now includes a backward-compatible `rule_candidates` section. Candidates are deterministic, structured, replay-only proposals from negative calibration clusters; they default to `activation_status="needs_replay"` and are not active policy.
 - `GET /agent-context/symbol-day` now includes a compact `factor_summary` block plus a compact `liquidity_context` block for prompt-safe decider use.
 - `liquidity_context.turnover.status` distinguishes `available`, `derived`, `stale`, `missing_price_or_volume`, and `storage_unavailable` so deciders can tell current-day turnover, safe close×volume fallback, stale prior-day context, and true storage failures apart.
 - `liquidity_context.turnover` now also carries `trading_value_source` (`raw`, `estimated`, or `missing`). Raw PyKRX/KRX `valuation_snapshot.trading_value` is preferred over close×volume estimates when present, and estimated fallback is labeled explicitly.
