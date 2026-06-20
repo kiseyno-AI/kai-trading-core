@@ -224,6 +224,35 @@ class InternalOpsTests(unittest.TestCase):
         self.assertTrue(delegated_watch.call_args.kwargs['refresh'])
         self.assertEqual(delegated_watch.call_args.kwargs['trigger'], 'internal_ops_cli')
 
+    def test_replay_decider_candidate_rules_uses_direct_service_call(self) -> None:
+        payload = {'schema_version': 'decider_replay_v1', 'summary': {'baseline_trade_count': 1}}
+        with (
+            patch('app.internal.ops.bootstrap_runtime') as bootstrap_runtime,
+            patch('app.internal.ops.decider_replay_service.replay', return_value=payload) as replay,
+        ):
+            result = ops.replay_decider_candidate_rules(
+                market_date_from='2026-06-15',
+                market_date_to='2026-06-19',
+                agent_name='short-term-decider',
+                rule_config_json='{"rules":[]}',
+                symbols='005930,000660',
+                fee_bps='1',
+                slippage_bps='2',
+                notional_krw='1000000',
+                horizon_days=5,
+                top_examples_limit=3,
+            )
+
+        bootstrap_runtime.assert_called_once_with()
+        self.assertEqual(result, payload)
+        self.assertEqual(replay.call_args.kwargs['market_date_from'], '2026-06-15')
+        self.assertEqual(replay.call_args.kwargs['market_date_to'], '2026-06-19')
+        self.assertEqual(replay.call_args.kwargs['agent_name'], 'short-term-decider')
+        self.assertEqual(replay.call_args.kwargs['symbols'], ['005930', '000660'])
+        self.assertEqual(replay.call_args.kwargs['fee_bps'], '1')
+        self.assertEqual(replay.call_args.kwargs['slippage_bps'], '2')
+        self.assertEqual(replay.call_args.kwargs['top_examples_limit'], 3)
+
     def test_compute_trending_ranks_uses_direct_store_call(self) -> None:
         with (
             patch('app.internal.ops.bootstrap_runtime') as bootstrap_runtime,
