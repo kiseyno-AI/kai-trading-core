@@ -167,6 +167,81 @@ class RepairJsonTailTests(unittest.TestCase):
             ]
         )
 
+    def test_build_signal_decider_payload_includes_signal_envelopes_without_replacing_raw_blocks(self):
+        upstream_summaries = {
+            'technical-summarizer': {
+                'preferred_action': 'buy',
+                'confidence_score_10': 8,
+                'summary': 'Constructive breakout.',
+                'supporting_evidence': ['Breakout held.'],
+            }
+        }
+        upstream_traceability = {
+            'technical-summarizer': {
+                'feedback_id': 7,
+                'run_id': 'tech-run-7',
+                'source': 'persisted_feedback',
+            }
+        }
+
+        payload = build_signal_decider_payload(
+            item={
+                'symbol': '005930',
+                'market_date': '2026-04-14',
+                'scores': {},
+                'factor_summary': {
+                    'requested_market_date': '2026-04-14',
+                    'factor_scores': {
+                        'momentum': {
+                            'status': 'available',
+                            'score': 0.91,
+                            'components_used': 3,
+                            'components_possible': 3,
+                        }
+                    },
+                },
+                'signal_envelopes': [
+                    {
+                        'schema_version': 'signal_envelope_v1',
+                        'source_name': 'news:external',
+                        'source_type': 'news',
+                        'symbol': '005930',
+                        'market_date': '2026-04-14',
+                        'horizon': '5d',
+                        'value': -0.4,
+                        'confidence': 0.6,
+                        'evidence_count': 1,
+                        'risk_flags': ['material_news'],
+                        'evidence_refs': [],
+                        'summary': 'Material risk headline.',
+                        'raw_ref': {'type': 'symbol_day_context', 'path': 'recent_external_news'},
+                    }
+                ],
+            },
+            market_date=date(2026, 4, 14),
+            request_run_id='request-run-test',
+            market_context={},
+            upstream_summaries=upstream_summaries,
+            upstream_traceability=upstream_traceability,
+            signal_decider_agent_name='signal-decider',
+        )
+
+        by_source = {item['source_name']: item for item in payload['signal_envelopes']}
+        self.assertIn('news:external', by_source)
+        self.assertIn('technical-summarizer', by_source)
+        self.assertIn('factor:momentum', by_source)
+        self.assertNotIn('signal_envelopes', payload['symbol_day_context'])
+        self.assertEqual(
+            payload['upstream_summaries']['technical-summarizer']['supporting_evidence'],
+            ['Breakout held.'],
+        )
+        self.assertEqual(payload['factor_summary']['factor_scores']['momentum']['score'], 0.91)
+        self.assertEqual(by_source['technical-summarizer']['raw_ref']['feedback_id'], 7)
+        self.assertEqual(
+            payload['decision_support_constraints']['missing_context_policy']['signal_envelope_schema_version'],
+            'signal_envelope_v1',
+        )
+
     def test_build_signal_decider_payload_preserves_degraded_macro_context_statuses(self):
         for status in ('partial', 'unavailable', 'stale'):
             with self.subTest(status=status):
