@@ -1070,6 +1070,23 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
                     'missing_fields': ['indices.kosdaq', 'flows.foreign', 'flows.institutional'],
                     'stale_reason': None,
                 },
+                'signal_envelopes': [
+                    {
+                        'schema_version': 'signal_envelope_v1',
+                        'source_name': 'factor:momentum',
+                        'source_type': 'factor',
+                        'symbol': '005930',
+                        'market_date': '2026-04-23',
+                        'horizon': '5d',
+                        'value': 0.82,
+                        'confidence': 1.0,
+                        'evidence_count': 3,
+                        'risk_flags': [],
+                        'evidence_refs': [],
+                        'summary': 'momentum factor status=available score=0.9100',
+                        'raw_ref': {'type': 'factor_summary', 'path': 'factor_summary.factor_scores.momentum'},
+                    }
+                ],
             },
             received_at='2026-04-23T06:00:00+00:00',
         )
@@ -1084,6 +1101,10 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
         self.assertEqual(snapshot_item['input_feature_snapshot_payload']['technical']['breakout_20d'], True)
         self.assertEqual(snapshot_item['request_payload']['scores']['quality']['status'], 'partial')
         self.assertEqual(snapshot_item['request_payload']['market_context']['status'], 'partial')
+        self.assertEqual(
+            snapshot_item['request_payload']['signal_envelopes'][0]['schema_version'],
+            'signal_envelope_v1',
+        )
         self.assertEqual(snapshot_item['input_feature_snapshot_payload']['scores']['quality']['components_possible'], 6)
         self.assertIn('decision_delta', snapshot_item['response_payload'])
         self.assertEqual(

@@ -7,6 +7,10 @@ from datetime import date, datetime, timezone
 from typing import Any, Sequence
 
 from fastapi.encoders import jsonable_encoder
+from app.agent_context.signal_envelope import (
+    SIGNAL_ENVELOPE_SCHEMA_VERSION,
+    build_decider_signal_envelopes,
+)
 from app.agent_context.signal_decider_loop_service import signal_decider_loop_service
 
 ABORTLIKE_ERROR_MARKERS = (
@@ -942,8 +946,21 @@ def build_signal_decider_payload(
         if isinstance(symbol_day_context.get('macro_context'), dict)
         else {}
     )
-    requested_at = datetime.now(timezone.utc).isoformat()
+    existing_signal_envelopes = (
+        symbol_day_context.pop('signal_envelopes', [])
+        if isinstance(symbol_day_context.get('signal_envelopes'), list)
+        else []
+    )
     symbol = str(item.get('symbol') or '')
+    signal_envelopes = build_decider_signal_envelopes(
+        symbol=symbol,
+        market_date=market_date,
+        factor_summary=factor_summary,
+        upstream_summaries=upstream_summaries,
+        upstream_traceability=upstream_traceability,
+        existing_envelopes=existing_signal_envelopes,
+    )
+    requested_at = datetime.now(timezone.utc).isoformat()
     resolved_signal_decider_policy = jsonable_encoder(
         signal_decider_policy
         if signal_decider_policy is not None
@@ -1026,6 +1043,7 @@ def build_signal_decider_payload(
         'decider_data_quality_context': jsonable_encoder(decider_data_quality_context),
         'decision_input_quality_context': jsonable_encoder(decision_input_quality_context),
         'macro_context': jsonable_encoder(macro_context),
+        'signal_envelopes': jsonable_encoder(signal_envelopes),
         'market_context': jsonable_encoder(market_context or {}),
         'upstream_summaries': jsonable_encoder(upstream_summaries),
         'upstream_traceability': jsonable_encoder(upstream_traceability),
@@ -1075,6 +1093,9 @@ def build_signal_decider_payload(
                 'macro_context_contextual_input_only': True,
                 'macro_context_not_a_direct_buy_sell_signal': True,
                 'macro_context_regime_summary_is_deterministic_no_llm': True,
+                'signal_envelope_schema_version': SIGNAL_ENVELOPE_SCHEMA_VERSION,
+                'signal_envelopes_are_compact_normalized_inputs': True,
+                'signal_envelopes_do_not_replace_raw_payloads': True,
                 'decision_input_quality_context_authoritative': True,
                 'decision_input_quality_sections': [
                     'data_quality',

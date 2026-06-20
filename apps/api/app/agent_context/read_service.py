@@ -12,6 +12,7 @@ from app.agent_context.derived_contexts import DEFAULT_DERIVED_CONTEXT_HISTORY_D
 from app.agent_context.decision_input_quality import build_decision_input_quality_envelope
 from app.agent_context.missing_data_taxonomy import CATEGORY_DEFINITIONS_BY_KEY
 from app.agent_context.score_context import build_signal_decider_scores
+from app.agent_context.signal_envelope import build_symbol_signal_envelopes
 from app.core.settings import settings
 from app.db import session_scope
 from app.db_models import (
@@ -5319,6 +5320,12 @@ class AgentContextReadService:
                 decider_data_quality_context=decider_data_quality_context,
                 pre_decider_enrichment_context=pre_decider_enrichment_context,
             )
+            signal_envelopes = build_symbol_signal_envelopes(
+                symbol=symbol,
+                market_date=normalized_market_date,
+                factor_summary=factor_summary,
+                recent_external_news=recent_external_news,
+            )
 
             fundamentals_entries = fundamentals_map.get(symbol) or []
             latest_disclosure = recent_disclosures[0] if recent_disclosures else None
@@ -5394,6 +5401,7 @@ class AgentContextReadService:
                     'pre_decider_enrichment_context': pre_decider_enrichment_context,
                     'decider_data_quality_context': decider_data_quality_context,
                     'decision_input_quality_context': decision_input_quality_context,
+                    'signal_envelopes': signal_envelopes,
                     'intraday_execution_context': intraday_execution_context,
                     'price_context_history': price_context_history,
                     'technical_snapshot': technical_snapshot,
@@ -5707,6 +5715,7 @@ class AgentContextReadService:
                 'pre_decider_enrichment_context_count': sum(
                     1 for item in items if _context_block_has_signal(item['pre_decider_enrichment_context'])
                 ),
+                'signal_envelope_count': sum(len(item.get('signal_envelopes') or []) for item in items),
                 'fundamentals_count': sum(
                     1 for item in items if item['fundamentals']['latest_snapshot'] is not None
                 ),
