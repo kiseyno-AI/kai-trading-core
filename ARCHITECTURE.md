@@ -26,6 +26,7 @@
 
 ## Documentation
 - **`docs/API_BUILD_ORDER.md`** — implemented vs planned HTTP routes (keep in sync with code).
+- **`docs/EXTERNAL_CONTEXT_SOURCE_CATALOG.md`** — approved external context source catalog, access requirements, TTL expectations, and direct-signal policy.
 - **`docs/ARCHITECTURE.md`**, **`docs/KIS_API_ONBOARDING.md`**, **`docs/scanner/`** — deeper notes.
 
 ## Tooling and quality
