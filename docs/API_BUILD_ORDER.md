@@ -229,6 +229,7 @@
 - `GET /macro/context` reads the compact persisted macro context used by agent/decider inputs. `POST /macro/context/refresh` refreshes it on demand and returns per-source status rather than failing the whole request for optional provider gaps.
 - The MVP persists slow-moving observations in `macro_context_observations` with `source`, `series_id`, `observation_period`, `observation_date`, `value`, `fetched_at`, and `source_status`.
 - World Bank indicators are the default no-key source for Korea GDP growth, CPI inflation, and unemployment. FRED is optional and explicitly reports `disabled_missing_api_key` unless `FRED_API_KEY` is configured.
+- External macro/news/research/market/risk source candidates, access requirements, TTL expectations, and direct-signal eligibility live in [docs/EXTERNAL_CONTEXT_SOURCE_CATALOG.md](./EXTERNAL_CONTEXT_SOURCE_CATALOG.md).
 - The daily pipeline stage `macro_context_refresh` runs before agent feedback by default. Upstream failures or missing keys are represented as `partial`, `unavailable`, or disabled source statuses; they must not block the whole daily pipeline.
 - Macro context is contextual input only. It must not be interpreted as a direct buy/sell signal or position-sizing instruction.
 
