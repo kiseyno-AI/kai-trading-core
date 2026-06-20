@@ -20,6 +20,7 @@
 - **`app/orders/intraday_auto_sell.py`** — persisted intraday watcher for linked next-open positions that evaluates live target/stop thresholds, suppresses duplicate exits, and submits sell orders through the durable order flow.
 - **`app/integrations/`** — BOK, FX (Korea Exim), etc.
 - **`app/fx/`** — Korea Exim FX service-level normalization, filtering, and date fallback behavior.
+- **`app/macro_context/`** — persisted slow-moving macro context refresh/read model for decider inputs; contextual only, not a direct trading signal.
 - **`app/quotes/`**, **`app/market/`**, **`app/scanner/`**, **`app/eod/`**, **`app/signals/`** — domain services and background behavior, including pykrx-based historical EOD backfill and daily KIS ranking signal features.
 
 ## Documentation

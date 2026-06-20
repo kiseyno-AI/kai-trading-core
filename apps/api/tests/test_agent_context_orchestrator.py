@@ -99,6 +99,21 @@ class RepairJsonTailTests(unittest.TestCase):
                 'max_safe_notional_krw': 49350000,
             },
         }
+        macro_context = {
+            'schema_version': 'macro_context_v1',
+            'status': 'available',
+            'macro_regime_summary': {
+                'growth_label': 'growth_expansion',
+                'inflation_label': 'inflation_stable',
+                'freshness_label': 'macro_context_fresh',
+                'llm_generated': False,
+            },
+            'usage_policy': {
+                'contextual_input_only': True,
+                'direct_buy_sell_signal': False,
+                'llm_generated': False,
+            },
+        }
 
         payload = build_signal_decider_payload(
             item={
@@ -106,6 +121,7 @@ class RepairJsonTailTests(unittest.TestCase):
                 'market_date': '2026-04-14',
                 'pre_decider_enrichment_context': pre_decider_context,
                 'decision_input_quality_context': decision_input_quality_context,
+                'macro_context': macro_context,
                 'scores': {},
                 'factor_summary': {},
                 'liquidity_context': {},
@@ -121,8 +137,10 @@ class RepairJsonTailTests(unittest.TestCase):
 
         self.assertEqual(payload['pre_decider_enrichment_context'], pre_decider_context)
         self.assertEqual(payload['decision_input_quality_context'], decision_input_quality_context)
+        self.assertEqual(payload['macro_context'], macro_context)
         self.assertNotIn('pre_decider_enrichment_context', payload['symbol_day_context'])
         self.assertNotIn('decision_input_quality_context', payload['symbol_day_context'])
+        self.assertNotIn('macro_context', payload['symbol_day_context'])
         self.assertTrue(
             payload['decision_support_constraints']['missing_context_policy'][
                 'pre_decider_enrichment_context_authoritative'
@@ -130,9 +148,78 @@ class RepairJsonTailTests(unittest.TestCase):
         )
         self.assertTrue(
             payload['decision_support_constraints']['missing_context_policy'][
+                'macro_context_contextual_input_only'
+            ]
+        )
+        self.assertTrue(
+            payload['decision_support_constraints']['missing_context_policy'][
+                'macro_context_not_a_direct_buy_sell_signal'
+            ]
+        )
+        self.assertTrue(
+            payload['decision_support_constraints']['missing_context_policy'][
+                'macro_context_regime_summary_is_deterministic_no_llm'
+            ]
+        )
+        self.assertTrue(
+            payload['decision_support_constraints']['missing_context_policy'][
                 'decision_input_quality_context_authoritative'
             ]
         )
+
+    def test_build_signal_decider_payload_preserves_degraded_macro_context_statuses(self):
+        for status in ('partial', 'unavailable', 'stale'):
+            with self.subTest(status=status):
+                macro_context = {
+                    'schema_version': 'macro_context_v1',
+                    'status': status,
+                    'freshness': {
+                        'status': status,
+                        'knowledge_cutoff_applied': True,
+                        'knowledge_cutoff_at': '2025-01-02T00:00:00+00:00',
+                    },
+                    'series': [
+                        {
+                            'source': 'world_bank',
+                            'series_id': 'NY.GDP.MKTP.KD.ZG',
+                            'status': 'missing' if status in {'partial', 'unavailable'} else 'stale',
+                            'latest_value': None,
+                        }
+                    ],
+                    'macro_regime_summary': {
+                        'freshness_label': f'macro_context_{status}',
+                        'llm_generated': False,
+                    },
+                    'usage_policy': {
+                        'contextual_input_only': True,
+                        'direct_buy_sell_signal': False,
+                        'llm_generated': False,
+                    },
+                }
+
+                payload = build_signal_decider_payload(
+                    item={
+                        'symbol': '005930',
+                        'market_date': '2025-01-01',
+                        'macro_context': macro_context,
+                        'scores': {},
+                        'factor_summary': {},
+                        'liquidity_context': {},
+                        'pre_decider_enrichment_context': {},
+                        'decider_data_quality_context': {},
+                    },
+                    market_date=date(2025, 1, 1),
+                    request_run_id='request-run-test',
+                    market_context={},
+                    upstream_summaries={},
+                    upstream_traceability={},
+                    signal_decider_agent_name='short-term-decider',
+                )
+
+                self.assertEqual(payload['macro_context']['status'], status)
+                self.assertEqual(payload['macro_context']['freshness']['status'], status)
+                self.assertTrue(payload['macro_context']['freshness']['knowledge_cutoff_applied'])
+                self.assertEqual(payload['macro_context']['series'][0]['status'], macro_context['series'][0]['status'])
 
     def test_coerce_decoded_batch_response_unwraps_batch_and_item_level_feedback(self):
         decoded = {

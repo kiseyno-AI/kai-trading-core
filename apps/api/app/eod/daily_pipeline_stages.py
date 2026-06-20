@@ -25,6 +25,7 @@ from app.eod.pykrx_backfill import DEFAULT_MARKETS, PYKRX_BACKFILL_SERVICE
 from app.eod.pykrx_enrichment import pykrx_enrichment_service
 from app.eod.technical_snapshots import daily_technical_snapshot_service
 from app.external_news.service import external_news_service
+from app.macro_context.service import macro_context_service
 from app.market.clock import get_market_state
 from app.market_data_store import compute_and_persist_daily_trending_ranks
 from app.signals.advanced_value_factor import (
@@ -82,6 +83,7 @@ DAILY_STAGE_ORDER: tuple[str, ...] = (
     *FACTOR_STAGE_ORDER,
     'external_news_collect',
     'external_news_enrich',
+    'macro_context_refresh',
     'agent_feedback_summaries',
     'signal_decider',
     'signal_decider_evaluations',
@@ -97,6 +99,7 @@ DEFAULT_DAILY_STAGE_ORDER: tuple[str, ...] = (
     *FACTOR_STAGE_ORDER,
     'external_news_collect',
     'external_news_enrich',
+    'macro_context_refresh',
     'agent_feedback_summaries',
     'signal_decider',
     'signal_decider_evaluations',
@@ -390,12 +393,30 @@ STAGE_DEFINITIONS: dict[str, DailyStageDefinition] = {
         output_tables=('external_news_items',),
         default_selected=True,
     ),
+    'macro_context_refresh': DailyStageDefinition(
+        id='macro_context_refresh',
+        label='macro context refresh',
+        group='external_data',
+        description='Refresh persisted slow-moving macro context from free/no-key sources and explicitly label unavailable keyed providers.',
+        depends_on=('external_news_enrich',),
+        supports_force=True,
+        inspect_routes=('/macro/context', '/macro/context/refresh'),
+        output_tables=('macro_context_observations',),
+        default_selected=True,
+    ),
     'agent_feedback_summaries': DailyStageDefinition(
         id='agent_feedback_summaries',
         label='agent feedback summarizer dispatch',
         group='agent_feedback',
         description='Run the persisted symbol-level summarizer stages over the symbol universe that passes both active pre-filters.',
-        depends_on=('market_risk_filter', 'piotroski_filter', *FACTOR_STAGE_ORDER, 'external_news_collect', 'external_news_enrich'),
+        depends_on=(
+            'market_risk_filter',
+            'piotroski_filter',
+            *FACTOR_STAGE_ORDER,
+            'external_news_collect',
+            'external_news_enrich',
+            'macro_context_refresh',
+        ),
         supports_symbols=True,
         supports_capture_limit=True,
         inspect_routes=('/agent-context/feedback/progress', '/agent-context/feedback/status'),
@@ -775,6 +796,16 @@ class DailyPipelineStageService:
                 'succeeded': succeeded,
                 'failed': failed,
             }
+        if stage_id == 'macro_context_refresh':
+            succeeded = _int(result.get('observations_upserted'))
+            failed = _int(result.get('observations_failed'))
+            total = succeeded + failed
+            return {
+                'processed': total,
+                'total': total,
+                'succeeded': succeeded,
+                'failed': failed,
+            }
 
         count_pairs = (
             ('snapshots_persisted', 'snapshots_failed'),
@@ -1006,6 +1037,11 @@ class DailyPipelineStageService:
                 lookback_days=settings.external_news_context_lookback_days,
                 limit=symbol_limit or 1000,
             )
+        if stage_id == 'macro_context_refresh':
+            return macro_context_service.refresh_context(
+                force=force,
+                trigger='daily_pipeline_stage',
+            )
         if stage_id in {'agent_feedback_summaries', 'signal_decider'}:
             prerequisites = agent_feedback_prerequisite_service.inspect_feedback_prerequisites(
                 market_date=market_date,
@@ -1197,6 +1233,8 @@ class DailyPipelineStageService:
             return 'skipped'
         raw_status = str(result.get('status') or '').strip()
         if raw_status:
+            if raw_status == 'unavailable':
+                return 'partial'
             return 'partial' if raw_status == 'completed_with_errors' else raw_status
         if 'completed' in result and 'final_pending' in result:
             return 'completed' if bool(result.get('completed')) else 'partial'
@@ -1214,7 +1252,7 @@ class DailyPipelineStageService:
 
     @staticmethod
     def _has_successful_work(result: dict[str, Any]) -> bool:
-        success_suffixes = ('_persisted', '_succeeded', '_refreshed', '_fresh')
+        success_suffixes = ('_persisted', '_succeeded', '_refreshed', '_fresh', '_upserted')
         success_keys = {'bars_upserted', 'persisted_count'}
         for key, value in result.items():
             if isinstance(value, bool):

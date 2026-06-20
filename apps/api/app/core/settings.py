@@ -103,6 +103,20 @@ class Settings(BaseSettings):
     koreaexim_base_url: str = 'https://oapi.koreaexim.go.kr/site/program/financial/exchangeJSON'
     koreaexim_fallback_days: int = 2
 
+    macro_context_enabled: bool = True
+    macro_context_refresh_min_interval_hours: int = 24
+    macro_context_stale_after_hours: int = 72
+    macro_context_request_timeout_seconds: float = 15.0
+    macro_context_world_bank_enabled: bool = True
+    macro_context_world_bank_base_url: str = 'https://api.worldbank.org/v2'
+    macro_context_world_bank_country: str = 'KOR'
+    macro_context_world_bank_series: str = 'NY.GDP.MKTP.KD.ZG,FP.CPI.TOTL.ZG,SL.UEM.TOTL.ZS'
+    macro_context_world_bank_mrnev: int = 1
+    macro_context_fred_enabled: bool = True
+    macro_context_fred_series: str = 'DEXKOUS'
+    fred_api_key: str = ''
+    fred_base_url: str = 'https://api.stlouisfed.org'
+
     upbit_base_url: str = 'https://api.upbit.com'
     upbit_request_timeout_seconds: float = 10.0
     upbit_market_whitelist: str = 'KRW-BTC,KRW-ETH'

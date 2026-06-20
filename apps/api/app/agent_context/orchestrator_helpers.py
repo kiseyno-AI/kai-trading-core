@@ -480,6 +480,7 @@ def _compact_symbol_day_context_for_decider(context: dict[str, Any]) -> dict[str
         'sector_peer_context',
         'market_relative_context',
         'market_breadth_context',
+        'macro_context',
         'recent_disclosures',
         'recent_dart_events',
         'recent_external_news',
@@ -936,6 +937,11 @@ def build_signal_decider_payload(
         if isinstance(symbol_day_context.get('pre_decider_enrichment_context'), dict)
         else {}
     )
+    macro_context = (
+        symbol_day_context.pop('macro_context', {})
+        if isinstance(symbol_day_context.get('macro_context'), dict)
+        else {}
+    )
     requested_at = datetime.now(timezone.utc).isoformat()
     symbol = str(item.get('symbol') or '')
     resolved_signal_decider_policy = jsonable_encoder(
@@ -1019,6 +1025,7 @@ def build_signal_decider_payload(
         'pre_decider_enrichment_context': jsonable_encoder(pre_decider_enrichment_context),
         'decider_data_quality_context': jsonable_encoder(decider_data_quality_context),
         'decision_input_quality_context': jsonable_encoder(decision_input_quality_context),
+        'macro_context': jsonable_encoder(macro_context),
         'market_context': jsonable_encoder(market_context or {}),
         'upstream_summaries': jsonable_encoder(upstream_summaries),
         'upstream_traceability': jsonable_encoder(upstream_traceability),
@@ -1065,6 +1072,9 @@ def build_signal_decider_payload(
                 'quarterly_financial_detail_confidence_only_unless_thesis_depends_on_it': True,
                 'forbid_untradeable_from_auxiliary_absence_only': True,
                 'pre_decider_enrichment_context_authoritative': True,
+                'macro_context_contextual_input_only': True,
+                'macro_context_not_a_direct_buy_sell_signal': True,
+                'macro_context_regime_summary_is_deterministic_no_llm': True,
                 'decision_input_quality_context_authoritative': True,
                 'decision_input_quality_sections': [
                     'data_quality',

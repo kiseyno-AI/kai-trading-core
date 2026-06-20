@@ -114,6 +114,29 @@ def _blocked_pykrx_enrichment_coverage(*, expected_symbols: int, market_count: i
     }
 
 
+def _available_macro_context_counts(*, updated_at: str = '2026-06-20T06:00:00+00:00') -> dict:
+    return {
+        'persisted': 3,
+        'required_series_count': 3,
+        'updated_at': updated_at,
+        'context_status': 'available',
+        'source_statuses': {
+            'world_bank': {'status': 'available', 'series_count': 3},
+            'fred': {'status': 'disabled_missing_api_key'},
+        },
+        'macro_regime_summary': {
+            'growth_label': 'growth_expansion',
+            'inflation_label': 'inflation_stable',
+            'llm_generated': False,
+        },
+        'usage_policy': {
+            'contextual_input_only': True,
+            'direct_buy_sell_signal': False,
+            'llm_generated': False,
+        },
+    }
+
+
 def _completed_official_stage(
     *,
     run_id: int,
@@ -283,9 +306,9 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
 
         self.assertEqual(result['market_date'], '2026-04-21')
         self.assertEqual(result['status'], 'pending')
-        self.assertEqual(result['total_stages'], 24)
+        self.assertEqual(result['total_stages'], 25)
         self.assertEqual(result['completed_stages'], 0)
-        self.assertEqual(result['pending_stages'], 24)
+        self.assertEqual(result['pending_stages'], 25)
         self.assertEqual(result['current_stage'], 'master_refresh')
         self.assertEqual(result['stages']['price_collection']['status'], 'pending')
         self.assertEqual(result['stages']['price_collection']['order'], 3)
@@ -349,7 +372,7 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
         result = service.read()
 
         self.assertEqual(result['status'], 'running')
-        self.assertEqual(result['total_stages'], 24)
+        self.assertEqual(result['total_stages'], 25)
         self.assertEqual(result['running_stages'], 1)
         self.assertEqual(result['current_stage'], 'market_risk_filter')
         self.assertEqual(result['official_run']['id'], 501)
@@ -1040,6 +1063,7 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
                 'composite_factors',
                 'external_news_collect',
                 'external_news_enrich',
+                'macro_context_refresh',
                 'agent_feedback_summaries',
                 'signal_decider',
                 'signal_decider_evaluations',
@@ -1766,11 +1790,11 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
         result = service.read()
 
         self.assertEqual(result['status'], 'partial')
-        self.assertEqual(result['total_stages'], 24)
+        self.assertEqual(result['total_stages'], 25)
         self.assertEqual(result['stage_status_counts']['completed'], 16)
         self.assertEqual(result['skipped_stages'], 2)
         self.assertEqual(result['partial_stages'], 0)
-        self.assertEqual(result['pending_stages'], 6)
+        self.assertEqual(result['pending_stages'], 7)
         self.assertEqual(result['current_stage'], 'signal_features')
         self.assertEqual(result['stages']['master_refresh']['status'], 'skipped')
         self.assertEqual(result['stages']['pykrx_universe_refresh']['status'], 'skipped')
@@ -1910,6 +1934,9 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
                 'classified_items': 1091,
                 'updated_at': '2026-05-28T06:40:00+00:00',
             },
+            macro_context_counts_loader=lambda **_: _available_macro_context_counts(
+                updated_at='2026-05-28T06:50:00+00:00',
+            ),
             signal_decider_counts_loader=lambda **_: {
                 'feedback_rows': 114,
                 'feedback_symbols': 114,
@@ -1922,10 +1949,10 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
         result = service.read(market_date=market_date)
 
         self.assertEqual(result['status'], 'completed')
-        self.assertEqual(result['total_stages'], 24)
-        self.assertEqual(result['completed_stages'], 22)
+        self.assertEqual(result['total_stages'], 25)
+        self.assertEqual(result['completed_stages'], 23)
         self.assertEqual(result['skipped_stages'], 2)
-        self.assertEqual(result['display_completed_stages'], 24)
+        self.assertEqual(result['display_completed_stages'], 25)
         self.assertEqual(result['pending_stages'], 0)
         self.assertEqual(result['partial_stages'], 0)
         self.assertEqual(result['running_stages'], 0)
@@ -1941,6 +1968,8 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
         self.assertEqual(result['stages']['external_news_collect']['details']['items_persisted'], 1091)
         self.assertEqual(result['stages']['external_news_enrich']['status'], 'completed')
         self.assertEqual(result['stages']['external_news_enrich']['details']['classified_items'], 1091)
+        self.assertEqual(result['stages']['macro_context_refresh']['status'], 'completed')
+        self.assertEqual(result['stages']['macro_context_refresh']['details']['persisted_series_count'], 3)
         self.assertEqual(result['stages']['signal_decider']['status'], 'completed')
         self.assertEqual(result['stages']['signal_decider']['details']['feedback_rows'], 114)
         self.assertEqual(result['stages']['signal_decider']['details']['decision_snapshots'], 228)
@@ -2187,3 +2216,45 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
                 'short_selling': 0,
             },
         )
+
+    def test_macro_context_stage_reports_persisted_context_status(self):
+        service = EODPipelineStatusService(
+            market_state_loader=lambda: _FakeMarketState(),
+            pykrx_run_loader=lambda **_: None,
+            pykrx_stage_counts_loader=lambda *_: {},
+            live_symbol_count_loader=lambda: 0,
+            fundamentals_refresh_loader=lambda **_: None,
+            price_bar_count_loader=lambda **_: 0,
+            pykrx_enrichment_loader=lambda **_: {},
+            macro_context_counts_loader=lambda **_: {
+                'persisted': 3,
+                'required_series_count': 3,
+                'updated_at': '2026-06-20T06:00:00+00:00',
+                'context_status': 'available',
+                'source_statuses': {
+                    'world_bank': {'status': 'available', 'series_count': 3},
+                    'fred': {'status': 'disabled_missing_api_key'},
+                },
+                'macro_regime_summary': {
+                    'growth_label': 'growth_expansion',
+                    'inflation_label': 'inflation_stable',
+                    'llm_generated': False,
+                },
+                'usage_policy': {
+                    'contextual_input_only': True,
+                    'direct_buy_sell_signal': False,
+                    'llm_generated': False,
+                },
+            },
+        )
+
+        result = service.read(market_date='2026-06-20', fs_div='CFS')
+
+        stage = result['stages']['macro_context_refresh']
+        self.assertEqual(stage['status'], 'completed')
+        self.assertEqual(stage['source_status'], 'stored_macro_context_fresh')
+        self.assertEqual(stage['succeeded'], 3)
+        self.assertEqual(stage['details']['context_status'], 'available')
+        self.assertEqual(stage['details']['source_statuses']['fred']['status'], 'disabled_missing_api_key')
+        self.assertTrue(stage['details']['usage_policy']['contextual_input_only'])
+        self.assertFalse(stage['details']['usage_policy']['direct_buy_sell_signal'])

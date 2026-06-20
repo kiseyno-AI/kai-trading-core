@@ -41,6 +41,28 @@ class UnconfiguredECOSClient:
         raise ECOSConfigurationError('BOK_ECOS_API_KEY is not configured')
 
 
+class FakeMacroContextService:
+    def __init__(self):
+        self.calls = []
+
+    def get_context(self, **kwargs):
+        self.calls.append({'method': 'get_context', **kwargs})
+        return {
+            'schema_version': 'macro_context_v1',
+            'status': 'available',
+            'macro_regime_summary': {'llm_generated': False},
+            'usage_policy': {'contextual_input_only': True, 'direct_buy_sell_signal': False},
+        }
+
+    def refresh_context(self, **kwargs):
+        self.calls.append({'method': 'refresh_context', **kwargs})
+        return {
+            'status': 'completed',
+            'observations_upserted': 3,
+            'source_statuses': {'fred': {'status': 'disabled_missing_api_key'}},
+        }
+
+
 class ECOSRouteTests(unittest.TestCase):
     def setUp(self):
         self.app = FastAPI()
@@ -122,6 +144,39 @@ class ECOSRouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         aliases = response.json()['aliases']
         self.assertTrue(any(item['alias'] == 'kr_base_rate' for item in aliases))
+
+    def test_macro_context_route_returns_compact_context(self):
+        original_service = routes_macro.macro_context_service
+        fake_service = FakeMacroContextService()
+        routes_macro.macro_context_service = fake_service
+        try:
+            client = TestClient(self.app)
+            response = client.get('/macro/context', params={'as_of_date': '2026-06-20'})
+        finally:
+            routes_macro.macro_context_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload['schema_version'], 'macro_context_v1')
+        self.assertEqual(payload['status'], 'available')
+        self.assertTrue(payload['usage_policy']['contextual_input_only'])
+        self.assertEqual(fake_service.calls[0], {'method': 'get_context', 'as_of_date': '2026-06-20'})
+
+    def test_macro_context_refresh_route_reports_disabled_keyed_source(self):
+        original_service = routes_macro.macro_context_service
+        fake_service = FakeMacroContextService()
+        routes_macro.macro_context_service = fake_service
+        try:
+            client = TestClient(self.app)
+            response = client.post('/macro/context/refresh', params={'force': 'true'})
+        finally:
+            routes_macro.macro_context_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload['status'], 'completed')
+        self.assertEqual(payload['source_statuses']['fred']['status'], 'disabled_missing_api_key')
+        self.assertEqual(fake_service.calls[0], {'method': 'refresh_context', 'force': True, 'trigger': 'manual_api'})
 
     def test_ecos_series_route_maps_upstream_errors_to_502(self):
         original_client = routes_macro.ecos_client

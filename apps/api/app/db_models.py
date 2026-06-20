@@ -237,6 +237,36 @@ class CurrentFXRateSnapshot(Base, TimestampMixin):
     captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class MacroContextObservation(Base, TimestampMixin):
+    __tablename__ = 'macro_context_observations'
+    __table_args__ = (
+        UniqueConstraint(
+            'source',
+            'series_id',
+            'observation_period',
+            name='uq_macro_context_observations_source_series_period',
+        ),
+        Index('ix_macro_context_observations_source_series_date', 'source', 'series_id', 'observation_date'),
+        Index('ix_macro_context_observations_fetched_at', 'fetched_at'),
+        Index('ix_macro_context_observations_source_status', 'source_status'),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    source: Mapped[str] = mapped_column(String(64), nullable=False)
+    series_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    series_name: Mapped[str | None] = mapped_column(String(255))
+    country_code: Mapped[str | None] = mapped_column(String(16))
+    observation_period: Mapped[str] = mapped_column(String(32), nullable=False)
+    observation_date: Mapped[date] = mapped_column(Date, nullable=False)
+    value: Mapped[float] = mapped_column(Numeric(24, 8), nullable=False)
+    unit: Mapped[str | None] = mapped_column(String(64))
+    frequency: Mapped[str | None] = mapped_column(String(32))
+    fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    source_status: Mapped[str] = mapped_column(String(64), nullable=False)
+    status_detail: Mapped[str | None] = mapped_column(Text)
+    payload: Mapped[dict | None] = mapped_column(JSON)
+
+
 class EODCollectionRun(Base):
     __tablename__ = 'eod_collection_runs'
 
