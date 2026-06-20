@@ -161,8 +161,12 @@ class MacroContextObservationStore:
         *,
         series_keys: Sequence[tuple[str, str]],
         as_of_date: date | str | None = None,
+        fetched_at_before: datetime | str | None = None,
     ) -> dict[tuple[str, str], MacroContextObservationRecord]:
         normalized_as_of = _normalize_date(as_of_date) if as_of_date is not None else None
+        normalized_fetched_at_before = (
+            _normalize_datetime(fetched_at_before) if fetched_at_before is not None else None
+        )
         loaded: dict[tuple[str, str], MacroContextObservationRecord] = {}
         if not series_keys:
             return loaded
@@ -184,6 +188,8 @@ class MacroContextObservationStore:
                 )
                 if normalized_as_of is not None:
                     query = query.where(MacroContextObservation.observation_date <= normalized_as_of)
+                if normalized_fetched_at_before is not None:
+                    query = query.where(MacroContextObservation.fetched_at < normalized_fetched_at_before)
                 row = session.execute(query).scalar_one_or_none()
                 if row is not None:
                     loaded[(source, series_id)] = self._to_record(row)
@@ -194,14 +200,25 @@ class MacroContextObservationStore:
             value = session.execute(select(func.max(MacroContextObservation.fetched_at))).scalar_one()
             return value
 
-    def count_for_date(self, *, as_of_date: date | str) -> dict[str, Any]:
+    def count_for_date(
+        self,
+        *,
+        as_of_date: date | str,
+        fetched_at_before: datetime | str | None = None,
+    ) -> dict[str, Any]:
         normalized_as_of = _normalize_date(as_of_date)
+        normalized_fetched_at_before = (
+            _normalize_datetime(fetched_at_before) if fetched_at_before is not None else None
+        )
+        filters = [MacroContextObservation.observation_date <= normalized_as_of]
+        if normalized_fetched_at_before is not None:
+            filters.append(MacroContextObservation.fetched_at < normalized_fetched_at_before)
         with session_scope() as session:
             count, updated_at = session.execute(
                 select(
                     func.count(MacroContextObservation.id),
                     func.max(MacroContextObservation.fetched_at),
-                ).where(MacroContextObservation.observation_date <= normalized_as_of)
+                ).where(*filters)
             ).one()
         return {
             'persisted': int(count or 0),

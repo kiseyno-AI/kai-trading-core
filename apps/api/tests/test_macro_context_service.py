@@ -1,5 +1,5 @@
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from sqlalchemy import delete, func, select
 
@@ -182,6 +182,79 @@ class MacroContextServiceTests(unittest.TestCase):
             {item['freshness']['freshness_status'] for item in context['series']},
             {'stale'},
         )
+
+    def test_get_context_excludes_rows_fetched_after_historical_as_of_date(self) -> None:
+        service = self._service()
+        fetched_after_replay = datetime(2026, 6, 19, 12, tzinfo=timezone.utc)
+        now = datetime(2026, 6, 20, 9, tzinfo=timezone.utc)
+        for series_id, config in DEFAULT_WORLD_BANK_SERIES.items():
+            service.store.upsert_observation(
+                source=WORLD_BANK_SOURCE,
+                series_id=series_id,
+                series_name=config.series_name,
+                country_code='KOR',
+                observation_period='2024',
+                observation_date='2024-12-31',
+                value=2.0,
+                unit=config.unit,
+                frequency=config.frequency,
+                fetched_at=fetched_after_replay,
+                source_status='available',
+            )
+
+        historical_context = service.get_context(as_of_date='2025-01-01', now=now)
+
+        self.assertEqual(historical_context['status'], 'unavailable')
+        self.assertIsNone(historical_context['latest_fetched_at'])
+        self.assertTrue(historical_context['freshness']['knowledge_cutoff_applied'])
+        self.assertEqual(historical_context['freshness']['knowledge_cutoff_at'], '2025-01-02T00:00:00+00:00')
+        self.assertEqual(historical_context['freshness']['status'], 'unavailable')
+        self.assertEqual(historical_context['macro_regime_summary']['freshness_label'], 'macro_context_unavailable')
+        self.assertEqual(historical_context['source_statuses'][WORLD_BANK_SOURCE]['status'], 'unavailable')
+        self.assertEqual(historical_context['source_statuses'][WORLD_BANK_SOURCE]['available_count'], 0)
+        self.assertEqual(historical_context['source_statuses'][WORLD_BANK_SOURCE]['missing_count'], 3)
+        self.assertEqual({item['status'] for item in historical_context['series']}, {'missing'})
+        self.assertTrue(all(item['latest_value'] is None for item in historical_context['series']))
+
+        current_context = service.get_context(as_of_date='2026-06-20', now=now)
+
+        self.assertEqual(current_context['status'], 'available')
+        self.assertFalse(current_context['freshness']['knowledge_cutoff_applied'])
+        self.assertEqual({item['status'] for item in current_context['series']}, {'available'})
+
+    def test_get_context_reports_partial_when_cutoff_excludes_one_historical_series(self) -> None:
+        service = self._service()
+        now = datetime(2025, 1, 3, tzinfo=timezone.utc)
+        fetched_before_cutoff = datetime(2025, 1, 1, 12, tzinfo=timezone.utc)
+        fetched_after_cutoff = datetime(2026, 6, 19, 12, tzinfo=timezone.utc)
+        excluded_series_id = 'NY.GDP.MKTP.KD.ZG'
+        for series_id, config in DEFAULT_WORLD_BANK_SERIES.items():
+            service.store.upsert_observation(
+                source=WORLD_BANK_SOURCE,
+                series_id=series_id,
+                series_name=config.series_name,
+                country_code='KOR',
+                observation_period='2024',
+                observation_date=date(2024, 12, 31),
+                value=2.0,
+                unit=config.unit,
+                frequency=config.frequency,
+                fetched_at=fetched_after_cutoff if series_id == excluded_series_id else fetched_before_cutoff,
+                source_status='available',
+            )
+
+        context = service.get_context(as_of_date=date(2025, 1, 1), now=now)
+        series_by_id = {item['series_id']: item for item in context['series']}
+
+        self.assertEqual(context['status'], 'partial')
+        self.assertEqual(context['freshness']['status'], 'partial')
+        self.assertTrue(context['freshness']['knowledge_cutoff_applied'])
+        self.assertEqual(context['macro_regime_summary']['freshness_label'], 'macro_context_partial')
+        self.assertEqual(context['source_statuses'][WORLD_BANK_SOURCE]['status'], 'partial')
+        self.assertEqual(context['source_statuses'][WORLD_BANK_SOURCE]['available_count'], 2)
+        self.assertEqual(context['source_statuses'][WORLD_BANK_SOURCE]['missing_count'], 1)
+        self.assertEqual(series_by_id[excluded_series_id]['status'], 'missing')
+        self.assertIsNone(series_by_id[excluded_series_id]['latest_value'])
 
 
 if __name__ == '__main__':

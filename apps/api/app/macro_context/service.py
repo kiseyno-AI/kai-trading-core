@@ -155,6 +155,13 @@ def _age_hours(fetched_at: datetime | None, *, now: datetime) -> float | None:
     return round(max((now - comparable.astimezone(timezone.utc)).total_seconds(), 0.0) / 3600.0, 3)
 
 
+def _historical_knowledge_cutoff_at(as_of_date: date, *, now: datetime) -> datetime | None:
+    comparable_now = now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
+    if as_of_date >= comparable_now.astimezone(timezone.utc).date():
+        return None
+    return datetime.combine(as_of_date + timedelta(days=1), time.min, tzinfo=timezone.utc)
+
+
 def _context_status(statuses: Sequence[str]) -> str:
     normalized = [str(status or '').strip().lower() for status in statuses]
     if not normalized or all(status in {'missing', 'unavailable'} for status in normalized):
@@ -394,12 +401,14 @@ class MacroContextService:
     ) -> dict[str, Any]:
         resolved_now = now or _utcnow()
         resolved_as_of = self._normalize_as_of_date(as_of_date, now=resolved_now)
+        knowledge_cutoff_at = _historical_knowledge_cutoff_at(resolved_as_of, now=resolved_now)
         stale_after_hours = max(1, int(settings.macro_context_stale_after_hours or 72))
         configs = self._context_series()
         try:
             latest = self.store.load_latest_by_series(
                 series_keys=[(config.source, config.series_id) for config in configs],
                 as_of_date=resolved_as_of,
+                fetched_at_before=knowledge_cutoff_at,
             )
         except SQLAlchemyError as exc:
             return self._unavailable_context(
@@ -451,6 +460,8 @@ class MacroContextService:
             'freshness': {
                 'stale_after_hours': stale_after_hours,
                 'status': 'stale' if status == 'stale' else 'fresh' if status == 'available' else status,
+                'knowledge_cutoff_at': knowledge_cutoff_at.isoformat() if knowledge_cutoff_at else None,
+                'knowledge_cutoff_applied': knowledge_cutoff_at is not None,
             },
             'source_statuses': source_statuses,
             'series': series_items,
@@ -463,7 +474,13 @@ class MacroContextService:
         }
 
     def count_for_status(self, *, market_date: str | date) -> dict[str, Any]:
-        return self.store.count_for_date(as_of_date=market_date)
+        now = _utcnow()
+        resolved_market_date = self._normalize_as_of_date(market_date, now=now)
+        knowledge_cutoff_at = _historical_knowledge_cutoff_at(resolved_market_date, now=now)
+        return self.store.count_for_date(
+            as_of_date=resolved_market_date,
+            fetched_at_before=knowledge_cutoff_at,
+        )
 
     async def _refresh_sources(self, *, now: datetime) -> dict[str, Any]:
         source_statuses: dict[str, dict[str, Any]] = {}

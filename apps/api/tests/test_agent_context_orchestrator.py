@@ -167,6 +167,60 @@ class RepairJsonTailTests(unittest.TestCase):
             ]
         )
 
+    def test_build_signal_decider_payload_preserves_degraded_macro_context_statuses(self):
+        for status in ('partial', 'unavailable', 'stale'):
+            with self.subTest(status=status):
+                macro_context = {
+                    'schema_version': 'macro_context_v1',
+                    'status': status,
+                    'freshness': {
+                        'status': status,
+                        'knowledge_cutoff_applied': True,
+                        'knowledge_cutoff_at': '2025-01-02T00:00:00+00:00',
+                    },
+                    'series': [
+                        {
+                            'source': 'world_bank',
+                            'series_id': 'NY.GDP.MKTP.KD.ZG',
+                            'status': 'missing' if status in {'partial', 'unavailable'} else 'stale',
+                            'latest_value': None,
+                        }
+                    ],
+                    'macro_regime_summary': {
+                        'freshness_label': f'macro_context_{status}',
+                        'llm_generated': False,
+                    },
+                    'usage_policy': {
+                        'contextual_input_only': True,
+                        'direct_buy_sell_signal': False,
+                        'llm_generated': False,
+                    },
+                }
+
+                payload = build_signal_decider_payload(
+                    item={
+                        'symbol': '005930',
+                        'market_date': '2025-01-01',
+                        'macro_context': macro_context,
+                        'scores': {},
+                        'factor_summary': {},
+                        'liquidity_context': {},
+                        'pre_decider_enrichment_context': {},
+                        'decider_data_quality_context': {},
+                    },
+                    market_date=date(2025, 1, 1),
+                    request_run_id='request-run-test',
+                    market_context={},
+                    upstream_summaries={},
+                    upstream_traceability={},
+                    signal_decider_agent_name='short-term-decider',
+                )
+
+                self.assertEqual(payload['macro_context']['status'], status)
+                self.assertEqual(payload['macro_context']['freshness']['status'], status)
+                self.assertTrue(payload['macro_context']['freshness']['knowledge_cutoff_applied'])
+                self.assertEqual(payload['macro_context']['series'][0]['status'], macro_context['series'][0]['status'])
+
     def test_coerce_decoded_batch_response_unwraps_batch_and_item_level_feedback(self):
         decoded = {
             'batch': {
