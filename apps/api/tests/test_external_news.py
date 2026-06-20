@@ -350,6 +350,60 @@ class ExternalNewsContextTests(unittest.TestCase):
         self.assertEqual(context['classification_summary']['access_status_counts']['paywalled'], 1)
         self.assertEqual(context['classification_summary']['max_materiality_score'], 0.62)
 
+    def test_freshness_provenance_uses_latest_news_timestamp_after_material_sorting(self) -> None:
+        provider_status = {'provider': 'fake_news', 'enabled': True, 'status': 'available', 'reason': None}
+        older_material_timestamp = '2026-05-08T00:00:00+00:00'
+        newer_noise_timestamp = '2026-05-08T00:05:00+00:00'
+
+        with patch.object(settings, 'external_news_context_limit', 1):
+            context = _build_recent_external_news_context(
+                [
+                    {
+                        'provider': 'fake_news',
+                        'title': '삼성전자 공급 계약',
+                        'description': '회사별 계약 기사',
+                        'url': 'https://example.test/news/material',
+                        'published_at': older_material_timestamp,
+                        'collected_at': '2026-05-08T00:01:00+00:00',
+                        'event_tags': ['contract'],
+                        'event_type': 'contract',
+                        'sentiment': 'positive',
+                        'materiality': 'material',
+                        'materiality_reason': 'Detected company-specific material event type "contract".',
+                        'materiality_score': 0.9,
+                        'materiality_bucket': 'high',
+                        'access_status': 'full_text',
+                    },
+                    {
+                        'provider': 'fake_news',
+                        'title': '삼성전자 시장 관심',
+                        'description': '업종 전반 관심 기사',
+                        'url': 'https://example.test/news/noise',
+                        'published_at': newer_noise_timestamp,
+                        'collected_at': '2026-05-08T00:06:00+00:00',
+                        'event_tags': ['general_news'],
+                        'event_type': 'generic_commentary',
+                        'sentiment': 'neutral',
+                        'materiality': 'noise',
+                        'materiality_reason': 'No company-specific material event keywords were detected.',
+                        'materiality_score': 0.1,
+                        'materiality_bucket': 'low',
+                        'access_status': 'headline_only',
+                    },
+                ],
+                provider_status=provider_status,
+            )
+
+        provenance = _build_external_news_freshness_provenance(
+            context=context,
+            requested_market_date=datetime(2026, 5, 8, tzinfo=timezone.utc).date(),
+        )
+
+        self.assertEqual(context['items'][0]['title'], '삼성전자 공급 계약')
+        self.assertEqual(context['items'][0]['published_at'], older_material_timestamp)
+        self.assertEqual(context['latest_published_at'], newer_noise_timestamp)
+        self.assertEqual(provenance['latest_available_timestamp'], newer_noise_timestamp)
+
     def test_decider_quality_context_distinguishes_empty_disclosures_from_news_provider_error(self) -> None:
         block = _build_decider_disclosures_news_quality_context(
             recent_dart_events={

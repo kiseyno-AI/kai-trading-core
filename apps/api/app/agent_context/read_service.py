@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from calendar import monthrange
 from collections import Counter
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Any, Sequence
 
 from sqlalchemy import func, select
@@ -4414,6 +4414,29 @@ def _external_news_sort_key(item: dict[str, Any]) -> tuple[int, float]:
     return rank, -score
 
 
+def _latest_external_news_published_at(items: Sequence[dict[str, Any]]) -> str | None:
+    latest_value: datetime | None = None
+    latest_text: str | None = None
+    for item in items:
+        raw_published_at = item.get('published_at')
+        parsed = (
+            raw_published_at
+            if isinstance(raw_published_at, datetime)
+            else _parse_iso_datetime(str(raw_published_at) if raw_published_at is not None else None)
+        )
+        if parsed is None:
+            continue
+        comparable = (
+            parsed.astimezone(timezone.utc)
+            if parsed.tzinfo is not None and parsed.utcoffset() is not None
+            else parsed.replace(tzinfo=timezone.utc)
+        )
+        if latest_value is None or comparable > latest_value:
+            latest_value = comparable
+            latest_text = parsed.isoformat()
+    return latest_text
+
+
 def _compact_external_news_context_item(item: dict[str, Any]) -> dict[str, Any]:
     classification = item.get('classification') if isinstance(item.get('classification'), dict) else {}
     source_evidence = (
@@ -4485,6 +4508,7 @@ def _build_recent_external_news_context(items: list[dict[str, Any]], *, provider
         reason = 'no_recent_external_news_found'
     context_limit = max(1, int(settings.external_news_context_limit or 1))
     compact_items = [_compact_external_news_context_item(item) for item in items]
+    latest_published_at = _latest_external_news_published_at(compact_items)
     sorted_items = sorted(compact_items, key=_external_news_sort_key)
     limited_items = sorted_items[:context_limit]
     material_items = [item for item in sorted_items if item['materiality'] == 'material']
@@ -4514,6 +4538,7 @@ def _build_recent_external_news_context(items: list[dict[str, Any]], *, provider
         'provider': provider_status,
         'lookback_days': settings.external_news_context_lookback_days,
         'item_count': len(items),
+        'latest_published_at': latest_published_at,
         'contract': {
             'schema_version': 'recent_external_news_context_v2',
             'materiality_values': ['material', 'noise', 'unknown'],
@@ -4566,6 +4591,7 @@ def _build_external_news_freshness_provenance(
         freshness_status = FRESHNESS_STATUS_MISSING
         provenance_status = 'external_provider_unavailable'
     items = context.get('items') if isinstance(context.get('items'), list) else []
+    latest_published_at = context.get('latest_published_at') or _latest_external_news_published_at(items)
     return _build_freshness_provenance(
         requested_market_date=requested_market_date,
         freshness_status=freshness_status,
@@ -4573,7 +4599,7 @@ def _build_external_news_freshness_provenance(
         source_tables=('external_news_items',),
         source_provider=str((context.get('provider') or {}).get('provider') or NAVER_NEWS_PROVIDER),
         reason=context.get('reason'),
-        latest_available_timestamp=items[0].get('published_at') if items else None,
+        latest_available_timestamp=latest_published_at,
         history_row_count=int(context.get('item_count') or 0),
         extra={
             'provider_status': context.get('provider'),
