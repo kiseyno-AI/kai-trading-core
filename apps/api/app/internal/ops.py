@@ -21,6 +21,7 @@ from app.agent_context.signal_decider_evaluation_maintenance_service import (
     signal_decider_evaluation_maintenance_service,
 )
 from app.agent_context.signal_decider_calendar_review_service import signal_decider_calendar_review_service
+from app.agent_context.decider_replay_service import decider_replay_service
 from app.agent_context.signal_decider_loop_service import (
     DEFAULT_SIGNAL_DECIDER_EVALUATION_LOOKBACK_DAYS,
     signal_decider_loop_service,
@@ -461,6 +462,40 @@ def repair_signal_decider_evaluation_coverage(
         refresh_calendar=refresh_calendar,
         fail_on_mature_gaps=fail_on_mature_gaps,
         trigger='internal_ops_cli',
+    )
+
+
+def replay_decider_candidate_rules(
+    *,
+    market_date_from: str,
+    market_date_to: str,
+    agent_name: str,
+    rule_config_json: str | None = None,
+    rule_config_path: str | None = None,
+    symbols: str | None = None,
+    fee_bps: str | float | int = 0,
+    slippage_bps: str | float | int = 0,
+    notional_krw: str | float | int = 1_000_000,
+    horizon_days: int = 5,
+    top_examples_limit: int = 10,
+) -> dict[str, Any]:
+    bootstrap_runtime()
+    if rule_config_path:
+        rule_config = Path(rule_config_path).read_text()
+    else:
+        rule_config = rule_config_json or '{}'
+    parsed_symbols = [item.strip() for item in symbols.split(',') if item.strip()] if symbols else None
+    return decider_replay_service.replay(
+        market_date_from=market_date_from,
+        market_date_to=market_date_to,
+        agent_name=agent_name,
+        symbols=parsed_symbols,
+        rule_config=rule_config,
+        fee_bps=fee_bps,
+        slippage_bps=slippage_bps,
+        notional_krw=notional_krw,
+        horizon_days=horizon_days,
+        top_examples_limit=top_examples_limit,
     )
 
 
@@ -1116,6 +1151,55 @@ def _build_parser() -> argparse.ArgumentParser:
     signal_decider_repair_parser.add_argument('--refresh-calendar', choices=('true', 'false'), default='true')
     signal_decider_repair_parser.add_argument('--fail-on-mature-gaps', choices=('true', 'false'), default='true')
 
+    decider_replay_parser = subparsers.add_parser(
+        'agent-decider-replay',
+        help='Replay candidate decider hard-gate rules offline against persisted decision snapshots and outcomes',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            'Example:\n'
+            '  python3.11 -m app.internal.ops agent-decider-replay \\\n'
+            '    --market-date-from 2026-06-15 --market-date-to 2026-06-19 \\\n'
+            '    --agent-name short-term-decider \\\n'
+            '    --rule-config-json \'{"rules":[{"name":"stale_watch_veto",'
+            '"predicates":[{"type":"trigger_price_drift","max_below_trigger_pct":0.03}]}]}\' \\\n'
+            '    --fee-bps 0 --slippage-bps 0 --output-format markdown\n\n'
+            'Predicates are evaluated only against persisted snapshot-time request, response, traceability, '
+            'and input-feature payloads. Realized outcomes are used only for replay P/L comparison.'
+        ),
+    )
+    decider_replay_parser.add_argument('--market-date-from', required=True)
+    decider_replay_parser.add_argument('--market-date-to', required=True)
+    decider_replay_parser.add_argument(
+        '--agent-name',
+        required=True,
+        choices=('signal-decider', 'short-term-decider'),
+        help='Decider snapshot stream to replay',
+    )
+    decider_replay_parser.add_argument('--symbols', help='Optional comma-separated symbol list')
+    decider_replay_parser.add_argument(
+        '--rule-config-json',
+        help=(
+            'Inline JSON rule config. Example: '
+            '\'{"rules":[{"name":"stale_watch_veto","predicates":[{"type":"trigger_price_drift","max_below_trigger_pct":0.03}]}]}\''
+        ),
+    )
+    decider_replay_parser.add_argument('--rule-config-path', help='Path to a JSON rule config file')
+    decider_replay_parser.add_argument('--fee-bps', default='0', help='Per-side fee in basis points')
+    decider_replay_parser.add_argument('--slippage-bps', default='0', help='Per-side slippage in basis points')
+    decider_replay_parser.add_argument(
+        '--notional-krw',
+        default='1000000',
+        help='Fallback simulated notional for evaluation-only outcomes',
+    )
+    decider_replay_parser.add_argument('--horizon-days', type=int, default=5)
+    decider_replay_parser.add_argument('--top-examples-limit', type=int, default=10)
+    decider_replay_parser.add_argument(
+        '--output-format',
+        choices=('json', 'markdown'),
+        default='json',
+        help='json returns machine-readable metrics including markdown_summary; markdown prints the concise summary only',
+    )
+
     feedback_smoke_parser = subparsers.add_parser(
         'agent-feedback-symbol-cleanup-smoke',
         help='Dispatch symbol feedback, store rows, attempt immediate session deletion, then retry failed deletions once',
@@ -1364,6 +1448,20 @@ def main(argv: Iterable[str] | None = None) -> int:
             refresh_calendar=args.refresh_calendar == 'true',
             fail_on_mature_gaps=args.fail_on_mature_gaps == 'true',
         )
+    elif args.command == 'agent-decider-replay':
+        payload = replay_decider_candidate_rules(
+            market_date_from=args.market_date_from,
+            market_date_to=args.market_date_to,
+            agent_name=args.agent_name,
+            rule_config_json=args.rule_config_json,
+            rule_config_path=args.rule_config_path,
+            symbols=args.symbols,
+            fee_bps=args.fee_bps,
+            slippage_bps=args.slippage_bps,
+            notional_krw=args.notional_krw,
+            horizon_days=args.horizon_days,
+            top_examples_limit=args.top_examples_limit,
+        )
     elif args.command == 'agent-feedback-symbol-cleanup-smoke':
         payload = run_agent_feedback_symbol_cleanup_smoke(
             market_date=args.market_date,
@@ -1413,7 +1511,10 @@ def main(argv: Iterable[str] | None = None) -> int:
     else:
         parser.error(f'Unsupported command: {args.command}')
 
-    print(json.dumps(payload, ensure_ascii=False))
+    if args.command == 'agent-decider-replay' and args.output_format == 'markdown':
+        print(payload['markdown_summary'])
+    else:
+        print(json.dumps(payload, ensure_ascii=False))
     return 0
 
 
