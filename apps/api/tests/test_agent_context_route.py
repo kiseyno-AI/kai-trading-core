@@ -1156,6 +1156,49 @@ class FakeSignalDeciderCalibrationService:
                 ],
                 'operator_review': [],
             },
+            'rule_candidates': {
+                'schema_version': 'signal_decider_calibration_rule_candidates_v1',
+                'status': 'generated',
+                'summary': {
+                    'candidate_count': 1,
+                    'candidate_type_counts': {'prompt_warning': 1},
+                    'activation_status_counts': {'needs_replay': 1},
+                    'active_policy_count': 0,
+                    'manual_review_only': True,
+                },
+                'thresholds': {'min_sample_size': 3},
+                'items': [
+                    {
+                        'candidate_id': 'signal_decider_missed_opportunity_cluster_h5_test',
+                        'candidate_type': 'prompt_warning',
+                        'target_decider': 'signal-decider',
+                        'predicate': {
+                            'schema_version': 'signal_decider_rule_predicate_v1',
+                            'operator': 'all',
+                            'conditions': [
+                                {
+                                    'field': 'decision.action',
+                                    'operator': 'eq',
+                                    'value': 'wait',
+                                }
+                            ],
+                        },
+                        'reason': 'Replay-only missed opportunity warning.',
+                        'support_sample_count': 3,
+                        'negative_rate': 1.0,
+                        'missed_opportunity_rate': 1.0,
+                        'example_symbols': ['005930'],
+                        'recommended_replay_config': {
+                            'schema_version': 'signal_decider_rule_candidate_replay_config_v1',
+                            'candidate_id': 'signal_decider_missed_opportunity_cluster_h5_test',
+                            'candidate_type': 'prompt_warning',
+                            'candidate_scope': 'missed_opportunity_cluster',
+                            'activation_requires_replay': True,
+                        },
+                        'activation_status': 'needs_replay',
+                    }
+                ],
+            },
         }
 
 
@@ -2153,6 +2196,7 @@ class AgentContextRouteTests(unittest.TestCase):
         self.assertEqual(payload['exclusions']['status_reason_counts']['pending_maturity'], 1)
         self.assertEqual(payload['condition_clusters']['positive'][0]['cluster_key'], 'decision.confidence_bucket=high')
         self.assertEqual(payload['calibration_hints']['scoring_guidance'][0]['manual_review_only'], True)
+        self.assertEqual(payload['rule_candidates']['items'][0]['activation_status'], 'needs_replay')
 
     def test_signal_decider_policy_candidate_generation_route_calls_service(self):
         fake_service = FakeSignalDeciderLoopService()

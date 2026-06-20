@@ -3,9 +3,12 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass
 from datetime import date
+import hashlib
 from itertools import combinations
+import json
 from typing import Any, Sequence
 
+from app.agent_context.roles import SIGNAL_DECIDER_AGENT_NAME
 from app.agent_context.signal_decider_loop_service import (
     DEFAULT_SIGNAL_DECIDER_EVALUATION_VERSION,
     DEFAULT_SIGNAL_DECIDER_REVIEW_PRIMARY_HORIZON,
@@ -25,6 +28,15 @@ CALIBRATION_REPORT_VERSION = 'signal_decider_calibration_report_v1'
 DEFAULT_CLUSTER_LIMIT = 10
 MAX_EXCLUSION_SAMPLE_ITEMS = 20
 MIN_CLUSTER_DIRECTION_RATE = 0.60
+RULE_CANDIDATES_SCHEMA_VERSION = 'signal_decider_calibration_rule_candidates_v1'
+RULE_CANDIDATE_ID_VERSION = 'signal_decider_rule_candidate_id_v1'
+RULE_CANDIDATE_PREDICATE_SCHEMA_VERSION = 'signal_decider_rule_predicate_v1'
+RULE_CANDIDATE_REPLAY_CONFIG_SCHEMA_VERSION = 'signal_decider_rule_candidate_replay_config_v1'
+RULE_CANDIDATE_DEFAULT_ACTIVATION_STATUS = 'needs_replay'
+RULE_CANDIDATE_MIN_SAMPLE_SIZE = 3
+RULE_CANDIDATE_BAD_BUY_RATE_THRESHOLD = 0.70
+RULE_CANDIDATE_BAD_BUY_VETO_RATE_THRESHOLD = 0.85
+RULE_CANDIDATE_MISSED_OPPORTUNITY_RATE_THRESHOLD = 0.60
 GROUP_SECTION_ORDER: tuple[str, ...] = (
     'decision_actions',
     'confidence_buckets',
@@ -123,6 +135,10 @@ def _rate(*, numerator: int, denominator: int) -> float | None:
     if denominator <= 0:
         return None
     return round(numerator / denominator, 6)
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(',', ':'))
 
 
 def _average(values: Sequence[float]) -> float | None:
@@ -298,6 +314,10 @@ def _finalize_bucket_stats(bucket: dict[str, Any]) -> dict[str, Any]:
         'grade_label_counts': dict(sorted(bucket['grade_label_counts'].items())),
         'positive_count': int(bucket['positive_count'] or 0),
         'negative_count': int(bucket['negative_count'] or 0),
+        'buy_sample_count': int(bucket['buy_sample_count'] or 0),
+        'bad_buy_count': int(bucket['bad_buy_count'] or 0),
+        'wait_reject_sample_count': int(bucket['wait_reject_sample_count'] or 0),
+        'missed_opportunity_count': int(bucket['missed_opportunity_count'] or 0),
         'positive_rate': _rate(
             numerator=int(bucket['positive_count'] or 0),
             denominator=sample_count,
@@ -486,6 +506,15 @@ class SignalDeciderCalibrationService:
             condition_clusters=clusters,
             exclusion_status_reason_counts=dict(coverage_summary.get('status_reason_counts') or {}),
         )
+        rule_candidates = self._build_rule_candidates(
+            market_date_from=normalized_from,
+            market_date_to=normalized_to,
+            horizon_days=normalized_horizon_days,
+            evaluation_version=resolved_evaluation_version,
+            min_sample_size=resolved_min_sample_size,
+            cluster_limit=resolved_cluster_limit,
+            condition_clusters=clusters,
+        )
         report_status = 'empty'
         if rows:
             report_status = 'ready' if len(mature_items) >= resolved_min_sample_size else 'insufficient_sample'
@@ -532,6 +561,7 @@ class SignalDeciderCalibrationService:
             'group_summaries': group_summaries,
             'condition_clusters': clusters,
             'calibration_hints': hints,
+            'rule_candidates': rule_candidates,
         }
 
     def _build_calibration_item(
@@ -1000,6 +1030,400 @@ class SignalDeciderCalibrationService:
                 'cluster_key': cluster.get('cluster_key'),
             },
         }
+
+    def _build_rule_candidates(
+        self,
+        *,
+        market_date_from: date,
+        market_date_to: date,
+        horizon_days: int,
+        evaluation_version: str,
+        min_sample_size: int,
+        cluster_limit: int,
+        condition_clusters: dict[str, Any],
+    ) -> dict[str, Any]:
+        rule_min_sample_size = max(RULE_CANDIDATE_MIN_SAMPLE_SIZE, int(min_sample_size or 0))
+        candidates_by_id: dict[str, dict[str, Any]] = {}
+        for cluster in list(condition_clusters.get('negative') or []):
+            for candidate in self._rule_candidates_for_cluster(
+                cluster=cluster,
+                market_date_from=market_date_from,
+                market_date_to=market_date_to,
+                horizon_days=horizon_days,
+                evaluation_version=evaluation_version,
+                min_sample_size=rule_min_sample_size,
+            ):
+                candidate_id = str(candidate['candidate_id'])
+                existing = candidates_by_id.get(candidate_id)
+                if existing is None or self._rule_candidate_preference(
+                    candidate
+                ) > self._rule_candidate_preference(existing):
+                    candidates_by_id[candidate_id] = candidate
+
+        candidates = list(candidates_by_id.values())
+        candidates.sort(key=self._rule_candidate_sort_key)
+        candidates = candidates[:cluster_limit]
+        activation_status_counts = Counter(
+            str(candidate.get('activation_status') or '') for candidate in candidates
+        )
+        candidate_type_counts = Counter(str(candidate.get('candidate_type') or '') for candidate in candidates)
+        return {
+            'schema_version': RULE_CANDIDATES_SCHEMA_VERSION,
+            'status': 'generated' if candidates else 'empty',
+            'summary': {
+                'candidate_count': len(candidates),
+                'candidate_type_counts': dict(sorted(candidate_type_counts.items())),
+                'activation_status_counts': dict(sorted(activation_status_counts.items())),
+                'active_policy_count': 0,
+                'manual_review_only': True,
+            },
+            'thresholds': {
+                'min_sample_size': rule_min_sample_size,
+                'bad_buy_rate_for_downsize': RULE_CANDIDATE_BAD_BUY_RATE_THRESHOLD,
+                'bad_buy_rate_for_veto': RULE_CANDIDATE_BAD_BUY_VETO_RATE_THRESHOLD,
+                'missed_opportunity_rate_for_prompt_warning': RULE_CANDIDATE_MISSED_OPPORTUNITY_RATE_THRESHOLD,
+            },
+            'items': candidates,
+        }
+
+    def _rule_candidates_for_cluster(
+        self,
+        *,
+        cluster: dict[str, Any],
+        market_date_from: date,
+        market_date_to: date,
+        horizon_days: int,
+        evaluation_version: str,
+        min_sample_size: int,
+    ) -> list[dict[str, Any]]:
+        tokens = [
+            token
+            for token in list(cluster.get('tokens') or [])
+            if isinstance(token, dict) and _normalize_optional_text(token.get('key'))
+        ]
+        if not self._has_policy_condition(tokens):
+            return []
+
+        candidates: list[dict[str, Any]] = []
+        bad_buy_candidate = self._bad_buy_rule_candidate(
+            cluster=cluster,
+            tokens=tokens,
+            market_date_from=market_date_from,
+            market_date_to=market_date_to,
+            horizon_days=horizon_days,
+            evaluation_version=evaluation_version,
+            min_sample_size=min_sample_size,
+        )
+        if bad_buy_candidate is not None:
+            candidates.append(bad_buy_candidate)
+
+        missed_opportunity_candidate = self._missed_opportunity_rule_candidate(
+            cluster=cluster,
+            tokens=tokens,
+            market_date_from=market_date_from,
+            market_date_to=market_date_to,
+            horizon_days=horizon_days,
+            evaluation_version=evaluation_version,
+            min_sample_size=min_sample_size,
+        )
+        if missed_opportunity_candidate is not None:
+            candidates.append(missed_opportunity_candidate)
+        return candidates
+
+    def _bad_buy_rule_candidate(
+        self,
+        *,
+        cluster: dict[str, Any],
+        tokens: Sequence[dict[str, Any]],
+        market_date_from: date,
+        market_date_to: date,
+        horizon_days: int,
+        evaluation_version: str,
+        min_sample_size: int,
+    ) -> dict[str, Any] | None:
+        decision_action_counts = dict(cluster.get('decision_action_counts') or {})
+        grade_label_counts = dict(cluster.get('grade_label_counts') or {})
+        buy_sample_count = int(cluster.get('buy_sample_count') or decision_action_counts.get('buy') or 0)
+        bad_buy_count = int(cluster.get('bad_buy_count') or grade_label_counts.get('bad_buy') or 0)
+        bad_buy_rate = _to_float(cluster.get('bad_buy_rate'))
+        if bad_buy_rate is None:
+            bad_buy_rate = _rate(numerator=bad_buy_count, denominator=buy_sample_count)
+        if (
+            buy_sample_count < min_sample_size
+            or bad_buy_count < min_sample_size
+            or bad_buy_rate is None
+            or bad_buy_rate < RULE_CANDIDATE_BAD_BUY_RATE_THRESHOLD
+        ):
+            return None
+
+        candidate_type = (
+            'veto'
+            if bad_buy_rate >= RULE_CANDIDATE_BAD_BUY_VETO_RATE_THRESHOLD
+            else 'downsize'
+        )
+        predicate = self._rule_candidate_predicate(
+            tokens=tokens,
+            action_condition={'field': 'decision.action', 'operator': 'eq', 'value': 'buy'},
+        )
+        reason = (
+            f'{bad_buy_count}/{buy_sample_count} matching buy decisions were graded bad_buy '
+            f'on the {horizon_days}d replay horizon.'
+        )
+        candidate = self._new_rule_candidate(
+            candidate_scope='bad_buy_cluster',
+            candidate_type=candidate_type,
+            predicate=predicate,
+            reason=reason,
+            cluster=cluster,
+            support_sample_count=bad_buy_count,
+            evaluated_sample_count=buy_sample_count,
+            negative_rate=bad_buy_rate,
+            market_date_from=market_date_from,
+            market_date_to=market_date_to,
+            horizon_days=horizon_days,
+            evaluation_version=evaluation_version,
+            primary_metric='bad_buy_rate',
+            min_sample_size=min_sample_size,
+        )
+        candidate['bad_buy_rate'] = round(float(bad_buy_rate), 6)
+        return candidate
+
+    def _missed_opportunity_rule_candidate(
+        self,
+        *,
+        cluster: dict[str, Any],
+        tokens: Sequence[dict[str, Any]],
+        market_date_from: date,
+        market_date_to: date,
+        horizon_days: int,
+        evaluation_version: str,
+        min_sample_size: int,
+    ) -> dict[str, Any] | None:
+        decision_action_counts = dict(cluster.get('decision_action_counts') or {})
+        grade_label_counts = dict(cluster.get('grade_label_counts') or {})
+        wait_reject_sample_count = int(
+            cluster.get('wait_reject_sample_count')
+            or int(decision_action_counts.get('wait') or 0)
+            + int(decision_action_counts.get('reject') or 0)
+        )
+        missed_opportunity_count = int(
+            cluster.get('missed_opportunity_count')
+            or int(grade_label_counts.get('missed_opportunity_after_wait') or 0)
+            + int(grade_label_counts.get('missed_opportunity_after_reject') or 0)
+        )
+        missed_opportunity_rate = _to_float(cluster.get('missed_opportunity_rate'))
+        if missed_opportunity_rate is None:
+            missed_opportunity_rate = _rate(
+                numerator=missed_opportunity_count,
+                denominator=wait_reject_sample_count,
+            )
+        if (
+            wait_reject_sample_count < min_sample_size
+            or missed_opportunity_count < min_sample_size
+            or missed_opportunity_rate is None
+            or missed_opportunity_rate < RULE_CANDIDATE_MISSED_OPPORTUNITY_RATE_THRESHOLD
+        ):
+            return None
+
+        action_values = [
+            action
+            for action in ('reject', 'wait')
+            if int(decision_action_counts.get(action) or 0) > 0
+        ]
+        action_condition: dict[str, Any]
+        if len(action_values) == 1:
+            action_condition = {
+                'field': 'decision.action',
+                'operator': 'eq',
+                'value': action_values[0],
+            }
+        else:
+            action_condition = {
+                'field': 'decision.action',
+                'operator': 'in',
+                'value': action_values or ['reject', 'wait'],
+            }
+        predicate = self._rule_candidate_predicate(tokens=tokens, action_condition=action_condition)
+        reason = (
+            f'{missed_opportunity_count}/{wait_reject_sample_count} matching wait/reject decisions '
+            f'missed opportunity on the {horizon_days}d replay horizon.'
+        )
+        candidate = self._new_rule_candidate(
+            candidate_scope='missed_opportunity_cluster',
+            candidate_type='prompt_warning',
+            predicate=predicate,
+            reason=reason,
+            cluster=cluster,
+            support_sample_count=missed_opportunity_count,
+            evaluated_sample_count=wait_reject_sample_count,
+            negative_rate=missed_opportunity_rate,
+            market_date_from=market_date_from,
+            market_date_to=market_date_to,
+            horizon_days=horizon_days,
+            evaluation_version=evaluation_version,
+            primary_metric='missed_opportunity_rate',
+            min_sample_size=min_sample_size,
+        )
+        candidate['missed_opportunity_rate'] = round(float(missed_opportunity_rate), 6)
+        return candidate
+
+    def _new_rule_candidate(
+        self,
+        *,
+        candidate_scope: str,
+        candidate_type: str,
+        predicate: dict[str, Any],
+        reason: str,
+        cluster: dict[str, Any],
+        support_sample_count: int,
+        evaluated_sample_count: int,
+        negative_rate: float,
+        market_date_from: date,
+        market_date_to: date,
+        horizon_days: int,
+        evaluation_version: str,
+        primary_metric: str,
+        min_sample_size: int,
+    ) -> dict[str, Any]:
+        target_decider = SIGNAL_DECIDER_AGENT_NAME
+        candidate_id = self._rule_candidate_id(
+            candidate_scope=candidate_scope,
+            target_decider=target_decider,
+            horizon_days=horizon_days,
+            predicate=predicate,
+        )
+        recommended_replay_config = {
+            'schema_version': RULE_CANDIDATE_REPLAY_CONFIG_SCHEMA_VERSION,
+            'source': 'calibration_report',
+            'candidate_id': candidate_id,
+            'candidate_type': candidate_type,
+            'candidate_scope': candidate_scope,
+            'target_decider': target_decider,
+            'market_date_from': market_date_from.isoformat(),
+            'market_date_to': market_date_to.isoformat(),
+            'horizon_days': horizon_days,
+            'evaluation_version': evaluation_version,
+            'predicate': predicate,
+            'primary_metric': primary_metric,
+            'minimum_support_sample_count': min_sample_size,
+            'observed_support_sample_count': int(support_sample_count),
+            'observed_evaluated_sample_count': int(evaluated_sample_count),
+            'observed_negative_rate': round(float(negative_rate), 6),
+            'activation_requires_replay': True,
+        }
+        return {
+            'candidate_id': candidate_id,
+            'candidate_type': candidate_type,
+            'target_decider': target_decider,
+            'predicate': predicate,
+            'reason': reason,
+            'support_sample_count': int(support_sample_count),
+            'evaluated_sample_count': int(evaluated_sample_count),
+            'negative_rate': round(float(negative_rate), 6),
+            'example_symbols': self._rule_candidate_example_symbols(cluster),
+            'recommended_replay_config': recommended_replay_config,
+            'activation_status': RULE_CANDIDATE_DEFAULT_ACTIVATION_STATUS,
+            'manual_review_only': True,
+            'active_policy': False,
+            'source_cluster': {
+                'cluster_key': cluster.get('cluster_key'),
+                'bucket_label': cluster.get('bucket_label'),
+                'sample_count': int(cluster.get('sample_count') or 0),
+                'support_sample_count': int(support_sample_count),
+                'evaluated_sample_count': int(evaluated_sample_count),
+                'negative_rate': round(float(negative_rate), 6),
+                'grade_label_counts': dict(cluster.get('grade_label_counts') or {}),
+                'decision_action_counts': dict(cluster.get('decision_action_counts') or {}),
+                'tokens': list(cluster.get('tokens') or []),
+            },
+        }
+
+    def _rule_candidate_id(
+        self,
+        *,
+        candidate_scope: str,
+        target_decider: str,
+        horizon_days: int,
+        predicate: dict[str, Any],
+    ) -> str:
+        seed = {
+            'id_version': RULE_CANDIDATE_ID_VERSION,
+            'candidate_scope': candidate_scope,
+            'target_decider': target_decider,
+            'horizon_days': horizon_days,
+            'predicate': predicate,
+        }
+        digest = hashlib.sha256(_canonical_json(seed).encode('utf-8')).hexdigest()[:12]
+        normalized_target = target_decider.replace('-', '_')
+        return f'{normalized_target}_{candidate_scope}_h{horizon_days}_{digest}'
+
+    def _rule_candidate_predicate(
+        self,
+        *,
+        tokens: Sequence[dict[str, Any]],
+        action_condition: dict[str, Any],
+    ) -> dict[str, Any]:
+        conditions: list[dict[str, Any]] = []
+        seen_fields: set[tuple[str, str]] = set()
+        for token in tokens:
+            key = _normalize_optional_text(token.get('key'))
+            if not key:
+                continue
+            value = token.get('value')
+            condition = {'field': key, 'operator': 'eq', 'value': str(value)}
+            condition_key = (condition['field'], _canonical_json(condition['value']))
+            if condition_key in seen_fields:
+                continue
+            seen_fields.add(condition_key)
+            conditions.append(condition)
+        if not any(condition.get('field') == action_condition.get('field') for condition in conditions):
+            conditions.append(dict(action_condition))
+        conditions.sort(
+            key=lambda item: (
+                0 if item.get('field') == 'decision.action' else 1,
+                str(item.get('field') or ''),
+                str(item.get('operator') or ''),
+                _canonical_json(item.get('value')),
+            )
+        )
+        return {
+            'schema_version': RULE_CANDIDATE_PREDICATE_SCHEMA_VERSION,
+            'operator': 'all',
+            'conditions': conditions,
+        }
+
+    def _has_policy_condition(self, tokens: Sequence[dict[str, Any]]) -> bool:
+        return any(str(token.get('key') or '') != 'decision.action' for token in tokens)
+
+    def _rule_candidate_example_symbols(self, cluster: dict[str, Any]) -> list[str]:
+        symbols = {
+            str(example.get('symbol') or '').strip().upper()
+            for example in list(cluster.get('examples') or [])
+            if isinstance(example, dict) and str(example.get('symbol') or '').strip()
+        }
+        return sorted(symbols)[:5]
+
+    def _rule_candidate_preference(self, candidate: dict[str, Any]) -> tuple[float, int, int]:
+        return (
+            float(candidate.get('negative_rate') or 0.0),
+            int(candidate.get('support_sample_count') or 0),
+            int(_maybe_dict(candidate.get('source_cluster')).get('sample_count') or 0),
+        )
+
+    def _rule_candidate_sort_key(self, candidate: dict[str, Any]) -> tuple[int, float, int, str]:
+        type_priority = {
+            'veto': 0,
+            'downsize': 1,
+            'require_confirmation': 2,
+            'prompt_warning': 3,
+        }
+        candidate_type = str(candidate.get('candidate_type') or '')
+        return (
+            type_priority.get(candidate_type, 9),
+            -float(candidate.get('negative_rate') or 0.0),
+            -int(candidate.get('support_sample_count') or 0),
+            str(candidate.get('candidate_id') or ''),
+        )
 
 
 signal_decider_calibration_service = SignalDeciderCalibrationService()
