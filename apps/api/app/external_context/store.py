@@ -12,6 +12,7 @@ from app.external_context.models import ExternalContextSourceStatus
 class ExternalContextCacheRecord:
     provider_name: str
     key: str
+    params_identity: str
     payload: Any
     source_status: ExternalContextSourceStatus
     source_url: str | None
@@ -29,10 +30,16 @@ class ExternalContextCacheRecord:
 
 class InMemoryExternalContextStore:
     def __init__(self) -> None:
-        self._records: dict[tuple[str, str], ExternalContextCacheRecord] = {}
+        self._records: dict[tuple[str, str, str], ExternalContextCacheRecord] = {}
 
-    def load(self, *, provider_name: str, key: str) -> ExternalContextCacheRecord | None:
-        record = self._records.get((provider_name, key))
+    def load(
+        self,
+        *,
+        provider_name: str,
+        key: str,
+        params_identity: str = '',
+    ) -> ExternalContextCacheRecord | None:
+        record = self._records.get((provider_name, key, params_identity))
         return deepcopy(record) if record is not None else None
 
     def save_success(
@@ -46,12 +53,15 @@ class InMemoryExternalContextStore:
         upstream_endpoint: str | None,
         fetched_at: datetime,
         expires_at: datetime,
+        params_identity: str = '',
     ) -> ExternalContextCacheRecord:
-        previous = self._records.get((provider_name, key))
+        record_key = (provider_name, key, params_identity)
+        previous = self._records.get(record_key)
         created_at = previous.created_at if previous is not None else fetched_at
         record = ExternalContextCacheRecord(
             provider_name=provider_name,
             key=key,
+            params_identity=params_identity,
             payload=deepcopy(payload),
             source_status=source_status,
             source_url=source_url,
@@ -66,7 +76,7 @@ class InMemoryExternalContextStore:
             created_at=created_at,
             updated_at=fetched_at,
         )
-        self._records[(provider_name, key)] = record
+        self._records[record_key] = record
         return deepcopy(record)
 
     def record_error(
@@ -77,12 +87,15 @@ class InMemoryExternalContextStore:
         attempted_at: datetime,
         error_message: str,
         error_type: str,
+        params_identity: str = '',
     ) -> ExternalContextCacheRecord:
-        previous = self._records.get((provider_name, key))
+        record_key = (provider_name, key, params_identity)
+        previous = self._records.get(record_key)
         created_at = previous.created_at if previous is not None else attempted_at
         record = ExternalContextCacheRecord(
             provider_name=provider_name,
             key=key,
+            params_identity=params_identity,
             payload=deepcopy(previous.payload) if previous is not None else None,
             source_status=previous.source_status if previous is not None else 'provider_error',
             source_url=previous.source_url if previous is not None else None,
@@ -97,5 +110,5 @@ class InMemoryExternalContextStore:
             created_at=created_at,
             updated_at=attempted_at,
         )
-        self._records[(provider_name, key)] = record
+        self._records[record_key] = record
         return deepcopy(record)

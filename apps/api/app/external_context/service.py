@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+from collections.abc import Mapping as MappingABC
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Mapping
 
@@ -36,6 +38,46 @@ def _age_seconds(*, now: datetime, fetched_at: datetime | None) -> float | None:
     return max(0.0, (now - fetched_at).total_seconds())
 
 
+def _stable_param_sort_key(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(',', ':'))
+
+
+def _stable_param_value(value: Any) -> Any:
+    if isinstance(value, MappingABC):
+        return {
+            '__type__': 'mapping',
+            'items': [
+                [_stable_param_value(item_key), _stable_param_value(item_value)]
+                for item_key, item_value in sorted(
+                    value.items(),
+                    key=lambda item: _stable_param_sort_key(_stable_param_value(item[0])),
+                )
+            ],
+        }
+    if isinstance(value, (set, frozenset)):
+        normalized_items = [_stable_param_value(item) for item in value]
+        return {'__type__': 'set', 'items': sorted(normalized_items, key=_stable_param_sort_key)}
+    if isinstance(value, tuple):
+        return {'__type__': 'tuple', 'items': [_stable_param_value(item) for item in value]}
+    if isinstance(value, list):
+        return [_stable_param_value(item) for item in value]
+    if isinstance(value, datetime):
+        return {'__type__': 'datetime', 'value': value.isoformat()}
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return {'__type__': value.__class__.__qualname__, 'value': str(value)}
+
+
+def _stable_params_identity(params: Mapping[str, Any]) -> str:
+    if not params:
+        return ''
+    return json.dumps(
+        _stable_param_value(params),
+        sort_keys=True,
+        separators=(',', ':'),
+    )
+
+
 class ExternalContextService:
     def __init__(
         self,
@@ -61,10 +103,15 @@ class ExternalContextService:
         if provider is None:
             return self._missing_provider_result(key=key, now=now, force_refresh=force_refresh)
 
+        params_identity = _stable_params_identity(request.params)
         ttl_seconds = max(0, int(provider.ttl_seconds))
         min_refresh_interval_seconds = max(0, int(provider.min_refresh_interval_seconds))
         provider_status = provider.status()
-        cached = self.store.load(provider_name=provider.provider_name, key=key)
+        cached = self.store.load(
+            provider_name=provider.provider_name,
+            key=key,
+            params_identity=params_identity,
+        )
 
         if not provider_status.enabled:
             return self._result_from_record(
@@ -124,6 +171,7 @@ class ExternalContextService:
             record = self.store.record_error(
                 provider_name=provider.provider_name,
                 key=key,
+                params_identity=params_identity,
                 attempted_at=now,
                 error_message=str(exc),
                 error_type=exc.__class__.__name__,
@@ -153,6 +201,7 @@ class ExternalContextService:
         record = self._save_success(
             provider=provider,
             key=key,
+            params_identity=params_identity,
             fetched=fetched,
             fetched_at=now,
             ttl_seconds=ttl_seconds,
@@ -260,6 +309,7 @@ class ExternalContextService:
         *,
         provider: ExternalContextProvider,
         key: str,
+        params_identity: str,
         fetched: ExternalContextFetchResult,
         fetched_at: datetime,
         ttl_seconds: int,
@@ -268,6 +318,7 @@ class ExternalContextService:
         return self.store.save_success(
             provider_name=provider.provider_name,
             key=key,
+            params_identity=params_identity,
             payload=fetched.payload,
             source_status=fetched.source_status,
             source_url=fetched.source_url or provider_status.source_url,

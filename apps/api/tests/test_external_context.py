@@ -109,6 +109,56 @@ class ExternalContextServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second.freshness.status, 'fresh')
         self.assertEqual(second.freshness.refresh_reason, 'ttl_cache_hit')
 
+    async def test_cache_identity_includes_params_for_ttl_hits(self) -> None:
+        provider = FakeExternalContextProvider(
+            ttl_seconds=60,
+            responses=[_available_payload(1), _available_payload(2)],
+        )
+        service = _build_service(provider, self.clock)
+
+        first = await service.get_context(key='news:symbol:005930', params={'window': '1d'})
+        self.clock.advance(seconds=10)
+        second = await service.get_context(key='news:symbol:005930', params={'window': '5d'})
+        third = await service.get_context(key='news:symbol:005930', params={'window': '1d'})
+
+        self.assertEqual(first.payload, {'version': 1})
+        self.assertEqual(second.payload, {'version': 2})
+        self.assertEqual(third.payload, {'version': 1})
+        self.assertEqual(len(provider.requests), 2)
+        self.assertFalse(second.freshness.cache_hit)
+        self.assertFalse(second.freshness.served_from_cache)
+        self.assertEqual(second.freshness.refresh_reason, 'cache_miss')
+        self.assertTrue(third.freshness.cache_hit)
+        self.assertEqual(third.freshness.refresh_reason, 'ttl_cache_hit')
+
+    async def test_equivalent_param_mappings_share_cache_identity(self) -> None:
+        provider = FakeExternalContextProvider(
+            ttl_seconds=60,
+            responses=[_available_payload(1), _available_payload(2)],
+        )
+        service = _build_service(provider, self.clock)
+
+        first = await service.get_context(
+            key='news:symbol:005930',
+            params={
+                'locale': 'ko',
+                'filters': {'market': 'KOSPI', 'source': 'news'},
+            },
+        )
+        second = await service.get_context(
+            key='news:symbol:005930',
+            params={
+                'filters': {'source': 'news', 'market': 'KOSPI'},
+                'locale': 'ko',
+            },
+        )
+
+        self.assertEqual(first.payload, {'version': 1})
+        self.assertEqual(second.payload, {'version': 1})
+        self.assertEqual(len(provider.requests), 1)
+        self.assertTrue(second.freshness.cache_hit)
+        self.assertEqual(second.freshness.refresh_reason, 'ttl_cache_hit')
+
     async def test_stale_cache_refreshes_after_ttl_expiry(self) -> None:
         provider = FakeExternalContextProvider(
             ttl_seconds=5,
@@ -146,6 +196,25 @@ class ExternalContextServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.error.message, 'upstream timeout')
         self.assertEqual(result.freshness.last_success_at.isoformat(), '2026-05-08T00:00:00+00:00')
         self.assertEqual(result.freshness.last_error_at.isoformat(), '2026-05-08T00:00:06+00:00')
+
+    async def test_provider_error_does_not_return_payload_cached_for_different_params(self) -> None:
+        provider = FakeExternalContextProvider(
+            ttl_seconds=0,
+            responses=[_available_payload(1), RuntimeError('upstream timeout')],
+        )
+        service = _build_service(provider, self.clock)
+
+        await service.get_context(key='news:symbol:005930', params={'window': '1d'})
+        self.clock.advance(seconds=1)
+        result = await service.get_context(key='news:symbol:005930', params={'window': '5d'})
+
+        self.assertIsNone(result.payload)
+        self.assertEqual(result.source_status, 'provider_error')
+        self.assertEqual(result.freshness.status, 'missing')
+        self.assertFalse(result.freshness.served_from_cache)
+        self.assertFalse(result.freshness.cache_hit)
+        self.assertEqual(result.error.error_type, 'RuntimeError')
+        self.assertEqual(len(provider.requests), 2)
 
     async def test_disabled_provider_returns_disabled_status_without_fetch(self) -> None:
         provider = FakeExternalContextProvider(enabled=False, responses=[_available_payload(1)])
@@ -196,6 +265,24 @@ class ExternalContextServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.freshness.next_refresh_allowed_at.isoformat(), '2026-05-08T00:00:30+00:00')
         self.assertTrue(result.freshness.served_from_cache)
         self.assertEqual(len(provider.requests), 1)
+
+    async def test_min_refresh_interval_is_scoped_to_params_identity(self) -> None:
+        provider = FakeExternalContextProvider(
+            ttl_seconds=0,
+            min_refresh_interval_seconds=30,
+            responses=[_available_payload(1), _available_payload(2)],
+        )
+        service = _build_service(provider, self.clock)
+
+        await service.get_context(key='news:symbol:005930', params={'window': '1d'})
+        self.clock.advance(seconds=10)
+        result = await service.get_context(key='news:symbol:005930', params={'window': '5d'})
+
+        self.assertEqual(result.payload, {'version': 2})
+        self.assertEqual(result.source_status, 'available')
+        self.assertEqual(result.freshness.refresh_reason, 'cache_miss')
+        self.assertFalse(result.freshness.served_from_cache)
+        self.assertEqual(len(provider.requests), 2)
 
     async def test_empty_provider_result_uses_consistent_result_shape(self) -> None:
         provider = FakeExternalContextProvider(
