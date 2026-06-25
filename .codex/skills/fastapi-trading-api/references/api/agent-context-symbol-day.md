@@ -9,6 +9,8 @@ The response now also includes a compact `liquidity_context` block per symbol/da
 
 The response now also includes `pre_decider_enrichment_context` per symbol/day. This is the short-term-decider handoff view for quote/spread/orderbook/execution-strength, raw-or-estimated trading value provenance, investor flow, short-selling, market breadth, and sector peer context. `trading_value.source` is `raw`, `estimated`, or `missing`; raw PyKRX/KRX `valuation_snapshot.trading_value` wins over close×volume fallback.
 
+The response now also includes `market_regime_context` per symbol/day. This core-owned deterministic posture payload combines PyKRX market breadth, sector/category peer context, and market-relative strength into `posture`, `reason_code`, `recommended_exec_action`, `recommended_sizing_multiplier`, source/freshness metadata, and explicit missing fields. It is included in `signal-decider` and `short-term-decider` inputs and is propagated into buy-oriented exec handoffs for kiseyno-AI/kai-trading-exec#140.
+
 Expected decider-facing context blocks are status-first even when the requested-date source row is missing. `quote_context`, `intraday_execution_context`, and the provider-backed optional PyKRX blocks stay object-shaped with explicit `status`, `reason`, and `freshness_provenance` instead of collapsing to raw `null`.
 
 The payload now also includes `market_session` metadata at the top level, under `summary.market_session`, and under each item. It keeps `requested_date`, `current_calendar_date`, `latest_valid_trading_date`, `status`, `is_trading_day`, `intraday_data_expected`, `quote_data_expected`, and `recommendation_basis` explicit so downstream agents can tell an actual trading-data gap from a weekend, holiday, or after-close read.
@@ -271,6 +273,27 @@ GET /agent-context/symbol-day?market_date=2026-04-15&symbols=005930&fs_div=CFS&d
           "freshness_status": "available_but_old",
           "provenance_status": "provider_sourced"
         }
+      },
+      "market_regime_context": {
+        "schema_version": "market_regime_context_v1",
+        "posture": "caution",
+        "reason_code": "weak_market_breadth",
+        "recommended_exec_action": "downsize",
+        "recommended_sizing_multiplier": 0.5,
+        "market_breadth": {
+          "up_ratio": 0.42,
+          "down_ratio": 0.52,
+          "advance_decline_ratio": 0.8077
+        },
+        "sector_context": {
+          "sector_name": "Semiconductors",
+          "weak_sector": false
+        },
+        "relative_strength_context": {
+          "return_percentile": 0.72,
+          "volume_percentile": 0.68
+        },
+        "missing_fields": []
       },
       "decision_input_quality_context": {
         "schema_version": "decision_input_quality_v1",
@@ -569,6 +592,14 @@ GET /agent-context/symbol-day?market_date=2026-04-15&symbols=005930&fs_div=CFS&d
   "market_relative_context": {
     "status": "unavailable",
     "reason": "no_stored_market_relative_context_row_for_request_date"
+  },
+  "market_regime_context": {
+    "schema_version": "market_regime_context_v1",
+    "posture": "unavailable",
+    "reason_code": "market_breadth_unavailable",
+    "recommended_exec_action": "no_opinion",
+    "recommended_sizing_multiplier": 0.0,
+    "missing_fields": ["market_breadth"]
   }
 }
 ```
@@ -582,6 +613,7 @@ GET /agent-context/symbol-day?market_date=2026-04-15&symbols=005930&fs_div=CFS&d
 - `liquidity_context.turnover.trading_value_source` and `pre_decider_enrichment_context.trading_value.source` preserve raw/estimated/missing provenance for turnover. Raw PyKRX/KRX trading value is preferred when the enrichment row exists.
 - `pre_decider_enrichment_context.quote_orderbook_snapshot.status="stale_eod"` is the expected closed-market shape when the latest completed EOD price context is available and live quote/orderbook rows are not expected.
 - `pre_decider_enrichment_context.flow_short_sector_context` is joined from PyKRX enrichment rows. If these rows exist but the block is unavailable, treat that as a pipeline join bug.
+- `market_regime_context` is the core-owned buy-posture payload for exec issue kiseyno-AI/kai-trading-exec#140. Missing or stale breadth must remain explicit as `posture="unavailable"` or `posture="stale"` rather than being omitted.
 - `decider_data_quality_context` is the compact prompt-safe quality overlay that both deciders can read without re-parsing the heavier raw context blocks. It surfaces source-specific `empty` vs `provider_error` semantics for DART and external news, keeps stale or derived liquidity/intraday inputs explicit, and now marks which gaps are `core_execution`, `supporting_context`, or `auxiliary_context`.
 - `macro_context` is included at the response top level and on each symbol item. It carries slow-moving source statuses, freshness, and deterministic `macro_regime_summary` labels for context only; it is not a direct buy/sell signal and is not LLM-generated.
 - `recent_external_news` is material-first and bounded for prompt use. Items carry `materiality` (`material`, `noise`, `unknown`), `materiality_reason`, `event_type`, `source_evidence`, and `access_status` (`full_text`, `headline_only`, `paywalled`, `fetch_failed`). Headline-only, paywalled, or fetch-failed items are not full-text summaries, and deciders must not forecast price reaction from news alone. Background/noise items live under a bounded `noise_filter` section.

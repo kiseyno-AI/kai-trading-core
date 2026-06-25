@@ -588,6 +588,31 @@ def _compact_pre_decider_enrichment_context(context: dict[str, Any]) -> dict[str
     return compacted
 
 
+def _compact_market_regime_context(context: dict[str, Any]) -> dict[str, Any]:
+    compacted = {
+        key: context.get(key)
+        for key in (
+            'schema_version',
+            'status',
+            'market_date',
+            'market',
+            'posture',
+            'reason_code',
+            'reason_summary',
+            'source_status',
+            'recommended_exec_action',
+            'recommended_sizing_multiplier',
+            'missing_fields',
+        )
+        if key in context
+    }
+    for key in ('market_breadth', 'sector_context', 'relative_strength_context', 'freshness'):
+        value = context.get(key)
+        if isinstance(value, dict):
+            compacted[key] = value
+    return compacted
+
+
 def trim_batch_item_for_prompt(item: dict[str, Any]) -> dict[str, Any]:
     trimmed = json.loads(json.dumps(item, ensure_ascii=False))
     symbol_day_context = trimmed.get('symbol_day_context')
@@ -617,6 +642,9 @@ def trim_batch_item_for_prompt(item: dict[str, Any]) -> dict[str, Any]:
     pre_decider_enrichment_context = trimmed.get('pre_decider_enrichment_context')
     if isinstance(pre_decider_enrichment_context, dict):
         trimmed['pre_decider_enrichment_context'] = _compact_pre_decider_enrichment_context(pre_decider_enrichment_context)
+    market_regime_context = trimmed.get('market_regime_context')
+    if isinstance(market_regime_context, dict):
+        trimmed['market_regime_context'] = _compact_market_regime_context(market_regime_context)
     technical_snapshot = trimmed.get('technical_snapshot')
     if isinstance(technical_snapshot, dict):
         technical_snapshot.pop('signal_payload', None)
@@ -941,6 +969,11 @@ def build_signal_decider_payload(
         if isinstance(symbol_day_context.get('pre_decider_enrichment_context'), dict)
         else {}
     )
+    market_regime_context = (
+        symbol_day_context.pop('market_regime_context', {})
+        if isinstance(symbol_day_context.get('market_regime_context'), dict)
+        else {}
+    )
     macro_context = (
         symbol_day_context.pop('macro_context', {})
         if isinstance(symbol_day_context.get('macro_context'), dict)
@@ -1040,6 +1073,7 @@ def build_signal_decider_payload(
         'factor_summary': jsonable_encoder(factor_summary),
         'liquidity_context': jsonable_encoder(liquidity_context),
         'pre_decider_enrichment_context': jsonable_encoder(pre_decider_enrichment_context),
+        'market_regime_context': jsonable_encoder(market_regime_context),
         'decider_data_quality_context': jsonable_encoder(decider_data_quality_context),
         'decision_input_quality_context': jsonable_encoder(decision_input_quality_context),
         'macro_context': jsonable_encoder(macro_context),
@@ -1090,6 +1124,13 @@ def build_signal_decider_payload(
                 'quarterly_financial_detail_confidence_only_unless_thesis_depends_on_it': True,
                 'forbid_untradeable_from_auxiliary_absence_only': True,
                 'pre_decider_enrichment_context_authoritative': True,
+                'market_regime_context_authoritative': True,
+                'market_regime_posture_values': ['normal', 'caution', 'risk_off', 'unavailable', 'stale'],
+                'market_regime_exec_actions': ['allow', 'downsize', 'reject', 'no_opinion'],
+                'account_for_market_regime_when_choosing_buy_wait_reject': True,
+                'risk_off_default_wait_or_reject_unless_exceptional_leadership': True,
+                'caution_requires_stronger_evidence_and_reduced_sizing': True,
+                'weak_sector_requires_sector_leadership_or_confirmation': True,
                 'macro_context_contextual_input_only': True,
                 'macro_context_not_a_direct_buy_sell_signal': True,
                 'macro_context_regime_summary_is_deterministic_no_llm': True,

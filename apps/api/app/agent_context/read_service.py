@@ -83,6 +83,17 @@ TRADING_VALUE_SOURCE_RAW = 'raw'
 TRADING_VALUE_SOURCE_ESTIMATED = 'estimated'
 TRADING_VALUE_SOURCE_MISSING = 'missing'
 PRE_DECIDER_ENRICHMENT_SCHEMA_VERSION = 'pre_decider_enrichment_v1'
+MARKET_REGIME_CONTEXT_SCHEMA_VERSION = 'market_regime_context_v1'
+MARKET_REGIME_MIN_SYMBOL_COUNT = 20
+MARKET_REGIME_CAUTION_UP_RATIO = 0.45
+MARKET_REGIME_RISK_OFF_UP_RATIO = 0.30
+MARKET_REGIME_CAUTION_DOWN_RATIO = 0.50
+MARKET_REGIME_RISK_OFF_DOWN_RATIO = 0.60
+MARKET_REGIME_CAUTION_ADVANCE_DECLINE_RATIO = 0.80
+MARKET_REGIME_RISK_OFF_ADVANCE_DECLINE_RATIO = 0.50
+MARKET_REGIME_WEAK_SECTOR_CHANGE_PCT = -1.50
+MARKET_REGIME_WEAK_RELATIVE_RETURN_PERCENTILE = 0.35
+MARKET_REGIME_WEAK_RELATIVE_VOLUME_PERCENTILE = 0.30
 PERSISTED_FACTOR_FAMILIES: tuple[str, ...] = (
     'value',
     'unified_value',
@@ -1907,6 +1918,279 @@ def _build_pre_decider_enrichment_context(
                 'freshness': _compact_provenance_summary(market_breadth_provenance),
             },
         },
+    }
+
+
+def _build_market_regime_context(
+    *,
+    requested_market_date: date,
+    market: str | None,
+    market_breadth_context: dict[str, Any],
+    market_breadth_provenance: dict[str, Any],
+    sector_peer_context: dict[str, Any],
+    sector_peer_provenance: dict[str, Any],
+    market_relative_context: dict[str, Any],
+    market_relative_provenance: dict[str, Any],
+) -> dict[str, Any]:
+    market_breadth_payload = _maybe_dict(market_breadth_context)
+    sector_payload = _maybe_dict(sector_peer_context)
+    market_relative_payload = _maybe_dict(market_relative_context)
+    market_breadth_freshness = _compact_provenance_summary(market_breadth_provenance)
+    sector_freshness = _compact_provenance_summary(sector_peer_provenance)
+    relative_freshness = _compact_provenance_summary(market_relative_provenance)
+
+    market_breadth_state = _normalize_decider_quality_status(
+        _context_block_status(market_breadth_payload),
+        freshness_provenance=market_breadth_provenance,
+    )
+    sector_state = _normalize_decider_quality_status(
+        _context_block_status(sector_payload),
+        freshness_provenance=sector_peer_provenance,
+    )
+    relative_state = _normalize_decider_quality_status(
+        _context_block_status(market_relative_payload),
+        freshness_provenance=market_relative_provenance,
+    )
+
+    up_count = _to_int(market_breadth_payload.get('up_count'))
+    down_count = _to_int(market_breadth_payload.get('down_count'))
+    flat_count = _to_int(market_breadth_payload.get('flat_count')) or 0
+    market_symbol_count = _to_int(market_breadth_payload.get('market_symbol_count'))
+    counted_symbol_count = (
+        up_count + down_count + flat_count
+        if up_count is not None and down_count is not None
+        else market_symbol_count
+    )
+    up_ratio = _ratio(up_count or 0, counted_symbol_count or 0) if counted_symbol_count else None
+    down_ratio = _ratio(down_count or 0, counted_symbol_count or 0) if counted_symbol_count else None
+    advance_decline_ratio = _to_float(market_breadth_payload.get('advance_decline_ratio'))
+    if advance_decline_ratio is None and up_count is not None and down_count is not None and down_count > 0:
+        advance_decline_ratio = round(up_count / down_count, 4)
+    elif advance_decline_ratio is None and up_count is not None and down_count == 0:
+        advance_decline_ratio = float(up_count) if up_count > 0 else None
+
+    sector_self = _maybe_dict(sector_payload.get('self'))
+    sector_peers = [peer for peer in list(sector_payload.get('peers') or []) if isinstance(peer, dict)]
+    peer_changes = [
+        value
+        for value in (_to_float(peer.get('change_pct')) for peer in sector_peers)
+        if value is not None
+    ]
+    self_change_pct = _to_float(sector_self.get('change_pct') if sector_self else sector_payload.get('change_pct'))
+    sector_change_values = [*peer_changes]
+    if self_change_pct is not None:
+        sector_change_values.append(self_change_pct)
+    sector_avg_change_pct = (
+        round(sum(sector_change_values) / len(sector_change_values), 4)
+        if sector_change_values
+        else None
+    )
+    weak_sector = (
+        sector_avg_change_pct is not None
+        and sector_avg_change_pct <= MARKET_REGIME_WEAK_SECTOR_CHANGE_PCT
+    )
+
+    relative_strength = _maybe_dict(market_relative_payload.get('relative_strength'))
+    market_relative_breadth = _maybe_dict(market_relative_payload.get('breadth'))
+    return_percentile = _to_float(relative_strength.get('return_percentile'))
+    volume_percentile = _to_float(relative_strength.get('volume_percentile'))
+    relative_strength_score = (
+        round((return_percentile + volume_percentile) / 2, 4)
+        if return_percentile is not None and volume_percentile is not None
+        else return_percentile
+        if return_percentile is not None
+        else volume_percentile
+    )
+    weak_relative_strength = (
+        (return_percentile is not None and return_percentile < MARKET_REGIME_WEAK_RELATIVE_RETURN_PERCENTILE)
+        or (volume_percentile is not None and volume_percentile < MARKET_REGIME_WEAK_RELATIVE_VOLUME_PERCENTILE)
+    )
+
+    missing_fields = [
+        f'market_breadth.{field}'
+        for field in list(market_breadth_payload.get('missing_fields') or [])
+    ]
+    missing_fields.extend(
+        f'sector_context.{field}'
+        for field in list(sector_payload.get('missing_fields') or [])
+    )
+    missing_fields.extend(
+        f'relative_strength_context.{field}'
+        for field in list(market_relative_payload.get('missing_fields') or [])
+    )
+    if market_breadth_state == DECIDER_QUALITY_STATUS_UNAVAILABLE:
+        missing_fields.append('market_breadth')
+    if sector_state == DECIDER_QUALITY_STATUS_UNAVAILABLE:
+        missing_fields.append('sector_context')
+    if relative_state == DECIDER_QUALITY_STATUS_UNAVAILABLE:
+        missing_fields.append('relative_strength_context')
+    missing_fields = list(dict.fromkeys(missing_fields))
+
+    severe_breadth = (
+        market_breadth_state == DECIDER_QUALITY_STATUS_AVAILABLE
+        and (
+            (up_ratio is not None and up_ratio <= MARKET_REGIME_RISK_OFF_UP_RATIO)
+            or (down_ratio is not None and down_ratio >= MARKET_REGIME_RISK_OFF_DOWN_RATIO)
+            or (
+                advance_decline_ratio is not None
+                and advance_decline_ratio <= MARKET_REGIME_RISK_OFF_ADVANCE_DECLINE_RATIO
+            )
+        )
+    )
+    weak_breadth = (
+        market_breadth_state == DECIDER_QUALITY_STATUS_AVAILABLE
+        and (
+            (up_ratio is not None and up_ratio <= MARKET_REGIME_CAUTION_UP_RATIO)
+            or (down_ratio is not None and down_ratio >= MARKET_REGIME_CAUTION_DOWN_RATIO)
+            or (
+                advance_decline_ratio is not None
+                and advance_decline_ratio <= MARKET_REGIME_CAUTION_ADVANCE_DECLINE_RATIO
+            )
+            or (counted_symbol_count is not None and counted_symbol_count < MARKET_REGIME_MIN_SYMBOL_COUNT)
+        )
+    )
+    stale_supporting_context = any(
+        state == DECIDER_QUALITY_STATUS_STALE
+        for state in (sector_state, relative_state)
+    )
+
+    if market_breadth_state == DECIDER_QUALITY_STATUS_STALE:
+        posture = 'stale'
+        reason_code = 'market_breadth_stale'
+        reason_summary = 'Market breadth exists but is stale for the requested market date.'
+        recommended_exec_action = 'no_opinion'
+        recommended_sizing_multiplier = 0.0
+    elif market_breadth_state in {DECIDER_QUALITY_STATUS_UNAVAILABLE, DECIDER_QUALITY_STATUS_PROVIDER_ERROR}:
+        posture = 'unavailable'
+        reason_code = 'market_breadth_unavailable'
+        reason_summary = 'No usable market breadth is available for the requested market date.'
+        recommended_exec_action = 'no_opinion'
+        recommended_sizing_multiplier = 0.0
+    elif severe_breadth:
+        posture = 'risk_off'
+        reason_code = 'severe_market_breadth'
+        reason_summary = 'Market breadth is severely weak; new buy handoffs should be rejected by default.'
+        recommended_exec_action = 'reject'
+        recommended_sizing_multiplier = 0.0
+    elif weak_breadth:
+        posture = 'caution'
+        reason_code = 'weak_market_breadth'
+        reason_summary = 'Market breadth is weak; fresh buy decisions need stronger evidence and reduced sizing.'
+        recommended_exec_action = 'downsize'
+        recommended_sizing_multiplier = 0.5
+    elif stale_supporting_context:
+        posture = 'caution'
+        reason_code = 'stale_market_regime_context'
+        reason_summary = 'Market or sector posture inputs are stale; buy decisions need fresher confirmation.'
+        recommended_exec_action = 'downsize'
+        recommended_sizing_multiplier = 0.75
+    elif weak_sector:
+        posture = 'caution'
+        reason_code = 'weak_sector_context'
+        reason_summary = 'The candidate sector/category is weak; avoid fresh exposure unless leadership is clear.'
+        recommended_exec_action = 'downsize'
+        recommended_sizing_multiplier = 0.75
+    elif weak_relative_strength:
+        posture = 'caution'
+        reason_code = 'weak_relative_strength'
+        reason_summary = 'The candidate lacks market-relative strength for an unrestricted buy handoff.'
+        recommended_exec_action = 'downsize'
+        recommended_sizing_multiplier = 0.75
+    else:
+        posture = 'normal'
+        reason_code = 'market_regime_normal'
+        reason_summary = 'Market breadth and candidate context do not require an execution downsize by default.'
+        recommended_exec_action = 'allow'
+        recommended_sizing_multiplier = 1.0
+
+    source_statuses = {
+        'market_breadth': market_breadth_state,
+        'sector_context': sector_state,
+        'relative_strength_context': relative_state,
+    }
+    source_overall = (
+        DECIDER_QUALITY_STATUS_STALE
+        if DECIDER_QUALITY_STATUS_STALE in source_statuses.values()
+        else DECIDER_QUALITY_STATUS_PROVIDER_ERROR
+        if DECIDER_QUALITY_STATUS_PROVIDER_ERROR in source_statuses.values()
+        else DECIDER_QUALITY_STATUS_UNAVAILABLE
+        if source_statuses['market_breadth'] == DECIDER_QUALITY_STATUS_UNAVAILABLE
+        else DECIDER_QUALITY_STATUS_AVAILABLE
+        if all(state == DECIDER_QUALITY_STATUS_AVAILABLE for state in source_statuses.values())
+        else DECIDER_QUALITY_STATUS_PARTIAL
+    )
+    return {
+        'schema_version': MARKET_REGIME_CONTEXT_SCHEMA_VERSION,
+        'status': source_overall,
+        'market_date': requested_market_date.isoformat(),
+        'market': market or market_breadth_payload.get('market') or market_relative_payload.get('market'),
+        'posture': posture,
+        'reason_code': reason_code,
+        'reason_summary': reason_summary,
+        'source_status': {
+            'overall': source_overall,
+            **source_statuses,
+        },
+        'freshness': {
+            'overall_status': (
+                FRESHNESS_STATUS_STALE
+                if any(
+                    str((freshness or {}).get('freshness_status') or '') in {FRESHNESS_STATUS_STALE, FRESHNESS_STATUS_AVAILABLE_BUT_OLD}
+                    for freshness in (market_breadth_freshness, sector_freshness, relative_freshness)
+                )
+                else FRESHNESS_STATUS_MISSING
+                if source_overall == DECIDER_QUALITY_STATUS_UNAVAILABLE
+                else FRESHNESS_STATUS_FRESH
+            ),
+            'market_breadth': market_breadth_freshness,
+            'sector_context': sector_freshness,
+            'relative_strength_context': relative_freshness,
+        },
+        'market_breadth': {
+            'status': market_breadth_state,
+            'source_status': market_breadth_payload.get('status'),
+            'market_symbol_count': market_symbol_count,
+            'counted_symbol_count': counted_symbol_count,
+            'up_count': up_count,
+            'down_count': down_count,
+            'flat_count': flat_count,
+            'up_ratio': up_ratio,
+            'down_ratio': down_ratio,
+            'advance_decline_ratio': advance_decline_ratio,
+            'basis': market_breadth_payload.get('basis') or 'close_vs_previous_close',
+            'source': market_breadth_payload.get('source') or market_breadth_freshness.get('source_provider') or 'pykrx_derived',
+            'captured_at': market_breadth_payload.get('captured_at') or market_breadth_freshness.get('latest_available_timestamp'),
+            'missing_fields': list(market_breadth_payload.get('missing_fields') or []),
+        },
+        'sector_context': {
+            'status': sector_state,
+            'source_status': sector_payload.get('status'),
+            'market': sector_payload.get('market') or market,
+            'sector_name': sector_payload.get('sector_name'),
+            'same_sector_symbol_count': sector_payload.get('same_sector_symbol_count'),
+            'peer_count': sector_payload.get('peer_count'),
+            'self_change_pct': self_change_pct,
+            'peer_avg_change_pct': round(sum(peer_changes) / len(peer_changes), 4) if peer_changes else None,
+            'sector_avg_change_pct': sector_avg_change_pct,
+            'weak_sector': weak_sector,
+            'missing_fields': list(sector_payload.get('missing_fields') or []),
+        },
+        'relative_strength_context': {
+            'status': relative_state,
+            'source_status': market_relative_payload.get('status'),
+            'return_percentile': return_percentile,
+            'volume_percentile': volume_percentile,
+            'relative_strength_score': relative_strength_score,
+            'market_symbol_count': market_relative_breadth.get('market_symbol_count'),
+            'up_count': market_relative_breadth.get('up_count'),
+            'down_count': market_relative_breadth.get('down_count'),
+            'leader': return_percentile is not None and return_percentile >= 0.70,
+            'weak_relative_strength': weak_relative_strength,
+            'missing_fields': list(market_relative_payload.get('missing_fields') or []),
+        },
+        'recommended_exec_action': recommended_exec_action,
+        'recommended_sizing_multiplier': recommended_sizing_multiplier,
+        'missing_fields': missing_fields,
     }
 
 
@@ -5283,6 +5567,22 @@ class AgentContextReadService:
                 market_breadth_context=market_breadth_context,
                 market_breadth_provenance=market_breadth_context_provenance,
             )
+            market_regime_context = _build_market_regime_context(
+                requested_market_date=normalized_market_date,
+                market=company_market or None,
+                market_breadth_context=market_breadth_context,
+                market_breadth_provenance=market_breadth_context_provenance,
+                sector_peer_context=sector_peer_context,
+                sector_peer_provenance=sector_peer_context_provenance,
+                market_relative_context=market_relative_context,
+                market_relative_provenance=market_relative_context_provenance,
+            )
+            context_completeness['market_regime_context'] = {
+                'status': market_regime_context.get('status'),
+                'posture': market_regime_context.get('posture'),
+                'missing_fields': list(market_regime_context.get('missing_fields') or []),
+                'recommended_exec_action': market_regime_context.get('recommended_exec_action'),
+            }
             decider_data_quality_context = _build_decider_data_quality_context(
                 market_date=normalized_market_date,
                 scores=scores,
@@ -5367,6 +5667,7 @@ class AgentContextReadService:
                 'market_relative_context': _context_block_has_signal(market_relative_context),
                 'sector_peer_context': _context_block_has_signal(sector_peer_context),
                 'market_breadth_context': _context_block_has_signal(market_breadth_context),
+                'market_regime_context': _context_block_has_signal(market_regime_context),
                 'investor_flow_context': _context_block_has_signal(investor_flow_context),
                 'short_selling_context': _context_block_has_signal(short_selling_context),
                 'valuation_context': _context_block_has_signal(valuation_context),
@@ -5381,7 +5682,7 @@ class AgentContextReadService:
             symbol_scoped_availability = {
                 key: value
                 for key, value in availability.items()
-                if key != 'macro_context'
+                if key not in {'macro_context', 'market_regime_context', 'pre_decider_enrichment_context'}
             }
             if any(symbol_scoped_availability.values()):
                 matched_symbols.append(symbol)
@@ -5399,6 +5700,7 @@ class AgentContextReadService:
                     'price_context': price_context,
                     'liquidity_context': liquidity_context,
                     'pre_decider_enrichment_context': pre_decider_enrichment_context,
+                    'market_regime_context': market_regime_context,
                     'decider_data_quality_context': decider_data_quality_context,
                     'decision_input_quality_context': decision_input_quality_context,
                     'signal_envelopes': signal_envelopes,
@@ -5440,6 +5742,7 @@ class AgentContextReadService:
                         'signal_features': signal_features_provenance,
                         'sector_peer_context': sector_peer_context_provenance,
                         'market_breadth_context': market_breadth_context_provenance,
+                        'market_regime_context': market_regime_context.get('freshness'),
                         'macro_context': macro_context_provenance,
                         'investor_flow_context': investor_flow_context_provenance,
                         'short_selling_context': short_selling_context_provenance,
@@ -5513,6 +5816,26 @@ class AgentContextReadService:
             1
             for item in items
             if str((item.get('market_breadth_context') or {}).get('status') or 'unavailable') == 'partial'
+        )
+        market_regime_available_count = sum(
+            1
+            for item in items
+            if str((item.get('market_regime_context') or {}).get('posture') or 'unavailable') == 'normal'
+        )
+        market_regime_caution_count = sum(
+            1
+            for item in items
+            if str((item.get('market_regime_context') or {}).get('posture') or 'unavailable') == 'caution'
+        )
+        market_regime_risk_off_count = sum(
+            1
+            for item in items
+            if str((item.get('market_regime_context') or {}).get('posture') or 'unavailable') == 'risk_off'
+        )
+        market_regime_stale_count = sum(
+            1
+            for item in items
+            if str((item.get('market_regime_context') or {}).get('posture') or 'unavailable') == 'stale'
         )
         investor_flow_available_count = sum(
             1
@@ -5604,6 +5927,21 @@ class AgentContextReadService:
                 partial_count=market_breadth_partial_count,
                 requested_count=requested_symbol_count,
             ),
+            'market_regime_context': {
+                'normal_rows': market_regime_available_count,
+                'caution_rows': market_regime_caution_count,
+                'risk_off_rows': market_regime_risk_off_count,
+                'stale_rows': market_regime_stale_count,
+                'unavailable_rows': requested_symbol_count
+                - market_regime_available_count
+                - market_regime_caution_count
+                - market_regime_risk_off_count
+                - market_regime_stale_count,
+                'coverage_ratio': _ratio(
+                    market_regime_available_count + market_regime_caution_count + market_regime_risk_off_count,
+                    requested_symbol_count,
+                ),
+            },
             'investor_flow_context': _build_symbol_block_coverage(
                 available_count=investor_flow_available_count,
                 partial_count=investor_flow_partial_count,
@@ -5664,6 +6002,7 @@ class AgentContextReadService:
             item['context_provenance']['market_relative_context']['requested_symbol_coverage'] = requested_symbol_coverage['market_relative_context']
             item['context_provenance']['sector_peer_context']['requested_symbol_coverage'] = requested_symbol_coverage['sector_peer_mapping']
             item['context_provenance']['market_breadth_context']['requested_symbol_coverage'] = requested_symbol_coverage['market_breadth_context']
+            item['context_provenance']['market_regime_context']['requested_symbol_coverage'] = requested_symbol_coverage['market_regime_context']
             item['context_provenance']['investor_flow_context']['requested_symbol_coverage'] = requested_symbol_coverage['investor_flow_context']
             item['context_provenance']['short_selling_context']['requested_symbol_coverage'] = requested_symbol_coverage['short_selling_context']
             item['context_provenance']['valuation_context']['requested_symbol_coverage'] = requested_symbol_coverage['valuation_context']
@@ -5702,6 +6041,12 @@ class AgentContextReadService:
                 ),
                 'market_breadth_context_count': sum(
                     1 for item in items if _context_block_has_signal(item['market_breadth_context'])
+                ),
+                'market_regime_context_count': sum(
+                    1
+                    for item in items
+                    if str((item.get('market_regime_context') or {}).get('posture') or 'unavailable')
+                    in {'normal', 'caution', 'risk_off'}
                 ),
                 'investor_flow_context_count': sum(
                     1 for item in items if _context_block_has_signal(item['investor_flow_context'])

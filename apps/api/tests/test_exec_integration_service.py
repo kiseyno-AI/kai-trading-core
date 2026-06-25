@@ -263,13 +263,39 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 specialist_disagreement_payload=[],
                 traceability_payload={'gate_checks': {'missing_upstream_roles': []}},
                 input_feature_snapshot_payload={'technical': {'trend_state': 'uptrend'}},
-                request_payload={'signal_decider_policy': {'current_version': self.policy_version}},
+                request_payload={
+                    'signal_decider_policy': {'current_version': self.policy_version},
+                    'market_regime_context': self._market_regime_context(),
+                },
                 response_payload={'next_day_open_action': 'buy'},
                 response_summary_payload={'policy_version': self.policy_version},
             )
             session.add(row)
             session.flush()
             return row.id
+
+    def _market_regime_context(self, *, posture: str = 'caution') -> dict:
+        return {
+            'schema_version': 'market_regime_context_v1',
+            'market_date': self.market_date.isoformat(),
+            'market': 'KOSPI',
+            'posture': posture,
+            'reason_code': 'weak_market_breadth' if posture == 'caution' else 'market_regime_normal',
+            'reason_summary': 'Market breadth is weak.',
+            'source_status': {
+                'overall': 'available',
+                'market_breadth': 'available',
+                'sector_context': 'available',
+                'relative_strength_context': 'available',
+            },
+            'freshness': {'overall_status': 'fresh'},
+            'market_breadth': {'up_ratio': 0.42, 'down_ratio': 0.52},
+            'sector_context': {'sector_name': 'Semiconductors', 'weak_sector': False},
+            'relative_strength_context': {'return_percentile': 0.72, 'volume_percentile': 0.68},
+            'recommended_exec_action': 'downsize' if posture == 'caution' else 'allow',
+            'recommended_sizing_multiplier': 0.5 if posture == 'caution' else 1.0,
+            'missing_fields': [],
+        }
 
     def _seed_short_term_snapshot(
         self,
@@ -1288,6 +1314,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                         'decision_band': 'small_probe',
                     },
                 },
+                'market_regime_context': self._market_regime_context(),
             },
             'orchestration': {'run_id': 'symbol-run-1'},
         }
@@ -1329,6 +1356,8 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(signal_entry['quantity_policy']['type'], 'exec_agent_sized')
         self.assertNotIn('quantity', signal_entry['quantity_policy'])
         self.assertEqual(signal_entry['risk_context']['classification'], EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING)
+        self.assertEqual(signal_entry['risk_context']['market_regime_context']['schema_version'], 'market_regime_context_v1')
+        self.assertEqual(signal_entry['risk_context']['market_regime_context']['recommended_exec_action'], 'downsize')
         self.assertEqual(signal_entry['risk_context']['max_holding_close_policy']['enabled'], False)
         self.assertIsNone(signal_entry['risk_context']['max_holding_close_policy']['max_holding_trading_sessions'])
         self.assertNotIn('max_holding_close_sell', [item['intent'] for item in signal_payload['items']])
@@ -1366,6 +1395,8 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(short_entry['quantity_policy']['account_reference'], self.account_reference)
         self.assertEqual(short_entry['quantity_policy']['account_label'], 'Main')
         self.assertEqual(short_entry['risk_context']['classification'], EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING)
+        self.assertEqual(short_entry['risk_context']['market_regime_context']['schema_version'], 'market_regime_context_v1')
+        self.assertEqual(short_entry['risk_context']['market_regime_context']['recommended_exec_action'], 'downsize')
         short_items_by_intent = {item['intent']: item for item in short_payload['items']}
         self.assertEqual(
             set(short_items_by_intent),
@@ -1407,6 +1438,11 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             handoff['decider_input_context']['decision_input_quality_context']['schema_version'],
             'decision_input_quality_v1',
         )
+        self.assertEqual(
+            handoff['decider_input_context']['market_regime_context']['schema_version'],
+            'market_regime_context_v1',
+        )
+        self.assertEqual(handoff['market_regime_context']['recommended_exec_action'], 'downsize')
         self.assertEqual(
             short_entry['risk_context']['decision_input_quality_context']['schema_version'],
             'decision_input_quality_v1',

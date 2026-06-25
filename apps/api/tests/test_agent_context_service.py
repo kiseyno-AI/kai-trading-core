@@ -14,6 +14,7 @@ from app.agent_context.read_service import (
     _build_factor_summary_entry,
     _build_intraday_execution_context,
     _build_intraday_execution_freshness_provenance,
+    _build_market_regime_context,
     _build_pre_decider_enrichment_context,
     _build_price_context,
     _build_quote_context,
@@ -27,6 +28,65 @@ EMPTY_LATEST_PRIOR_ROWS = {
     'factor_rows': {family: {} for family in PERSISTED_FACTOR_FAMILIES},
     'signal_features': {},
 }
+
+
+def _fresh_provenance() -> dict[str, object]:
+    return {
+        'freshness_status': 'fresh',
+        'provenance_status': 'provider_sourced',
+        'as_of_market_date': '2026-04-29',
+        'latest_available_market_date': '2026-04-29',
+    }
+
+
+def _stale_provenance() -> dict[str, object]:
+    return {
+        **_fresh_provenance(),
+        'freshness_status': 'stale',
+        'reason': 'latest_available_market_date_before_request',
+    }
+
+
+def _market_breadth_context(*, up: int = 650, down: int = 280, flat: int = 70) -> dict[str, object]:
+    return {
+        'status': 'available',
+        'market_symbol_count': up + down + flat,
+        'up_count': up,
+        'down_count': down,
+        'flat_count': flat,
+        'advance_decline_ratio': round(up / down, 4) if down else None,
+        'missing_fields': [],
+    }
+
+
+def _sector_context(*, sector_avg: float = 0.4) -> dict[str, object]:
+    return {
+        'status': 'available',
+        'market': 'KOSPI',
+        'sector_name': 'Semiconductors',
+        'same_sector_symbol_count': 3,
+        'peer_count': 2,
+        'self': {'symbol': '005930', 'change_pct': sector_avg},
+        'peers': [
+            {'symbol': '000660', 'change_pct': sector_avg},
+            {'symbol': '123456', 'change_pct': sector_avg},
+        ],
+        'missing_fields': [],
+    }
+
+
+def _relative_context(*, return_percentile: float = 0.72, volume_percentile: float = 0.68) -> dict[str, object]:
+    return {
+        'status': 'available',
+        'market_date': '2026-04-29',
+        'market': 'KOSPI',
+        'breadth': {'market_symbol_count': 1000, 'up_count': 650, 'down_count': 280},
+        'relative_strength': {
+            'return_percentile': return_percentile,
+            'volume_percentile': volume_percentile,
+        },
+        'missing_fields': [],
+    }
 
 
 def _closed_market_session() -> dict[str, object]:
@@ -121,6 +181,111 @@ def _make_intraday_execution_row(
             ],
         },
     }
+
+
+class MarketRegimeContextTests(unittest.TestCase):
+    def test_build_market_regime_context_returns_normal_posture(self) -> None:
+        result = _build_market_regime_context(
+            requested_market_date=date(2026, 4, 29),
+            market='KOSPI',
+            market_breadth_context=_market_breadth_context(),
+            market_breadth_provenance=_fresh_provenance(),
+            sector_peer_context=_sector_context(),
+            sector_peer_provenance=_fresh_provenance(),
+            market_relative_context=_relative_context(),
+            market_relative_provenance=_fresh_provenance(),
+        )
+
+        self.assertEqual(result['schema_version'], 'market_regime_context_v1')
+        self.assertEqual(result['posture'], 'normal')
+        self.assertEqual(result['recommended_exec_action'], 'allow')
+        self.assertEqual(result['recommended_sizing_multiplier'], 1.0)
+        self.assertEqual(result['market_breadth']['up_ratio'], 0.65)
+        self.assertEqual(result['sector_context']['sector_name'], 'Semiconductors')
+        self.assertTrue(result['relative_strength_context']['leader'])
+
+    def test_build_market_regime_context_cautions_on_weak_breadth(self) -> None:
+        result = _build_market_regime_context(
+            requested_market_date=date(2026, 4, 29),
+            market='KOSPI',
+            market_breadth_context=_market_breadth_context(up=420, down=520, flat=60),
+            market_breadth_provenance=_fresh_provenance(),
+            sector_peer_context=_sector_context(),
+            sector_peer_provenance=_fresh_provenance(),
+            market_relative_context=_relative_context(),
+            market_relative_provenance=_fresh_provenance(),
+        )
+
+        self.assertEqual(result['posture'], 'caution')
+        self.assertEqual(result['reason_code'], 'weak_market_breadth')
+        self.assertEqual(result['recommended_exec_action'], 'downsize')
+        self.assertEqual(result['recommended_sizing_multiplier'], 0.5)
+
+    def test_build_market_regime_context_marks_risk_off_on_severe_breadth(self) -> None:
+        result = _build_market_regime_context(
+            requested_market_date=date(2026, 4, 29),
+            market='KOSPI',
+            market_breadth_context=_market_breadth_context(up=250, down=680, flat=70),
+            market_breadth_provenance=_fresh_provenance(),
+            sector_peer_context=_sector_context(),
+            sector_peer_provenance=_fresh_provenance(),
+            market_relative_context=_relative_context(),
+            market_relative_provenance=_fresh_provenance(),
+        )
+
+        self.assertEqual(result['posture'], 'risk_off')
+        self.assertEqual(result['reason_code'], 'severe_market_breadth')
+        self.assertEqual(result['recommended_exec_action'], 'reject')
+        self.assertEqual(result['recommended_sizing_multiplier'], 0.0)
+
+    def test_build_market_regime_context_marks_stale_and_missing_breadth_explicitly(self) -> None:
+        stale = _build_market_regime_context(
+            requested_market_date=date(2026, 4, 29),
+            market='KOSPI',
+            market_breadth_context=_market_breadth_context(),
+            market_breadth_provenance=_stale_provenance(),
+            sector_peer_context=_sector_context(),
+            sector_peer_provenance=_fresh_provenance(),
+            market_relative_context=_relative_context(),
+            market_relative_provenance=_fresh_provenance(),
+        )
+        missing = _build_market_regime_context(
+            requested_market_date=date(2026, 4, 29),
+            market='KOSPI',
+            market_breadth_context={
+                'status': 'unavailable',
+                'reason': 'no_stored_pykrx_market_breadth_row_for_request_date',
+                'missing_fields': ['market_symbol_count', 'up_count', 'down_count', 'flat_count'],
+            },
+            market_breadth_provenance={'freshness_status': 'missing', 'provenance_status': 'derived_from_provider_data'},
+            sector_peer_context=_sector_context(),
+            sector_peer_provenance=_fresh_provenance(),
+            market_relative_context=_relative_context(),
+            market_relative_provenance=_fresh_provenance(),
+        )
+
+        self.assertEqual(stale['posture'], 'stale')
+        self.assertEqual(stale['recommended_exec_action'], 'no_opinion')
+        self.assertEqual(missing['posture'], 'unavailable')
+        self.assertEqual(missing['reason_code'], 'market_breadth_unavailable')
+        self.assertIn('market_breadth', missing['missing_fields'])
+
+    def test_build_market_regime_context_cautions_on_weak_sector_context(self) -> None:
+        result = _build_market_regime_context(
+            requested_market_date=date(2026, 4, 29),
+            market='KOSPI',
+            market_breadth_context=_market_breadth_context(),
+            market_breadth_provenance=_fresh_provenance(),
+            sector_peer_context=_sector_context(sector_avg=-2.1),
+            sector_peer_provenance=_fresh_provenance(),
+            market_relative_context=_relative_context(),
+            market_relative_provenance=_fresh_provenance(),
+        )
+
+        self.assertEqual(result['posture'], 'caution')
+        self.assertEqual(result['reason_code'], 'weak_sector_context')
+        self.assertTrue(result['sector_context']['weak_sector'])
+        self.assertEqual(result['recommended_exec_action'], 'downsize')
 
 
 class FakeFundamentalsRepository:

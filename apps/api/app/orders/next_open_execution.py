@@ -237,6 +237,17 @@ def _snapshot_pre_decider_enrichment_context(snapshot: SignalDeciderDecisionSnap
     return {}
 
 
+def _snapshot_market_regime_context(snapshot: SignalDeciderDecisionSnapshot) -> dict[str, Any]:
+    request_payload = _snapshot_request_payload(snapshot)
+    context = request_payload.get('market_regime_context')
+    if isinstance(context, dict):
+        return context
+    symbol_day_context = request_payload.get('symbol_day_context')
+    if isinstance(symbol_day_context, dict) and isinstance(symbol_day_context.get('market_regime_context'), dict):
+        return symbol_day_context['market_regime_context']
+    return {}
+
+
 def _snapshot_decider_data_quality_context(snapshot: SignalDeciderDecisionSnapshot) -> dict[str, Any]:
     request_payload = _snapshot_request_payload(snapshot)
     context = request_payload.get('decider_data_quality_context')
@@ -1691,6 +1702,7 @@ class SignalDeciderNextOpenExecutionService:
         decision_agent_name = _snapshot_agent_name(snapshot)
         response_payload = _snapshot_response_payload(snapshot)
         pre_decider_enrichment_context = _snapshot_pre_decider_enrichment_context(snapshot)
+        market_regime_context = _snapshot_market_regime_context(snapshot)
         short_term_tactical_action = (
             _short_term_tactical_action(snapshot)
             if decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
@@ -2081,6 +2093,7 @@ class SignalDeciderNextOpenExecutionService:
                 'estimated_notional_krw': _decimal_to_text(estimated_notional),
             },
             'pre_decider_enrichment_context': pre_decider_enrichment_context,
+            'market_regime_context': market_regime_context,
             'decision_input_quality_context': decision_input_quality_context,
             'handoff': {
                 'decision_agent_name': decision_agent_name,
@@ -2130,6 +2143,7 @@ class SignalDeciderNextOpenExecutionService:
                 'invalidation_conditions': snapshot.invalidation_conditions_payload,
                 'data_quality_warnings': snapshot.data_quality_warnings_payload,
                 'pre_decider_enrichment_context': pre_decider_enrichment_context,
+                'market_regime_context': market_regime_context,
                 'decision_input_quality_context': decision_input_quality_context,
                 'response_payload_summary': _to_json_safe(response_payload),
                 'response_summary': snapshot.response_summary_payload if isinstance(snapshot.response_summary_payload, dict) else None,
@@ -2279,6 +2293,7 @@ class SignalDeciderNextOpenExecutionService:
             'invalidation_conditions': snapshot.invalidation_conditions_payload,
             'data_quality_warnings': snapshot.data_quality_warnings_payload,
             'pre_decider_enrichment_context': validation_payload.get('pre_decider_enrichment_context') or {},
+            'market_regime_context': validation_payload.get('market_regime_context') or {},
             'decision_input_quality_context': validation_payload.get('decision_input_quality_context') or {},
             'response_summary': snapshot.response_summary_payload if isinstance(snapshot.response_summary_payload, dict) else None,
             'response_payload_summary': _to_json_safe(response_payload),
