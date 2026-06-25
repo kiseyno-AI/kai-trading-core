@@ -171,6 +171,19 @@ def _compact_risk_context_summary(risk_context: Any) -> dict[str, Any] | None:
     decision_quality = risk_context.get('decision_input_quality_context')
     if isinstance(decision_quality, dict):
         compact['decision_input_quality_summary'] = _compact_decision_quality_summary(decision_quality)
+    market_regime = risk_context.get('market_regime_context')
+    if isinstance(market_regime, dict):
+        compact['market_regime_context'] = {
+            key: _truncate_text(market_regime.get(key), max_chars=160)
+            for key in (
+                'schema_version',
+                'posture',
+                'reason_code',
+                'recommended_exec_action',
+                'recommended_sizing_multiplier',
+            )
+            if market_regime.get(key) is not None
+        }
     return compact or None
 
 

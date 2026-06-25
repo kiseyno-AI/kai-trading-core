@@ -114,12 +114,20 @@ class RepairJsonTailTests(unittest.TestCase):
                 'llm_generated': False,
             },
         }
+        market_regime_context = {
+            'schema_version': 'market_regime_context_v1',
+            'posture': 'caution',
+            'reason_code': 'weak_market_breadth',
+            'recommended_exec_action': 'downsize',
+            'recommended_sizing_multiplier': 0.5,
+        }
 
         payload = build_signal_decider_payload(
             item={
                 'symbol': '005930',
                 'market_date': '2026-04-14',
                 'pre_decider_enrichment_context': pre_decider_context,
+                'market_regime_context': market_regime_context,
                 'decision_input_quality_context': decision_input_quality_context,
                 'macro_context': macro_context,
                 'scores': {},
@@ -136,14 +144,26 @@ class RepairJsonTailTests(unittest.TestCase):
         )
 
         self.assertEqual(payload['pre_decider_enrichment_context'], pre_decider_context)
+        self.assertEqual(payload['market_regime_context'], market_regime_context)
         self.assertEqual(payload['decision_input_quality_context'], decision_input_quality_context)
         self.assertEqual(payload['macro_context'], macro_context)
         self.assertNotIn('pre_decider_enrichment_context', payload['symbol_day_context'])
+        self.assertNotIn('market_regime_context', payload['symbol_day_context'])
         self.assertNotIn('decision_input_quality_context', payload['symbol_day_context'])
         self.assertNotIn('macro_context', payload['symbol_day_context'])
         self.assertTrue(
             payload['decision_support_constraints']['missing_context_policy'][
                 'pre_decider_enrichment_context_authoritative'
+            ]
+        )
+        self.assertTrue(
+            payload['decision_support_constraints']['missing_context_policy'][
+                'market_regime_context_authoritative'
+            ]
+        )
+        self.assertTrue(
+            payload['decision_support_constraints']['missing_context_policy'][
+                'account_for_market_regime_when_choosing_buy_wait_reject'
             ]
         )
         self.assertTrue(

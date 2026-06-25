@@ -400,6 +400,22 @@ def _decision_input_quality_from_payloads(
     )
 
 
+def _market_regime_context_from_payloads(
+    *,
+    request_payload: dict[str, Any],
+    validation: dict[str, Any],
+    traceability: dict[str, Any],
+) -> dict[str, Any]:
+    for payload in (validation, traceability, request_payload):
+        context = payload.get('market_regime_context') if isinstance(payload, dict) else None
+        if isinstance(context, dict) and context:
+            return context
+    symbol_day_context = request_payload.get('symbol_day_context')
+    if isinstance(symbol_day_context, dict) and isinstance(symbol_day_context.get('market_regime_context'), dict):
+        return symbol_day_context['market_regime_context']
+    return {}
+
+
 def _strip_signal_decider_fixed_sizing_preview(payload: dict[str, Any], *, decision_agent_name: str) -> dict[str, Any]:
     if decision_agent_name != SIGNAL_DECIDER_AGENT_NAME:
         return payload
@@ -2613,6 +2629,11 @@ class SignalDeciderExecIntegrationService:
             estimated_reference_price=row.estimated_reference_price,
             planned_notional_krw=row.estimated_notional_krw,
         )
+        market_regime_context = _market_regime_context_from_payloads(
+            request_payload=request_payload,
+            validation=validation,
+            traceability=traceability,
+        )
         request_payload = _strip_signal_decider_only_labels(
             request_payload,
             decision_agent_name=row_decision_agent_name,
@@ -2657,8 +2678,10 @@ class SignalDeciderExecIntegrationService:
                     'request_payload': request_payload,
                     'input_feature_snapshot_payload': input_feature_snapshot_payload,
                     'pre_decider_enrichment_context': pre_decider_enrichment_context,
+                    'market_regime_context': market_regime_context,
                     'decision_input_quality_context': decision_input_quality_context,
                 },
+                'market_regime_context': market_regime_context,
                 'decision_input_quality_context': decision_input_quality_context,
                 'decider_output': {
                     'decision_action': snapshot.decision_action if snapshot is not None else None,
@@ -2791,6 +2814,11 @@ class SignalDeciderExecIntegrationService:
                 if isinstance(decider_handoff_context.get('decision_input_quality_context'), dict)
                 else {}
             )
+            market_regime_context = (
+                decider_handoff_context.get('market_regime_context')
+                if isinstance(decider_handoff_context.get('market_regime_context'), dict)
+                else {}
+            )
             execution_feasibility_context = (
                 decision_input_quality_context.get('execution_feasibility')
                 if isinstance(decision_input_quality_context.get('execution_feasibility'), dict)
@@ -2859,6 +2887,7 @@ class SignalDeciderExecIntegrationService:
                 'validation': validation,
                 'traceability': decision_traceability,
                 'decider_handoff_context': decider_handoff_context,
+                'market_regime_context': market_regime_context,
                 'decision_input_quality_context': decision_input_quality_context,
                 'execution_feasibility_context': execution_feasibility_context,
             }

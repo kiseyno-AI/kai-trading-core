@@ -139,6 +139,7 @@ DISPATCH_SPECS: tuple[AgentDispatchSpec, ...] = (
             'Prioritize liquidity, fresh participation, clean trigger/invalidation levels, and chase-risk control. '
             'Every watch_for_trigger, avoid_chase, or wait decision must name one primary wait_reason taxonomy blocker plus a concise actionable explanation. '
             'If previous_decision_context is supplied, summarize the delta instead of repeating the earlier wait explanation: state what changed, what stayed the same, whether the setup is persistent or improving or worsening, and the concrete trigger that upgrades the setup. '
+            'Account for market_regime_context posture when choosing scalp_buy_candidate, watch_for_trigger, wait, or reject: risk_off defaults to wait/reject unless the candidate shows exceptional market/sector leadership; caution requires stronger evidence, trigger confirmation, and reduced-size language; weak sector context requires sector leadership or clear confirmation. '
             'Treat missing news/disclosure detail and missing detailed quarterly/cash-flow detail as auxiliary by default, not standalone blockers, unless the setup explicitly depends on them. '
             'Write all operator-facing feedback in Korean while staying JSON-only, and avoid execution logic, leverage, sizing, or fake precision.'
         ),
@@ -152,6 +153,7 @@ DISPATCH_SPECS: tuple[AgentDispatchSpec, ...] = (
             'and explicit realistic target and stop-loss levels for every symbol. '
             'Every wait decision must name one primary wait_reason taxonomy blocker plus a concise actionable explanation. '
             'If previous_decision_context is supplied, summarize the delta instead of repeating the earlier wait explanation: state what changed, what stayed the same, whether the setup is persistent or improving or worsening, and the concrete trigger that upgrades the setup to buy. '
+            'Account for market_regime_context posture when choosing buy, wait, or reject: risk_off defaults to wait/reject unless the candidate shows exceptional market/sector leadership; caution requires stronger evidence and reduced-size language; weak sector context requires sector leadership or clear confirmation. '
             'Treat missing news/disclosure detail and missing detailed quarterly/cash-flow detail as auxiliary by default, not standalone blockers, unless the thesis explicitly depends on them. '
             'Write all operator-facing feedback in Korean while staying JSON-only, and avoid execution logic, leverage, sizing, or fake precision.'
         ),
@@ -1022,6 +1024,7 @@ class OpenClawAgentClient:
             "If previous_decision_context is present, use it to populate decision_delta, avoid copy-pasting the prior wait narrative, and explain both the stable blockers and the concrete upgrade trigger.\n"
             "Interpret decider_data_quality_context.decision_priority literally: core_execution gaps can justify conservative wait/reject, while auxiliary_context gaps are confidence reducers only by default.\n"
             "Interpret decision_input_quality_context.final_judgment and execution_feasibility as the source-attributed buy-quality guardrail; hard_blocks should prevent buy/watch upgrades unless directly contradicted by fresher supplied evidence.\n"
+            "Interpret market_regime_context as the authoritative market/sector posture guardrail: risk_off should default to wait/reject unless exceptional relative/sector leadership is evident; caution should require stronger evidence and reduced-size language; weak sector context should block fresh exposure unless leadership or confirmation is explicit.\n"
             "Empty recent news means no captured recent news and is neutral unless separate risk evidence exists.\n"
             "Do not forecast price reaction from news alone; use external news only as source-backed material/noise context, and do not treat headline-only, paywalled, or fetch-failed items as full-text summaries.\n"
             "Missing detailed quarterly/cash-flow context should usually reduce confidence only, not make the symbol untradeable on its own.\n"
@@ -1057,6 +1060,7 @@ class OpenClawAgentClient:
                 "For decision-support outputs, provide explicit target_price and stop_loss_price levels for each symbol whenever possible; short-term-decider must also provide trigger_price and chase_limit_price. If a level is genuinely not supportable, keep the key and explain the limitation in data_quality_warnings.\n"
                 "Interpret decider_data_quality_context.decision_priority literally: core_execution gaps can justify conservative wait/reject, while auxiliary_context gaps are confidence reducers only by default.\n"
                 "Interpret decision_input_quality_context.final_judgment and execution_feasibility as the source-attributed buy-quality guardrail; hard_blocks should prevent buy/watch upgrades unless directly contradicted by fresher supplied evidence.\n"
+                "Interpret market_regime_context as the authoritative market/sector posture guardrail: risk_off should default to wait/reject unless exceptional relative/sector leadership is evident; caution should require stronger evidence and reduced-size language; weak sector context should block fresh exposure unless leadership or confirmation is explicit.\n"
                 "Empty recent news means no captured recent news and is neutral unless separate risk evidence exists.\n"
                 "Do not forecast price reaction from news alone; use external news only as source-backed material/noise context, and do not treat headline-only, paywalled, or fetch-failed items as full-text summaries.\n"
                 "Missing detailed quarterly/cash-flow context should usually reduce confidence only, not make the symbol untradeable on its own.\n"
@@ -1083,6 +1087,7 @@ class OpenClawAgentClient:
             "For decision-support outputs, provide explicit target_price and stop_loss_price levels for the assigned symbol whenever possible; short-term-decider must also provide trigger_price and chase_limit_price. If a level is genuinely not supportable, keep the key and explain the limitation in data_quality_warnings.\n"
             "Interpret decider_data_quality_context.decision_priority literally: core_execution gaps can justify conservative wait/reject, while auxiliary_context gaps are confidence reducers only by default.\n"
             "Interpret decision_input_quality_context.final_judgment and execution_feasibility as the source-attributed buy-quality guardrail; hard_blocks should prevent buy/watch upgrades unless directly contradicted by fresher supplied evidence.\n"
+            "Interpret market_regime_context as the authoritative market/sector posture guardrail: risk_off should default to wait/reject unless exceptional relative/sector leadership is evident; caution should require stronger evidence and reduced-size language; weak sector context should block fresh exposure unless leadership or confirmation is explicit.\n"
             "Empty recent news means no captured recent news and is neutral unless separate risk evidence exists.\n"
             "Do not forecast price reaction from news alone; use external news only as source-backed material/noise context, and do not treat headline-only, paywalled, or fetch-failed items as full-text summaries.\n"
             "Missing detailed quarterly/cash-flow context should usually reduce confidence only, not make the symbol untradeable on its own.\n"

@@ -274,6 +274,29 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             'flow_short_sector_context': {'status': 'available'},
         }
 
+    def _market_regime_context(self, *, posture: str = 'caution') -> dict:
+        return {
+            'schema_version': 'market_regime_context_v1',
+            'market_date': self.market_date.isoformat(),
+            'market': 'KOSPI',
+            'posture': posture,
+            'reason_code': 'weak_market_breadth' if posture == 'caution' else 'market_regime_normal',
+            'reason_summary': 'Market breadth is weak.',
+            'source_status': {
+                'overall': 'available',
+                'market_breadth': 'available',
+                'sector_context': 'available',
+                'relative_strength_context': 'available',
+            },
+            'freshness': {'overall_status': 'fresh'},
+            'market_breadth': {'up_ratio': 0.42, 'down_ratio': 0.52},
+            'sector_context': {'sector_name': 'Semiconductors', 'weak_sector': False},
+            'relative_strength_context': {'return_percentile': 0.72, 'volume_percentile': 0.68},
+            'recommended_exec_action': 'downsize' if posture == 'caution' else 'allow',
+            'recommended_sizing_multiplier': 0.5 if posture == 'caution' else 1.0,
+            'missing_fields': [],
+        }
+
     def _seed_snapshot(
         self,
         *,
@@ -324,6 +347,7 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
                     'symbol_day_context': {
                         'decider_data_quality_context': self._quality_context(),
                         'pre_decider_enrichment_context': self._pre_decider_context(),
+                        'market_regime_context': self._market_regime_context(),
                     },
                 },
                 response_payload={'next_day_open_action': next_day_open_action},
@@ -358,6 +382,7 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
                 if pre_decider_enrichment_context is None
                 else pre_decider_enrichment_context
             ),
+            'market_regime_context': self._market_regime_context(),
         }
         if include_decider_data_quality_context:
             request_payload['decider_data_quality_context'] = (
@@ -386,9 +411,9 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
                 confidence_score_10=confidence_score_10,
                 conviction_score_10=6.4,
                 thesis_summary=f'{symbol} short-term summary',
-                supporting_evidence_payload=['Momentum stayed constructive.'],
+                supporting_evidence_payload=['Support held with relative strength.'],
                 decision_risks_payload=['Opening range may stay volatile.'],
-                invalidation_conditions_payload=['Trigger reclaim failed.'],
+                invalidation_conditions_payload=['Stop below floor.'],
                 data_quality_warnings_payload=data_warnings or [],
                 specialist_disagreement_payload=[],
                 traceability_payload={
@@ -418,9 +443,9 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
                     'expected_holding_period': '1-2 trading days',
                     'confidence_score_10': confidence_score_10,
                     'conviction_score_10': 6.4,
-                    'supporting_evidence': ['Momentum stayed constructive.'],
+                    'supporting_evidence': ['Support held with relative strength.'],
                     'tactical_risks': ['Opening range may stay volatile.'],
-                    'invalidation_conditions': ['Trigger reclaim failed.'],
+                    'invalidation_conditions': ['Stop below floor.'],
                     'data_quality_warnings': data_warnings or [],
                 },
                 response_summary_payload={'model': 'openclaw/short-term-decider'},
@@ -914,6 +939,10 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(item['validation']['pre_decider_enrichment_context'], pre_decider_context)
         self.assertEqual(item['validation']['short_term']['pre_decider_enrichment_context'], pre_decider_context)
         self.assertEqual(item['traceability']['pre_decider_enrichment_context'], pre_decider_context)
+        self.assertEqual(item['validation']['market_regime_context']['schema_version'], 'market_regime_context_v1')
+        self.assertEqual(item['validation']['market_regime_context']['posture'], 'caution')
+        self.assertEqual(item['validation']['short_term']['market_regime_context']['recommended_exec_action'], 'downsize')
+        self.assertEqual(item['traceability']['market_regime_context']['schema_version'], 'market_regime_context_v1')
         quality_context = item['validation']['decision_input_quality_context']
         self.assertEqual(quality_context['schema_version'], 'decision_input_quality_v1')
         self.assertEqual(quality_context['execution_feasibility']['liquidity_tier'], 'medium')
