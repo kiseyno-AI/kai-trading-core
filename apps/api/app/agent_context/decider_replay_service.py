@@ -455,7 +455,7 @@ def _actual_short_term_outcome_to_wait_conflict_trade(
     point_in_time = _build_point_in_time_context(snapshot)
     point_in_time.update(
         {
-            'market_date': outcome.target_trade_date.isoformat(),
+            'market_date': plan_row.source_market_date.isoformat(),
             'source_market_date': plan_row.source_market_date.isoformat(),
             'target_trade_date': outcome.target_trade_date.isoformat(),
             'entry_plan_item_id': plan_row.id,
@@ -474,7 +474,7 @@ def _actual_short_term_outcome_to_wait_conflict_trade(
         snapshot_id=int(snapshot.id),
         agent_name=snapshot.agent_name,
         symbol=snapshot.symbol,
-        market_date=outcome.target_trade_date,
+        market_date=plan_row.source_market_date,
         policy_version=snapshot.policy_version,
         baseline_gross_pnl_krw=gross_pnl or Decimal('0'),
         baseline_return_pct=realized_return,
@@ -702,10 +702,11 @@ class DeciderReplayRepository:
                 .where(
                     SignalDeciderExecutionPlanItem.execution_window == 'next_open',
                     SignalDeciderExecutionPlanItem.decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME,
-                    SignalDeciderActualExecutionOutcome.target_trade_date >= market_date_from,
-                    SignalDeciderActualExecutionOutcome.target_trade_date <= market_date_to,
+                    SignalDeciderExecutionPlanItem.source_market_date >= market_date_from,
+                    SignalDeciderExecutionPlanItem.source_market_date <= market_date_to,
                 )
                 .order_by(
+                    SignalDeciderExecutionPlanItem.source_market_date.asc(),
                     SignalDeciderActualExecutionOutcome.target_trade_date.asc(),
                     SignalDeciderActualExecutionOutcome.symbol.asc(),
                     SignalDeciderActualExecutionOutcome.id.asc(),
@@ -1012,7 +1013,7 @@ def _example_from_trade(
     reasons: Sequence[str],
     cost_assumptions: DeciderReplayCostAssumptions,
 ) -> dict[str, Any]:
-    return {
+    example = {
         'snapshot_id': trade.snapshot_id,
         'replay_trade_id': trade.replay_trade_id,
         'symbol': trade.symbol,
@@ -1026,6 +1027,13 @@ def _example_from_trade(
         'baseline_return_pct': _to_ratio_number(trade.baseline_return_pct),
         'outcome_source': trade.outcome_source,
     }
+    source_market_date = _normalize_text(trade.point_in_time.get('source_market_date'))
+    target_trade_date = _normalize_text(trade.point_in_time.get('target_trade_date'))
+    if source_market_date is not None:
+        example['source_market_date'] = source_market_date
+    if target_trade_date is not None:
+        example['target_trade_date'] = target_trade_date
+    return example
 
 
 def _sort_examples(examples: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1110,7 +1118,8 @@ def _build_wait_conflict_markdown_summary(
     lines = [
         '# Short-term WAIT-conflict gate replay',
         '',
-        f'- Execution window: {request["market_date_from"]}..{request["market_date_to"]}',
+        f'- Source decision window: {request["market_date_from"]}..{request["market_date_to"]}',
+        f'- Date window basis: {request["date_window_basis"]}',
         '- Baseline source: actual short-term execution outcomes only',
         f'- Baseline trades: {summary["baseline_trade_count"]}',
         f'- Candidate trades: {summary["candidate_trade_count"]}',
@@ -1127,12 +1136,13 @@ def _build_wait_conflict_markdown_summary(
     if not examples:
         lines.append('No blocked WAIT-conflict examples.')
         return '\n'.join(lines)
-    lines.append('| execution date | symbol | reason | gross pnl KRW | return |')
-    lines.append('| --- | --- | --- | ---: | ---: |')
+    lines.append('| source date | execution date | symbol | reason | gross pnl KRW | return |')
+    lines.append('| --- | --- | --- | --- | ---: | ---: |')
     for example in examples:
         lines.append(
-            '| {date} | {symbol} | {reason} | {pnl} | {ret} |'.format(
-                date=example.get('market_date'),
+            '| {source_date} | {execution_date} | {symbol} | {reason} | {pnl} | {ret} |'.format(
+                source_date=example.get('source_market_date') or example.get('market_date'),
+                execution_date=example.get('target_trade_date') or '',
                 symbol=example.get('symbol'),
                 reason=str(example.get('reason') or '').replace('|', '/'),
                 pnl=example.get('baseline_gross_pnl_krw'),
@@ -1321,6 +1331,7 @@ class DeciderReplayService:
             'symbols': normalized_symbols,
             'candidate_gate_mode': gate_mode,
             'baseline_source': 'actual_short_term_execution_outcomes',
+            'date_window_basis': 'source_market_date',
             'cost_assumptions': {
                 'fee_bps': _to_json_number(resolved_costs.fee_bps, places='0.000001'),
                 'slippage_bps': _to_json_number(resolved_costs.slippage_bps, places='0.000001'),

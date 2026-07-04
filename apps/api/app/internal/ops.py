@@ -1246,12 +1246,22 @@ def _build_parser() -> argparse.ArgumentParser:
             '  python3.11 -m app.internal.ops agent-short-term-wait-conflict-replay \\\n'
             '    --market-date-from 2026-06-29 --market-date-to 2026-07-03 \\\n'
             '    --output-format markdown\n\n'
+            'The market-date window is the short-term decision/source market date, not the next-open '
+            'target execution date. '
             'This report uses actual short-term execution outcome rows only. It does not fall back to synthetic '
             'calendar/evaluation outcomes.'
         ),
     )
-    wait_conflict_replay_parser.add_argument('--market-date-from', default='2026-06-29')
-    wait_conflict_replay_parser.add_argument('--market-date-to', default='2026-07-03')
+    wait_conflict_replay_parser.add_argument(
+        '--market-date-from',
+        default='2026-06-29',
+        help='Inclusive source decision market date lower bound',
+    )
+    wait_conflict_replay_parser.add_argument(
+        '--market-date-to',
+        default='2026-07-03',
+        help='Inclusive source decision market date upper bound',
+    )
     wait_conflict_replay_parser.add_argument('--symbols', help='Optional comma-separated symbol list')
     wait_conflict_replay_parser.add_argument('--fee-bps', default='0', help='Per-side fee in basis points')
     wait_conflict_replay_parser.add_argument('--slippage-bps', default='0', help='Per-side slippage in basis points')

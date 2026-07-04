@@ -1,12 +1,37 @@
+from contextlib import contextmanager
 from datetime import date, datetime, timezone
 from decimal import Decimal
 import unittest
+from unittest.mock import patch
 
-from app.agent_context.decider_replay_service import DeciderReplayService, DeciderReplayTrade
+from sqlalchemy import create_engine, event
+from sqlalchemy.orm import sessionmaker
+
+from app.agent_context.decider_replay_service import (
+    DeciderReplayCostAssumptions,
+    DeciderReplayRepository,
+    DeciderReplayService,
+    DeciderReplayTrade,
+)
 from app.agent_context.roles import SHORT_TERM_DECIDER_AGENT_NAME
+from app.db_models import (
+    AgentContextFeedback,
+    Base,
+    BrokerOrder,
+    OrderRequest,
+    SignalDeciderActualExecutionOutcome,
+    SignalDeciderDecisionSnapshot,
+    SignalDeciderExecutionPlanItem,
+)
 
 
 DEFAULT_NOTIONAL = Decimal('1000000')
+
+
+def _enable_sqlite_foreign_keys(dbapi_connection, _connection_record) -> None:
+    cursor = dbapi_connection.cursor()
+    cursor.execute('PRAGMA foreign_keys=ON')
+    cursor.close()
 
 
 class FakeDeciderReplayRepository:
@@ -304,6 +329,173 @@ class DeciderReplayServiceTests(unittest.TestCase):
         self.assertEqual(result['summary']['baseline_trade_count'], 0)
         self.assertEqual(result['summary']['empty_data_reason'], 'no_actual_short_term_execution_outcomes_in_range')
         self.assertIn('actual short-term execution outcomes only', result['markdown_summary'])
+
+
+class DeciderReplayRepositoryTests(unittest.TestCase):
+    def test_wait_conflict_gate_filters_source_market_date_not_target_trade_date(self) -> None:
+        engine = create_engine('sqlite+pysqlite:///:memory:')
+        event.listen(engine, 'connect', _enable_sqlite_foreign_keys)
+        tables = [
+            AgentContextFeedback.__table__,
+            OrderRequest.__table__,
+            BrokerOrder.__table__,
+            SignalDeciderDecisionSnapshot.__table__,
+            SignalDeciderExecutionPlanItem.__table__,
+            SignalDeciderActualExecutionOutcome.__table__,
+        ]
+        Base.metadata.create_all(engine, tables=tables)
+        TestSessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+
+        @contextmanager
+        def test_session_scope():
+            session = TestSessionLocal()
+            try:
+                yield session
+                session.commit()
+            except Exception:
+                session.rollback()
+                raise
+            finally:
+                session.close()
+
+        def seed_outcome(
+            *,
+            session,
+            symbol: str,
+            source_market_date: date,
+            target_trade_date: date,
+            realized_pnl_krw: Decimal,
+        ) -> None:
+            snapshot = SignalDeciderDecisionSnapshot(
+                feedback_id=None,
+                market_date=source_market_date,
+                symbol=symbol,
+                agent_name=SHORT_TERM_DECIDER_AGENT_NAME,
+                agent_version='test-agent',
+                decision_run_id=f'run-{symbol}-{source_market_date.isoformat()}',
+                feedback_received_at=datetime.combine(
+                    source_market_date,
+                    datetime.min.time(),
+                    tzinfo=timezone.utc,
+                ),
+                policy_version='short_term_decider_policy_test',
+                decision_action='buy',
+                preferred_action='buy',
+                next_day_open_action='buy',
+                entry_price_basis='next_open',
+                target_price=11000,
+                expected_return_pct=0.05,
+                stop_loss_price=9500,
+                suggested_holding_period='1-3 trading days',
+                confidence_score_10=7,
+                conviction_score_10=6,
+                thesis_summary='Repository replay regression snapshot.',
+                supporting_evidence_payload=[],
+                decision_risks_payload=[],
+                invalidation_conditions_payload=[],
+                data_quality_warnings_payload=[],
+                specialist_disagreement_payload=[],
+                traceability_payload={},
+                input_feature_snapshot_payload={},
+                request_payload={'symbol_day_context': {'symbol': symbol}},
+                response_payload={'tactical_action': 'watch_for_trigger'},
+                response_summary_payload={},
+            )
+            session.add(snapshot)
+            session.flush()
+            plan_row = SignalDeciderExecutionPlanItem(
+                execution_window='next_open',
+                decision_agent_name=SHORT_TERM_DECIDER_AGENT_NAME,
+                decision_snapshot_id=snapshot.id,
+                broker_name='kis',
+                target_trade_date=target_trade_date,
+                source_market_date=source_market_date,
+                account_reference='KIS:WAIT-CONFLICT-01',
+                account_label='Regression',
+                symbol=symbol,
+                policy_version='short_term_decider_policy_test',
+                planned_side='buy',
+                planned_order_type='market',
+                planned_time_in_force='day',
+                allocation_budget_krw=Decimal('100000'),
+                estimated_reference_price=10000,
+                planned_quantity=Decimal('10'),
+                estimated_notional_krw=Decimal('100000'),
+                eligibility_status='eligible',
+                execution_status='filled',
+                validation_payload={'short_term': {'tactical_action': 'watch_for_trigger'}},
+                traceability_payload={'tactical_action': 'watch_for_trigger'},
+            )
+            session.add(plan_row)
+            session.flush()
+            session.add(
+                SignalDeciderActualExecutionOutcome(
+                    decision_snapshot_id=snapshot.id,
+                    entry_plan_item_id=plan_row.id,
+                    broker_name='kis',
+                    market_date=target_trade_date,
+                    source_market_date=source_market_date,
+                    target_trade_date=target_trade_date,
+                    account_reference='KIS:WAIT-CONFLICT-01',
+                    symbol=symbol,
+                    policy_version='short_term_decider_policy_test',
+                    lifecycle_status='closed',
+                    exit_reason='time_exit',
+                    entry_filled_quantity=Decimal('10'),
+                    exit_filled_quantity=Decimal('10'),
+                    closed_quantity=Decimal('10'),
+                    open_quantity=Decimal('0'),
+                    entry_average_fill_price=Decimal('10000'),
+                    exit_average_fill_price=Decimal('10100'),
+                    entry_notional_krw=Decimal('100000'),
+                    exit_notional_krw=Decimal('101000'),
+                    realized_pnl_krw=realized_pnl_krw,
+                    realized_return_pct=Decimal('0.01'),
+                    diagnostics_payload={},
+                )
+            )
+
+        try:
+            with TestSessionLocal() as session:
+                seed_outcome(
+                    session=session,
+                    symbol='111111',
+                    source_market_date=date(2026, 7, 3),
+                    target_trade_date=date(2026, 7, 6),
+                    realized_pnl_krw=Decimal('1000'),
+                )
+                seed_outcome(
+                    session=session,
+                    symbol='222222',
+                    source_market_date=date(2026, 6, 26),
+                    target_trade_date=date(2026, 6, 29),
+                    realized_pnl_krw=Decimal('-2000'),
+                )
+                seed_outcome(
+                    session=session,
+                    symbol='333333',
+                    source_market_date=date(2026, 7, 6),
+                    target_trade_date=date(2026, 7, 7),
+                    realized_pnl_krw=Decimal('3000'),
+                )
+                session.commit()
+
+            with patch('app.agent_context.decider_replay_service.session_scope', test_session_scope):
+                trades = DeciderReplayRepository().list_wait_conflict_gate_trades(
+                    market_date_from=date(2026, 6, 29),
+                    market_date_to=date(2026, 7, 3),
+                    symbols=None,
+                    cost_assumptions=DeciderReplayCostAssumptions(),
+                    gate_mode='hard_block',
+                )
+
+            self.assertEqual([trade.symbol for trade in trades], ['111111'])
+            self.assertEqual(trades[0].market_date, date(2026, 7, 3))
+            self.assertEqual(trades[0].point_in_time['market_date'], '2026-07-03')
+            self.assertEqual(trades[0].point_in_time['source_market_date'], '2026-07-03')
+            self.assertEqual(trades[0].point_in_time['target_trade_date'], '2026-07-06')
+        finally:
+            Base.metadata.drop_all(engine, tables=list(reversed(tables)))
 
 
 if __name__ == '__main__':
