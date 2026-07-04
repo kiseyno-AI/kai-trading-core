@@ -330,6 +330,105 @@ class SignalDeciderExecutionOutcomeServiceTests(unittest.TestCase):
             }
             row.submitted_at = datetime(2026, 4, 30, 0, 1, tzinfo=timezone.utc)
 
+    def _attach_partial_exec_full_order_readback_submission(self, *, entry_plan_item_id: int) -> None:
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, entry_plan_item_id)
+            self.assertIsNotNone(row)
+            row.submission_payload = {
+                'mode': 'exec_dispatch',
+                'exec_dispatch': {
+                    'plan_id': f'exec-plan-{entry_plan_item_id}',
+                    'dispatch_status': 'accepted',
+                    'item_links': [
+                        {
+                            'core_item_key': f'core-plan-{entry_plan_item_id}:next_open_buy',
+                            'intent': 'next_open_buy',
+                            'side': 'buy',
+                            'symbol': self.symbol,
+                            'exec_plan_item_id': 'exec-entry-item-1',
+                            'remote_status': 'filled',
+                        },
+                        {
+                            'core_item_key': f'core-plan-{entry_plan_item_id}:target_sell',
+                            'intent': 'target_sell',
+                            'side': 'sell',
+                            'symbol': self.symbol,
+                            'exec_plan_item_id': 'exec-target-item-1',
+                            'remote_status': 'filled',
+                        },
+                    ],
+                    'readback': {
+                        'last_synced_at': '2026-04-30T03:06:00+00:00',
+                        'runtime': {'status': 'ok', 'payload': {'mode': 'mock', 'ready': True}},
+                        'orders': {
+                            'status': 'ok',
+                            'count': 2,
+                            'items': [
+                                {
+                                    'id': 'exec-buy-order-1',
+                                    'execution_plan_item_id': 'exec-entry-item-1',
+                                    'broker_order_id': 'exec-buy-order-1',
+                                    'client_order_id': 'EXEC-BUY-1',
+                                    'symbol': self.symbol,
+                                    'side': 'buy',
+                                    'status': 'filled',
+                                    'filled_quantity': '5',
+                                    'average_fill_price': '50000',
+                                    'submitted_at': '2026-04-30T00:01:00+00:00',
+                                    'last_filled_at': '2026-04-30T00:01:30+00:00',
+                                    'updated_at': '2026-04-30T00:01:30+00:00',
+                                },
+                                {
+                                    'id': 'exec-sell-order-1',
+                                    'execution_plan_item_id': 'exec-target-item-1',
+                                    'broker_order_id': 'exec-sell-order-1',
+                                    'client_order_id': 'EXEC-SELL-1',
+                                    'symbol': self.symbol,
+                                    'side': 'sell',
+                                    'status': 'filled',
+                                    'filled_quantity': '5',
+                                    'average_fill_price': '54000',
+                                    'submitted_at': '2026-04-30T03:00:00+00:00',
+                                    'last_filled_at': '2026-04-30T03:05:00+00:00',
+                                    'updated_at': '2026-04-30T03:05:00+00:00',
+                                },
+                            ],
+                        },
+                        'executions': {
+                            'status': 'ok',
+                            'count': 6,
+                            'items_omitted_count': 4,
+                            'items': [
+                                {
+                                    'id': 'exec-buy-compact-1',
+                                    'execution_plan_item_id': 'exec-entry-item-1',
+                                    'broker_order_id': 'exec-buy-order-1',
+                                    'client_order_id': 'EXEC-BUY-1',
+                                    'symbol': self.symbol,
+                                    'side': 'buy',
+                                    'quantity': '2',
+                                    'price': '50000',
+                                    'executed_at': '2026-04-30T00:01:10+00:00',
+                                },
+                                {
+                                    'id': 'exec-sell-compact-1',
+                                    'execution_plan_item_id': 'exec-target-item-1',
+                                    'broker_order_id': 'exec-sell-order-1',
+                                    'client_order_id': 'EXEC-SELL-1',
+                                    'symbol': self.symbol,
+                                    'side': 'sell',
+                                    'quantity': '2',
+                                    'price': '54000',
+                                    'executed_at': '2026-04-30T03:04:00+00:00',
+                                },
+                            ],
+                        },
+                        'positions': {'status': 'ok', 'count': 0, 'items': []},
+                    },
+                },
+            }
+            row.submitted_at = datetime(2026, 4, 30, 0, 1, tzinfo=timezone.utc)
+
     def test_list_outcomes_refresh_persists_closed_target_hit_trade(self) -> None:
         snapshot_id = self._seed_snapshot()
         entry_client_order_id = 'SDNO-20260430-005930'
@@ -469,6 +568,58 @@ class SignalDeciderExecutionOutcomeServiceTests(unittest.TestCase):
             ).scalar_one()
             self.assertEqual(row.exit_reason, 'target_hit')
             self.assertEqual(row.realized_pnl_krw, Decimal('20000.00'))
+
+    def test_list_outcomes_reconciles_capped_execution_readback_with_order_totals(self) -> None:
+        snapshot_id = self._seed_snapshot()
+        entry_plan_item_id = self._seed_plan_item(
+            execution_window='next_open',
+            snapshot_id=snapshot_id,
+            planned_side='buy',
+            client_order_id='SDNO-20260430-005930-PARTIAL-READBACK',
+            order_request_id=None,
+            broker_order_row_id=None,
+            execution_status='submitted',
+            traceability_payload={'target_price': 54000, 'stop_loss_price': 47000},
+        )
+        self._attach_partial_exec_full_order_readback_submission(entry_plan_item_id=entry_plan_item_id)
+
+        payload = signal_decider_execution_outcome_service.list_outcomes(
+            snapshot_id=snapshot_id,
+            refresh=True,
+        )
+
+        self.assertEqual(payload['summary']['count'], 1)
+        self.assertEqual(payload['summary']['closed_count'], 1)
+        self.assertEqual(payload['summary']['total_realized_pnl_krw'], '20000.00')
+        item = payload['items'][0]
+        self.assertEqual(item['entry_plan_item_id'], entry_plan_item_id)
+        self.assertEqual(item['lifecycle_status'], 'closed')
+        self.assertEqual(item['exit_reason'], 'target_hit')
+        self.assertEqual(item['entry_filled_quantity'], '5.00000000')
+        self.assertEqual(item['exit_filled_quantity'], '5.00000000')
+        self.assertEqual(item['closed_quantity'], '5.00000000')
+        self.assertEqual(item['open_quantity'], '0.00000000')
+        self.assertEqual(item['entry_average_fill_price'], 50000)
+        self.assertEqual(item['exit_average_fill_price'], 54000)
+        self.assertEqual(item['realized_pnl_krw'], '20000.00')
+        self.assertEqual(item['diagnostics']['entry']['exec_readback']['source'], 'orders')
+        self.assertEqual(item['diagnostics']['exit']['exec_readback']['source'], 'orders')
+        self.assertEqual(
+            item['diagnostics']['entry']['exec_readback']['remote_execution_ids'],
+            ['exec-buy-compact-1'],
+        )
+        self.assertEqual(
+            item['diagnostics']['exit']['exec_readback']['remote_execution_ids'],
+            ['exec-sell-compact-1'],
+        )
+        self.assertEqual(
+            item['diagnostics']['entry']['exec_readback']['remote_order_ids'],
+            ['exec-buy-order-1'],
+        )
+        self.assertEqual(
+            item['diagnostics']['exit']['exec_readback']['remote_order_ids'],
+            ['exec-sell-order-1'],
+        )
 
     def test_agent_context_route_returns_persisted_outcomes_with_filters(self) -> None:
         snapshot_id = self._seed_snapshot()

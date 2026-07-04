@@ -1077,9 +1077,30 @@ class SignalDeciderExecutionOutcomeService:
                 )
             )
         ]
-        selected_facts = execution_facts if execution_facts else order_facts
-        filled_quantity_total = Decimal('0')
-        weighted_price_notional = Decimal('0')
+        execution_quantity_total, execution_weighted_price_notional = self._readback_fact_totals(
+            facts=execution_facts,
+        )
+        order_quantity_total, order_weighted_price_notional = self._readback_fact_totals(
+            facts=order_facts,
+        )
+        if execution_facts and execution_quantity_total >= order_quantity_total:
+            selected_facts = execution_facts
+            metadata_facts = execution_facts
+            filled_quantity_total = execution_quantity_total
+            weighted_price_notional = execution_weighted_price_notional
+            readback_source = 'executions'
+        elif order_facts:
+            selected_facts = order_facts
+            metadata_facts = [*execution_facts, *order_facts] if execution_facts else order_facts
+            filled_quantity_total = order_quantity_total
+            weighted_price_notional = order_weighted_price_notional
+            readback_source = 'orders'
+        else:
+            selected_facts = []
+            metadata_facts = []
+            filled_quantity_total = Decimal('0')
+            weighted_price_notional = Decimal('0')
+            readback_source = None
         submitted_at: datetime | None = None
         first_fill_at: datetime | None = None
         last_fill_at: datetime | None = None
@@ -1093,13 +1114,7 @@ class SignalDeciderExecutionOutcomeService:
         remote_order_ids: list[str] = []
         remote_exec_plan_item_ids: list[str] = []
 
-        for fact in selected_facts:
-            quantity = _safe_decimal(fact.get('quantity')) or Decimal('0')
-            price = _safe_decimal(fact.get('price'))
-            if quantity > Decimal('0'):
-                filled_quantity_total += quantity
-                if price is not None:
-                    weighted_price_notional += quantity * price
+        for fact in metadata_facts:
             submitted_at = _min_datetime(submitted_at, fact.get('submitted_at'))
             first_fill_at = _min_datetime(first_fill_at, fact.get('filled_at'))
             last_fill_at = _max_datetime(last_fill_at, fact.get('filled_at'))
@@ -1125,11 +1140,21 @@ class SignalDeciderExecutionOutcomeService:
                 latest_client_order_id = _normalize_optional_text(fact.get('client_order_id'))
                 latest_broker_order_id = _normalize_optional_text(fact.get('broker_order_id'))
 
-        average_fill_price = (
-            weighted_price_notional / filled_quantity_total
-            if filled_quantity_total > Decimal('0') and weighted_price_notional > Decimal('0')
-            else None
-        )
+        average_fill_price = None
+        if filled_quantity_total > Decimal('0'):
+            if weighted_price_notional > Decimal('0'):
+                average_fill_price = weighted_price_notional / filled_quantity_total
+            else:
+                fallback_quantity_total = (
+                    execution_quantity_total if readback_source == 'orders' else order_quantity_total
+                )
+                fallback_weighted_price_notional = (
+                    execution_weighted_price_notional
+                    if readback_source == 'orders'
+                    else order_weighted_price_notional
+                )
+                if fallback_quantity_total > Decimal('0') and fallback_weighted_price_notional > Decimal('0'):
+                    average_fill_price = fallback_weighted_price_notional / fallback_quantity_total
         if latest_order_status is None and filled_quantity_total > Decimal('0'):
             latest_order_status = BrokerOrderStatus.FILLED.value
         return {
@@ -1153,7 +1178,7 @@ class SignalDeciderExecutionOutcomeService:
             'metric_source': 'exec_readback' if selected_facts else None,
             'readback': {
                 'last_synced_at': readback.get('last_synced_at') if isinstance(readback, dict) else None,
-                'source': 'executions' if execution_facts else 'orders' if order_facts else None,
+                'source': readback_source,
                 'execution_count': len(execution_facts),
                 'order_count': len(order_facts),
                 'remote_execution_ids': remote_execution_ids,
@@ -1161,6 +1186,19 @@ class SignalDeciderExecutionOutcomeService:
                 'remote_exec_plan_item_ids': remote_exec_plan_item_ids,
             },
         }
+
+    def _readback_fact_totals(self, *, facts: Sequence[dict[str, Any]]) -> tuple[Decimal, Decimal]:
+        filled_quantity_total = Decimal('0')
+        weighted_price_notional = Decimal('0')
+        for fact in facts:
+            quantity = _safe_decimal(fact.get('quantity')) or Decimal('0')
+            price = _safe_decimal(fact.get('price'))
+            if quantity <= Decimal('0'):
+                continue
+            filled_quantity_total += quantity
+            if price is not None:
+                weighted_price_notional += quantity * price
+        return filled_quantity_total, weighted_price_notional
 
     def _select_execution_metrics(
         self,
