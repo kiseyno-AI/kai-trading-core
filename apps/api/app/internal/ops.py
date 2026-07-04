@@ -500,6 +500,31 @@ def replay_decider_candidate_rules(
     )
 
 
+def replay_short_term_wait_conflict_gate(
+    *,
+    market_date_from: str = '2026-06-29',
+    market_date_to: str = '2026-07-03',
+    symbols: str | None = None,
+    fee_bps: str | float | int = 0,
+    slippage_bps: str | float | int = 0,
+    notional_krw: str | float | int = 1_000_000,
+    gate_mode: str = 'hard_block',
+    top_examples_limit: int = 10,
+) -> dict[str, Any]:
+    bootstrap_runtime()
+    parsed_symbols = [item.strip() for item in symbols.split(',') if item.strip()] if symbols else None
+    return decider_replay_service.replay_wait_conflict_gate(
+        market_date_from=market_date_from,
+        market_date_to=market_date_to,
+        symbols=parsed_symbols,
+        fee_bps=fee_bps,
+        slippage_bps=slippage_bps,
+        notional_krw=notional_krw,
+        gate_mode=gate_mode,
+        top_examples_limit=top_examples_limit,
+    )
+
+
 def collect_market_risk_snapshots(
     *,
     market_date: str,
@@ -1212,6 +1237,43 @@ def _build_parser() -> argparse.ArgumentParser:
         help='json returns machine-readable metrics including markdown_summary; markdown prints the concise summary only',
     )
 
+    wait_conflict_replay_parser = subparsers.add_parser(
+        'agent-short-term-wait-conflict-replay',
+        help='Replay actual short-term executions against the signal-decider WAIT-conflict candidate gate',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            'Example:\n'
+            '  python3.11 -m app.internal.ops agent-short-term-wait-conflict-replay \\\n'
+            '    --market-date-from 2026-06-29 --market-date-to 2026-07-03 \\\n'
+            '    --output-format markdown\n\n'
+            'This report uses actual short-term execution outcome rows only. It does not fall back to synthetic '
+            'calendar/evaluation outcomes.'
+        ),
+    )
+    wait_conflict_replay_parser.add_argument('--market-date-from', default='2026-06-29')
+    wait_conflict_replay_parser.add_argument('--market-date-to', default='2026-07-03')
+    wait_conflict_replay_parser.add_argument('--symbols', help='Optional comma-separated symbol list')
+    wait_conflict_replay_parser.add_argument('--fee-bps', default='0', help='Per-side fee in basis points')
+    wait_conflict_replay_parser.add_argument('--slippage-bps', default='0', help='Per-side slippage in basis points')
+    wait_conflict_replay_parser.add_argument(
+        '--notional-krw',
+        default='1000000',
+        help='Fallback notional if an actual outcome row lacks entry notional',
+    )
+    wait_conflict_replay_parser.add_argument(
+        '--gate-mode',
+        choices=('hard_block', 'report_only'),
+        default='hard_block',
+        help='Candidate gate mode for replay comparison only; this does not alter live runtime settings',
+    )
+    wait_conflict_replay_parser.add_argument('--top-examples-limit', type=int, default=10)
+    wait_conflict_replay_parser.add_argument(
+        '--output-format',
+        choices=('json', 'markdown'),
+        default='json',
+        help='json returns machine-readable metrics including markdown_summary; markdown prints the concise summary only',
+    )
+
     feedback_smoke_parser = subparsers.add_parser(
         'agent-feedback-symbol-cleanup-smoke',
         help='Dispatch symbol feedback, store rows, attempt immediate session deletion, then retry failed deletions once',
@@ -1483,6 +1545,17 @@ def main(argv: Iterable[str] | None = None) -> int:
             horizon_days=args.horizon_days,
             top_examples_limit=args.top_examples_limit,
         )
+    elif args.command == 'agent-short-term-wait-conflict-replay':
+        payload = replay_short_term_wait_conflict_gate(
+            market_date_from=args.market_date_from,
+            market_date_to=args.market_date_to,
+            symbols=args.symbols,
+            fee_bps=args.fee_bps,
+            slippage_bps=args.slippage_bps,
+            notional_krw=args.notional_krw,
+            gate_mode=args.gate_mode,
+            top_examples_limit=args.top_examples_limit,
+        )
     elif args.command == 'agent-feedback-symbol-cleanup-smoke':
         payload = run_agent_feedback_symbol_cleanup_smoke(
             market_date=args.market_date,
@@ -1532,7 +1605,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     else:
         parser.error(f'Unsupported command: {args.command}')
 
-    if args.command == 'agent-decider-replay' and args.output_format == 'markdown':
+    if args.command in {'agent-decider-replay', 'agent-short-term-wait-conflict-replay'} and args.output_format == 'markdown':
         print(payload['markdown_summary'])
     else:
         print(json.dumps(payload, ensure_ascii=False))

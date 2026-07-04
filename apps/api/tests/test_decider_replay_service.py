@@ -10,13 +10,23 @@ DEFAULT_NOTIONAL = Decimal('1000000')
 
 
 class FakeDeciderReplayRepository:
-    def __init__(self, trades: list[DeciderReplayTrade]) -> None:
+    def __init__(
+        self,
+        trades: list[DeciderReplayTrade],
+        wait_conflict_trades: list[DeciderReplayTrade] | None = None,
+    ) -> None:
         self.trades = list(trades)
+        self.wait_conflict_trades = list(wait_conflict_trades or [])
         self.calls: list[dict] = []
+        self.wait_conflict_calls: list[dict] = []
 
     def list_replay_trades(self, **kwargs) -> list[DeciderReplayTrade]:
         self.calls.append(kwargs)
         return list(self.trades)
+
+    def list_wait_conflict_gate_trades(self, **kwargs) -> list[DeciderReplayTrade]:
+        self.wait_conflict_calls.append(kwargs)
+        return list(self.wait_conflict_trades)
 
 
 def _trade(
@@ -27,6 +37,8 @@ def _trade(
     trigger_price_drift_pct: float | None,
     confidence_score_10: float = 7.0,
     market_date: str = '2026-06-16',
+    alignment_gate: dict | None = None,
+    outcome_source: str = 'decider_post_decision_evaluation',
 ) -> DeciderReplayTrade:
     gross = Decimal(str(gross_pnl_krw))
     return DeciderReplayTrade(
@@ -39,7 +51,7 @@ def _trade(
         baseline_gross_pnl_krw=gross,
         baseline_return_pct=float(gross / DEFAULT_NOTIONAL),
         baseline_notional_krw=DEFAULT_NOTIONAL,
-        outcome_source='decider_post_decision_evaluation',
+        outcome_source=outcome_source,
         point_in_time={
             'snapshot_id': snapshot_id,
             'agent_name': SHORT_TERM_DECIDER_AGENT_NAME,
@@ -54,8 +66,10 @@ def _trade(
                 'response_payload': {'tactical_action': 'watch_for_trigger'},
                 'request_payload': {'symbol_day_context': {'symbol': symbol}},
             },
+            'alignment_gate': alignment_gate or {},
         },
         decision_timestamp=datetime(2026, 6, 16, 6, 0, tzinfo=timezone.utc),
+        alignment_gate=alignment_gate,
     )
 
 
@@ -72,6 +86,16 @@ def _stale_watch_rule() -> dict:
                 ],
             }
         ]
+    }
+
+
+def _alignment_gate(alignment: str, action: str) -> dict:
+    return {
+        'schema_version': 'signal_decider_alignment_gate_v1',
+        'signal_decider_alignment': alignment,
+        'alignment_gate_action': action,
+        'alignment_gate_reason': f'{alignment} test reason',
+        'signal_decider_decision_snapshot_id': 900,
     }
 
 
@@ -216,6 +240,70 @@ class DeciderReplayServiceTests(unittest.TestCase):
         self.assertEqual(zero_cost['summary']['baseline']['gross_pnl_krw'], 10_000)
         self.assertEqual(zero_cost['summary']['baseline']['estimated_net_pnl_krw'], 10_000)
         self.assertEqual(with_cost['summary']['baseline']['estimated_net_pnl_krw'], 7_000)
+
+    def test_wait_conflict_gate_replay_reports_tradeoff_counts(self) -> None:
+        repository = FakeDeciderReplayRepository(
+            [],
+            wait_conflict_trades=[
+                _trade(
+                    snapshot_id=100,
+                    symbol='005960',
+                    gross_pnl_krw=-50_000,
+                    trigger_price_drift_pct=None,
+                    market_date='2026-07-01',
+                    outcome_source='actual_short_term_execution_outcome',
+                    alignment_gate=_alignment_gate('wait_conflict_block', 'block'),
+                ),
+                _trade(
+                    snapshot_id=101,
+                    symbol='013580',
+                    gross_pnl_krw=80_000,
+                    trigger_price_drift_pct=None,
+                    market_date='2026-07-02',
+                    outcome_source='actual_short_term_execution_outcome',
+                    alignment_gate=_alignment_gate('wait_conflict_override', 'allow_by_override'),
+                ),
+                _trade(
+                    snapshot_id=102,
+                    symbol='005930',
+                    gross_pnl_krw=10_000,
+                    trigger_price_drift_pct=None,
+                    market_date='2026-07-03',
+                    outcome_source='actual_short_term_execution_outcome',
+                    alignment_gate=_alignment_gate('aligned', 'allow'),
+                ),
+            ],
+        )
+        service = DeciderReplayService(repository=repository)
+
+        result = service.replay_wait_conflict_gate(
+            market_date_from='2026-06-29',
+            market_date_to='2026-07-03',
+        )
+
+        self.assertEqual(result['schema_version'], 'short_term_wait_conflict_gate_replay_v1')
+        self.assertEqual(result['summary']['baseline_trade_count'], 3)
+        self.assertEqual(result['summary']['candidate_trade_count'], 2)
+        self.assertEqual(result['summary']['blocked_candidate_count'], 1)
+        self.assertEqual(result['summary']['allowed_by_override_count'], 1)
+        self.assertEqual(result['summary']['skipped_losses'], 1)
+        self.assertEqual(result['summary']['skipped_winners'], 0)
+        self.assertEqual(result['summary']['gross_pnl_delta_krw'], 50_000)
+        self.assertEqual(result['summary']['estimated_net_pnl_delta_krw'], 50_000)
+        self.assertEqual(result['examples'][0]['symbol'], '005960')
+        self.assertEqual(repository.wait_conflict_calls[0]['gate_mode'], 'hard_block')
+
+    def test_wait_conflict_gate_replay_returns_empty_data_reason(self) -> None:
+        service = DeciderReplayService(repository=FakeDeciderReplayRepository([]))
+
+        result = service.replay_wait_conflict_gate(
+            market_date_from='2026-06-29',
+            market_date_to='2026-07-03',
+        )
+
+        self.assertEqual(result['summary']['baseline_trade_count'], 0)
+        self.assertEqual(result['summary']['empty_data_reason'], 'no_actual_short_term_execution_outcomes_in_range')
+        self.assertIn('actual short-term execution outcomes only', result['markdown_summary'])
 
 
 if __name__ == '__main__':

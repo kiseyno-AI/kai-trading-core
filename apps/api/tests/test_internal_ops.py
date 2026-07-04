@@ -253,6 +253,36 @@ class InternalOpsTests(unittest.TestCase):
         self.assertEqual(replay.call_args.kwargs['slippage_bps'], '2')
         self.assertEqual(replay.call_args.kwargs['top_examples_limit'], 3)
 
+    def test_replay_short_term_wait_conflict_gate_uses_direct_service_call(self) -> None:
+        payload = {
+            'schema_version': 'short_term_wait_conflict_gate_replay_v1',
+            'summary': {'baseline_trade_count': 2},
+        }
+        with (
+            patch('app.internal.ops.bootstrap_runtime') as bootstrap_runtime,
+            patch('app.internal.ops.decider_replay_service.replay_wait_conflict_gate', return_value=payload) as replay,
+        ):
+            result = ops.replay_short_term_wait_conflict_gate(
+                market_date_from='2026-06-29',
+                market_date_to='2026-07-03',
+                symbols='005960,013580',
+                fee_bps='1',
+                slippage_bps='2',
+                notional_krw='1000000',
+                gate_mode='hard_block',
+                top_examples_limit=4,
+            )
+
+        bootstrap_runtime.assert_called_once_with()
+        self.assertEqual(result, payload)
+        self.assertEqual(replay.call_args.kwargs['market_date_from'], '2026-06-29')
+        self.assertEqual(replay.call_args.kwargs['market_date_to'], '2026-07-03')
+        self.assertEqual(replay.call_args.kwargs['symbols'], ['005960', '013580'])
+        self.assertEqual(replay.call_args.kwargs['fee_bps'], '1')
+        self.assertEqual(replay.call_args.kwargs['slippage_bps'], '2')
+        self.assertEqual(replay.call_args.kwargs['gate_mode'], 'hard_block')
+        self.assertEqual(replay.call_args.kwargs['top_examples_limit'], 4)
+
     def test_compute_trending_ranks_uses_direct_store_call(self) -> None:
         with (
             patch('app.internal.ops.bootstrap_runtime') as bootstrap_runtime,

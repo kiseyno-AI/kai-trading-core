@@ -11,6 +11,8 @@ Exec handoffs now include `risk_context.decision_input_quality_context`, `risk_c
 
 Buy-oriented exec handoffs also include `risk_context.market_regime_context` and the same payload under `risk_context.decider_handoff_context.decider_input_context.market_regime_context`. Core derives it from PyKRX market breadth, sector/category peer context, and market-relative strength with deterministic `normal`, `caution`, `risk_off`, `unavailable`, and `stale` posture semantics. This is the core-owned context contract for kiseyno-AI/kai-trading-exec#140, allowing exec-side buy approval to apply market/sector guardrails without querying core.
 
+Short-term exec handoffs also carry signal-decider alignment audit metadata in `risk_context`: `signal_decider_alignment`, `alignment_gate_action`, `alignment_gate_reason`, `alignment_signal_decider_decision_snapshot_id`, and `alignment_gate`. The default live mode is report-only, so a same-symbol `WAIT` conflict can be visible as `alignment_gate_action="report_only_block_candidate"` without being represented as an actual skipped execution.
+
 Core blocks classic signal-decider next-open exec dispatch when source-market-date PyKRX enrichment coverage is missing for `sector_classification`, `investor_flow_symbol`, or `short_selling`. Blocked dispatch responses expose `summary.reason="pykrx_enrichment_preflight_blocked"` and the full `enrichment_preflight` payload on `POST /trading/orders/next-open-execution/run-if-due`; actionable short-term watch candidates remain visible as conditional/degraded rows rather than being erased by the global preflight.
 
 ## Example request
@@ -135,6 +137,10 @@ GET /trading/orders/exec/signal-decider?target_trade_date=2026-04-30&symbol=0059
       "approval_state": "approved",
       "target_price": 54000,
       "stop_loss_price": 49000,
+      "signal_decider_alignment": "wait_conflict_block",
+      "alignment_gate_action": "report_only_block_candidate",
+      "alignment_gate_reason": "Signal-decider is WAIT for the same symbol/date context and the short-term setup did not pass the stronger override threshold.",
+      "alignment_signal_decider_decision_snapshot_id": 144,
       "trigger_price": 50500,
       "chase_limit_price": 51500,
       "decision_run_id": "short-run-145",
