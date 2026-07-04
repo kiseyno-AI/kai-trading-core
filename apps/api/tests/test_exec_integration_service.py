@@ -1331,7 +1331,33 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 'risk_flags': ['Opening gap risk.'],
             },
         )
-        self._seed_short_term_plan_item(snapshot_id=short_snapshot_id)
+        short_plan_item_id = self._seed_short_term_plan_item(snapshot_id=short_snapshot_id)
+        alignment_gate = {
+            'schema_version': 'signal_decider_alignment_gate_v1',
+            'signal_decider_alignment': 'wait_conflict_block',
+            'alignment_gate_action': 'report_only_block_candidate',
+            'alignment_gate_reason': 'Signal-decider is WAIT for the same symbol/date context.',
+            'signal_decider_decision_snapshot_id': 991,
+            'decision_snapshot_id': 991,
+        }
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, short_plan_item_id)
+            row.validation_payload = {
+                **(row.validation_payload or {}),
+                'alignment_gate': alignment_gate,
+                'signal_decider_alignment': 'wait_conflict_block',
+                'alignment_gate_action': 'report_only_block_candidate',
+                'alignment_gate_reason': alignment_gate['alignment_gate_reason'],
+                'alignment_signal_decider_decision_snapshot_id': 991,
+            }
+            row.traceability_payload = {
+                **(row.traceability_payload or {}),
+                'alignment_gate': alignment_gate,
+                'signal_decider_alignment': 'wait_conflict_block',
+                'alignment_gate_action': 'report_only_block_candidate',
+                'alignment_gate_reason': alignment_gate['alignment_gate_reason'],
+                'alignment_signal_decider_decision_snapshot_id': 991,
+            }
 
         result = await self.service.dispatch_next_open_plan(
             target_trade_date=self.target_trade_date,
@@ -1374,6 +1400,9 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(short_entry['risk_context']['decision_agent_name'], 'short-term-decider')
         self.assertEqual(short_entry['risk_context']['handoff_intent'], 'intraday_watch_buy')
         self.assertEqual(short_entry['risk_context']['generic_action'], 'buy')
+        self.assertEqual(short_entry['risk_context']['signal_decider_alignment'], 'wait_conflict_block')
+        self.assertEqual(short_entry['risk_context']['alignment_gate_action'], 'report_only_block_candidate')
+        self.assertEqual(short_entry['risk_context']['alignment_signal_decider_decision_snapshot_id'], 991)
         self.assertEqual(short_entry['risk_context']['entry_execution_mode'], 'pending_trigger_limit')
         self.assertTrue(short_entry['risk_context']['monitoring_candidate'])
         self.assertEqual(short_entry['risk_context']['monitoring_intent'], EXEC_INTENT_INTRADAY_WATCH_BUY)
@@ -1425,8 +1454,11 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(handoff['source_market_date'], '2026-04-29')
         self.assertEqual(handoff['traceability']['decision_snapshot_id'], short_snapshot_id)
         self.assertEqual(handoff['traceability']['handoff_intent'], 'intraday_watch_buy')
+        self.assertEqual(handoff['traceability']['signal_decider_alignment'], 'wait_conflict_block')
+        self.assertEqual(handoff['traceability']['alignment_gate_action'], 'report_only_block_candidate')
         self.assertEqual(handoff['decider_output']['generic_action'], 'buy')
         self.assertEqual(handoff['decider_output']['handoff_intent'], 'intraday_watch_buy')
+        self.assertEqual(handoff['decider_output']['signal_decider_alignment'], 'wait_conflict_block')
         self.assertEqual(handoff['traceability']['core_plan_item_id'], short_entry['risk_context']['core_plan_item_id'])
         self.assertEqual(handoff['decider_input_context']['request_payload'], decider_request_payload)
         self.assertEqual(handoff['decider_input_context']['input_feature_snapshot_payload'], decider_input_features)

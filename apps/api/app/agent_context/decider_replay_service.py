@@ -14,11 +14,20 @@ from app.db_models import (
     DeciderPostDecisionEvaluation,
     SignalDeciderActualExecutionOutcome,
     SignalDeciderDecisionSnapshot,
+    SignalDeciderExecutionPlanItem,
     SignalDeciderRealizedOutcome,
+)
+from app.orders.signal_decider_alignment_gate import (
+    ALIGNMENT_GATE_ACTION_BLOCK,
+    SIGNAL_DECIDER_ALIGNMENT_WAIT_CONFLICT_BLOCK,
+    SIGNAL_DECIDER_ALIGNMENT_WAIT_CONFLICT_OVERRIDE,
+    build_signal_decider_alignment_context,
+    build_signal_decider_alignment_gate,
 )
 
 
 DECIDER_REPLAY_SCHEMA_VERSION = 'decider_replay_v1'
+WAIT_CONFLICT_GATE_REPLAY_SCHEMA_VERSION = 'short_term_wait_conflict_gate_replay_v1'
 DECIDER_REPLAY_RULE_CONFIG_SCHEMA_VERSION = 'decider_replay_rule_config_v1'
 SUPPORTED_REPLAY_AGENT_NAMES: tuple[str, ...] = (
     SIGNAL_DECIDER_AGENT_NAME,
@@ -27,6 +36,8 @@ SUPPORTED_REPLAY_AGENT_NAMES: tuple[str, ...] = (
 DEFAULT_REPLAY_HORIZON_DAYS = 5
 DEFAULT_REPLAY_NOTIONAL_KRW = Decimal('1000000')
 DEFAULT_TOP_EXAMPLES_LIMIT = 10
+DEFAULT_WAIT_CONFLICT_REPLAY_MARKET_DATE_FROM = date(2026, 6, 29)
+DEFAULT_WAIT_CONFLICT_REPLAY_MARKET_DATE_TO = date(2026, 7, 3)
 
 
 @dataclass(frozen=True)
@@ -50,6 +61,7 @@ class DeciderReplayTrade:
     outcome_source: str
     point_in_time: dict[str, Any]
     decision_timestamp: datetime | None = None
+    alignment_gate: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -404,6 +416,76 @@ def _actual_outcome_to_trade(
     )
 
 
+def _actual_short_term_outcome_to_wait_conflict_trade(
+    *,
+    snapshot: SignalDeciderDecisionSnapshot,
+    plan_row: SignalDeciderExecutionPlanItem,
+    outcome: SignalDeciderActualExecutionOutcome,
+    signal_decider_context: dict[str, Any] | None,
+    cost_assumptions: DeciderReplayCostAssumptions,
+    gate_mode: str,
+) -> DeciderReplayTrade:
+    validation = plan_row.validation_payload if isinstance(plan_row.validation_payload, dict) else {}
+    traceability = plan_row.traceability_payload if isinstance(plan_row.traceability_payload, dict) else {}
+    short_term = validation.get('short_term') if isinstance(validation.get('short_term'), dict) else {}
+    response_payload = snapshot.response_payload if isinstance(snapshot.response_payload, dict) else {}
+    tactical_action = (
+        traceability.get('tactical_action')
+        or short_term.get('tactical_action')
+        or response_payload.get('tactical_action')
+    )
+    alignment_gate = build_signal_decider_alignment_gate(
+        signal_decider_context=signal_decider_context,
+        short_term_entry_quality=validation.get('short_term_entry_quality')
+        if isinstance(validation.get('short_term_entry_quality'), dict)
+        else None,
+        tactical_action=str(tactical_action).strip().lower() if tactical_action is not None else None,
+        mode=gate_mode,
+    )
+    entry_notional = _safe_decimal(outcome.entry_notional_krw)
+    if entry_notional is None:
+        quantity = _safe_decimal(outcome.entry_filled_quantity)
+        price = _safe_decimal(outcome.entry_average_fill_price)
+        entry_notional = quantity * price if quantity is not None and price is not None else None
+    notional = entry_notional if entry_notional is not None and entry_notional > 0 else cost_assumptions.notional_krw
+    gross_pnl = _safe_decimal(outcome.realized_pnl_krw)
+    realized_return = _to_float(outcome.realized_return_pct)
+    if gross_pnl is None and realized_return is not None:
+        gross_pnl = Decimal(str(realized_return)) * notional
+    point_in_time = _build_point_in_time_context(snapshot)
+    point_in_time.update(
+        {
+            'market_date': plan_row.source_market_date.isoformat(),
+            'source_market_date': plan_row.source_market_date.isoformat(),
+            'target_trade_date': outcome.target_trade_date.isoformat(),
+            'entry_plan_item_id': plan_row.id,
+            'actual_execution_outcome_id': outcome.id,
+            'signal_decider_alignment': alignment_gate.get('signal_decider_alignment'),
+            'alignment_gate_action': alignment_gate.get('alignment_gate_action'),
+            'alignment_gate_reason': alignment_gate.get('alignment_gate_reason'),
+            'alignment_signal_decider_decision_snapshot_id': alignment_gate.get(
+                'signal_decider_decision_snapshot_id'
+            ),
+            'alignment_gate': alignment_gate,
+        }
+    )
+    return DeciderReplayTrade(
+        replay_trade_id=f'actual_short_term:{outcome.id}',
+        snapshot_id=int(snapshot.id),
+        agent_name=snapshot.agent_name,
+        symbol=snapshot.symbol,
+        market_date=plan_row.source_market_date,
+        policy_version=snapshot.policy_version,
+        baseline_gross_pnl_krw=gross_pnl or Decimal('0'),
+        baseline_return_pct=realized_return,
+        baseline_notional_krw=notional,
+        outcome_source='actual_short_term_execution_outcome',
+        point_in_time=point_in_time,
+        decision_timestamp=snapshot.feedback_received_at or snapshot.created_at,
+        alignment_gate=alignment_gate,
+    )
+
+
 def _realized_outcome_to_trade(
     *,
     snapshot: SignalDeciderDecisionSnapshot,
@@ -589,6 +671,92 @@ class DeciderReplayRepository:
                         outcome_source='decision_snapshot_no_outcome',
                         point_in_time=_build_point_in_time_context(snapshot),
                         decision_timestamp=snapshot.feedback_received_at or snapshot.created_at,
+                    )
+                )
+            return sorted(trades, key=lambda item: (item.market_date, item.symbol, item.replay_trade_id))
+
+    def list_wait_conflict_gate_trades(
+        self,
+        *,
+        market_date_from: date,
+        market_date_to: date,
+        symbols: Sequence[str] | None,
+        cost_assumptions: DeciderReplayCostAssumptions,
+        gate_mode: str,
+    ) -> list[DeciderReplayTrade]:
+        with session_scope() as session:
+            stmt = (
+                select(
+                    SignalDeciderActualExecutionOutcome,
+                    SignalDeciderExecutionPlanItem,
+                    SignalDeciderDecisionSnapshot,
+                )
+                .join(
+                    SignalDeciderExecutionPlanItem,
+                    SignalDeciderActualExecutionOutcome.entry_plan_item_id == SignalDeciderExecutionPlanItem.id,
+                )
+                .join(
+                    SignalDeciderDecisionSnapshot,
+                    SignalDeciderActualExecutionOutcome.decision_snapshot_id == SignalDeciderDecisionSnapshot.id,
+                )
+                .where(
+                    SignalDeciderExecutionPlanItem.execution_window == 'next_open',
+                    SignalDeciderExecutionPlanItem.decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME,
+                    SignalDeciderExecutionPlanItem.source_market_date >= market_date_from,
+                    SignalDeciderExecutionPlanItem.source_market_date <= market_date_to,
+                )
+                .order_by(
+                    SignalDeciderExecutionPlanItem.source_market_date.asc(),
+                    SignalDeciderActualExecutionOutcome.target_trade_date.asc(),
+                    SignalDeciderActualExecutionOutcome.symbol.asc(),
+                    SignalDeciderActualExecutionOutcome.id.asc(),
+                )
+            )
+            if symbols:
+                stmt = stmt.where(SignalDeciderActualExecutionOutcome.symbol.in_(list(symbols)))
+            rows = [
+                row
+                for row in session.execute(stmt).all()
+                if row[0].realized_pnl_krw is not None or row[0].realized_return_pct is not None
+            ]
+            if not rows:
+                return []
+
+            source_dates = sorted({row[1].source_market_date for row in rows})
+            signal_symbols = sorted({row[0].symbol for row in rows})
+            signal_stmt = (
+                select(SignalDeciderDecisionSnapshot)
+                .where(
+                    SignalDeciderDecisionSnapshot.agent_name == SIGNAL_DECIDER_AGENT_NAME,
+                    SignalDeciderDecisionSnapshot.market_date.in_(source_dates),
+                    SignalDeciderDecisionSnapshot.symbol.in_(signal_symbols),
+                )
+                .order_by(
+                    SignalDeciderDecisionSnapshot.market_date.asc(),
+                    SignalDeciderDecisionSnapshot.symbol.asc(),
+                    SignalDeciderDecisionSnapshot.feedback_received_at.desc(),
+                    SignalDeciderDecisionSnapshot.created_at.desc(),
+                    SignalDeciderDecisionSnapshot.id.desc(),
+                )
+            )
+            signal_by_context: dict[tuple[date, str], dict[str, Any]] = {}
+            for signal_row in session.execute(signal_stmt).scalars().all():
+                key = (signal_row.market_date, signal_row.symbol)
+                if key in signal_by_context:
+                    continue
+                signal_by_context[key] = build_signal_decider_alignment_context(signal_row) or {}
+
+            trades: list[DeciderReplayTrade] = []
+            for outcome, plan_row, snapshot in rows:
+                signal_context = signal_by_context.get((plan_row.source_market_date, outcome.symbol))
+                trades.append(
+                    _actual_short_term_outcome_to_wait_conflict_trade(
+                        snapshot=snapshot,
+                        plan_row=plan_row,
+                        outcome=outcome,
+                        signal_decider_context=signal_context,
+                        cost_assumptions=cost_assumptions,
+                        gate_mode=gate_mode,
                     )
                 )
             return sorted(trades, key=lambda item: (item.market_date, item.symbol, item.replay_trade_id))
@@ -845,7 +1013,7 @@ def _example_from_trade(
     reasons: Sequence[str],
     cost_assumptions: DeciderReplayCostAssumptions,
 ) -> dict[str, Any]:
-    return {
+    example = {
         'snapshot_id': trade.snapshot_id,
         'replay_trade_id': trade.replay_trade_id,
         'symbol': trade.symbol,
@@ -859,6 +1027,13 @@ def _example_from_trade(
         'baseline_return_pct': _to_ratio_number(trade.baseline_return_pct),
         'outcome_source': trade.outcome_source,
     }
+    source_market_date = _normalize_text(trade.point_in_time.get('source_market_date'))
+    target_trade_date = _normalize_text(trade.point_in_time.get('target_trade_date'))
+    if source_market_date is not None:
+        example['source_market_date'] = source_market_date
+    if target_trade_date is not None:
+        example['target_trade_date'] = target_trade_date
+    return example
 
 
 def _sort_examples(examples: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -910,6 +1085,64 @@ def _build_markdown_summary(
         lines.append(
             '| {date} | {symbol} | {reason} | {pnl} | {ret} |'.format(
                 date=example.get('market_date'),
+                symbol=example.get('symbol'),
+                reason=str(example.get('reason') or '').replace('|', '/'),
+                pnl=example.get('baseline_gross_pnl_krw'),
+                ret=example.get('baseline_return_pct'),
+            )
+        )
+    return '\n'.join(lines)
+
+
+def _trade_alignment_gate(trade: DeciderReplayTrade) -> dict[str, Any]:
+    if isinstance(trade.alignment_gate, dict):
+        return trade.alignment_gate
+    gate = _maybe_dict(trade.point_in_time.get('alignment_gate'))
+    return gate
+
+
+def _wait_conflict_reason(trade: DeciderReplayTrade) -> list[str]:
+    gate = _trade_alignment_gate(trade)
+    reason = _normalize_text(gate.get('alignment_gate_reason')) or _normalize_text(
+        trade.point_in_time.get('alignment_gate_reason')
+    )
+    return [reason] if reason else ['signal_decider_wait_conflict_gate']
+
+
+def _build_wait_conflict_markdown_summary(
+    *,
+    request: dict[str, Any],
+    summary: dict[str, Any],
+    examples: Sequence[dict[str, Any]],
+) -> str:
+    lines = [
+        '# Short-term WAIT-conflict gate replay',
+        '',
+        f'- Source decision window: {request["market_date_from"]}..{request["market_date_to"]}',
+        f'- Date window basis: {request["date_window_basis"]}',
+        '- Baseline source: actual short-term execution outcomes only',
+        f'- Baseline trades: {summary["baseline_trade_count"]}',
+        f'- Candidate trades: {summary["candidate_trade_count"]}',
+        f'- Blocked candidates: {summary["blocked_candidate_count"]}',
+        f'- Allowed by override: {summary["allowed_by_override_count"]}',
+        f'- Skipped losses: {summary["skipped_losses"]}',
+        f'- Skipped winners: {summary["skipped_winners"]}',
+        f'- Gross P/L delta KRW: {summary["gross_pnl_delta_krw"]}',
+        f'- Estimated net P/L delta KRW: {summary["estimated_net_pnl_delta_krw"]}',
+    ]
+    if summary.get('empty_data_reason'):
+        lines.append(f'- Empty-data reason: {summary["empty_data_reason"]}')
+    lines.extend(['', '## Blocked examples'])
+    if not examples:
+        lines.append('No blocked WAIT-conflict examples.')
+        return '\n'.join(lines)
+    lines.append('| source date | execution date | symbol | reason | gross pnl KRW | return |')
+    lines.append('| --- | --- | --- | --- | ---: | ---: |')
+    for example in examples:
+        lines.append(
+            '| {source_date} | {execution_date} | {symbol} | {reason} | {pnl} | {ret} |'.format(
+                source_date=example.get('source_market_date') or example.get('market_date'),
+                execution_date=example.get('target_trade_date') or '',
                 symbol=example.get('symbol'),
                 reason=str(example.get('reason') or '').replace('|', '/'),
                 pnl=example.get('baseline_gross_pnl_krw'),
@@ -1028,6 +1261,123 @@ class DeciderReplayService:
             'markdown_summary': markdown_summary,
         }
 
+    def replay_wait_conflict_gate(
+        self,
+        *,
+        market_date_from: str | date = DEFAULT_WAIT_CONFLICT_REPLAY_MARKET_DATE_FROM,
+        market_date_to: str | date = DEFAULT_WAIT_CONFLICT_REPLAY_MARKET_DATE_TO,
+        symbols: Sequence[str] | str | None = None,
+        fee_bps: Decimal | float | int | str = Decimal('0'),
+        slippage_bps: Decimal | float | int | str = Decimal('0'),
+        notional_krw: Decimal | float | int | str = DEFAULT_REPLAY_NOTIONAL_KRW,
+        gate_mode: str = 'hard_block',
+        top_examples_limit: int = DEFAULT_TOP_EXAMPLES_LIMIT,
+    ) -> dict[str, Any]:
+        normalized_from = _normalize_market_date(market_date_from)
+        normalized_to = _normalize_market_date(market_date_to)
+        if normalized_from > normalized_to:
+            raise ValueError('market_date_from must be on or before market_date_to')
+        normalized_symbols = _normalize_symbols(symbols)
+        resolved_costs = DeciderReplayCostAssumptions(
+            fee_bps=_normalize_non_negative_decimal(fee_bps, name='fee_bps'),
+            slippage_bps=_normalize_non_negative_decimal(slippage_bps, name='slippage_bps'),
+            notional_krw=_normalize_non_negative_decimal(notional_krw, name='notional_krw'),
+        )
+        if resolved_costs.notional_krw <= 0:
+            raise ValueError('notional_krw must be > 0')
+        resolved_top_examples_limit = max(0, int(top_examples_limit))
+        trades = self.repository.list_wait_conflict_gate_trades(
+            market_date_from=normalized_from,
+            market_date_to=normalized_to,
+            symbols=normalized_symbols or None,
+            cost_assumptions=resolved_costs,
+            gate_mode=gate_mode,
+        )
+
+        blocked = [
+            trade
+            for trade in trades
+            if _trade_alignment_gate(trade).get('signal_decider_alignment')
+            == SIGNAL_DECIDER_ALIGNMENT_WAIT_CONFLICT_BLOCK
+            and _trade_alignment_gate(trade).get('alignment_gate_action') == ALIGNMENT_GATE_ACTION_BLOCK
+        ]
+        allowed_by_override = [
+            trade
+            for trade in trades
+            if _trade_alignment_gate(trade).get('signal_decider_alignment')
+            == SIGNAL_DECIDER_ALIGNMENT_WAIT_CONFLICT_OVERRIDE
+        ]
+        kept = [trade for trade in trades if trade not in blocked]
+        baseline = _metric_block(trades, cost_assumptions=resolved_costs)
+        candidate = _metric_block(kept, cost_assumptions=resolved_costs)
+        gross_delta = _safe_decimal_or_zero(candidate['gross_pnl_krw']) - _safe_decimal_or_zero(baseline['gross_pnl_krw'])
+        net_delta = _safe_decimal_or_zero(candidate['estimated_net_pnl_krw']) - _safe_decimal_or_zero(
+            baseline['estimated_net_pnl_krw']
+        )
+        examples = _sort_examples(
+            [
+                _example_from_trade(
+                    trade=trade,
+                    reasons=_wait_conflict_reason(trade),
+                    cost_assumptions=resolved_costs,
+                )
+                for trade in blocked
+            ]
+        )[:resolved_top_examples_limit]
+        request = {
+            'market_date_from': normalized_from.isoformat(),
+            'market_date_to': normalized_to.isoformat(),
+            'agent_name': SHORT_TERM_DECIDER_AGENT_NAME,
+            'symbols': normalized_symbols,
+            'candidate_gate_mode': gate_mode,
+            'baseline_source': 'actual_short_term_execution_outcomes',
+            'date_window_basis': 'source_market_date',
+            'cost_assumptions': {
+                'fee_bps': _to_json_number(resolved_costs.fee_bps, places='0.000001'),
+                'slippage_bps': _to_json_number(resolved_costs.slippage_bps, places='0.000001'),
+                'notional_krw': _to_json_number(resolved_costs.notional_krw),
+            },
+            'top_examples_limit': resolved_top_examples_limit,
+        }
+        summary = {
+            'baseline_trade_count': baseline['trade_count'],
+            'candidate_trade_count': candidate['trade_count'],
+            'blocked_candidate_count': len(blocked),
+            'allowed_by_override_count': len(allowed_by_override),
+            'allowed_non_conflict_count': max(len(kept) - len(allowed_by_override), 0),
+            'skipped_losses': sum(1 for trade in blocked if trade.baseline_gross_pnl_krw < 0),
+            'skipped_winners': sum(1 for trade in blocked if trade.baseline_gross_pnl_krw > 0),
+            'skipped_losses_gross_pnl_krw': _to_json_number(
+                _round_money(sum((trade.baseline_gross_pnl_krw for trade in blocked if trade.baseline_gross_pnl_krw < 0), Decimal('0')))
+            ),
+            'skipped_winners_gross_pnl_krw': _to_json_number(
+                _round_money(sum((trade.baseline_gross_pnl_krw for trade in blocked if trade.baseline_gross_pnl_krw > 0), Decimal('0')))
+            ),
+            'gross_pnl_delta_krw': _to_json_number(_round_money(gross_delta)),
+            'estimated_net_pnl_delta_krw': _to_json_number(_round_money(net_delta)),
+            'baseline': baseline,
+            'candidate': candidate,
+            'outcome_sources': _count_by_key(trades, key='outcome_source'),
+            'alignment_counts': _count_alignment(trades),
+            'empty_data_reason': (
+                'no_actual_short_term_execution_outcomes_in_range'
+                if not trades
+                else None
+            ),
+        }
+        markdown_summary = _build_wait_conflict_markdown_summary(
+            request=request,
+            summary=summary,
+            examples=examples,
+        )
+        return {
+            'schema_version': WAIT_CONFLICT_GATE_REPLAY_SCHEMA_VERSION,
+            'request': request,
+            'summary': summary,
+            'examples': examples,
+            'markdown_summary': markdown_summary,
+        }
+
 
 def _count_by_key(trades: Sequence[DeciderReplayTrade], *, key: str) -> dict[str, int]:
     counts: dict[str, int] = {}
@@ -1035,6 +1385,14 @@ def _count_by_key(trades: Sequence[DeciderReplayTrade], *, key: str) -> dict[str
         value = getattr(trade, key)
         text = str(value)
         counts[text] = counts.get(text, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def _count_alignment(trades: Sequence[DeciderReplayTrade]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for trade in trades:
+        alignment = _normalize_text(_trade_alignment_gate(trade).get('signal_decider_alignment')) or 'unknown'
+        counts[alignment] = counts.get(alignment, 0) + 1
     return dict(sorted(counts.items()))
 
 

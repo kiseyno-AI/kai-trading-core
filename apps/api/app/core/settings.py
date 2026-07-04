@@ -77,6 +77,7 @@ class Settings(BaseSettings):
     signal_decider_next_open_block_on_data_warnings: bool = True
     signal_decider_next_open_block_on_specialist_disagreement: bool = True
     signal_decider_next_open_require_target_and_stop: bool = True
+    signal_decider_wait_conflict_gate_mode: str = 'report_only'
     signal_decider_exec_integration_mode: str = 'disabled'
     signal_decider_exec_base_url: str = 'http://127.0.0.1:8010'
     signal_decider_exec_bearer_token: Optional[str] = None

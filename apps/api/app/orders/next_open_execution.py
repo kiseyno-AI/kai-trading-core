@@ -12,6 +12,14 @@ from sqlalchemy import select
 
 from app.agent_context.decision_input_quality import build_decision_input_quality_envelope
 from app.agent_context.roles import SHORT_TERM_DECIDER_AGENT_NAME, SIGNAL_DECIDER_AGENT_NAME
+from app.orders.signal_decider_alignment_gate import (
+    ALIGNMENT_GATE_ACTION_BLOCK,
+    ALIGNMENT_GATE_ACTION_REPORT_ONLY_BLOCK,
+    SIGNAL_DECIDER_ALIGNMENT_WAIT_CONFLICT_BLOCK,
+    SIGNAL_DECIDER_ALIGNMENT_WAIT_CONFLICT_OVERRIDE,
+    build_signal_decider_alignment_context,
+    build_signal_decider_alignment_gate,
+)
 from app.agent_context.signal_decider_loop_service import signal_decider_loop_service
 from app.core.settings import settings
 from app.db import session_scope
@@ -374,13 +382,7 @@ def _latest_signal_decider_action_by_symbol(
             continue
         if snapshot.symbol in actions:
             continue
-        actions[snapshot.symbol] = {
-            'action': _normalize_action(snapshot.next_day_open_action or snapshot.decision_action),
-            'decision_snapshot_id': snapshot.id,
-            'policy_version': snapshot.policy_version,
-            'confidence_score_10': _to_json_safe(snapshot.confidence_score_10),
-            'conviction_score_10': _to_json_safe(snapshot.conviction_score_10),
-        }
+        actions[snapshot.symbol] = build_signal_decider_alignment_context(snapshot) or {}
     return actions
 
 
@@ -1720,6 +1722,7 @@ class SignalDeciderNextOpenExecutionService:
             if generic_action == 'buy'
             else None
         )
+        alignment_gate_payload: dict[str, Any] | None = None
         blocking_reasons: list[dict[str, str]] = []
         warnings: list[dict[str, str]] = []
         gate_checks = (
@@ -1893,6 +1896,37 @@ class SignalDeciderNextOpenExecutionService:
             )
             blocking_reasons.extend(entry_quality_blocks)
             warnings.extend(entry_quality_warnings)
+            alignment_gate_payload = build_signal_decider_alignment_gate(
+                signal_decider_context=signal_decider_crosscheck,
+                short_term_entry_quality=entry_quality_snapshot,
+                tactical_action=short_term_tactical_action,
+                mode=settings.signal_decider_wait_conflict_gate_mode,
+            )
+            if alignment_gate_payload.get('signal_decider_alignment') == SIGNAL_DECIDER_ALIGNMENT_WAIT_CONFLICT_BLOCK:
+                if alignment_gate_payload.get('alignment_gate_action') == ALIGNMENT_GATE_ACTION_BLOCK:
+                    blocking_reasons.append(
+                        _reason(
+                            'signal_decider_wait_conflict_gate',
+                            alignment_gate_payload.get('alignment_gate_reason')
+                            or 'Signal-decider WAIT conflicts with this short-term buy candidate.',
+                        )
+                    )
+                elif alignment_gate_payload.get('alignment_gate_action') == ALIGNMENT_GATE_ACTION_REPORT_ONLY_BLOCK:
+                    warnings.append(
+                        _reason(
+                            'signal_decider_wait_conflict_gate_report_only',
+                            alignment_gate_payload.get('alignment_gate_reason')
+                            or 'Signal-decider WAIT conflicts with this short-term buy candidate.',
+                        )
+                    )
+            elif alignment_gate_payload.get('signal_decider_alignment') == SIGNAL_DECIDER_ALIGNMENT_WAIT_CONFLICT_OVERRIDE:
+                warnings.append(
+                    _reason(
+                        'signal_decider_wait_conflict_override',
+                        alignment_gate_payload.get('alignment_gate_reason')
+                        or 'Signal-decider WAIT conflict was allowed by the short-term override threshold.',
+                    )
+                )
             trigger_price = _to_decimal(response_payload.get('trigger_price'))
             chase_limit_price = _to_decimal(response_payload.get('chase_limit_price'))
             target_price = _to_decimal(
@@ -2151,6 +2185,21 @@ class SignalDeciderNextOpenExecutionService:
                 or snapshot.suggested_holding_period,
             }
             validation_payload['short_term_entry_quality'] = entry_quality_snapshot
+            if alignment_gate_payload is not None:
+                validation_payload['alignment_gate'] = alignment_gate_payload
+                validation_payload['signal_decider_alignment'] = alignment_gate_payload.get('signal_decider_alignment')
+                validation_payload['alignment_gate_action'] = alignment_gate_payload.get('alignment_gate_action')
+                validation_payload['alignment_gate_reason'] = alignment_gate_payload.get('alignment_gate_reason')
+                validation_payload['alignment_signal_decider_decision_snapshot_id'] = alignment_gate_payload.get(
+                    'signal_decider_decision_snapshot_id'
+                )
+                validation_payload['short_term']['alignment_gate'] = alignment_gate_payload
+                validation_payload['short_term']['signal_decider_alignment'] = alignment_gate_payload.get(
+                    'signal_decider_alignment'
+                )
+                validation_payload['short_term']['alignment_gate_action'] = alignment_gate_payload.get(
+                    'alignment_gate_action'
+                )
         return validation_payload, {
             'estimated_reference_price': estimated_reference_price,
             'planned_quantity': planned_quantity,
@@ -2300,6 +2349,21 @@ class SignalDeciderNextOpenExecutionService:
             'decision_traceability': snapshot.traceability_payload if isinstance(snapshot.traceability_payload, dict) else {},
             'signal_traceability': snapshot.traceability_payload if isinstance(snapshot.traceability_payload, dict) else {},
         }
+        if decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME:
+            alignment_gate_payload = (
+                validation_payload.get('alignment_gate') if isinstance(validation_payload.get('alignment_gate'), dict) else None
+            )
+            row.traceability_payload.update(
+                {
+                    'alignment_gate': alignment_gate_payload,
+                    'signal_decider_alignment': validation_payload.get('signal_decider_alignment'),
+                    'alignment_gate_action': validation_payload.get('alignment_gate_action'),
+                    'alignment_gate_reason': validation_payload.get('alignment_gate_reason'),
+                    'alignment_signal_decider_decision_snapshot_id': validation_payload.get(
+                        'alignment_signal_decider_decision_snapshot_id'
+                    ),
+                }
+            )
         row.last_evaluated_at = now
         row.eligibility_status = ELIGIBILITY_BLOCKED if blocking_reasons else ELIGIBILITY_ELIGIBLE
         if row.eligibility_status == ELIGIBILITY_ELIGIBLE and row.first_ready_at is None:
@@ -2412,6 +2476,20 @@ class SignalDeciderNextOpenExecutionService:
                     for reason in (_row_validation_payload(row).get('blocking_reasons') or [])
                 )
             ),
+            'short_term_wait_conflict_block_count': sum(
+                1
+                for row in rows
+                if _normalize_agent_name(row.decision_agent_name) == SHORT_TERM_DECIDER_AGENT_NAME
+                and _row_validation_payload(row).get('signal_decider_alignment')
+                == SIGNAL_DECIDER_ALIGNMENT_WAIT_CONFLICT_BLOCK
+            ),
+            'short_term_wait_conflict_override_count': sum(
+                1
+                for row in rows
+                if _normalize_agent_name(row.decision_agent_name) == SHORT_TERM_DECIDER_AGENT_NAME
+                and _row_validation_payload(row).get('signal_decider_alignment')
+                == SIGNAL_DECIDER_ALIGNMENT_WAIT_CONFLICT_OVERRIDE
+            ),
         }
         return {
             'target_trade_date': target_trade_date.isoformat(),
@@ -2509,6 +2587,17 @@ class SignalDeciderNextOpenExecutionService:
             'expected_holding_period': traceability.get('expected_holding_period')
             or traceability.get('suggested_holding_period'),
             'entry_execution_mode': traceability.get('entry_execution_mode'),
+            'signal_decider_alignment': traceability.get('signal_decider_alignment')
+            or validation.get('signal_decider_alignment'),
+            'alignment_gate_action': traceability.get('alignment_gate_action')
+            or validation.get('alignment_gate_action'),
+            'alignment_gate_reason': traceability.get('alignment_gate_reason')
+            or validation.get('alignment_gate_reason'),
+            'alignment_signal_decider_decision_snapshot_id': traceability.get(
+                'alignment_signal_decider_decision_snapshot_id'
+            )
+            or validation.get('alignment_signal_decider_decision_snapshot_id'),
+            'alignment_gate': traceability.get('alignment_gate') or validation.get('alignment_gate'),
             'blocker_reason': blocker_reason,
             'data_quality_warnings': traceability.get('data_quality_warnings') or [],
             'planned_side': row.planned_side,

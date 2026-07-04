@@ -2652,6 +2652,13 @@ class SignalDeciderExecIntegrationService:
                 handoff_intent = 'tactical_buy'
             elif raw_action == 'watch_for_trigger':
                 handoff_intent = EXEC_INTENT_INTRADAY_WATCH_BUY
+        alignment_gate = (
+            traceability.get('alignment_gate')
+            if isinstance(traceability.get('alignment_gate'), dict)
+            else validation.get('alignment_gate')
+            if isinstance(validation.get('alignment_gate'), dict)
+            else None
+        )
         return _json_safe(
             {
                 'schema_version': 'exec_agent_decider_handoff_v1',
@@ -2672,6 +2679,17 @@ class SignalDeciderExecIntegrationService:
                     'tactical_action': traceability.get('tactical_action'),
                     'generic_action': generic_action,
                     'handoff_intent': handoff_intent,
+                    'signal_decider_alignment': traceability.get('signal_decider_alignment')
+                    or validation.get('signal_decider_alignment'),
+                    'alignment_gate_action': traceability.get('alignment_gate_action')
+                    or validation.get('alignment_gate_action'),
+                    'alignment_gate_reason': traceability.get('alignment_gate_reason')
+                    or validation.get('alignment_gate_reason'),
+                    'alignment_signal_decider_decision_snapshot_id': traceability.get(
+                        'alignment_signal_decider_decision_snapshot_id'
+                    )
+                    or validation.get('alignment_signal_decider_decision_snapshot_id'),
+                    'alignment_gate': alignment_gate,
                     'decision_traceability': decision_traceability,
                 },
                 'decider_input_context': {
@@ -2691,6 +2709,13 @@ class SignalDeciderExecIntegrationService:
                     'tactical_action': traceability.get('tactical_action'),
                     'generic_action': generic_action,
                     'handoff_intent': handoff_intent,
+                    'signal_decider_alignment': traceability.get('signal_decider_alignment')
+                    or validation.get('signal_decider_alignment'),
+                    'alignment_gate_action': traceability.get('alignment_gate_action')
+                    or validation.get('alignment_gate_action'),
+                    'alignment_gate_reason': traceability.get('alignment_gate_reason')
+                    or validation.get('alignment_gate_reason'),
+                    'alignment_gate': alignment_gate,
                     'entry_price_basis': snapshot.entry_price_basis if snapshot is not None else traceability.get('entry_price_basis'),
                     'trigger_price': traceability.get('trigger_price'),
                     'chase_limit_price': traceability.get('chase_limit_price'),
@@ -2824,6 +2849,13 @@ class SignalDeciderExecIntegrationService:
                 if isinstance(decision_input_quality_context.get('execution_feasibility'), dict)
                 else {}
             )
+            alignment_gate = (
+                traceability.get('alignment_gate')
+                if isinstance(traceability.get('alignment_gate'), dict)
+                else validation.get('alignment_gate')
+                if isinstance(validation.get('alignment_gate'), dict)
+                else None
+            )
             max_holding_close_policy = (
                 {
                     'enabled': True,
@@ -2870,6 +2902,17 @@ class SignalDeciderExecIntegrationService:
                 'tactical_action': traceability.get('tactical_action'),
                 'generic_action': generic_action,
                 'handoff_intent': handoff_intent,
+                'signal_decider_alignment': traceability.get('signal_decider_alignment')
+                or validation.get('signal_decider_alignment'),
+                'alignment_gate_action': traceability.get('alignment_gate_action')
+                or validation.get('alignment_gate_action'),
+                'alignment_gate_reason': traceability.get('alignment_gate_reason')
+                or validation.get('alignment_gate_reason'),
+                'alignment_signal_decider_decision_snapshot_id': traceability.get(
+                    'alignment_signal_decider_decision_snapshot_id'
+                )
+                or validation.get('alignment_signal_decider_decision_snapshot_id'),
+                'alignment_gate': alignment_gate,
                 'handoff_active': bool(traceability.get('handoff_active')) if is_short_term else True,
                 'original_watch_trigger_price': trigger_price,
                 'original_watch_chase_limit_price': chase_limit_price,

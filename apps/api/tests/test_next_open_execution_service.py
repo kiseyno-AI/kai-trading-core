@@ -128,6 +128,7 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             'signal_decider_next_open_block_on_data_warnings': settings.signal_decider_next_open_block_on_data_warnings,
             'signal_decider_next_open_block_on_specialist_disagreement': settings.signal_decider_next_open_block_on_specialist_disagreement,
             'signal_decider_next_open_require_target_and_stop': settings.signal_decider_next_open_require_target_and_stop,
+            'signal_decider_wait_conflict_gate_mode': settings.signal_decider_wait_conflict_gate_mode,
             'signal_decider_exec_integration_mode': settings.signal_decider_exec_integration_mode,
         }
         settings.signal_decider_next_open_account_targets = f'Main={self.account_reference}@1500000'
@@ -139,6 +140,7 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         settings.signal_decider_next_open_block_on_data_warnings = True
         settings.signal_decider_next_open_block_on_specialist_disagreement = True
         settings.signal_decider_next_open_require_target_and_stop = True
+        settings.signal_decider_wait_conflict_gate_mode = 'report_only'
         settings.signal_decider_exec_integration_mode = 'disabled'
         self.enrichment_preflight_patcher = patch(
             'app.orders.next_open_execution.inspect_pykrx_enrichment_preflight',
@@ -371,6 +373,7 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         decider_data_quality_context: dict[str, object] | None = None,
         include_decider_data_quality_context: bool = True,
         confidence_score_10: float = 7.1,
+        input_feature_snapshot_payload: dict[str, object] | None = None,
     ) -> int:
         generic_action = 'buy' if tactical_action in {'scalp_buy_candidate', 'watch_for_trigger'} else tactical_action
         if generic_action not in {'buy', 'wait', 'reject'}:
@@ -429,7 +432,11 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
                         'chase_limit_price': chase_limit_price,
                     },
                 },
-                input_feature_snapshot_payload={'meta': {'source_agent_name': 'short-term-decider'}},
+                input_feature_snapshot_payload=(
+                    input_feature_snapshot_payload
+                    if input_feature_snapshot_payload is not None
+                    else {'meta': {'source_agent_name': 'short-term-decider'}}
+                ),
                 request_payload=request_payload,
                 response_payload={
                     'role': 'short-term-decider',
@@ -860,6 +867,83 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(by_agent['short-term-decider']['chase_limit_price'], 51500)
         self.assertEqual(by_agent['short-term-decider']['target_price'], 54000)
         self.assertEqual(by_agent['short-term-decider']['stop_loss_price'], 49000)
+
+    def test_refresh_plan_items_audits_wait_conflict_block_report_only(self) -> None:
+        signal_snapshot_id = self._seed_snapshot(symbol='005930', next_day_open_action='wait')
+        self._seed_short_term_snapshot(symbol='005930')
+        service = self._service(state='PREOPEN', server_time='2026-04-30T08:40:00+09:00')
+
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[{'trade_date': '2026-04-29', 'close_price': 50000}],
+        ):
+            result = service.refresh_plan_items(target_trade_date=self.target_trade_date, trigger='test')
+
+        short_item = next(item for item in result['items'] if item['decision_agent_name'] == 'short-term-decider')
+        self.assertEqual(short_item['eligibility_status'], ELIGIBILITY_ELIGIBLE)
+        self.assertEqual(short_item['signal_decider_alignment'], 'wait_conflict_block')
+        self.assertEqual(short_item['alignment_gate_action'], 'report_only_block_candidate')
+        self.assertEqual(short_item['alignment_signal_decider_decision_snapshot_id'], signal_snapshot_id)
+        self.assertEqual(short_item['validation']['signal_decider_alignment'], 'wait_conflict_block')
+        self.assertEqual(short_item['traceability']['signal_decider_alignment'], 'wait_conflict_block')
+        warning_codes = {warning['code'] for warning in short_item['validation']['warnings']}
+        block_codes = {reason['code'] for reason in short_item['validation']['blocking_reasons']}
+        self.assertIn('signal_decider_wait_conflict_gate_report_only', warning_codes)
+        self.assertNotIn('signal_decider_wait_conflict_gate', block_codes)
+        self.assertEqual(result['summary']['short_term_wait_conflict_block_count'], 1)
+        self.assertEqual(result['summary']['short_term_wait_conflict_override_count'], 0)
+
+    def test_refresh_plan_items_allows_wait_conflict_override_for_strong_watch_setup(self) -> None:
+        signal_snapshot_id = self._seed_snapshot(symbol='005930', next_day_open_action='wait')
+        self._seed_short_term_snapshot(
+            symbol='005930',
+            input_feature_snapshot_payload={
+                'meta': {'source_agent_name': 'short-term-decider'},
+                'quality': {
+                    'buy_quality_score': 76,
+                    'return_percentile': 0.82,
+                    'volume_percentile': 0.68,
+                    'raw_trading_value_krw': 9000000000,
+                },
+            },
+        )
+        service = self._service(state='PREOPEN', server_time='2026-04-30T08:40:00+09:00')
+
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[{'trade_date': '2026-04-29', 'close_price': 50000}],
+        ):
+            result = service.refresh_plan_items(target_trade_date=self.target_trade_date, trigger='test')
+
+        short_item = next(item for item in result['items'] if item['decision_agent_name'] == 'short-term-decider')
+        self.assertEqual(short_item['eligibility_status'], ELIGIBILITY_ELIGIBLE)
+        self.assertEqual(short_item['signal_decider_alignment'], 'wait_conflict_override')
+        self.assertEqual(short_item['alignment_gate_action'], 'allow_by_override')
+        self.assertEqual(short_item['alignment_signal_decider_decision_snapshot_id'], signal_snapshot_id)
+        self.assertTrue(short_item['alignment_gate']['override']['allowed'])
+        warning_codes = {warning['code'] for warning in short_item['validation']['warnings']}
+        self.assertIn('signal_decider_wait_conflict_override', warning_codes)
+        self.assertEqual(result['summary']['short_term_wait_conflict_block_count'], 0)
+        self.assertEqual(result['summary']['short_term_wait_conflict_override_count'], 1)
+
+    def test_refresh_plan_items_marks_short_term_buy_aligned_with_signal_buy(self) -> None:
+        signal_snapshot_id = self._seed_snapshot(symbol='005930', next_day_open_action='buy')
+        self._seed_short_term_snapshot(symbol='005930')
+        service = self._service(state='PREOPEN', server_time='2026-04-30T08:40:00+09:00')
+
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[{'trade_date': '2026-04-29', 'close_price': 50000}],
+        ):
+            result = service.refresh_plan_items(target_trade_date=self.target_trade_date, trigger='test')
+
+        short_item = next(item for item in result['items'] if item['decision_agent_name'] == 'short-term-decider')
+        self.assertEqual(short_item['eligibility_status'], ELIGIBILITY_ELIGIBLE)
+        self.assertEqual(short_item['signal_decider_alignment'], 'aligned')
+        self.assertEqual(short_item['alignment_gate_action'], 'allow')
+        self.assertEqual(short_item['alignment_signal_decider_decision_snapshot_id'], signal_snapshot_id)
+        self.assertEqual(result['summary']['short_term_wait_conflict_block_count'], 0)
+        self.assertEqual(result['summary']['short_term_wait_conflict_override_count'], 0)
 
     def test_refresh_plan_items_dispatches_low_confidence_short_term_watchers_for_monitoring(self) -> None:
         settings.signal_decider_exec_integration_mode = 'dispatch'
