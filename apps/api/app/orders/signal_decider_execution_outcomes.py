@@ -23,6 +23,10 @@ EXECUTION_WINDOW_NEXT_OPEN = 'next_open'
 EXECUTION_WINDOW_INTRADAY_AUTO_SELL = 'intraday_auto_sell'
 ORDER_SOURCE_NEXT_OPEN = 'signal_decider_next_open'
 ORDER_SOURCE_AUTO_SELL = 'signal_decider_auto_sell'
+EXEC_INTENT_NEXT_OPEN_BUY = 'next_open_buy'
+EXEC_INTENT_INTRADAY_WATCH_BUY = 'intraday_watch_buy'
+EXEC_INTENT_TARGET_SELL = 'target_sell'
+EXEC_INTENT_STOP_SELL = 'stop_sell'
 LIFECYCLE_PLANNED = 'planned'
 LIFECYCLE_DRY_RUN = 'dry_run'
 LIFECYCLE_ENTRY_SUBMITTED = 'entry_submitted'
@@ -58,6 +62,23 @@ FILLED_ORDER_STATUSES = {
     BrokerOrderStatus.PARTIAL_FILL.value,
     BrokerOrderStatus.FILLED.value,
 }
+REMOTE_ACTIVE_STATUS_ALIASES = {
+    'accepted',
+    'active',
+    'created',
+    'monitoring',
+    'open',
+    'pending',
+    'queued',
+    'running',
+    'scheduled',
+    'submitted',
+    'working',
+}
+REMOTE_PARTIAL_STATUS_ALIASES = {'partial', 'partial_fill', 'partially_filled'}
+REMOTE_FILLED_STATUS_ALIASES = {'complete', 'completed', 'done', 'filled'}
+REMOTE_CANCELLED_STATUS_ALIASES = {'canceled', 'cancelled'}
+REMOTE_REJECTED_STATUS_ALIASES = {'declined', 'denied', 'expired', 'failed', 'not_approved', 'reject', 'rejected'}
 
 
 def _utcnow() -> datetime:
@@ -134,6 +155,18 @@ def _as_utc(value: datetime | None) -> datetime | None:
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc)
+
+
+def _parse_datetime(value: Any) -> datetime | None:
+    text = _normalize_optional_text(value)
+    if text is None:
+        return None
+    normalized = text[:-1] + '+00:00' if text.endswith('Z') else text
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    return _as_utc(parsed)
 
 
 def _min_datetime(first: datetime | None, second: datetime | None) -> datetime | None:
@@ -260,6 +293,47 @@ class SignalDeciderExecutionOutcomeService:
             account_reference=_normalize_optional_text(account_reference),
             symbol=_normalize_optional_text(symbol),
         )
+
+    def backfill_outcomes(
+        self,
+        *,
+        market_date_from: str | date,
+        market_date_to: str | date,
+        symbol: str | None = None,
+        account_reference: str | None = None,
+        policy_version: str | None = None,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        resolved_market_date_from = (
+            market_date_from if isinstance(market_date_from, date) else date.fromisoformat(str(market_date_from))
+        )
+        resolved_market_date_to = (
+            market_date_to if isinstance(market_date_to, date) else date.fromisoformat(str(market_date_to))
+        )
+        if resolved_market_date_to < resolved_market_date_from:
+            raise ValueError('market_date_to must be on or after market_date_from')
+
+        resolved_limit = None if limit is None else max(1, int(limit))
+        items = self._sync_matching_entry_plans(
+            market_date_from=resolved_market_date_from,
+            market_date_to=resolved_market_date_to,
+            symbol=_normalize_optional_text(symbol),
+            account_reference=_normalize_optional_text(account_reference),
+            policy_version=_normalize_optional_text(policy_version),
+            limit=resolved_limit,
+        )
+        return {
+            'request': {
+                'market_date_from': resolved_market_date_from.isoformat(),
+                'market_date_to': resolved_market_date_to.isoformat(),
+                'symbol': (_normalize_optional_text(symbol) or '').upper() or None,
+                'account_reference': _normalize_optional_text(account_reference),
+                'policy_version': _normalize_optional_text(policy_version),
+                'limit': resolved_limit,
+            },
+            'summary': self.build_summary(items=items),
+            'items': items,
+        }
 
     def list_snapshot_outcomes(
         self,
@@ -518,13 +592,23 @@ class SignalDeciderExecutionOutcomeService:
                 'trigger_rule': None,
             }
         ]
-        entry_metrics = self._aggregate_order_pairs(pairs=entry_pairs)
+        entry_local_metrics = self._aggregate_order_pairs(pairs=entry_pairs)
+        entry_readback_metrics = self._aggregate_exec_readback_side(entry_row=entry_row, side='buy')
+        entry_metrics = self._select_execution_metrics(
+            local_metrics=entry_local_metrics,
+            readback_metrics=entry_readback_metrics,
+        )
         exit_pairs = self._load_linked_exit_pairs(
             session=session,
             entry_row=entry_row,
             exit_row=exit_row,
         )
-        exit_metrics = self._aggregate_order_pairs(pairs=exit_pairs)
+        exit_local_metrics = self._aggregate_order_pairs(pairs=exit_pairs)
+        exit_readback_metrics = self._aggregate_exec_readback_side(entry_row=entry_row, side='sell')
+        exit_metrics = self._select_execution_metrics(
+            local_metrics=exit_local_metrics,
+            readback_metrics=exit_readback_metrics,
+        )
         manual_exit_candidates = self._load_manual_exit_candidates(
             session=session,
             entry_row=entry_row,
@@ -535,7 +619,10 @@ class SignalDeciderExecutionOutcomeService:
             (_safe_decimal(item.get('filled_quantity')) or Decimal('0'))
             for item in manual_exit_candidates
         )
-        exit_trigger_rule = self._resolve_exit_trigger_rule(exit_row=exit_row, exit_pairs=exit_pairs)
+        exit_trigger_rule = self._resolve_exit_trigger_rule(
+            exit_row=exit_row,
+            exit_pairs=exit_pairs,
+        ) or self._resolve_exec_readback_exit_trigger_rule(entry_row=entry_row)
 
         entry_filled_quantity = entry_metrics['filled_quantity']
         exit_filled_quantity = exit_metrics['filled_quantity']
@@ -569,6 +656,7 @@ class SignalDeciderExecutionOutcomeService:
             entry_row=entry_row,
             entry_request=entry_request,
             entry_order=entry_order,
+            entry_metrics=entry_metrics,
             entry_filled_quantity=entry_filled_quantity,
             exit_row=exit_row,
             exit_trigger_rule=exit_trigger_rule,
@@ -588,6 +676,8 @@ class SignalDeciderExecutionOutcomeService:
                 'order_status': entry_metrics['latest_order_status'],
                 'fill_event_ids': entry_metrics['fill_event_ids'],
                 'pair_count': entry_metrics['pair_count'],
+                'metric_source': entry_metrics.get('metric_source'),
+                'exec_readback': self._serialize_exec_readback_metrics(entry_readback_metrics),
             },
             'exit': {
                 'plan_item_id': exit_row.id if exit_row is not None else None,
@@ -600,6 +690,8 @@ class SignalDeciderExecutionOutcomeService:
                 'fill_event_ids': exit_metrics['fill_event_ids'],
                 'trigger_rule': exit_trigger_rule,
                 'pair_count': exit_metrics['pair_count'],
+                'metric_source': exit_metrics.get('metric_source'),
+                'exec_readback': self._serialize_exec_readback_metrics(exit_readback_metrics),
             },
             'snapshot': {
                 'decision_snapshot_id': snapshot.id,
@@ -945,6 +1037,478 @@ class SignalDeciderExecutionOutcomeService:
             'pair_count': len(pairs),
         }
 
+    def _aggregate_exec_readback_side(
+        self,
+        *,
+        entry_row: SignalDeciderExecutionPlanItem,
+        side: str,
+    ) -> dict[str, Any]:
+        readback = self._load_exec_readback(entry_row=entry_row)
+        orders = self._readback_items(readback=readback, key='orders')
+        executions = self._readback_items(readback=readback, key='executions')
+        item_links = self._load_exec_item_links(entry_row=entry_row)
+        order_link_by_broker_order_id = self._readback_order_link_by_broker_order_id(
+            orders=orders,
+            item_links=item_links,
+        )
+        execution_facts = [
+            fact
+            for payload in executions
+            if (
+                fact := self._exec_readback_fact(
+                    payload=payload,
+                    side=side,
+                    source='execution',
+                    item_links=item_links,
+                    order_link_by_broker_order_id=order_link_by_broker_order_id,
+                )
+            )
+        ]
+        order_facts = [
+            fact
+            for payload in orders
+            if (
+                fact := self._exec_readback_fact(
+                    payload=payload,
+                    side=side,
+                    source='order',
+                    item_links=item_links,
+                    order_link_by_broker_order_id=order_link_by_broker_order_id,
+                )
+            )
+        ]
+        execution_quantity_total, execution_weighted_price_notional = self._readback_fact_totals(
+            facts=execution_facts,
+        )
+        order_quantity_total, order_weighted_price_notional = self._readback_fact_totals(
+            facts=order_facts,
+        )
+        if execution_facts and execution_quantity_total >= order_quantity_total:
+            selected_facts = execution_facts
+            metadata_facts = execution_facts
+            filled_quantity_total = execution_quantity_total
+            weighted_price_notional = execution_weighted_price_notional
+            readback_source = 'executions'
+        elif order_facts:
+            selected_facts = order_facts
+            metadata_facts = [*execution_facts, *order_facts] if execution_facts else order_facts
+            filled_quantity_total = order_quantity_total
+            weighted_price_notional = order_weighted_price_notional
+            readback_source = 'orders'
+        else:
+            selected_facts = []
+            metadata_facts = []
+            filled_quantity_total = Decimal('0')
+            weighted_price_notional = Decimal('0')
+            readback_source = None
+        submitted_at: datetime | None = None
+        first_fill_at: datetime | None = None
+        last_fill_at: datetime | None = None
+        latest_sort_at: datetime | None = None
+        latest_order_status: str | None = None
+        latest_client_order_id: str | None = None
+        latest_broker_order_id: str | None = None
+        client_order_ids: list[str] = []
+        broker_order_ids: list[str] = []
+        remote_execution_ids: list[str] = []
+        remote_order_ids: list[str] = []
+        remote_exec_plan_item_ids: list[str] = []
+
+        for fact in metadata_facts:
+            submitted_at = _min_datetime(submitted_at, fact.get('submitted_at'))
+            first_fill_at = _min_datetime(first_fill_at, fact.get('filled_at'))
+            last_fill_at = _max_datetime(last_fill_at, fact.get('filled_at'))
+            if client_order_id := _normalize_optional_text(fact.get('client_order_id')):
+                if client_order_id not in client_order_ids:
+                    client_order_ids.append(client_order_id)
+            if broker_order_id := _normalize_optional_text(fact.get('broker_order_id')):
+                if broker_order_id not in broker_order_ids:
+                    broker_order_ids.append(broker_order_id)
+            if execution_id := _normalize_optional_text(fact.get('execution_id')):
+                if execution_id not in remote_execution_ids:
+                    remote_execution_ids.append(execution_id)
+            if order_id := _normalize_optional_text(fact.get('order_id')):
+                if order_id not in remote_order_ids:
+                    remote_order_ids.append(order_id)
+            if exec_plan_item_id := _normalize_optional_text(fact.get('exec_plan_item_id')):
+                if exec_plan_item_id not in remote_exec_plan_item_ids:
+                    remote_exec_plan_item_ids.append(exec_plan_item_id)
+            sort_at = fact.get('sort_at') or datetime(1970, 1, 1, tzinfo=timezone.utc)
+            if latest_sort_at is None or sort_at >= latest_sort_at:
+                latest_sort_at = sort_at
+                latest_order_status = _normalize_optional_text(fact.get('status'), lowercase=True)
+                latest_client_order_id = _normalize_optional_text(fact.get('client_order_id'))
+                latest_broker_order_id = _normalize_optional_text(fact.get('broker_order_id'))
+
+        average_fill_price = None
+        if filled_quantity_total > Decimal('0'):
+            if weighted_price_notional > Decimal('0'):
+                average_fill_price = weighted_price_notional / filled_quantity_total
+            else:
+                fallback_quantity_total = (
+                    execution_quantity_total if readback_source == 'orders' else order_quantity_total
+                )
+                fallback_weighted_price_notional = (
+                    execution_weighted_price_notional
+                    if readback_source == 'orders'
+                    else order_weighted_price_notional
+                )
+                if fallback_quantity_total > Decimal('0') and fallback_weighted_price_notional > Decimal('0'):
+                    average_fill_price = fallback_weighted_price_notional / fallback_quantity_total
+        if latest_order_status is None and filled_quantity_total > Decimal('0'):
+            latest_order_status = BrokerOrderStatus.FILLED.value
+        return {
+            'filled_quantity': filled_quantity_total,
+            'average_fill_price': average_fill_price,
+            'submitted_at': submitted_at,
+            'first_fill_at': first_fill_at,
+            'last_fill_at': last_fill_at,
+            'latest_request_status': None,
+            'latest_order_status': latest_order_status,
+            'latest_order_request_id': None,
+            'latest_broker_order_row_id': None,
+            'latest_client_order_id': latest_client_order_id,
+            'latest_broker_order_id': latest_broker_order_id,
+            'client_order_ids': client_order_ids,
+            'broker_order_ids': broker_order_ids,
+            'order_request_ids': [],
+            'broker_order_row_ids': [],
+            'fill_event_ids': [],
+            'pair_count': len(selected_facts),
+            'metric_source': 'exec_readback' if selected_facts else None,
+            'readback': {
+                'last_synced_at': readback.get('last_synced_at') if isinstance(readback, dict) else None,
+                'source': readback_source,
+                'execution_count': len(execution_facts),
+                'order_count': len(order_facts),
+                'remote_execution_ids': remote_execution_ids,
+                'remote_order_ids': remote_order_ids,
+                'remote_exec_plan_item_ids': remote_exec_plan_item_ids,
+            },
+        }
+
+    def _readback_fact_totals(self, *, facts: Sequence[dict[str, Any]]) -> tuple[Decimal, Decimal]:
+        filled_quantity_total = Decimal('0')
+        weighted_price_notional = Decimal('0')
+        for fact in facts:
+            quantity = _safe_decimal(fact.get('quantity')) or Decimal('0')
+            price = _safe_decimal(fact.get('price'))
+            if quantity <= Decimal('0'):
+                continue
+            filled_quantity_total += quantity
+            if price is not None:
+                weighted_price_notional += quantity * price
+        return filled_quantity_total, weighted_price_notional
+
+    def _select_execution_metrics(
+        self,
+        *,
+        local_metrics: dict[str, Any],
+        readback_metrics: dict[str, Any],
+    ) -> dict[str, Any]:
+        local_quantity = _safe_decimal(local_metrics.get('filled_quantity')) or Decimal('0')
+        readback_quantity = _safe_decimal(readback_metrics.get('filled_quantity')) or Decimal('0')
+        readback_has_state = bool(readback_metrics.get('pair_count') and readback_metrics.get('latest_order_status'))
+        local_has_state = bool(local_metrics.get('pair_count') and local_metrics.get('latest_order_status'))
+        if readback_quantity > local_quantity or (
+            readback_quantity == local_quantity == Decimal('0')
+            and readback_has_state
+            and not local_has_state
+        ):
+            selected = dict(readback_metrics)
+            selected['metric_source'] = 'exec_readback'
+            for key in ('latest_order_request_id', 'latest_broker_order_row_id'):
+                selected[key] = selected.get(key) or local_metrics.get(key)
+            for key in ('order_request_ids', 'broker_order_row_ids', 'fill_event_ids'):
+                selected[key] = list(local_metrics.get(key) or []) + list(selected.get(key) or [])
+            if local_metrics.get('latest_client_order_id') and not selected.get('latest_client_order_id'):
+                selected['latest_client_order_id'] = local_metrics.get('latest_client_order_id')
+            return selected
+        selected = dict(local_metrics)
+        selected['metric_source'] = 'broker_orders' if local_quantity > Decimal('0') else 'plan_or_order_state'
+        return selected
+
+    def _load_exec_readback(self, *, entry_row: SignalDeciderExecutionPlanItem) -> dict[str, Any]:
+        submission = entry_row.submission_payload if isinstance(entry_row.submission_payload, dict) else {}
+        exec_dispatch = submission.get('exec_dispatch') if isinstance(submission.get('exec_dispatch'), dict) else {}
+        readback = exec_dispatch.get('readback') if isinstance(exec_dispatch.get('readback'), dict) else {}
+        return readback
+
+    def _load_exec_item_links(self, *, entry_row: SignalDeciderExecutionPlanItem) -> list[dict[str, Any]]:
+        submission = entry_row.submission_payload if isinstance(entry_row.submission_payload, dict) else {}
+        exec_dispatch = submission.get('exec_dispatch') if isinstance(submission.get('exec_dispatch'), dict) else {}
+        return [item for item in (exec_dispatch.get('item_links') or []) if isinstance(item, dict)]
+
+    def _readback_items(self, *, readback: dict[str, Any], key: str) -> list[dict[str, Any]]:
+        section = readback.get(key) if isinstance(readback, dict) else None
+        if isinstance(section, dict):
+            return [item for item in (section.get('items') or []) if isinstance(item, dict)]
+        if isinstance(section, list):
+            return [item for item in section if isinstance(item, dict)]
+        return []
+
+    def _exec_readback_fact(
+        self,
+        *,
+        payload: dict[str, Any],
+        side: str,
+        source: str,
+        item_links: Sequence[dict[str, Any]],
+        order_link_by_broker_order_id: dict[str, dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        payload_side = self._resolve_readback_side(
+            payload=payload,
+            item_links=item_links,
+            order_link_by_broker_order_id=order_link_by_broker_order_id,
+        )
+        if payload_side != side:
+            return None
+        status = self._normalize_readback_order_status(
+            payload.get('status') or payload.get('current_status') or payload.get('broker_status')
+        )
+        quantity = self._readback_filled_quantity(payload=payload, source=source, status=status)
+        if (
+            quantity <= Decimal('0')
+            and status not in ACTIVE_ORDER_STATUSES
+            and status not in FILLED_ORDER_STATUSES
+            and status not in {BrokerOrderStatus.CANCELED.value, BrokerOrderStatus.REJECTED.value}
+        ):
+            return None
+        filled_at = self._readback_fill_timestamp(payload=payload, source=source)
+        submitted_at = self._readback_submitted_timestamp(payload=payload)
+        return {
+            'quantity': quantity,
+            'price': self._readback_fill_price(payload=payload),
+            'filled_at': filled_at,
+            'submitted_at': submitted_at,
+            'sort_at': filled_at or submitted_at or _parse_datetime(payload.get('updated_at')) or datetime(1970, 1, 1, tzinfo=timezone.utc),
+            'status': status,
+            'client_order_id': _normalize_optional_text(payload.get('client_order_id')),
+            'broker_order_id': self._readback_broker_order_id(payload=payload),
+            'execution_id': _normalize_optional_text(
+                payload.get('execution_id') or payload.get('broker_execution_id') or payload.get('id')
+            ) if source == 'execution' else None,
+            'order_id': _normalize_optional_text(
+                payload.get('order_id') or payload.get('broker_order_id') or payload.get('id')
+            ) if source == 'order' else None,
+            'exec_plan_item_id': _normalize_optional_text(
+                payload.get('execution_plan_item_id') or payload.get('plan_item_id') or payload.get('exec_plan_item_id')
+            ),
+        }
+
+    def _resolve_readback_side(
+        self,
+        *,
+        payload: dict[str, Any],
+        item_links: Sequence[dict[str, Any]],
+        order_link_by_broker_order_id: dict[str, dict[str, Any]],
+    ) -> str | None:
+        normalized_side = self._normalize_readback_side(payload.get('side'))
+        if normalized_side:
+            return normalized_side
+        link = self._readback_link_for_payload(
+            payload=payload,
+            item_links=item_links,
+            order_link_by_broker_order_id=order_link_by_broker_order_id,
+        )
+        intent = _normalize_optional_text(link.get('intent') if link else None, lowercase=True)
+        if intent in {EXEC_INTENT_NEXT_OPEN_BUY, EXEC_INTENT_INTRADAY_WATCH_BUY}:
+            return 'buy'
+        if intent in {EXEC_INTENT_TARGET_SELL, EXEC_INTENT_STOP_SELL}:
+            return 'sell'
+        return None
+
+    def _readback_order_link_by_broker_order_id(
+        self,
+        *,
+        orders: Sequence[dict[str, Any]],
+        item_links: Sequence[dict[str, Any]],
+    ) -> dict[str, dict[str, Any]]:
+        links_by_plan_item_id = self._readback_links_by_exec_plan_item_id(item_links=item_links)
+        result: dict[str, dict[str, Any]] = {}
+        for order in orders:
+            link = self._readback_link_for_payload(
+                payload=order,
+                item_links=item_links,
+                order_link_by_broker_order_id={},
+            )
+            if link is None:
+                plan_item_id = _normalize_optional_text(
+                    order.get('execution_plan_item_id') or order.get('plan_item_id') or order.get('exec_plan_item_id')
+                )
+                link = links_by_plan_item_id.get(plan_item_id or '')
+            if link is None:
+                continue
+            for value in (order.get('broker_order_id'), order.get('order_id'), order.get('id')):
+                broker_order_id = _normalize_optional_text(value)
+                if broker_order_id:
+                    result[broker_order_id] = link
+        return result
+
+    def _readback_link_for_payload(
+        self,
+        *,
+        payload: dict[str, Any],
+        item_links: Sequence[dict[str, Any]],
+        order_link_by_broker_order_id: dict[str, dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        plan_item_id = _normalize_optional_text(
+            payload.get('execution_plan_item_id') or payload.get('plan_item_id') or payload.get('exec_plan_item_id')
+        )
+        if plan_item_id:
+            links_by_plan_item_id = self._readback_links_by_exec_plan_item_id(item_links=item_links)
+            if link := links_by_plan_item_id.get(plan_item_id):
+                return link
+        broker_order_id = self._readback_broker_order_id(payload=payload)
+        if broker_order_id and broker_order_id in order_link_by_broker_order_id:
+            return order_link_by_broker_order_id[broker_order_id]
+        return None
+
+    def _readback_links_by_exec_plan_item_id(
+        self,
+        *,
+        item_links: Sequence[dict[str, Any]],
+    ) -> dict[str, dict[str, Any]]:
+        result: dict[str, dict[str, Any]] = {}
+        for link in item_links:
+            for value in (
+                link.get('exec_plan_item_id'),
+                link.get('execution_plan_item_id'),
+                link.get('plan_item_id'),
+                (link.get('response_item') or {}).get('id') if isinstance(link.get('response_item'), dict) else None,
+                (link.get('response_item') or {}).get('execution_plan_item_id')
+                if isinstance(link.get('response_item'), dict)
+                else None,
+            ):
+                plan_item_id = _normalize_optional_text(value)
+                if plan_item_id:
+                    result[plan_item_id] = link
+        return result
+
+    def _resolve_exec_readback_exit_trigger_rule(
+        self,
+        *,
+        entry_row: SignalDeciderExecutionPlanItem,
+    ) -> str | None:
+        readback = self._load_exec_readback(entry_row=entry_row)
+        orders = self._readback_items(readback=readback, key='orders')
+        executions = self._readback_items(readback=readback, key='executions')
+        item_links = self._load_exec_item_links(entry_row=entry_row)
+        order_link_by_broker_order_id = self._readback_order_link_by_broker_order_id(
+            orders=orders,
+            item_links=item_links,
+        )
+        for payload in [*executions, *orders]:
+            side = self._resolve_readback_side(
+                payload=payload,
+                item_links=item_links,
+                order_link_by_broker_order_id=order_link_by_broker_order_id,
+            )
+            if side != 'sell':
+                continue
+            status = self._normalize_readback_order_status(
+                payload.get('status') or payload.get('current_status') or payload.get('broker_status')
+            )
+            quantity = self._readback_filled_quantity(payload=payload, source='execution', status=status)
+            if quantity <= Decimal('0') and status not in FILLED_ORDER_STATUSES:
+                continue
+            link = self._readback_link_for_payload(
+                payload=payload,
+                item_links=item_links,
+                order_link_by_broker_order_id=order_link_by_broker_order_id,
+            )
+            intent = _normalize_optional_text(link.get('intent') if link else None, lowercase=True)
+            if intent == EXEC_INTENT_TARGET_SELL:
+                return EXIT_REASON_TARGET_HIT
+            if intent == EXEC_INTENT_STOP_SELL:
+                return EXIT_REASON_STOP_LOSS_HIT
+        return None
+
+    def _serialize_exec_readback_metrics(self, metrics: dict[str, Any]) -> dict[str, Any] | None:
+        if (_safe_decimal(metrics.get('filled_quantity')) or Decimal('0')) <= Decimal('0') and not metrics.get('pair_count'):
+            return None
+        readback = metrics.get('readback') if isinstance(metrics.get('readback'), dict) else {}
+        return {
+            'source': readback.get('source'),
+            'last_synced_at': readback.get('last_synced_at'),
+            'filled_quantity': _decimal_to_text(_safe_decimal(metrics.get('filled_quantity'))),
+            'average_fill_price': _to_json_number(_safe_decimal(metrics.get('average_fill_price'))),
+            'first_fill_at': metrics.get('first_fill_at').isoformat() if metrics.get('first_fill_at') else None,
+            'last_fill_at': metrics.get('last_fill_at').isoformat() if metrics.get('last_fill_at') else None,
+            'execution_count': readback.get('execution_count'),
+            'order_count': readback.get('order_count'),
+            'remote_execution_ids': readback.get('remote_execution_ids') or [],
+            'remote_order_ids': readback.get('remote_order_ids') or [],
+            'remote_exec_plan_item_ids': readback.get('remote_exec_plan_item_ids') or [],
+        }
+
+    def _readback_filled_quantity(self, *, payload: dict[str, Any], source: str, status: str | None) -> Decimal:
+        if source == 'execution':
+            return _safe_decimal(payload.get('quantity') or payload.get('filled_quantity')) or Decimal('0')
+        quantity = _safe_decimal(
+            payload.get('filled_quantity')
+            or payload.get('executed_quantity')
+            or payload.get('cumulative_filled_quantity')
+        )
+        if quantity is None and status in FILLED_ORDER_STATUSES:
+            quantity = _safe_decimal(payload.get('quantity'))
+        return quantity or Decimal('0')
+
+    def _readback_fill_price(self, *, payload: dict[str, Any]) -> Decimal | None:
+        return _safe_decimal(
+            payload.get('average_fill_price')
+            or payload.get('avg_fill_price')
+            or payload.get('fill_price')
+            or payload.get('price')
+            or payload.get('avg_price')
+        )
+
+    def _readback_fill_timestamp(self, *, payload: dict[str, Any], source: str) -> datetime | None:
+        fields = (
+            ('executed_at', 'filled_at', 'last_filled_at', 'created_at', 'updated_at')
+            if source == 'execution'
+            else ('filled_at', 'last_filled_at', 'updated_at', 'created_at', 'submitted_at')
+        )
+        for field in fields:
+            if parsed := _parse_datetime(payload.get(field)):
+                return parsed
+        return None
+
+    def _readback_submitted_timestamp(self, *, payload: dict[str, Any]) -> datetime | None:
+        for field in ('submitted_at', 'created_at', 'updated_at'):
+            if parsed := _parse_datetime(payload.get(field)):
+                return parsed
+        return None
+
+    def _readback_broker_order_id(self, *, payload: dict[str, Any]) -> str | None:
+        return _normalize_optional_text(
+            payload.get('broker_order_id') or payload.get('order_id') or payload.get('broker_order_pk') or payload.get('id')
+        )
+
+    def _normalize_readback_side(self, value: Any) -> str | None:
+        normalized = _normalize_optional_text(value, lowercase=True)
+        if normalized in {'buy', 'b', 'bid'}:
+            return 'buy'
+        if normalized in {'sell', 's', 'ask'}:
+            return 'sell'
+        return None
+
+    def _normalize_readback_order_status(self, value: Any) -> str | None:
+        normalized = _normalize_optional_text(value, lowercase=True)
+        if normalized is None:
+            return None
+        if normalized in REMOTE_FILLED_STATUS_ALIASES:
+            return BrokerOrderStatus.FILLED.value
+        if normalized in REMOTE_PARTIAL_STATUS_ALIASES:
+            return BrokerOrderStatus.PARTIAL_FILL.value
+        if normalized in REMOTE_CANCELLED_STATUS_ALIASES:
+            return BrokerOrderStatus.CANCELED.value
+        if normalized in REMOTE_REJECTED_STATUS_ALIASES:
+            return BrokerOrderStatus.REJECTED.value
+        if normalized in REMOTE_ACTIVE_STATUS_ALIASES:
+            return BrokerOrderStatus.SUBMITTED.value
+        return normalized
+
     def _extract_fill_event_info(
         self,
         *,
@@ -1041,6 +1605,7 @@ class SignalDeciderExecutionOutcomeService:
         entry_row: SignalDeciderExecutionPlanItem,
         entry_request: OrderRequest | None,
         entry_order: BrokerOrder | None,
+        entry_metrics: dict[str, Any],
         entry_filled_quantity: Decimal,
         exit_row: SignalDeciderExecutionPlanItem | None,
         exit_trigger_rule: str | None,
@@ -1052,11 +1617,11 @@ class SignalDeciderExecutionOutcomeService:
         entry_request_status = _normalize_optional_text(
             entry_request.submission_status if entry_request is not None else None,
             lowercase=True,
-        )
+        ) or _normalize_optional_text(entry_metrics.get('latest_request_status'), lowercase=True)
         entry_order_status = _normalize_optional_text(
             entry_order.current_status if entry_order is not None else None,
             lowercase=True,
-        )
+        ) or _normalize_optional_text(entry_metrics.get('latest_order_status'), lowercase=True)
         exit_order_status = _normalize_optional_text(exit_metrics.get('latest_order_status'), lowercase=True)
         exit_request_status = _normalize_optional_text(exit_metrics.get('latest_request_status'), lowercase=True)
 

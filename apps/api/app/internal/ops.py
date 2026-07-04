@@ -53,6 +53,7 @@ from app.orders.exec_integration import signal_decider_exec_integration_service
 from app.orders.intraday_auto_sell import signal_decider_intraday_auto_sell_service
 from app.orders.next_open_execution import signal_decider_next_open_execution_service
 from app.orders.reconciliation import trading_order_reconciliation_service
+from app.orders.signal_decider_execution_outcomes import signal_decider_execution_outcome_service
 from app.quotes.service import QuoteService
 from app.signals.advanced_value_factor import (
     ADVANCED_VALUE_FACTOR_SOURCE,
@@ -1151,6 +1152,17 @@ def _build_parser() -> argparse.ArgumentParser:
     signal_decider_repair_parser.add_argument('--refresh-calendar', choices=('true', 'false'), default='true')
     signal_decider_repair_parser.add_argument('--fail-on-mature-gaps', choices=('true', 'false'), default='true')
 
+    execution_outcomes_parser = subparsers.add_parser(
+        'agent-signal-decider-execution-outcomes-backfill',
+        help='Backfill actual signal-decider execution outcomes from persisted core order/fill and exec readback data',
+    )
+    execution_outcomes_parser.add_argument('--market-date-from', required=True)
+    execution_outcomes_parser.add_argument('--market-date-to', required=True)
+    execution_outcomes_parser.add_argument('--symbol')
+    execution_outcomes_parser.add_argument('--account-reference')
+    execution_outcomes_parser.add_argument('--policy-version')
+    execution_outcomes_parser.add_argument('--limit', type=int)
+
     decider_replay_parser = subparsers.add_parser(
         'agent-decider-replay',
         help='Replay candidate decider hard-gate rules offline against persisted decision snapshots and outcomes',
@@ -1447,6 +1459,15 @@ def main(argv: Iterable[str] | None = None) -> int:
             force_recompute=args.force_recompute == 'true',
             refresh_calendar=args.refresh_calendar == 'true',
             fail_on_mature_gaps=args.fail_on_mature_gaps == 'true',
+        )
+    elif args.command == 'agent-signal-decider-execution-outcomes-backfill':
+        payload = signal_decider_execution_outcome_service.backfill_outcomes(
+            market_date_from=args.market_date_from,
+            market_date_to=args.market_date_to,
+            symbol=args.symbol,
+            account_reference=args.account_reference,
+            policy_version=args.policy_version,
+            limit=args.limit,
         )
     elif args.command == 'agent-decider-replay':
         payload = replay_decider_candidate_rules(
