@@ -48,6 +48,7 @@ from app.agent_context.orchestrator_helpers import (
     normalize_requested_symbols as _normalize_requested_symbols,
     request_scope_from_items as _request_scope_from_items,
     resolve_dispatch_status as _resolve_dispatch_status,
+    compressed_batch_item_for_prompt as _compressed_batch_item_for_prompt,
     slot_from_items as _slot_from_items,
     strip_runtime_session_fields as _strip_runtime_session_fields,
     subagent_test_session_key as _subagent_test_session_key,
@@ -1070,7 +1071,7 @@ class OpenClawAgentClient:
             )
             if max_chars <= 0 or len(candidate) <= max_chars:
                 return candidate
-        fallback_item = _trim_batch_item_for_prompt(batch_items[0])
+        fallback_item = _compressed_batch_item_for_prompt(batch_items[0])
         fallback_symbol = str(fallback_item.get('symbol') or example_symbol).strip() or '000000'
         fallback_assigned_symbols = [fallback_symbol]
         fallback_assigned_symbols_json = json.dumps(fallback_assigned_symbols, ensure_ascii=False)

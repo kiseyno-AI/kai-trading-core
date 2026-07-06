@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import uuid
 from datetime import date, datetime, timezone
@@ -627,7 +628,12 @@ def trim_batch_item_for_prompt(item: dict[str, Any]) -> dict[str, Any]:
             'price_context_history',
         }
         for key in bulky_duplicate_keys:
-            trimmed.pop(key, None)
+            if key in trimmed:
+                trimmed[key] = {
+                    'compressed_payload': _compress_prompt_value(trimmed[key]),
+                    'source_field': key,
+                    'note': 'Bulky supporting context compressed for prompt transport; not dropped.',
+                }
     scores = trimmed.get('scores')
     if isinstance(scores, dict):
         trimmed['scores'] = _compact_factor_scores(scores)
@@ -727,6 +733,226 @@ def trim_batch_item_for_prompt(item: dict[str, Any]) -> dict[str, Any]:
             recent_external_news['items'] = items[:3]
             recent_external_news['item_count'] = min(recent_external_news.get('item_count', len(items)), len(recent_external_news['items']))
     return trimmed
+
+
+_PROMPT_COMPRESS_RAW_KEYS = {
+    'raw',
+    'raw_item',
+    'raw_items',
+    'raw_payload',
+    'raw_response',
+    'raw_rows',
+    'source_payload',
+    'full_payload',
+    'context_provenance',
+    'persisted_factor_rows',
+    'price_context_history',
+    'request_payload',
+    'response_payload',
+    'summary_payload',
+}
+
+_PROMPT_SLIM_PRIORITY_KEYS = (
+    'symbol',
+    'market_date',
+    'agent_name',
+    'role',
+    'preferred_action',
+    'next_day_open_action',
+    'tactical_action',
+    'decision_action',
+    'wait_reason',
+    'confidence',
+    'confidence_score_10',
+    'conviction_score_10',
+    'summary',
+    'thesis_summary',
+    'target_price',
+    'stop_loss_price',
+    'trigger_price',
+    'chase_limit_price',
+    'expected_return_pct',
+    'risk_flags',
+    'supporting_evidence',
+    'decision_risks',
+    'tactical_risks',
+    'data_quality_warnings',
+    'specialist_disagreement',
+    'traceability',
+    'market_regime_context',
+    'decision_input_quality_context',
+    'decider_data_quality_context',
+    'pre_decider_enrichment_context',
+    'upstream_summaries',
+    'upstream_traceability',
+    'previous_decision_context',
+)
+
+
+def _truncate_prompt_string(value: str, *, limit: int) -> str:
+    if len(value) <= limit:
+        return value
+    return f'{value[: max(0, limit - 32)]}...[truncated {len(value) - limit} chars]'
+
+
+def _stable_prompt_hash(value: Any) -> str:
+    encoded = json.dumps(jsonable_encoder(value), ensure_ascii=False, sort_keys=True, default=str)
+    return 'sha256:' + hashlib.sha256(encoded.encode('utf-8')).hexdigest()[:16]
+
+
+def _text_evidence_summary(value: str) -> dict[str, Any]:
+    stripped = value.strip()
+    sentences = [part.strip() for part in re.split(r'(?<=[.!?。！？])\s+|\n+', stripped) if part.strip()]
+    if not sentences:
+        sentences = [stripped] if stripped else []
+    snippets: list[str] = []
+    for sentence in sentences:
+        if sentence in snippets:
+            continue
+        snippets.append(_truncate_prompt_string(sentence, limit=260))
+        if len(snippets) >= 5:
+            break
+    if len(stripped) > 800 and stripped[-260:].strip() not in snippets:
+        snippets.append(_truncate_prompt_string(stripped[-260:].strip(), limit=260))
+    return {
+        'compression': 'text_evidence_summary_v1',
+        'char_count': len(value),
+        'hash': _stable_prompt_hash(value),
+        'snippets': snippets,
+    }
+
+
+def _scalar_summary(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return _truncate_prompt_string(value, limit=220)
+    return _truncate_prompt_string(str(value), limit=220)
+
+
+def _compressed_list_summary(value: list[Any], *, depth: int) -> dict[str, Any]:
+    numeric_values = [item for item in value if isinstance(item, (int, float)) and not isinstance(item, bool)]
+    scalar_counts: dict[str, int] = {}
+    for item in value:
+        if item is None or isinstance(item, (bool, int, float, str)):
+            label = str(_scalar_summary(item))
+            scalar_counts[label] = scalar_counts.get(label, 0) + 1
+    summary: dict[str, Any] = {
+        'compression': 'list_summary_v1',
+        'item_count': len(value),
+        'hash': _stable_prompt_hash(value),
+        'samples': [_compress_prompt_value(item, depth=depth + 1) for item in value[:5]],
+    }
+    if len(value) > 5:
+        summary['tail_sample'] = _compress_prompt_value(value[-1], depth=depth + 1)
+    if numeric_values:
+        summary['numeric_range'] = {
+            'min': min(numeric_values),
+            'max': max(numeric_values),
+            'avg': sum(float(item) for item in numeric_values) / len(numeric_values),
+        }
+    if scalar_counts:
+        summary['top_scalar_values'] = [
+            {'value': key, 'count': count}
+            for key, count in sorted(scalar_counts.items(), key=lambda item: (-item[1], item[0]))[:8]
+        ]
+    return summary
+
+
+def _compressed_dict_summary(value: dict[str, Any], *, depth: int) -> dict[str, Any]:
+    priority_payload = {
+        key: _compress_prompt_value(value[key], depth=depth + 1)
+        for key in _PROMPT_SLIM_PRIORITY_KEYS
+        if key in value
+    }
+    numeric_fields: dict[str, Any] = {}
+    scalar_fields: dict[str, Any] = {}
+    nested_shapes: dict[str, Any] = {}
+    for key, item in value.items():
+        key_text = str(key)
+        if key_text in priority_payload or key_text.startswith('_'):
+            continue
+        if isinstance(item, (int, float)) and not isinstance(item, bool):
+            numeric_fields[key_text] = item
+        elif item is None or isinstance(item, (bool, str)):
+            scalar_fields[key_text] = _scalar_summary(item)
+        elif isinstance(item, list):
+            nested_shapes[key_text] = {'type': 'list', 'item_count': len(item)}
+        elif isinstance(item, dict):
+            nested_shapes[key_text] = {'type': 'dict', 'key_count': len(item), 'keys': list(item.keys())[:12]}
+    summary: dict[str, Any] = {
+        'compression': 'dict_summary_v1',
+        'key_count': len(value),
+        'keys': list(value.keys())[:30],
+        'hash': _stable_prompt_hash(value),
+    }
+    if priority_payload:
+        summary['priority_fields'] = priority_payload
+    if numeric_fields:
+        summary['numeric_fields'] = numeric_fields
+    if scalar_fields:
+        summary['scalar_fields'] = scalar_fields
+    if nested_shapes:
+        summary['nested_shapes'] = nested_shapes
+    return summary
+
+
+def _compress_prompt_value(value: Any, *, depth: int = 0) -> Any:
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        if len(value) > (1600 if depth <= 2 else 700):
+            return _text_evidence_summary(value)
+        return value
+    if isinstance(value, list):
+        if len(value) > (8 if depth <= 2 else 4):
+            return _compressed_list_summary(value, depth=depth)
+        return [_compress_prompt_value(item, depth=depth + 1) for item in value]
+    if isinstance(value, dict):
+        if depth >= 5:
+            return _compressed_dict_summary(value, depth=depth)
+
+        ordered_keys = [
+            key for key in _PROMPT_SLIM_PRIORITY_KEYS if key in value
+        ]
+        ordered_keys.extend(
+            key
+            for key in value
+            if key not in set(ordered_keys)
+            and not str(key).startswith('_')
+        )
+        limit = 18 if depth <= 1 else 10
+        selected_keys = ordered_keys[:limit]
+        compact = {
+            str(key): (
+                {
+                    'compressed_payload': _compress_prompt_value(value[key], depth=depth + 1),
+                    'source_field': str(key),
+                    'note': 'Large/raw field compressed for prompt transport; not dropped.',
+                }
+                if str(key) in _PROMPT_COMPRESS_RAW_KEYS
+                else _compress_prompt_value(value[key], depth=depth + 1)
+            )
+            for key in selected_keys
+        }
+        dropped_count = max(0, len(ordered_keys) - len(selected_keys))
+        if dropped_count:
+            remaining = {str(key): value[key] for key in ordered_keys[limit:]}
+            compact['compressed_remaining_fields'] = _compressed_dict_summary(remaining, depth=depth + 1)
+        return compact
+    return _text_evidence_summary(str(value))
+
+
+def compressed_batch_item_for_prompt(item: dict[str, Any]) -> dict[str, Any]:
+    """Return a bounded one-symbol prompt payload without silently dropping raw evidence."""
+    trimmed = trim_batch_item_for_prompt(item)
+    compressed = _compress_prompt_value(trimmed)
+    return compressed if isinstance(compressed, dict) else {'payload': compressed}
+
+
+def slim_batch_item_for_prompt(item: dict[str, Any]) -> dict[str, Any]:
+    """Backward-compatible alias for older tests/imports."""
+    return compressed_batch_item_for_prompt(item)
 
 
 def extract_json_object(text: str | None) -> str | None:
