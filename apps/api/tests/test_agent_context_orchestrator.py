@@ -14,6 +14,7 @@ from app.agent_context.orchestrator import AgentFeedbackOrchestrator, OpenClawAg
 from app.agent_context.orchestrator_helpers import (
     build_signal_decider_payload,
     coerce_decoded_batch_response,
+    compressed_batch_item_for_prompt,
     correlate_decoded_batch_response,
     repair_json_tail,
     trim_batch_item_for_prompt,
@@ -1259,6 +1260,72 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertNotIn('Assigned symbols (exact authoritative strings): ["005930", "000660"]', message)
         self.assertNotIn('output exactly 2 item(s)', message)
         self.assertNotIn('"symbol": "000660"', message)
+
+    def test_signal_decider_prompt_trim_final_fallback_compresses_large_one_symbol_payload(self):
+        fake_settings = SimpleNamespace(
+            openclaw_base_url='https://openclaw.example',
+            openclaw_gateway_token='gateway-token',
+            openclaw_agent_timeout_seconds=30,
+            openclaw_agent_max_retries=0,
+            openclaw_agent_retry_backoff_seconds=0,
+            openclaw_agent_max_prompt_chars=60000,
+        )
+
+        huge_item = {
+            'symbol': '005930',
+            'market_date': '2026-04-14',
+            'context_provenance': {'raw': 'x' * 80000},
+            'upstream_summaries': {
+                'technical-summarizer': {
+                    'summary': '상승 추세 확인. ' * 1000,
+                    'raw_payload': 'y' * 80000,
+                    'risk_flags': ['flag'] * 50,
+                }
+            },
+            'decision_input_quality_context': {
+                'final_judgment': {'decision_band': 'high_conviction', 'hard_blocks': []},
+                'raw_rows': ['z' * 1000] * 100,
+            },
+        }
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            client = OpenClawAgentClient()
+            message = client._build_batch_message(
+                spec=orchestrator_module.DISPATCH_SPECS[-1],
+                market_date=orchestrator_module.date.fromisoformat('2026-04-14'),
+                batch_items=[huge_item],
+                request_marker='batch-request::large-one',
+            )
+
+        self.assertLess(len(message), fake_settings.openclaw_agent_max_prompt_chars)
+        self.assertIn('Assigned symbols (exact authoritative strings): ["005930"]', message)
+        self.assertIn('"symbol": "005930"', message)
+        self.assertIn('compressed_payload', message)
+        self.assertIn('hash', message)
+        self.assertIn('context_provenance', message)
+        self.assertIn('raw_payload', message)
+
+    def test_compressed_batch_item_for_prompt_keeps_bulky_raw_fields_as_summaries(self):
+        compressed = compressed_batch_item_for_prompt(
+            {
+                'symbol': '005930',
+                'market_date': '2026-04-14',
+                'raw_payload': 'x' * 5000,
+                'upstream_summaries': {
+                    'signal-decider': {
+                        'summary': '요약' * 1000,
+                        'response_payload': {'raw': 'y' * 5000},
+                    }
+                },
+            }
+        )
+
+        encoded = json.dumps(compressed, ensure_ascii=False)
+        self.assertIn('005930', encoded)
+        self.assertIn('compressed_payload', encoded)
+        self.assertIn('text_evidence_summary_v1', encoded)
+        self.assertIn('raw_payload', encoded)
+        self.assertIn('response_payload', encoded)
 
     def test_reuse_existing_skips_reusable_symbol_role_pairs(self):
         service = AgentFeedbackOrchestrator()
