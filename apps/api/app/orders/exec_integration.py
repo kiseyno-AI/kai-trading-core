@@ -1204,7 +1204,8 @@ class SignalDeciderExecIntegrationService:
                 runtime_payload=runtime_result['runtime'],
             )
 
-        plan_view = signal_decider_next_open_execution_service.list_plan_items(
+        plan_view = await asyncio.to_thread(
+            signal_decider_next_open_execution_service.list_plan_items,
             target_trade_date=resolved_target_date,
             account_reference=resolved_account_reference,
             refresh=False,
