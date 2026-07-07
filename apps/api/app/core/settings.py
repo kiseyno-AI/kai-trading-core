@@ -21,6 +21,8 @@ class Settings(BaseSettings):
     upstream_http_log_file_name: str = 'upstream-http.log'
     api_log_rotation_max_bytes: int = 20 * 1024 * 1024
     api_log_rotation_backup_count: int = 10
+    startup_maintenance_enabled: bool = True
+    background_runner_enabled: bool = True
 
     db_auto_upgrade: bool = True
     database_url: Optional[str] = None

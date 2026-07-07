@@ -104,8 +104,10 @@ async def lifespan(_: FastAPI):
         logger.warning('Database initialization failed; starting in degraded mode: %s', exc)
     await kis_realtime_order_notice_service.start()
     await kis_realtime_price_service.start()
-    startup_maintenance_task = asyncio.create_task(_run_startup_maintenance(), name='startup-maintenance')
-    await background_runner.start()
+    if settings.startup_maintenance_enabled:
+        startup_maintenance_task = asyncio.create_task(_run_startup_maintenance(), name='startup-maintenance')
+    if settings.background_runner_enabled:
+        await background_runner.start()
     try:
         yield
     finally:
