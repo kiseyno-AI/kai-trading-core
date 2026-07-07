@@ -151,19 +151,32 @@ class AgentContextReuseService:
             ).all()
             symbol_id_map = {str(row.symbol): int(row.id) for row in symbol_rows}
 
-            latest_feedback_map: dict[tuple[str, str], AgentContextFeedback] = {}
+            latest_feedback_map: dict[tuple[str, str], Any] = {}
             latest_failure_map: dict[tuple[str, str], AgentContextFeedbackFailure] = {}
             for role in requested_roles:
                 agent_name = ROLE_TO_AGENT[role]
                 for chunk in _chunked(normalized_symbols, 500):
                     feedback_rows = session.execute(
-                        select(AgentContextFeedback)
+                        select(
+                            AgentContextFeedback.id,
+                            AgentContextFeedback.market_date,
+                            AgentContextFeedback.symbol,
+                            AgentContextFeedback.agent_name,
+                            AgentContextFeedback.run_id,
+                            AgentContextFeedback.summary_payload,
+                            AgentContextFeedback.feedback_payload,
+                            AgentContextFeedback.context_payload,
+                            AgentContextFeedback.received_at,
+                        )
                         .where(AgentContextFeedback.market_date <= normalized_market_date)
                         .where(AgentContextFeedback.symbol.in_(chunk))
                         .where(AgentContextFeedback.agent_name == agent_name)
+                        .distinct(AgentContextFeedback.symbol)
                         .order_by(AgentContextFeedback.symbol.asc(), AgentContextFeedback.market_date.desc(), AgentContextFeedback.received_at.desc(), AgentContextFeedback.id.desc())
-                    ).scalars().all()
+                    ).all()
                     for row in feedback_rows:
+                        if not hasattr(row, 'feedback_payload'):
+                            continue
                         key = (row.symbol, agent_name)
                         if key not in latest_feedback_map:
                             latest_feedback_map[key] = row

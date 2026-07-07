@@ -786,13 +786,15 @@ class AgentFeedbackRetryService:
             if requested_symbols is not None
             else []
         )
-        previous_run = agent_context_feedback_run_state_service.find_latest_run(
-            market_date=config.market_date,
-            requested_symbols=list(requested_symbols) if requested_symbols is not None else None,
-            requested_roles=list(roles),
-            request_modes=[DAILY_RETRY_CYCLE_MODE],
-            feedback_scope_mode=feedback_scope_mode,
-        )
+        previous_run = None
+        if not effective_force_recompute:
+            previous_run = agent_context_feedback_run_state_service.find_latest_run(
+                market_date=config.market_date,
+                requested_symbols=list(requested_symbols) if requested_symbols is not None else None,
+                requested_roles=list(roles),
+                request_modes=[DAILY_RETRY_CYCLE_MODE],
+                feedback_scope_mode=feedback_scope_mode,
+            )
         previous_cycle_number, previous_completed_cycles = self._extract_prior_cycle_state(previous_run)
         initial_snapshot = self._build_role_sequence_snapshot(
             market_date=config.market_date,
