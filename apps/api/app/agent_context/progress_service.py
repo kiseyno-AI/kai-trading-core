@@ -236,6 +236,8 @@ class AgentContextProgressService:
         resolved_run: dict[str, Any] | None,
         child_run_id: str | None,
     ) -> bool:
+        if child_run_id is not None:
+            return False
         if child_run_id is None or not isinstance(resolved_run, dict):
             return True
         request_payload = (

@@ -87,12 +87,17 @@ class AgentContextStatusService:
         latest_run_scope_mode = self._feedback_scope_mode_from_run(latest_run)
 
         with session_scope() as session:
-            orm_rows = session.execute(
-                select(AgentContextFeedback)
+            feedback_rows = session.execute(
+                select(
+                    AgentContextFeedback.symbol,
+                    AgentContextFeedback.agent_name,
+                    AgentContextFeedback.run_id,
+                    AgentContextFeedback.received_at,
+                )
                 .where(AgentContextFeedback.market_date == normalized_market_date)
                 .where(AgentContextFeedback.symbol.in_(normalized_symbols))
                 .order_by(AgentContextFeedback.symbol.asc(), AgentContextFeedback.received_at.desc(), AgentContextFeedback.id.desc())
-            ).scalars().all()
+            ).all()
             rows = [
                 {
                     'symbol': row.symbol,
@@ -100,7 +105,7 @@ class AgentContextStatusService:
                     'run_id': row.run_id,
                     'received_at': row.received_at.isoformat() if row.received_at else None,
                 }
-                for row in orm_rows
+                for row in feedback_rows
             ]
             orm_failure_rows = session.execute(
                 select(AgentContextFeedbackFailure)
