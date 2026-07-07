@@ -23,7 +23,7 @@ async def get_execution_runtime_status(
 @router.get('/monitored-symbols')
 async def list_execution_runtime_monitored_symbols(
     market_date: date | None = Query(default=None),
-    refresh: bool = Query(default=True),
+    refresh: bool = Query(default=False),
 ) -> dict[str, Any]:
     try:
         return await signal_decider_exec_integration_service.list_runtime_monitored_symbols(
@@ -40,7 +40,7 @@ async def list_execution_runtime_monitored_symbols(
 @router.get('/daily-board')
 async def get_execution_runtime_daily_board(
     market_date: date | None = Query(default=None),
-    refresh: bool = Query(default=True),
+    refresh: bool = Query(default=False),
 ) -> dict[str, Any]:
     try:
         return await signal_decider_exec_integration_service.get_runtime_daily_board(
@@ -58,7 +58,7 @@ async def get_execution_runtime_daily_board(
 async def get_execution_runtime_symbol_detail(
     symbol: str,
     market_date: date | None = Query(default=None),
-    refresh: bool = Query(default=True),
+    refresh: bool = Query(default=False),
 ) -> dict[str, Any]:
     try:
         return await signal_decider_exec_integration_service.get_runtime_symbol_detail(

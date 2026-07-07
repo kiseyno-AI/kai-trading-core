@@ -1193,7 +1193,8 @@ async def get_agent_feedback_progress(
     run_id: str | None = Query(default=None),
 ) -> dict:
     try:
-        return agent_context_progress_service.get_feedback_progress(
+        return await run_in_threadpool(
+            agent_context_progress_service.get_feedback_progress,
             market_date=market_date,
             symbols=symbols,
             run_id=run_id,
