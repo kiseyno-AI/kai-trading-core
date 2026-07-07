@@ -1134,7 +1134,8 @@ class SignalDeciderExecIntegrationService:
                 }
             )
 
-        plan_view = signal_decider_next_open_execution_service.list_plan_items(
+        plan_view = await asyncio.to_thread(
+            signal_decider_next_open_execution_service.list_plan_items,
             target_trade_date=resolved_target_date,
             account_reference=resolved_account_reference,
             refresh=False,
@@ -1203,7 +1204,8 @@ class SignalDeciderExecIntegrationService:
                 runtime_payload=runtime_result['runtime'],
             )
 
-        plan_view = signal_decider_next_open_execution_service.list_plan_items(
+        plan_view = await asyncio.to_thread(
+            signal_decider_next_open_execution_service.list_plan_items,
             target_trade_date=resolved_target_date,
             account_reference=resolved_account_reference,
             refresh=False,
@@ -1344,7 +1346,8 @@ class SignalDeciderExecIntegrationService:
             symbol=None,
             trigger=trigger,
         )
-        payload = self._build_runtime_daily_board_payload(
+        payload = await asyncio.to_thread(
+            self._build_runtime_daily_board_payload,
             market_date=resolved_market_date,
             refresh=refresh,
             overview=overview,
@@ -1398,7 +1401,8 @@ class SignalDeciderExecIntegrationService:
             market_date=resolved_market_date,
             trigger=trigger,
         )
-        payload = self._build_runtime_monitored_symbols_payload(
+        payload = await asyncio.to_thread(
+            self._build_runtime_monitored_symbols_payload,
             board=board,
             refresh=refresh,
             refresh_state=refresh_state,
@@ -1675,7 +1679,8 @@ class SignalDeciderExecIntegrationService:
             symbol=resolved_symbol,
             trigger=trigger,
         )
-        payload = self._build_runtime_symbol_detail_payload(
+        payload = await asyncio.to_thread(
+            self._build_runtime_symbol_detail_payload,
             market_date=resolved_market_date,
             symbol=resolved_symbol,
             refresh=refresh,

@@ -1592,6 +1592,30 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(short_item['exec_agent_approved'])
         self.assertFalse(short_item['exec_monitoring_active'])
 
+    async def test_exec_overview_offloads_plan_read_to_threadpool(self) -> None:
+        to_thread_calls = []
+
+        async def run_inline(func, *args, **kwargs):
+            to_thread_calls.append((func, kwargs))
+            return func(*args, **kwargs)
+
+        to_thread = AsyncMock(side_effect=run_inline)
+        with patch('app.orders.exec_integration.asyncio.to_thread', new=to_thread):
+            overview = await self.service.list_signal_decider_exec_overview(
+                target_trade_date=self.target_trade_date,
+                refresh=False,
+                trigger='test',
+            )
+
+        to_thread.assert_awaited_once()
+        offloaded_func, offloaded_kwargs = to_thread_calls[0]
+        self.assertIs(offloaded_func.__self__, signal_decider_next_open_execution_service)
+        self.assertEqual(offloaded_func.__name__, 'list_plan_items')
+        self.assertEqual(offloaded_kwargs['target_trade_date'], self.target_trade_date)
+        self.assertIsNone(offloaded_kwargs['account_reference'])
+        self.assertFalse(offloaded_kwargs['refresh'])
+        self.assertEqual(len(overview['items']), 1)
+
     async def test_exec_overview_refresh_persists_remote_readback(self) -> None:
         dispatch_result = await self.service.dispatch_next_open_plan(
             target_trade_date=self.target_trade_date,
@@ -3536,18 +3560,35 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 refresh_call_count += 1
                 refresh_started.set()
                 await release_refresh.wait()
+                runtime_result = await self.service.runtime_status(refresh=False)
+                return {
+                    'request': {
+                        'target_trade_date': str(kwargs.get('target_trade_date')),
+                        'account_reference': kwargs.get('account_reference'),
+                        'symbol': kwargs.get('symbol'),
+                        'refresh': True,
+                    },
+                    'integration': runtime_result['integration'],
+                    'runtime': runtime_result['runtime'],
+                    'summary': {},
+                    'items': [],
+                }
             return await original_overview(**kwargs)
+
+        async def run_inline(func, *args, **kwargs):
+            return func(*args, **kwargs)
 
         self.service.list_signal_decider_exec_overview = slow_refresh_overview
         try:
-            monitored = await asyncio.wait_for(
-                self.service.list_runtime_monitored_symbols(
-                    market_date=empty_market_date,
-                    refresh=True,
-                    trigger='test',
-                ),
-                timeout=1.0,
-            )
+            with patch('app.orders.exec_integration.asyncio.to_thread', new=AsyncMock(side_effect=run_inline)):
+                monitored = await asyncio.wait_for(
+                    self.service.list_runtime_monitored_symbols(
+                        market_date=empty_market_date,
+                        refresh=True,
+                        trigger='test',
+                    ),
+                    timeout=1.0,
+                )
 
             self.assertEqual(monitored['summary']['items_total'], 0)
             self.assertEqual(monitored['items'], [])

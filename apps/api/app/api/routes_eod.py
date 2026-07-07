@@ -83,7 +83,7 @@ async def get_eod_status() -> dict:
 
 @router.get('/freshness')
 async def get_eod_freshness() -> dict:
-    return eod_freshness_service.read()
+    return await asyncio.to_thread(eod_freshness_service.read)
 
 
 @router.get('/screening-results')
