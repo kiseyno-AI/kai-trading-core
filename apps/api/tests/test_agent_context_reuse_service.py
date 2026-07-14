@@ -176,6 +176,30 @@ class FundamentalReuseServiceTests(unittest.TestCase):
         )
         self.assertIn('technical-summarizer', missing_roles)
 
+    def test_decider_upstream_bundle_uses_same_day_feedback_pending_refresh(self):
+        decision = _decision(
+            should_dispatch=True,
+            reason='fundamental_input_fingerprint_changed',
+        )
+        decision.latest_feedback['market_date'] = '2026-04-15'
+
+        upstream_summaries, upstream_traceability, missing_roles = build_upstream_feedback_bundle(
+            symbol='005930',
+            market_date=__import__('datetime').date.fromisoformat('2026-04-15'),
+            buffered_lookup={},
+            upstream_reuse_decisions={
+                '005930': {
+                    'fundamental-summarizer': decision,
+                }
+            },
+            upstream_summary_roles=('fundamental-summarizer',),
+        )
+
+        self.assertEqual(missing_roles, [])
+        self.assertEqual(upstream_summaries['fundamental-summarizer']['summary'], 'reusable fundamentals')
+        self.assertTrue(upstream_traceability['fundamental-summarizer']['refresh_pending'])
+        self.assertEqual(upstream_traceability['fundamental-summarizer']['source'], 'persisted_feedback')
+
 
 if __name__ == '__main__':
     unittest.main()

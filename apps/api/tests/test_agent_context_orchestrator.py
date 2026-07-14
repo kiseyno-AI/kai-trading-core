@@ -2185,7 +2185,7 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertIn(result['request']['request_run_id'], cleanup_target.session_key)
         self.assertIn('feedback-fresh/signal-decider/', cleanup_target.session_key)
 
-    def test_build_upstream_feedback_bundle_does_not_reuse_same_day_persisted_summary_when_role_requires_redispatch(self):
+    def test_build_upstream_feedback_bundle_reuses_same_day_persisted_summary_when_role_requires_redispatch(self):
         upstream_summaries, upstream_traceability, missing_roles = AgentFeedbackOrchestrator._build_upstream_feedback_bundle(
             symbol='005930',
             market_date=orchestrator_module.date.fromisoformat('2026-04-14'),
@@ -2216,10 +2216,14 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
             },
         )
 
-        self.assertEqual(set(upstream_summaries.keys()), {'eod-summarizer', 'fundamental-summarizer'})
-        self.assertNotIn('technical-summarizer', upstream_summaries)
-        self.assertEqual(missing_roles, ['technical-summarizer'])
+        self.assertEqual(
+            set(upstream_summaries.keys()),
+            {'eod-summarizer', 'technical-summarizer', 'fundamental-summarizer'},
+        )
+        self.assertEqual(upstream_summaries['technical-summarizer']['summary'], 'stale technical')
+        self.assertEqual(missing_roles, [])
         self.assertEqual(upstream_traceability['eod-summarizer']['source'], 'current_run_buffer')
+        self.assertTrue(upstream_traceability['technical-summarizer']['refresh_pending'])
 
     def test_signal_decider_missing_upstream_records_dependency_context_without_dispatch(self):
         service = AgentFeedbackOrchestrator()

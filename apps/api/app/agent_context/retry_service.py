@@ -22,7 +22,7 @@ from app.agent_context.eligibility import (
 from app.agent_context.orchestrator import agent_feedback_orchestrator
 from app.agent_context.progress_service import agent_context_progress_service
 from app.agent_context.reuse_service import agent_context_reuse_service
-from app.agent_context.roles import DEFAULT_AGENT_NAMES, SIGNAL_DECIDER_AGENT_NAME
+from app.agent_context.roles import DEFAULT_AGENT_NAMES, SIGNAL_DECIDER_AGENT_NAME, SUMMARIZER_AGENT_NAMES
 from app.agent_context.run_modes import (
     DAILY_RETRY_CYCLE_MODE,
     FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
@@ -200,6 +200,47 @@ class AgentFeedbackRetryService:
             failed_by_role[role].add(symbol)
         return completed_by_role, failed_by_role
 
+    def _filter_decider_retry_ready_symbols(
+        self,
+        *,
+        market_date: date,
+        symbols: Sequence[str],
+    ) -> tuple[str, ...]:
+        normalized_symbols = _normalize_optional_symbol_scope(symbols)
+        if not normalized_symbols:
+            return ()
+
+        upstream_decisions = agent_context_reuse_service.build_latest_decisions(
+            market_date=market_date,
+            symbols=normalized_symbols,
+            roles=SUMMARIZER_AGENT_NAMES,
+            force_recompute=False,
+        )
+        ready_symbols: list[str] = []
+        for symbol in normalized_symbols:
+            symbol_decisions = upstream_decisions.get(symbol, {})
+            upstream_ready = True
+            for role in SUMMARIZER_AGENT_NAMES:
+                decision = symbol_decisions.get(role)
+                latest_feedback = getattr(decision, 'latest_feedback', None) if decision is not None else None
+                feedback_market_date = (
+                    latest_feedback.get('market_date')
+                    if isinstance(latest_feedback, dict)
+                    else None
+                )
+                has_same_day_feedback = feedback_market_date == market_date.isoformat()
+                has_reusable_feedback = (
+                    decision is not None
+                    and not bool(getattr(decision, 'should_dispatch', True))
+                    and isinstance(latest_feedback, dict)
+                )
+                if not (has_same_day_feedback or has_reusable_feedback):
+                    upstream_ready = False
+                    break
+            if upstream_ready:
+                ready_symbols.append(symbol)
+        return tuple(ready_symbols)
+
     @staticmethod
     def _classify_role_boundary_status(
         *,
@@ -306,6 +347,11 @@ class AgentFeedbackRetryService:
                     force_recompute=force_recompute,
                 )
             )
+            if role == SIGNAL_DECIDER_AGENT_NAME and not boundary_pending_symbols:
+                retry_pending_symbols = self._filter_decider_retry_ready_symbols(
+                    market_date=market_date,
+                    symbols=failed_symbols,
+                )
             role_states[role] = RoleSequenceRoleState(
                 role=role,
                 total_symbols=len(role_symbols),
@@ -641,7 +687,8 @@ class AgentFeedbackRetryService:
     @staticmethod
     def _retry_symbols_for_role(role_state: RoleSequenceRoleState) -> tuple[str, ...]:
         if role_state.role == SIGNAL_DECIDER_AGENT_NAME and not role_state.boundary_pending_symbols:
-            return role_state.failed_symbols
+            retry_ready = set(role_state.retry_pending_symbols)
+            return tuple(symbol for symbol in role_state.failed_symbols if symbol in retry_ready)
         return role_state.retry_pending_symbols
 
     def _retry_pending_roles(self, snapshot: RoleSequenceSnapshot) -> list[str]:

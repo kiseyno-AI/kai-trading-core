@@ -14,8 +14,8 @@ from app.agent_context.prerequisite_service import FEEDBACK_DATA_PREREQUISITE_ST
 from scripts import run_feedback_retry_cycles
 
 
-def _decision(*, should_dispatch):
-    return SimpleNamespace(should_dispatch=should_dispatch)
+def _decision(*, should_dispatch, latest_feedback=None):
+    return SimpleNamespace(should_dispatch=should_dispatch, latest_feedback=latest_feedback)
 
 
 def _feedback_prerequisites(*, status: str = 'ready', missing_stage_ids: list[str] | None = None) -> dict:
@@ -187,6 +187,33 @@ class FeedbackRetryCycleTests(unittest.TestCase):
                 )
 
         self.assertEqual(result, [])
+
+    def test_filter_decider_retry_ready_symbols_waits_for_upstream_summaries(self):
+        service = AgentFeedbackRetryService()
+        market_date = date.fromisoformat('2026-04-16')
+        decisions = {
+            '005930': {
+                'eod-summarizer': _decision(should_dispatch=False, latest_feedback={'market_date': '2026-04-16'}),
+                'technical-summarizer': _decision(should_dispatch=True, latest_feedback={'market_date': '2026-04-16'}),
+                'fundamental-summarizer': _decision(should_dispatch=False, latest_feedback={'market_date': '2026-04-15'}),
+            },
+            '000660': {
+                'eod-summarizer': _decision(should_dispatch=False, latest_feedback={'market_date': '2026-04-16'}),
+                'technical-summarizer': _decision(should_dispatch=False, latest_feedback={'market_date': '2026-04-16'}),
+                'fundamental-summarizer': _decision(should_dispatch=True, latest_feedback=None),
+            },
+        }
+
+        with patch(
+            'app.agent_context.retry_service.agent_context_reuse_service.build_latest_decisions',
+            return_value=decisions,
+        ):
+            result = service._filter_decider_retry_ready_symbols(
+                market_date=market_date,
+                symbols=('005930', '000660'),
+            )
+
+        self.assertEqual(result, ('005930',))
 
     def test_load_incomplete_symbols_uses_feedback_eligible_universe(self):
         service = AgentFeedbackRetryService()

@@ -601,6 +601,7 @@ def _load_prior_positive_decision_reasons(
                 .where(AgentContextFeedback.market_date < market_date)
                 .where(AgentContextFeedback.symbol.in_(list(symbols)))
                 .where(AgentContextFeedback.agent_name.in_(list(DECISION_SUPPORT_AGENT_NAMES)))
+                .distinct(AgentContextFeedback.symbol, AgentContextFeedback.agent_name)
                 .order_by(
                     AgentContextFeedback.symbol.asc(),
                     AgentContextFeedback.agent_name.asc(),
