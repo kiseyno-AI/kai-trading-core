@@ -1079,6 +1079,7 @@ class AgentFeedbackRetryService:
                                     roles=roles,
                                     eligible_symbols=scoped_feedback_symbols,
                                     role_symbol_scopes=role_symbol_scopes,
+                                    force_recompute=effective_force_recompute,
                                 )
                                 self._sync_runtime_state(
                                     market_date=config.market_date,
