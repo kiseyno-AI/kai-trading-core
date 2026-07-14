@@ -1365,6 +1365,61 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertEqual([item['symbol'] for item in feedback_service.bulk_items], ['000660'])
         self.assertEqual([target.symbol for target in cleanup_service.targets], ['000660'])
 
+    def test_dispatch_finalization_counts_reused_successes_with_missing_terminal_failures(self):
+        service = AgentFeedbackOrchestrator()
+        client = RecordingBatchClient()
+        service.client = client
+        feedback_service = FakeFeedbackService()
+        cleanup_service = FakeSessionCleanupService()
+        failure_service = RecordingFailureService()
+        run_state_service = RecordingRunStateService()
+        symbols = [f'{index:06d}' for index in range(1, 21)]
+        reused_symbols = set(symbols[:15])
+        missing_symbols = symbols[15:]
+        reuse_service = SimpleNamespace(
+            build_latest_decisions=lambda **kwargs: {
+                symbol: {
+                    'eod-summarizer': _reuse_decision(symbol not in reused_symbols),
+                }
+                for symbol in symbols
+            }
+        )
+        fake_settings = SimpleNamespace(openclaw_agent_symbol_chunk_size=1, openclaw_agent_parallel_subtasks=1)
+
+        with patch.object(service, '_prepare_role_dispatch_items', return_value=[]):
+            with patch.object(orchestrator_module, 'settings', fake_settings):
+                with patch.object(orchestrator_module, 'agent_context_reuse_service', reuse_service):
+                    with patch.object(orchestrator_module, 'agent_context_feedback_run_state_service', run_state_service):
+                        with patch.object(orchestrator_module, 'agent_context_read_service', DynamicFakeAgentContextReadService()):
+                            with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
+                                with patch.object(orchestrator_module, 'agent_context_feedback_failure_service', failure_service):
+                                    with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
+                                        with _patch_feedback_eligibility(*symbols):
+                                            result = service.dispatch_for_symbols(
+                                                market_date='2026-04-14',
+                                                symbols=symbols,
+                                                roles=['eod-summarizer'],
+                                                reuse_existing=True,
+                                            )
+
+        self.assertEqual(client.calls, [])
+        self.assertEqual(feedback_service.bulk_calls, [])
+        self.assertEqual(result['summary']['status'], 'partial')
+        self.assertEqual(result['summary']['completed'], 15)
+        self.assertEqual(result['summary']['reused_count'], 15)
+        self.assertEqual(result['summary']['computed_count'], 0)
+        self.assertEqual(result['summary']['failed'], 5)
+        self.assertEqual(run_state_service.finished[0]['status'], 'partial')
+        self.assertEqual(run_state_service.finished[0]['completed_count'], 15)
+        self.assertEqual(len(failure_service.recorded), 5)
+        self.assertEqual(
+            {failure['symbol'] for failure in failure_service.recorded},
+            set(missing_symbols),
+        )
+        self.assertTrue(
+            all(failure['failure_kind'] == 'dispatch_incomplete' for failure in failure_service.recorded)
+        )
+
     def test_dispatch_for_symbols_returns_blocked_gate_when_prerequisites_are_not_ready(self):
         service = AgentFeedbackOrchestrator()
 
