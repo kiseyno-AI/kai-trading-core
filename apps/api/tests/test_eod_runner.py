@@ -350,3 +350,47 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
             fake_service.release_refresh.set()
             if fake_service.task is not None:
                 await asyncio.gather(fake_service.task, return_exceptions=True)
+
+    async def test_closed_loop_schedules_eod_when_runtime_background_disabled(self) -> None:
+        runner = EODBackgroundRunner(interval_seconds=0)
+        market_state = MarketState(
+            market='KRX',
+            state='CLOSED',
+            is_trading_day=True,
+            is_open=False,
+            server_time='2026-04-30T15:45:00+09:00',
+            session_open_at='2026-04-30T09:00:00+09:00',
+            session_close_at='2026-04-30T15:30:00+09:00',
+        )
+
+        async def stop_after_tick(_seconds: int) -> None:
+            runner._running = False
+
+        with (
+            patch('app.eod.runner.settings.background_runner_enabled', False),
+            patch('app.eod.runner.async_get_market_state', return_value=market_state),
+            patch(
+                'app.eod.runner.auto_pykrx_eod_scheduler.schedule_daily_pipeline_if_due',
+                new=AsyncMock(),
+            ) as schedule_daily,
+            patch(
+                'app.eod.runner.trading_order_reconciliation_service.run_periodic_if_due',
+                new=AsyncMock(),
+            ) as reconcile,
+            patch(
+                'app.eod.runner.market_snapshot_service.refresh_market_snapshot_if_due',
+                new=AsyncMock(),
+            ) as refresh_snapshot,
+            patch(
+                'app.eod.runner.portfolio_summary_service.refresh_portfolio_summary_if_due',
+                new=AsyncMock(),
+            ) as refresh_portfolio,
+            patch('app.eod.runner.asyncio.sleep', side_effect=stop_after_tick),
+        ):
+            runner._running = True
+            await runner._run_loop()
+
+        schedule_daily.assert_awaited_once_with()
+        reconcile.assert_not_awaited()
+        refresh_snapshot.assert_not_awaited()
+        refresh_portfolio.assert_not_awaited()
