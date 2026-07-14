@@ -407,8 +407,10 @@ def _resolve_market_date_window(
     return resolved_from, resolved_to
 
 
-def _normalize_optional_text(value: str | None, *, default: str | None = None) -> str | None:
+def _normalize_optional_text(value: str | None, *, default: str | None = None, max_length: int | None = None) -> str | None:
     normalized = str(value or '').strip()
+    if normalized and max_length is not None and max_length > 0:
+        return normalized[:max_length]
     if normalized:
         return normalized
     return default
@@ -2574,7 +2576,8 @@ class SignalDeciderLoopService:
                 'suggested_holding_period': _normalize_optional_text(
                     str(response_payload.get('suggested_holding_period'))
                     if response_payload.get('suggested_holding_period') is not None
-                    else None
+                    else None,
+                    max_length=64,
                 ),
                 'confidence_score_10': _to_float(response_payload.get('confidence_score_10')),
                 'conviction_score_10': _to_float(response_payload.get('conviction_score_10')),
@@ -2711,7 +2714,8 @@ class SignalDeciderLoopService:
                 'suggested_holding_period': _normalize_optional_text(
                     str(response_payload.get('expected_holding_period'))
                     if response_payload.get('expected_holding_period') is not None
-                    else None
+                    else None,
+                    max_length=64,
                 ),
                 'confidence_score_10': _to_float(response_payload.get('confidence_score_10')),
                 'conviction_score_10': _to_float(response_payload.get('conviction_score_10')),
