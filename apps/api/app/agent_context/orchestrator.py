@@ -3790,16 +3790,16 @@ class AgentFeedbackOrchestrator:
                     )
 
                 final_snapshot = runtime_feedback_state_store.get_run(normalized_market_date, run_id=request_run_id) or state
-                completed_count = len(final_snapshot.buffered_feedback_rows)
-                failed_count = len(final_snapshot.buffered_failures)
                 progress_counts = final_snapshot.to_progress_summary()
+                completed_count = int(progress_counts.get('completed_feedback_count') or 0)
+                failed_count = len(final_snapshot.buffered_failures)
                 final_status = _resolve_dispatch_status(completed=completed_count, failed=failed_count)
                 response_payload = {
                     'request': request_payload,
                     'summary': {
                         'status': final_status,
                         'completed': completed_count,
-                        'computed_count': int(progress_counts.get('computed_feedback_count') or completed_count),
+                        'computed_count': int(progress_counts.get('computed_feedback_count') or 0),
                         'reused_count': int(progress_counts.get('reused_feedback_count') or 0),
                         'stale_count': int(progress_counts.get('stale_feedback_count') or 0),
                         'failed': failed_count,
@@ -3877,7 +3877,8 @@ class AgentFeedbackOrchestrator:
                         error_message=str(cleanup_exc),
                     )
             final_snapshot = runtime_feedback_state_store.get_run(normalized_market_date, run_id=request_run_id) or final_snapshot
-            completed_count = len(final_snapshot.buffered_feedback_rows) if final_snapshot is not None else 0
+            progress_counts = final_snapshot.to_progress_summary() if final_snapshot is not None else {}
+            completed_count = int(progress_counts.get('completed_feedback_count') or 0)
             failed_count = len(final_snapshot.buffered_failures) if final_snapshot is not None else 0
             if raised_exception is not None or finalization_error is not None:
                 final_status = 'partial' if (completed_count > 0 or failed_count > 0) else 'failed'
@@ -3967,7 +3968,7 @@ class AgentFeedbackOrchestrator:
                 progress_counts = final_snapshot.to_progress_summary() if final_snapshot else {}
                 response_payload['summary']['status'] = final_status
                 response_payload['summary']['completed'] = completed_count
-                response_payload['summary']['computed_count'] = int(progress_counts.get('computed_feedback_count') or completed_count)
+                response_payload['summary']['computed_count'] = int(progress_counts.get('computed_feedback_count') or 0)
                 response_payload['summary']['reused_count'] = int(progress_counts.get('reused_feedback_count') or 0)
                 response_payload['summary']['stale_count'] = int(progress_counts.get('stale_feedback_count') or 0)
                 response_payload['summary']['failed'] = failed_count
