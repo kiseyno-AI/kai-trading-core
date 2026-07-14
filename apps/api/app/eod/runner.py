@@ -104,7 +104,8 @@ class EODBackgroundRunner:
         while self._running:
             try:
                 market = await async_get_market_state()
-                if market.state == 'PREOPEN':
+                runtime_background_enabled = settings.background_runner_enabled
+                if runtime_background_enabled and market.state == 'PREOPEN':
                     await self._run_blocking_step('refresh_master_if_due', refresh_master_if_due)
                     await self._run_blocking_step(
                         'signal_decider_next_open_execution_refresh_plan_if_due',
@@ -122,7 +123,7 @@ class EODBackgroundRunner:
                                 trigger='preopen_exec_dispatch',
                             ),
                         )
-                elif market.state == 'OPEN':
+                elif runtime_background_enabled and market.state == 'OPEN':
                     if signal_decider_exec_integration_service.should_delegate_execution():
                         self._schedule_exec_readback_refresh(
                             target_trade_date=market.server_time[:10],
@@ -141,27 +142,28 @@ class EODBackgroundRunner:
                                 trigger='market_open_scheduler'
                             ),
                         )
-                elif market.state == 'CLOSED':
+                if market.state == 'CLOSED':
                     await self._run_async_step(
                         'auto_pykrx_schedule_daily_pipeline_if_due',
                         auto_pykrx_eod_scheduler.schedule_daily_pipeline_if_due(),
                     )
-                await self._run_async_step(
-                    'trading_order_reconciliation_periodic',
-                    trading_order_reconciliation_service.run_periodic_if_due(),
-                )
-                await self._run_async_step(
-                    'market_snapshot_refresh_if_due',
-                    market_snapshot_service.refresh_market_snapshot_if_due(
-                        trigger=f'background_runner:{market.state.lower()}'
-                    ),
-                )
-                await self._run_async_step(
-                    'portfolio_summary_refresh_if_due',
-                    portfolio_summary_service.refresh_portfolio_summary_if_due(
-                        trigger=f'background_runner:{market.state.lower()}'
-                    ),
-                )
+                if runtime_background_enabled:
+                    await self._run_async_step(
+                        'trading_order_reconciliation_periodic',
+                        trading_order_reconciliation_service.run_periodic_if_due(),
+                    )
+                    await self._run_async_step(
+                        'market_snapshot_refresh_if_due',
+                        market_snapshot_service.refresh_market_snapshot_if_due(
+                            trigger=f'background_runner:{market.state.lower()}'
+                        ),
+                    )
+                    await self._run_async_step(
+                        'portfolio_summary_refresh_if_due',
+                        portfolio_summary_service.refresh_portfolio_summary_if_due(
+                            trigger=f'background_runner:{market.state.lower()}'
+                        ),
+                    )
             except Exception as exc:
                 logger.exception('Background runner loop failed: %s', exc)
             await asyncio.sleep(self.interval_seconds)

@@ -106,7 +106,7 @@ async def lifespan(_: FastAPI):
     await kis_realtime_price_service.start()
     if settings.startup_maintenance_enabled:
         startup_maintenance_task = asyncio.create_task(_run_startup_maintenance(), name='startup-maintenance')
-    if settings.background_runner_enabled:
+    if settings.background_runner_enabled or settings.eod_auto_pykrx_enabled:
         await background_runner.start()
     try:
         yield
