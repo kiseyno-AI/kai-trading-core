@@ -3102,6 +3102,62 @@ class AgentFeedbackOrchestrator:
                 failure_context=context,
             )
 
+        def buffer_incomplete_terminal_failures(snapshot: RuntimeFeedbackRunState) -> list[dict[str, Any]]:
+            buffered: list[dict[str, Any]] = []
+            for role in requested_role_names:
+                role_symbols = normalized_role_symbol_scopes.get(role, list(scoped_dispatch_symbols))
+                completed_symbols = snapshot.completed_symbols_by_role.get(role, set())
+                failed_symbols = snapshot.failed_symbols_by_role.get(role, set())
+                terminal_symbols = completed_symbols | failed_symbols
+                for symbol in role_symbols:
+                    normalized_symbol = str(symbol or '').strip().upper()
+                    if not normalized_symbol or normalized_symbol in terminal_symbols:
+                        continue
+                    context = {
+                        'origin': 'final_terminal_reconciliation',
+                        'role': role,
+                        'symbol': normalized_symbol,
+                        'request_run_id': request_run_id,
+                        'expected_role_symbols': len(role_symbols),
+                        'completed_symbols': len(completed_symbols),
+                        'failed_symbols': len(failed_symbols),
+                    }
+                    failure = _build_failed_dispatch_item(
+                        role=role,
+                        agent_name=role,
+                        symbol=normalized_symbol,
+                        error='dispatch_incomplete: terminal feedback missing at final reconciliation',
+                        retryable=True,
+                        failure_kind=FeedbackFailureKind.DISPATCH_INCOMPLETE.value,
+                        context=context,
+                        batch_symbols=[normalized_symbol],
+                    )
+                    all_failures.append(failure)
+                    buffered.append(failure)
+                    buffer_failure(
+                        role,
+                        normalized_symbol,
+                        'dispatch_incomplete: terminal feedback missing at final reconciliation',
+                        True,
+                        failure_kind=FeedbackFailureKind.DISPATCH_INCOMPLETE.value,
+                        context=context,
+                        agent_name=role,
+                        batch_symbols=[normalized_symbol],
+                    )
+                    log_agent_feedback_event(
+                        'terminal_feedback_missing',
+                        status='retryable_failure_buffered',
+                        market_date=normalized_market_date.isoformat(),
+                        request_run_id=request_run_id,
+                        role=role,
+                        agent_name=role,
+                        symbol=normalized_symbol,
+                        batch_symbols=[normalized_symbol],
+                        failure_kind=FeedbackFailureKind.DISPATCH_INCOMPLETE.value,
+                        failure_context=context,
+                    )
+            return buffered
+
         all_items: list[dict[str, Any]] = []
         all_failures: list[dict[str, Any]] = []
         symbol_context = {'items': []}
@@ -3763,6 +3819,38 @@ class AgentFeedbackOrchestrator:
                     request_run_id=request_run_id,
                     reason='finalize',
                 )
+                final_snapshot = runtime_feedback_state_store.get_run(normalized_market_date, run_id=request_run_id) or final_snapshot
+                if final_snapshot is not None and (final_snapshot.pending_feedback_rows or final_snapshot.pending_failures):
+                    drain_flush_result = self._flush_pending_run_buffers(
+                        market_date=normalized_market_date,
+                        request_run_id=request_run_id,
+                        reason='finalize_drain_pending',
+                    )
+                    final_flush_result = {
+                        'status': 'drained',
+                        'initial_flush': final_flush_result,
+                        'drain_flush': drain_flush_result,
+                    }
+                    final_snapshot = runtime_feedback_state_store.get_run(normalized_market_date, run_id=request_run_id) or final_snapshot
+                if (
+                    final_snapshot is not None
+                    and scoped_dispatch_symbols
+                    and raised_exception is None
+                    and finalization_error is None
+                ):
+                    incomplete_failures = buffer_incomplete_terminal_failures(final_snapshot)
+                    if incomplete_failures:
+                        incomplete_flush_result = self._flush_pending_run_buffers(
+                            market_date=normalized_market_date,
+                            request_run_id=request_run_id,
+                            reason='finalize_missing_terminal_feedback',
+                        )
+                        final_flush_result = {
+                            'status': 'terminal_reconciled',
+                            'previous_flush': final_flush_result,
+                            'incomplete_failure_count': len(incomplete_failures),
+                            'incomplete_flush': incomplete_flush_result,
+                        }
             except Exception as exc:  # noqa: BLE001
                 finalization_error = exc
                 log_agent_feedback_event(

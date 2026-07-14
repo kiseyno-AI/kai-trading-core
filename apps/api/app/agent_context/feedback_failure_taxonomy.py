@@ -12,6 +12,7 @@ class FeedbackFailureKind(str, Enum):
     OPENCLAW_RESPONSE_INVALID_JSON = 'openclaw_response_invalid_json'
     OPENCLAW_ASSISTANT_NON_JSON = 'openclaw_assistant_non_json'
     OPENCLAW_RESPONSE_CONTRACT = 'openclaw_response_contract'
+    DISPATCH_INCOMPLETE = 'dispatch_incomplete'
     DISPATCH_FAILED = 'dispatch_failed'
 
 
@@ -22,6 +23,7 @@ class FeedbackFailureStatus(str, Enum):
     RESPONSE_INVALID_JSON = 'response/invalid-json'
     RESPONSE_ASSISTANT_NON_JSON = 'response/assistant-non-json'
     RESPONSE_CONTRACT = 'response/contract'
+    DISPATCH_INCOMPLETE = 'dispatch/incomplete'
     DISPATCH_ERROR = 'dispatch/error'
 
 
@@ -125,6 +127,14 @@ def classify_feedback_failure(
             failure_status=FeedbackFailureStatus.DEPENDENCY_MISSING_UPSTREAM.value,
             failure_category='dependency',
             reason='missing upstream summarizer feedback required by decider role',
+        )
+
+    if 'dispatch_incomplete' in haystack or 'terminal feedback missing' in haystack:
+        return FeedbackFailureClassification(
+            failure_kind=FeedbackFailureKind.DISPATCH_INCOMPLETE.value,
+            failure_status=FeedbackFailureStatus.DISPATCH_INCOMPLETE.value,
+            failure_category='dispatch',
+            reason='dispatch completed without terminal feedback or failure for the requested symbol',
         )
 
     if (
