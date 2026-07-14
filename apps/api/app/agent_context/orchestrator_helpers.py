@@ -1121,13 +1121,26 @@ def build_upstream_feedback_bundle(
                 continue
 
         decision = symbol_decisions.get(role)
-        if decision is not None and bool(decision.should_dispatch):
-            missing_roles.append(role)
-            continue
-        latest_feedback = decision.latest_feedback if decision is not None else None
+        latest_feedback = getattr(decision, 'latest_feedback', None) if decision is not None else None
         feedback_payload = latest_feedback.get('feedback_payload') if isinstance(latest_feedback, dict) else None
         feedback_market_date = latest_feedback.get('market_date') if isinstance(latest_feedback, dict) else None
         reuse_reason = str(getattr(decision, 'reason', '') or '')
+        if isinstance(feedback_payload, dict) and feedback_market_date == market_date.isoformat():
+            upstream_summaries[role] = feedback_payload
+            upstream_traceability[role] = {
+                'agent_name': role,
+                'run_id': latest_feedback.get('run_id'),
+                'market_date': feedback_market_date,
+                'received_at': latest_feedback.get('received_at'),
+                'feedback_id': latest_feedback.get('id'),
+                'source': 'persisted_feedback',
+                'reuse_reason': reuse_reason or None,
+                'refresh_pending': bool(decision.should_dispatch) if decision is not None else None,
+            }
+            continue
+        if decision is not None and bool(decision.should_dispatch):
+            missing_roles.append(role)
+            continue
         fingerprint_reuse_allowed = (
             role == 'fundamental-summarizer'
             and reuse_reason == 'reuse_unchanged_fundamental_inputs'
