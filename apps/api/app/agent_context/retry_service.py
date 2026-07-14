@@ -1072,6 +1072,48 @@ class AgentFeedbackRetryService:
                                     },
                                 )
                                 dispatch_results.append(dispatch_result)
+                                if chunk_index >= len(dispatch_chunks):
+                                    continue
+                                snapshot_after_chunk = self._build_role_sequence_snapshot(
+                                    market_date=config.market_date,
+                                    roles=roles,
+                                    eligible_symbols=scoped_feedback_symbols,
+                                    role_symbol_scopes=role_symbol_scopes,
+                                    force_recompute=effective_force_recompute,
+                                )
+                                self._sync_runtime_state(
+                                    market_date=config.market_date,
+                                    run_id=request_run_id,
+                                    snapshot=snapshot_after_chunk,
+                                    current_role=role,
+                                    completed_roles=completed_roles_before,
+                                    remaining_roles=remaining_roles_before,
+                                    cycle_number=active_plan.cycle_number,
+                                    completed_cycles=active_plan.completed_cycles,
+                                    max_cycles=config.max_cycles,
+                                    cycle_mode=active_plan.mode,
+                                    cycle_status='running',
+                                    status='running',
+                                    funnel_diagnostics=role_funnel,
+                                )
+                                self._checkpoint_run_state(
+                                    market_date=config.market_date,
+                                    request_run_id=request_run_id,
+                                    request_payload=request_payload,
+                                    lifecycle_stage='role_batch_completed',
+                                    status='running',
+                                    progress_callback=progress_callback,
+                                    cycle_result={
+                                        'cycle': active_plan.cycle_number,
+                                        'mode': active_plan.mode,
+                                        'role': role,
+                                        'chunk_index': chunk_index,
+                                        'chunk_total': len(dispatch_chunks),
+                                        'chunk_symbols': list(dispatch_chunk),
+                                        'chunk_request': dispatch_result.get('request'),
+                                        'chunk_summary': dispatch_result.get('summary'),
+                                    },
+                                )
                             aggregate_summary = self._aggregate_dispatch_summaries(dispatch_results)
                             role_result.update(
                                 {

@@ -547,6 +547,92 @@ class FeedbackRetryCycleTests(unittest.TestCase):
         self.assertTrue(result['completed'])
         self.assertEqual(result['cycles'][0]['role_batches'][0]['summary']['chunks'], 3)
 
+    def test_force_recompute_batch_checkpoint_does_not_count_old_rows_as_completed(self):
+        service = AgentFeedbackRetryService()
+        run_state_service = RecordingRunStateService()
+        roles = ('eod-summarizer',)
+        symbols = ('000020', '000040', '000050', '000070')
+        regenerated_symbols = set()
+        dispatch_calls = []
+        mid_chunk_snapshot_calls = []
+
+        def build_snapshot(**kwargs):
+            if 0 < len(dispatch_calls) < 2:
+                mid_chunk_snapshot_calls.append(kwargs)
+            if kwargs.get('force_recompute'):
+                completed = tuple(symbol for symbol in symbols if symbol in regenerated_symbols)
+                pending = tuple(symbol for symbol in symbols if symbol not in regenerated_symbols)
+            else:
+                completed = symbols
+                pending = ()
+            return _snapshot(
+                symbols=symbols,
+                role_states={
+                    'eod-summarizer': _role_state(
+                        role='eod-summarizer',
+                        symbols=symbols,
+                        completed=completed,
+                        boundary_pending=pending,
+                        retry_pending=pending,
+                    )
+                },
+            )
+
+        def dispatch_for_symbols(**kwargs):
+            dispatch_calls.append(kwargs)
+            regenerated_symbols.update(kwargs['symbols'])
+            return {
+                'request': {'roles': kwargs['roles'], 'symbols': kwargs['symbols']},
+                'summary': {'status': 'completed', 'completed': len(kwargs['symbols']), 'failed': 0},
+            }
+
+        progress = {'request': {'expected_agents': list(roles)}, 'summary': {'cycle_status': 'completed'}}
+
+        with patch.object(service, '_load_eligible_symbols', return_value=list(symbols)):
+            with patch.object(service, '_build_role_sequence_snapshot', side_effect=build_snapshot):
+                with patch('app.agent_context.retry_service.agent_context_feedback_run_state_service', run_state_service):
+                    with patch(
+                        'app.agent_context.retry_service.agent_feedback_orchestrator.dispatch_for_symbols',
+                        side_effect=dispatch_for_symbols,
+                    ):
+                        with patch(
+                            'app.agent_context.retry_service.agent_context_progress_service.get_feedback_progress',
+                            return_value=progress,
+                        ):
+                            service.run_retry_cycles(
+                                config=SimpleNamespace(
+                                    market_date=date.fromisoformat('2026-04-16'),
+                                    roles=roles,
+                                    max_cycles=1,
+                                    outer_batch_size=2,
+                                    reuse_existing=True,
+                                    force_recompute=True,
+                                )
+                            )
+
+        self.assertEqual(
+            [call['symbols'] for call in dispatch_calls],
+            [['000020', '000040'], ['000050', '000070']],
+        )
+        self.assertTrue(all(call['reuse_existing'] is False for call in dispatch_calls))
+        self.assertTrue(all(call['force_recompute'] is True for call in dispatch_calls))
+        self.assertEqual(len(mid_chunk_snapshot_calls), 1)
+        self.assertIs(mid_chunk_snapshot_calls[0]['force_recompute'], True)
+
+        batch_checkpoints = [
+            checkpoint
+            for checkpoint in run_state_service.checkpoints
+            if checkpoint['summary_payload']['lifecycle_stage'] == 'role_batch_completed'
+        ]
+        self.assertEqual(len(batch_checkpoints), 1)
+        batch_summary = batch_checkpoints[0]['summary_payload']['progress_summary']
+        self.assertEqual(batch_summary['completed_feedback_count'], 2)
+        self.assertEqual(batch_summary['pending_symbols'], 2)
+        self.assertEqual(
+            batch_summary['role_progress']['eod-summarizer']['pending_symbols'],
+            2,
+        )
+
     def test_run_retry_cycles_returns_waiting_gate_when_prerequisites_are_not_ready(self):
         service = AgentFeedbackRetryService()
         run_state_service = RecordingRunStateService()
