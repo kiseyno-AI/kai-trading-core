@@ -1,6 +1,6 @@
 import unittest
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -120,6 +120,29 @@ class FakeProgressSession:
     @staticmethod
     def _compile(statement) -> str:
         return str(statement.compile(compile_kwargs={'literal_binds': True}))
+
+
+def _reuse_decision(*, symbol: str, agent_name: str, should_dispatch: bool = False, reason: str = 'reuse_latest_feedback'):
+    return SimpleNamespace(
+        symbol=symbol,
+        agent_name=agent_name,
+        should_dispatch=should_dispatch,
+        reason=reason,
+        latest_feedback_id=77,
+        latest_feedback_received_at='2026-04-13T01:00:00+00:00',
+        latest_source_updated_at=None,
+        latest_feedback={
+            'id': 77,
+            'market_date': '2026-04-13',
+            'symbol': symbol,
+            'agent_name': agent_name,
+            'run_id': 'prior-run',
+            'received_at': '2026-04-13T01:00:00+00:00',
+        },
+        input_fingerprint=None,
+        stored_input_fingerprint=None,
+        reuse_policy_version=None,
+    )
 
 
 class AgentContextProgressServiceTests(unittest.TestCase):
@@ -994,10 +1017,23 @@ class AgentContextProgressServiceTests(unittest.TestCase):
                     'app.agent_context.progress_service.agent_context_feedback_run_state_service.get_run',
                     return_value=run_snapshot,
                 ):
-                    result = AgentContextProgressService().get_feedback_progress(
-                        market_date='2026-06-19',
-                        run_id='active-symbol-run',
-                    )
+                    with patch(
+                        'app.agent_context.progress_service.agent_context_reuse_service.build_latest_decisions',
+                        return_value={
+                            '005930': {
+                                'eod-summarizer': _reuse_decision(
+                                    symbol='005930',
+                                    agent_name='eod-summarizer',
+                                )
+                            }
+                        },
+                    ) as build_latest_decisions:
+                        result = AgentContextProgressService().get_feedback_progress(
+                            market_date='2026-06-19',
+                            run_id='active-symbol-run',
+                        )
+
+        build_latest_decisions.assert_not_called()
 
         feedback_sql = fake_session._compile(fake_session.statements[0])
         failure_sql = fake_session._compile(fake_session.statements[1])
@@ -1154,11 +1190,136 @@ class AgentContextProgressServiceTests(unittest.TestCase):
             with patch('app.agent_context.progress_service.runtime_feedback_state_store.get_run', return_value=None):
                 with patch('app.agent_context.progress_service.agent_context_feedback_run_state_service.find_latest_run', return_value=None):
                     with patch('app.agent_context.progress_service.agent_context_feedback_run_state_service.get_run', return_value=None):
-                        return AgentContextProgressService().get_feedback_progress(
-                            market_date='2026-04-14',
-                            symbols=symbols,
-                            expected_agents=expected_agents,
-                        )
+                        with patch(
+                            'app.agent_context.progress_service.agent_context_reuse_service.build_latest_decisions',
+                            return_value={},
+                        ):
+                            return AgentContextProgressService().get_feedback_progress(
+                                market_date='2026-04-14',
+                                symbols=symbols,
+                                expected_agents=expected_agents,
+                            )
+
+    def test_feedback_progress_explicit_symbol_subset_without_resolved_run_counts_prior_reuse(self):
+        fake_session = FakeProgressSession()
+        fake_session.feedback_rows = []
+        fake_session.failure_rows = []
+        reuse_decision = _reuse_decision(symbol='000660', agent_name='fundamental-summarizer')
+
+        @contextmanager
+        def fake_session_scope():
+            yield fake_session
+
+        with patch('app.agent_context.progress_service.session_scope', fake_session_scope):
+            with patch('app.agent_context.progress_service.runtime_feedback_state_store.get_run', return_value=None) as get_runtime_run:
+                with patch(
+                    'app.agent_context.progress_service.agent_context_feedback_run_state_service.find_latest_run',
+                    return_value=None,
+                ):
+                    with patch(
+                        'app.agent_context.progress_service.agent_feedback_prerequisite_service.inspect_feedback_prerequisites',
+                        return_value={'ready': True, 'status': 'ready', 'missing_prerequisites': []},
+                    ):
+                        with patch(
+                            'app.agent_context.progress_service.agent_context_reuse_service.build_latest_decisions',
+                            return_value={'000660': {'fundamental-summarizer': reuse_decision}},
+                        ) as build_latest_decisions:
+                            result = AgentContextProgressService().get_feedback_progress(
+                                market_date='2026-04-14',
+                                symbols=['000660'],
+                                expected_agents=['fundamental-summarizer'],
+                            )
+
+        get_runtime_run.assert_not_called()
+        build_latest_decisions.assert_called_once_with(
+            market_date=date(2026, 4, 14),
+            symbols=['000660'],
+            roles=('fundamental-summarizer',),
+        )
+        summary = result['summary']
+        role_summary = summary['role_progress']['fundamental-summarizer']
+        self.assertIsNone(summary['run_id'])
+        self.assertEqual(summary['run_status'], 'completed')
+        self.assertEqual(summary['completed_feedback_count'], 1)
+        self.assertEqual(summary['computed_feedback_count'], 0)
+        self.assertEqual(summary['reused_feedback_count'], 1)
+        self.assertEqual(summary['pending_symbols'], 0)
+        self.assertEqual(role_summary['completed_symbols'], 1)
+        self.assertEqual(role_summary['computed_symbols'], 0)
+        self.assertEqual(role_summary['reused_symbols'], 1)
+        self.assertEqual(role_summary['pending_symbols'], 0)
+        self.assertEqual(
+            result['result']['roles']['fundamental-summarizer'],
+            {'requested_count': 1, 'completed_count': 1, 'error_count': 0},
+        )
+
+    def test_feedback_progress_resolved_run_reuse_opt_outs_do_not_count_prior_reuse(self):
+        for case_name, opt_out_payload in (
+            ('reuse_existing_false', {'reuse_existing': False}),
+            ('force_recompute_true', {'force_recompute': True}),
+        ):
+            with self.subTest(case_name=case_name):
+                fake_session = FakeProgressSession()
+                fake_session.feedback_rows = []
+                fake_session.failure_rows = []
+                run_snapshot = {
+                    'run_id': f'run-{case_name}',
+                    'status': 'partial',
+                    'symbols_total': 1,
+                    'completed_count': 0,
+                    'failed_count': 0,
+                    'started_at': datetime(2026, 4, 14, 1, 0, tzinfo=timezone.utc),
+                    'completed_at': datetime(2026, 4, 14, 1, 5, tzinfo=timezone.utc),
+                    'request_payload': {
+                        'symbols': ['000660'],
+                        'requested_symbols': ['000660'],
+                        'roles': ['fundamental-summarizer'],
+                        **opt_out_payload,
+                    },
+                    'summary_payload': {},
+                }
+
+                @contextmanager
+                def fake_session_scope():
+                    yield fake_session
+
+                with patch('app.agent_context.progress_service.session_scope', fake_session_scope):
+                    with patch('app.agent_context.progress_service.runtime_feedback_state_store.get_run', return_value=None):
+                        with patch(
+                            'app.agent_context.progress_service.agent_context_feedback_run_state_service.find_latest_run',
+                            return_value=run_snapshot,
+                        ):
+                            with patch(
+                                'app.agent_context.progress_service.agent_feedback_prerequisite_service.inspect_feedback_prerequisites',
+                                return_value={'ready': True, 'status': 'ready', 'missing_prerequisites': []},
+                            ):
+                                with patch(
+                                    'app.agent_context.progress_service.agent_context_reuse_service.build_latest_decisions',
+                                    return_value={
+                                        '000660': {
+                                            'fundamental-summarizer': _reuse_decision(
+                                                symbol='000660',
+                                                agent_name='fundamental-summarizer',
+                                            )
+                                        }
+                                    },
+                                ) as build_latest_decisions:
+                                    result = AgentContextProgressService().get_feedback_progress(
+                                        market_date='2026-04-14',
+                                        symbols=['000660'],
+                                        expected_agents=['fundamental-summarizer'],
+                                    )
+
+                build_latest_decisions.assert_not_called()
+                summary = result['summary']
+                role_summary = summary['role_progress']['fundamental-summarizer']
+                self.assertEqual(summary['run_id'], f'run-{case_name}')
+                self.assertEqual(summary['completed_feedback_count'], 0)
+                self.assertEqual(summary['reused_feedback_count'], 0)
+                self.assertEqual(summary['pending_symbols'], 1)
+                self.assertEqual(role_summary['completed_symbols'], 0)
+                self.assertEqual(role_summary['reused_symbols'], 0)
+                self.assertEqual(role_summary['pending_symbols'], 1)
 
     def test_feedback_progress_explicit_symbols_ignore_active_runtime_when_no_durable_run_matches(self):
         fake_session = FakeProgressSession()
@@ -1208,11 +1369,15 @@ class AgentContextProgressServiceTests(unittest.TestCase):
                     'app.agent_context.progress_service.agent_context_feedback_run_state_service.find_latest_run',
                     return_value=None,
                 ):
-                    result = AgentContextProgressService().get_feedback_progress(
-                        market_date='2026-04-14',
-                        symbols=['005930'],
-                        expected_agents=['eod-summarizer'],
-                    )
+                    with patch(
+                        'app.agent_context.progress_service.agent_context_reuse_service.build_latest_decisions',
+                        return_value={},
+                    ):
+                        result = AgentContextProgressService().get_feedback_progress(
+                            market_date='2026-04-14',
+                            symbols=['005930'],
+                            expected_agents=['eod-summarizer'],
+                        )
 
         get_run.assert_not_called()
         feedback_sql = fake_session._compile(fake_session.statements[0])
@@ -1256,21 +1421,17 @@ class AgentContextProgressServiceTests(unittest.TestCase):
             {'requested_count', 'completed_count', 'error_count'},
         )
 
-    def test_feedback_progress_uses_market_date_symbol_universe_when_symbols_omitted_before_prerequisites_ready(self):
+    def test_feedback_progress_without_symbols_run_or_state_avoids_market_universe_lookup(self):
         fake_session = FakeProgressSession()
 
         result = self._call_service(fake_session, symbols=None)
 
-        universe_sql = fake_session._compile(fake_session.statements[0])
-        feedback_sql = fake_session._compile(fake_session.statements[1])
+        self.assertEqual(fake_session.statements, [])
+        self.assertEqual(result['summary']['total_symbols'], 0)
+        self.assertEqual(result['result']['roles']['technical-summarizer']['requested_count'], 0)
+        self.assertEqual(result['result']['roles']['technical-summarizer']['completed_count'], 0)
 
-        self.assertIn('daily_price_bars', universe_sql)
-        self.assertIn('agent_context_feedback.symbol IN', feedback_sql)
-        self.assertEqual(result['summary']['total_symbols'], 2)
-        self.assertEqual(result['result']['roles']['technical-summarizer']['requested_count'], 2)
-        self.assertEqual(result['result']['roles']['technical-summarizer']['completed_count'], 1)
-
-    def test_feedback_progress_uses_eligible_prefilter_symbols_when_symbols_omitted_and_prerequisites_ready(self):
+    def test_feedback_progress_without_symbols_run_or_state_skips_prefilter_when_prerequisites_ready(self):
         fake_session = FakeProgressSession()
 
         @contextmanager
@@ -1289,23 +1450,18 @@ class AgentContextProgressServiceTests(unittest.TestCase):
                     ):
                         with patch(
                             'app.agent_context.progress_service.agent_feedback_prerequisite_service.inspect_feedback_prerequisites',
-                            return_value={'ready': True},
+                            return_value={'ready': True, 'status': 'ready', 'missing_prerequisites': []},
                         ):
-                            with patch(
-                                'app.agent_context.progress_service.load_agent_feedback_eligible_symbols',
-                                return_value=['005930'],
-                            ):
-                                result = AgentContextProgressService().get_feedback_progress(
-                                    market_date='2026-04-14',
-                                    symbols=None,
-                                    expected_agents=['technical-summarizer'],
-                                )
+                            result = AgentContextProgressService().get_feedback_progress(
+                                market_date='2026-04-14',
+                                symbols=None,
+                                expected_agents=['technical-summarizer'],
+                            )
 
-        self.assertNotIn('daily_price_bars', fake_session._compile(fake_session.statements[0]))
-        self.assertIn("IN ('005930')", fake_session._compile(fake_session.statements[0]))
-        self.assertEqual(result['summary']['total_symbols'], 1)
-        self.assertEqual(result['result']['roles']['technical-summarizer']['requested_count'], 1)
-        self.assertEqual(result['result']['roles']['technical-summarizer']['completed_count'], 1)
+        self.assertEqual(fake_session.statements, [])
+        self.assertEqual(result['summary']['total_symbols'], 0)
+        self.assertEqual(result['result']['roles']['technical-summarizer']['requested_count'], 0)
+        self.assertEqual(result['result']['roles']['technical-summarizer']['completed_count'], 0)
 
     def test_feedback_progress_without_symbols_uses_latest_durable_retry_cycle_run(self):
         fake_session = FakeProgressSession()
