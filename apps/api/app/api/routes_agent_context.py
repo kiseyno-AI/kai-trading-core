@@ -3,6 +3,7 @@ from pathlib import Path
 import os
 import signal
 import subprocess
+from time import monotonic
 from typing import Any
 
 import logging
@@ -49,6 +50,43 @@ import uuid
 
 router = APIRouter(prefix='/agent-context', tags=['agent-context'])
 logger = logging.getLogger(__name__)
+
+_FEEDBACK_PROGRESS_CACHE_TTL_SECONDS = 5.0
+_FEEDBACK_PROGRESS_CACHE_MAX_ITEMS = 64
+_feedback_progress_cache: dict[tuple[str, tuple[str, ...] | None, str | None], tuple[float, dict]] = {}
+
+
+def _feedback_progress_cache_key(
+    *,
+    market_date: date,
+    symbols: list[str] | None,
+    run_id: str | None,
+) -> tuple[str, tuple[str, ...] | None, str | None]:
+    normalized_symbols = tuple(sorted({str(symbol).strip() for symbol in symbols if str(symbol).strip()})) if symbols else None
+    return market_date.isoformat(), normalized_symbols, run_id
+
+
+def _get_cached_feedback_progress(
+    key: tuple[str, tuple[str, ...] | None, str | None],
+) -> dict | None:
+    cached = _feedback_progress_cache.get(key)
+    if cached is None:
+        return None
+    cached_at, payload = cached
+    if monotonic() - cached_at > _FEEDBACK_PROGRESS_CACHE_TTL_SECONDS:
+        _feedback_progress_cache.pop(key, None)
+        return None
+    return payload
+
+
+def _set_cached_feedback_progress(
+    key: tuple[str, tuple[str, ...] | None, str | None],
+    payload: dict,
+) -> None:
+    if len(_feedback_progress_cache) >= _FEEDBACK_PROGRESS_CACHE_MAX_ITEMS:
+        oldest_key = min(_feedback_progress_cache, key=lambda item: _feedback_progress_cache[item][0])
+        _feedback_progress_cache.pop(oldest_key, None)
+    _feedback_progress_cache[key] = (monotonic(), payload)
 
 
 class AgentFeedbackRequest(BaseModel):
@@ -1193,12 +1231,22 @@ async def get_agent_feedback_progress(
     run_id: str | None = Query(default=None),
 ) -> dict:
     try:
-        return await run_in_threadpool(
+        cache_key = _feedback_progress_cache_key(
+            market_date=market_date,
+            symbols=symbols,
+            run_id=run_id,
+        )
+        cached = _get_cached_feedback_progress(cache_key)
+        if cached is not None:
+            return cached
+        payload = await run_in_threadpool(
             agent_context_progress_service.get_feedback_progress,
             market_date=market_date,
             symbols=symbols,
             run_id=run_id,
         )
+        _set_cached_feedback_progress(cache_key, payload)
+        return payload
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
