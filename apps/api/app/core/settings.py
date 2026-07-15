@@ -26,6 +26,9 @@ class Settings(BaseSettings):
 
     db_auto_upgrade: bool = True
     database_url: Optional[str] = None
+    db_pool_size: int = 10
+    db_max_overflow: int = 20
+    db_pool_timeout_seconds: int = 10
     postgres_host: str = 'localhost'
     postgres_port: int = 5432
     postgres_db: str = 'kai_trading'

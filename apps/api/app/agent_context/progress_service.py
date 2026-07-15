@@ -7,7 +7,6 @@ from typing import Any, Sequence
 
 from sqlalchemy import select
 
-from app.agent_context.eligibility import load_agent_feedback_eligible_symbols
 from app.agent_context.feedback_failure_taxonomy import build_failure_groups
 from app.agent_context.feedback_service import _normalize_market_date, _normalize_symbols
 from app.agent_context.prerequisite_service import agent_feedback_prerequisite_service
@@ -62,8 +61,12 @@ class AgentContextProgressService:
             resolved_run=resolved_run,
             runtime_state=state,
         )
-        if scoped_symbols is None and prerequisites['ready']:
-            scoped_symbols = load_agent_feedback_eligible_symbols(market_date=normalized_market_date)
+        if scoped_symbols is None and normalized_symbols is None and state is None and resolved_run is None:
+            # Progress reads are polled frequently by dashboards.  If there is
+            # no live or durable feedback run to report, avoid recomputing the
+            # full eligible-symbol universe just to render an empty progress
+            # state.
+            scoped_symbols = []
         resolved_run_mode = self._resolve_run_mode(resolved_run)
         persisted_child_run_id = self._resolve_persisted_child_run_id(
             resolved_run=resolved_run,
@@ -74,9 +77,12 @@ class AgentContextProgressService:
             symbols=scoped_symbols,
             expected_agents=expected_agent_names,
             child_run_id=persisted_child_run_id,
-            include_reuse=self._should_include_prior_feedback_reuse(
-                resolved_run=resolved_run,
-                child_run_id=persisted_child_run_id,
+            include_reuse=(
+                self._should_include_prior_feedback_reuse(
+                    resolved_run=resolved_run,
+                    child_run_id=persisted_child_run_id,
+                )
+                and normalized_symbols is not None
             ),
         )
 
@@ -139,6 +145,7 @@ class AgentContextProgressService:
                     summary=summary_payload,
                     expected_agents=expected_agent_names,
                 )
+
         if (
             not prerequisites['ready']
             and state is None
@@ -238,7 +245,7 @@ class AgentContextProgressService:
     ) -> bool:
         if child_run_id is not None:
             return False
-        if child_run_id is None or not isinstance(resolved_run, dict):
+        if not isinstance(resolved_run, dict):
             return True
         request_payload = (
             resolved_run.get('request_payload')

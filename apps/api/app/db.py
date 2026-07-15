@@ -24,6 +24,9 @@ def _build_database_url() -> str:
 DATABASE_URL = _build_database_url()
 engine = create_engine(
     DATABASE_URL,
+    pool_size=settings.db_pool_size,
+    max_overflow=settings.db_max_overflow,
+    pool_timeout=settings.db_pool_timeout_seconds,
     pool_pre_ping=True,
     future=True,
     connect_args=ENGINE_CONNECT_ARGS,
