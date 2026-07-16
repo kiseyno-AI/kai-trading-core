@@ -246,7 +246,7 @@ class AgentContextProgressService:
         if child_run_id is not None:
             return False
         if not isinstance(resolved_run, dict):
-            return False
+            return True
         request_payload = (
             resolved_run.get('request_payload')
             if isinstance(resolved_run.get('request_payload'), dict)
