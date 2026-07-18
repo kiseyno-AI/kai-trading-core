@@ -613,13 +613,13 @@ def _run_daily_feedback_followup(
     progress_callback: Callable[..., None] | None = None,
 ) -> dict[str, Any]:
     from app.agent_context.roles import SUMMARIZER_AGENT_NAMES
-    from app.agent_context.run_modes import FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE
+    from app.agent_context.run_modes import FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH
 
     return _run_daily_agent_feedback_followup(
         market_date=market_date,
         enabled=enabled,
         roles=SUMMARIZER_AGENT_NAMES,
-        feedback_scope_mode=FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE,
+        feedback_scope_mode=FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
         progress_callback=progress_callback,
     )
 

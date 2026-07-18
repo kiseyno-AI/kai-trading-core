@@ -10,7 +10,13 @@ import pandas as pd
 
 from app.eod.auto_pykrx import AutoPykrxEODScheduler
 from app.eod.pykrx_backfill import PYKRX_STAGE_SEQUENCE, PykrxBackfillService, PykrxSymbol
-from app.eod.pykrx_pipeline_runner import _OfficialDailyPipelineTracker, _extract_result_counts, _normalize_stage_status
+from app.eod.pykrx_pipeline_runner import (
+    _OfficialDailyPipelineTracker,
+    _extract_result_counts,
+    _normalize_stage_status,
+    _run_daily_feedback_followup,
+    _run_daily_signal_decider_followup,
+)
 from app.market.clock import KST, MarketState
 
 
@@ -135,6 +141,43 @@ class PykrxBackfillServiceTests(TestCase):
         self.assertEqual(
             fake_run_state_service.finish_runs[-1]['run_metadata']['stage_statuses'],
             {'signal_decider_evaluations': 'partial'},
+        )
+
+    def test_auto_feedback_followups_use_matching_decider_scope(self) -> None:
+        from app.agent_context.roles import DECISION_SUPPORT_AGENT_NAMES, SUMMARIZER_AGENT_NAMES
+        from app.agent_context.run_modes import FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH
+
+        configs = []
+
+        def run_retry_cycles(*, config):
+            configs.append(config)
+            return {'status': 'completed'}
+
+        with (
+            patch(
+                'app.agent_context.prerequisite_service.agent_feedback_prerequisite_service.inspect_feedback_prerequisites',
+                return_value={'ready': True, 'status': 'ready'},
+            ),
+            patch(
+                'app.agent_context.retry_service.agent_feedback_retry_service.run_retry_cycles',
+                side_effect=run_retry_cycles,
+            ),
+        ):
+            summary_result = _run_daily_feedback_followup(market_date='2026-04-03', enabled=True)
+            decider_result = _run_daily_signal_decider_followup(market_date='2026-04-03', enabled=True)
+
+        self.assertEqual(summary_result['status'], 'completed')
+        self.assertEqual(decider_result['status'], 'completed')
+        self.assertEqual(
+            [config.roles for config in configs],
+            [SUMMARIZER_AGENT_NAMES, DECISION_SUPPORT_AGENT_NAMES],
+        )
+        self.assertEqual(
+            [config.feedback_scope_mode for config in configs],
+            [
+                FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
+                FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
+            ],
         )
 
     def test_fetch_recent_universe_uses_index_when_market_frame_columns_change(self) -> None:
