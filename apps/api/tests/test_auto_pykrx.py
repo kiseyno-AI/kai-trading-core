@@ -771,6 +771,12 @@ class PykrxBackfillServiceTests(TestCase):
                     return_value={'triggered': True, 'status': 'completed'},
                 )
             )
+            signal_decider_followup = stack.enter_context(
+                patch(
+                    'app.eod.pykrx_pipeline_runner._run_daily_signal_decider_followup',
+                    return_value={'triggered': True, 'status': 'completed', 'decision_snapshots': 2},
+                )
+            )
             evaluation_followup = stack.enter_context(
                 patch(
                     'app.eod.pykrx_pipeline_runner._run_daily_signal_decider_evaluation_followup',
@@ -806,6 +812,11 @@ class PykrxBackfillServiceTests(TestCase):
             enabled=False,
             progress_callback=ANY,
         )
+        signal_decider_followup.assert_called_once_with(
+            market_date='2026-04-03',
+            enabled=False,
+            progress_callback=ANY,
+        )
         evaluation_followup.assert_called_once_with(market_date='2026-04-03', enabled=True)
         self.assertEqual(
             result['factor_scoring_followup'],
@@ -818,6 +829,10 @@ class PykrxBackfillServiceTests(TestCase):
         self.assertEqual(
             result['feedback_followup'],
             {'triggered': True, 'status': 'completed'},
+        )
+        self.assertEqual(
+            result['signal_decider_followup'],
+            {'triggered': True, 'status': 'completed', 'decision_snapshots': 2},
         )
         self.assertEqual(
             result['signal_decider_evaluation_followup'],
@@ -932,6 +947,12 @@ class PykrxBackfillServiceTests(TestCase):
             )
             stack.enter_context(
                 patch(
+                    'app.eod.pykrx_pipeline_runner._run_daily_signal_decider_followup',
+                    return_value={'triggered': False, 'reason': 'followup_disabled', 'market_date': '2026-04-03'},
+                )
+            )
+            stack.enter_context(
+                patch(
                     'app.eod.pykrx_pipeline_runner._run_daily_signal_decider_evaluation_followup',
                     return_value={'triggered': True, 'status': 'completed', 'summary': {'computed_count': 4}},
                 )
@@ -953,6 +974,7 @@ class PykrxBackfillServiceTests(TestCase):
         self.assertEqual(fake_run_state_service.start_runs[0]['market_date'], '2026-04-03')
         self.assertIn('fundamentals_daily_refresh', fake_run_state_service.start_runs[0]['resolved_stages'])
         self.assertIn('momentum_factors', fake_run_state_service.start_runs[0]['resolved_stages'])
+        self.assertIn('signal_decider', fake_run_state_service.start_runs[0]['resolved_stages'])
         self.assertIn('signal_decider_evaluations', fake_run_state_service.start_runs[0]['resolved_stages'])
         stage_statuses = {
             (item['stage_id'], item['status'])
@@ -961,6 +983,7 @@ class PykrxBackfillServiceTests(TestCase):
         self.assertIn(('fundamentals_daily_refresh', 'running'), stage_statuses)
         self.assertIn(('fundamentals_daily_refresh', 'completed'), stage_statuses)
         self.assertIn(('momentum_factors', 'running'), stage_statuses)
+        self.assertIn(('signal_decider', 'running'), stage_statuses)
         self.assertIn(('signal_decider_evaluations', 'running'), stage_statuses)
         self.assertEqual(fake_run_state_service.finish_runs[-1]['status'], 'completed')
         self.assertEqual(
@@ -1147,6 +1170,12 @@ class PykrxBackfillServiceTests(TestCase):
                     return_value={'triggered': True, 'status': 'warning', 'summary': {'not_computed_count': 1}},
                 )
             )
+            signal_decider_followup = stack.enter_context(
+                patch(
+                    'app.eod.pykrx_pipeline_runner._run_daily_signal_decider_followup',
+                    return_value={'triggered': True, 'status': 'completed', 'decision_snapshots': 1},
+                )
+            )
             stack.enter_context(patch('app.eod.pykrx_backfill.complete_eod_collection_run'))
             result = service._run_market_data_pipeline(
                 start_date='20260403',
@@ -1175,7 +1204,16 @@ class PykrxBackfillServiceTests(TestCase):
             },
         )
         self.assertIn('external_news_followup', result)
+        signal_decider_followup.assert_called_once_with(
+            market_date='2026-04-03',
+            enabled=False,
+            progress_callback=ANY,
+        )
         evaluation_followup.assert_called_once_with(market_date='2026-04-03', enabled=True)
+        self.assertEqual(
+            result['signal_decider_followup'],
+            {'triggered': True, 'status': 'completed', 'decision_snapshots': 1},
+        )
         self.assertEqual(
             result['signal_decider_evaluation_followup'],
             {'triggered': True, 'status': 'warning', 'summary': {'not_computed_count': 1}},
