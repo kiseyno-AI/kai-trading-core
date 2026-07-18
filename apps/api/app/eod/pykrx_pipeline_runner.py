@@ -44,6 +44,7 @@ AUTO_DAILY_FOLLOWUP_STAGE_ORDER: tuple[str, ...] = (
     *FACTOR_FOLLOWUP_STAGE_ORDER,
     'external_news_collect',
     'agent_feedback_summaries',
+    'signal_decider',
     'signal_decider_evaluations',
 )
 AUTO_DAILY_TRACKED_STAGE_ORDER: tuple[str, ...] = (
@@ -611,6 +612,44 @@ def _run_daily_feedback_followup(
     enabled: bool,
     progress_callback: Callable[..., None] | None = None,
 ) -> dict[str, Any]:
+    from app.agent_context.roles import SUMMARIZER_AGENT_NAMES
+    from app.agent_context.run_modes import FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH
+
+    return _run_daily_agent_feedback_followup(
+        market_date=market_date,
+        enabled=enabled,
+        roles=SUMMARIZER_AGENT_NAMES,
+        feedback_scope_mode=FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
+        progress_callback=progress_callback,
+    )
+
+
+def _run_daily_signal_decider_followup(
+    *,
+    market_date: str,
+    enabled: bool,
+    progress_callback: Callable[..., None] | None = None,
+) -> dict[str, Any]:
+    from app.agent_context.roles import DECISION_SUPPORT_AGENT_NAMES
+    from app.agent_context.run_modes import FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH
+
+    return _run_daily_agent_feedback_followup(
+        market_date=market_date,
+        enabled=enabled,
+        roles=DECISION_SUPPORT_AGENT_NAMES,
+        feedback_scope_mode=FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
+        progress_callback=progress_callback,
+    )
+
+
+def _run_daily_agent_feedback_followup(
+    *,
+    market_date: str,
+    enabled: bool,
+    roles: tuple[str, ...],
+    feedback_scope_mode: str,
+    progress_callback: Callable[..., None] | None = None,
+) -> dict[str, Any]:
     if not enabled:
         return {
             'triggered': False,
@@ -621,7 +660,7 @@ def _run_daily_feedback_followup(
     from datetime import date
 
     from app.agent_context.prerequisite_service import agent_feedback_prerequisite_service
-    from app.agent_context.retry_service import EXPECTED_ROLES, FeedbackRetryCycleConfig, agent_feedback_retry_service
+    from app.agent_context.retry_service import FeedbackRetryCycleConfig, agent_feedback_retry_service
     from app.core.settings import settings
 
     prerequisites = agent_feedback_prerequisite_service.inspect_feedback_prerequisites(
@@ -639,7 +678,8 @@ def _run_daily_feedback_followup(
     result = agent_feedback_retry_service.run_retry_cycles(
         config=FeedbackRetryCycleConfig(
             market_date=date.fromisoformat(market_date),
-            roles=EXPECTED_ROLES,
+            roles=roles,
+            feedback_scope_mode=feedback_scope_mode,
             max_cycles=settings.openclaw_feedback_retry_max_cycles,
             outer_batch_size=settings.openclaw_feedback_retry_outer_batch_size,
             reuse_existing=True,
@@ -1774,6 +1814,23 @@ def run_market_data_pipeline(
             extra=details,
         )
 
+    def signal_decider_progress_callback(**payload: Any) -> None:
+        details = payload.get('details') if isinstance(payload.get('details'), dict) else {}
+        source_run_ids = payload.get('source_run_ids') if isinstance(payload.get('source_run_ids'), dict) else None
+        persist_stage_progress(
+            stage='signal_decider',
+            status=str(payload.get('status') or 'running'),
+            current_step=str(payload.get('current_step') or 'signal_decider_running'),
+            current_activity=str(payload.get('current_activity') or 'Running signal-decider follow-up'),
+            processed=payload.get('processed'),
+            total=payload.get('total'),
+            succeeded=payload.get('succeeded'),
+            failed=payload.get('failed'),
+            current_period=payload.get('current_period'),
+            source_run_ids=source_run_ids,
+            extra=details,
+        )
+
     def record_factor_followup_result(factor_result: dict[str, Any]) -> None:
         stage_results = factor_result.get('stages') if isinstance(factor_result.get('stages'), dict) else {}
         for stage_id in FACTOR_FOLLOWUP_STAGE_ORDER:
@@ -1876,6 +1933,15 @@ def run_market_data_pipeline(
                     progress_callback=feedback_progress_callback,
                 ),
             )
+            result['signal_decider_followup'] = run_followup_stage(
+                'signal_decider',
+                activity='Running signal-decider follow-up',
+                call=lambda: _run_daily_signal_decider_followup(
+                    market_date=latest_trade_date,
+                    enabled=bool(dependencies.settings.openclaw_feedback_trigger_after_fundamentals_refresh),
+                    progress_callback=signal_decider_progress_callback,
+                ),
+            )
             result['signal_decider_evaluation_followup'] = run_followup_stage(
                 'signal_decider_evaluations',
                 activity='Running signal-decider evaluation follow-up',
@@ -1916,6 +1982,15 @@ def run_market_data_pipeline(
                     market_date=latest_trade_date,
                     enabled=bool(dependencies.settings.openclaw_feedback_trigger_after_fundamentals_refresh),
                     progress_callback=feedback_progress_callback,
+                ),
+            )
+            result['signal_decider_followup'] = run_followup_stage(
+                'signal_decider',
+                activity='Running signal-decider follow-up',
+                call=lambda: _run_daily_signal_decider_followup(
+                    market_date=latest_trade_date,
+                    enabled=bool(dependencies.settings.openclaw_feedback_trigger_after_fundamentals_refresh),
+                    progress_callback=signal_decider_progress_callback,
                 ),
             )
             result['signal_decider_evaluation_followup'] = run_followup_stage(
