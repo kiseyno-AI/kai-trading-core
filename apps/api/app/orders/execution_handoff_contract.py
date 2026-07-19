@@ -23,6 +23,8 @@ ExecutionDashboardRefreshStatus = Literal[
     'succeeded',
     'timeout',
     'failed',
+    'disabled',
+    'not_configured',
 ]
 ExecutionBoardStatus = Literal[
     'planned',

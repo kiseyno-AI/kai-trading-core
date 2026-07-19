@@ -13,6 +13,7 @@ from app.orders.execution_handoff_contract import (
     PORTFOLIO_SUMMARY_READ_MODEL_SOURCE,
     serialize_exec_agent_decider_handoff_payload,
     serialize_execution_daily_board_payload,
+    serialize_execution_dashboard_refresh_payload,
     serialize_execution_monitored_symbols_payload,
     serialize_execution_plan_dispatch_payload,
     serialize_execution_runtime_status_payload,
@@ -473,6 +474,68 @@ class ExecutionHandoffContractTests(unittest.TestCase):
         bad_board['items'][0]['status'] = 'mystery'
         with self.assertRaises(ValidationError):
             serialize_execution_daily_board_payload(bad_board)
+
+    def test_dashboard_payload_serializers_accept_disabled_refresh_states(self) -> None:
+        for refresh_status in ('disabled', 'not_configured'):
+            refresh = self._refresh(status=refresh_status)
+            self.assertEqual(
+                serialize_execution_dashboard_refresh_payload(refresh)['status'],
+                refresh_status,
+            )
+
+            board = serialize_execution_daily_board_payload(
+                {
+                    'request': {'market_date': '2026-04-30', 'refresh': True},
+                    'runtime': self._runtime(status='offline'),
+                    'market_date': '2026-04-30',
+                    'summary': {'items_total': 0},
+                    'freshness': self._freshness(status='unavailable'),
+                    'refresh': refresh,
+                    'items': [],
+                }
+            )
+            monitored = serialize_execution_monitored_symbols_payload(
+                {
+                    'request': {'market_date': '2026-04-30', 'refresh': True},
+                    'runtime': self._runtime(status='offline'),
+                    'market_date': '2026-04-30',
+                    'summary': {'items_total': 0},
+                    'realtime_subscription': {
+                        'desired_symbols': [],
+                        'desired_symbol_count': 0,
+                        'max_subscriptions': 40,
+                    },
+                    'freshness': self._freshness(endpoint='monitored_symbols', status='unavailable'),
+                    'refresh': refresh,
+                    'items': [],
+                }
+            )
+            detail = serialize_execution_symbol_detail_payload(
+                {
+                    'request': {'market_date': '2026-04-30', 'symbol': '005930', 'refresh': True},
+                    'runtime': self._runtime(status='offline'),
+                    'market_date': '2026-04-30',
+                    'symbol': '005930',
+                    'name': 'Samsung Electronics',
+                    'market': 'KOSPI',
+                    'display_price_available': False,
+                    'realtime_subscribed': False,
+                    'planning': {
+                        'decision_agent_names': [],
+                        'decision_snapshot_ids': [],
+                        'account_references': [],
+                    },
+                    'monitoring': {'state': 'idle', 'planned_intents': []},
+                    'summary': {'items_total': 0},
+                    'freshness': self._freshness(endpoint='symbol_detail', status='unavailable'),
+                    'refresh': refresh,
+                    'items': [],
+                }
+            )
+
+            self.assertEqual(board['refresh']['status'], refresh_status)
+            self.assertEqual(monitored['refresh']['status'], refresh_status)
+            self.assertEqual(detail['refresh']['status'], refresh_status)
 
     def test_portfolio_risk_equivalent_contract_documents_current_core_surface(self) -> None:
         payload = serialize_portfolio_risk_equivalent_payload(
