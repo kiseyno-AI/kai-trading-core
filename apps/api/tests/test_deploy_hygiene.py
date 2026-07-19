@@ -177,6 +177,27 @@ class DeployHygieneTests(unittest.TestCase):
         self.assertFalse(missing_table_check['ready'])
         self.assertEqual(missing_table_check['kind'], 'table')
 
+    def test_collect_schema_drift_preflight_blocks_missing_broker_orders_table(self) -> None:
+        connection = object()
+        inspector = _ready_schema_inspector(missing_tables={'broker_orders'})
+
+        connect_context = Mock()
+        connect_context.__enter__ = Mock(return_value=connection)
+        connect_context.__exit__ = Mock(return_value=False)
+
+        with (
+            patch('app.internal.deploy_hygiene.engine.connect', return_value=connect_context),
+            patch('app.internal.deploy_hygiene.sqlalchemy_inspect', return_value=inspector),
+        ):
+            report, exit_code = deploy_hygiene.collect_schema_drift_preflight()
+
+        self.assertEqual(exit_code, 1)
+        self.assertFalse(report['ready'])
+        self.assertIn('Missing required table broker_orders.', report['blocking_reasons'])
+        missing_table_check = next(check for check in report['checks'] if check['name'] == 'broker_orders_table')
+        self.assertFalse(missing_table_check['ready'])
+        self.assertEqual(missing_table_check['kind'], 'table')
+
     def test_collect_schema_drift_preflight_blocks_missing_unique_and_foreign_key(self) -> None:
         connection = object()
         inspector = _ready_schema_inspector(
@@ -208,6 +229,47 @@ class DeployHygieneTests(unittest.TestCase):
         failed_check_names = {check['name'] for check in report['checks'] if not check['ready']}
         self.assertIn('daily_action_summaries_symbol_market_date_unique', failed_check_names)
         self.assertIn('daily_signal_features_symbol_id_fk', failed_check_names)
+
+    def test_collect_schema_drift_preflight_blocks_missing_broker_order_uniques_and_event_fk(self) -> None:
+        connection = object()
+        inspector = _ready_schema_inspector(
+            missing_unique_names={
+                'uq_broker_orders_broker_account_client_order_id',
+                'uq_broker_orders_broker_account_broker_order_id',
+            },
+            missing_foreign_key_checks={'broker_order_events_broker_order_row_id_fk'},
+        )
+
+        connect_context = Mock()
+        connect_context.__enter__ = Mock(return_value=connection)
+        connect_context.__exit__ = Mock(return_value=False)
+
+        with (
+            patch('app.internal.deploy_hygiene.engine.connect', return_value=connect_context),
+            patch('app.internal.deploy_hygiene.sqlalchemy_inspect', return_value=inspector),
+        ):
+            report, exit_code = deploy_hygiene.collect_schema_drift_preflight()
+
+        self.assertEqual(exit_code, 1)
+        self.assertFalse(report['ready'])
+        self.assertIn(
+            'Missing required unique constraint/index uq_broker_orders_broker_account_client_order_id '
+            'on broker_orders(broker_name, account_reference, client_order_id).',
+            report['blocking_reasons'],
+        )
+        self.assertIn(
+            'Missing required unique constraint/index uq_broker_orders_broker_account_broker_order_id '
+            'on broker_orders(broker_name, account_reference, broker_order_id).',
+            report['blocking_reasons'],
+        )
+        self.assertIn(
+            'Missing foreign key from broker_order_events(broker_order_row_id) to broker_orders(id).',
+            report['blocking_reasons'],
+        )
+        failed_check_names = {check['name'] for check in report['checks'] if not check['ready']}
+        self.assertIn('broker_orders_broker_account_client_order_id_unique', failed_check_names)
+        self.assertIn('broker_orders_broker_account_broker_order_id_unique', failed_check_names)
+        self.assertIn('broker_order_events_broker_order_row_id_fk', failed_check_names)
 
     def test_collect_migration_preflight_flags_likely_duplicate_table_drift(self) -> None:
         connection = object()

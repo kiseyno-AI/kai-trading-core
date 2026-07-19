@@ -59,6 +59,7 @@ RUNTIME_SCHEMA_TABLE_DESCRIPTIONS: dict[str, str] = {
     'signal_decider_execution_plan_items': 'Signal-decider next-open/intraday execution plan items.',
     'signal_decider_actual_execution_outcomes': 'Actual execution outcome store linked to execution plan items.',
     'order_requests': 'Normalized trading order request store; duplicate protection uses ON CONFLICT.',
+    'broker_orders': 'Current broker order snapshots; execution submit/reconcile writes select and update this parent store first.',
     'broker_order_events': 'Broker order event ledger; event dedupe uses ON CONFLICT.',
 }
 
@@ -68,6 +69,12 @@ RUNTIME_SCHEMA_PRIMARY_KEY_CHECKS: tuple[dict[str, Any], ...] = (
         'table': 'symbols',
         'columns': ('id',),
         'description': 'symbols.id must be the primary key so downstream foreign keys and ORM identity are valid.',
+    },
+    {
+        'name': 'broker_orders_id_primary_key',
+        'table': 'broker_orders',
+        'columns': ('id',),
+        'description': 'broker_orders.id must be the primary key so broker order event foreign keys are valid.',
     },
 )
 
@@ -332,6 +339,20 @@ RUNTIME_SCHEMA_UNIQUE_CHECKS: tuple[dict[str, Any], ...] = (
         'description': 'Trading order request persistence uses this named conflict target.',
     },
     {
+        'name': 'broker_orders_broker_account_client_order_id_unique',
+        'table': 'broker_orders',
+        'columns': ('broker_name', 'account_reference', 'client_order_id'),
+        'required_name': 'uq_broker_orders_broker_account_client_order_id',
+        'description': 'Broker order upsert/load uses one current snapshot per broker account client order.',
+    },
+    {
+        'name': 'broker_orders_broker_account_broker_order_id_unique',
+        'table': 'broker_orders',
+        'columns': ('broker_name', 'account_reference', 'broker_order_id'),
+        'required_name': 'uq_broker_orders_broker_account_broker_order_id',
+        'description': 'Broker order reconciliation uses one current snapshot per broker account broker order id.',
+    },
+    {
         'name': 'broker_order_events_broker_order_dedup_key_unique',
         'table': 'broker_order_events',
         'columns': ('broker_order_row_id', 'event_dedup_key'),
@@ -396,6 +417,14 @@ RUNTIME_SCHEMA_FOREIGN_KEY_CHECKS: tuple[dict[str, Any], ...] = (
         'referred_table': 'signal_decider_execution_plan_items',
         'referred_columns': ('id',),
         'description': 'Actual execution outcomes must reference entry execution plan items.',
+    },
+    {
+        'name': 'broker_order_events_broker_order_row_id_fk',
+        'table': 'broker_order_events',
+        'columns': ('broker_order_row_id',),
+        'referred_table': 'broker_orders',
+        'referred_columns': ('id',),
+        'description': 'Broker order events must reference the parent broker order snapshot.',
     },
 )
 
