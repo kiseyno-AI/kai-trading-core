@@ -1095,6 +1095,32 @@ class SignalDeciderExecIntegrationService:
             try:
                 response_payload = await self.client.post_execution_plan(plan_payload)
             except SignalDeciderExecClientError as exc:
+                if exc.status_code == 409:
+                    response_payload = await self._recover_duplicate_dispatch_response(
+                        plan_id=plan_id,
+                        row_links=row_links,
+                    )
+                    if response_payload is not None:
+                        persisted_group_result = self._persist_dispatch_success(
+                            rows=eligible_rows,
+                            row_links=row_links,
+                            plan_id=plan_id,
+                            fingerprint=fingerprint,
+                            payload=plan_payload,
+                            response_payload=response_payload,
+                            trigger=trigger,
+                        )
+                        dispatched_group_count += 1
+                        group_results.append(
+                            {
+                                'account_reference': account_key,
+                                'decision_agent_name': decision_agent_name,
+                                'plan_id': plan_id,
+                                'recovered_from_duplicate': True,
+                                **persisted_group_result,
+                            }
+                        )
+                        continue
                 status = self._client_error_status(exc)
                 failed_group_count += 1
                 self._persist_dispatch_failure(
@@ -1193,6 +1219,69 @@ class SignalDeciderExecIntegrationService:
             'summary': summary,
             'enrichment_preflight': enrichment_preflight,
             'items': plan_view.get('items') or [],
+        }
+
+    async def _recover_duplicate_dispatch_response(
+        self,
+        *,
+        plan_id: str,
+        row_links: dict[int, list[dict[str, Any]]],
+    ) -> dict[str, Any] | None:
+        try:
+            readback = await self.client.list_execution_plans(external_plan_id=plan_id)
+        except SignalDeciderExecClientError:
+            return None
+        plans = _collect_items(readback)
+        plan = next(
+            (
+                item
+                for item in plans
+                if _normalize_optional_text(item.get('plan_id') or item.get('external_plan_id')) == plan_id
+            ),
+            plans[0] if len(plans) == 1 else None,
+        )
+        if not isinstance(plan, dict):
+            return None
+        status = _normalize_status(plan.get('status'))
+        if status not in {EXEC_DISPATCH_STATUS_ACCEPTED, EXEC_DISPATCH_STATUS_PARTIAL, 'accepted'}:
+            return None
+        exec_items = _collect_items(plan)
+        by_symbol_intent: dict[tuple[str | None, str | None], dict[str, Any]] = {}
+        for item in exec_items:
+            by_symbol_intent[
+                (
+                    _normalize_optional_text(item.get('symbol')),
+                    _normalize_optional_text(item.get('intent')),
+                )
+            ] = item
+        recovered_items: list[dict[str, Any]] = []
+        for links in row_links.values():
+            for link in links:
+                item = by_symbol_intent.get(
+                    (
+                        _normalize_optional_text(link.get('symbol')),
+                        _normalize_optional_text(link.get('intent')),
+                    )
+                )
+                if item is None:
+                    continue
+                recovered_items.append(
+                    {
+                        **item,
+                        'core_item_key': link.get('core_item_key'),
+                        'status': item.get('status') or EXEC_DISPATCH_STATUS_ACCEPTED,
+                    }
+                )
+        if not recovered_items:
+            return None
+        return {
+            'plan_id': plan_id,
+            'execution_plan_id': plan.get('execution_plan_id') or plan.get('id'),
+            'status': EXEC_DISPATCH_STATUS_ACCEPTED,
+            'accepted_item_count': len(recovered_items),
+            'rejected_item_count': 0,
+            'items': recovered_items,
+            'duplicate_recovered': True,
         }
 
     async def list_signal_decider_exec_overview(

@@ -1,5 +1,6 @@
 from datetime import date, datetime, timezone
 from decimal import Decimal
+import json
 import unittest
 from unittest.mock import patch
 from uuid import uuid4
@@ -1269,13 +1270,41 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         with patch(
             'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
             return_value=[{'trade_date': '2026-04-29', 'close_price': 50000}],
+        ) as load_bars:
+            first = service.refresh_plan_items(target_trade_date=self.target_trade_date, trigger='test')
+            second = service.refresh_plan_items(target_trade_date=self.target_trade_date, trigger='test_retry')
+
+        load_bars.assert_not_called()
+        self.assertEqual(first['summary']['items_total'], 1)
+        self.assertEqual(second['summary']['items_total'], 1)
+        self.assertEqual(first['items'][0]['plan_item_id'], second['items'][0]['plan_item_id'])
+
+    def test_refresh_plan_items_reuses_short_term_candidate_with_string_json_payloads(self) -> None:
+        snapshot_id = self._seed_short_term_snapshot(symbol='005930', tactical_action='watch_for_trigger')
+        with session_scope() as session:
+            snapshot = session.get(SignalDeciderDecisionSnapshot, snapshot_id)
+            self.assertIsNotNone(snapshot)
+            snapshot.response_payload = json.dumps(snapshot.response_payload)
+            snapshot.request_payload = json.dumps(snapshot.request_payload)
+            snapshot.traceability_payload = json.dumps(snapshot.traceability_payload)
+            snapshot.input_feature_snapshot_payload = json.dumps(snapshot.input_feature_snapshot_payload)
+            snapshot.response_summary_payload = json.dumps(snapshot.response_summary_payload)
+        service = self._service(state='PREOPEN', server_time='2026-04-30T08:40:00+09:00')
+
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[{'trade_date': '2026-04-29', 'close_price': 50000}],
         ):
             first = service.refresh_plan_items(target_trade_date=self.target_trade_date, trigger='test')
             second = service.refresh_plan_items(target_trade_date=self.target_trade_date, trigger='test_retry')
 
         self.assertEqual(first['summary']['items_total'], 1)
+        self.assertEqual(first['summary']['ready_count'], 1)
         self.assertEqual(second['summary']['items_total'], 1)
+        self.assertEqual(second['summary']['ready_count'], 1)
         self.assertEqual(first['items'][0]['plan_item_id'], second['items'][0]['plan_item_id'])
+        self.assertEqual(second['items'][0]['eligibility_status'], ELIGIBILITY_ELIGIBLE)
+        self.assertEqual(second['items'][0]['validation']['short_term']['tactical_action'], 'watch_for_trigger')
 
     async def test_run_market_open_execution_submits_and_prevents_duplicate_replays(self) -> None:
         self._seed_snapshot(symbol='005930')
