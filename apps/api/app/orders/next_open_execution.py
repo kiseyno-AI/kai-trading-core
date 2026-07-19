@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 import inspect
+import json
 import logging
 from typing import Any, Callable, Sequence
 
@@ -226,12 +227,39 @@ def _snapshot_agent_name(snapshot: SignalDeciderDecisionSnapshot) -> str:
     return _normalize_agent_name(snapshot.agent_name)
 
 
+def _json_object_payload(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip()
+        if not normalized:
+            return {}
+        try:
+            parsed = json.loads(normalized)
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
 def _snapshot_response_payload(snapshot: SignalDeciderDecisionSnapshot) -> dict[str, Any]:
-    return snapshot.response_payload if isinstance(snapshot.response_payload, dict) else {}
+    return _json_object_payload(snapshot.response_payload)
 
 
 def _snapshot_request_payload(snapshot: SignalDeciderDecisionSnapshot) -> dict[str, Any]:
-    return snapshot.request_payload if isinstance(snapshot.request_payload, dict) else {}
+    return _json_object_payload(snapshot.request_payload)
+
+
+def _snapshot_traceability_payload(snapshot: SignalDeciderDecisionSnapshot) -> dict[str, Any]:
+    return _json_object_payload(snapshot.traceability_payload)
+
+
+def _snapshot_input_feature_payload(snapshot: SignalDeciderDecisionSnapshot) -> dict[str, Any]:
+    return _json_object_payload(snapshot.input_feature_snapshot_payload)
+
+
+def _snapshot_response_summary_payload(snapshot: SignalDeciderDecisionSnapshot) -> dict[str, Any]:
+    return _json_object_payload(snapshot.response_summary_payload)
 
 
 def _snapshot_pre_decider_enrichment_context(snapshot: SignalDeciderDecisionSnapshot) -> dict[str, Any]:
@@ -465,9 +493,9 @@ def _short_term_entry_quality_blocks(
     tactical_action: str | None,
 ) -> tuple[list[dict[str, str]], list[dict[str, str]], dict[str, Any]]:
     payloads = [
-        snapshot.input_feature_snapshot_payload if isinstance(snapshot.input_feature_snapshot_payload, dict) else {},
-        snapshot.request_payload if isinstance(snapshot.request_payload, dict) else {},
-        snapshot.response_payload if isinstance(snapshot.response_payload, dict) else {},
+        _snapshot_input_feature_payload(snapshot),
+        _snapshot_request_payload(snapshot),
+        _snapshot_response_payload(snapshot),
     ]
     feature_payload = {'sources': payloads}
     atr_pct = _flatten_numeric_feature(feature_payload, {'atr_pct_14', 'atr_pct', 'atr14_pct', 'atr_percent'})
@@ -1725,11 +1753,7 @@ class SignalDeciderNextOpenExecutionService:
         alignment_gate_payload: dict[str, Any] | None = None
         blocking_reasons: list[dict[str, str]] = []
         warnings: list[dict[str, str]] = []
-        gate_checks = (
-            snapshot.traceability_payload.get('gate_checks')
-            if isinstance(snapshot.traceability_payload, dict)
-            else {}
-        ) or {}
+        gate_checks = _snapshot_traceability_payload(snapshot).get('gate_checks') or {}
         missing_upstream_roles = _normalize_text_list(gate_checks.get('missing_upstream_roles'))
         if missing_upstream_roles:
             blocking_reasons.append(
@@ -1835,7 +1859,14 @@ class SignalDeciderNextOpenExecutionService:
                     )
                 )
 
+        estimated_reference_price_basis = 'latest_source_market_close'
         estimated_reference_price = price_cache.get(snapshot.symbol)
+        if decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME:
+            estimated_reference_price = _to_int(response_payload.get('trigger_price')) or _to_int(
+                response_payload.get('chase_limit_price')
+            )
+            price_cache[snapshot.symbol] = estimated_reference_price
+            estimated_reference_price_basis = 'short_term_trigger_price'
         if snapshot.symbol not in price_cache:
             bars = load_daily_bars_for_symbol_range(
                 snapshot.symbol,
@@ -1846,7 +1877,6 @@ class SignalDeciderNextOpenExecutionService:
             )
             estimated_reference_price = bars[-1]['close_price'] if bars else None
             price_cache[snapshot.symbol] = estimated_reference_price
-        estimated_reference_price_basis = 'latest_source_market_close'
 
         if decision_agent_name == SIGNAL_DECIDER_AGENT_NAME:
             policy_context = policy_context or {}
@@ -2180,7 +2210,7 @@ class SignalDeciderNextOpenExecutionService:
                 'market_regime_context': market_regime_context,
                 'decision_input_quality_context': decision_input_quality_context,
                 'response_payload_summary': _to_json_safe(response_payload),
-                'response_summary': snapshot.response_summary_payload if isinstance(snapshot.response_summary_payload, dict) else None,
+                'response_summary': _snapshot_response_summary_payload(snapshot) or None,
                 'expected_holding_period': _short_term_field_text(snapshot, 'expected_holding_period')
                 or snapshot.suggested_holding_period,
             }
@@ -2344,10 +2374,10 @@ class SignalDeciderNextOpenExecutionService:
             'pre_decider_enrichment_context': validation_payload.get('pre_decider_enrichment_context') or {},
             'market_regime_context': validation_payload.get('market_regime_context') or {},
             'decision_input_quality_context': validation_payload.get('decision_input_quality_context') or {},
-            'response_summary': snapshot.response_summary_payload if isinstance(snapshot.response_summary_payload, dict) else None,
+            'response_summary': _snapshot_response_summary_payload(snapshot) or None,
             'response_payload_summary': _to_json_safe(response_payload),
-            'decision_traceability': snapshot.traceability_payload if isinstance(snapshot.traceability_payload, dict) else {},
-            'signal_traceability': snapshot.traceability_payload if isinstance(snapshot.traceability_payload, dict) else {},
+            'decision_traceability': _snapshot_traceability_payload(snapshot),
+            'signal_traceability': _snapshot_traceability_payload(snapshot),
         }
         if decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME:
             alignment_gate_payload = (
