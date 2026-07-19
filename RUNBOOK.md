@@ -126,21 +126,36 @@ Use these commands from `apps/api` when you want deploy-time schema checks to fa
 
 1. Preflight before upgrade or restart:
    `python3.11 -m app.internal.deploy_hygiene preflight --format text`
-2. Explicit head gate for a deploy:
+2. Runtime schema drift preflight when write-heavy workflows fail or before declaring them healthy:
+   `python3.11 -m app.internal.deploy_hygiene schema-drift-preflight --format text`
+   or through the internal ops surface:
+   `python3.11 -m app.internal.ops schema-drift-preflight`
+3. Explicit head gate for a deploy:
    `alembic upgrade head`
    `python3.11 -m app.internal.deploy_hygiene preflight --require-head --format text`
-3. Restart the API.
-4. Post-restart smoke:
+4. Restart the API.
+5. Post-restart smoke:
    `python3.11 -m app.internal.deploy_hygiene smoke-check --base-url http://127.0.0.1:8000 --format text`
 
 Notes:
 
 - The preflight is intentionally non-destructive. It does not mutate schema state.
+- The migration preflight includes the runtime schema drift result. It blocks on schema drift when the database is expected to be at Alembic head, including the `--require-head` deploy gate.
 - The preflight now also reports whether `/market/snapshot` is runtime-ready before restart, including the resolved KIS environment and any missing required secrets.
 - The preflight now also reports whether `/portfolio/summary` is runtime-ready before restart, including whether `PORTFOLIO_ACCOUNT_REFERENCES` is present and whether production is still pointed at the mock KIS environment.
 - The duplicate-table warning is heuristic by design: it flags live tables that overlap with still-pending unguarded `create_table(...)` revisions, which is the common `alembic_version` lag pattern behind repeated `DuplicateTable` deploy failures.
 - The smoke command now exercises `/portfolio/summary` in addition to `/health`, `/eod/freshness`, and `/market/snapshot`, and it fails when portfolio sync is still `not_configured` after restart.
 - The smoke command automatically sends `Authorization: Bearer <token>` when `UPSTREAM_BEARER_TOKEN` is set in the current shell environment.
+
+## Runtime write-path schema drift diagnostics
+
+When an EOD, DART, signal-decider, or execution write path fails, debug in this order:
+
+1. Reproduce the real write path that failed, preferably through `python3.11 -m app.internal.ops ...`, so the same SQL conflict target and payload shape are exercised.
+2. Inspect runtime schema constraints with `python3.11 -m app.internal.ops schema-drift-preflight`; if it blocks, compare the reported table, primary key, unique constraint/index, and foreign-key details against the expected migration.
+3. Only after the write path and schema objects are verified should you debug providers, credentials, upstream payload content, or rate limits.
+
+The schema drift preflight is diagnostic only. It never creates tables, adds constraints, stamps Alembic state, or mutates production schema.
 
 ## Duplicate-table drift recovery
 

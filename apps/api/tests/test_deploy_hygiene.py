@@ -56,6 +56,89 @@ BLOCKED_PORTFOLIO_SUMMARY_RUNTIME = {
     ],
 }
 
+READY_SCHEMA_DRIFT_REPORT = {
+    'status': deploy_hygiene.OK_STATUS,
+    'ready': True,
+    'summary': 'Runtime-critical schema objects are present.',
+    'database': {
+        'connected': True,
+        'url': 'postgresql://test:***@localhost/test',
+        'error': None,
+        'existing_table_count': 1,
+    },
+    'blocking_reasons': [],
+    'warnings': [],
+    'recommended_actions': [],
+    'checks': [],
+}
+
+BLOCKED_SCHEMA_DRIFT_REPORT = {
+    **READY_SCHEMA_DRIFT_REPORT,
+    'status': deploy_hygiene.FAIL_STATUS,
+    'ready': False,
+    'summary': 'Runtime-critical schema drift was detected.',
+    'blocking_reasons': ['Missing required table daily_signal_features.'],
+    'recommended_actions': ['Repair the missing runtime schema object.'],
+}
+
+
+def _ready_schema_inspector(
+    *,
+    missing_tables: set[str] | None = None,
+    missing_unique_names: set[str] | None = None,
+    missing_foreign_key_checks: set[str] | None = None,
+) -> Mock:
+    missing_tables = missing_tables or set()
+    missing_unique_names = missing_unique_names or set()
+    missing_foreign_key_checks = missing_foreign_key_checks or set()
+
+    required_tables = set(deploy_hygiene._runtime_schema_required_tables()) - missing_tables
+    unique_constraints_by_table: dict[str, list[dict]] = {table: [] for table in required_tables}
+    unique_indexes_by_table: dict[str, list[dict]] = {table: [] for table in required_tables}
+    foreign_keys_by_table: dict[str, list[dict]] = {table: [] for table in required_tables}
+
+    for spec in deploy_hygiene.RUNTIME_SCHEMA_UNIQUE_CHECKS:
+        table = spec['table']
+        if table not in required_tables:
+            continue
+        required_name = spec.get('required_name')
+        if required_name and required_name in missing_unique_names:
+            continue
+        if not required_name and spec['name'] in missing_unique_names:
+            continue
+
+        entry = {'name': required_name or f"uq_test_{spec['name']}", 'column_names': list(spec['columns'])}
+        if required_name:
+            unique_constraints_by_table[table].append(entry)
+        else:
+            unique_indexes_by_table[table].append({**entry, 'unique': True})
+
+    for spec in deploy_hygiene.RUNTIME_SCHEMA_FOREIGN_KEY_CHECKS:
+        table = spec['table']
+        if table not in required_tables or spec['referred_table'] not in required_tables:
+            continue
+        if spec['name'] in missing_foreign_key_checks:
+            continue
+        foreign_keys_by_table[table].append(
+            {
+                'name': f"fk_test_{spec['name']}",
+                'constrained_columns': list(spec['columns']),
+                'referred_table': spec['referred_table'],
+                'referred_columns': list(spec['referred_columns']),
+            }
+        )
+
+    inspector = Mock()
+    inspector.get_table_names.return_value = sorted(required_tables)
+    inspector.get_pk_constraint.side_effect = lambda table: {
+        'name': f'pk_{table}',
+        'constrained_columns': ['id'],
+    }
+    inspector.get_unique_constraints.side_effect = lambda table: unique_constraints_by_table.get(table, [])
+    inspector.get_indexes.side_effect = lambda table: unique_indexes_by_table.get(table, [])
+    inspector.get_foreign_keys.side_effect = lambda table: foreign_keys_by_table.get(table, [])
+    return inspector
+
 
 class DeployHygieneTests(unittest.TestCase):
     def test_parse_create_table_metadata_distinguishes_guarded_and_unguarded_revisions(self) -> None:
@@ -71,6 +154,122 @@ class DeployHygieneTests(unittest.TestCase):
         self.assertTrue(guarded)
         self.assertEqual(unguarded_tables, ['agent_feedback_session_cleanup_failures'])
         self.assertFalse(unguarded)
+
+    def test_collect_schema_drift_preflight_blocks_missing_runtime_table(self) -> None:
+        connection = object()
+        inspector = _ready_schema_inspector(missing_tables={'daily_signal_features'})
+
+        connect_context = Mock()
+        connect_context.__enter__ = Mock(return_value=connection)
+        connect_context.__exit__ = Mock(return_value=False)
+
+        with (
+            patch('app.internal.deploy_hygiene.engine.connect', return_value=connect_context),
+            patch('app.internal.deploy_hygiene.sqlalchemy_inspect', return_value=inspector),
+        ):
+            report, exit_code = deploy_hygiene.collect_schema_drift_preflight()
+
+        self.assertEqual(exit_code, 1)
+        self.assertFalse(report['ready'])
+        self.assertEqual(report['status'], deploy_hygiene.FAIL_STATUS)
+        self.assertIn('Missing required table daily_signal_features.', report['blocking_reasons'])
+        missing_table_check = next(check for check in report['checks'] if check['name'] == 'daily_signal_features_table')
+        self.assertFalse(missing_table_check['ready'])
+        self.assertEqual(missing_table_check['kind'], 'table')
+
+    def test_collect_schema_drift_preflight_blocks_missing_broker_orders_table(self) -> None:
+        connection = object()
+        inspector = _ready_schema_inspector(missing_tables={'broker_orders'})
+
+        connect_context = Mock()
+        connect_context.__enter__ = Mock(return_value=connection)
+        connect_context.__exit__ = Mock(return_value=False)
+
+        with (
+            patch('app.internal.deploy_hygiene.engine.connect', return_value=connect_context),
+            patch('app.internal.deploy_hygiene.sqlalchemy_inspect', return_value=inspector),
+        ):
+            report, exit_code = deploy_hygiene.collect_schema_drift_preflight()
+
+        self.assertEqual(exit_code, 1)
+        self.assertFalse(report['ready'])
+        self.assertIn('Missing required table broker_orders.', report['blocking_reasons'])
+        missing_table_check = next(check for check in report['checks'] if check['name'] == 'broker_orders_table')
+        self.assertFalse(missing_table_check['ready'])
+        self.assertEqual(missing_table_check['kind'], 'table')
+
+    def test_collect_schema_drift_preflight_blocks_missing_unique_and_foreign_key(self) -> None:
+        connection = object()
+        inspector = _ready_schema_inspector(
+            missing_unique_names={'uq_daily_action_summaries_symbol_market_date'},
+            missing_foreign_key_checks={'daily_signal_features_symbol_id_fk'},
+        )
+
+        connect_context = Mock()
+        connect_context.__enter__ = Mock(return_value=connection)
+        connect_context.__exit__ = Mock(return_value=False)
+
+        with (
+            patch('app.internal.deploy_hygiene.engine.connect', return_value=connect_context),
+            patch('app.internal.deploy_hygiene.sqlalchemy_inspect', return_value=inspector),
+        ):
+            report, exit_code = deploy_hygiene.collect_schema_drift_preflight()
+
+        self.assertEqual(exit_code, 1)
+        self.assertFalse(report['ready'])
+        self.assertIn(
+            'Missing required unique constraint/index uq_daily_action_summaries_symbol_market_date '
+            'on daily_action_summaries(symbol_id, market_date).',
+            report['blocking_reasons'],
+        )
+        self.assertIn(
+            'Missing foreign key from daily_signal_features(symbol_id) to symbols(id).',
+            report['blocking_reasons'],
+        )
+        failed_check_names = {check['name'] for check in report['checks'] if not check['ready']}
+        self.assertIn('daily_action_summaries_symbol_market_date_unique', failed_check_names)
+        self.assertIn('daily_signal_features_symbol_id_fk', failed_check_names)
+
+    def test_collect_schema_drift_preflight_blocks_missing_broker_order_uniques_and_event_fk(self) -> None:
+        connection = object()
+        inspector = _ready_schema_inspector(
+            missing_unique_names={
+                'uq_broker_orders_broker_account_client_order_id',
+                'uq_broker_orders_broker_account_broker_order_id',
+            },
+            missing_foreign_key_checks={'broker_order_events_broker_order_row_id_fk'},
+        )
+
+        connect_context = Mock()
+        connect_context.__enter__ = Mock(return_value=connection)
+        connect_context.__exit__ = Mock(return_value=False)
+
+        with (
+            patch('app.internal.deploy_hygiene.engine.connect', return_value=connect_context),
+            patch('app.internal.deploy_hygiene.sqlalchemy_inspect', return_value=inspector),
+        ):
+            report, exit_code = deploy_hygiene.collect_schema_drift_preflight()
+
+        self.assertEqual(exit_code, 1)
+        self.assertFalse(report['ready'])
+        self.assertIn(
+            'Missing required unique constraint/index uq_broker_orders_broker_account_client_order_id '
+            'on broker_orders(broker_name, account_reference, client_order_id).',
+            report['blocking_reasons'],
+        )
+        self.assertIn(
+            'Missing required unique constraint/index uq_broker_orders_broker_account_broker_order_id '
+            'on broker_orders(broker_name, account_reference, broker_order_id).',
+            report['blocking_reasons'],
+        )
+        self.assertIn(
+            'Missing foreign key from broker_order_events(broker_order_row_id) to broker_orders(id).',
+            report['blocking_reasons'],
+        )
+        failed_check_names = {check['name'] for check in report['checks'] if not check['ready']}
+        self.assertIn('broker_orders_broker_account_client_order_id_unique', failed_check_names)
+        self.assertIn('broker_orders_broker_account_broker_order_id_unique', failed_check_names)
+        self.assertIn('broker_order_events_broker_order_row_id_fk', failed_check_names)
 
     def test_collect_migration_preflight_flags_likely_duplicate_table_drift(self) -> None:
         connection = object()
@@ -110,6 +309,7 @@ class DeployHygieneTests(unittest.TestCase):
             patch('app.internal.deploy_hygiene.engine.connect', return_value=connect_context),
             patch('app.internal.deploy_hygiene.sqlalchemy_inspect', return_value=inspector),
             patch('app.internal.deploy_hygiene.MigrationContext.configure', return_value=migration_context),
+            patch('app.internal.deploy_hygiene._inspect_runtime_schema_drift', return_value=READY_SCHEMA_DRIFT_REPORT),
             patch('app.internal.deploy_hygiene.market_snapshot_service.runtime_status', return_value=READY_MARKET_SNAPSHOT_RUNTIME),
             patch('app.internal.deploy_hygiene.portfolio_summary_service.runtime_status', return_value=READY_PORTFOLIO_SUMMARY_RUNTIME),
         ):
@@ -153,6 +353,7 @@ class DeployHygieneTests(unittest.TestCase):
             patch('app.internal.deploy_hygiene.engine.connect', return_value=connect_context),
             patch('app.internal.deploy_hygiene.sqlalchemy_inspect', return_value=inspector),
             patch('app.internal.deploy_hygiene.MigrationContext.configure', return_value=migration_context),
+            patch('app.internal.deploy_hygiene._inspect_runtime_schema_drift', return_value=READY_SCHEMA_DRIFT_REPORT),
             patch('app.internal.deploy_hygiene.market_snapshot_service.runtime_status', return_value=READY_MARKET_SNAPSHOT_RUNTIME),
             patch('app.internal.deploy_hygiene.portfolio_summary_service.runtime_status', return_value=READY_PORTFOLIO_SUMMARY_RUNTIME),
         ):
@@ -162,6 +363,94 @@ class DeployHygieneTests(unittest.TestCase):
         self.assertEqual(report['status'], deploy_hygiene.WARN_STATUS)
         self.assertEqual(report['drift']['status'], 'none')
         self.assertTrue(report['safe_to_continue'])
+
+    def test_collect_migration_preflight_reports_schema_drift_without_blocking_pre_upgrade(self) -> None:
+        connection = object()
+        inspector = Mock()
+        inspector.get_table_names.return_value = ['symbols']
+
+        migration_context = Mock()
+        migration_context.get_current_heads.return_value = ('20260405_0001',)
+
+        connect_context = Mock()
+        connect_context.__enter__ = Mock(return_value=connection)
+        connect_context.__exit__ = Mock(return_value=False)
+
+        revision_catalog = [
+            {
+                'revision': '20260405_0001',
+                'migration': '20260405_0001_initial_market_schema.py',
+                'create_tables': ['symbols'],
+                'duplicate_table_guarded': True,
+            },
+            {
+                'revision': '20260407_0002',
+                'migration': '20260407_0002_dart_disclosure_sync.py',
+                'create_tables': ['dart_disclosure_sync_runs'],
+                'duplicate_table_guarded': True,
+            },
+        ]
+
+        with (
+            patch('app.internal.deploy_hygiene._load_revision_catalog', return_value=(('20260407_0002',), revision_catalog)),
+            patch('app.internal.deploy_hygiene.engine.connect', return_value=connect_context),
+            patch('app.internal.deploy_hygiene.sqlalchemy_inspect', return_value=inspector),
+            patch('app.internal.deploy_hygiene.MigrationContext.configure', return_value=migration_context),
+            patch('app.internal.deploy_hygiene._inspect_runtime_schema_drift', return_value=BLOCKED_SCHEMA_DRIFT_REPORT),
+            patch('app.internal.deploy_hygiene.market_snapshot_service.runtime_status', return_value=READY_MARKET_SNAPSHOT_RUNTIME),
+            patch('app.internal.deploy_hygiene.portfolio_summary_service.runtime_status', return_value=READY_PORTFOLIO_SUMMARY_RUNTIME),
+        ):
+            report, exit_code = deploy_hygiene.collect_migration_preflight()
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(report['status'], deploy_hygiene.WARN_STATUS)
+        self.assertFalse(report['schema_drift']['ready'])
+        self.assertFalse(report['schema_drift']['enforced'])
+        self.assertTrue(report['safe_to_continue'])
+
+    def test_collect_migration_preflight_blocks_schema_drift_at_head(self) -> None:
+        connection = object()
+        inspector = Mock()
+        inspector.get_table_names.return_value = ['symbols']
+
+        migration_context = Mock()
+        migration_context.get_current_heads.return_value = ('20260407_0002',)
+
+        connect_context = Mock()
+        connect_context.__enter__ = Mock(return_value=connection)
+        connect_context.__exit__ = Mock(return_value=False)
+
+        revision_catalog = [
+            {
+                'revision': '20260405_0001',
+                'migration': '20260405_0001_initial_market_schema.py',
+                'create_tables': ['symbols'],
+                'duplicate_table_guarded': True,
+            },
+            {
+                'revision': '20260407_0002',
+                'migration': '20260407_0002_dart_disclosure_sync.py',
+                'create_tables': ['dart_disclosure_sync_runs'],
+                'duplicate_table_guarded': True,
+            },
+        ]
+
+        with (
+            patch('app.internal.deploy_hygiene._load_revision_catalog', return_value=(('20260407_0002',), revision_catalog)),
+            patch('app.internal.deploy_hygiene.engine.connect', return_value=connect_context),
+            patch('app.internal.deploy_hygiene.sqlalchemy_inspect', return_value=inspector),
+            patch('app.internal.deploy_hygiene.MigrationContext.configure', return_value=migration_context),
+            patch('app.internal.deploy_hygiene._inspect_runtime_schema_drift', return_value=BLOCKED_SCHEMA_DRIFT_REPORT),
+            patch('app.internal.deploy_hygiene.market_snapshot_service.runtime_status', return_value=READY_MARKET_SNAPSHOT_RUNTIME),
+            patch('app.internal.deploy_hygiene.portfolio_summary_service.runtime_status', return_value=READY_PORTFOLIO_SUMMARY_RUNTIME),
+        ):
+            report, exit_code = deploy_hygiene.collect_migration_preflight()
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(report['status'], deploy_hygiene.FAIL_STATUS)
+        self.assertFalse(report['schema_drift']['ready'])
+        self.assertTrue(report['schema_drift']['enforced'])
+        self.assertFalse(report['safe_to_continue'])
 
     def test_collect_migration_preflight_require_head_fails_when_pending_remain(self) -> None:
         connection = object()
@@ -195,6 +484,7 @@ class DeployHygieneTests(unittest.TestCase):
             patch('app.internal.deploy_hygiene.engine.connect', return_value=connect_context),
             patch('app.internal.deploy_hygiene.sqlalchemy_inspect', return_value=inspector),
             patch('app.internal.deploy_hygiene.MigrationContext.configure', return_value=migration_context),
+            patch('app.internal.deploy_hygiene._inspect_runtime_schema_drift', return_value=READY_SCHEMA_DRIFT_REPORT),
             patch('app.internal.deploy_hygiene.market_snapshot_service.runtime_status', return_value=READY_MARKET_SNAPSHOT_RUNTIME),
             patch('app.internal.deploy_hygiene.portfolio_summary_service.runtime_status', return_value=READY_PORTFOLIO_SUMMARY_RUNTIME),
         ):
@@ -237,6 +527,7 @@ class DeployHygieneTests(unittest.TestCase):
             patch('app.internal.deploy_hygiene.engine.connect', return_value=connect_context),
             patch('app.internal.deploy_hygiene.sqlalchemy_inspect', return_value=inspector),
             patch('app.internal.deploy_hygiene.MigrationContext.configure', return_value=migration_context),
+            patch('app.internal.deploy_hygiene._inspect_runtime_schema_drift', return_value=READY_SCHEMA_DRIFT_REPORT),
             patch('app.internal.deploy_hygiene.market_snapshot_service.runtime_status', return_value=BLOCKED_MARKET_SNAPSHOT_RUNTIME),
             patch('app.internal.deploy_hygiene.portfolio_summary_service.runtime_status', return_value=READY_PORTFOLIO_SUMMARY_RUNTIME),
         ):
@@ -279,6 +570,7 @@ class DeployHygieneTests(unittest.TestCase):
             patch('app.internal.deploy_hygiene.engine.connect', return_value=connect_context),
             patch('app.internal.deploy_hygiene.sqlalchemy_inspect', return_value=inspector),
             patch('app.internal.deploy_hygiene.MigrationContext.configure', return_value=migration_context),
+            patch('app.internal.deploy_hygiene._inspect_runtime_schema_drift', return_value=READY_SCHEMA_DRIFT_REPORT),
             patch('app.internal.deploy_hygiene.market_snapshot_service.runtime_status', return_value=READY_MARKET_SNAPSHOT_RUNTIME),
             patch('app.internal.deploy_hygiene.portfolio_summary_service.runtime_status', return_value=BLOCKED_PORTFOLIO_SUMMARY_RUNTIME),
         ):

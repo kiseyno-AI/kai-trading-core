@@ -97,6 +97,24 @@ class InternalAPIClientTests(unittest.IsolatedAsyncioTestCase):
 
 
 class InternalOpsTests(unittest.TestCase):
+    def test_main_schema_drift_preflight_emits_json_and_exit_code(self) -> None:
+        payload = {
+            'ready': False,
+            'blocking_reasons': ['Missing required table daily_signal_features.'],
+            'warnings': [],
+            'recommended_actions': ['Inspect schema constraints.'],
+        }
+        stdout = io.StringIO()
+        with (
+            patch('app.internal.ops.collect_schema_drift_preflight', return_value=(payload, 1)) as collect_preflight,
+            redirect_stdout(stdout),
+        ):
+            exit_code = ops.main(['schema-drift-preflight'])
+
+        collect_preflight.assert_called_once_with()
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(json.loads(stdout.getvalue()), payload)
+
     def test_run_pykrx_daily_if_due_uses_direct_service_call(self) -> None:
         with (
             patch('app.internal.ops.bootstrap_runtime') as bootstrap_runtime,
@@ -408,6 +426,10 @@ class InternalOpsTests(unittest.TestCase):
         with (
             patch('app.internal.ops.bootstrap_runtime') as bootstrap_runtime,
             patch(
+                'app.internal.ops.agent_feedback_prerequisite_service.inspect_feedback_prerequisites',
+                return_value={'ready': True, 'status': 'ready'},
+            ) as inspect_prerequisites,
+            patch(
                 'app.internal.ops.signal_decider_loop_service.compute_recent_evaluations',
                 return_value={'summary': {'evaluations_upserted': 4}},
             ) as compute_evaluations,
@@ -422,6 +444,7 @@ class InternalOpsTests(unittest.TestCase):
             )
 
         bootstrap_runtime.assert_called_once_with()
+        inspect_prerequisites.assert_called_once_with(market_date='2026-04-30')
         self.assertEqual(result, {'summary': {'evaluations_upserted': 4}})
         self.assertEqual(compute_evaluations.call_args.kwargs['as_of_market_date'], '2026-04-30')
         self.assertEqual(compute_evaluations.call_args.kwargs['lookback_days'], 21)

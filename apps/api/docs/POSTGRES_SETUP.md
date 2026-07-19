@@ -42,12 +42,14 @@ If you keep `DB_AUTO_UPGRADE=true` and launch uvicorn directly, normal FastAPI s
 For deploy-time hygiene from `apps/api`:
 
 1. `python3.11 -m app.internal.deploy_hygiene preflight --format text`
-2. `alembic upgrade head`
-3. `python3.11 -m app.internal.deploy_hygiene preflight --require-head --format text`
-4. Restart the API
-5. `python3.11 -m app.internal.deploy_hygiene smoke-check --base-url http://127.0.0.1:8000 --format text`
+2. `python3.11 -m app.internal.deploy_hygiene schema-drift-preflight --format text`
+3. `alembic upgrade head`
+4. `python3.11 -m app.internal.deploy_hygiene preflight --require-head --format text`
+5. Restart the API
+6. `python3.11 -m app.internal.deploy_hygiene smoke-check --base-url http://127.0.0.1:8000 --format text`
 
 If the preflight flags likely duplicate-table drift, verify the live table shape against the pending migration and use `alembic stamp <matching_revision>` only after schema parity is confirmed. If parity is not clean, prefer a corrective migration over destructive table drops.
+If runtime writes fail, reproduce the real write path first, inspect the schema-drift report second, and debug provider payloads or credentials only after the expected constraints are present.
 
 ## First-pass schema
 
