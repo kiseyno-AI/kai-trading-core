@@ -41,6 +41,7 @@ from app.eod.pykrx_enrichment import pykrx_enrichment_service
 from app.eod.state import job_state
 from app.eod.technical_snapshots import daily_technical_snapshot_service
 from app.external_news.service import external_news_service
+from app.internal.deploy_hygiene import collect_schema_drift_preflight
 from app.market.clock import get_market_state
 from app.market.kis_intraday_snapshots import KIS_INTRADAY_SNAPSHOT_SOURCE, kis_intraday_snapshot_service
 from app.market_data_store import (
@@ -882,6 +883,10 @@ def _build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser('scanner-tracked-symbols', help='Return /scanner/tracked-symbols directly from services')
     subparsers.add_parser('eod-status', help='Return /eod/status directly from services')
     subparsers.add_parser('eod-pipeline-stages', help='List the canonical daily pipeline stage catalog')
+    subparsers.add_parser(
+        'schema-drift-preflight',
+        help='Verify runtime-critical tables and constraints before write-heavy workflows are treated as healthy',
+    )
 
     pipeline_run_parser = subparsers.add_parser(
         'eod-pipeline-run',
@@ -1358,6 +1363,10 @@ def main(argv: Iterable[str] | None = None) -> int:
         payload = get_eod_status()
     elif args.command == 'eod-pipeline-stages':
         payload = list_daily_pipeline_stages()
+    elif args.command == 'schema-drift-preflight':
+        payload, exit_code = collect_schema_drift_preflight()
+        print(json.dumps(payload, ensure_ascii=False))
+        return exit_code
     elif args.command == 'eod-pipeline-run':
         payload = run_daily_pipeline_stages(
             market_date=args.market_date,

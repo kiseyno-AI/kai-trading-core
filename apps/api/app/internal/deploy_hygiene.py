@@ -21,6 +21,384 @@ OK_STATUS = 'ok'
 WARN_STATUS = 'warn'
 FAIL_STATUS = 'fail'
 
+RUNTIME_SCHEMA_TABLE_DESCRIPTIONS: dict[str, str] = {
+    'symbols': 'Symbol identity table; symbol writes and downstream FKs depend on symbols.id and symbols.symbol.',
+    'tracked_symbols': 'Tracked universe state used by scanner, EOD, quote, and execution workflows.',
+    'current_quote_cache': 'Current quote read model updated by quote ingestion and read by execution/runtime dashboards.',
+    'daily_price_bars': 'Primary EOD price-bar store; PyKRX/KIS writes use ON CONFLICT by symbol/date.',
+    'daily_price_contexts': 'Derived price context store used by agent-context reads.',
+    'daily_technical_snapshots': 'Daily technical read model written by the EOD pipeline.',
+    'daily_action_summaries': 'Daily action-summary read model written by the EOD pipeline.',
+    'daily_signal_features': 'KIS ranking signal feature table used by EOD and decider context.',
+    'daily_market_risk_snapshots': 'Daily KIS market risk source snapshots.',
+    'daily_market_risk_filter_results': 'Persisted market risk filter results.',
+    'daily_piotroski_filter_results': 'Persisted Piotroski filter results.',
+    'daily_momentum_factor_results': 'Persisted momentum factor results.',
+    'daily_low_risk_factor_results': 'Persisted low-risk factor results.',
+    'daily_beta_factor_results': 'Persisted beta factor results.',
+    'daily_value_factor_results': 'Persisted value factor results.',
+    'daily_advanced_value_factor_results': 'Persisted advanced value factor results.',
+    'daily_unified_value_factor_results': 'Persisted unified value factor results.',
+    'daily_quality_factor_results': 'Persisted quality factor results.',
+    'daily_composite_factor_results': 'Persisted composite factor results.',
+    'daily_market_participation_contexts': 'Persisted market participation context written by KIS signal collection.',
+    'daily_pykrx_enrichment_rows': 'Persisted PyKRX enrichment rows for sector, investor-flow, and short-selling context.',
+    'dart_disclosure_events': 'DART disclosure event store; disclosure sync upserts by receipt number.',
+    'dart_fundamentals_snapshots': 'DART fundamentals snapshot store; fundamentals capture upserts by event/period/fs_div.',
+    'agent_context_feedback': 'Agent feedback store used by decider snapshot persistence.',
+    'agent_context_feedback_failures': 'Agent feedback failure store used by retry/repair workflows.',
+    'agent_context_feedback_runs': 'Agent feedback run-state store used by retry/run tracking.',
+    'agent_feedback_session_cleanup_failures': 'Cleanup failure retry queue for agent-feedback transcript/session cleanup.',
+    'signal_decider_decision_snapshots': 'Signal-decider snapshot store; feedback-linked snapshots use ON CONFLICT.',
+    'signal_decider_realized_outcomes': 'Signal-decider realized outcome store written by evaluation refresh.',
+    'signal_decider_evaluations': 'Signal-decider evaluation store written by evaluation refresh.',
+    'decider_post_decision_evaluations': 'Post-decision evaluation store used by decider feedback quality loops.',
+    'signal_decider_calendar_review_items': 'Signal-decider calendar-review read model.',
+    'signal_decider_policy_versions': 'Signal-decider policy version store.',
+    'signal_decider_policy_candidates': 'Signal-decider policy candidate store.',
+    'signal_decider_execution_plan_items': 'Signal-decider next-open/intraday execution plan items.',
+    'signal_decider_actual_execution_outcomes': 'Actual execution outcome store linked to execution plan items.',
+    'order_requests': 'Normalized trading order request store; duplicate protection uses ON CONFLICT.',
+    'broker_order_events': 'Broker order event ledger; event dedupe uses ON CONFLICT.',
+}
+
+RUNTIME_SCHEMA_PRIMARY_KEY_CHECKS: tuple[dict[str, Any], ...] = (
+    {
+        'name': 'symbols_id_primary_key',
+        'table': 'symbols',
+        'columns': ('id',),
+        'description': 'symbols.id must be the primary key so downstream foreign keys and ORM identity are valid.',
+    },
+)
+
+RUNTIME_SCHEMA_UNIQUE_CHECKS: tuple[dict[str, Any], ...] = (
+    {
+        'name': 'symbols_symbol_unique',
+        'table': 'symbols',
+        'columns': ('symbol',),
+        'required_name': None,
+        'description': 'Symbol upserts use ON CONFLICT(symbol).',
+    },
+    {
+        'name': 'tracked_symbols_symbol_id_unique',
+        'table': 'tracked_symbols',
+        'columns': ('symbol_id',),
+        'required_name': 'uq_tracked_symbols_symbol_id',
+        'description': 'Tracked-symbol replacement depends on one row per symbol.',
+    },
+    {
+        'name': 'current_quote_cache_symbol_id_unique',
+        'table': 'current_quote_cache',
+        'columns': ('symbol_id',),
+        'required_name': 'uq_current_quote_cache_symbol_id',
+        'description': 'Current quote cache must have one mutable row per symbol.',
+    },
+    {
+        'name': 'daily_price_bars_symbol_trade_date_unique',
+        'table': 'daily_price_bars',
+        'columns': ('symbol_id', 'trade_date'),
+        'required_name': None,
+        'description': 'Daily price-bar persistence uses ON CONFLICT(symbol_id, trade_date).',
+    },
+    {
+        'name': 'daily_price_contexts_symbol_market_date_unique',
+        'table': 'daily_price_contexts',
+        'columns': ('symbol_id', 'market_date'),
+        'required_name': 'uq_daily_price_contexts_symbol_market_date',
+        'description': 'Daily price-context persistence uses this named conflict target.',
+    },
+    {
+        'name': 'daily_technical_snapshots_symbol_market_date_unique',
+        'table': 'daily_technical_snapshots',
+        'columns': ('symbol_id', 'market_date'),
+        'required_name': 'uq_daily_technical_snapshots_symbol_market_date',
+        'description': 'Daily technical snapshot persistence uses this named conflict target.',
+    },
+    {
+        'name': 'daily_action_summaries_symbol_market_date_unique',
+        'table': 'daily_action_summaries',
+        'columns': ('symbol_id', 'market_date'),
+        'required_name': 'uq_daily_action_summaries_symbol_market_date',
+        'description': 'Daily action summary persistence uses this named conflict target.',
+    },
+    {
+        'name': 'daily_signal_features_symbol_market_date_unique',
+        'table': 'daily_signal_features',
+        'columns': ('symbol_id', 'market_date'),
+        'required_name': 'uq_daily_signal_features_symbol_market_date',
+        'description': 'Daily signal feature persistence uses this named conflict target.',
+    },
+    {
+        'name': 'daily_market_risk_snapshots_symbol_market_date_unique',
+        'table': 'daily_market_risk_snapshots',
+        'columns': ('symbol_id', 'market_date'),
+        'required_name': 'uq_daily_market_risk_snapshots_symbol_market_date',
+        'description': 'Daily market risk snapshot persistence uses this named conflict target.',
+    },
+    {
+        'name': 'daily_market_risk_filter_results_symbol_market_date_unique',
+        'table': 'daily_market_risk_filter_results',
+        'columns': ('symbol_id', 'market_date'),
+        'required_name': 'uq_daily_market_risk_filter_results_symbol_market_date',
+        'description': 'Daily market risk filter persistence uses this named conflict target.',
+    },
+    {
+        'name': 'daily_piotroski_filter_results_symbol_market_date_unique',
+        'table': 'daily_piotroski_filter_results',
+        'columns': ('symbol_id', 'market_date'),
+        'required_name': 'uq_daily_piotroski_filter_results_symbol_market_date',
+        'description': 'Daily Piotroski filter persistence uses this named conflict target.',
+    },
+    {
+        'name': 'daily_momentum_factor_results_symbol_market_date_unique',
+        'table': 'daily_momentum_factor_results',
+        'columns': ('symbol_id', 'market_date'),
+        'required_name': 'uq_daily_momentum_factor_results_symbol_market_date',
+        'description': 'Daily momentum factor persistence uses this named conflict target.',
+    },
+    {
+        'name': 'daily_low_risk_factor_results_symbol_market_date_unique',
+        'table': 'daily_low_risk_factor_results',
+        'columns': ('symbol_id', 'market_date'),
+        'required_name': 'uq_daily_low_risk_factor_results_symbol_market_date',
+        'description': 'Daily low-risk factor persistence uses this named conflict target.',
+    },
+    {
+        'name': 'daily_beta_factor_results_symbol_market_date_unique',
+        'table': 'daily_beta_factor_results',
+        'columns': ('symbol_id', 'market_date'),
+        'required_name': 'uq_daily_beta_factor_results_symbol_market_date',
+        'description': 'Daily beta factor persistence uses this named conflict target.',
+    },
+    {
+        'name': 'daily_value_factor_results_symbol_market_date_unique',
+        'table': 'daily_value_factor_results',
+        'columns': ('symbol_id', 'market_date'),
+        'required_name': 'uq_daily_value_factor_results_symbol_market_date',
+        'description': 'Daily value factor persistence uses this named conflict target.',
+    },
+    {
+        'name': 'daily_advanced_value_factor_results_symbol_market_date_unique',
+        'table': 'daily_advanced_value_factor_results',
+        'columns': ('symbol_id', 'market_date'),
+        'required_name': 'uq_daily_advanced_value_factor_results_symbol_market_date',
+        'description': 'Daily advanced-value factor persistence uses this named conflict target.',
+    },
+    {
+        'name': 'daily_unified_value_factor_results_symbol_market_date_unique',
+        'table': 'daily_unified_value_factor_results',
+        'columns': ('symbol_id', 'market_date'),
+        'required_name': 'uq_daily_unified_value_factor_results_symbol_market_date',
+        'description': 'Daily unified-value factor persistence uses this named conflict target.',
+    },
+    {
+        'name': 'daily_quality_factor_results_symbol_market_date_unique',
+        'table': 'daily_quality_factor_results',
+        'columns': ('symbol_id', 'market_date'),
+        'required_name': 'uq_daily_quality_factor_results_symbol_market_date',
+        'description': 'Daily quality factor persistence uses this named conflict target.',
+    },
+    {
+        'name': 'daily_composite_factor_results_symbol_market_date_unique',
+        'table': 'daily_composite_factor_results',
+        'columns': ('symbol_id', 'market_date'),
+        'required_name': 'uq_daily_composite_factor_results_symbol_market_date',
+        'description': 'Daily composite factor persistence uses this named conflict target.',
+    },
+    {
+        'name': 'daily_market_participation_contexts_market_market_date_unique',
+        'table': 'daily_market_participation_contexts',
+        'columns': ('market', 'market_date'),
+        'required_name': 'uq_daily_market_participation_contexts_market_market_date',
+        'description': 'Daily market participation persistence uses this named conflict target.',
+    },
+    {
+        'name': 'daily_pykrx_enrichment_rows_scope_unique',
+        'table': 'daily_pykrx_enrichment_rows',
+        'columns': ('market_date', 'category', 'scope_type', 'scope_key', 'source'),
+        'required_name': 'uq_daily_pykrx_enrichment_rows_scope',
+        'description': 'PyKRX enrichment persistence uses this named conflict target.',
+    },
+    {
+        'name': 'dart_disclosure_events_rcept_no_unique',
+        'table': 'dart_disclosure_events',
+        'columns': ('rcept_no',),
+        'required_name': None,
+        'description': 'DART disclosure sync uses ON CONFLICT(rcept_no).',
+    },
+    {
+        'name': 'dart_fundamentals_snapshots_event_period_fs_div_unique',
+        'table': 'dart_fundamentals_snapshots',
+        'columns': ('disclosure_event_id', 'business_year', 'report_code', 'fs_div'),
+        'required_name': 'uq_dart_fundamentals_snapshots_event_period_fs_div',
+        'description': 'DART fundamentals capture uses this named conflict target.',
+    },
+    {
+        'name': 'agent_context_feedback_market_symbol_agent_unique',
+        'table': 'agent_context_feedback',
+        'columns': ('market_date', 'symbol', 'agent_name'),
+        'required_name': 'uq_agent_context_feedback_market_symbol_agent',
+        'description': 'Agent feedback persistence uses this named conflict target.',
+    },
+    {
+        'name': 'agent_context_feedback_failures_market_symbol_agent_unique',
+        'table': 'agent_context_feedback_failures',
+        'columns': ('market_date', 'symbol', 'agent_name'),
+        'required_name': 'uq_agent_context_feedback_failures_market_symbol_agent',
+        'description': 'Agent feedback failure persistence uses this named conflict target.',
+    },
+    {
+        'name': 'agent_context_feedback_runs_run_id_unique',
+        'table': 'agent_context_feedback_runs',
+        'columns': ('run_id',),
+        'required_name': None,
+        'description': 'Agent feedback run-state persistence uses ON CONFLICT(run_id).',
+    },
+    {
+        'name': 'agent_feedback_session_cleanup_failures_session_key_unique',
+        'table': 'agent_feedback_session_cleanup_failures',
+        'columns': ('session_key',),
+        'required_name': 'uq_agent_feedback_session_cleanup_failures_session_key',
+        'description': 'Agent feedback session cleanup retry persistence uses this named conflict target.',
+    },
+    {
+        'name': 'signal_decider_decision_snapshots_feedback_id_unique',
+        'table': 'signal_decider_decision_snapshots',
+        'columns': ('feedback_id',),
+        'required_name': 'uq_signal_decider_decision_snapshots_feedback_id_not_null',
+        'description': 'Signal-decider snapshot persistence uses the partial unique feedback_id index.',
+    },
+    {
+        'name': 'signal_decider_realized_outcomes_snapshot_horizon_unique',
+        'table': 'signal_decider_realized_outcomes',
+        'columns': ('decision_snapshot_id', 'horizon_days'),
+        'required_name': 'uq_signal_decider_realized_outcomes_snapshot_horizon',
+        'description': 'Signal-decider realized outcome persistence uses this named conflict target.',
+    },
+    {
+        'name': 'signal_decider_evaluations_snapshot_horizon_version_unique',
+        'table': 'signal_decider_evaluations',
+        'columns': ('decision_snapshot_id', 'horizon_days', 'evaluation_version'),
+        'required_name': 'uq_signal_decider_evaluations_snapshot_horizon_version',
+        'description': 'Signal-decider evaluation persistence uses this named conflict target.',
+    },
+    {
+        'name': 'decider_post_decision_evaluations_feedback_window_unique',
+        'table': 'decider_post_decision_evaluations',
+        'columns': ('feedback_id', 'window_days'),
+        'required_name': 'uq_decider_post_decision_evaluations_feedback_window',
+        'description': 'Post-decision evaluation persistence uses this named conflict target.',
+    },
+    {
+        'name': 'signal_decider_calendar_review_items_snapshot_eval_horizon_unique',
+        'table': 'signal_decider_calendar_review_items',
+        'columns': ('decision_snapshot_id', 'evaluation_version', 'primary_horizon_days'),
+        'required_name': 'uq_sd_cal_review_items_snapshot_eval_horizon',
+        'description': 'Signal-decider calendar review persistence uses this named conflict target.',
+    },
+    {
+        'name': 'signal_decider_policy_versions_version_unique',
+        'table': 'signal_decider_policy_versions',
+        'columns': ('policy_version',),
+        'required_name': 'uq_signal_decider_policy_versions_version',
+        'description': 'Signal-decider policy version persistence uses this named conflict target.',
+    },
+    {
+        'name': 'signal_decider_policy_candidates_version_unique',
+        'table': 'signal_decider_policy_candidates',
+        'columns': ('candidate_version',),
+        'required_name': 'uq_signal_decider_policy_candidates_version',
+        'description': 'Signal-decider policy candidate persistence uses this named conflict target.',
+    },
+    {
+        'name': 'signal_decider_execution_plan_items_scope_unique',
+        'table': 'signal_decider_execution_plan_items',
+        'columns': ('execution_window', 'target_trade_date', 'account_reference', 'symbol', 'decision_agent_name'),
+        'required_name': 'uq_signal_decider_execution_plan_items_scope',
+        'description': 'Signal-decider execution plan refresh depends on one row per execution scope.',
+    },
+    {
+        'name': 'signal_decider_actual_execution_outcomes_entry_plan_unique',
+        'table': 'signal_decider_actual_execution_outcomes',
+        'columns': ('entry_plan_item_id',),
+        'required_name': 'uq_sdao_entry_plan',
+        'description': 'Actual execution outcomes depend on one outcome per entry plan item.',
+    },
+    {
+        'name': 'order_requests_broker_account_client_order_id_unique',
+        'table': 'order_requests',
+        'columns': ('broker_name', 'account_reference', 'client_order_id'),
+        'required_name': 'uq_order_requests_broker_account_client_order_id',
+        'description': 'Trading order request persistence uses this named conflict target.',
+    },
+    {
+        'name': 'broker_order_events_broker_order_dedup_key_unique',
+        'table': 'broker_order_events',
+        'columns': ('broker_order_row_id', 'event_dedup_key'),
+        'required_name': 'uq_broker_order_events_broker_order_dedup_key',
+        'description': 'Broker order event persistence uses this named conflict target.',
+    },
+)
+
+RUNTIME_SCHEMA_FOREIGN_KEY_CHECKS: tuple[dict[str, Any], ...] = (
+    {
+        'name': 'tracked_symbols_symbol_id_fk',
+        'table': 'tracked_symbols',
+        'columns': ('symbol_id',),
+        'referred_table': 'symbols',
+        'referred_columns': ('id',),
+        'description': 'tracked_symbols.symbol_id must reference symbols.id.',
+    },
+    {
+        'name': 'current_quote_cache_symbol_id_fk',
+        'table': 'current_quote_cache',
+        'columns': ('symbol_id',),
+        'referred_table': 'symbols',
+        'referred_columns': ('id',),
+        'description': 'current_quote_cache.symbol_id must reference symbols.id.',
+    },
+    {
+        'name': 'daily_price_bars_symbol_id_fk',
+        'table': 'daily_price_bars',
+        'columns': ('symbol_id',),
+        'referred_table': 'symbols',
+        'referred_columns': ('id',),
+        'description': 'daily_price_bars.symbol_id must reference symbols.id.',
+    },
+    {
+        'name': 'daily_signal_features_symbol_id_fk',
+        'table': 'daily_signal_features',
+        'columns': ('symbol_id',),
+        'referred_table': 'symbols',
+        'referred_columns': ('id',),
+        'description': 'daily_signal_features.symbol_id must reference symbols.id.',
+    },
+    {
+        'name': 'dart_fundamentals_snapshots_disclosure_event_id_fk',
+        'table': 'dart_fundamentals_snapshots',
+        'columns': ('disclosure_event_id',),
+        'referred_table': 'dart_disclosure_events',
+        'referred_columns': ('id',),
+        'description': 'dart_fundamentals_snapshots.disclosure_event_id must reference dart_disclosure_events.id.',
+    },
+    {
+        'name': 'signal_decider_execution_plan_items_decision_snapshot_id_fk',
+        'table': 'signal_decider_execution_plan_items',
+        'columns': ('decision_snapshot_id',),
+        'referred_table': 'signal_decider_decision_snapshots',
+        'referred_columns': ('id',),
+        'description': 'Execution plan items must reference persisted decision snapshots.',
+    },
+    {
+        'name': 'signal_decider_actual_execution_outcomes_entry_plan_item_id_fk',
+        'table': 'signal_decider_actual_execution_outcomes',
+        'columns': ('entry_plan_item_id',),
+        'referred_table': 'signal_decider_execution_plan_items',
+        'referred_columns': ('id',),
+        'description': 'Actual execution outcomes must reference entry execution plan items.',
+    },
+)
+
 
 def _market_snapshot_runtime_actions(runtime_status: dict[str, Any]) -> list[str]:
     actions: list[str] = []
@@ -111,6 +489,389 @@ def _load_revision_catalog() -> tuple[tuple[str, ...], list[dict[str, Any]]]:
     return tuple(script_dir.get_heads()), catalog
 
 
+def _runtime_schema_required_tables() -> tuple[str, ...]:
+    tables = set(RUNTIME_SCHEMA_TABLE_DESCRIPTIONS)
+    for spec in RUNTIME_SCHEMA_PRIMARY_KEY_CHECKS:
+        tables.add(spec['table'])
+    for spec in RUNTIME_SCHEMA_UNIQUE_CHECKS:
+        tables.add(spec['table'])
+    for spec in RUNTIME_SCHEMA_FOREIGN_KEY_CHECKS:
+        tables.add(spec['table'])
+        tables.add(spec['referred_table'])
+    return tuple(sorted(tables))
+
+
+def _normalize_column_names(value: Any) -> tuple[str, ...]:
+    if value is None:
+        return tuple()
+    if isinstance(value, str):
+        return (value,)
+    try:
+        return tuple(str(item) for item in value if item is not None)
+    except TypeError:
+        return tuple()
+
+
+def _column_sets_match(actual: Iterable[str], expected: Iterable[str]) -> bool:
+    return set(actual) == set(expected)
+
+
+def _format_columns(columns: Iterable[str]) -> str:
+    return '(' + ', '.join(columns) + ')'
+
+
+def _normalize_reflected_entries(raw_entries: Any, *, label: str, table: str) -> tuple[list[dict[str, Any]], list[str]]:
+    if raw_entries is None:
+        return [], []
+    if not isinstance(raw_entries, (list, tuple)):
+        return [], [f'{label} reflection for {table} returned {type(raw_entries).__name__}, expected list.']
+
+    entries: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    for raw_entry in raw_entries:
+        if not isinstance(raw_entry, dict):
+            warnings.append(f'{label} reflection for {table} included non-dict entry {type(raw_entry).__name__}.')
+            continue
+        entries.append(raw_entry)
+    return entries, warnings
+
+
+def _normalize_primary_key(raw_pk: Any, *, table: str) -> tuple[dict[str, Any], list[str]]:
+    if raw_pk is None:
+        return {'name': None, 'columns': []}, []
+    if not isinstance(raw_pk, dict):
+        return {'name': None, 'columns': []}, [
+            f'Primary-key reflection for {table} returned {type(raw_pk).__name__}, expected dict.'
+        ]
+    return {
+        'name': raw_pk.get('name'),
+        'columns': list(_normalize_column_names(raw_pk.get('constrained_columns') or raw_pk.get('column_names'))),
+    }, []
+
+
+def _normalize_unique_constraint(raw_constraint: dict[str, Any]) -> dict[str, Any]:
+    return {
+        'source': 'unique_constraint',
+        'name': raw_constraint.get('name'),
+        'columns': list(_normalize_column_names(raw_constraint.get('column_names') or raw_constraint.get('constrained_columns'))),
+    }
+
+
+def _normalize_unique_index(raw_index: dict[str, Any]) -> dict[str, Any] | None:
+    if not raw_index.get('unique'):
+        return None
+    dialect_options = raw_index.get('dialect_options')
+    where_clause = None
+    if isinstance(dialect_options, dict):
+        where_clause = dialect_options.get('postgresql_where') or dialect_options.get('sqlite_where')
+    return {
+        'source': 'unique_index',
+        'name': raw_index.get('name'),
+        'columns': list(_normalize_column_names(raw_index.get('column_names') or raw_index.get('expressions'))),
+        'where': str(where_clause) if where_clause is not None else None,
+    }
+
+
+def _normalize_foreign_key(raw_key: dict[str, Any]) -> dict[str, Any]:
+    return {
+        'name': raw_key.get('name'),
+        'columns': list(_normalize_column_names(raw_key.get('constrained_columns'))),
+        'referred_table': raw_key.get('referred_table'),
+        'referred_columns': list(_normalize_column_names(raw_key.get('referred_columns'))),
+    }
+
+
+def _reflect_runtime_table(inspector: Any, table: str) -> tuple[dict[str, Any], list[str]]:
+    metadata: dict[str, Any] = {
+        'primary_key': {'name': None, 'columns': []},
+        'unique_constraints': [],
+        'unique_indexes': [],
+        'foreign_keys': [],
+    }
+    warnings: list[str] = []
+
+    try:
+        primary_key, pk_warnings = _normalize_primary_key(inspector.get_pk_constraint(table), table=table)
+        metadata['primary_key'] = primary_key
+        warnings.extend(pk_warnings)
+    except Exception as exc:
+        warnings.append(f'Could not reflect primary key for {table}: {exc}')
+
+    try:
+        raw_constraints, constraint_warnings = _normalize_reflected_entries(
+            inspector.get_unique_constraints(table),
+            label='Unique-constraint',
+            table=table,
+        )
+        metadata['unique_constraints'] = [_normalize_unique_constraint(item) for item in raw_constraints]
+        warnings.extend(constraint_warnings)
+    except Exception as exc:
+        warnings.append(f'Could not reflect unique constraints for {table}: {exc}')
+
+    try:
+        raw_indexes, index_warnings = _normalize_reflected_entries(
+            inspector.get_indexes(table),
+            label='Index',
+            table=table,
+        )
+        metadata['unique_indexes'] = [
+            normalized for item in raw_indexes if (normalized := _normalize_unique_index(item)) is not None
+        ]
+        warnings.extend(index_warnings)
+    except Exception as exc:
+        warnings.append(f'Could not reflect indexes for {table}: {exc}')
+
+    try:
+        raw_foreign_keys, foreign_key_warnings = _normalize_reflected_entries(
+            inspector.get_foreign_keys(table),
+            label='Foreign-key',
+            table=table,
+        )
+        metadata['foreign_keys'] = [_normalize_foreign_key(item) for item in raw_foreign_keys]
+        warnings.extend(foreign_key_warnings)
+    except Exception as exc:
+        warnings.append(f'Could not reflect foreign keys for {table}: {exc}')
+
+    return metadata, warnings
+
+
+def _unique_candidates(table_metadata: dict[str, Any]) -> list[dict[str, Any]]:
+    return list(table_metadata.get('unique_constraints') or []) + list(table_metadata.get('unique_indexes') or [])
+
+
+def _schema_drift_connection_error_report(redacted_database_url: str, error: str) -> dict[str, Any]:
+    return {
+        'status': FAIL_STATUS,
+        'ready': False,
+        'summary': 'Runtime schema drift preflight could not inspect the configured database.',
+        'database': {
+            'connected': False,
+            'url': redacted_database_url,
+            'error': error,
+        },
+        'blocking_reasons': ['Database schema metadata could not be inspected.'],
+        'warnings': [],
+        'recommended_actions': [
+            'Verify the configured database is reachable from apps/api and rerun the schema drift preflight.',
+        ],
+        'checks': [],
+    }
+
+
+def _build_schema_drift_report(
+    *,
+    redacted_database_url: str,
+    existing_tables: Iterable[str],
+    checks: list[dict[str, Any]],
+    blocking_reasons: list[str],
+    warnings: list[str],
+) -> dict[str, Any]:
+    ready = not blocking_reasons
+    status = OK_STATUS if ready and not warnings else WARN_STATUS if ready else FAIL_STATUS
+    if ready:
+        summary = 'Runtime-critical schema objects are present.'
+        recommended_actions = [
+            'Continue with the real write-path reproduction before debugging providers if runtime writes still fail.',
+        ]
+    else:
+        summary = 'Runtime-critical schema drift was detected.'
+        recommended_actions = [
+            'Reproduce the real failing write path against the target database.',
+            'Inspect the flagged table, primary key, unique constraint/index, and foreign-key metadata.',
+            'Apply or repair the missing migration explicitly; do not mutate production schema automatically from this preflight.',
+            'After schema parity is confirmed, rerun schema-drift-preflight before debugging provider payloads or credentials.',
+        ]
+
+    return {
+        'status': status,
+        'ready': ready,
+        'summary': summary,
+        'database': {
+            'connected': True,
+            'url': redacted_database_url,
+            'error': None,
+            'existing_table_count': len(set(existing_tables)),
+        },
+        'blocking_reasons': list(dict.fromkeys(blocking_reasons)),
+        'warnings': list(dict.fromkeys(warnings)),
+        'recommended_actions': recommended_actions,
+        'checks': checks,
+    }
+
+
+def _inspect_runtime_schema_drift(
+    inspector: Any,
+    *,
+    existing_tables: Iterable[str] | None = None,
+    redacted_database_url: str | None = None,
+) -> dict[str, Any]:
+    database_url = redacted_database_url or _redacted_database_url()
+    try:
+        reflected_tables = sorted(existing_tables if existing_tables is not None else inspector.get_table_names())
+    except Exception as exc:
+        return _schema_drift_connection_error_report(database_url, str(exc))
+
+    required_tables = _runtime_schema_required_tables()
+    existing_table_set = set(reflected_tables)
+    checks: list[dict[str, Any]] = []
+    blocking_reasons: list[str] = []
+    warnings: list[str] = []
+    metadata_by_table: dict[str, dict[str, Any]] = {}
+
+    for table in required_tables:
+        exists = table in existing_table_set
+        checks.append(
+            {
+                'name': f'{table}_table',
+                'kind': 'table',
+                'table': table,
+                'ready': exists,
+                'expected': {'table': table},
+                'actual': {'exists': exists},
+                'description': RUNTIME_SCHEMA_TABLE_DESCRIPTIONS.get(table, 'Required runtime table.'),
+                'message': 'table exists' if exists else f'missing required table {table}',
+            }
+        )
+        if not exists:
+            blocking_reasons.append(f'Missing required table {table}.')
+            continue
+        metadata_by_table[table], table_warnings = _reflect_runtime_table(inspector, table)
+        warnings.extend(table_warnings)
+
+    for spec in RUNTIME_SCHEMA_PRIMARY_KEY_CHECKS:
+        table = spec['table']
+        expected_columns = tuple(spec['columns'])
+        if table not in metadata_by_table:
+            continue
+        primary_key = metadata_by_table[table]['primary_key']
+        ready = _column_sets_match(primary_key.get('columns') or [], expected_columns)
+        checks.append(
+            {
+                'name': spec['name'],
+                'kind': 'primary_key',
+                'table': table,
+                'ready': ready,
+                'expected': {'columns': list(expected_columns)},
+                'actual': primary_key,
+                'description': spec['description'],
+                'message': (
+                    f'primary key covers {_format_columns(expected_columns)}'
+                    if ready
+                    else f'missing primary key over {table}{_format_columns(expected_columns)}'
+                ),
+            }
+        )
+        if not ready:
+            blocking_reasons.append(f'Missing primary key over {table}{_format_columns(expected_columns)}.')
+
+    for spec in RUNTIME_SCHEMA_UNIQUE_CHECKS:
+        table = spec['table']
+        expected_columns = tuple(spec['columns'])
+        required_name = spec.get('required_name')
+        if table not in metadata_by_table:
+            continue
+
+        candidates = _unique_candidates(metadata_by_table[table])
+        column_matches = [candidate for candidate in candidates if _column_sets_match(candidate.get('columns') or [], expected_columns)]
+        if required_name:
+            matches = [candidate for candidate in column_matches if candidate.get('name') == required_name]
+        else:
+            matches = column_matches
+
+        ready = bool(matches)
+        check = {
+            'name': spec['name'],
+            'kind': 'unique',
+            'table': table,
+            'ready': ready,
+            'expected': {
+                'name': required_name,
+                'columns': list(expected_columns),
+                'name_required': bool(required_name),
+            },
+            'actual': {
+                'matching_candidates': matches,
+                'column_matching_candidates': column_matches,
+                'unique_constraints': metadata_by_table[table].get('unique_constraints') or [],
+                'unique_indexes': metadata_by_table[table].get('unique_indexes') or [],
+            },
+            'description': spec['description'],
+            'message': (
+                f'unique constraint/index present on {table}{_format_columns(expected_columns)}'
+                if ready
+                else f'missing required unique constraint/index on {table}{_format_columns(expected_columns)}'
+            ),
+        }
+        checks.append(check)
+        if not ready:
+            if required_name:
+                blocking_reasons.append(
+                    f'Missing required unique constraint/index {required_name} on {table}{_format_columns(expected_columns)}.'
+                )
+            else:
+                blocking_reasons.append(
+                    f'Missing required unique constraint/index on {table}{_format_columns(expected_columns)}.'
+                )
+
+    for spec in RUNTIME_SCHEMA_FOREIGN_KEY_CHECKS:
+        table = spec['table']
+        expected_columns = tuple(spec['columns'])
+        expected_referred_columns = tuple(spec['referred_columns'])
+        expected_referred_table = spec['referred_table']
+        if table not in metadata_by_table:
+            continue
+        if expected_referred_table not in existing_table_set:
+            continue
+
+        foreign_keys = metadata_by_table[table].get('foreign_keys') or []
+        matches = [
+            foreign_key
+            for foreign_key in foreign_keys
+            if _column_sets_match(foreign_key.get('columns') or [], expected_columns)
+            and foreign_key.get('referred_table') == expected_referred_table
+            and _column_sets_match(foreign_key.get('referred_columns') or [], expected_referred_columns)
+        ]
+        ready = bool(matches)
+        checks.append(
+            {
+                'name': spec['name'],
+                'kind': 'foreign_key',
+                'table': table,
+                'ready': ready,
+                'expected': {
+                    'columns': list(expected_columns),
+                    'referred_table': expected_referred_table,
+                    'referred_columns': list(expected_referred_columns),
+                },
+                'actual': {
+                    'matching_candidates': matches,
+                    'foreign_keys': foreign_keys,
+                },
+                'description': spec['description'],
+                'message': (
+                    f'foreign key present from {table}{_format_columns(expected_columns)} to '
+                    f'{expected_referred_table}{_format_columns(expected_referred_columns)}'
+                    if ready
+                    else f'missing foreign key from {table}{_format_columns(expected_columns)} to '
+                    f'{expected_referred_table}{_format_columns(expected_referred_columns)}'
+                ),
+            }
+        )
+        if not ready:
+            blocking_reasons.append(
+                f'Missing foreign key from {table}{_format_columns(expected_columns)} to '
+                f'{expected_referred_table}{_format_columns(expected_referred_columns)}.'
+            )
+
+    return _build_schema_drift_report(
+        redacted_database_url=database_url,
+        existing_tables=reflected_tables,
+        checks=checks,
+        blocking_reasons=blocking_reasons,
+        warnings=warnings,
+    )
+
+
 def _build_preflight_report(*, require_head: bool) -> dict[str, Any]:
     redacted_database_url = _redacted_database_url()
     market_snapshot_runtime = market_snapshot_service.runtime_status()
@@ -119,8 +880,14 @@ def _build_preflight_report(*, require_head: bool) -> dict[str, Any]:
     try:
         head_revisions, revision_catalog = _load_revision_catalog()
         with engine.connect() as connection:
-            existing_tables = sorted(sqlalchemy_inspect(connection).get_table_names())
+            inspector = sqlalchemy_inspect(connection)
+            existing_tables = sorted(inspector.get_table_names())
             current_revisions = tuple(MigrationContext.configure(connection).get_current_heads())
+            schema_drift_report = _inspect_runtime_schema_drift(
+                inspector,
+                existing_tables=existing_tables,
+                redacted_database_url=redacted_database_url,
+            )
     except Exception as exc:
         return {
             'status': FAIL_STATUS,
@@ -144,6 +911,7 @@ def _build_preflight_report(*, require_head: bool) -> dict[str, Any]:
                 'heuristic': 'Skipped because the database connection failed before Alembic state inspection.',
                 'findings': [],
             },
+            'schema_drift': _schema_drift_connection_error_report(redacted_database_url, str(exc)),
             'recommended_actions': [
                 'Verify the configured database is reachable from apps/api and rerun the preflight.',
             ],
@@ -157,6 +925,11 @@ def _build_preflight_report(*, require_head: bool) -> dict[str, Any]:
     head_revisions_list = list(head_revisions)
     current_revisions_list = list(current_revisions)
     at_head = bool(head_revisions) and tuple(current_revisions) == tuple(head_revisions)
+    schema_drift_enforced = at_head or require_head
+    schema_drift_report = {
+        **schema_drift_report,
+        'enforced': schema_drift_enforced,
+    }
 
     pending_revisions: list[dict[str, Any]] = []
     drift_findings: list[dict[str, Any]] = []
@@ -236,6 +1009,18 @@ def _build_preflight_report(*, require_head: bool) -> dict[str, Any]:
                     'After restart, run the deploy smoke check against /health, /eod/freshness, /market/snapshot, and /portfolio/summary.',
                 ]
 
+    if not schema_drift_report['ready']:
+        if not schema_drift_enforced and status != FAIL_STATUS:
+            recommended_actions.append(
+                'Runtime schema drift was reported before the database reached Alembic head; run alembic upgrade head, then rerun preflight --require-head.'
+            )
+        recommended_actions.extend(schema_drift_report['recommended_actions'])
+
+    if schema_drift_enforced and not schema_drift_report['ready']:
+        if status != FAIL_STATUS:
+            status = FAIL_STATUS
+            summary = 'Runtime schema drift preflight failed.'
+
     if not market_snapshot_runtime['ready']:
         if status != FAIL_STATUS:
             status = FAIL_STATUS
@@ -273,6 +1058,7 @@ def _build_preflight_report(*, require_head: bool) -> dict[str, Any]:
             ),
             'findings': drift_findings,
         },
+        'schema_drift': schema_drift_report,
         'recommended_actions': list(dict.fromkeys(recommended_actions)),
         'runtime_checks': {
             'market_snapshot': market_snapshot_runtime,
@@ -309,6 +1095,21 @@ def _render_preflight_text(report: dict[str, Any]) -> str:
             tables = ', '.join(finding['tables'])
             lines.append(f"- {finding['revision']} ({finding['migration']}): live table(s) already present -> {tables}")
 
+    schema_drift = report.get('schema_drift')
+    if isinstance(schema_drift, dict):
+        lines.append(
+            'Runtime schema drift: '
+            + ('ready' if schema_drift.get('ready') else 'blocked')
+            + f" (enforced={schema_drift.get('enforced', True)}, {schema_drift.get('summary')})"
+        )
+        for reason in (schema_drift.get('blocking_reasons') or [])[:12]:
+            lines.append(f"- schema_drift: {reason}")
+        remaining_reasons = len(schema_drift.get('blocking_reasons') or []) - 12
+        if remaining_reasons > 0:
+            lines.append(f"- schema_drift: ... {remaining_reasons} additional blocking reason(s) omitted")
+        for warning in (schema_drift.get('warnings') or [])[:6]:
+            lines.append(f"- schema_drift warning: {warning}")
+
     runtime_checks = report.get('runtime_checks') or {}
     market_snapshot = runtime_checks.get('market_snapshot')
     if isinstance(market_snapshot, dict):
@@ -336,6 +1137,67 @@ def _render_preflight_text(report: dict[str, Any]) -> str:
         lines.append(f"Database error: {report['database']['error']}")
 
     if report['recommended_actions']:
+        lines.append('Recommended actions:')
+        for action in report['recommended_actions']:
+            lines.append(f"- {action}")
+
+    return '\n'.join(lines)
+
+
+def collect_schema_drift_preflight() -> tuple[dict[str, Any], int]:
+    redacted_database_url = _redacted_database_url()
+    try:
+        with engine.connect() as connection:
+            inspector = sqlalchemy_inspect(connection)
+            existing_tables = sorted(inspector.get_table_names())
+            report = _inspect_runtime_schema_drift(
+                inspector,
+                existing_tables=existing_tables,
+                redacted_database_url=redacted_database_url,
+            )
+    except Exception as exc:
+        report = _schema_drift_connection_error_report(redacted_database_url, str(exc))
+    return report, 0 if report['ready'] else 1
+
+
+def _render_schema_drift_text(report: dict[str, Any]) -> str:
+    lines = [f"{report['status'].upper()} schema drift preflight: {report['summary']}"]
+    lines.append(f"Database: {report['database']['url']}")
+    lines.append(f"Ready: {report['ready']}")
+
+    checks = report.get('checks') or []
+    failed_checks = [check for check in checks if not check.get('ready')]
+    lines.append(f"Checks: {len(checks)} total, {len(failed_checks)} blocking")
+
+    if report.get('blocking_reasons'):
+        lines.append('Blocking reasons:')
+        for reason in report['blocking_reasons']:
+            lines.append(f"- {reason}")
+
+    if failed_checks:
+        lines.append('Failed check details:')
+        for check in failed_checks[:20]:
+            expected = check.get('expected') or {}
+            expected_name = expected.get('name')
+            expected_columns = expected.get('columns')
+            expected_detail = ''
+            if expected_name:
+                expected_detail += f" name={expected_name}"
+            if expected_columns:
+                expected_detail += f" columns={expected_columns}"
+            if expected.get('referred_table'):
+                expected_detail += f" references={expected.get('referred_table')}({expected.get('referred_columns')})"
+            lines.append(f"- {check.get('kind')} {check.get('table')}.{check.get('name')}:{expected_detail} -> {check.get('message')}")
+        remaining = len(failed_checks) - 20
+        if remaining > 0:
+            lines.append(f"- ... {remaining} additional failed check(s) omitted")
+
+    if report.get('warnings'):
+        lines.append('Warnings:')
+        for warning in report['warnings']:
+            lines.append(f"- {warning}")
+
+    if report.get('recommended_actions'):
         lines.append('Recommended actions:')
         for action in report['recommended_actions']:
             lines.append(f"- {action}")
@@ -521,6 +1383,12 @@ def _build_parser() -> argparse.ArgumentParser:
     preflight_parser.add_argument('--require-head', action='store_true')
     preflight_parser.add_argument('--format', choices=('json', 'text'), default='json')
 
+    schema_drift_parser = subparsers.add_parser(
+        'schema-drift-preflight',
+        help='Verify runtime-critical tables, primary keys, unique constraints/indexes, and foreign keys.',
+    )
+    schema_drift_parser.add_argument('--format', choices=('json', 'text'), default='json')
+
     smoke_parser = subparsers.add_parser(
         'smoke-check',
         help='Hit /health, /eod/freshness, and /market/snapshot after restart and fail if the service does not look healthy.',
@@ -538,6 +1406,11 @@ def main(argv: Iterable[str] | None = None) -> int:
     if args.command == 'preflight':
         report, exit_code = collect_migration_preflight(require_head=args.require_head)
         _emit_report(report, output_format=args.format, renderer=_render_preflight_text)
+        return exit_code
+
+    if args.command == 'schema-drift-preflight':
+        report, exit_code = collect_schema_drift_preflight()
+        _emit_report(report, output_format=args.format, renderer=_render_schema_drift_text)
         return exit_code
 
     if args.command == 'smoke-check':
