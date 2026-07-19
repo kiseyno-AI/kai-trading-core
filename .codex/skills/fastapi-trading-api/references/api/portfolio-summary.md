@@ -3,6 +3,9 @@
 ## Summary
 Read the aggregate portfolio payload for dashboard and portfolio-card consumers. The route resolves deployment-configured KIS account references, reuses the existing account inquiry services, and serves a short-lived cached summary by default so repeated dashboard reads do not fan out to live KIS account inquiries on every request.
 
+## Contract source
+Core does not expose a separate portfolio-risk snapshot endpoint today. The contract-documented equivalent is this route with `source="kis_portfolio_summary_v1"` plus execution-runtime held-position/readback fields; the portfolio equivalent is validated by `apps/api/app/orders/execution_handoff_contract.py`.
+
 ## Example request
 ```http
 GET /portfolio/summary?refresh=false

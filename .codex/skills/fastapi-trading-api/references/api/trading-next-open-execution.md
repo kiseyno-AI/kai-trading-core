@@ -26,6 +26,9 @@ When short-term candidates are present but `SIGNAL_DECIDER_NEXT_OPEN_ACCOUNT_TAR
 
 In that case the synthetic rail is treated as a budget/route placeholder, not a hard pre-priced share budget.
 
+## Contract source
+When the POST route delegates to Exec, the serialized dispatch payload is validated by `apps/api/app/orders/execution_handoff_contract.py` as `signal_decider_exec_plan_v2`; nested decider handoff context is validated as `exec_agent_decider_handoff_v1`. Core owns strategy context and payload construction, while Exec owns acceptance, sizing, and order/execution truth.
+
 ## Example request
 ```http
 GET /trading/orders/next-open-execution?target_trade_date=2026-04-30&refresh=true

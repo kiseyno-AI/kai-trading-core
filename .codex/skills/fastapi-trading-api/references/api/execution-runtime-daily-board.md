@@ -7,6 +7,9 @@ Each row includes compact `today_activity` facts for the requested `market_date`
 
 Price fields are display-oriented and cache-first: realtime websocket prices are preferred, but rows can fall back to local current-quote/cache or recent daily close with explicit source, freshness, and realtime subscription metadata.
 
+## Contract source
+The daily-board row statuses, `freshness` shape, `refresh` shape, display-price keys, and `today_activity` schema are validated by `apps/api/app/orders/execution_handoff_contract.py`. Core owns the cached dashboard read model, Exec owns order/execution/position truth, and Web should render the read model without inferring or issuing execution commands.
+
 ## Example request
 ```http
 GET /execution/runtime/daily-board?market_date=2026-04-30&refresh=true

@@ -1484,9 +1484,50 @@ Authorization: Bearer <token>
 
 ---
 
-# 5. Consumer Notes for UX / Web / Agent Layers
+# 5. Execution Handoff / Runtime Contract
 
-## 5.1 Freshness is not globally uniform
+Core's execution handoff boundary is versioned in code at
+[`apps/api/app/orders/execution_handoff_contract.py`](../apps/api/app/orders/execution_handoff_contract.py).
+That module is the source of truth for serialized dispatch payloads, dashboard runtime read models, status literals, today-activity rows, and the current portfolio-risk equivalent.
+
+## Ownership
+Core owns strategy/read-model work:
+- persisted signal-decider and short-term-decider planning rows,
+- core-to-exec dispatch payload construction,
+- cached dashboard read models under `/execution/runtime/*`,
+- the current portfolio summary equivalent exposed by `/portfolio/summary`.
+
+`kai-trading-exec` owns execution truth:
+- accepted execution plans,
+- order, execution, and position readback,
+- runtime liveness,
+- pause and kill-switch state.
+
+Web is a display-only consumer:
+- read Core's `/execution/runtime/*`, `/trading/orders/exec/*`, and `/portfolio/summary` payloads,
+- render explicit Core statuses instead of inferring execution state from labels,
+- do not submit orders or create new execution commands from these read models.
+
+## Contract surfaces
+- Dispatch payloads use `signal_decider_exec_plan_v2` in `metadata.schema_version` and per-item `risk_context.schema_version`.
+- Exec-agent handoff context uses `exec_agent_decider_handoff_v1`.
+- Dashboard read models use `execution_runtime_dashboard_read_model_v1` in `freshness.schema_version`.
+- Today buy/sell facts use `execution_runtime_today_activity_v1`.
+- Runtime status values are `ready`, `degraded`, `offline`, `paused`, and `kill_switched`.
+- Daily-board row statuses are `planned`, `accepted`, `scheduled`, `submitted`, `partial`, `filled`, `cancelled`, and `failed`.
+- Monitored-symbol states are `watching_target_stop`, `watching_fill`, `reconciling`, and `idle`.
+- Freshness states are `fresh`, `stale`, `partial`, `refreshing`, and `unavailable`.
+
+## Current portfolio-risk equivalent
+Core does not expose a separate portfolio-risk snapshot endpoint today. The currently owned equivalent is:
+- `/portfolio/summary` with `source = "kis_portfolio_summary_v1"`, `sync.status`, account summaries, holdings, allocation, recent activity, and notices,
+- execution-runtime row fields such as `held_position`, `position_quantity`, `position_average_price`, `open_quantity`, `today_activity`, and `remote_state`.
+
+Consumers should treat this as a read model, not as executable risk authority. Exec remains the execution-truth owner for live position/order state.
+
+# 6. Consumer Notes for UX / Web / Agent Layers
+
+## 6.1 Freshness is not globally uniform
 Do not assume:
 - price latest date,
 - technical latest date,
@@ -1496,20 +1537,20 @@ all match.
 
 Use `/eod/freshness` and section-specific timestamps/dates where possible.
 
-## 5.2 Partial coverage is normal
+## 6.2 Partial coverage is normal
 This system legitimately produces partial coverage in cases such as:
 - sparse DART history,
 - DART `[013]` no-data filings, which are stored as terminal `no_data` fundamentals capture state instead of retryable failures,
 - insufficient lookback for technical fields,
 - unavailable quote states.
 
-## 5.3 Unavailable does not mean zero
+## 6.3 Unavailable does not mean zero
 If a quote or subsection is unavailable:
 - preserve that state explicitly,
 - do not fabricate a numeric value,
 - do not silently degrade to misleading UI.
 
-## 5.4 Symbol detail is a composite screen
+## 6.4 Symbol detail is a composite screen
 Symbol-detail style consumers should think in layered modules:
 - quote,
 - market status,
@@ -1524,13 +1565,17 @@ These modules may differ in freshness and completeness.
 
 ---
 
-# 6. Recommended Core APIs for UX/GUI Planning
+# 7. Recommended Core APIs for UX/GUI Planning
 
 If a UX or frontend team needs to plan against the current system, the most important core APIs are:
 - `/market/status`
 - `/quotes/{symbol}`
 - `/quotes/tracked`
 - `/portfolio/summary`
+- `/execution/runtime/status`
+- `/execution/runtime/monitored-symbols`
+- `/execution/runtime/daily-board`
+- `/execution/runtime/symbols/{symbol}`
 - `/scanner/tracked-symbols`
 - `/symbols/search`
 - `/symbols/{symbol}/price-bars`
@@ -1545,7 +1590,7 @@ These cover most currently meaningful user-facing flows.
 
 ---
 
-# 7. Summary
+# 8. Summary
 
 `kai-trading-core` currently provides a layered API system covering:
 - market state,

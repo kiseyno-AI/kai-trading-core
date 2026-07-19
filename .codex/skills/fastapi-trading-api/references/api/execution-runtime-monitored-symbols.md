@@ -7,6 +7,9 @@ Each item includes explicit exec-runtime ownership fields so dashboard clients d
 
 Price fields are display-oriented: realtime websocket prices are preferred, then local current-quote/cache fallback, then recent daily close. Fallback prices are labeled with `price_source`, `price_status`, `display_price_available`, and realtime subscription metadata so capacity-limited symbols do not look like true data gaps.
 
+## Contract source
+The monitored-symbol item keys, monitoring states, exec-card flags, freshness, and price fields are validated by `apps/api/app/orders/execution_handoff_contract.py`. Core owns this symbol-level read model, Exec owns runtime/order/position truth, and Web consumes it for display-only monitored cards.
+
 ## Example request
 ```http
 GET /execution/runtime/monitored-symbols?market_date=2026-04-30&refresh=true

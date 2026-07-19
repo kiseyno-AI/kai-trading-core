@@ -3,6 +3,9 @@
 ## Summary
 Read the current `kai-trading-exec` runtime readiness from core. The response keeps integration configuration, auth presence, and remote runtime failure states explicit so operators can distinguish `disabled`, `not_configured`, `unavailable`, and contract-level failures without querying exec directly.
 
+## Contract source
+This operator route exposes raw integration/readiness state. The dashboard-facing normalized status contract is validated in `apps/api/app/orders/execution_handoff_contract.py`; Exec remains the owner of liveness, pause, and kill-switch truth.
+
 ## Example request
 ```http
 GET /trading/orders/exec/runtime?refresh=true

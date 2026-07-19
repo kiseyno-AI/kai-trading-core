@@ -15,6 +15,9 @@ Short-term exec handoffs also carry signal-decider alignment audit metadata in `
 
 Core blocks classic signal-decider next-open exec dispatch when source-market-date PyKRX enrichment coverage is missing for `sector_classification`, `investor_flow_symbol`, or `short_selling`. Blocked dispatch responses expose `summary.reason="pykrx_enrichment_preflight_blocked"` and the full `enrichment_preflight` payload on `POST /trading/orders/next-open-execution/run-if-due`; actionable short-term watch candidates remain visible as conditional/degraded rows rather than being erased by the global preflight.
 
+## Contract source
+Core-to-Exec dispatch payloads use `signal_decider_exec_plan_v2`, and nested exec-agent handoff context uses `exec_agent_decider_handoff_v1`; both are validated by `apps/api/app/orders/execution_handoff_contract.py`. Core owns strategy context and dispatch construction, Exec owns acceptance/sizing/order truth, and Web should read Core's aggregated view instead of querying Exec directly.
+
 ## Example request
 ```http
 GET /trading/orders/exec/signal-decider?target_trade_date=2026-04-30&symbol=005930&refresh=true

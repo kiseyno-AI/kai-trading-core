@@ -3,6 +3,9 @@
 ## Summary
 Read the web-facing exec runtime summary from core. The route normalizes core↔exec readiness into concise UI states such as `ready`, `degraded`, `offline`, `paused`, and `kill_switched`, while keeping liveness and safety issues explicit.
 
+## Contract source
+Status literals and serialized payload keys are validated by `apps/api/app/orders/execution_handoff_contract.py`. Core owns this display read model, Exec owns execution truth and safety state, and Web consumes the payload for display only.
+
 ## Example request
 ```http
 GET /execution/runtime/status?refresh=true
