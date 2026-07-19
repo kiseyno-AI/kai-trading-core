@@ -5,6 +5,9 @@ Read the per-symbol execution detail from core for dashboard/operator pages. The
 
 Top-level and row price fields use the dashboard display price read model: realtime websocket first, then local current-quote/cache, then recent daily close, with explicit fallback and realtime subscription metadata.
 
+## Contract source
+The symbol-detail top-level shape, planning/monitoring summaries, daily-board-compatible row items, freshness, and `today_activity` schema are validated by `apps/api/app/orders/execution_handoff_contract.py`. Core owns the strategy/read-model projection, Exec owns execution truth, and Web renders the result without calling Exec directly.
+
 ## Example request
 ```http
 GET /execution/runtime/symbols/005930?market_date=2026-04-30&refresh=true

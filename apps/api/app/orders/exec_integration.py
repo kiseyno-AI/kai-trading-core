@@ -29,6 +29,21 @@ from app.market.session import (
     CALENDAR_SOURCE_STATUS_UNAVAILABLE,
     async_get_krx_calendar_day,
 )
+from app.orders.execution_handoff_contract import (
+    EXEC_AGENT_DECIDER_HANDOFF_SCHEMA_VERSION,
+    EXECUTION_PLAN_DISPATCH_SCHEMA_VERSION,
+    EXECUTION_RUNTIME_DASHBOARD_READ_MODEL_SCHEMA_VERSION,
+    EXECUTION_RUNTIME_TODAY_ACTIVITY_SCHEMA_VERSION,
+    serialize_exec_agent_decider_handoff_payload,
+    serialize_execution_daily_board_payload,
+    serialize_execution_dashboard_freshness_payload,
+    serialize_execution_monitored_symbols_payload,
+    serialize_execution_plan_dispatch_payload,
+    serialize_execution_runtime_exec_card_payload,
+    serialize_execution_runtime_status_payload,
+    serialize_execution_symbol_detail_payload,
+    serialize_execution_today_activity_payload,
+)
 from app.orders.exec_payload_slimming import (
     compact_exec_item_link,
     compact_exec_readback,
@@ -73,7 +88,7 @@ EXEC_INTENT_INTRADAY_WATCH_BUY = 'intraday_watch_buy'
 EXEC_INTENT_TARGET_SELL = 'target_sell'
 EXEC_INTENT_STOP_SELL = 'stop_sell'
 EXEC_ENTRY_BUY_INTENTS = {EXEC_INTENT_NEXT_OPEN_BUY, EXEC_INTENT_INTRADAY_WATCH_BUY}
-EXEC_SOURCE_SCHEMA_VERSION = 'signal_decider_exec_plan_v2'
+EXEC_SOURCE_SCHEMA_VERSION = EXECUTION_PLAN_DISPATCH_SCHEMA_VERSION
 
 EXEC_DISPATCH_STATUS_PREVIEW = 'preview'
 EXEC_DISPATCH_STATUS_ACCEPTED = 'accepted'
@@ -202,7 +217,7 @@ EXEC_AGENT_ACCEPTED_ENTRY_STATUSES = {
 DASHBOARD_ENDPOINT_DAILY_BOARD = 'daily_board'
 DASHBOARD_ENDPOINT_MONITORED_SYMBOLS = 'monitored_symbols'
 DASHBOARD_ENDPOINT_SYMBOL_DETAIL = 'symbol_detail'
-DASHBOARD_READ_MODEL_SCHEMA_VERSION = 'execution_runtime_dashboard_read_model_v1'
+DASHBOARD_READ_MODEL_SCHEMA_VERSION = EXECUTION_RUNTIME_DASHBOARD_READ_MODEL_SCHEMA_VERSION
 DASHBOARD_REFRESH_STATUS_NOT_REQUESTED = 'not_requested'
 DASHBOARD_REFRESH_STATUS_SCHEDULED = 'scheduled'
 DASHBOARD_REFRESH_STATUS_RUNNING = 'running'
@@ -215,7 +230,7 @@ DASHBOARD_FRESHNESS_STATUS_STALE = 'stale'
 DASHBOARD_FRESHNESS_STATUS_PARTIAL = 'partial'
 DASHBOARD_FRESHNESS_STATUS_REFRESHING = 'refreshing'
 DASHBOARD_FRESHNESS_STATUS_UNAVAILABLE = 'unavailable'
-DASHBOARD_TODAY_ACTIVITY_SCHEMA_VERSION = 'execution_runtime_today_activity_v1'
+DASHBOARD_TODAY_ACTIVITY_SCHEMA_VERSION = EXECUTION_RUNTIME_TODAY_ACTIVITY_SCHEMA_VERSION
 DASHBOARD_TODAY_ACTIVITY_BROKER_ORDER_ID_LIMIT = 5
 
 MARKET_TIME_ZONE = ZoneInfo('Asia/Seoul')
@@ -1721,7 +1736,7 @@ class SignalDeciderExecIntegrationService:
             )
             for item in overview_items
         ]
-        return {
+        payload = {
             'request': {
                 'market_date': market_date.isoformat(),
                 'refresh': refresh,
@@ -1742,6 +1757,7 @@ class SignalDeciderExecIntegrationService:
             'refresh': refresh_state,
             'items': items,
         }
+        return serialize_execution_daily_board_payload(payload)
 
     def _build_runtime_monitored_symbols_payload(
         self,
@@ -1755,15 +1771,16 @@ class SignalDeciderExecIntegrationService:
     ) -> dict[str, Any]:
         resolved_market_date = date.fromisoformat(str(board['market_date']))
         board_items = list(board.get('items') or [])
-        board_items.extend(
-            self._load_historical_held_runtime_board_items(
-                market_date=resolved_market_date,
-                runtime_status=board['runtime']['status'],
-                existing_plan_item_ids=self._collect_runtime_plan_item_ids(board_items),
-                existing_held_scopes=self._collect_runtime_held_scopes(board_items),
-                live_holding_symbols=live_holding_symbols,
+        if board_items or live_holding_symbols is None or live_holding_symbols:
+            board_items.extend(
+                self._load_historical_held_runtime_board_items(
+                    market_date=resolved_market_date,
+                    runtime_status=board['runtime']['status'],
+                    existing_plan_item_ids=self._collect_runtime_plan_item_ids(board_items),
+                    existing_held_scopes=self._collect_runtime_held_scopes(board_items),
+                    live_holding_symbols=live_holding_symbols,
+                )
             )
-        )
         grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
         live_exec_monitoring_symbols = live_exec_monitoring_symbols or set()
         for item in board_items:
@@ -1811,7 +1828,7 @@ class SignalDeciderExecIntegrationService:
             for symbol in realtime_symbols
         ]
         generated_at = _utcnow()
-        return {
+        payload = {
             'request': {
                 'market_date': board['market_date'],
                 'refresh': refresh,
@@ -1837,6 +1854,7 @@ class SignalDeciderExecIntegrationService:
             'refresh': refresh_state,
             'items': items,
         }
+        return serialize_execution_monitored_symbols_payload(payload)
 
     def _build_runtime_symbol_detail_payload(
         self,
@@ -1949,7 +1967,7 @@ class SignalDeciderExecIntegrationService:
             'refresh': refresh_state,
             'items': items,
         }
-        return payload
+        return serialize_execution_symbol_detail_payload(payload)
 
     @staticmethod
     def _resolve_dashboard_runtime_read_model(
@@ -2356,7 +2374,7 @@ class SignalDeciderExecIntegrationService:
             runtime_status=runtime_status,
             refresh_state=refresh_state,
         )
-        return {
+        return serialize_execution_dashboard_freshness_payload({
             'schema_version': DASHBOARD_READ_MODEL_SCHEMA_VERSION,
             'endpoint': endpoint,
             'market_date': market_date.isoformat(),
@@ -2376,7 +2394,7 @@ class SignalDeciderExecIntegrationService:
             'readback_missing_count': readback_missing_count,
             'overview_item_count': len(overview_items),
             'output_item_count': output_item_count,
-        }
+        })
 
     def _resolve_dashboard_freshness_status(
         self,
@@ -2664,90 +2682,104 @@ class SignalDeciderExecIntegrationService:
             if isinstance(validation.get('alignment_gate'), dict)
             else None
         )
-        return _json_safe(
-            {
-                'schema_version': 'exec_agent_decider_handoff_v1',
-                'classification': EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING,
-                'symbol': row.symbol,
-                'target_trade_date': row.target_trade_date.isoformat(),
-                'source_market_date': row.source_market_date.isoformat(),
-                'traceability': {
-                    'core_plan_item_id': row.id,
-                    'core_client_order_id': row.client_order_id,
-                    'decision_snapshot_id': row.decision_snapshot_id,
-                    'feedback_id': traceability.get('source_feedback_id') or traceability.get('feedback_id'),
-                    'source_feedback_id': traceability.get('source_feedback_id') or traceability.get('feedback_id'),
-                    'decision_run_id': traceability.get('decision_run_id'),
-                    'policy_version': row.policy_version,
-                    'decision_agent_name': row_decision_agent_name,
-                    'raw_action': raw_action,
-                    'tactical_action': traceability.get('tactical_action'),
-                    'generic_action': generic_action,
-                    'handoff_intent': handoff_intent,
-                    'signal_decider_alignment': traceability.get('signal_decider_alignment')
-                    or validation.get('signal_decider_alignment'),
-                    'alignment_gate_action': traceability.get('alignment_gate_action')
-                    or validation.get('alignment_gate_action'),
-                    'alignment_gate_reason': traceability.get('alignment_gate_reason')
-                    or validation.get('alignment_gate_reason'),
-                    'alignment_signal_decider_decision_snapshot_id': traceability.get(
-                        'alignment_signal_decider_decision_snapshot_id'
-                    )
-                    or validation.get('alignment_signal_decider_decision_snapshot_id'),
-                    'alignment_gate': alignment_gate,
-                    'decision_traceability': decision_traceability,
-                },
-                'decider_input_context': {
-                    'request_payload': request_payload,
-                    'input_feature_snapshot_payload': input_feature_snapshot_payload,
-                    'pre_decider_enrichment_context': pre_decider_enrichment_context,
+        return serialize_exec_agent_decider_handoff_payload(
+            _json_safe(
+                {
+                    'schema_version': EXEC_AGENT_DECIDER_HANDOFF_SCHEMA_VERSION,
+                    'classification': EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING,
+                    'symbol': row.symbol,
+                    'target_trade_date': row.target_trade_date.isoformat(),
+                    'source_market_date': row.source_market_date.isoformat(),
+                    'traceability': {
+                        'core_plan_item_id': row.id,
+                        'core_client_order_id': row.client_order_id,
+                        'decision_snapshot_id': row.decision_snapshot_id,
+                        'feedback_id': traceability.get('source_feedback_id') or traceability.get('feedback_id'),
+                        'source_feedback_id': traceability.get('source_feedback_id') or traceability.get('feedback_id'),
+                        'decision_run_id': traceability.get('decision_run_id'),
+                        'policy_version': row.policy_version,
+                        'decision_agent_name': row_decision_agent_name,
+                        'raw_action': raw_action,
+                        'tactical_action': traceability.get('tactical_action'),
+                        'generic_action': generic_action,
+                        'handoff_intent': handoff_intent,
+                        'signal_decider_alignment': traceability.get('signal_decider_alignment')
+                        or validation.get('signal_decider_alignment'),
+                        'alignment_gate_action': traceability.get('alignment_gate_action')
+                        or validation.get('alignment_gate_action'),
+                        'alignment_gate_reason': traceability.get('alignment_gate_reason')
+                        or validation.get('alignment_gate_reason'),
+                        'alignment_signal_decider_decision_snapshot_id': traceability.get(
+                            'alignment_signal_decider_decision_snapshot_id'
+                        )
+                        or validation.get('alignment_signal_decider_decision_snapshot_id'),
+                        'alignment_gate': alignment_gate,
+                        'decision_traceability': decision_traceability,
+                    },
+                    'decider_input_context': {
+                        'request_payload': request_payload,
+                        'input_feature_snapshot_payload': input_feature_snapshot_payload,
+                        'pre_decider_enrichment_context': pre_decider_enrichment_context,
+                        'market_regime_context': market_regime_context,
+                        'decision_input_quality_context': decision_input_quality_context,
+                    },
                     'market_regime_context': market_regime_context,
                     'decision_input_quality_context': decision_input_quality_context,
-                },
-                'market_regime_context': market_regime_context,
-                'decision_input_quality_context': decision_input_quality_context,
-                'decider_output': {
-                    'decision_action': snapshot.decision_action if snapshot is not None else None,
-                    'preferred_action': snapshot.preferred_action if snapshot is not None else None,
-                    'next_day_open_action': snapshot.next_day_open_action if snapshot is not None else None,
-                    'raw_action': raw_action,
-                    'tactical_action': traceability.get('tactical_action'),
-                    'generic_action': generic_action,
-                    'handoff_intent': handoff_intent,
-                    'signal_decider_alignment': traceability.get('signal_decider_alignment')
-                    or validation.get('signal_decider_alignment'),
-                    'alignment_gate_action': traceability.get('alignment_gate_action')
-                    or validation.get('alignment_gate_action'),
-                    'alignment_gate_reason': traceability.get('alignment_gate_reason')
-                    or validation.get('alignment_gate_reason'),
-                    'alignment_gate': alignment_gate,
-                    'entry_price_basis': snapshot.entry_price_basis if snapshot is not None else traceability.get('entry_price_basis'),
-                    'trigger_price': traceability.get('trigger_price'),
-                    'chase_limit_price': traceability.get('chase_limit_price'),
-                    'target_price': traceability.get('target_price'),
-                    'stop_loss_price': traceability.get('stop_loss_price'),
-                    'expected_return_pct': snapshot.expected_return_pct if snapshot is not None else None,
-                    'confidence_score_10': snapshot.confidence_score_10 if snapshot is not None else traceability.get('confidence_score_10'),
-                    'conviction_score_10': snapshot.conviction_score_10 if snapshot is not None else traceability.get('conviction_score_10'),
-                    'thesis': snapshot.thesis_summary if snapshot is not None else traceability.get('thesis_summary'),
-                    'thesis_summary': snapshot.thesis_summary if snapshot is not None else traceability.get('thesis_summary'),
-                    'supporting_evidence': snapshot.supporting_evidence_payload if snapshot is not None else traceability.get('supporting_evidence') or [],
-                    'trigger_conditions': response_payload.get('trigger_conditions')
-                    or response_payload.get('trigger_conditions_payload')
-                    or traceability.get('trigger_conditions')
-                    or traceability.get('invalidation_conditions')
-                    or (snapshot.invalidation_conditions_payload if snapshot is not None else []),
-                    'risk_flags': response_payload.get('risk_flags')
-                    or response_payload.get('tactical_risks')
-                    or traceability.get('risk_flags')
-                    or traceability.get('decision_risks')
-                    or (snapshot.decision_risks_payload if snapshot is not None else []),
-                    'data_quality_warnings': snapshot.data_quality_warnings_payload if snapshot is not None else traceability.get('data_quality_warnings') or [],
-                    'response_payload': response_payload,
-                    'response_summary_payload': response_summary_payload,
-                },
-                'eod_pre_decider_enrichment_metadata': pre_decider_enrichment_context,
-            }
+                    'decider_output': {
+                        'decision_action': snapshot.decision_action if snapshot is not None else None,
+                        'preferred_action': snapshot.preferred_action if snapshot is not None else None,
+                        'next_day_open_action': snapshot.next_day_open_action if snapshot is not None else None,
+                        'raw_action': raw_action,
+                        'tactical_action': traceability.get('tactical_action'),
+                        'generic_action': generic_action,
+                        'handoff_intent': handoff_intent,
+                        'signal_decider_alignment': traceability.get('signal_decider_alignment')
+                        or validation.get('signal_decider_alignment'),
+                        'alignment_gate_action': traceability.get('alignment_gate_action')
+                        or validation.get('alignment_gate_action'),
+                        'alignment_gate_reason': traceability.get('alignment_gate_reason')
+                        or validation.get('alignment_gate_reason'),
+                        'alignment_gate': alignment_gate,
+                        'entry_price_basis': snapshot.entry_price_basis
+                        if snapshot is not None
+                        else traceability.get('entry_price_basis'),
+                        'trigger_price': traceability.get('trigger_price'),
+                        'chase_limit_price': traceability.get('chase_limit_price'),
+                        'target_price': traceability.get('target_price'),
+                        'stop_loss_price': traceability.get('stop_loss_price'),
+                        'expected_return_pct': snapshot.expected_return_pct if snapshot is not None else None,
+                        'confidence_score_10': snapshot.confidence_score_10
+                        if snapshot is not None
+                        else traceability.get('confidence_score_10'),
+                        'conviction_score_10': snapshot.conviction_score_10
+                        if snapshot is not None
+                        else traceability.get('conviction_score_10'),
+                        'thesis': snapshot.thesis_summary if snapshot is not None else traceability.get('thesis_summary'),
+                        'thesis_summary': snapshot.thesis_summary
+                        if snapshot is not None
+                        else traceability.get('thesis_summary'),
+                        'supporting_evidence': snapshot.supporting_evidence_payload
+                        if snapshot is not None
+                        else traceability.get('supporting_evidence') or [],
+                        'trigger_conditions': response_payload.get('trigger_conditions')
+                        or response_payload.get('trigger_conditions_payload')
+                        or traceability.get('trigger_conditions')
+                        or traceability.get('invalidation_conditions')
+                        or (snapshot.invalidation_conditions_payload if snapshot is not None else []),
+                        'risk_flags': response_payload.get('risk_flags')
+                        or response_payload.get('tactical_risks')
+                        or traceability.get('risk_flags')
+                        or traceability.get('decision_risks')
+                        or (snapshot.decision_risks_payload if snapshot is not None else []),
+                        'data_quality_warnings': snapshot.data_quality_warnings_payload
+                        if snapshot is not None
+                        else traceability.get('data_quality_warnings') or [],
+                        'response_payload': response_payload,
+                        'response_summary_payload': response_summary_payload,
+                    },
+                    'eod_pre_decider_enrichment_metadata': pre_decider_enrichment_context,
+                }
+            )
         )
 
     def _build_exec_plan_payload(
@@ -3123,7 +3155,7 @@ class SignalDeciderExecIntegrationService:
                 'target_trade_date': first_row.target_trade_date.isoformat(),
             },
         }
-        return payload, row_links
+        return serialize_execution_plan_dispatch_payload(payload), row_links
 
     def _rows_match_existing_dispatch(
         self,
@@ -4011,7 +4043,7 @@ class SignalDeciderExecIntegrationService:
         else:
             status = UI_RUNTIME_STATUS_OFFLINE
 
-        return {
+        return serialize_execution_runtime_status_payload({
             'status': status,
             'mode': _coalesce_text(payload.get('mode'), integration.get('runtime_mode')) or 'mock',
             'exec_connected': exec_connected,
@@ -4025,7 +4057,7 @@ class SignalDeciderExecIntegrationService:
             'issues': issues,
             'core_integration_mode': integration.get('mode'),
             'delegate_execution': bool(integration.get('delegate_execution')),
-        }
+        })
 
     @classmethod
     def _iter_exec_agent_payloads(cls, item: dict[str, Any]) -> Iterable[dict[str, Any]]:
@@ -4372,7 +4404,7 @@ class SignalDeciderExecIntegrationService:
             runtime_state = 'stale_no_active_monitoring'
             exclusion_reason = 'stale_no_active_monitoring'
 
-        return {
+        return serialize_execution_runtime_exec_card_payload({
             'exec_monitoring_active': exec_monitoring_active,
             'exec_runtime_showable': exec_monitoring_active,
             'exec_runtime_state': runtime_state,
@@ -4389,7 +4421,7 @@ class SignalDeciderExecIntegrationService:
             'approved_quantity': _to_json_number(agent_decision['approved_quantity']),
             'approved_notional': _decimal_to_text(agent_decision['approved_notional']),
             'monitoring_statuses': monitoring_statuses,
-        }
+        })
 
     def _build_runtime_board_item(
         self,
@@ -5132,7 +5164,7 @@ class SignalDeciderExecIntegrationService:
             orders=orders,
             executions=executions,
         )
-        return {
+        return serialize_execution_today_activity_payload({
             'schema_version': DASHBOARD_TODAY_ACTIVITY_SCHEMA_VERSION,
             'market_date': market_date.isoformat(),
             'buy_activity_status': buy['status'],
@@ -5150,7 +5182,7 @@ class SignalDeciderExecIntegrationService:
             'sell_broker_order_ids': sell['broker_order_ids'],
             'sell_broker_order_ids_omitted_count': sell['broker_order_ids_omitted_count'],
             'net_open_quantity': _to_json_number(net_open_quantity),
-        }
+        })
 
     @classmethod
     def _build_today_activity_side(

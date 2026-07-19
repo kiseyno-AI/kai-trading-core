@@ -15,6 +15,10 @@ from app.orders.account_inquiry_service import (
     trading_account_inquiry_service,
 )
 from app.orders.account_scope import parse_kis_account_reference
+from app.orders.execution_handoff_contract import (
+    PORTFOLIO_SUMMARY_READ_MODEL_SOURCE,
+    serialize_portfolio_risk_equivalent_payload,
+)
 from app.orders.service import trading_order_service
 
 logger = logging.getLogger(__name__)
@@ -291,9 +295,9 @@ class PortfolioSummaryService:
         if sync_message:
             notices = [sync_message, *notices]
 
-        return {
+        return serialize_portfolio_risk_equivalent_payload({
             'asOf': as_of,
-            'source': 'kis_portfolio_summary_v1',
+            'source': PORTFOLIO_SUMMARY_READ_MODEL_SOURCE,
             'sync': {
                 'status': sync_status,
                 'lastSyncedAt': last_synced_at,
@@ -302,7 +306,7 @@ class PortfolioSummaryService:
             },
             'accounts': accounts,
             'notices': notices,
-        }
+        })
 
     def _classify_refresh_result(self, payload: dict[str, Any]) -> tuple[str, str | None]:
         sync = payload.get('sync') if isinstance(payload.get('sync'), dict) else {}
@@ -631,7 +635,7 @@ class PortfolioSummaryService:
     ) -> dict[str, Any]:
         payload = {
             'asOf': as_of,
-            'source': 'kis_portfolio_summary_v1',
+            'source': PORTFOLIO_SUMMARY_READ_MODEL_SOURCE,
             'sync': {
                 'status': status,
                 'lastSyncedAt': None,
@@ -643,7 +647,7 @@ class PortfolioSummaryService:
         }
         if freshness is not None:
             payload['freshness'] = freshness
-        return payload
+        return serialize_portfolio_risk_equivalent_payload(payload)
 
     def _decorate_cached_payload(
         self,
@@ -671,7 +675,7 @@ class PortfolioSummaryService:
 
         payload['sync'] = sync
         payload['notices'] = notices
-        return payload
+        return serialize_portfolio_risk_equivalent_payload(payload)
 
     def _build_cache_status_payload(
         self,
