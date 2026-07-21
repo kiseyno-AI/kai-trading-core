@@ -660,7 +660,16 @@ class DailyTrendingRank(Base, TimestampMixin):
 
 class DailySignalFeature(Base, TimestampMixin):
     __tablename__ = 'daily_signal_features'
-    __table_args__ = (UniqueConstraint('symbol_id', 'market_date', name='uq_daily_signal_features_symbol_market_date'),)
+    __table_args__ = (
+        UniqueConstraint('symbol_id', 'market_date', name='uq_daily_signal_features_symbol_market_date'),
+        Index(
+            'ix_daily_signal_features_symbol_recent',
+            'symbol_id',
+            'market_date',
+            'captured_at',
+            'id',
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     symbol_id: Mapped[int] = mapped_column(ForeignKey('symbols.id', ondelete='CASCADE'), nullable=False, index=True)
@@ -792,6 +801,7 @@ class DailyLowRiskFactorResult(Base, TimestampMixin):
         ),
         Index('ix_daily_low_risk_factor_results_market_eligible', 'market_date', 'is_low_risk_eligible'),
         Index('ix_daily_low_risk_factor_results_market_score', 'market_date', 'low_risk_score'),
+        Index('ix_daily_low_risk_factor_results_symbol_recent', 'symbol_id', 'market_date', 'captured_at', 'id'),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -829,6 +839,7 @@ class DailyBetaFactorResult(Base, TimestampMixin):
         ),
         Index('ix_daily_beta_factor_results_market_eligible', 'market_date', 'is_low_beta_eligible'),
         Index('ix_daily_beta_factor_results_market_score', 'market_date', 'low_beta_score'),
+        Index('ix_daily_beta_factor_results_symbol_recent', 'symbol_id', 'market_date', 'captured_at', 'id'),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -867,6 +878,7 @@ class DailyValueFactorResult(Base, TimestampMixin):
         Index('ix_daily_value_factor_results_market_rank', 'market_date', 'value_rank'),
         Index('ix_daily_value_factor_results_market_score', 'market_date', 'value_score'),
         Index('ix_daily_value_factor_results_market_status', 'market_date', 'value_status'),
+        Index('ix_daily_value_factor_results_symbol_recent', 'symbol_id', 'market_date', 'captured_at', 'id'),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -910,6 +922,13 @@ class DailyAdvancedValueFactorResult(Base, TimestampMixin):
             'ix_daily_advanced_value_factor_results_market_classification',
             'market_date',
             'advanced_value_classification',
+        ),
+        Index(
+            'ix_daily_advanced_value_factor_results_symbol_recent',
+            'symbol_id',
+            'market_date',
+            'captured_at',
+            'id',
         ),
     )
 
@@ -962,6 +981,13 @@ class DailyUnifiedValueFactorResult(Base, TimestampMixin):
         Index('ix_daily_unified_value_factor_results_market_rank', 'market_date', 'unified_value_rank'),
         Index('ix_daily_unified_value_factor_results_market_score', 'market_date', 'unified_value_score'),
         Index('ix_daily_unified_value_factor_results_market_status', 'market_date', 'unified_value_status'),
+        Index(
+            'ix_daily_unified_value_factor_results_symbol_recent',
+            'symbol_id',
+            'market_date',
+            'captured_at',
+            'id',
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -1013,6 +1039,7 @@ class DailyQualityFactorResult(Base, TimestampMixin):
         Index('ix_daily_quality_factor_results_market_rank', 'market_date', 'quality_rank'),
         Index('ix_daily_quality_factor_results_market_score', 'market_date', 'quality_score'),
         Index('ix_daily_quality_factor_results_market_status', 'market_date', 'quality_status'),
+        Index('ix_daily_quality_factor_results_symbol_recent', 'symbol_id', 'market_date', 'captured_at', 'id'),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -1079,6 +1106,7 @@ class DailyCompositeFactorResult(Base, TimestampMixin):
             'market_date',
             'composite_classification',
         ),
+        Index('ix_daily_composite_factor_results_symbol_recent', 'symbol_id', 'market_date', 'captured_at', 'id'),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -1129,6 +1157,7 @@ class DailyMomentumFactorResult(Base, TimestampMixin):
             'passes_momentum_top_percentile',
         ),
         Index('ix_daily_momentum_factor_results_market_eligible', 'market_date', 'is_momentum_eligible'),
+        Index('ix_daily_momentum_factor_results_symbol_recent', 'symbol_id', 'market_date', 'captured_at', 'id'),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -1704,6 +1733,13 @@ class SignalDeciderExecutionPlanItem(Base, TimestampMixin):
             'target_trade_date',
             'account_reference',
             'symbol',
+            'id',
+        ),
+        Index(
+            'ix_signal_decider_plan_active_symbol_lookup',
+            'symbol',
+            'target_trade_date',
+            'execution_status',
             'id',
         ),
         Index(
