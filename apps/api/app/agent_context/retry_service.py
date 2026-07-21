@@ -154,8 +154,21 @@ class AgentFeedbackRetryService:
             roles=expected_roles,
             force_recompute=force_recompute,
         )
+        completed_by_role: dict[str, set[str]] = {}
+        if not force_recompute:
+            completed_by_role, _ = self._load_same_day_terminal_symbols(
+                market_date=market_date,
+                roles=expected_roles,
+                symbols=symbols,
+            )
         incomplete: list[str] = []
         for symbol in symbols:
+            if (
+                not force_recompute
+                and expected_roles
+                and all(symbol in completed_by_role.get(role, set()) for role in expected_roles)
+            ):
+                continue
             symbol_decisions = decisions.get(symbol, {})
             if any(
                 symbol_decisions.get(role) is None or symbol_decisions[role].should_dispatch
