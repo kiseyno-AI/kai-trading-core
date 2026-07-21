@@ -399,6 +399,7 @@ class AgentFeedbackRetryService:
         previous_cycle_number: int,
         previous_completed_cycles: int,
         enforce_max_cycles: bool = True,
+        retry_attempted_symbols_by_role: dict[str, set[str]] | None = None,
     ) -> RetryCyclePlan | None:
         boundary_pending_roles = snapshot.boundary_pending_roles()
         if boundary_pending_roles:
@@ -417,7 +418,10 @@ class AgentFeedbackRetryService:
                 remaining_roles=tuple(snapshot.roles[current_index:]),
             )
 
-        retry_pending_roles = self._retry_pending_roles(snapshot)
+        retry_pending_roles = self._retry_pending_roles(
+            snapshot,
+            retry_attempted_symbols_by_role=retry_attempted_symbols_by_role,
+        )
         if not retry_pending_roles:
             return None
 
@@ -685,24 +689,48 @@ class AgentFeedbackRetryService:
         )
 
     @staticmethod
-    def _retry_symbols_for_role(role_state: RoleSequenceRoleState) -> tuple[str, ...]:
+    def _retry_symbols_for_role(
+        role_state: RoleSequenceRoleState,
+        *,
+        attempted_symbols: set[str] | None = None,
+    ) -> tuple[str, ...]:
+        attempted = attempted_symbols or set()
         if role_state.role == SIGNAL_DECIDER_AGENT_NAME and not role_state.boundary_pending_symbols:
             retry_ready = set(role_state.retry_pending_symbols)
-            return tuple(symbol for symbol in role_state.failed_symbols if symbol in retry_ready)
-        return role_state.retry_pending_symbols
+            return tuple(
+                symbol for symbol in role_state.failed_symbols
+                if symbol in retry_ready and symbol not in attempted
+            )
+        return tuple(symbol for symbol in role_state.retry_pending_symbols if symbol not in attempted)
 
-    def _retry_pending_roles(self, snapshot: RoleSequenceSnapshot) -> list[str]:
+    def _retry_pending_roles(
+        self,
+        snapshot: RoleSequenceSnapshot,
+        *,
+        retry_attempted_symbols_by_role: dict[str, set[str]] | None = None,
+    ) -> list[str]:
         return [
             role
             for role in snapshot.roles
-            if self._retry_symbols_for_role(snapshot.role_states[role])
+            if self._retry_symbols_for_role(
+                snapshot.role_states[role],
+                attempted_symbols=(retry_attempted_symbols_by_role or {}).get(role),
+            )
         ]
 
-    def _collect_retry_pending_symbols(self, snapshot: RoleSequenceSnapshot) -> list[str]:
+    def _collect_retry_pending_symbols(
+        self,
+        snapshot: RoleSequenceSnapshot,
+        *,
+        retry_attempted_symbols_by_role: dict[str, set[str]] | None = None,
+    ) -> list[str]:
         ordered: list[str] = []
         seen: set[str] = set()
         for role in snapshot.roles:
-            for symbol in self._retry_symbols_for_role(snapshot.role_states[role]):
+            for symbol in self._retry_symbols_for_role(
+                snapshot.role_states[role],
+                attempted_symbols=(retry_attempted_symbols_by_role or {}).get(role),
+            ):
                 if symbol in seen:
                     continue
                 seen.add(symbol)
@@ -948,7 +976,22 @@ class AgentFeedbackRetryService:
         try:
             while active_plan is not None:
                 cycle_roles: list[dict[str, Any]] = []
-                cycle_start_pending = len(self._collect_retry_pending_symbols(initial_snapshot if not cycles else snapshot_after_cycle))
+                cycle_state_before = runtime_feedback_state_store.get_run(
+                    config.market_date,
+                    run_id=request_run_id,
+                    logical=True,
+                )
+                retry_attempted_before = (
+                    cycle_state_before.retry_attempted_symbols_by_role
+                    if cycle_state_before is not None
+                    else {}
+                )
+                cycle_start_pending = len(
+                    self._collect_retry_pending_symbols(
+                        initial_snapshot if not cycles else snapshot_after_cycle,
+                        retry_attempted_symbols_by_role=retry_attempted_before,
+                    )
+                )
                 self._sync_runtime_state(
                     market_date=config.market_date,
                     run_id=request_run_id,
@@ -1223,15 +1266,23 @@ class AgentFeedbackRetryService:
                     eligible_symbols=scoped_feedback_symbols,
                     role_symbol_scopes=role_symbol_scopes,
                 )
-                retry_pending_symbols = self._collect_retry_pending_symbols(snapshot_after_cycle)
-                cycle_status = 'blocked' if blocked else ('completed' if not retry_pending_symbols else 'partial')
-                if not blocked:
-                    completed_cycles = active_plan.cycle_number
                 cycle_state = runtime_feedback_state_store.get_run(
                     config.market_date,
                     run_id=request_run_id,
                     logical=True,
                 )
+                retry_attempted_after = (
+                    cycle_state.retry_attempted_symbols_by_role
+                    if cycle_state is not None
+                    else {}
+                )
+                retry_pending_symbols = self._collect_retry_pending_symbols(
+                    snapshot_after_cycle,
+                    retry_attempted_symbols_by_role=retry_attempted_after,
+                )
+                cycle_status = 'blocked' if blocked else ('completed' if not retry_pending_symbols else 'partial')
+                if not blocked:
+                    completed_cycles = active_plan.cycle_number
                 cycles.append(
                     {
                         'cycle': active_plan.cycle_number,
@@ -1254,6 +1305,7 @@ class AgentFeedbackRetryService:
                     max_cycles=config.max_cycles,
                     previous_cycle_number=active_plan.cycle_number,
                     previous_completed_cycles=completed_cycles,
+                    retry_attempted_symbols_by_role=retry_attempted_after,
                 )
         finally:
             final_snapshot = self._build_role_sequence_snapshot(
@@ -1262,7 +1314,20 @@ class AgentFeedbackRetryService:
                 eligible_symbols=scoped_feedback_symbols,
                 role_symbol_scopes=role_symbol_scopes,
             )
-            final_retry_pending_symbols = self._collect_retry_pending_symbols(final_snapshot)
+            final_state_before_finish = runtime_feedback_state_store.get_run(
+                config.market_date,
+                run_id=request_run_id,
+                logical=True,
+            )
+            final_retry_attempted = (
+                final_state_before_finish.retry_attempted_symbols_by_role
+                if final_state_before_finish is not None
+                else {}
+            )
+            final_retry_pending_symbols = self._collect_retry_pending_symbols(
+                final_snapshot,
+                retry_attempted_symbols_by_role=final_retry_attempted,
+            )
             final_boundary_pending_roles = final_snapshot.boundary_pending_roles()
             terminal_items = self._collect_terminal_items(final_snapshot)
             if not eligible_symbols:
@@ -1278,6 +1343,7 @@ class AgentFeedbackRetryService:
                 previous_cycle_number=active_plan.cycle_number if active_plan is not None else completed_cycles,
                 previous_completed_cycles=completed_cycles,
                 enforce_max_cycles=False,
+                retry_attempted_symbols_by_role=final_retry_attempted,
             )
             resolved_cycle_status = (
                 'failed'
@@ -1336,7 +1402,12 @@ class AgentFeedbackRetryService:
                 roles=roles,
                 eligible_symbols=scoped_feedback_symbols,
                 role_symbol_scopes=role_symbol_scopes,
-            )
+            ),
+            retry_attempted_symbols_by_role=(
+                final_state.retry_attempted_symbols_by_role
+                if final_state is not None
+                else {}
+            ),
         )
 
         return {
