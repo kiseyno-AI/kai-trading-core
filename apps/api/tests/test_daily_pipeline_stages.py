@@ -1,7 +1,9 @@
 import unittest
+from datetime import datetime, timezone
 from unittest.mock import patch
 
 from app.agent_context.roles import DECISION_SUPPORT_AGENT_NAMES, SUMMARIZER_AGENT_NAMES
+from app.eod.daily_pipeline_state import _build_stage_duration_details
 from app.eod.daily_pipeline_stages import FACTOR_STAGE_ORDER, DailyPipelineStageService
 
 
@@ -222,6 +224,7 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             quality_stage['depends_on'],
             ['price_collection', 'fundamentals_daily_refresh'],
         )
+
         advanced_value_stage = next(
             stage
             for stage in payload['stages']
@@ -287,6 +290,17 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         self.assertTrue(external_news_stage['default_selected'])
         self.assertTrue(external_news_enrich_stage['default_selected'])
         self.assertTrue(macro_context_stage['default_selected'])
+
+    def test_stage_duration_details_marks_slow_stage(self) -> None:
+        started_at = datetime(2026, 7, 21, 9, 0, 0, tzinfo=timezone.utc)
+        completed_at = datetime(2026, 7, 21, 9, 6, 1, 123000, tzinfo=timezone.utc)
+
+        details = _build_stage_duration_details(started_at=started_at, completed_at=completed_at)
+
+        self.assertEqual(details['duration_ms'], 361123)
+        self.assertEqual(details['duration_seconds'], 361.123)
+        self.assertTrue(details['slow_stage'])
+        self.assertEqual(details['slow_stage_threshold_ms'], 300000)
 
     def test_run_reorders_requested_subset_and_splits_feedback_stages(self) -> None:
         pykrx_runner = _FakePykrxStageRunner()
