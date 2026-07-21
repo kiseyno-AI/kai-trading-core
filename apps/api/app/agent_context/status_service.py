@@ -18,6 +18,13 @@ from app.db_models import AgentContextFeedback, AgentContextFeedbackFailure
 
 EXPECTED_AGENT_NAMES = DEFAULT_AGENT_NAMES
 EXPECTED_AGENT_SET = set(EXPECTED_AGENT_NAMES)
+FEEDBACK_STATUS_SYMBOL_CHUNK_SIZE = 500
+
+
+def _chunked_symbols(symbols: Sequence[str], size: int = FEEDBACK_STATUS_SYMBOL_CHUNK_SIZE) -> list[list[str]]:
+    if size < 1:
+        raise ValueError('size must be >= 1')
+    return [list(symbols[index:index + size]) for index in range(0, len(symbols), size)]
 
 
 def _group_feedback_rows(rows: Sequence[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
@@ -87,17 +94,40 @@ class AgentContextStatusService:
         latest_run_scope_mode = self._feedback_scope_mode_from_run(latest_run)
 
         with session_scope() as session:
-            feedback_rows = session.execute(
-                select(
-                    AgentContextFeedback.symbol,
-                    AgentContextFeedback.agent_name,
-                    AgentContextFeedback.run_id,
-                    AgentContextFeedback.received_at,
+            feedback_rows = []
+            orm_failure_rows = []
+            for symbol_chunk in _chunked_symbols(normalized_symbols):
+                feedback_rows.extend(
+                    session.execute(
+                        select(
+                            AgentContextFeedback.symbol,
+                            AgentContextFeedback.agent_name,
+                            AgentContextFeedback.run_id,
+                            AgentContextFeedback.received_at,
+                        )
+                        .where(AgentContextFeedback.market_date == normalized_market_date)
+                        .where(AgentContextFeedback.symbol.in_(symbol_chunk))
+                        .order_by(
+                            AgentContextFeedback.symbol.asc(),
+                            AgentContextFeedback.received_at.desc(),
+                            AgentContextFeedback.id.desc(),
+                        )
+                    ).all()
                 )
-                .where(AgentContextFeedback.market_date == normalized_market_date)
-                .where(AgentContextFeedback.symbol.in_(normalized_symbols))
-                .order_by(AgentContextFeedback.symbol.asc(), AgentContextFeedback.received_at.desc(), AgentContextFeedback.id.desc())
-            ).all()
+                orm_failure_rows.extend(
+                    session.execute(
+                        select(AgentContextFeedbackFailure)
+                        .where(AgentContextFeedbackFailure.market_date == normalized_market_date)
+                        .where(AgentContextFeedbackFailure.symbol.in_(symbol_chunk))
+                        .where(AgentContextFeedbackFailure.agent_name.in_(EXPECTED_AGENT_NAMES))
+                        .order_by(
+                            AgentContextFeedbackFailure.symbol.asc(),
+                            AgentContextFeedbackFailure.agent_name.asc(),
+                            AgentContextFeedbackFailure.received_at.desc(),
+                            AgentContextFeedbackFailure.id.desc(),
+                        )
+                    ).scalars().all()
+                )
             rows = [
                 {
                     'symbol': row.symbol,
@@ -107,18 +137,6 @@ class AgentContextStatusService:
                 }
                 for row in feedback_rows
             ]
-            orm_failure_rows = session.execute(
-                select(AgentContextFeedbackFailure)
-                .where(AgentContextFeedbackFailure.market_date == normalized_market_date)
-                .where(AgentContextFeedbackFailure.symbol.in_(normalized_symbols))
-                .where(AgentContextFeedbackFailure.agent_name.in_(EXPECTED_AGENT_NAMES))
-                .order_by(
-                    AgentContextFeedbackFailure.symbol.asc(),
-                    AgentContextFeedbackFailure.agent_name.asc(),
-                    AgentContextFeedbackFailure.received_at.desc(),
-                    AgentContextFeedbackFailure.id.desc(),
-                )
-            ).scalars().all()
             failure_rows = []
             for row in orm_failure_rows:
                 summary = row.summary_payload if isinstance(row.summary_payload, dict) else {}
