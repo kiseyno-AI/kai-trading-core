@@ -467,6 +467,16 @@ class DartFundamentalsRepository:
         fs_div: str,
     ) -> dict[str, dict[str, Any]]:
         normalized_codes = [code for code in dict.fromkeys(stock_codes) if code]
+        if len(normalized_codes) > 500:
+            merged: dict[str, dict[str, Any]] = {}
+            for index in range(0, len(normalized_codes), 500):
+                merged.update(
+                    self.list_symbol_fundamentals_states(
+                        stock_codes=normalized_codes[index : index + 500],
+                        fs_div=fs_div,
+                    )
+                )
+            return merged
         states: dict[str, dict[str, Any]] = {
             code: {
                 'stock_code': code,
@@ -481,61 +491,23 @@ class DartFundamentalsRepository:
         if not normalized_codes:
             return states
 
-        ranked_snapshots = (
-            select(
-                DartFundamentalsSnapshot.id.label('snapshot_id'),
-                DartFundamentalsSnapshot.stock_code.label('stock_code'),
-                func.row_number()
-                .over(
-                    partition_by=DartFundamentalsSnapshot.stock_code,
-                    order_by=(
-                        DartDisclosureEvent.receipt_date.desc().nullslast(),
-                        DartFundamentalsSnapshot.business_year.desc(),
-                        DartFundamentalsSnapshot.report_code.desc(),
-                        DartFundamentalsSnapshot.id.desc(),
-                    ),
-                )
-                .label('symbol_rank'),
-            )
-            .join(
-                DartDisclosureEvent,
-                DartDisclosureEvent.id == DartFundamentalsSnapshot.disclosure_event_id,
-            )
-            .where(
-                DartFundamentalsSnapshot.stock_code.in_(normalized_codes),
-                DartFundamentalsSnapshot.fs_div == fs_div,
-                DartDisclosureEvent.fundamentals_capture_status == CAPTURE_STATUS_CAPTURED,
-            )
-        ).subquery()
-
-        ranked_terminal_events = (
-            select(
-                DartDisclosureEvent.id.label('event_id'),
-                DartDisclosureEvent.stock_code.label('stock_code'),
-                func.row_number()
-                .over(
-                    partition_by=DartDisclosureEvent.stock_code,
-                    order_by=(
-                        DartDisclosureEvent.receipt_date.desc(),
-                        DartDisclosureEvent.id.desc(),
-                    ),
-                )
-                .label('symbol_rank'),
-            )
-            .where(
-                DartDisclosureEvent.stock_code.in_(normalized_codes),
-                DartDisclosureEvent.is_financial_report.is_(True),
-                DartDisclosureEvent.receipt_date.is_not(None),
-                DartDisclosureEvent.fundamentals_capture_status.in_(TERMINAL_CAPTURE_STATUSES),
-            )
-        ).subquery()
-
         with session_scope() as session:
             rows = session.execute(
                 select(DartFundamentalsSnapshot, DartDisclosureEvent)
-                .join(ranked_snapshots, DartFundamentalsSnapshot.id == ranked_snapshots.c.snapshot_id)
                 .join(DartDisclosureEvent, DartDisclosureEvent.id == DartFundamentalsSnapshot.disclosure_event_id)
-                .where(ranked_snapshots.c.symbol_rank == 1)
+                .where(
+                    DartFundamentalsSnapshot.stock_code.in_(normalized_codes),
+                    DartFundamentalsSnapshot.fs_div == fs_div,
+                    DartDisclosureEvent.fundamentals_capture_status == CAPTURE_STATUS_CAPTURED,
+                )
+                .distinct(DartFundamentalsSnapshot.stock_code)
+                .order_by(
+                    DartFundamentalsSnapshot.stock_code.asc(),
+                    DartDisclosureEvent.receipt_date.desc().nullslast(),
+                    DartFundamentalsSnapshot.business_year.desc(),
+                    DartFundamentalsSnapshot.report_code.desc(),
+                    DartFundamentalsSnapshot.id.desc(),
+                )
             ).all()
 
             for snapshot, event in rows:
@@ -558,8 +530,18 @@ class DartFundamentalsRepository:
 
             terminal_rows = session.execute(
                 select(DartDisclosureEvent)
-                .join(ranked_terminal_events, DartDisclosureEvent.id == ranked_terminal_events.c.event_id)
-                .where(ranked_terminal_events.c.symbol_rank == 1)
+                .where(
+                    DartDisclosureEvent.stock_code.in_(normalized_codes),
+                    DartDisclosureEvent.is_financial_report.is_(True),
+                    DartDisclosureEvent.receipt_date.is_not(None),
+                    DartDisclosureEvent.fundamentals_capture_status.in_(TERMINAL_CAPTURE_STATUSES),
+                )
+                .distinct(DartDisclosureEvent.stock_code)
+                .order_by(
+                    DartDisclosureEvent.stock_code.asc(),
+                    DartDisclosureEvent.receipt_date.desc(),
+                    DartDisclosureEvent.id.desc(),
+                )
             ).scalars()
             for event in terminal_rows:
                 stock_code = event.stock_code

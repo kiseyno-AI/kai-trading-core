@@ -962,7 +962,10 @@ class SignalDeciderIntradayAutoSellService:
     def _discover_accounts_from_next_open_history(self) -> tuple[list[MonitoredAccount], list[str], str]:
         with session_scope() as session:
             rows = session.execute(
-                select(SignalDeciderExecutionPlanItem)
+                select(
+                    SignalDeciderExecutionPlanItem.account_reference,
+                    SignalDeciderExecutionPlanItem.account_label,
+                )
                 .where(
                     SignalDeciderExecutionPlanItem.execution_window == EXECUTION_WINDOW_NEXT_OPEN,
                     SignalDeciderExecutionPlanItem.decision_agent_name == SIGNAL_DECIDER_AGENT_NAME,
@@ -972,21 +975,21 @@ class SignalDeciderIntradayAutoSellService:
                     SignalDeciderExecutionPlanItem.submitted_at.desc(),
                     SignalDeciderExecutionPlanItem.id.desc(),
                 )
-            ).scalars().all()
-            for row in rows:
-                session.expunge(row)
+                .limit(200)
+            ).all()
 
         accounts: list[MonitoredAccount] = []
         errors: list[str] = []
         seen: set[str] = set()
         for row in rows:
-            if row.account_reference in seen:
+            account_reference = row.account_reference
+            if account_reference in seen:
                 continue
-            seen.add(row.account_reference)
+            seen.add(account_reference)
             try:
-                scope = parse_kis_account_reference(row.account_reference)
+                scope = parse_kis_account_reference(account_reference)
             except ValueError as exc:
-                errors.append(f'Invalid next-open account reference "{row.account_reference}": {exc}')
+                errors.append(f'Invalid next-open account reference "{account_reference}": {exc}')
                 continue
             accounts.append(
                 MonitoredAccount(
@@ -1019,6 +1022,7 @@ class SignalDeciderIntradayAutoSellService:
                     SignalDeciderExecutionPlanItem.submitted_at.desc(),
                     SignalDeciderExecutionPlanItem.id.desc(),
                 )
+                .limit(30)
             ).scalars().all()
             for row in rows:
                 session.expunge(row)

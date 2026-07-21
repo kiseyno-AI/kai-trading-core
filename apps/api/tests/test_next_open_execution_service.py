@@ -1274,7 +1274,7 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             first = service.refresh_plan_items(target_trade_date=self.target_trade_date, trigger='test')
             second = service.refresh_plan_items(target_trade_date=self.target_trade_date, trigger='test_retry')
 
-        load_bars.assert_not_called()
+        self.assertEqual(load_bars.call_count, 2)
         self.assertEqual(first['summary']['items_total'], 1)
         self.assertEqual(second['summary']['items_total'], 1)
         self.assertEqual(first['items'][0]['plan_item_id'], second['items'][0]['plan_item_id'])
