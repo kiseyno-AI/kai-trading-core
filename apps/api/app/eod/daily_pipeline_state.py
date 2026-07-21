@@ -20,6 +20,7 @@ TERMINAL_DAILY_PIPELINE_STATUSES = {
     'waiting',
     'skipped',
 }
+SLOW_DAILY_PIPELINE_STAGE_THRESHOLD_MS = 5 * 60 * 1000
 
 
 def _utcnow() -> datetime:
@@ -71,6 +72,22 @@ def _build_counts(
         'succeeded': succeeded_value,
         'failed': failed_value,
         'remaining': remaining_value,
+    }
+
+
+def _build_stage_duration_details(
+    *,
+    started_at: datetime | None,
+    completed_at: datetime | None,
+) -> dict[str, Any]:
+    if started_at is None or completed_at is None:
+        return {}
+    elapsed_ms = max(0, int(round((completed_at - started_at).total_seconds() * 1000)))
+    return {
+        'duration_ms': elapsed_ms,
+        'duration_seconds': round(elapsed_ms / 1000, 3),
+        'slow_stage': elapsed_ms >= SLOW_DAILY_PIPELINE_STAGE_THRESHOLD_MS,
+        'slow_stage_threshold_ms': SLOW_DAILY_PIPELINE_STAGE_THRESHOLD_MS,
     }
 
 
@@ -254,9 +271,18 @@ class DailyPipelineRunStateService:
             row.error_message = error_message
             if source_run_ids is not None:
                 row.source_run_ids = dict(source_run_ids)
+            row.completed_at = completed_at or (now if terminal else None)
             if details is not None:
                 row.details = dict(details)
-            row.completed_at = completed_at or (now if terminal else None)
+            if terminal:
+                merged_details = dict(row.details or {})
+                merged_details.update(
+                    _build_stage_duration_details(
+                        started_at=row.started_at,
+                        completed_at=row.completed_at,
+                    )
+                )
+                row.details = merged_details
             row.updated_at = now
 
             run_row.status = 'running' if normalized_status == 'running' else run_row.status
