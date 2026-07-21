@@ -382,6 +382,14 @@ def _load_row_count_stage_counts(*, market_date: str) -> dict[str, dict[str, Any
     normalized_market_date = date.fromisoformat(market_date)
     counts: dict[str, dict[str, Any]] = {}
     with session_scope() as session:
+        price_symbol_count = int(
+            session.execute(
+                select(func.count(func.distinct(DailyPriceBar.symbol_id)))
+                .select_from(DailyPriceBar)
+                .where(DailyPriceBar.trade_date == normalized_market_date)
+            ).scalar_one()
+            or 0
+        )
         for stage_id, model in ROW_COUNT_STAGE_MODELS.items():
             persisted, updated_at = session.execute(
                 select(
@@ -391,14 +399,23 @@ def _load_row_count_stage_counts(*, market_date: str) -> dict[str, dict[str, Any
                 .select_from(model)
                 .where(model.market_date == normalized_market_date)
             ).one()
-            missing_diagnostics = _load_row_count_missing_diagnostics_for_model(
-                session=session,
-                model=model,
-                market_date=normalized_market_date,
-                limit=ROW_COUNT_STAGE_MISSING_SAMPLE_LIMIT,
-            )
+            persisted_count = int(persisted or 0)
+            if price_symbol_count > 0 and persisted_count >= price_symbol_count:
+                missing_diagnostics = {
+                    'missing_count': 0,
+                    'missing_symbols_sample': [],
+                    'missing_symbol_details_sample': [],
+                    'missing_sample_limit': ROW_COUNT_STAGE_MISSING_SAMPLE_LIMIT,
+                }
+            else:
+                missing_diagnostics = _load_row_count_missing_diagnostics_for_model(
+                    session=session,
+                    model=model,
+                    market_date=normalized_market_date,
+                    limit=ROW_COUNT_STAGE_MISSING_SAMPLE_LIMIT,
+                )
             counts[stage_id] = {
-                'persisted': int(persisted or 0),
+                'persisted': persisted_count,
                 'updated_at': updated_at.isoformat() if updated_at else None,
                 **missing_diagnostics,
             }
