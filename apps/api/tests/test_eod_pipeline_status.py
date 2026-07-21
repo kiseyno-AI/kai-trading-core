@@ -1,10 +1,12 @@
 import unittest
+from contextlib import contextmanager
 from unittest.mock import patch
 
 from app.eod.pipeline_status import (
     DEFAULT_FACTOR_STAGE_ORDER,
     DEFAULT_PYKRX_ENRICHMENT_CATEGORIES,
     EODPipelineStatusService,
+    _load_daily_pipeline_stage_history,
     _load_latest_feedback_run_summary,
     _load_latest_pipeline_pykrx_run,
 )
@@ -232,6 +234,34 @@ def _incomplete_official_stage(
 
 
 class EODPipelineStatusServiceTests(unittest.TestCase):
+    def test_load_daily_pipeline_stage_history_filters_stage_market_date_for_history_index(self):
+        class _CapturedResult:
+            def all(self):
+                return []
+
+        class _CapturedSession:
+            statement = None
+
+            def execute(self, statement):
+                self.statement = statement
+                return _CapturedResult()
+
+        captured_session = _CapturedSession()
+
+        @contextmanager
+        def _session_scope():
+            yield captured_session
+
+        with patch('app.eod.pipeline_status.session_scope', _session_scope):
+            result = _load_daily_pipeline_stage_history(market_date='2026-05-28')
+
+        self.assertEqual(result, {})
+        compiled_sql = str(captured_session.statement.compile(compile_kwargs={'literal_binds': True}))
+        where_sql = compiled_sql.split('\nWHERE ', 1)[1].split(' ORDER BY ', 1)[0]
+        self.assertIn('daily_pipeline_runs.market_date =', where_sql)
+        self.assertIn('daily_pipeline_stage_runs.market_date =', where_sql)
+        self.assertIn('daily_pipeline_stage_runs.stage_id IN', where_sql)
+
     def test_load_latest_pipeline_pykrx_run_reconciles_selected_daily_run_instead_of_newer_historical_backfill(self):
         historical_run = {
             'id': 900,
