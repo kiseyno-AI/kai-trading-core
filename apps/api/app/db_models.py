@@ -2064,6 +2064,21 @@ class DartDisclosureEvent(Base, TimestampMixin):
             'receipt_date',
             'updated_at',
         ),
+        Index(
+            'ix_dart_disclosure_events_failed_attempt_stock',
+            'fundamentals_last_attempt_at',
+            'stock_code',
+            postgresql_where=text(
+                "is_financial_report IS TRUE "
+                "AND stock_code IS NOT NULL "
+                "AND fundamentals_capture_status = 'failed'"
+            ),
+            sqlite_where=text(
+                "is_financial_report IS 1 "
+                "AND stock_code IS NOT NULL "
+                "AND fundamentals_capture_status = 'failed'"
+            ),
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
