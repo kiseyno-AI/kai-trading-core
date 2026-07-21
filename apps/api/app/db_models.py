@@ -165,6 +165,7 @@ class ExternalNewsItem(Base, TimestampMixin):
         UniqueConstraint('provider', 'url', name='uq_external_news_items_provider_url'),
         UniqueConstraint('provider', 'provider_item_id', name='uq_external_news_items_provider_item_id'),
         Index('ix_external_news_items_symbol_published', 'symbol_id', 'published_at'),
+        Index('ix_external_news_items_symbol_collected_published', 'symbol_id', 'collected_at', 'published_at'),
         Index('ix_external_news_items_provider_collected', 'provider', 'collected_at'),
     )
 
@@ -1289,6 +1290,14 @@ class SignalDeciderDecisionSnapshot(Base, TimestampMixin):
             'created_at',
         ),
         Index(
+            'ix_signal_decider_snapshots_market_agent_symbol_created',
+            'market_date',
+            'agent_name',
+            'symbol',
+            'created_at',
+            'id',
+        ),
+        Index(
             'uq_signal_decider_decision_snapshots_feedback_id_not_null',
             'feedback_id',
             unique=True,
@@ -1706,6 +1715,13 @@ class SignalDeciderExecutionPlanItem(Base, TimestampMixin):
             'source_market_date',
             'execution_status',
             'decision_agent_name',
+        ),
+        Index(
+            'ix_signal_decider_plan_source_date_lookup',
+            'execution_window',
+            'target_trade_date',
+            'source_market_date',
+            'id',
         ),
         Index(
             'ix_signal_decider_plan_history_submission_lookup',
