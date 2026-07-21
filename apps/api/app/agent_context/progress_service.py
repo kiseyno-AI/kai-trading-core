@@ -19,6 +19,15 @@ from app.db import session_scope
 from app.db_models import AgentContextFeedback, AgentContextFeedbackFailure, DailyPriceBar, Symbol
 
 
+PROGRESS_SYMBOL_CHUNK_SIZE = 500
+
+
+def _chunked_symbols(symbols: Sequence[str], size: int = PROGRESS_SYMBOL_CHUNK_SIZE) -> list[list[str]]:
+    if size < 1:
+        raise ValueError('size must be >= 1')
+    return [list(symbols[index:index + size]) for index in range(0, len(symbols), size)]
+
+
 class AgentContextProgressService:
     def get_feedback_progress(
         self,
@@ -715,37 +724,40 @@ class AgentContextProgressService:
 
         if scoped_symbols:
             with session_scope() as session:
-                feedback_query = (
-                    select(
-                        AgentContextFeedback.symbol,
-                        AgentContextFeedback.agent_name,
-                        AgentContextFeedback.run_id,
-                        AgentContextFeedback.received_at,
+                feedback_rows = []
+                failure_rows = []
+                for symbol_chunk in _chunked_symbols(scoped_symbols):
+                    feedback_query = (
+                        select(
+                            AgentContextFeedback.symbol,
+                            AgentContextFeedback.agent_name,
+                            AgentContextFeedback.run_id,
+                            AgentContextFeedback.received_at,
+                        )
+                        .where(AgentContextFeedback.market_date == market_date)
+                        .where(AgentContextFeedback.symbol.in_(symbol_chunk))
+                        .where(AgentContextFeedback.agent_name.in_(expected_agents))
                     )
-                    .where(AgentContextFeedback.market_date == market_date)
-                    .where(AgentContextFeedback.symbol.in_(scoped_symbols))
-                    .where(AgentContextFeedback.agent_name.in_(expected_agents))
-                )
-                failure_query = (
-                    select(
-                        AgentContextFeedbackFailure.symbol,
-                        AgentContextFeedbackFailure.agent_name,
-                        AgentContextFeedbackFailure.run_id,
-                        AgentContextFeedbackFailure.received_at,
-                        AgentContextFeedbackFailure.failure_kind,
-                        AgentContextFeedbackFailure.retryable,
-                        AgentContextFeedbackFailure.summary_payload,
-                        AgentContextFeedbackFailure.context_payload,
+                    failure_query = (
+                        select(
+                            AgentContextFeedbackFailure.symbol,
+                            AgentContextFeedbackFailure.agent_name,
+                            AgentContextFeedbackFailure.run_id,
+                            AgentContextFeedbackFailure.received_at,
+                            AgentContextFeedbackFailure.failure_kind,
+                            AgentContextFeedbackFailure.retryable,
+                            AgentContextFeedbackFailure.summary_payload,
+                            AgentContextFeedbackFailure.context_payload,
+                        )
+                        .where(AgentContextFeedbackFailure.market_date == market_date)
+                        .where(AgentContextFeedbackFailure.symbol.in_(symbol_chunk))
+                        .where(AgentContextFeedbackFailure.agent_name.in_(expected_agents))
                     )
-                    .where(AgentContextFeedbackFailure.market_date == market_date)
-                    .where(AgentContextFeedbackFailure.symbol.in_(scoped_symbols))
-                    .where(AgentContextFeedbackFailure.agent_name.in_(expected_agents))
-                )
-                if child_run_id is not None:
-                    feedback_query = feedback_query.where(AgentContextFeedback.run_id == child_run_id)
-                    failure_query = failure_query.where(AgentContextFeedbackFailure.run_id == child_run_id)
-                feedback_rows = session.execute(feedback_query).all()
-                failure_rows = session.execute(failure_query).all()
+                    if child_run_id is not None:
+                        feedback_query = feedback_query.where(AgentContextFeedback.run_id == child_run_id)
+                        failure_query = failure_query.where(AgentContextFeedbackFailure.run_id == child_run_id)
+                    feedback_rows.extend(session.execute(feedback_query).all())
+                    failure_rows.extend(session.execute(failure_query).all())
 
             for row in feedback_rows:
                 symbol = str(row.symbol)
