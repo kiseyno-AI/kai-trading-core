@@ -13,6 +13,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    desc,
     func,
     text,
 )
@@ -1300,6 +1301,13 @@ class SignalDeciderDecisionSnapshot(Base, TimestampMixin):
             'symbol',
             'created_at',
             'id',
+        ),
+        Index(
+            'ix_signal_decider_snapshots_agent_market_created',
+            'agent_name',
+            desc('market_date'),
+            desc('created_at'),
+            desc('id'),
         ),
         Index(
             'uq_signal_decider_decision_snapshots_feedback_id_not_null',
