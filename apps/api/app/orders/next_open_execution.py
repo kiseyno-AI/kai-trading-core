@@ -1861,12 +1861,6 @@ class SignalDeciderNextOpenExecutionService:
 
         estimated_reference_price_basis = 'latest_source_market_close'
         estimated_reference_price = price_cache.get(snapshot.symbol)
-        if decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME:
-            estimated_reference_price = _to_int(response_payload.get('trigger_price')) or _to_int(
-                response_payload.get('chase_limit_price')
-            )
-            price_cache[snapshot.symbol] = estimated_reference_price
-            estimated_reference_price_basis = 'short_term_trigger_price'
         if snapshot.symbol not in price_cache:
             bars = load_daily_bars_for_symbol_range(
                 snapshot.symbol,
@@ -1877,6 +1871,14 @@ class SignalDeciderNextOpenExecutionService:
             )
             estimated_reference_price = bars[-1]['close_price'] if bars else None
             price_cache[snapshot.symbol] = estimated_reference_price
+        if decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME and (
+            estimated_reference_price is None or estimated_reference_price <= 0
+        ):
+            estimated_reference_price = _to_int(response_payload.get('trigger_price')) or _to_int(
+                response_payload.get('chase_limit_price')
+            )
+            price_cache[snapshot.symbol] = estimated_reference_price
+            estimated_reference_price_basis = 'short_term_trigger_price'
 
         if decision_agent_name == SIGNAL_DECIDER_AGENT_NAME:
             policy_context = policy_context or {}
@@ -2521,6 +2523,7 @@ class SignalDeciderNextOpenExecutionService:
                 == SIGNAL_DECIDER_ALIGNMENT_WAIT_CONFLICT_OVERRIDE
             ),
         }
+        counts['ready_count'] = counts['eligible_count']
         return {
             'target_trade_date': target_trade_date.isoformat(),
             'source_market_date': source_market_date.isoformat(),
