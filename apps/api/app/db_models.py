@@ -1238,6 +1238,14 @@ class AgentContextFeedback(Base, TimestampMixin):
             'agent_name',
             'received_at',
         ),
+        Index(
+            'ix_agent_context_feedback_symbol_agent_recent',
+            'symbol',
+            'agent_name',
+            'market_date',
+            'received_at',
+            'id',
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -1926,6 +1934,14 @@ class AgentContextFeedbackFailure(Base, TimestampMixin):
             'symbol',
             'agent_name',
             'received_at',
+        ),
+        Index(
+            'ix_agent_context_feedback_failures_symbol_agent_recent',
+            'symbol',
+            'agent_name',
+            'market_date',
+            'received_at',
+            'id',
         ),
     )
 
