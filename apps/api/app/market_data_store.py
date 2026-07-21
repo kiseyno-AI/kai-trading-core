@@ -1143,37 +1143,46 @@ def load_daily_price_context_history(
     normalized_market_date = _normalize_trade_date(market_date)
     normalized_symbols = list(dict.fromkeys(symbols))
     with session_scope() as session:
-        ranked = (
-            select(
-                DailyPriceContext.market_date.label('market_date'),
-                DailyPriceContext.source.label('source'),
-                DailyPriceContext.context_payload.label('context_payload'),
-                DailyPriceContext.captured_at.label('captured_at'),
-                Symbol.symbol.label('symbol'),
-                func.row_number()
-                .over(partition_by=DailyPriceContext.symbol_id, order_by=DailyPriceContext.market_date.desc())
-                .label('context_rank'),
-            )
-            .join(Symbol, Symbol.id == DailyPriceContext.symbol_id)
-            .where(
-                Symbol.symbol.in_(normalized_symbols),
-                DailyPriceContext.market_date <= normalized_market_date,
-            )
-            .subquery()
-        )
-        rows = session.execute(
-            select(ranked)
-            .where(ranked.c.context_rank <= history_days)
-            .order_by(ranked.c.symbol.asc(), ranked.c.market_date.asc())
+        symbol_rows = session.execute(
+            select(Symbol.id, Symbol.symbol)
+            .where(Symbol.symbol.in_(normalized_symbols))
+            .order_by(Symbol.symbol.asc())
         ).all()
+        rows = []
+        for symbol_id, symbol in symbol_rows:
+            symbol_context_rows = session.execute(
+                select(
+                    DailyPriceContext.market_date.label('market_date'),
+                    DailyPriceContext.source.label('source'),
+                    DailyPriceContext.context_payload.label('context_payload'),
+                    DailyPriceContext.captured_at.label('captured_at'),
+                )
+                .where(
+                    DailyPriceContext.symbol_id == symbol_id,
+                    DailyPriceContext.market_date <= normalized_market_date,
+                )
+                .order_by(DailyPriceContext.market_date.desc())
+                .limit(history_days)
+            ).all()
+            rows.extend(
+                {
+                    'symbol': symbol,
+                    'market_date': row.market_date,
+                    'source': row.source,
+                    'context_payload': row.context_payload,
+                    'captured_at': row.captured_at,
+                }
+                for row in symbol_context_rows
+            )
+    rows.sort(key=lambda row: (row['symbol'], row['market_date']))
 
     return [
         {
-            'symbol': row.symbol,
-            'market_date': row.market_date.isoformat(),
-            'source': row.source,
-            'context_payload': row.context_payload,
-            'captured_at': row.captured_at.isoformat() if row.captured_at else None,
+            'symbol': row['symbol'],
+            'market_date': row['market_date'].isoformat(),
+            'source': row['source'],
+            'context_payload': row['context_payload'],
+            'captured_at': row['captured_at'].isoformat() if row['captured_at'] else None,
         }
         for row in rows
     ]
