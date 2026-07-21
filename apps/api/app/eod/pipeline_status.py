@@ -220,6 +220,7 @@ def _load_daily_pipeline_stage_history(*, market_date: str) -> dict[str, dict[st
             select(DailyPipelineRun, DailyPipelineStageRun)
             .join(DailyPipelineStageRun, DailyPipelineStageRun.pipeline_run_id == DailyPipelineRun.id)
             .where(DailyPipelineRun.market_date == normalized_market_date)
+            .where(DailyPipelineStageRun.market_date == normalized_market_date)
             .where(DailyPipelineStageRun.stage_id.in_(PIPELINE_STAGE_ORDER))
             .order_by(
                 DailyPipelineStageRun.updated_at.desc().nullslast(),
