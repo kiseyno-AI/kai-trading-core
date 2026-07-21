@@ -2107,6 +2107,7 @@ class DartFundamentalsRow(Base, TimestampMixin):
     __tablename__ = 'dart_fundamentals_rows'
     __table_args__ = (
         UniqueConstraint('snapshot_id', 'row_key', name='uq_dart_fundamentals_rows_snapshot_row_key'),
+        Index('ix_dart_fundamentals_rows_snapshot_order', 'snapshot_id', 'row_order', 'id'),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)

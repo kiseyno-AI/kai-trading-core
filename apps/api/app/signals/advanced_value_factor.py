@@ -25,6 +25,7 @@ from app.market_data_store import (
 
 ADVANCED_VALUE_FACTOR_VERSION = 'advanced_value_v1'
 ADVANCED_VALUE_FACTOR_SOURCE = ADVANCED_VALUE_FACTOR_VERSION
+ADVANCED_VALUE_FUNDAMENTALS_ROW_CHUNK_SIZE = 500
 ADVANCED_VALUE_FUNDAMENTALS_FS_DIV = 'CFS'
 ADVANCED_VALUE_FUNDAMENTALS_REPORT_CODE = '11011'
 ADVANCED_VALUE_FUNDAMENTALS_PERIOD_TYPE = 'annual'
@@ -958,22 +959,23 @@ class DailyAdvancedValueFactorService:
                 select(DartFundamentalsHighlight)
                 .where(DartFundamentalsHighlight.snapshot_id.in_(snapshot_ids))
             ).scalars()
-            statement_rows = session.execute(
-                select(DartFundamentalsRow)
-                .where(DartFundamentalsRow.snapshot_id.in_(snapshot_ids))
-                .order_by(
-                    DartFundamentalsRow.snapshot_id.asc(),
-                    DartFundamentalsRow.row_order.asc(),
-                    DartFundamentalsRow.id.asc(),
-                )
-            ).scalars()
-
             highlights_by_snapshot: dict[int, dict[str, dict[str, Any]]] = defaultdict(dict)
             rows_by_snapshot: dict[int, list[dict[str, Any]]] = defaultdict(list)
             for row in highlight_rows:
                 highlights_by_snapshot[row.snapshot_id][row.metric_key] = _serialize_highlight_row(row)
-            for row in statement_rows:
-                rows_by_snapshot[row.snapshot_id].append(_serialize_statement_row(row))
+            for start in range(0, len(snapshot_ids), ADVANCED_VALUE_FUNDAMENTALS_ROW_CHUNK_SIZE):
+                snapshot_id_chunk = snapshot_ids[start:start + ADVANCED_VALUE_FUNDAMENTALS_ROW_CHUNK_SIZE]
+                statement_rows = session.execute(
+                    select(DartFundamentalsRow)
+                    .where(DartFundamentalsRow.snapshot_id.in_(snapshot_id_chunk))
+                    .order_by(
+                        DartFundamentalsRow.snapshot_id.asc(),
+                        DartFundamentalsRow.row_order.asc(),
+                        DartFundamentalsRow.id.asc(),
+                    )
+                ).scalars()
+                for row in statement_rows:
+                    rows_by_snapshot[row.snapshot_id].append(_serialize_statement_row(row))
 
             result: dict[str, AnnualFundamentalsSnapshot] = {}
             for symbol, snapshot_id in snapshot_id_by_symbol.items():
