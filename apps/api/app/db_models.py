@@ -2030,6 +2030,12 @@ class DartDisclosureEvent(Base, TimestampMixin):
             'receipt_date',
             'id',
         ),
+        Index(
+            'ix_dart_disclosure_events_stock_receipt_updated',
+            'stock_code',
+            'receipt_date',
+            'updated_at',
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
