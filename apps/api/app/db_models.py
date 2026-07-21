@@ -308,6 +308,7 @@ class DailyPipelineStageRun(Base, TimestampMixin):
         UniqueConstraint('pipeline_run_id', 'stage_id', name='uq_daily_pipeline_stage_runs_run_stage'),
         Index('ix_daily_pipeline_stage_runs_stage_status', 'stage_id', 'status'),
         Index('ix_daily_pipeline_stage_runs_market_stage_status', 'market_date', 'stage_id', 'status'),
+        Index('ix_daily_pipeline_stage_runs_market_stage_updated', 'market_date', 'stage_id', 'updated_at', 'id'),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
