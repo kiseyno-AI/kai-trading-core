@@ -540,7 +540,10 @@ class BrokerOrderEvent(Base):
 
 class DailyPriceBar(Base):
     __tablename__ = 'daily_price_bars'
-    __table_args__ = (UniqueConstraint('symbol_id', 'trade_date', name='uq_daily_price_bars_symbol_trade_date'),)
+    __table_args__ = (
+        UniqueConstraint('symbol_id', 'trade_date', name='uq_daily_price_bars_symbol_trade_date'),
+        Index('ix_daily_price_bars_trade_date_symbol', 'trade_date', 'symbol_id'),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     symbol_id: Mapped[int] = mapped_column(ForeignKey('symbols.id', ondelete='CASCADE'), nullable=False, index=True)
@@ -733,6 +736,7 @@ class DailyMarketRiskFilterResult(Base, TimestampMixin):
         Index('ix_daily_market_risk_filter_results_market_passed', 'market_date', 'passed_filter'),
         Index('ix_daily_market_risk_filter_results_market_watchlist', 'market_date', 'watchlist_flagged'),
         Index('ix_daily_market_risk_filter_results_market_state', 'market_date', 'risk_state'),
+        Index('ix_daily_market_risk_filter_results_market_symbol', 'market_date', 'symbol_id'),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
