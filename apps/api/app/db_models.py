@@ -1643,6 +1643,69 @@ class SignalDeciderExecutionPlanItem(Base, TimestampMixin):
             'account_reference',
         ),
         Index(
+            'ix_signal_decider_plan_next_open_lookup',
+            'execution_window',
+            'target_trade_date',
+            'account_reference',
+            'decision_agent_name',
+            'symbol',
+            'id',
+        ),
+        Index(
+            'ix_signal_decider_plan_next_open_status_lookup',
+            'execution_window',
+            'target_trade_date',
+            'eligibility_status',
+            'execution_status',
+            'account_reference',
+            'decision_agent_name',
+            'symbol',
+        ),
+        Index(
+            'ix_signal_decider_plan_source_block_lookup',
+            'execution_window',
+            'target_trade_date',
+            'source_market_date',
+            'execution_status',
+            'decision_agent_name',
+        ),
+        Index(
+            'ix_signal_decider_plan_history_submission_lookup',
+            'execution_window',
+            'decision_agent_name',
+            'target_trade_date',
+            'submitted_at',
+            'id',
+            postgresql_where=text('submission_payload is not null'),
+        ),
+        Index(
+            'ix_signal_decider_plan_account_discovery_lookup',
+            'execution_window',
+            'decision_agent_name',
+            'target_trade_date',
+            'submitted_at',
+            'id',
+        ),
+        Index(
+            'ix_signal_decider_plan_linked_source_lookup',
+            'execution_window',
+            'decision_agent_name',
+            'account_reference',
+            'symbol',
+            'planned_side',
+            'target_trade_date',
+            'submitted_at',
+            'id',
+        ),
+        Index(
+            'ix_signal_decider_plan_intraday_watch_lookup',
+            'execution_window',
+            'target_trade_date',
+            'account_reference',
+            'symbol',
+            'id',
+        ),
+        Index(
             'ix_signal_decider_execution_plan_items_snapshot',
             'decision_snapshot_id',
         ),
@@ -1905,6 +1968,16 @@ class DartDisclosureSyncRun(Base):
 
 class DartDisclosureEvent(Base, TimestampMixin):
     __tablename__ = 'dart_disclosure_events'
+    __table_args__ = (
+        Index(
+            'ix_dart_disclosure_events_financial_status_symbol_receipt',
+            'is_financial_report',
+            'fundamentals_capture_status',
+            'stock_code',
+            'receipt_date',
+            'id',
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     rcept_no: Mapped[str] = mapped_column(String(32), unique=True, nullable=False, index=True)
@@ -1989,6 +2062,14 @@ class DartFundamentalsSnapshot(Base, TimestampMixin):
             'report_code',
             'fs_div',
             name='uq_dart_fundamentals_snapshots_event_period_fs_div',
+        ),
+        Index(
+            'ix_dart_fundamentals_snapshots_symbol_fs_year_report',
+            'stock_code',
+            'fs_div',
+            'business_year',
+            'report_code',
+            'id',
         ),
     )
 

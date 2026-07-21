@@ -467,6 +467,16 @@ class DartFundamentalsRepository:
         fs_div: str,
     ) -> dict[str, dict[str, Any]]:
         normalized_codes = [code for code in dict.fromkeys(stock_codes) if code]
+        if len(normalized_codes) > 500:
+            merged: dict[str, dict[str, Any]] = {}
+            for index in range(0, len(normalized_codes), 500):
+                merged.update(
+                    self.list_symbol_fundamentals_states(
+                        stock_codes=normalized_codes[index : index + 500],
+                        fs_div=fs_div,
+                    )
+                )
+            return merged
         states: dict[str, dict[str, Any]] = {
             code: {
                 'stock_code': code,
