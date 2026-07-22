@@ -667,11 +667,13 @@ def _run_daily_agent_feedback_followup(
     prerequisites = agent_feedback_prerequisite_service.inspect_feedback_prerequisites(
         market_date=market_date,
     )
-    bypass_prerequisite_gate = (
+    bypass_prerequisite_gate_enabled = (
         bool(settings.openclaw_feedback_fast_path_bypass_prerequisite_gate)
         and feedback_scope_mode == FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH
     )
-    if not prerequisites['ready'] and not bypass_prerequisite_gate:
+    prerequisites_ready = bool(prerequisites['ready'])
+    bypass_prerequisite_gate = bypass_prerequisite_gate_enabled and not prerequisites_ready
+    if not prerequisites_ready and not bypass_prerequisite_gate:
         return {
             'triggered': False,
             'reason': 'feedback_prerequisites_not_ready',
@@ -690,12 +692,12 @@ def _run_daily_agent_feedback_followup(
             reuse_existing=True,
             progress_callback=progress_callback,
         ),
-        force=bypass_prerequisite_gate,
+        bypass_prerequisite_gate=bypass_prerequisite_gate,
     )
     return {
         'triggered': True,
-        'prerequisite_gate_bypassed': bypass_prerequisite_gate and not prerequisites['ready'],
-        'prerequisites': prerequisites if bypass_prerequisite_gate and not prerequisites['ready'] else None,
+        'prerequisite_gate_bypassed': bypass_prerequisite_gate,
+        'prerequisites': prerequisites if bypass_prerequisite_gate else None,
         **result,
     }
 

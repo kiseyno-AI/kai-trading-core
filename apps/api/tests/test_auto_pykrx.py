@@ -149,7 +149,7 @@ class PykrxBackfillServiceTests(TestCase):
 
         configs = []
 
-        def run_retry_cycles(*, config):
+        def run_retry_cycles(*, config, **_kwargs):
             configs.append(config)
             return {'status': 'completed'}
 
@@ -510,7 +510,35 @@ class PykrxBackfillServiceTests(TestCase):
         self.assertTrue(result['triggered'])
         self.assertTrue(result['prerequisite_gate_bypassed'])
         self.assertEqual(result['prerequisites'], blocked_prerequisites)
-        self.assertTrue(run_retry_cycles.call_args.kwargs['force'])
+        self.assertTrue(run_retry_cycles.call_args.kwargs['bypass_prerequisite_gate'])
+        self.assertFalse(run_retry_cycles.call_args.kwargs.get('force', False))
+        self.assertFalse(run_retry_cycles.call_args.kwargs['config'].force_recompute)
+
+    def test_daily_signal_decider_followup_does_not_bypass_or_force_when_prerequisites_are_ready(self) -> None:
+        ready_prerequisites = {'ready': True, 'status': 'ready'}
+
+        with (
+            patch(
+                'app.agent_context.prerequisite_service.agent_feedback_prerequisite_service.inspect_feedback_prerequisites',
+                return_value=ready_prerequisites,
+            ),
+            patch(
+                'app.agent_context.retry_service.agent_feedback_retry_service.run_retry_cycles',
+                return_value={'status': 'completed', 'completed': True},
+            ) as run_retry_cycles,
+            patch('app.core.settings.settings.openclaw_feedback_fast_path_bypass_prerequisite_gate', True),
+        ):
+            result = _run_daily_signal_decider_followup(
+                market_date='2026-04-03',
+                enabled=True,
+            )
+
+        self.assertTrue(result['triggered'])
+        self.assertFalse(result['prerequisite_gate_bypassed'])
+        self.assertIsNone(result['prerequisites'])
+        self.assertFalse(run_retry_cycles.call_args.kwargs['bypass_prerequisite_gate'])
+        self.assertFalse(run_retry_cycles.call_args.kwargs.get('force', False))
+        self.assertFalse(run_retry_cycles.call_args.kwargs['config'].force_recompute)
 
     def test_reconcile_latest_daily_run_status_uses_last_progress_heartbeat(self) -> None:
         service = PykrxBackfillService()

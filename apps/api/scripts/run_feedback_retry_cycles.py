@@ -6,9 +6,6 @@ import os
 from datetime import date
 from pathlib import Path
 
-from app.agent_context.retry_service import EXPECTED_ROLES, FeedbackRetryCycleConfig, agent_feedback_retry_service
-from app.agent_context.run_modes import FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH, FEEDBACK_SCOPE_MODES
-
 MAX_CYCLES = 3
 OUTER_BATCH_SIZE = 20
 MARKET_DATE_ENV_VARS = ('FEEDBACK_RETRY_MARKET_DATE', 'MARKET_DATE')
@@ -27,6 +24,12 @@ def _load_dotenv() -> None:
         if not key or key in os.environ:
             continue
         os.environ[key] = value.strip().strip('"').strip("'")
+
+
+_load_dotenv()
+
+from app.agent_context.retry_service import EXPECTED_ROLES, FeedbackRetryCycleConfig, agent_feedback_retry_service
+from app.agent_context.run_modes import FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH, FEEDBACK_SCOPE_MODES
 
 
 def _default_market_date() -> date:

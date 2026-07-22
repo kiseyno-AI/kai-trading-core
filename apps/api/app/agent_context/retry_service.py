@@ -808,11 +808,18 @@ class AgentFeedbackRetryService:
             'chunks': len(dispatch_results),
         }
 
-    def run_retry_cycles(self, *, config: FeedbackRetryCycleConfig, force: bool = False) -> dict[str, Any]:
+    def run_retry_cycles(
+        self,
+        *,
+        config: FeedbackRetryCycleConfig,
+        force: bool = False,
+        bypass_prerequisite_gate: bool = False,
+    ) -> dict[str, Any]:
         roles = tuple(config.roles)
         progress_callback = getattr(config, 'progress_callback', None)
         feedback_scope_mode = normalize_feedback_scope_mode(getattr(config, 'feedback_scope_mode', None))
         effective_force_recompute = bool(force or getattr(config, 'force_recompute', False))
+        should_bypass_prerequisite_gate = bool(force or bypass_prerequisite_gate)
         raw_requested_symbols = getattr(config, 'symbols', None)
         requested_symbols = (
             tuple(_normalize_requested_symbols(raw_requested_symbols))
@@ -822,7 +829,7 @@ class AgentFeedbackRetryService:
         prerequisites = agent_feedback_prerequisite_service.inspect_feedback_prerequisites(
             market_date=config.market_date,
         )
-        if not force and not prerequisites['ready']:
+        if not should_bypass_prerequisite_gate and not prerequisites['ready']:
             progress = self._get_retry_progress(
                 market_date=config.market_date,
                 roles=roles,
