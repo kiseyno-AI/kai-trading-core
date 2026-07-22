@@ -6,7 +6,11 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.api import routes_scanner
-from app.market_data_store import build_daily_trending_rank_items, compute_and_persist_daily_trending_ranks
+from app.market_data_store import (
+    build_daily_trending_rank_items,
+    compute_and_persist_daily_trending_ranks,
+    replace_daily_trending_ranks,
+)
 from app.scanner.trending import TrendingStocksService
 
 
@@ -142,6 +146,29 @@ class TrendingRankBuilderTests(unittest.TestCase):
 
 
 class DailyTrendingRankPersistenceTests(unittest.TestCase):
+    def test_compute_and_persist_rebuilds_ranks_without_loader_limit(self):
+        with (
+            patch(
+                'app.market_data_store._load_trending_stocks_from_daily_price_bars',
+                return_value=[],
+            ) as daily_loader,
+            patch(
+                'app.market_data_store._load_trending_stocks_from_snapshots',
+                return_value=[],
+            ) as snapshot_loader,
+            patch(
+                'app.market_data_store.replace_daily_trending_ranks',
+                return_value=0,
+            ),
+        ):
+            compute_and_persist_daily_trending_ranks(
+                market_date='2026-04-29',
+                periods=['1d', '5d', '20d'],
+            )
+
+        self.assertIsNone(daily_loader.call_args.kwargs['limit'])
+        self.assertEqual([call.kwargs['limit'] for call in snapshot_loader.call_args_list], [None, None])
+
     def test_compute_and_persist_ignores_progress_callback_failures(self):
         progress_updates: list[dict] = []
 
@@ -172,6 +199,85 @@ class DailyTrendingRankPersistenceTests(unittest.TestCase):
         self.assertEqual(result['trending_ranks_persisted'], 2)
         self.assertEqual([item['status'] for item in progress_updates], ['running', 'running', 'completed'])
         self.assertEqual(replace_mock.call_count, 2)
+
+    def test_replace_daily_trending_ranks_uses_one_rollback_scope_for_insert_failure(self):
+        class FakeResult:
+            def all(self):
+                return [('AAA', 1), ('BBB', 2)]
+
+        class FakeSession:
+            def __init__(self):
+                self.insert_count = 0
+                self.statements = []
+
+            def execute(self, statement):
+                statement_name = statement.__class__.__name__
+                self.statements.append(statement_name)
+                if statement_name == 'Select':
+                    return FakeResult()
+                if statement_name == 'Insert':
+                    self.insert_count += 1
+                    if self.insert_count == 2:
+                        raise RuntimeError('insert failed')
+                return None
+
+        class FakeSessionScope:
+            def __init__(self):
+                self.session = FakeSession()
+                self.committed = False
+                self.rolled_back = False
+
+            def __enter__(self):
+                return self.session
+
+            def __exit__(self, exc_type, _exc, _tb):
+                if exc_type is None:
+                    self.committed = True
+                else:
+                    self.rolled_back = True
+                return False
+
+        scopes: list[FakeSessionScope] = []
+
+        def fake_session_scope():
+            scope = FakeSessionScope()
+            scopes.append(scope)
+            return scope
+
+        items = [
+            {
+                'symbol': 'AAA',
+                'trend_direction': 'up',
+                'metric': {'name': 'return_5d_pct', 'value': 10.0},
+                'price': None,
+                'technical': {},
+                'action_summary': None,
+            },
+            {
+                'symbol': 'BBB',
+                'trend_direction': 'down',
+                'metric': {'name': 'return_5d_pct', 'value': -8.0},
+                'price': None,
+                'technical': {},
+                'action_summary': None,
+            },
+        ]
+
+        with (
+            patch('app.market_data_store.session_scope', side_effect=fake_session_scope),
+            patch('app.market_data_store.TRENDING_RANK_INSERT_CHUNK_SIZE', 1),
+        ):
+            with self.assertRaisesRegex(RuntimeError, 'insert failed'):
+                replace_daily_trending_ranks(
+                    market_date='2026-04-29',
+                    period='5d',
+                    items=items,
+                )
+
+        self.assertEqual(len(scopes), 1)
+        self.assertFalse(scopes[0].committed)
+        self.assertTrue(scopes[0].rolled_back)
+        self.assertEqual(scopes[0].session.statements, ['Delete', 'Select', 'Insert', 'Insert'])
 
 
 class FakeTrendingStocksService:
