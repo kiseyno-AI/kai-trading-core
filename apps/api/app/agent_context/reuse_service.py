@@ -33,6 +33,7 @@ FUNDAMENTAL_SUMMARY_PROMPT_VERSION = 'fundamental_summarizer_prompt_v1'
 FUNDAMENTAL_SUMMARY_RESPONSE_SCHEMA_VERSION = 'agent_feedback_response_contract_v1'
 FUNDAMENTAL_SUMMARY_REUSE_POLICY_VERSION = 'fundamental_summary_reuse_policy_v1'
 FUNDAMENTAL_SUMMARY_REUSE_REASON = 'reuse_unchanged_fundamental_inputs'
+FEEDBACK_REUSE_SYMBOL_CHUNK_SIZE = 50
 
 FUNDAMENTAL_REUSE_STALE_REASONS = {
     'forced_recompute',
@@ -155,7 +156,7 @@ class AgentContextReuseService:
             latest_failure_map: dict[tuple[str, str], AgentContextFeedbackFailure] = {}
             for role in requested_roles:
                 agent_name = ROLE_TO_AGENT[role]
-                for chunk in _chunked(normalized_symbols, 500):
+                for chunk in _chunked(normalized_symbols, FEEDBACK_REUSE_SYMBOL_CHUNK_SIZE):
                     feedback_rows = session.execute(
                         select(
                             AgentContextFeedback.id,

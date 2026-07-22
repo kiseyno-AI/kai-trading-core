@@ -132,6 +132,7 @@ class Settings(BaseSettings):
     naver_search_base_url: str = 'https://openapi.naver.com/v1/search/news.json'
     external_news_default_display: int = 10
     external_news_request_timeout_seconds: float = 10.0
+    external_news_context_enabled: bool = True
     external_news_context_limit: int = 3
     external_news_context_lookback_days: int = 14
     external_news_collect_throttle_seconds: float = 0.15
@@ -207,6 +208,9 @@ class Settings(BaseSettings):
     openclaw_feedback_force_include_prior_missed_opportunities_enabled: bool = True
     openclaw_feedback_force_include_prior_missed_opportunities_broad_scope_enabled: bool = False
     openclaw_feedback_force_include_event_symbols_enabled: bool = True
+    openclaw_feedback_upstream_reuse_enabled: bool = True
+    openclaw_feedback_prior_block_history_enabled: bool = True
+    openclaw_feedback_fast_path_bypass_prerequisite_gate: bool = True
     openclaw_agent_subtask_poll_seconds: float = 2.0
     openclaw_agent_slot_cooldown_seconds: float = 600.0
     openclaw_session_cleanup_timeout_seconds: float = 30.0

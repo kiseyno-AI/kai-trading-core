@@ -1,6 +1,6 @@
 import unittest
 from contextlib import contextmanager
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -33,12 +33,14 @@ def _build_run_row(
     market_date: date,
     started_at: datetime,
     request_payload: dict,
+    status: str = 'completed',
+    updated_at: datetime | None = None,
 ):
     return SimpleNamespace(
         id=row_id,
         run_id=run_id,
         market_date=market_date,
-        status='completed',
+        status=status,
         symbols_total=2,
         completed_count=4,
         failed_count=0,
@@ -47,7 +49,7 @@ def _build_run_row(
         started_at=started_at,
         completed_at=started_at,
         created_at=started_at,
-        updated_at=started_at,
+        updated_at=updated_at or started_at,
     )
 
 
@@ -218,6 +220,50 @@ class AgentContextFeedbackRunStateServiceTests(unittest.TestCase):
 
         self.assertIsNotNone(result)
         self.assertEqual(result['run_id'], 'matching-run')
+
+    def test_find_latest_run_skips_stale_running_rows(self):
+        service = AgentContextFeedbackRunStateService()
+        market_date = date.fromisoformat('2026-04-14')
+        fake_session = FakeRunStateSession(
+            [
+                _build_run_row(
+                    row_id=2,
+                    run_id='stale-running-run',
+                    market_date=market_date,
+                    started_at=datetime.now(timezone.utc) - timedelta(hours=2),
+                    updated_at=datetime.now(timezone.utc) - timedelta(hours=1),
+                    status='running',
+                    request_payload={
+                        'symbols': ['005930'],
+                        'roles': ['signal-decider'],
+                    },
+                ),
+                _build_run_row(
+                    row_id=1,
+                    run_id='completed-run',
+                    market_date=market_date,
+                    started_at=datetime(2026, 4, 14, 1, 0, tzinfo=timezone.utc),
+                    request_payload={
+                        'symbols': ['005930'],
+                        'roles': ['signal-decider'],
+                    },
+                ),
+            ]
+        )
+
+        @contextmanager
+        def fake_session_scope():
+            yield fake_session
+
+        with patch('app.agent_context.run_state_service.session_scope', fake_session_scope):
+            result = service.find_latest_run(
+                market_date=market_date,
+                requested_symbols=['005930'],
+                requested_roles=['signal-decider'],
+            )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result['run_id'], 'completed-run')
 
     def test_resolve_run_requested_symbols_prefers_actual_dispatch_scope(self):
         service = AgentContextFeedbackRunStateService()

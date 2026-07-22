@@ -3192,7 +3192,10 @@ class AgentFeedbackOrchestrator:
                         force_recompute=force_recompute,
                     )
                 upstream_reuse_decisions = {}
-                if any(spec.role in DECISION_SUPPORT_AGENT_NAMES for spec in specs):
+                if (
+                    bool(getattr(settings, 'openclaw_feedback_upstream_reuse_enabled', True))
+                    and any(spec.role in DECISION_SUPPORT_AGENT_NAMES for spec in specs)
+                ):
                     upstream_reuse_decisions = agent_context_reuse_service.build_latest_decisions(
                         market_date=normalized_market_date,
                         symbols=scoped_dispatch_symbols,
