@@ -151,7 +151,8 @@ class DailySignalFeatureServiceTests(unittest.IsolatedAsyncioTestCase):
                     },
                 ),
             ),
-            patch('app.signals.daily_signal_features.upsert_daily_signal_feature') as upsert,
+            patch('app.signals.daily_signal_features.upsert_daily_signal_feature') as fallback_upsert,
+            patch('app.signals.daily_signal_features.upsert_daily_signal_features') as bulk_upsert,
             patch(
                 'app.signals.daily_signal_features.daily_market_participation_context_service.rebuild_for_market_date',
                 return_value={'captured_symbol_count': 2},
@@ -165,9 +166,10 @@ class DailySignalFeatureServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['source_counts'][OVERTIME_VOLUME], 2)
         self.assertEqual(result['source_counts'][OVERTIME_FLUCTUATION], 1)
         self.assertEqual(result['features_persisted'], 2)
-        self.assertEqual(upsert.call_count, 2)
-        persisted_symbols = {call.args[0]['symbol'] for call in upsert.call_args_list}
+        bulk_upsert.assert_called_once()
+        persisted_symbols = {item['symbol'] for item in bulk_upsert.call_args.args[0]}
         self.assertEqual(persisted_symbols, {'005930', '000660'})
+        fallback_upsert.assert_not_called()
         self.assertEqual(result['participation_context'], {'captured_symbol_count': 2})
         self.assertEqual(result['items_total'], 2)
         self.assertEqual(result['items_returned'], 2)

@@ -1461,6 +1461,11 @@ def run_market_data_pipeline(
                 total=0,
                 succeeded=0,
                 failed=1,
+                error_message=trending_rank_error_message,
+                extra={
+                    'error_type': type(exc).__name__,
+                    'error_message': str(exc),
+                },
             )
     else:
         trending_rank_result = {
@@ -1539,6 +1544,11 @@ def run_market_data_pipeline(
                 total=3,
                 succeeded=0,
                 failed=1,
+                error_message=signal_feature_error_message,
+                extra={
+                    'error_type': type(exc).__name__,
+                    'error_message': str(exc),
+                },
             )
     else:
         signal_feature_result = {

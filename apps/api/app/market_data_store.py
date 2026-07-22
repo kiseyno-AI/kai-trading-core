@@ -3,7 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from decimal import Decimal
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 from sqlalchemy import Numeric, and_, case, cast, delete, func, select, text, true, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -128,7 +128,9 @@ def _rank_percentile_desc(rank: int, total: int) -> float | None:
 
 
 DAY_BASED_TRENDING_PERIODS = ('1d', '5d', '20d')
-TRENDING_RANK_REBUILD_LIMIT = 100000
+TRENDING_RANK_REBUILD_LIMIT = 500
+TRENDING_RANK_INSERT_CHUNK_SIZE = 50
+DAILY_SIGNAL_FEATURE_UPSERT_CHUNK_SIZE = 50
 
 
 def _get_symbol(session, symbol: str) -> Symbol | None:
@@ -773,6 +775,8 @@ def load_recent_price_bars_by_symbol(
         return {}
 
     normalized_symbols = list(dict.fromkeys(symbols))
+    normalized_market_date = _normalize_trade_date(market_date)
+    lower_bound_date = normalized_market_date - timedelta(days=max(history_days * 7, 14))
     with session_scope() as session:
         ranked = (
             select(
@@ -799,7 +803,8 @@ def load_recent_price_bars_by_symbol(
             .join(Symbol, Symbol.id == DailyPriceBar.symbol_id)
             .where(
                 Symbol.symbol.in_(normalized_symbols),
-                DailyPriceBar.trade_date <= _normalize_trade_date(market_date),
+                DailyPriceBar.trade_date <= normalized_market_date,
+                DailyPriceBar.trade_date >= lower_bound_date,
             )
             .subquery()
         )
@@ -1518,18 +1523,16 @@ def _load_trending_stocks_from_daily_price_bars(
     markets: list[str] | None,
 ) -> list[dict]:
     previous_bar = aliased(DailyPriceBar)
-    previous_close_expr = (
-        select(previous_bar.close_price)
-        .where(previous_bar.symbol_id == DailyPriceBar.symbol_id)
-        .where(previous_bar.trade_date < DailyPriceBar.trade_date)
-        .order_by(previous_bar.trade_date.desc())
-        .limit(1)
-        .correlate(DailyPriceBar)
-        .scalar_subquery()
-    )
-    previous_close_numeric = cast(previous_close_expr, Numeric(20, 6))
+    with session_scope() as session:
+        previous_trade_date = session.execute(
+            select(func.max(previous_bar.trade_date)).where(previous_bar.trade_date < normalized_market_date)
+        ).scalar_one_or_none()
+        if previous_trade_date is None:
+            return []
+
+    previous_close_numeric = cast(previous_bar.close_price, Numeric(20, 6))
     close_numeric = cast(DailyPriceBar.close_price, Numeric(20, 6))
-    change_expr = DailyPriceBar.close_price - previous_close_expr
+    change_expr = DailyPriceBar.close_price - previous_bar.close_price
     change_pct_expr = ((close_numeric - previous_close_numeric) / func.nullif(previous_close_numeric, 0)) * 100
 
     with session_scope() as session:
@@ -1547,7 +1550,7 @@ def _load_trending_stocks_from_daily_price_bars(
                 DailyPriceBar.turnover.label('turnover'),
                 DailyPriceBar.source.label('price_source'),
                 DailyPriceBar.captured_at.label('price_captured_at'),
-                previous_close_expr.label('previous_close_price'),
+                previous_bar.close_price.label('previous_close_price'),
                 change_expr.label('change'),
                 change_pct_expr.label('metric_value'),
                 DailyTechnicalSnapshot.trend_state.label('trend_state'),
@@ -1569,6 +1572,11 @@ def _load_trending_stocks_from_daily_price_bars(
                 DailyActionSummary.captured_at.label('action_captured_at'),
             )
             .join(Symbol, Symbol.id == DailyPriceBar.symbol_id)
+            .join(
+                previous_bar,
+                (previous_bar.symbol_id == DailyPriceBar.symbol_id)
+                & (previous_bar.trade_date == previous_trade_date),
+            )
             .outerjoin(
                 DailyTechnicalSnapshot,
                 (DailyTechnicalSnapshot.symbol_id == DailyPriceBar.symbol_id)
@@ -1581,7 +1589,7 @@ def _load_trending_stocks_from_daily_price_bars(
             )
             .where(DailyPriceBar.trade_date == normalized_market_date)
             .where(Symbol.is_active.is_(True))
-            .where(previous_close_expr.isnot(None))
+            .where(previous_bar.close_price.isnot(None))
             .where(change_pct_expr.isnot(None))
         )
         if markets:
@@ -1818,43 +1826,46 @@ def replace_daily_trending_ranks(
             .where(DailyTrendingRank.market_date == normalized_market_date)
             .where(DailyTrendingRank.period == normalized_period)
         )
-        if not ranked_items:
-            return 0
+    if not ranked_items:
+        return 0
 
+    with session_scope() as session:
         symbol_rows = session.execute(select(Symbol.symbol, Symbol.id).where(Symbol.symbol.in_(symbols))).all()
-        symbol_ids = {symbol: symbol_id for symbol, symbol_id in symbol_rows}
-        values = []
-        for item in ranked_items:
-            symbol_id = symbol_ids.get(item['symbol'])
-            if symbol_id is None:
-                continue
-            metric = item['metric']
-            stored_ranks = item['stored_ranks']
-            values.append(
-                {
-                    'symbol_id': symbol_id,
-                    'eod_run_id': run_id,
-                    'market_date': normalized_market_date,
-                    'period': normalized_period,
-                    'source': source,
-                    'metric_name': metric['name'],
-                    'metric_value': metric['value'],
-                    'trend_direction': item['trend_direction'],
-                    'absolute_rank': stored_ranks['absolute_rank'],
-                    'up_rank': stored_ranks['up_rank'],
-                    'down_rank': stored_ranks['down_rank'],
-                    'price_payload': item.get('price'),
-                    'technical_payload': item.get('technical'),
-                    'action_summary_payload': item.get('action_summary'),
-                    'captured_at': refreshed_at,
-                    'created_at': refreshed_at,
-                    'updated_at': refreshed_at,
-                }
-            )
-        if not values:
-            return 0
-        session.execute(pg_insert(DailyTrendingRank).values(values))
-        return len(values)
+    symbol_ids = {symbol: symbol_id for symbol, symbol_id in symbol_rows}
+    values = []
+    for item in ranked_items:
+        symbol_id = symbol_ids.get(item['symbol'])
+        if symbol_id is None:
+            continue
+        metric = item['metric']
+        stored_ranks = item['stored_ranks']
+        values.append(
+            {
+                'symbol_id': symbol_id,
+                'eod_run_id': run_id,
+                'market_date': normalized_market_date,
+                'period': normalized_period,
+                'source': source,
+                'metric_name': metric['name'],
+                'metric_value': metric['value'],
+                'trend_direction': item['trend_direction'],
+                'absolute_rank': stored_ranks['absolute_rank'],
+                'up_rank': stored_ranks['up_rank'],
+                'down_rank': stored_ranks['down_rank'],
+                'price_payload': item.get('price'),
+                'technical_payload': item.get('technical'),
+                'action_summary_payload': item.get('action_summary'),
+                'captured_at': refreshed_at,
+                'created_at': refreshed_at,
+                'updated_at': refreshed_at,
+            }
+        )
+    if not values:
+        return 0
+    for start in range(0, len(values), TRENDING_RANK_INSERT_CHUNK_SIZE):
+        with session_scope() as session:
+            session.execute(pg_insert(DailyTrendingRank).values(values[start:start + TRENDING_RANK_INSERT_CHUNK_SIZE]))
+    return len(values)
 
 
 def compute_and_persist_daily_trending_ranks(
@@ -2136,6 +2147,79 @@ def upsert_daily_signal_feature(feature: dict) -> None:
                 },
             )
         )
+
+
+def upsert_daily_signal_features(features: Sequence[dict]) -> int:
+    if not features:
+        return 0
+
+    refreshed_at = datetime.utcnow()
+    symbols = list(dict.fromkeys(feature['symbol'] for feature in features))
+    with session_scope() as session:
+        symbol_rows = session.execute(select(Symbol).where(Symbol.symbol.in_(symbols))).scalars().all()
+        symbol_map = {symbol.symbol: symbol for symbol in symbol_rows}
+        for feature in features:
+            symbol_code = feature['symbol']
+            symbol = symbol_map.get(symbol_code)
+            if symbol is None:
+                symbol = Symbol(
+                    symbol=symbol_code,
+                    market=feature.get('market', 'KRX'),
+                    name_ko=feature.get('name_ko') or symbol_code,
+                    instrument_type='equity',
+                    source=feature.get('source', 'kis_ranking'),
+                    is_active=True,
+                    last_refreshed_at=refreshed_at,
+                )
+                session.add(symbol)
+                symbol_map[symbol_code] = symbol
+            elif feature.get('name_ko') and symbol.name_ko == symbol.symbol:
+                symbol.name_ko = feature['name_ko']
+                symbol.last_refreshed_at = refreshed_at
+        session.flush()
+
+        symbol_ids = {symbol_code: symbol.id for symbol_code, symbol in symbol_map.items()}
+
+    values = [
+        {
+            'symbol_id': symbol_ids[feature['symbol']],
+            'market_date': _normalize_trade_date(feature['market_date']),
+            'source': feature.get('source', 'kis_ranking'),
+            'signal_count': int(feature.get('signal_count') or 0),
+            'volume_power_rank': feature.get('volume_power_rank'),
+            'volume_power': feature.get('volume_power'),
+            'overtime_volume_rank': feature.get('overtime_volume_rank'),
+            'overtime_volume': feature.get('overtime_volume'),
+            'overtime_fluctuation_rank': feature.get('overtime_fluctuation_rank'),
+            'overtime_fluctuation_rate': feature.get('overtime_fluctuation_rate'),
+            'feature_payload': feature['feature_payload'],
+            'captured_at': refreshed_at,
+            'updated_at': refreshed_at,
+        }
+        for feature in features
+    ]
+    for start in range(0, len(values), DAILY_SIGNAL_FEATURE_UPSERT_CHUNK_SIZE):
+        with session_scope() as session:
+            statement = pg_insert(DailySignalFeature).values(values[start:start + DAILY_SIGNAL_FEATURE_UPSERT_CHUNK_SIZE])
+            session.execute(
+                statement.on_conflict_do_update(
+                    constraint='uq_daily_signal_features_symbol_market_date',
+                    set_={
+                        'source': statement.excluded.source,
+                        'signal_count': statement.excluded.signal_count,
+                        'volume_power_rank': statement.excluded.volume_power_rank,
+                        'volume_power': statement.excluded.volume_power,
+                        'overtime_volume_rank': statement.excluded.overtime_volume_rank,
+                        'overtime_volume': statement.excluded.overtime_volume,
+                        'overtime_fluctuation_rank': statement.excluded.overtime_fluctuation_rank,
+                        'overtime_fluctuation_rate': statement.excluded.overtime_fluctuation_rate,
+                        'feature_payload': statement.excluded.feature_payload,
+                        'captured_at': statement.excluded.captured_at,
+                        'updated_at': refreshed_at,
+                    },
+                )
+            )
+    return len(values)
 
 
 def upsert_daily_market_risk_snapshot(snapshot: dict) -> None:

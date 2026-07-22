@@ -27,6 +27,7 @@ from app.market_data_store import (
     load_recent_price_bars_by_symbol,
     load_symbols,
     upsert_daily_signal_feature,
+    upsert_daily_signal_features,
 )
 
 SIGNAL_FEATURE_VERSION = 'daily_signal_features_v2'
@@ -1213,12 +1214,16 @@ class DailySignalFeatureService:
 
         failed_symbols: list[str] = []
         persisted_items: list[dict[str, Any]] = []
-        for item in collection.items:
-            try:
-                upsert_daily_signal_feature(item)
-                persisted_items.append(item)
-            except Exception:
-                failed_symbols.append(item['symbol'])
+        try:
+            upsert_daily_signal_features(collection.items)
+            persisted_items = list(collection.items)
+        except Exception:
+            for item in collection.items:
+                try:
+                    upsert_daily_signal_feature(item)
+                    persisted_items.append(item)
+                except Exception:
+                    failed_symbols.append(item['symbol'])
 
         try:
             participation_context = daily_market_participation_context_service.rebuild_for_market_date(
