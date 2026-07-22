@@ -130,6 +130,7 @@ def _rank_percentile_desc(rank: int, total: int) -> float | None:
 DAY_BASED_TRENDING_PERIODS = ('1d', '5d', '20d')
 TRENDING_RANK_INSERT_CHUNK_SIZE = 50
 DAILY_SIGNAL_FEATURE_UPSERT_CHUNK_SIZE = 50
+RECENT_PRICE_BARS_SYMBOL_CHUNK_SIZE = 250
 
 
 def _get_symbol(session, symbol: str) -> Symbol | None:
@@ -776,65 +777,68 @@ def load_recent_price_bars_by_symbol(
     normalized_symbols = list(dict.fromkeys(symbols))
     normalized_market_date = _normalize_trade_date(market_date)
     lower_bound_date = normalized_market_date - timedelta(days=max(history_days * 7, 14))
-    with session_scope() as session:
-        ranked = (
-            select(
-                Symbol.symbol.label('symbol'),
-                DailyPriceBar.trade_date.label('trade_date'),
-                DailyPriceBar.open_price.label('open_price'),
-                DailyPriceBar.high_price.label('high_price'),
-                DailyPriceBar.low_price.label('low_price'),
-                DailyPriceBar.close_price.label('close_price'),
-                DailyPriceBar.volume.label('volume'),
-                DailyPriceBar.turnover.label('turnover'),
-                DailyPriceBar.per.label('per'),
-                DailyPriceBar.pbr.label('pbr'),
-                DailyPriceBar.bps.label('bps'),
-                DailyPriceBar.eps.label('eps'),
-                DailyPriceBar.dividend_yield.label('dividend_yield'),
-                DailyPriceBar.dps.label('dps'),
-                DailyPriceBar.source.label('source'),
-                DailyPriceBar.captured_at.label('captured_at'),
-                func.row_number()
-                .over(partition_by=DailyPriceBar.symbol_id, order_by=DailyPriceBar.trade_date.desc())
-                .label('bar_rank'),
-            )
-            .join(Symbol, Symbol.id == DailyPriceBar.symbol_id)
-            .where(
-                Symbol.symbol.in_(normalized_symbols),
-                DailyPriceBar.trade_date <= normalized_market_date,
-                DailyPriceBar.trade_date >= lower_bound_date,
-            )
-            .subquery()
-        )
-        rows = session.execute(
-            select(ranked)
-            .where(ranked.c.bar_rank <= history_days)
-            .order_by(ranked.c.symbol.asc(), ranked.c.trade_date.desc())
-        ).all()
 
     grouped: dict[str, list[dict]] = {symbol: [] for symbol in normalized_symbols}
-    for row in rows:
-        mapping = row._mapping
-        grouped.setdefault(mapping['symbol'], []).append(
-            {
-                'trade_date': mapping['trade_date'].isoformat() if mapping['trade_date'] else None,
-                'open_price': int(mapping['open_price']) if mapping['open_price'] is not None else None,
-                'high_price': int(mapping['high_price']) if mapping['high_price'] is not None else None,
-                'low_price': int(mapping['low_price']) if mapping['low_price'] is not None else None,
-                'close_price': int(mapping['close_price']) if mapping['close_price'] is not None else None,
-                'volume': int(mapping['volume']) if mapping['volume'] is not None else None,
-                'turnover': int(mapping['turnover']) if mapping['turnover'] is not None else None,
-                'per': _round_float(mapping['per'], 6),
-                'pbr': _round_float(mapping['pbr'], 6),
-                'bps': _round_float(mapping['bps'], 6),
-                'eps': _round_float(mapping['eps'], 6),
-                'dividend_yield': _round_float(mapping['dividend_yield'], 6),
-                'dps': _round_float(mapping['dps'], 6),
-                'source': mapping['source'],
-                'captured_at': mapping['captured_at'].isoformat() if mapping['captured_at'] else None,
-            }
-        )
+    for start in range(0, len(normalized_symbols), RECENT_PRICE_BARS_SYMBOL_CHUNK_SIZE):
+        symbol_chunk = normalized_symbols[start:start + RECENT_PRICE_BARS_SYMBOL_CHUNK_SIZE]
+        with session_scope() as session:
+            ranked = (
+                select(
+                    Symbol.symbol.label('symbol'),
+                    DailyPriceBar.trade_date.label('trade_date'),
+                    DailyPriceBar.open_price.label('open_price'),
+                    DailyPriceBar.high_price.label('high_price'),
+                    DailyPriceBar.low_price.label('low_price'),
+                    DailyPriceBar.close_price.label('close_price'),
+                    DailyPriceBar.volume.label('volume'),
+                    DailyPriceBar.turnover.label('turnover'),
+                    DailyPriceBar.per.label('per'),
+                    DailyPriceBar.pbr.label('pbr'),
+                    DailyPriceBar.bps.label('bps'),
+                    DailyPriceBar.eps.label('eps'),
+                    DailyPriceBar.dividend_yield.label('dividend_yield'),
+                    DailyPriceBar.dps.label('dps'),
+                    DailyPriceBar.source.label('source'),
+                    DailyPriceBar.captured_at.label('captured_at'),
+                    func.row_number()
+                    .over(partition_by=DailyPriceBar.symbol_id, order_by=DailyPriceBar.trade_date.desc())
+                    .label('bar_rank'),
+                )
+                .join(Symbol, Symbol.id == DailyPriceBar.symbol_id)
+                .where(
+                    Symbol.symbol.in_(symbol_chunk),
+                    DailyPriceBar.trade_date <= normalized_market_date,
+                    DailyPriceBar.trade_date >= lower_bound_date,
+                )
+                .subquery()
+            )
+            rows = session.execute(
+                select(ranked)
+                .where(ranked.c.bar_rank <= history_days)
+                .order_by(ranked.c.symbol.asc(), ranked.c.trade_date.desc())
+            ).all()
+
+        for row in rows:
+            mapping = row._mapping
+            grouped.setdefault(mapping['symbol'], []).append(
+                {
+                    'trade_date': mapping['trade_date'].isoformat() if mapping['trade_date'] else None,
+                    'open_price': int(mapping['open_price']) if mapping['open_price'] is not None else None,
+                    'high_price': int(mapping['high_price']) if mapping['high_price'] is not None else None,
+                    'low_price': int(mapping['low_price']) if mapping['low_price'] is not None else None,
+                    'close_price': int(mapping['close_price']) if mapping['close_price'] is not None else None,
+                    'volume': int(mapping['volume']) if mapping['volume'] is not None else None,
+                    'turnover': int(mapping['turnover']) if mapping['turnover'] is not None else None,
+                    'per': _round_float(mapping['per'], 6),
+                    'pbr': _round_float(mapping['pbr'], 6),
+                    'bps': _round_float(mapping['bps'], 6),
+                    'eps': _round_float(mapping['eps'], 6),
+                    'dividend_yield': _round_float(mapping['dividend_yield'], 6),
+                    'dps': _round_float(mapping['dps'], 6),
+                    'source': mapping['source'],
+                    'captured_at': mapping['captured_at'].isoformat() if mapping['captured_at'] else None,
+                }
+            )
     return grouped
 
 
