@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from fastapi import APIRouter, HTTPException
 
@@ -9,6 +9,7 @@ from app.fx.service import KoreaEximRateNotFoundError
 from app.integrations.fx.client import KoreaEximAPIError, KoreaEximConfigurationError
 from app.market_data_store import persist_market_status_snapshot
 from app.market.clock import KST, MarketState, async_get_market_state
+from app.market.session import get_krx_exchange_calendar_day, latest_krx_exchange_calendar_trading_date
 from app.market.snapshot import (
     MarketSnapshotConfigurationError,
     MarketSnapshotUnavailableError,
@@ -40,43 +41,42 @@ async def market_status() -> dict:
 
 def _build_market_status_fallback(exc: Exception) -> MarketState:
     now = datetime.now(KST)
+    calendar_source_error = _market_status_calendar_source_error(exc)
+    calendar_day = get_krx_exchange_calendar_day(now.date(), error=calendar_source_error)
+    latest_valid_date = latest_krx_exchange_calendar_trading_date(now.date())
+    latest_valid_trading_date = latest_valid_date.isoformat() if latest_valid_date is not None else None
     session_open = now.replace(hour=9, minute=0, second=0, microsecond=0)
     session_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
-    is_weekday = now.weekday() < 5
 
-    if not is_weekday:
-        state = 'WEEKEND'
+    if not calendar_day.is_open:
+        state = 'WEEKEND' if now.weekday() >= 5 else 'HOLIDAY'
         is_open = False
-        market_session = 'weekend'
+        market_session = 'weekend' if now.weekday() >= 5 else 'holiday'
         session_open_at = None
         session_close_at = None
-        latest_valid_trading_date = _previous_weekday(now).date().isoformat()
     elif now < session_open:
         state = 'PREOPEN'
         is_open = False
         market_session = 'closed'
         session_open_at = session_open.isoformat()
         session_close_at = session_close.isoformat()
-        latest_valid_trading_date = _previous_weekday(now).date().isoformat()
     elif now <= session_close:
         state = 'OPEN'
         is_open = True
         market_session = 'open'
         session_open_at = session_open.isoformat()
         session_close_at = session_close.isoformat()
-        latest_valid_trading_date = now.date().isoformat()
     else:
         state = 'CLOSED'
         is_open = False
         market_session = 'closed'
         session_open_at = session_open.isoformat()
         session_close_at = session_close.isoformat()
-        latest_valid_trading_date = now.date().isoformat()
 
     return MarketState(
         market='KRX',
         state=state,
-        is_trading_day=is_weekday,
+        is_trading_day=calendar_day.is_open,
         is_open=is_open,
         server_time=now.isoformat(),
         session_open_at=session_open_at,
@@ -85,17 +85,17 @@ def _build_market_status_fallback(exc: Exception) -> MarketState:
         current_calendar_date=now.date().isoformat(),
         latest_valid_trading_date=latest_valid_trading_date,
         market_session=market_session,
-        calendar_source='local_weekday_fallback',
-        calendar_source_status='fallback',
-        calendar_source_error=str(exc),
+        calendar_source=calendar_day.calendar_source,
+        calendar_source_status=calendar_day.calendar_source_status,
+        calendar_source_error=calendar_day.calendar_source_error,
     )
 
 
-def _previous_weekday(now: datetime) -> datetime:
-    candidate = now - timedelta(days=1)
-    while candidate.weekday() >= 5:
-        candidate -= timedelta(days=1)
-    return candidate
+def _market_status_calendar_source_error(exc: Exception) -> str:
+    message = str(exc)
+    if message:
+        return f'market status lookup failed: {type(exc).__name__}: {message}'
+    return f'market status lookup failed: {type(exc).__name__}'
 
 
 @router.get('/snapshot', response_model=MarketSnapshotResponse)
