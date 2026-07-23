@@ -94,6 +94,72 @@ MARKET_REGIME_RISK_OFF_ADVANCE_DECLINE_RATIO = 0.50
 MARKET_REGIME_WEAK_SECTOR_CHANGE_PCT = -1.50
 MARKET_REGIME_WEAK_RELATIVE_RETURN_PERCENTILE = 0.35
 MARKET_REGIME_WEAK_RELATIVE_VOLUME_PERCENTILE = 0.30
+MARKET_REGIME_STRONG_UP_RATIO = 0.62
+MARKET_REGIME_STRONG_ADVANCE_DECLINE_RATIO = 1.80
+MARKET_REGIME_OPEN_GAP_UP_PCT = 0.30
+MARKET_REGIME_OPEN_INDEX_STRENGTH_PCT = 0.50
+MARKET_REGIME_EARLY_CONTINUATION_PCT = 0.15
+MARKET_REGIME_TRADING_VALUE_EXPANSION_RATIO = 1.35
+MARKET_REGIME_AGGRESSIVE_OPEN_MULTIPLIER_CAP = 2.0
+MARKET_REGIME_TREND_DAY_MULTIPLIER_CAP = 1.25
+MARKET_REGIME_OPEN_WINDOW_START = '09:00:00+09:00'
+MARKET_REGIME_OPEN_WINDOW_END = '09:20:00+09:00'
+MARKET_REGIME_TREND_WINDOW_START = '09:20:00+09:00'
+MARKET_REGIME_TREND_WINDOW_END = '14:30:00+09:00'
+MARKET_REGIME_EXPORTER_FX_KEYWORDS: tuple[str, ...] = (
+    'semiconductor',
+    'electronics',
+    'automobile',
+    'auto',
+    'shipbuilding',
+    'export',
+    'display',
+    'battery',
+    'chemical',
+    'steel',
+    'machinery',
+    'hardware',
+    'it',
+    '\ubc18\ub3c4\uccb4',
+    '\uc804\uae30\uc804\uc790',
+    '\uc790\ub3d9\ucc28',
+    '\uc6b4\uc218\uc7a5\ube44',
+    '\uc870\uc120',
+    '\ud654\ud559',
+    '\ucca0\uac15',
+    '\uae30\uacc4',
+    '\ub514\uc2a4\ud50c\ub808\uc774',
+    '\ubc30\ud130\ub9ac',
+)
+MARKET_REGIME_IMPORT_COST_FX_KEYWORDS: tuple[str, ...] = (
+    'airline',
+    'aviation',
+    'retail',
+    'food',
+    'beverage',
+    'utility',
+    'gas',
+    'power',
+    'construction',
+    'telecom',
+    'media',
+    'leisure',
+    'restaurant',
+    'domestic',
+    'import',
+    '\ud56d\uacf5',
+    '\uc18c\ub9e4',
+    '\uc720\ud1b5',
+    '\uc74c\uc2dd\ub8cc',
+    '\uc804\uae30\uac00\uc2a4',
+    '\uac00\uc2a4',
+    '\uc804\ub825',
+    '\uac74\uc124',
+    '\ud1b5\uc2e0',
+    '\ubbf8\ub514\uc5b4',
+    '\ub808\uc800',
+    '\ub0b4\uc218',
+)
 PERSISTED_FACTOR_FAMILIES: tuple[str, ...] = (
     'value',
     'unified_value',
@@ -1921,6 +1987,312 @@ def _build_pre_decider_enrichment_context(
     }
 
 
+def _contains_any_keyword(value: str | None, keywords: Sequence[str]) -> bool:
+    if value is None:
+        return False
+    normalized = value.casefold()
+    return any(keyword.casefold() in normalized for keyword in keywords)
+
+
+def _classify_fx_sector_sensitivity(sector_name: str | None) -> str:
+    if _contains_any_keyword(sector_name, MARKET_REGIME_EXPORTER_FX_KEYWORDS):
+        return 'exporter_or_dollar_revenue_sensitive'
+    if _contains_any_keyword(sector_name, MARKET_REGIME_IMPORT_COST_FX_KEYWORDS):
+        return 'domestic_or_import_cost_sensitive'
+    if sector_name:
+        return 'neutral_or_unknown'
+    return 'unknown'
+
+
+def _normalize_fx_direction(value: Any) -> str:
+    if value is None:
+        return 'unknown'
+    normalized = str(value).strip().lower().replace('-', '_').replace(' ', '_')
+    if normalized in {'falling', 'down', 'declining', 'lower', 'usdkrw_falling', 'won_strengthening'}:
+        return 'falling'
+    if normalized in {'rising', 'up', 'increasing', 'higher', 'usdkrw_rising', 'won_weakening'}:
+        return 'rising'
+    if normalized in {'flat', 'stable', 'unchanged', 'sideways'}:
+        return 'stable'
+    return 'unknown'
+
+
+def _derive_fx_direction(payload: dict[str, Any], *, latest_value: float | None) -> str:
+    for key in (
+        'direction',
+        'usd_krw_direction',
+        'usdkrw_direction',
+        'day_direction',
+        'trend',
+    ):
+        direction = _normalize_fx_direction(payload.get(key))
+        if direction != 'unknown':
+            return direction
+    for key in ('change', 'change_pct', 'day_change', 'day_change_pct', 'delta', 'delta_pct'):
+        change = _to_float(payload.get(key))
+        if change is None:
+            continue
+        if change <= -0.05:
+            return 'falling'
+        if change >= 0.05:
+            return 'rising'
+        return 'stable'
+    previous_value = None
+    for key in ('previous_value', 'prior_value', 'previous_rate', 'prior_rate'):
+        previous_value = _to_float(payload.get(key))
+        if previous_value is not None:
+            break
+    if previous_value is not None and latest_value is not None:
+        delta = latest_value - previous_value
+        if delta <= -0.5:
+            return 'falling'
+        if delta >= 0.5:
+            return 'rising'
+        return 'stable'
+    return 'unknown'
+
+
+def _looks_like_usd_krw_series(item: dict[str, Any]) -> bool:
+    series_id = str(item.get('series_id') or '').strip().upper()
+    series_name = str(item.get('series_name') or '').strip().casefold()
+    unit = str(item.get('unit') or '').strip().casefold()
+    return (
+        series_id == 'DEXKOUS'
+        or 'usd/krw' in series_name
+        or 'usdkrw' in series_name
+        or ('krw' in unit and 'usd' in unit)
+    )
+
+
+def _extract_fx_payload_from_macro_context(macro_context: dict[str, Any] | None) -> dict[str, Any]:
+    macro_payload = _maybe_dict(macro_context)
+    if not macro_payload:
+        return {}
+    for key in ('fx_context', 'fx', 'usd_krw', 'usdkrw'):
+        payload = macro_payload.get(key)
+        if isinstance(payload, dict):
+            return payload
+    for item in list(macro_payload.get('series') or []):
+        if isinstance(item, dict) and _looks_like_usd_krw_series(item):
+            return item
+    return {}
+
+
+def _build_market_regime_fx_context(
+    *,
+    macro_context: dict[str, Any] | None,
+    sector_name: str | None,
+    strong_breadth: bool,
+) -> tuple[dict[str, Any], float, list[str]]:
+    fx_payload = _extract_fx_payload_from_macro_context(macro_context)
+    latest_value = (
+        _to_float(fx_payload.get('latest_value'))
+        or _to_float(fx_payload.get('value'))
+        or _to_float(fx_payload.get('rate'))
+        or _to_float(fx_payload.get('usd_krw'))
+        or _to_float(fx_payload.get('usdkrw'))
+    )
+    direction = _derive_fx_direction(fx_payload, latest_value=latest_value) if fx_payload else 'unknown'
+    sector_sensitivity = _classify_fx_sector_sensitivity(sector_name)
+    reasons: list[str] = []
+    if latest_value is None:
+        return (
+            {
+                'status': DECIDER_QUALITY_STATUS_UNAVAILABLE,
+                'usd_krw': None,
+                'level_label': 'unknown',
+                'direction': direction,
+                'sector_sensitivity': sector_sensitivity,
+                'penalty_score': 0.0,
+                'penalty_status': 'unavailable',
+                'penalty_reasons': ['fx_usdkrw_unavailable'],
+                'source': fx_payload.get('source') if fx_payload else None,
+                'observation_date': fx_payload.get('observation_date') if fx_payload else None,
+                'freshness': fx_payload.get('freshness') if isinstance(fx_payload.get('freshness'), dict) else None,
+            },
+            0.0,
+            ['fx_usdkrw_unavailable'],
+        )
+
+    if latest_value >= 1450.0:
+        penalty = 0.30
+        level_label = 'usdkrw_very_high'
+        reasons.append('fx_usdkrw_very_high_burden')
+    elif latest_value >= 1400.0:
+        penalty = 0.20
+        level_label = 'usdkrw_high'
+        reasons.append('fx_usdkrw_high_burden')
+    elif latest_value <= 1200.0:
+        penalty = 0.0
+        level_label = 'usdkrw_low'
+        reasons.append('fx_usdkrw_low_or_benign')
+    else:
+        penalty = 0.0
+        level_label = 'usdkrw_normal'
+        reasons.append('fx_usdkrw_normal')
+
+    raw_penalty = penalty
+    if direction == 'falling' and penalty > 0:
+        penalty = max(0.0, penalty - 0.10)
+        reasons.append('fx_burden_reduced_by_falling_usdkrw')
+    elif direction == 'rising' and latest_value >= 1400.0:
+        penalty += 0.05
+        reasons.append('fx_burden_increased_by_rising_usdkrw')
+
+    if sector_sensitivity == 'exporter_or_dollar_revenue_sensitive' and latest_value >= 1400.0:
+        penalty = max(0.0, penalty - 0.10)
+        reasons.append('fx_penalty_dampened_for_exporter_sector')
+    elif sector_sensitivity == 'domestic_or_import_cost_sensitive' and latest_value >= 1400.0:
+        penalty += 0.05
+        reasons.append('fx_penalty_retained_for_domestic_import_cost_sector')
+
+    if strong_breadth and latest_value >= 1400.0:
+        penalty = max(0.0, penalty - 0.05)
+        reasons.append('fx_burden_dampened_by_market_strength')
+
+    penalty = round(min(max(penalty, 0.0), 0.50), 4)
+    penalty_status = 'dampened' if penalty < raw_penalty else 'active' if penalty > 0 else 'none'
+    return (
+        {
+            'status': DECIDER_QUALITY_STATUS_AVAILABLE,
+            'usd_krw': latest_value,
+            'level_label': level_label,
+            'direction': direction,
+            'sector_sensitivity': sector_sensitivity,
+            'penalty_score': penalty,
+            'penalty_status': penalty_status,
+            'penalty_reasons': reasons,
+            'source': fx_payload.get('source'),
+            'series_id': fx_payload.get('series_id'),
+            'latest_period': fx_payload.get('latest_period'),
+            'observation_date': fx_payload.get('observation_date'),
+            'freshness': fx_payload.get('freshness') if isinstance(fx_payload.get('freshness'), dict) else None,
+        },
+        penalty,
+        reasons,
+    )
+
+
+def _to_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {'true', 'yes', '1'}:
+            return True
+        if normalized in {'false', 'no', '0'}:
+            return False
+    return None
+
+
+def _first_numeric_value(payload: dict[str, Any], keys: Sequence[str]) -> float | None:
+    for key in keys:
+        value = _to_float(payload.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _build_open_drive_evidence(
+    *,
+    market_breadth_payload: dict[str, Any],
+    market_relative_payload: dict[str, Any],
+    open_drive_context: dict[str, Any] | None,
+) -> dict[str, Any]:
+    payloads = [
+        _maybe_dict(open_drive_context),
+        _maybe_dict(market_breadth_payload.get('open_drive')),
+        _maybe_dict(market_relative_payload.get('open_drive')),
+        market_breadth_payload,
+        market_relative_payload,
+    ]
+    combined: dict[str, Any] = {}
+    for payload in reversed(payloads):
+        combined.update({key: value for key, value in payload.items() if value is not None})
+
+    gap_up_pct = _first_numeric_value(combined, ('gap_up_pct', 'open_gap_pct', 'index_gap_pct'))
+    index_change_pct = _first_numeric_value(
+        combined,
+        ('index_change_pct', 'market_change_pct', 'combined_index_change_pct', 'early_index_change_pct'),
+    )
+    early_continuation_pct = _first_numeric_value(
+        combined,
+        ('early_continuation_pct', 'continuation_pct', 'index_slope_pct', 'early_slope_pct'),
+    )
+    trading_value_expansion_ratio = _first_numeric_value(
+        combined,
+        ('trading_value_expansion_ratio', 'volume_expansion_ratio', 'early_volume_expansion_ratio'),
+    )
+    explicit_gap = _to_bool(combined.get('gap_up_confirmed'))
+    explicit_strength = _to_bool(combined.get('broad_market_strength'))
+    explicit_continuation = _to_bool(combined.get('early_continuation_confirmed'))
+    explicit_fade = _to_bool(combined.get('gap_fade_detected')) or _to_bool(combined.get('weak_continuation_detected'))
+
+    gap_up_confirmed = (
+        explicit_gap
+        if explicit_gap is not None
+        else gap_up_pct is not None and gap_up_pct >= MARKET_REGIME_OPEN_GAP_UP_PCT
+    )
+    broad_market_strength = (
+        explicit_strength
+        if explicit_strength is not None
+        else index_change_pct is not None and index_change_pct >= MARKET_REGIME_OPEN_INDEX_STRENGTH_PCT
+    )
+    trading_value_expanded = (
+        trading_value_expansion_ratio is not None
+        and trading_value_expansion_ratio >= MARKET_REGIME_TRADING_VALUE_EXPANSION_RATIO
+    )
+    if explicit_continuation is not None:
+        early_continuation_confirmed = explicit_continuation
+    else:
+        early_continuation_confirmed = (
+            early_continuation_pct is not None
+            and early_continuation_pct >= MARKET_REGIME_EARLY_CONTINUATION_PCT
+        ) or trading_value_expanded
+    gap_fade_detected = (
+        explicit_fade
+        if explicit_fade is not None
+        else early_continuation_pct is not None
+        and early_continuation_pct <= -MARKET_REGIME_EARLY_CONTINUATION_PCT
+    )
+    return {
+        'status': 'available' if any(payloads[:3]) else 'unavailable',
+        'gap_up_pct': gap_up_pct,
+        'index_change_pct': index_change_pct,
+        'early_continuation_pct': early_continuation_pct,
+        'trading_value_expansion_ratio': trading_value_expansion_ratio,
+        'trading_value_expanded': bool(trading_value_expanded),
+        'gap_up_confirmed': bool(gap_up_confirmed),
+        'broad_market_strength': bool(broad_market_strength),
+        'early_continuation_confirmed': bool(early_continuation_confirmed),
+        'gap_fade_detected': bool(gap_fade_detected),
+    }
+
+
+def _market_regime_window(*, requested_market_date: date, market_regime: str) -> dict[str, Any] | None:
+    if market_regime == 'aggressive_open':
+        return {
+            'name': 'aggressive_open',
+            'timezone': 'Asia/Seoul',
+            'valid_from': f'{requested_market_date.isoformat()}T{MARKET_REGIME_OPEN_WINDOW_START}',
+            'valid_until': f'{requested_market_date.isoformat()}T{MARKET_REGIME_OPEN_WINDOW_END}',
+            'quantity_multiplier_cap': MARKET_REGIME_AGGRESSIVE_OPEN_MULTIPLIER_CAP,
+            'entry_priority_boost': True,
+            'exec_enforced': True,
+        }
+    if market_regime == 'trend_day':
+        return {
+            'name': 'trend_day',
+            'timezone': 'Asia/Seoul',
+            'valid_from': f'{requested_market_date.isoformat()}T{MARKET_REGIME_TREND_WINDOW_START}',
+            'valid_until': f'{requested_market_date.isoformat()}T{MARKET_REGIME_TREND_WINDOW_END}',
+            'quantity_multiplier_cap': MARKET_REGIME_TREND_DAY_MULTIPLIER_CAP,
+            'entry_priority_boost': False,
+            'exec_enforced': True,
+        }
+    return None
+
+
 def _build_market_regime_context(
     *,
     requested_market_date: date,
@@ -1931,6 +2303,8 @@ def _build_market_regime_context(
     sector_peer_provenance: dict[str, Any],
     market_relative_context: dict[str, Any],
     market_relative_provenance: dict[str, Any],
+    macro_context: dict[str, Any] | None = None,
+    open_drive_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     market_breadth_payload = _maybe_dict(market_breadth_context)
     sector_payload = _maybe_dict(sector_peer_context)
@@ -2053,70 +2427,216 @@ def _build_market_regime_context(
         state == DECIDER_QUALITY_STATUS_STALE
         for state in (sector_state, relative_state)
     )
+    strong_breadth = (
+        market_breadth_state == DECIDER_QUALITY_STATUS_AVAILABLE
+        and (
+            (up_ratio is not None and up_ratio >= MARKET_REGIME_STRONG_UP_RATIO)
+            or (
+                advance_decline_ratio is not None
+                and advance_decline_ratio >= MARKET_REGIME_STRONG_ADVANCE_DECLINE_RATIO
+            )
+        )
+        and not severe_breadth
+        and not weak_breadth
+    )
+    open_drive_evidence = _build_open_drive_evidence(
+        market_breadth_payload=market_breadth_payload,
+        market_relative_payload=market_relative_payload,
+        open_drive_context=open_drive_context,
+    )
+    strong_sector = sector_avg_change_pct is not None and sector_avg_change_pct >= 1.0
+    relative_leader = (
+        (return_percentile is not None and return_percentile >= 0.70)
+        or (volume_percentile is not None and volume_percentile >= 0.70)
+    )
+    fx_context, fx_penalty, fx_reasons = _build_market_regime_fx_context(
+        macro_context=macro_context,
+        sector_name=sector_payload.get('sector_name'),
+        strong_breadth=strong_breadth,
+    )
+    if macro_context and fx_context.get('status') == DECIDER_QUALITY_STATUS_UNAVAILABLE:
+        missing_fields.append('fx.usd_krw')
+        missing_fields = list(dict.fromkeys(missing_fields))
+    broad_market_strength_confirmed = bool(open_drive_evidence.get('broad_market_strength')) and strong_breadth
+    aggressive_open_confirmed = bool(
+        broad_market_strength_confirmed
+        and open_drive_evidence.get('gap_up_confirmed')
+        and open_drive_evidence.get('early_continuation_confirmed')
+        and not open_drive_evidence.get('gap_fade_detected')
+    )
+    trend_day_confirmed = bool(
+        broad_market_strength_confirmed
+        and not open_drive_evidence.get('gap_fade_detected')
+        and (
+            bool(open_drive_evidence.get('early_continuation_confirmed'))
+            or bool(open_drive_evidence.get('trading_value_expanded'))
+            or strong_sector
+            or relative_leader
+        )
+    )
 
     if market_breadth_state == DECIDER_QUALITY_STATUS_STALE:
         posture = 'stale'
+        market_regime = 'normal'
         reason_code = 'market_breadth_stale'
         reason_summary = 'Market breadth exists but is stale for the requested market date.'
         recommended_exec_action = 'no_opinion'
         recommended_sizing_multiplier = 0.0
+        regime_confidence = 0.0
+        regime_reasons = ['market_breadth_stale']
     elif market_breadth_state in {DECIDER_QUALITY_STATUS_UNAVAILABLE, DECIDER_QUALITY_STATUS_PROVIDER_ERROR}:
         posture = 'unavailable'
+        market_regime = 'normal'
         reason_code = 'market_breadth_unavailable'
         reason_summary = 'No usable market breadth is available for the requested market date.'
         recommended_exec_action = 'no_opinion'
         recommended_sizing_multiplier = 0.0
+        regime_confidence = 0.0
+        regime_reasons = ['market_breadth_unavailable']
     elif severe_breadth:
         posture = 'risk_off'
+        market_regime = 'defensive'
         reason_code = 'severe_market_breadth'
         reason_summary = 'Market breadth is severely weak; new buy handoffs should be rejected by default.'
         recommended_exec_action = 'reject'
         recommended_sizing_multiplier = 0.0
+        regime_confidence = 0.82
+        regime_reasons = ['severe_market_breadth']
     elif weak_breadth:
         posture = 'caution'
+        market_regime = 'defensive'
         reason_code = 'weak_market_breadth'
         reason_summary = 'Market breadth is weak; fresh buy decisions need stronger evidence and reduced sizing.'
         recommended_exec_action = 'downsize'
         recommended_sizing_multiplier = 0.5
+        regime_confidence = 0.70
+        regime_reasons = ['weak_market_breadth']
     elif stale_supporting_context:
         posture = 'caution'
+        market_regime = 'defensive'
         reason_code = 'stale_market_regime_context'
         reason_summary = 'Market or sector posture inputs are stale; buy decisions need fresher confirmation.'
         recommended_exec_action = 'downsize'
         recommended_sizing_multiplier = 0.75
+        regime_confidence = 0.55
+        regime_reasons = ['stale_market_regime_context']
     elif weak_sector:
         posture = 'caution'
+        market_regime = 'defensive'
         reason_code = 'weak_sector_context'
         reason_summary = 'The candidate sector/category is weak; avoid fresh exposure unless leadership is clear.'
         recommended_exec_action = 'downsize'
         recommended_sizing_multiplier = 0.75
+        regime_confidence = 0.60
+        regime_reasons = ['weak_sector_context']
     elif weak_relative_strength:
         posture = 'caution'
+        market_regime = 'defensive'
         reason_code = 'weak_relative_strength'
         reason_summary = 'The candidate lacks market-relative strength for an unrestricted buy handoff.'
         recommended_exec_action = 'downsize'
         recommended_sizing_multiplier = 0.75
+        regime_confidence = 0.58
+        regime_reasons = ['weak_relative_strength']
+    elif aggressive_open_confirmed and fx_penalty < 0.35:
+        posture = 'normal'
+        market_regime = 'aggressive_open'
+        reason_code = 'aggressive_open_drive_confirmed'
+        reason_summary = 'Broad market strength, gap-up evidence, and early continuation support an aggressive opening-window handoff.'
+        recommended_exec_action = 'allow'
+        recommended_sizing_multiplier = round(
+            min(MARKET_REGIME_AGGRESSIVE_OPEN_MULTIPLIER_CAP, max(1.0, 2.0 - fx_penalty)),
+            4,
+        )
+        regime_confidence = round(
+            min(
+                0.95,
+                0.62
+                + (0.10 if strong_breadth else 0.0)
+                + (0.08 if strong_sector else 0.0)
+                + (0.08 if relative_leader else 0.0)
+                - (fx_penalty * 0.20),
+            ),
+            4,
+        )
+        regime_reasons = [
+            'breadth_strong',
+            'market_gap_up_confirmed',
+            'broad_market_strength_confirmed',
+            'early_continuation_confirmed',
+        ]
+        if open_drive_evidence.get('trading_value_expansion_ratio') is not None:
+            regime_reasons.append('early_trading_value_expanded')
+    elif trend_day_confirmed and fx_penalty < 0.40:
+        posture = 'normal'
+        market_regime = 'trend_day'
+        reason_code = 'trend_day_context_confirmed'
+        reason_summary = 'Broad market strength supports continuation or selected pullback entries after the opening window.'
+        recommended_exec_action = 'allow'
+        recommended_sizing_multiplier = round(
+            min(MARKET_REGIME_TREND_DAY_MULTIPLIER_CAP, max(1.0, 1.25 - (fx_penalty * 0.5))),
+            4,
+        )
+        regime_confidence = round(
+            min(0.88, 0.58 + (0.10 if strong_breadth else 0.0) + (0.08 if relative_leader else 0.0) - (fx_penalty * 0.15)),
+            4,
+        )
+        regime_reasons = ['breadth_strong', 'broad_market_strength_confirmed']
+        if strong_sector:
+            regime_reasons.append('sector_participation_strong')
+        if relative_leader:
+            regime_reasons.append('candidate_relative_strength_leader')
+        if open_drive_evidence.get('early_continuation_confirmed'):
+            regime_reasons.append('early_continuation_confirmed')
+    elif open_drive_evidence.get('gap_fade_detected'):
+        posture = 'normal'
+        market_regime = 'normal'
+        reason_code = 'gap_fade_or_weak_continuation'
+        reason_summary = 'Opening evidence faded or did not continue; aggressive sizing is not allowed.'
+        recommended_exec_action = 'allow' if fx_penalty < 0.20 else 'downsize'
+        recommended_sizing_multiplier = round(max(0.75, 1.0 - fx_penalty), 4)
+        regime_confidence = 0.62
+        regime_reasons = ['gap_fade_or_weak_continuation']
     else:
         posture = 'normal'
-        reason_code = 'market_regime_normal'
-        reason_summary = 'Market breadth and candidate context do not require an execution downsize by default.'
-        recommended_exec_action = 'allow'
-        recommended_sizing_multiplier = 1.0
+        market_regime = 'normal'
+        reason_code = 'market_regime_normal' if fx_penalty < 0.20 else 'market_regime_normal_fx_dampened'
+        reason_summary = (
+            'Market breadth and candidate context do not require an execution downsize by default.'
+            if fx_penalty < 0.20
+            else 'Market breadth is usable, but FX burden should dampen sizing.'
+        )
+        recommended_sizing_multiplier = round(max(0.75, 1.0 - fx_penalty), 4)
+        recommended_exec_action = 'allow' if recommended_sizing_multiplier >= 1.0 else 'downsize'
+        regime_confidence = round(0.55 + (0.08 if strong_breadth else 0.0) - (fx_penalty * 0.10), 4)
+        regime_reasons = ['market_regime_normal']
 
-    source_statuses = {
+    regime_reasons = list(dict.fromkeys([*regime_reasons, *fx_reasons]))
+    regime_window = _market_regime_window(
+        requested_market_date=requested_market_date,
+        market_regime=market_regime,
+    )
+    entry_priority_boost = bool(regime_window.get('entry_priority_boost')) if isinstance(regime_window, dict) else False
+    valid_until = regime_window.get('valid_until') if isinstance(regime_window, dict) else None
+
+    core_source_statuses = {
         'market_breadth': market_breadth_state,
         'sector_context': sector_state,
         'relative_strength_context': relative_state,
     }
+    source_statuses = {
+        **core_source_statuses,
+        'fx_context': fx_context.get('status'),
+    }
     source_overall = (
         DECIDER_QUALITY_STATUS_STALE
-        if DECIDER_QUALITY_STATUS_STALE in source_statuses.values()
+        if DECIDER_QUALITY_STATUS_STALE in core_source_statuses.values()
         else DECIDER_QUALITY_STATUS_PROVIDER_ERROR
-        if DECIDER_QUALITY_STATUS_PROVIDER_ERROR in source_statuses.values()
+        if DECIDER_QUALITY_STATUS_PROVIDER_ERROR in core_source_statuses.values()
         else DECIDER_QUALITY_STATUS_UNAVAILABLE
-        if source_statuses['market_breadth'] == DECIDER_QUALITY_STATUS_UNAVAILABLE
+        if core_source_statuses['market_breadth'] == DECIDER_QUALITY_STATUS_UNAVAILABLE
         else DECIDER_QUALITY_STATUS_AVAILABLE
-        if all(state == DECIDER_QUALITY_STATUS_AVAILABLE for state in source_statuses.values())
+        if all(state == DECIDER_QUALITY_STATUS_AVAILABLE for state in core_source_statuses.values())
         else DECIDER_QUALITY_STATUS_PARTIAL
     )
     return {
@@ -2125,6 +2645,10 @@ def _build_market_regime_context(
         'market_date': requested_market_date.isoformat(),
         'market': market or market_breadth_payload.get('market') or market_relative_payload.get('market'),
         'posture': posture,
+        'market_regime': market_regime,
+        'risk_mode': market_regime,
+        'regime_confidence': regime_confidence,
+        'regime_reasons': regime_reasons,
         'reason_code': reason_code,
         'reason_summary': reason_summary,
         'source_status': {
@@ -2136,7 +2660,7 @@ def _build_market_regime_context(
                 FRESHNESS_STATUS_STALE
                 if any(
                     str((freshness or {}).get('freshness_status') or '') in {FRESHNESS_STATUS_STALE, FRESHNESS_STATUS_AVAILABLE_BUT_OLD}
-                    for freshness in (market_breadth_freshness, sector_freshness, relative_freshness)
+                    for freshness in (market_breadth_freshness, sector_freshness, relative_freshness, fx_context.get('freshness'))
                 )
                 else FRESHNESS_STATUS_MISSING
                 if source_overall == DECIDER_QUALITY_STATUS_UNAVAILABLE
@@ -2145,6 +2669,7 @@ def _build_market_regime_context(
             'market_breadth': market_breadth_freshness,
             'sector_context': sector_freshness,
             'relative_strength_context': relative_freshness,
+            'fx_context': fx_context.get('freshness'),
         },
         'market_breadth': {
             'status': market_breadth_state,
@@ -2188,8 +2713,25 @@ def _build_market_regime_context(
             'weak_relative_strength': weak_relative_strength,
             'missing_fields': list(market_relative_payload.get('missing_fields') or []),
         },
+        'open_drive_context': open_drive_evidence,
+        'fx_context': fx_context,
         'recommended_exec_action': recommended_exec_action,
         'recommended_sizing_multiplier': recommended_sizing_multiplier,
+        'quantity_multiplier': recommended_sizing_multiplier,
+        'entry_priority_boost': entry_priority_boost,
+        'valid_until': valid_until,
+        'sizing_window': regime_window,
+        'exec_guardrails': {
+            'core_bypasses_safety_gates': False,
+            'exec_must_enforce_window': market_regime in {'aggressive_open', 'trend_day'},
+            'must_respect': [
+                'kill_switch',
+                'account_drawdown_gate',
+                'symbol_caps',
+                'max_notional_caps',
+                'stop_loss_required',
+            ],
+        },
         'missing_fields': missing_fields,
     }
 
@@ -5590,12 +6132,15 @@ class AgentContextReadService:
                 sector_peer_provenance=sector_peer_context_provenance,
                 market_relative_context=market_relative_context,
                 market_relative_provenance=market_relative_context_provenance,
+                macro_context=macro_context,
             )
             context_completeness['market_regime_context'] = {
                 'status': market_regime_context.get('status'),
                 'posture': market_regime_context.get('posture'),
+                'market_regime': market_regime_context.get('market_regime'),
                 'missing_fields': list(market_regime_context.get('missing_fields') or []),
                 'recommended_exec_action': market_regime_context.get('recommended_exec_action'),
+                'quantity_multiplier': market_regime_context.get('quantity_multiplier'),
             }
             decider_data_quality_context = _build_decider_data_quality_context(
                 market_date=normalized_market_date,

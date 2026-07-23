@@ -89,6 +89,51 @@ def _relative_context(*, return_percentile: float = 0.72, volume_percentile: flo
     }
 
 
+def _macro_context_fx(*, value: float = 1320.0, direction: str = 'stable') -> dict[str, object]:
+    return {
+        'status': 'available',
+        'series': [
+            {
+                'source': 'fred',
+                'series_id': 'DEXKOUS',
+                'series_name': 'USD/KRW exchange rate from FRED',
+                'status': 'available',
+                'latest_value': value,
+                'direction': direction,
+                'unit': 'KRW per USD',
+                'freshness': {'freshness_status': 'fresh'},
+            }
+        ],
+        'macro_regime_summary': {
+            'fx_label': 'usdkrw_elevated' if value >= 1400 else 'usdkrw_normal',
+        },
+    }
+
+
+def _open_drive_context(
+    *,
+    gap_up_pct: float = 0.65,
+    index_change_pct: float = 1.05,
+    early_continuation_pct: float = 0.35,
+    trading_value_expansion_ratio: float = 1.8,
+    gap_fade_detected: bool = False,
+    early_continuation_confirmed: bool | None = None,
+    weak_continuation_detected: bool | None = None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        'gap_up_pct': gap_up_pct,
+        'index_change_pct': index_change_pct,
+        'early_continuation_pct': early_continuation_pct,
+        'trading_value_expansion_ratio': trading_value_expansion_ratio,
+        'gap_fade_detected': gap_fade_detected,
+    }
+    if early_continuation_confirmed is not None:
+        payload['early_continuation_confirmed'] = early_continuation_confirmed
+    if weak_continuation_detected is not None:
+        payload['weak_continuation_detected'] = weak_continuation_detected
+    return payload
+
+
 def _closed_market_session() -> dict[str, object]:
     return {
         'status': 'weekend',
@@ -198,11 +243,124 @@ class MarketRegimeContextTests(unittest.TestCase):
 
         self.assertEqual(result['schema_version'], 'market_regime_context_v1')
         self.assertEqual(result['posture'], 'normal')
+        self.assertEqual(result['status'], 'available')
+        self.assertEqual(result['market_regime'], 'normal')
         self.assertEqual(result['recommended_exec_action'], 'allow')
         self.assertEqual(result['recommended_sizing_multiplier'], 1.0)
+        self.assertEqual(result['quantity_multiplier'], 1.0)
+        self.assertNotIn('fx.usd_krw', result['missing_fields'])
         self.assertEqual(result['market_breadth']['up_ratio'], 0.65)
         self.assertEqual(result['sector_context']['sector_name'], 'Semiconductors')
         self.assertTrue(result['relative_strength_context']['leader'])
+
+    def test_build_market_regime_context_detects_aggressive_open_drive(self) -> None:
+        result = _build_market_regime_context(
+            requested_market_date=date(2026, 7, 23),
+            market='KOSPI',
+            market_breadth_context=_market_breadth_context(up=780, down=140, flat=80),
+            market_breadth_provenance=_fresh_provenance(),
+            sector_peer_context=_sector_context(sector_avg=1.4),
+            sector_peer_provenance=_fresh_provenance(),
+            market_relative_context=_relative_context(return_percentile=0.84, volume_percentile=0.78),
+            market_relative_provenance=_fresh_provenance(),
+            macro_context=_macro_context_fx(value=1320.0),
+            open_drive_context=_open_drive_context(),
+        )
+
+        self.assertEqual(result['market_regime'], 'aggressive_open')
+        self.assertGreater(result['quantity_multiplier'], 1.0)
+        self.assertLessEqual(result['quantity_multiplier'], 2.0)
+        self.assertTrue(result['entry_priority_boost'])
+        self.assertEqual(result['valid_until'], '2026-07-23T09:20:00+09:00')
+        self.assertIn('early_continuation_confirmed', result['regime_reasons'])
+
+    def test_build_market_regime_context_dampens_high_fx_for_exporter_with_strong_breadth(self) -> None:
+        result = _build_market_regime_context(
+            requested_market_date=date(2026, 7, 23),
+            market='KOSPI',
+            market_breadth_context=_market_breadth_context(up=760, down=160, flat=80),
+            market_breadth_provenance=_fresh_provenance(),
+            sector_peer_context=_sector_context(sector_avg=1.2),
+            sector_peer_provenance=_fresh_provenance(),
+            market_relative_context=_relative_context(return_percentile=0.82, volume_percentile=0.76),
+            market_relative_provenance=_fresh_provenance(),
+            macro_context=_macro_context_fx(value=1455.0, direction='falling'),
+            open_drive_context=_open_drive_context(),
+        )
+
+        self.assertEqual(result['market_regime'], 'aggressive_open')
+        self.assertEqual(result['fx_context']['sector_sensitivity'], 'exporter_or_dollar_revenue_sensitive')
+        self.assertEqual(result['fx_context']['penalty_status'], 'dampened')
+        self.assertLess(result['fx_context']['penalty_score'], 0.30)
+        self.assertGreater(result['quantity_multiplier'], 1.0)
+        self.assertIn('fx_penalty_dampened_for_exporter_sector', result['regime_reasons'])
+
+    def test_build_market_regime_context_keeps_high_fx_penalty_with_weak_breadth(self) -> None:
+        result = _build_market_regime_context(
+            requested_market_date=date(2026, 7, 23),
+            market='KOSPI',
+            market_breadth_context=_market_breadth_context(up=420, down=520, flat=60),
+            market_breadth_provenance=_fresh_provenance(),
+            sector_peer_context={
+                **_sector_context(sector_avg=0.2),
+                'sector_name': 'Retail',
+            },
+            sector_peer_provenance=_fresh_provenance(),
+            market_relative_context=_relative_context(return_percentile=0.55, volume_percentile=0.48),
+            market_relative_provenance=_fresh_provenance(),
+            macro_context=_macro_context_fx(value=1455.0, direction='rising'),
+            open_drive_context=_open_drive_context(),
+        )
+
+        self.assertEqual(result['market_regime'], 'defensive')
+        self.assertEqual(result['posture'], 'caution')
+        self.assertLessEqual(result['quantity_multiplier'], 1.0)
+        self.assertFalse(result['entry_priority_boost'])
+        self.assertNotEqual(result['recommended_exec_action'], 'allow')
+        self.assertEqual(result['fx_context']['sector_sensitivity'], 'domestic_or_import_cost_sensitive')
+
+    def test_build_market_regime_context_blocks_aggressive_mode_on_gap_fade(self) -> None:
+        result = _build_market_regime_context(
+            requested_market_date=date(2026, 7, 23),
+            market='KOSPI',
+            market_breadth_context=_market_breadth_context(up=780, down=140, flat=80),
+            market_breadth_provenance=_fresh_provenance(),
+            sector_peer_context=_sector_context(sector_avg=1.4),
+            sector_peer_provenance=_fresh_provenance(),
+            market_relative_context=_relative_context(return_percentile=0.84, volume_percentile=0.78),
+            market_relative_provenance=_fresh_provenance(),
+            macro_context=_macro_context_fx(value=1320.0),
+            open_drive_context=_open_drive_context(early_continuation_pct=-0.25, gap_fade_detected=True),
+        )
+
+        self.assertEqual(result['market_regime'], 'normal')
+        self.assertEqual(result['reason_code'], 'gap_fade_or_weak_continuation')
+        self.assertLessEqual(result['quantity_multiplier'], 1.0)
+        self.assertFalse(result['entry_priority_boost'])
+
+    def test_build_market_regime_context_blocks_aggressive_mode_on_weak_continuation(self) -> None:
+        result = _build_market_regime_context(
+            requested_market_date=date(2026, 7, 23),
+            market='KOSPI',
+            market_breadth_context=_market_breadth_context(up=780, down=140, flat=80),
+            market_breadth_provenance=_fresh_provenance(),
+            sector_peer_context=_sector_context(sector_avg=1.4),
+            sector_peer_provenance=_fresh_provenance(),
+            market_relative_context=_relative_context(return_percentile=0.84, volume_percentile=0.78),
+            market_relative_provenance=_fresh_provenance(),
+            macro_context=_macro_context_fx(value=1320.0),
+            open_drive_context=_open_drive_context(
+                early_continuation_pct=0.05,
+                trading_value_expansion_ratio=2.0,
+                early_continuation_confirmed=False,
+                weak_continuation_detected=True,
+            ),
+        )
+
+        self.assertEqual(result['market_regime'], 'normal')
+        self.assertEqual(result['reason_code'], 'gap_fade_or_weak_continuation')
+        self.assertLessEqual(result['quantity_multiplier'], 1.0)
+        self.assertFalse(result['open_drive_context']['early_continuation_confirmed'])
 
     def test_build_market_regime_context_cautions_on_weak_breadth(self) -> None:
         result = _build_market_regime_context(
@@ -217,6 +375,7 @@ class MarketRegimeContextTests(unittest.TestCase):
         )
 
         self.assertEqual(result['posture'], 'caution')
+        self.assertEqual(result['market_regime'], 'defensive')
         self.assertEqual(result['reason_code'], 'weak_market_breadth')
         self.assertEqual(result['recommended_exec_action'], 'downsize')
         self.assertEqual(result['recommended_sizing_multiplier'], 0.5)
