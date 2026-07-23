@@ -1135,8 +1135,7 @@ def run_market_data_pipeline(
             error_type='PykrxProviderUnavailable',
             error_message=error_message,
         )
-        run_metadata = dependencies.update_run_stage_metadata(
-            run_metadata,
+        persist_stage_progress(
             stage='price_collection',
             status='failed',
             current_step='price_collection_provider_unavailable',
