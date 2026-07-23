@@ -78,6 +78,12 @@ _POSITIVE_DECIDER_ACTIONS = {
     'scalp_buy_candidate',
     'advance_to_decider',
 }
+_PRIOR_CONTEXT_SYMBOL_CHUNK_SIZE = 50
+
+
+def _chunk_symbols(symbols: Sequence[str], size: int = _PRIOR_CONTEXT_SYMBOL_CHUNK_SIZE) -> list[list[str]]:
+    normalized = [str(symbol).strip().upper() for symbol in symbols if str(symbol or '').strip()]
+    return [normalized[index:index + size] for index in range(0, len(normalized), size)]
 _ACTIVE_ORDER_REQUEST_STATUSES = {
     OrderRequestSubmissionStatus.PENDING_SUBMIT.value,
     OrderRequestSubmissionStatus.SUBMITTING.value,
@@ -589,27 +595,31 @@ def _load_prior_positive_decision_reasons(
         return {'status': 'empty_scope'}
     try:
         with session_scope() as session:
-            rows = session.execute(
-                select(
-                    AgentContextFeedback.symbol,
-                    AgentContextFeedback.agent_name,
-                    AgentContextFeedback.market_date,
-                    AgentContextFeedback.feedback_payload,
-                    AgentContextFeedback.normalized_feedback_payload,
-                    AgentContextFeedback.received_at,
+            rows = []
+            for symbol_chunk in _chunk_symbols(symbols):
+                rows.extend(
+                    session.execute(
+                        select(
+                            AgentContextFeedback.symbol,
+                            AgentContextFeedback.agent_name,
+                            AgentContextFeedback.market_date,
+                            AgentContextFeedback.feedback_payload,
+                            AgentContextFeedback.normalized_feedback_payload,
+                            AgentContextFeedback.received_at,
+                        )
+                        .where(AgentContextFeedback.market_date < market_date)
+                        .where(AgentContextFeedback.symbol.in_(symbol_chunk))
+                        .where(AgentContextFeedback.agent_name.in_(list(DECISION_SUPPORT_AGENT_NAMES)))
+                        .distinct(AgentContextFeedback.symbol, AgentContextFeedback.agent_name)
+                        .order_by(
+                            AgentContextFeedback.symbol.asc(),
+                            AgentContextFeedback.agent_name.asc(),
+                            AgentContextFeedback.market_date.desc(),
+                            AgentContextFeedback.received_at.desc(),
+                            AgentContextFeedback.id.desc(),
+                        )
+                    ).all()
                 )
-                .where(AgentContextFeedback.market_date < market_date)
-                .where(AgentContextFeedback.symbol.in_(list(symbols)))
-                .where(AgentContextFeedback.agent_name.in_(list(DECISION_SUPPORT_AGENT_NAMES)))
-                .distinct(AgentContextFeedback.symbol, AgentContextFeedback.agent_name)
-                .order_by(
-                    AgentContextFeedback.symbol.asc(),
-                    AgentContextFeedback.agent_name.asc(),
-                    AgentContextFeedback.market_date.desc(),
-                    AgentContextFeedback.received_at.desc(),
-                    AgentContextFeedback.id.desc(),
-                )
-            ).all()
     except Exception as exc:  # noqa: BLE001
         return {'status': 'source_error', 'error_type': type(exc).__name__, 'message': str(exc)}
 
@@ -661,34 +671,38 @@ def _load_prior_missed_opportunity_reasons(
         return {'status': 'empty_scope'}
     try:
         with session_scope() as session:
-            rows = session.execute(
-                select(
-                    SignalDeciderEvaluation.symbol,
-                    SignalDeciderEvaluation.market_date,
-                    SignalDeciderEvaluation.decision_action,
-                    SignalDeciderEvaluation.horizon_days,
-                    SignalDeciderEvaluation.grade_label,
-                    SignalDeciderEvaluation.grade_score,
-                    SignalDeciderEvaluation.evaluation_version,
-                    SignalDeciderEvaluation.evaluated_at,
+            rows = []
+            for symbol_chunk in _chunk_symbols(symbols):
+                rows.extend(
+                    session.execute(
+                        select(
+                            SignalDeciderEvaluation.symbol,
+                            SignalDeciderEvaluation.market_date,
+                            SignalDeciderEvaluation.decision_action,
+                            SignalDeciderEvaluation.horizon_days,
+                            SignalDeciderEvaluation.grade_label,
+                            SignalDeciderEvaluation.grade_score,
+                            SignalDeciderEvaluation.evaluation_version,
+                            SignalDeciderEvaluation.evaluated_at,
+                        )
+                        .where(SignalDeciderEvaluation.market_date < market_date)
+                        .where(SignalDeciderEvaluation.symbol.in_(symbol_chunk))
+                        .where(SignalDeciderEvaluation.evaluation_status == 'graded')
+                        .where(SignalDeciderEvaluation.missed_opportunity.is_(True))
+                        .where(
+                            SignalDeciderEvaluation.grade_label.in_(
+                                ['missed_opportunity_after_wait', 'missed_opportunity_after_reject']
+                            )
+                        )
+                        .order_by(
+                            SignalDeciderEvaluation.symbol.asc(),
+                            SignalDeciderEvaluation.market_date.desc(),
+                            SignalDeciderEvaluation.horizon_days.asc(),
+                            SignalDeciderEvaluation.evaluated_at.desc(),
+                            SignalDeciderEvaluation.id.desc(),
+                        )
+                    ).all()
                 )
-                .where(SignalDeciderEvaluation.market_date < market_date)
-                .where(SignalDeciderEvaluation.symbol.in_(list(symbols)))
-                .where(SignalDeciderEvaluation.evaluation_status == 'graded')
-                .where(SignalDeciderEvaluation.missed_opportunity.is_(True))
-                .where(
-                    SignalDeciderEvaluation.grade_label.in_(
-                        ['missed_opportunity_after_wait', 'missed_opportunity_after_reject']
-                    )
-                )
-                .order_by(
-                    SignalDeciderEvaluation.symbol.asc(),
-                    SignalDeciderEvaluation.market_date.desc(),
-                    SignalDeciderEvaluation.horizon_days.asc(),
-                    SignalDeciderEvaluation.evaluated_at.desc(),
-                    SignalDeciderEvaluation.id.desc(),
-                )
-            ).all()
     except Exception as exc:  # noqa: BLE001
         return {'status': 'source_error', 'error_type': type(exc).__name__, 'message': str(exc)}
 

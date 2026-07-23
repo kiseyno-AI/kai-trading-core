@@ -661,12 +661,19 @@ def _run_daily_agent_feedback_followup(
 
     from app.agent_context.prerequisite_service import agent_feedback_prerequisite_service
     from app.agent_context.retry_service import FeedbackRetryCycleConfig, agent_feedback_retry_service
+    from app.agent_context.run_modes import FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH
     from app.core.settings import settings
 
     prerequisites = agent_feedback_prerequisite_service.inspect_feedback_prerequisites(
         market_date=market_date,
     )
-    if not prerequisites['ready']:
+    bypass_prerequisite_gate_enabled = (
+        bool(settings.openclaw_feedback_fast_path_bypass_prerequisite_gate)
+        and feedback_scope_mode == FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH
+    )
+    prerequisites_ready = bool(prerequisites['ready'])
+    bypass_prerequisite_gate = bypass_prerequisite_gate_enabled and not prerequisites_ready
+    if not prerequisites_ready and not bypass_prerequisite_gate:
         return {
             'triggered': False,
             'reason': 'feedback_prerequisites_not_ready',
@@ -684,10 +691,13 @@ def _run_daily_agent_feedback_followup(
             outer_batch_size=settings.openclaw_feedback_retry_outer_batch_size,
             reuse_existing=True,
             progress_callback=progress_callback,
-        )
+        ),
+        bypass_prerequisite_gate=bypass_prerequisite_gate,
     )
     return {
         'triggered': True,
+        'prerequisite_gate_bypassed': bypass_prerequisite_gate,
+        'prerequisites': prerequisites if bypass_prerequisite_gate else None,
         **result,
     }
 

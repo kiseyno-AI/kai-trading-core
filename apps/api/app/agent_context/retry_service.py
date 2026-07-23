@@ -142,17 +142,22 @@ class AgentFeedbackRetryService:
         roles: Sequence[str],
         eligible_symbols: Sequence[str] | None = None,
         force_recompute: bool = False,
+        reuse_existing: bool = True,
     ) -> list[str]:
         expected_roles = tuple(roles)
         symbols = list(eligible_symbols) if eligible_symbols is not None else self._load_eligible_symbols(market_date=market_date)
         if not symbols:
             return []
 
-        decisions = agent_context_reuse_service.build_latest_decisions(
-            market_date=market_date,
-            symbols=symbols,
-            roles=expected_roles,
-            force_recompute=force_recompute,
+        decisions = (
+            agent_context_reuse_service.build_latest_decisions(
+                market_date=market_date,
+                symbols=symbols,
+                roles=expected_roles,
+                force_recompute=force_recompute,
+            )
+            if reuse_existing
+            else {}
         )
         completed_by_role: dict[str, set[str]] = {}
         if not force_recompute:
@@ -280,6 +285,7 @@ class AgentFeedbackRetryService:
         eligible_symbols: Sequence[str],
         role_symbol_scopes: dict[str, Sequence[str]] | None = None,
         force_recompute: bool = False,
+        reuse_existing: bool = True,
     ) -> RoleSequenceSnapshot:
         normalized_roles = tuple(roles)
         normalized_symbols = tuple(eligible_symbols)
@@ -304,7 +310,7 @@ class AgentFeedbackRetryService:
                 roles=normalized_roles,
                 force_recompute=force_recompute,
             )
-            if normalized_symbols and normalized_roles
+            if reuse_existing and normalized_symbols and normalized_roles
             else {}
         )
 
@@ -358,6 +364,7 @@ class AgentFeedbackRetryService:
                     roles=[role],
                     eligible_symbols=role_symbols,
                     force_recompute=force_recompute,
+                    reuse_existing=reuse_existing,
                 )
             )
             if role == SIGNAL_DECIDER_AGENT_NAME and not boundary_pending_symbols:
@@ -801,11 +808,18 @@ class AgentFeedbackRetryService:
             'chunks': len(dispatch_results),
         }
 
-    def run_retry_cycles(self, *, config: FeedbackRetryCycleConfig, force: bool = False) -> dict[str, Any]:
+    def run_retry_cycles(
+        self,
+        *,
+        config: FeedbackRetryCycleConfig,
+        force: bool = False,
+        bypass_prerequisite_gate: bool = False,
+    ) -> dict[str, Any]:
         roles = tuple(config.roles)
         progress_callback = getattr(config, 'progress_callback', None)
         feedback_scope_mode = normalize_feedback_scope_mode(getattr(config, 'feedback_scope_mode', None))
         effective_force_recompute = bool(force or getattr(config, 'force_recompute', False))
+        should_bypass_prerequisite_gate = bool(force or bypass_prerequisite_gate)
         raw_requested_symbols = getattr(config, 'symbols', None)
         requested_symbols = (
             tuple(_normalize_requested_symbols(raw_requested_symbols))
@@ -815,7 +829,7 @@ class AgentFeedbackRetryService:
         prerequisites = agent_feedback_prerequisite_service.inspect_feedback_prerequisites(
             market_date=config.market_date,
         )
-        if not force and not prerequisites['ready']:
+        if not should_bypass_prerequisite_gate and not prerequisites['ready']:
             progress = self._get_retry_progress(
                 market_date=config.market_date,
                 roles=roles,
@@ -890,6 +904,7 @@ class AgentFeedbackRetryService:
             eligible_symbols=scoped_feedback_symbols,
             role_symbol_scopes=role_symbol_scopes,
             force_recompute=effective_force_recompute,
+            reuse_existing=config.reuse_existing,
         )
         next_plan = self._resolve_cycle_plan(
             snapshot=initial_snapshot,
@@ -1040,6 +1055,7 @@ class AgentFeedbackRetryService:
                         roles=roles,
                         eligible_symbols=scoped_feedback_symbols,
                         role_symbol_scopes=role_symbol_scopes,
+                        reuse_existing=config.reuse_existing,
                     )
                     completed_roles_before = tuple(
                         list(active_plan.completed_roles) + list(active_plan.plan_roles[:index])
@@ -1136,6 +1152,7 @@ class AgentFeedbackRetryService:
                                     eligible_symbols=scoped_feedback_symbols,
                                     role_symbol_scopes=role_symbol_scopes,
                                     force_recompute=effective_force_recompute,
+                                    reuse_existing=config.reuse_existing,
                                 )
                                 self._sync_runtime_state(
                                     market_date=config.market_date,
@@ -1211,6 +1228,7 @@ class AgentFeedbackRetryService:
                         roles=roles,
                         eligible_symbols=scoped_feedback_symbols,
                         role_symbol_scopes=role_symbol_scopes,
+                        reuse_existing=config.reuse_existing,
                     )
                     role_state_after = snapshot_after_role.role_states[role]
                     role_boundary_complete = len(role_state_after.boundary_pending_symbols) == 0
@@ -1278,6 +1296,7 @@ class AgentFeedbackRetryService:
                     roles=roles,
                     eligible_symbols=scoped_feedback_symbols,
                     role_symbol_scopes=role_symbol_scopes,
+                    reuse_existing=config.reuse_existing,
                 )
                 cycle_state = runtime_feedback_state_store.get_run(
                     config.market_date,
@@ -1326,6 +1345,7 @@ class AgentFeedbackRetryService:
                 roles=roles,
                 eligible_symbols=scoped_feedback_symbols,
                 role_symbol_scopes=role_symbol_scopes,
+                reuse_existing=config.reuse_existing,
             )
             final_state_before_finish = runtime_feedback_state_store.get_run(
                 config.market_date,
@@ -1415,6 +1435,7 @@ class AgentFeedbackRetryService:
                 roles=roles,
                 eligible_symbols=scoped_feedback_symbols,
                 role_symbol_scopes=role_symbol_scopes,
+                reuse_existing=config.reuse_existing,
             ),
             retry_attempted_symbols_by_role=(
                 final_state.retry_attempted_symbols_by_role

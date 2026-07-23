@@ -1,5 +1,10 @@
+import importlib.util
+import os
+import sys
+import types
 import unittest
 from datetime import date, datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import ANY, patch
 
@@ -297,6 +302,76 @@ class FeedbackRetryCycleTests(unittest.TestCase):
             args = run_feedback_retry_cycles._parse_args()
 
         self.assertTrue(args.force_recompute)
+
+    def test_script_loads_dotenv_before_configured_app_imports(self):
+        observed_env_values: list[str | None] = []
+        script_path = Path(run_feedback_retry_cycles.__file__).resolve()
+        module_name = 'run_feedback_retry_cycles_import_order_test'
+
+        app_module = types.ModuleType('app')
+        app_module.__path__ = []
+        agent_context_module = types.ModuleType('app.agent_context')
+        agent_context_module.__path__ = []
+        retry_service_module = types.ModuleType('app.agent_context.retry_service')
+        run_modes_module = types.ModuleType('app.agent_context.run_modes')
+
+        class DummyConfig:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        def retry_service_getattr(name):
+            if name.startswith('__'):
+                raise AttributeError(name)
+            observed_env_values.append(os.environ.get('KAI_IMPORT_ORDER_SENTINEL'))
+            values = {
+                'EXPECTED_ROLES': ('eod-summarizer',),
+                'FeedbackRetryCycleConfig': DummyConfig,
+                'agent_feedback_retry_service': SimpleNamespace(run_retry_cycles=lambda **_: {}),
+            }
+            if name in values:
+                return values[name]
+            raise AttributeError(name)
+
+        def run_modes_getattr(name):
+            if name.startswith('__'):
+                raise AttributeError(name)
+            observed_env_values.append(os.environ.get('KAI_IMPORT_ORDER_SENTINEL'))
+            values = {
+                'FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH': 'decider_scope_fast_path',
+                'FEEDBACK_SCOPE_MODES': ('decider_scope_fast_path',),
+            }
+            if name in values:
+                return values[name]
+            raise AttributeError(name)
+
+        retry_service_module.__getattr__ = retry_service_getattr
+        run_modes_module.__getattr__ = run_modes_getattr
+        fake_modules = {
+            'app': app_module,
+            'app.agent_context': agent_context_module,
+            'app.agent_context.retry_service': retry_service_module,
+            'app.agent_context.run_modes': run_modes_module,
+        }
+
+        spec = importlib.util.spec_from_file_location(module_name, script_path)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = importlib.util.module_from_spec(spec)
+
+        with (
+            patch.dict('os.environ', {}, clear=True),
+            patch.dict(sys.modules, fake_modules),
+            patch.object(Path, 'exists', return_value=True),
+            patch.object(Path, 'read_text', return_value='KAI_IMPORT_ORDER_SENTINEL=loaded\n'),
+        ):
+            sys.modules[module_name] = module
+            try:
+                spec.loader.exec_module(module)
+            finally:
+                sys.modules.pop(module_name, None)
+
+        self.assertTrue(observed_env_values)
+        self.assertTrue(all(value == 'loaded' for value in observed_env_values))
 
     def test_run_retry_cycles_includes_progress_response_fields(self):
         service = AgentFeedbackRetryService()
@@ -664,6 +739,46 @@ class FeedbackRetryCycleTests(unittest.TestCase):
         self.assertEqual(result['status'], 'waiting')
         self.assertEqual(result['run_id'], None)
         self.assertEqual(run_state_service.started, [])
+
+    def test_run_retry_cycles_bypasses_unready_gate_without_forcing_recompute(self):
+        service = AgentFeedbackRetryService()
+        run_state_service = RecordingRunStateService()
+        progress = {'request': {'expected_agents': ['eod-summarizer']}, 'summary': {'run_status': 'completed'}}
+
+        with (
+            patch(
+                'app.agent_context.retry_service.agent_feedback_prerequisite_service.inspect_feedback_prerequisites',
+                side_effect=lambda **_: _feedback_prerequisites(
+                    status='waiting',
+                    missing_stage_ids=['fundamentals_daily_refresh'],
+                ),
+            ),
+            patch.object(service, '_load_eligible_symbols', return_value=[]),
+            patch('app.agent_context.retry_service.load_agent_feedback_eligibility_records', return_value=[]),
+            patch(
+                'app.agent_context.retry_service.agent_context_feedback_run_state_service',
+                run_state_service,
+            ),
+            patch(
+                'app.agent_context.retry_service.agent_context_progress_service.get_feedback_progress',
+                return_value=progress,
+            ),
+        ):
+            result = service.run_retry_cycles(
+                config=SimpleNamespace(
+                    market_date=date.fromisoformat('2026-04-16'),
+                    roles=('eod-summarizer',),
+                    max_cycles=3,
+                    outer_batch_size=20,
+                    reuse_existing=True,
+                ),
+                bypass_prerequisite_gate=True,
+            )
+
+        self.assertNotIn('gated', result)
+        self.assertFalse(result['force_recompute'])
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(run_state_service.started[0]['request_payload']['force_recompute'], False)
 
     def test_run_retry_cycles_persists_role_boundaries_and_advances_past_terminal_failures(self):
         service = AgentFeedbackRetryService()

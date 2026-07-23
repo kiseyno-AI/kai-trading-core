@@ -2327,6 +2327,13 @@ def _load_latest_symbol_day_block_history(
     market_date: date,
     symbols: Sequence[str],
 ) -> dict[str, Any]:
+    if not bool(getattr(settings, 'openclaw_feedback_prior_block_history_enabled', True)):
+        return {
+            'factor_rows': {family: {} for family in FACTOR_ROW_MODELS},
+            'factor_storage_unavailable': {family: False for family in FACTOR_ROW_MODELS},
+            'signal_features': {},
+            'signal_features_storage_unavailable': False,
+        }
     factor_rows: dict[str, dict[str, dict[str, Any]]] = {}
     factor_storage_unavailable: dict[str, bool] = {}
     for family, model in FACTOR_ROW_MODELS.items():
@@ -5100,6 +5107,13 @@ class AgentContextReadService:
             disclosures_by_symbol = {symbol: [] for symbol in normalized_symbols}
         external_news_provider_status = _external_news_provider_status()
         external_news_by_symbol: dict[str, list[dict[str, Any]]] = {}
+        if not bool(getattr(settings, 'external_news_context_enabled', True)):
+            external_news_provider_status = {
+                **external_news_provider_status,
+                'enabled': False,
+                'status': 'disabled',
+                'reason': 'external_news_context_disabled',
+            }
         if external_news_provider_status.get('enabled'):
             try:
                 external_news_by_symbol = list_recent_external_news_for_symbols(

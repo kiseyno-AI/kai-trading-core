@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import select
@@ -8,6 +8,7 @@ from sqlalchemy.dialects.postgresql import insert
 
 from app.db import session_scope
 from app.db_models import AgentContextFeedbackRun
+from app.core.settings import settings
 
 
 class AgentContextFeedbackRunStateService:
@@ -132,6 +133,18 @@ class AgentContextFeedbackRunStateService:
             'updated_at': row.updated_at,
         }
 
+    @staticmethod
+    def _is_stale_running_row(row: dict[str, Any]) -> bool:
+        if str(row.get('status') or '').strip().lower() != 'running':
+            return False
+        updated_at = row.get('updated_at') or row.get('started_at')
+        if not isinstance(updated_at, datetime):
+            return False
+        if updated_at.tzinfo is None:
+            updated_at = updated_at.replace(tzinfo=timezone.utc)
+        max_age_minutes = max(1, int(settings.eod_auto_pykrx_stale_run_minutes or 30))
+        return datetime.now(timezone.utc) - updated_at > timedelta(minutes=max_age_minutes)
+
     def start_run(
         self,
         *,
@@ -250,6 +263,8 @@ class AgentContextFeedbackRunStateService:
         normalized_modes = set(self._normalize_scope(list(request_modes) if request_modes is not None else None))
         normalized_feedback_scope_mode = str(feedback_scope_mode or '').strip()
         for row in serialized_rows:
+            if self._is_stale_running_row(row):
+                continue
             request_payload = row.get('request_payload') if isinstance(row.get('request_payload'), dict) else {}
             run_symbol_scopes = self._collect_run_symbol_scopes(row)
             run_roles = request_payload.get('roles')

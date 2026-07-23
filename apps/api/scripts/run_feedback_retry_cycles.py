@@ -4,13 +4,32 @@ import argparse
 import json
 import os
 from datetime import date
-
-from app.agent_context.retry_service import EXPECTED_ROLES, FeedbackRetryCycleConfig, agent_feedback_retry_service
-from app.agent_context.run_modes import FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH, FEEDBACK_SCOPE_MODES
+from pathlib import Path
 
 MAX_CYCLES = 3
 OUTER_BATCH_SIZE = 20
 MARKET_DATE_ENV_VARS = ('FEEDBACK_RETRY_MARKET_DATE', 'MARKET_DATE')
+
+
+def _load_dotenv() -> None:
+    env_path = Path(__file__).resolve().parents[1] / '.env'
+    if not env_path.exists():
+        return
+    for raw_line in env_path.read_text().splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith('#') or '=' not in line:
+            continue
+        key, value = line.split('=', 1)
+        key = key.strip()
+        if not key or key in os.environ:
+            continue
+        os.environ[key] = value.strip().strip('"').strip("'")
+
+
+_load_dotenv()
+
+from app.agent_context.retry_service import EXPECTED_ROLES, FeedbackRetryCycleConfig, agent_feedback_retry_service
+from app.agent_context.run_modes import FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH, FEEDBACK_SCOPE_MODES
 
 
 def _default_market_date() -> date:
@@ -52,6 +71,7 @@ def _parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    _load_dotenv()
     args = _parse_args()
     result = agent_feedback_retry_service.run_retry_cycles(
         config=FeedbackRetryCycleConfig(
