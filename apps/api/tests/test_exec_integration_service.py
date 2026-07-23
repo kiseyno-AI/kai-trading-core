@@ -147,6 +147,46 @@ class FailingCalendarClient:
 
 
 class MarketRegimeSizingPolicyTests(unittest.TestCase):
+    def test_preserves_zero_quantity_multiplier(self) -> None:
+        for recommended_sizing_multiplier in (0, 1):
+            with self.subTest(recommended_sizing_multiplier=recommended_sizing_multiplier):
+                policy = _build_market_regime_sizing_policy(
+                    {
+                        'market_regime': 'defensive',
+                        'quantity_multiplier': 0,
+                        'recommended_sizing_multiplier': recommended_sizing_multiplier,
+                    }
+                )
+
+                self.assertEqual(policy['quantity_multiplier'], 0)
+                self.assertEqual(policy['raw_quantity_multiplier'], 0)
+
+    def test_preserves_zero_recommended_sizing_multiplier_when_quantity_missing(self) -> None:
+        policy = _build_market_regime_sizing_policy(
+            {
+                'market_regime': 'defensive',
+                'recommended_sizing_multiplier': 0,
+            }
+        )
+
+        self.assertEqual(policy['quantity_multiplier'], 0)
+        self.assertEqual(policy['raw_quantity_multiplier'], 0)
+
+    def test_defaults_missing_or_none_multiplier_hints_to_one(self) -> None:
+        for context in (
+            {'market_regime': 'normal'},
+            {
+                'market_regime': 'normal',
+                'quantity_multiplier': None,
+                'recommended_sizing_multiplier': None,
+            },
+        ):
+            with self.subTest(context=context):
+                policy = _build_market_regime_sizing_policy(context)
+
+                self.assertEqual(policy['quantity_multiplier'], 1)
+                self.assertEqual(policy['raw_quantity_multiplier'], 1)
+
     def test_caps_aggressive_multiplier_and_carries_window_and_gate_requirements(self) -> None:
         policy = _build_market_regime_sizing_policy(
             {

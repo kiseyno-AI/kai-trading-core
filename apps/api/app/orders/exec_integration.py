@@ -331,11 +331,16 @@ def _build_market_regime_sizing_policy(market_regime_context: dict[str, Any]) ->
     market_regime = _normalize_optional_text(market_regime_context.get('market_regime'), lowercase=True)
     if market_regime is None:
         market_regime = _normalize_optional_text(market_regime_context.get('risk_mode'), lowercase=True) or 'normal'
-    raw_multiplier = (
-        _safe_decimal(market_regime_context.get('quantity_multiplier'))
-        or _safe_decimal(market_regime_context.get('recommended_sizing_multiplier'))
-        or Decimal('1')
+    quantity_multiplier = _safe_decimal(market_regime_context.get('quantity_multiplier'))
+    recommended_sizing_multiplier = _safe_decimal(
+        market_regime_context.get('recommended_sizing_multiplier')
     )
+    if quantity_multiplier is not None:
+        raw_multiplier = quantity_multiplier
+    elif recommended_sizing_multiplier is not None:
+        raw_multiplier = recommended_sizing_multiplier
+    else:
+        raw_multiplier = Decimal('1')
     cap = _market_regime_multiplier_cap(market_regime)
     multiplier = min(max(raw_multiplier, Decimal('0')), cap)
     sizing_window = (
