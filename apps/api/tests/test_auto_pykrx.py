@@ -1092,6 +1092,71 @@ class PykrxBackfillServiceTests(TestCase):
         fundamentals_refresh.assert_called_once()
         self.assertIn('progress_callback', fundamentals_refresh.call_args.kwargs)
 
+    def test_run_collection_fast_fails_when_price_provider_fails_all_symbols(self) -> None:
+        service = PykrxBackfillService()
+        fake_run_state_service = _FakeDailyPipelineRunStateService()
+
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch.object(
+                    service,
+                    'load_active_universe',
+                    return_value=[
+                        PykrxSymbol(symbol='005930', market='KOSPI', name_ko='Samsung Electronics'),
+                        PykrxSymbol(symbol='000660', market='KOSPI', name_ko='SK Hynix'),
+                    ],
+                )
+            )
+            stack.enter_context(patch.object(service, 'resolve_latest_trade_date', return_value='2026-04-03'))
+            stack.enter_context(
+                patch(
+                    'app.eod.pykrx_backfill._get_market_ohlcv_by_date',
+                    side_effect=RuntimeError('PyKRX stock client is unavailable'),
+                )
+            )
+            stack.enter_context(patch('app.eod.pykrx_backfill.create_eod_collection_run', return_value=12))
+            stack.enter_context(patch('app.eod.pykrx_backfill.update_eod_collection_run_progress'))
+            complete_run = stack.enter_context(patch('app.eod.pykrx_backfill.complete_eod_collection_run'))
+            fundamentals_refresh = stack.enter_context(
+                patch('app.eod.pykrx_backfill.dart_fundamentals_capture_service.run_daily_incremental_refresh')
+            )
+            technical_snapshots = stack.enter_context(
+                patch('app.eod.pykrx_backfill.daily_technical_snapshot_service.rebuild_for_market_date')
+            )
+            action_summaries = stack.enter_context(
+                patch('app.eod.pykrx_backfill.daily_action_summary_service.rebuild_for_market_date')
+            )
+            market_risk = stack.enter_context(
+                patch('app.eod.pykrx_backfill.daily_market_risk_filter_service.rebuild_for_market_date')
+            )
+            stack.enter_context(
+                patch('app.eod.pykrx_backfill.daily_pipeline_run_state_service', fake_run_state_service)
+            )
+
+            result = service._run_market_data_pipeline(
+                start_date='20260403',
+                end_date='20260403',
+                markets=('KOSPI',),
+                trigger='auto_close_scheduler',
+                refresh_universe=False,
+                mode='daily_auto',
+                selected_stages=PYKRX_STAGE_SEQUENCE,
+                track_daily_pipeline=True,
+            )
+
+        self.assertEqual(result['status'], 'failed')
+        self.assertEqual(result['error_type'], 'PykrxProviderUnavailable')
+        self.assertEqual(result['symbols_succeeded'], 0)
+        self.assertEqual(result['symbols_failed'], 2)
+        complete_run.assert_called_once()
+        self.assertEqual(complete_run.call_args.kwargs['status'], 'failed')
+        self.assertIn('provider appears unavailable', complete_run.call_args.kwargs['error_message'])
+        fundamentals_refresh.assert_not_called()
+        technical_snapshots.assert_not_called()
+        action_summaries.assert_not_called()
+        market_risk.assert_not_called()
+        self.assertEqual(fake_run_state_service.finish_runs[-1]['status'], 'failed')
+
     def test_run_collection_daily_auto_rebuilds_price_contexts_when_selected_stages_are_explicit(self) -> None:
         service = PykrxBackfillService()
 
