@@ -1938,6 +1938,15 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 'unmatched_sell_quantity': 150,
                 'pnl_method': 'fifo_internal_fills',
             },
+            'weekly_pnl': {
+                'weekly_realized_pnl': '8800.0000',
+                'matched_sell_quantity': 3,
+                'unmatched_sell_quantity': 150,
+                'closed_trade_count': 2,
+                'win_count': 2,
+                'loss_count': 0,
+                'pnl_method': 'fifo_internal_fills',
+            },
             'actionable_alerts': {
                 'status': 'ok',
                 'alerts': [],
@@ -1964,6 +1973,8 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['daily_pnl']['sold_symbol_count'], 3)
         self.assertEqual(result['daily_pnl']['closed_symbol_count'], 2)
         self.assertEqual(result['daily_pnl']['unmatched_sell_symbols'], ['003280'])
+        self.assertEqual(result['weekly_pnl']['weekly_realized_pnl'], '8800.0000')
+        self.assertEqual(result['weekly_pnl']['closed_trade_count'], 2)
         self.assertEqual(result['monthly_pnl']['monthly_realized_pnl'], '8800.0000')
         self.assertEqual(result['actionable_alerts']['status'], 'ok')
 

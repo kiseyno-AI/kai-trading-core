@@ -74,6 +74,7 @@ class ExecutionRuntimeStatusPayload(_ContractModel):
     active_execution_job_count: int | None = None
     symbols: dict[str, Any] | None = None
     daily_pnl: dict[str, Any] | None = None
+    weekly_pnl: dict[str, Any] | None = None
     monthly_pnl: dict[str, Any] | None = None
     actionable_alerts: dict[str, Any] | None = None
     issues: list[dict[str, Any]] = Field(default_factory=list)

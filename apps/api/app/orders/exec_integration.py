@@ -4108,6 +4108,7 @@ class SignalDeciderExecIntegrationService:
         monitoring = payload.get('monitoring') if isinstance(payload.get('monitoring'), dict) else {}
         symbols = payload.get('symbols') if isinstance(payload.get('symbols'), dict) else None
         daily_pnl = payload.get('daily_pnl') if isinstance(payload.get('daily_pnl'), dict) else None
+        weekly_pnl = payload.get('weekly_pnl') if isinstance(payload.get('weekly_pnl'), dict) else None
         monthly_pnl = payload.get('monthly_pnl') if isinstance(payload.get('monthly_pnl'), dict) else None
         actionable_alerts = payload.get('actionable_alerts') if isinstance(payload.get('actionable_alerts'), dict) else None
 
@@ -4223,6 +4224,7 @@ class SignalDeciderExecIntegrationService:
             'active_execution_job_count': active_execution_job_count,
             'symbols': symbols,
             'daily_pnl': daily_pnl,
+            'weekly_pnl': weekly_pnl,
             'monthly_pnl': monthly_pnl,
             'actionable_alerts': actionable_alerts,
             'issues': issues,
