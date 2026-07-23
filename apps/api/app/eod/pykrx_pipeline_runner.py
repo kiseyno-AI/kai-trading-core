@@ -1088,6 +1088,74 @@ def run_market_data_pipeline(
         daily_pipeline_tracker.finish_run(status='failed', error_message=str(exc))
         raise
 
+    if mode == 'daily_auto' and symbols_succeeded == 0 and symbols_failed > 0:
+        error_message = (
+            'PyKRX daily price collection failed for every requested symbol; '
+            'provider appears unavailable, so downstream EOD stages were not run.'
+        )
+        dependencies.log_fetch(
+            'run_collection',
+            'failed',
+            run_id=run_id,
+            mode=mode,
+            trigger=trigger,
+            start_date=normalized_start,
+            end_date=normalized_end,
+            latest_available_trade_date=latest_trade_date,
+            symbols_total=len(symbols),
+            symbols_succeeded=symbols_succeeded,
+            symbols_failed=symbols_failed,
+            bars_upserted=bars_upserted,
+            error_type='PykrxProviderUnavailable',
+            error_message=error_message,
+        )
+        run_metadata = dependencies.update_run_stage_metadata(
+            run_metadata,
+            stage='price_collection',
+            status='failed',
+            current_step='price_collection_provider_unavailable',
+            current_activity=error_message,
+            processed=symbols_failed,
+            total=len(symbols),
+            succeeded=0,
+            failed=symbols_failed,
+            current_symbol=None,
+            extra={
+                'bars_upserted': bars_upserted,
+                'provider_outage_suspected': True,
+                'downstream_stages_skipped': True,
+            },
+        )
+        run_metadata = service._run_metadata_with_failed_symbols(run_metadata, failed_symbols)
+        dependencies.complete_eod_collection_run(
+            run_id,
+            status='failed',
+            symbols_succeeded=symbols_succeeded,
+            symbols_failed=symbols_failed,
+            error_message=error_message,
+            run_metadata=run_metadata,
+        )
+        daily_pipeline_tracker.finish_run(status='failed', error_message=error_message)
+        return {
+            'run_id': run_id,
+            'source': 'pykrx',
+            'status': 'failed',
+            'selected_stages': list(selected_stages or PYKRX_DAILY_STAGE_ORDER),
+            'markets': list(markets),
+            'start_date': normalized_start,
+            'requested_end_date': normalized_end,
+            'latest_available_trade_date': latest_trade_date,
+            'symbols_total': len(symbols),
+            'symbols_succeeded': symbols_succeeded,
+            'symbols_failed': symbols_failed,
+            'failed_symbols': failed_symbols[:50],
+            'bars_upserted': bars_upserted,
+            'error_type': 'PykrxProviderUnavailable',
+            'error_message': error_message,
+            'refresh_universe': effective_refresh_universe,
+            'universe_snapshot': universe_snapshot,
+        }
+
     failed_symbol_set = set(failed_symbols)
     price_context_symbols = [item.symbol for item in symbols if item.symbol not in failed_symbol_set]
     price_context_result: dict
