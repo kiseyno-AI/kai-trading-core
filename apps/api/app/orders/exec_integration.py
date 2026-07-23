@@ -213,6 +213,16 @@ EXEC_AGENT_ACCEPTED_ENTRY_STATUSES = {
     'watch_monitoring_active',
     'working',
 }
+MARKET_REGIME_AGGRESSIVE_OPEN_MULTIPLIER_CAP = Decimal('2.0')
+MARKET_REGIME_TREND_DAY_MULTIPLIER_CAP = Decimal('1.25')
+MARKET_REGIME_DEFAULT_MULTIPLIER_CAP = Decimal('1.0')
+MARKET_REGIME_REQUIRED_EXEC_GATES = [
+    'kill_switch',
+    'account_drawdown_gate',
+    'symbol_caps',
+    'max_notional_caps',
+    'stop_loss_required',
+]
 
 DASHBOARD_ENDPOINT_DAILY_BOARD = 'daily_board'
 DASHBOARD_ENDPOINT_MONITORED_SYMBOLS = 'monitored_symbols'
@@ -307,6 +317,57 @@ def _to_json_number(value: Decimal | None) -> int | float | None:
     if value == value.to_integral():
         return int(value)
     return float(value)
+
+
+def _market_regime_multiplier_cap(market_regime: str | None) -> Decimal:
+    if market_regime == 'aggressive_open':
+        return MARKET_REGIME_AGGRESSIVE_OPEN_MULTIPLIER_CAP
+    if market_regime == 'trend_day':
+        return MARKET_REGIME_TREND_DAY_MULTIPLIER_CAP
+    return MARKET_REGIME_DEFAULT_MULTIPLIER_CAP
+
+
+def _build_market_regime_sizing_policy(market_regime_context: dict[str, Any]) -> dict[str, Any]:
+    market_regime = _normalize_optional_text(market_regime_context.get('market_regime'), lowercase=True)
+    if market_regime is None:
+        market_regime = _normalize_optional_text(market_regime_context.get('risk_mode'), lowercase=True) or 'normal'
+    quantity_multiplier = _safe_decimal(market_regime_context.get('quantity_multiplier'))
+    recommended_sizing_multiplier = _safe_decimal(
+        market_regime_context.get('recommended_sizing_multiplier')
+    )
+    if quantity_multiplier is not None:
+        raw_multiplier = quantity_multiplier
+    elif recommended_sizing_multiplier is not None:
+        raw_multiplier = recommended_sizing_multiplier
+    else:
+        raw_multiplier = Decimal('1')
+    cap = _market_regime_multiplier_cap(market_regime)
+    multiplier = min(max(raw_multiplier, Decimal('0')), cap)
+    sizing_window = (
+        copy.deepcopy(market_regime_context.get('sizing_window'))
+        if isinstance(market_regime_context.get('sizing_window'), dict)
+        else None
+    )
+    valid_until = (
+        _normalize_optional_text(market_regime_context.get('valid_until'))
+        or _normalize_optional_text((sizing_window or {}).get('valid_until'))
+    )
+    return {
+        'schema_version': 'market_regime_sizing_v1',
+        'market_regime': market_regime,
+        'regime_confidence': market_regime_context.get('regime_confidence'),
+        'regime_reasons': list(market_regime_context.get('regime_reasons') or []),
+        'quantity_multiplier': _to_json_number(multiplier),
+        'raw_quantity_multiplier': _to_json_number(raw_multiplier),
+        'quantity_multiplier_cap': _to_json_number(cap),
+        'entry_priority_boost': bool(market_regime_context.get('entry_priority_boost')),
+        'valid_until': valid_until,
+        'sizing_window': sizing_window,
+        'exec_must_enforce_window': market_regime in {'aggressive_open', 'trend_day'},
+        'required_exec_gates': list(MARKET_REGIME_REQUIRED_EXEC_GATES),
+        'core_bypasses_safety_gates': False,
+        'stop_loss_required': True,
+    }
 
 
 def _json_safe(value: Any) -> Any:
@@ -2970,6 +3031,7 @@ class SignalDeciderExecIntegrationService:
                 if isinstance(decider_handoff_context.get('market_regime_context'), dict)
                 else {}
             )
+            market_regime_sizing_policy = _build_market_regime_sizing_policy(market_regime_context)
             execution_feasibility_context = (
                 decision_input_quality_context.get('execution_feasibility')
                 if isinstance(decision_input_quality_context.get('execution_feasibility'), dict)
@@ -3057,6 +3119,7 @@ class SignalDeciderExecIntegrationService:
                 'traceability': decision_traceability,
                 'decider_handoff_context': decider_handoff_context,
                 'market_regime_context': market_regime_context,
+                'market_regime_sizing_policy': market_regime_sizing_policy,
                 'decision_input_quality_context': decision_input_quality_context,
                 'execution_feasibility_context': execution_feasibility_context,
             }
@@ -3083,6 +3146,7 @@ class SignalDeciderExecIntegrationService:
                     'sizing_hints': list(execution_feasibility_context.get('sizing_hints') or []),
                     'max_safe_notional_krw': execution_feasibility_context.get('max_safe_notional_krw'),
                     'liquidity_tier': execution_feasibility_context.get('liquidity_tier'),
+                    'market_regime_sizing': market_regime_sizing_policy,
                 }
             else:
                 quantity_policy = {
@@ -3091,7 +3155,17 @@ class SignalDeciderExecIntegrationService:
                     'budget_krw': _decimal_to_text(_safe_decimal(row.allocation_budget_krw)),
                     'estimated_reference_price': row.estimated_reference_price,
                     'estimated_notional_krw': _decimal_to_text(_safe_decimal(row.estimated_notional_krw)),
+                    'market_regime_sizing': market_regime_sizing_policy,
                 }
+            quantity_policy.update(
+                {
+                    'market_regime': market_regime_sizing_policy['market_regime'],
+                    'quantity_multiplier': market_regime_sizing_policy['quantity_multiplier'],
+                    'quantity_multiplier_cap': market_regime_sizing_policy['quantity_multiplier_cap'],
+                    'entry_priority_boost': market_regime_sizing_policy['entry_priority_boost'],
+                    'quantity_multiplier_valid_until': market_regime_sizing_policy['valid_until'],
+                }
+            )
             entry_item = {
                 'core_item_key': core_entry_key,
                 'agent_name': row_decision_agent_name,

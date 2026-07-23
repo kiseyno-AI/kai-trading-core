@@ -598,16 +598,25 @@ def _compact_market_regime_context(context: dict[str, Any]) -> dict[str, Any]:
             'market_date',
             'market',
             'posture',
+            'market_regime',
+            'risk_mode',
+            'regime_confidence',
+            'regime_reasons',
             'reason_code',
             'reason_summary',
             'source_status',
             'recommended_exec_action',
             'recommended_sizing_multiplier',
+            'quantity_multiplier',
+            'entry_priority_boost',
+            'valid_until',
+            'sizing_window',
+            'exec_guardrails',
             'missing_fields',
         )
         if key in context
     }
-    for key in ('market_breadth', 'sector_context', 'relative_strength_context', 'freshness'):
+    for key in ('market_breadth', 'sector_context', 'relative_strength_context', 'open_drive_context', 'fx_context', 'freshness'):
         value = context.get(key)
         if isinstance(value, dict):
             compacted[key] = value
@@ -1365,7 +1374,12 @@ def build_signal_decider_payload(
                 'pre_decider_enrichment_context_authoritative': True,
                 'market_regime_context_authoritative': True,
                 'market_regime_posture_values': ['normal', 'caution', 'risk_off', 'unavailable', 'stale'],
+                'market_regime_values': ['defensive', 'normal', 'aggressive_open', 'trend_day'],
                 'market_regime_exec_actions': ['allow', 'downsize', 'reject', 'no_opinion'],
+                'quantity_multiplier_is_exec_side_capped_hint': True,
+                'aggressive_open_requires_bounded_window': True,
+                'trend_day_requires_bounded_window': True,
+                'market_regime_never_bypasses_safety_gates': True,
                 'account_for_market_regime_when_choosing_buy_wait_reject': True,
                 'risk_off_default_wait_or_reject_unless_exceptional_leadership': True,
                 'caution_requires_stronger_evidence_and_reduced_sizing': True,

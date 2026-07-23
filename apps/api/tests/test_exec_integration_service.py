@@ -31,6 +31,7 @@ from app.orders.exec_integration import (
     EXEC_INTENT_TARGET_SELL,
     SignalDeciderExecClientError,
     SignalDeciderExecIntegrationService,
+    _build_market_regime_sizing_policy,
 )
 from app.orders.exec_payload_slimming import (
     SIGNAL_DECIDER_EXEC_SUBMISSION_MAX_BYTES,
@@ -143,6 +144,84 @@ class FakeCalendarClient:
 class FailingCalendarClient:
     async def fetch_krx_holiday_calendar(self, **_kwargs):
         raise RuntimeError('kis calendar unavailable')
+
+
+class MarketRegimeSizingPolicyTests(unittest.TestCase):
+    def test_preserves_zero_quantity_multiplier(self) -> None:
+        for recommended_sizing_multiplier in (0, 1):
+            with self.subTest(recommended_sizing_multiplier=recommended_sizing_multiplier):
+                policy = _build_market_regime_sizing_policy(
+                    {
+                        'market_regime': 'defensive',
+                        'quantity_multiplier': 0,
+                        'recommended_sizing_multiplier': recommended_sizing_multiplier,
+                    }
+                )
+
+                self.assertEqual(policy['quantity_multiplier'], 0)
+                self.assertEqual(policy['raw_quantity_multiplier'], 0)
+
+    def test_preserves_zero_recommended_sizing_multiplier_when_quantity_missing(self) -> None:
+        policy = _build_market_regime_sizing_policy(
+            {
+                'market_regime': 'defensive',
+                'recommended_sizing_multiplier': 0,
+            }
+        )
+
+        self.assertEqual(policy['quantity_multiplier'], 0)
+        self.assertEqual(policy['raw_quantity_multiplier'], 0)
+
+    def test_defaults_missing_or_none_multiplier_hints_to_one(self) -> None:
+        for context in (
+            {'market_regime': 'normal'},
+            {
+                'market_regime': 'normal',
+                'quantity_multiplier': None,
+                'recommended_sizing_multiplier': None,
+            },
+        ):
+            with self.subTest(context=context):
+                policy = _build_market_regime_sizing_policy(context)
+
+                self.assertEqual(policy['quantity_multiplier'], 1)
+                self.assertEqual(policy['raw_quantity_multiplier'], 1)
+
+    def test_caps_aggressive_multiplier_and_carries_window_and_gate_requirements(self) -> None:
+        policy = _build_market_regime_sizing_policy(
+            {
+                'schema_version': 'market_regime_context_v1',
+                'market_regime': 'aggressive_open',
+                'regime_confidence': 0.84,
+                'regime_reasons': ['breadth_strong', 'early_continuation_confirmed'],
+                'quantity_multiplier': 3.5,
+                'entry_priority_boost': True,
+                'valid_until': '2026-04-30T09:20:00+09:00',
+                'sizing_window': {
+                    'name': 'aggressive_open',
+                    'timezone': 'Asia/Seoul',
+                    'valid_from': '2026-04-30T09:00:00+09:00',
+                    'valid_until': '2026-04-30T09:20:00+09:00',
+                    'quantity_multiplier_cap': 2.0,
+                    'entry_priority_boost': True,
+                    'exec_enforced': True,
+                },
+            }
+        )
+
+        self.assertEqual(policy['market_regime'], 'aggressive_open')
+        self.assertEqual(policy['quantity_multiplier'], 2)
+        self.assertEqual(policy['raw_quantity_multiplier'], 3.5)
+        self.assertEqual(policy['quantity_multiplier_cap'], 2)
+        self.assertEqual(policy['valid_until'], '2026-04-30T09:20:00+09:00')
+        self.assertEqual(policy['sizing_window']['valid_from'], '2026-04-30T09:00:00+09:00')
+        self.assertTrue(policy['entry_priority_boost'])
+        self.assertTrue(policy['exec_must_enforce_window'])
+        self.assertFalse(policy['core_bypasses_safety_gates'])
+        self.assertEqual(
+            set(policy['required_exec_gates']),
+            {'kill_switch', 'account_drawdown_gate', 'symbol_caps', 'max_notional_caps', 'stop_loss_required'},
+        )
 
 
 class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
@@ -274,12 +353,43 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             session.flush()
             return row.id
 
-    def _market_regime_context(self, *, posture: str = 'caution') -> dict:
+    def _market_regime_context(
+        self,
+        *,
+        posture: str = 'caution',
+        market_regime: str | None = None,
+        quantity_multiplier: float | None = None,
+    ) -> dict:
+        resolved_market_regime = market_regime or ('defensive' if posture == 'caution' else 'normal')
+        resolved_multiplier = (
+            quantity_multiplier
+            if quantity_multiplier is not None
+            else 0.5
+            if posture == 'caution'
+            else 1.0
+        )
+        sizing_window = (
+            {
+                'name': 'aggressive_open',
+                'timezone': 'Asia/Seoul',
+                'valid_from': f'{self.target_trade_date.isoformat()}T09:00:00+09:00',
+                'valid_until': f'{self.target_trade_date.isoformat()}T09:20:00+09:00',
+                'quantity_multiplier_cap': 2.0,
+                'entry_priority_boost': True,
+                'exec_enforced': True,
+            }
+            if resolved_market_regime == 'aggressive_open'
+            else None
+        )
         return {
             'schema_version': 'market_regime_context_v1',
             'market_date': self.market_date.isoformat(),
             'market': 'KOSPI',
             'posture': posture,
+            'market_regime': resolved_market_regime,
+            'risk_mode': resolved_market_regime,
+            'regime_confidence': 0.81 if resolved_market_regime == 'aggressive_open' else 0.60,
+            'regime_reasons': ['breadth_strong'] if resolved_market_regime == 'aggressive_open' else ['weak_market_breadth'],
             'reason_code': 'weak_market_breadth' if posture == 'caution' else 'market_regime_normal',
             'reason_summary': 'Market breadth is weak.',
             'source_status': {
@@ -293,7 +403,16 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             'sector_context': {'sector_name': 'Semiconductors', 'weak_sector': False},
             'relative_strength_context': {'return_percentile': 0.72, 'volume_percentile': 0.68},
             'recommended_exec_action': 'downsize' if posture == 'caution' else 'allow',
-            'recommended_sizing_multiplier': 0.5 if posture == 'caution' else 1.0,
+            'recommended_sizing_multiplier': resolved_multiplier,
+            'quantity_multiplier': resolved_multiplier,
+            'entry_priority_boost': resolved_market_regime == 'aggressive_open',
+            'valid_until': sizing_window['valid_until'] if sizing_window else None,
+            'sizing_window': sizing_window,
+            'exec_guardrails': {
+                'core_bypasses_safety_gates': False,
+                'exec_must_enforce_window': resolved_market_regime == 'aggressive_open',
+                'must_respect': ['kill_switch', 'account_drawdown_gate', 'symbol_caps', 'max_notional_caps', 'stop_loss_required'],
+            },
             'missing_fields': [],
         }
 
