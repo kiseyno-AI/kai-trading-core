@@ -1157,6 +1157,47 @@ class PykrxBackfillServiceTests(TestCase):
         market_risk.assert_not_called()
         self.assertEqual(fake_run_state_service.finish_runs[-1]['status'], 'failed')
 
+    def test_run_collection_aborts_daily_auto_price_loop_after_initial_provider_failures(self) -> None:
+        service = PykrxBackfillService()
+        symbols = [
+            PykrxSymbol(symbol=str(index).zfill(6), market='KOSPI', name_ko=f'Symbol {index}')
+            for index in range(25)
+        ]
+
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(service, 'load_active_universe', return_value=symbols))
+            stack.enter_context(patch.object(service, 'resolve_latest_trade_date', return_value='2026-04-03'))
+            price_fetch = stack.enter_context(
+                patch(
+                    'app.eod.pykrx_backfill._get_market_ohlcv_by_date',
+                    side_effect=RuntimeError('PyKRX stock client is unavailable'),
+                )
+            )
+            stack.enter_context(patch('app.eod.pykrx_backfill.create_eod_collection_run', return_value=12))
+            stack.enter_context(patch('app.eod.pykrx_backfill.update_eod_collection_run_progress'))
+            complete_run = stack.enter_context(patch('app.eod.pykrx_backfill.complete_eod_collection_run'))
+            fundamentals_refresh = stack.enter_context(
+                patch('app.eod.pykrx_backfill.dart_fundamentals_capture_service.run_daily_incremental_refresh')
+            )
+
+            result = service._run_market_data_pipeline(
+                start_date='20260403',
+                end_date='20260403',
+                markets=('KOSPI',),
+                trigger='auto_close_scheduler',
+                refresh_universe=False,
+                mode='daily_auto',
+                selected_stages=PYKRX_STAGE_SEQUENCE,
+                track_daily_pipeline=True,
+            )
+
+        self.assertEqual(result['status'], 'failed')
+        self.assertEqual(result['symbols_total'], 25)
+        self.assertEqual(result['symbols_failed'], 20)
+        self.assertEqual(price_fetch.call_count, 20)
+        self.assertEqual(complete_run.call_args.kwargs['status'], 'failed')
+        fundamentals_refresh.assert_not_called()
+
     def test_run_collection_daily_auto_rebuilds_price_contexts_when_selected_stages_are_explicit(self) -> None:
         service = PykrxBackfillService()
 
