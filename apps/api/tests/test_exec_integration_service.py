@@ -1908,6 +1908,49 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 'open_orders': 2,
                 'active_execution_jobs': 3,
             },
+            'symbols': {
+                'filled_today': ['003280', '010950', '161390'],
+                'filled_today_by_side': {
+                    'buy': ['010950', '161390'],
+                    'sell': ['003280', '010950', '161390'],
+                },
+                'filled_today_counts': {
+                    'all': {'symbols': 3, 'fills': 5, 'quantity': 306},
+                    'buy': {'symbols': 2, 'fills': 2, 'quantity': 3},
+                    'sell': {'symbols': 3, 'fills': 3, 'quantity': 153},
+                },
+            },
+            'daily_pnl': {
+                'daily_realized_pnl': '8800.0000',
+                'matched_sell_quantity': 3,
+                'unmatched_sell_quantity': 150,
+                'sold_symbols': ['003280', '010950', '161390'],
+                'sold_symbol_count': 3,
+                'closed_symbols': ['010950', '161390'],
+                'closed_symbol_count': 2,
+                'unmatched_sell_symbols': ['003280'],
+                'unmatched_sell_symbol_count': 1,
+                'pnl_method': 'fifo_internal_fills',
+            },
+            'monthly_pnl': {
+                'monthly_realized_pnl': '8800.0000',
+                'matched_sell_quantity': 3,
+                'unmatched_sell_quantity': 150,
+                'pnl_method': 'fifo_internal_fills',
+            },
+            'weekly_pnl': {
+                'weekly_realized_pnl': '8800.0000',
+                'matched_sell_quantity': 3,
+                'unmatched_sell_quantity': 150,
+                'closed_trade_count': 2,
+                'win_count': 2,
+                'loss_count': 0,
+                'pnl_method': 'fifo_internal_fills',
+            },
+            'actionable_alerts': {
+                'status': 'ok',
+                'alerts': [],
+            },
             'monitoring': {
                 'alive': True,
                 'last_heartbeat_at': '2026-04-30T00:05:00+00:00',
@@ -1926,6 +1969,14 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['open_order_count'], 2)
         self.assertEqual(result['active_execution_job_count'], 3)
         self.assertEqual(result['last_heartbeat_at'], '2026-04-30T00:05:00+00:00')
+        self.assertEqual(result['symbols']['filled_today_by_side']['sell'], ['003280', '010950', '161390'])
+        self.assertEqual(result['daily_pnl']['sold_symbol_count'], 3)
+        self.assertEqual(result['daily_pnl']['closed_symbol_count'], 2)
+        self.assertEqual(result['daily_pnl']['unmatched_sell_symbols'], ['003280'])
+        self.assertEqual(result['weekly_pnl']['weekly_realized_pnl'], '8800.0000')
+        self.assertEqual(result['weekly_pnl']['closed_trade_count'], 2)
+        self.assertEqual(result['monthly_pnl']['monthly_realized_pnl'], '8800.0000')
+        self.assertEqual(result['actionable_alerts']['status'], 'ok')
 
     async def test_dashboard_runtime_status_surfaces_exec_offline_state(self) -> None:
         service = SignalDeciderExecIntegrationService(client=FailingRuntimeExecClient())

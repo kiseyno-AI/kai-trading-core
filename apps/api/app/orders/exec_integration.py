@@ -4106,6 +4106,11 @@ class SignalDeciderExecIntegrationService:
         counts = payload.get('counts') if isinstance(payload.get('counts'), dict) else {}
         readiness = payload.get('readiness') if isinstance(payload.get('readiness'), dict) else {}
         monitoring = payload.get('monitoring') if isinstance(payload.get('monitoring'), dict) else {}
+        symbols = payload.get('symbols') if isinstance(payload.get('symbols'), dict) else None
+        daily_pnl = payload.get('daily_pnl') if isinstance(payload.get('daily_pnl'), dict) else None
+        weekly_pnl = payload.get('weekly_pnl') if isinstance(payload.get('weekly_pnl'), dict) else None
+        monthly_pnl = payload.get('monthly_pnl') if isinstance(payload.get('monthly_pnl'), dict) else None
+        actionable_alerts = payload.get('actionable_alerts') if isinstance(payload.get('actionable_alerts'), dict) else None
 
         paused = _normalize_bool(
             _coalesce_text(
@@ -4217,6 +4222,11 @@ class SignalDeciderExecIntegrationService:
             'last_heartbeat_at': last_heartbeat_at,
             'open_order_count': open_order_count,
             'active_execution_job_count': active_execution_job_count,
+            'symbols': symbols,
+            'daily_pnl': daily_pnl,
+            'weekly_pnl': weekly_pnl,
+            'monthly_pnl': monthly_pnl,
+            'actionable_alerts': actionable_alerts,
             'issues': issues,
             'core_integration_mode': integration.get('mode'),
             'delegate_execution': bool(integration.get('delegate_execution')),
