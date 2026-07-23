@@ -29,6 +29,17 @@ from app.market.session import (
 KST = ZoneInfo('Asia/Seoul')
 
 
+def fixed_datetime_class(value: datetime):
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            if tz is None:
+                return value.replace(tzinfo=None)
+            return value.astimezone(tz)
+
+    return FixedDateTime
+
+
 class FakeCalendarClient:
     def __init__(
         self,
@@ -229,6 +240,74 @@ class MarketSessionTests(unittest.TestCase):
             self.assertEqual(payload['market'], 'KRX')
             self.assertEqual(payload['calendar_source'], CALENDAR_SOURCE_KIS_CHK_HOLIDAY)
             self.assertEqual(len(client.calls), 1)
+
+        self.loop_run(scenario())
+
+    def test_market_status_route_falls_back_when_state_lookup_times_out(self):
+        async def scenario():
+            async def slow_market_state():
+                await asyncio.sleep(0.05)
+
+            fixed_datetime = fixed_datetime_class(datetime(2026, 4, 29, 12, 0, tzinfo=KST))
+            with patch('app.api.routes_market.datetime', fixed_datetime), patch(
+                'app.api.routes_market.MARKET_STATUS_TIMEOUT_SECONDS',
+                0.01,
+            ), patch('app.api.routes_market.persist_market_status_snapshot') as persist, patch(
+                'app.api.routes_market.async_get_market_state',
+                side_effect=slow_market_state,
+            ):
+                payload = await market_status()
+
+            self.assertEqual(payload['market'], 'KRX')
+            self.assertEqual(payload['state'], 'OPEN')
+            self.assertTrue(payload['is_trading_day'])
+            self.assertTrue(payload['is_open'])
+            self.assertEqual(payload['latest_valid_trading_date'], '2026-04-29')
+            self.assertEqual(payload['calendar_source'], CALENDAR_SOURCE_EXCHANGE_CALENDARS)
+            self.assertEqual(payload['calendar_source_status'], 'fallback')
+            self.assertIn('TimeoutError', payload['calendar_source_error'])
+            self.assertEqual(payload['reason'], 'market_status_fallback')
+            persist.assert_not_called()
+
+        self.loop_run(scenario())
+
+    def test_market_status_route_fallback_uses_exchange_calendar_for_weekday_holiday(self):
+        async def scenario():
+            client = FakeCalendarClient(
+                {
+                    'output': [
+                        {'bass_dt': '20260505', 'opnd_yn': 'Y'},
+                    ]
+                }
+            )
+            set_krx_calendar_provider(KisKrxTradingCalendarProvider(client=client))
+
+            async def failed_market_state():
+                raise RuntimeError('state unavailable')
+
+            fixed_datetime = fixed_datetime_class(datetime(2026, 5, 5, 12, 0, tzinfo=KST))
+            with patch('app.api.routes_market.datetime', fixed_datetime), patch(
+                'app.api.routes_market.persist_market_status_snapshot'
+            ) as persist, patch(
+                'app.api.routes_market.async_get_market_state',
+                side_effect=failed_market_state,
+            ):
+                payload = await market_status()
+
+            self.assertEqual(payload['market'], 'KRX')
+            self.assertEqual(payload['state'], 'HOLIDAY')
+            self.assertFalse(payload['is_trading_day'])
+            self.assertFalse(payload['is_open'])
+            self.assertIsNone(payload['session_open_at'])
+            self.assertIsNone(payload['session_close_at'])
+            self.assertEqual(payload['current_calendar_date'], '2026-05-05')
+            self.assertEqual(payload['latest_valid_trading_date'], '2026-05-04')
+            self.assertEqual(payload['market_session'], 'holiday')
+            self.assertEqual(payload['calendar_source'], CALENDAR_SOURCE_EXCHANGE_CALENDARS)
+            self.assertEqual(payload['calendar_source_status'], 'fallback')
+            self.assertIn('state unavailable', payload['calendar_source_error'])
+            self.assertEqual(client.calls, [])
+            persist.assert_not_called()
 
         self.loop_run(scenario())
 

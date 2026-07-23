@@ -3,6 +3,8 @@
 ## Summary
 Returns the current KRX market clock state used by web and operators, including the latest valid trading date, KIS-backed calendar source metadata, and explicit weekend or holiday session semantics.
 
+When the primary market-state lookup times out or fails, the route serves a fast local fallback from `exchange_calendars`; `calendar_source_status` is `fallback` and `calendar_source_error` records the failed market-state lookup.
+
 ## Example request
 ```http
 GET /market/status

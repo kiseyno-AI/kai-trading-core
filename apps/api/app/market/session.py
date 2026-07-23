@@ -221,13 +221,7 @@ class KisKrxTradingCalendarProvider:
         self.cache.store_days(records)
 
     def _exchange_calendar_fallback(self, value: date, *, status: str, error: str | None) -> KrxCalendarDay:
-        return KrxCalendarDay(
-            date=value,
-            is_open=_exchange_calendar_is_open(value),
-            calendar_source=CALENDAR_SOURCE_EXCHANGE_CALENDARS,
-            calendar_source_status=status,
-            calendar_source_error=error,
-        )
+        return get_krx_exchange_calendar_day(value, status=status, error=error)
 
 
 def _run_maybe_async(value: Any) -> Any:
@@ -332,6 +326,35 @@ def _exchange_calendar_is_open(value: date) -> bool:
         return bool(KRX_EXCHANGE_CALENDAR.is_session(pd.Timestamp(value.isoformat())))
     except Exception:
         return False
+
+
+def get_krx_exchange_calendar_day(
+    value: date | str,
+    *,
+    status: str = CALENDAR_SOURCE_STATUS_FALLBACK,
+    error: str | None = None,
+) -> KrxCalendarDay:
+    normalized = _normalize_date(value)
+    return KrxCalendarDay(
+        date=normalized,
+        is_open=_exchange_calendar_is_open(normalized),
+        calendar_source=CALENDAR_SOURCE_EXCHANGE_CALENDARS,
+        calendar_source_status=status,
+        calendar_source_error=error,
+    )
+
+
+def latest_krx_exchange_calendar_trading_date(
+    value: date | str,
+    *,
+    max_scan_days: int = DEFAULT_KRX_CALENDAR_SCAN_DAYS,
+) -> date | None:
+    normalized = _normalize_date(value)
+    for offset in range(max_scan_days + 1):
+        candidate = normalized - timedelta(days=offset)
+        if _exchange_calendar_is_open(candidate):
+            return candidate
+    return None
 
 
 _calendar_provider: KisKrxTradingCalendarProvider = KisKrxTradingCalendarProvider()
