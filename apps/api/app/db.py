@@ -6,10 +6,16 @@ from alembic.config import Config
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
-ENGINE_CONNECT_ARGS = {'client_encoding': 'UTF8'}
-
 from app.core.settings import settings
 from app.db_models import Base
+
+ENGINE_CONNECT_ARGS = {
+    'client_encoding': 'UTF8',
+    'options': (
+        f'-c statement_timeout={settings.db_statement_timeout_ms} '
+        f'-c lock_timeout={settings.db_lock_timeout_ms}'
+    ),
+}
 
 
 def _build_database_url() -> str:

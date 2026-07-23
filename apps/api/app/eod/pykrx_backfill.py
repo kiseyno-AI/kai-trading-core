@@ -8,10 +8,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
-from typing import Iterable, Sequence
-
-from pykrx import stock
-from pykrx.website.comm import webio
+from typing import Any, Iterable, Sequence
 
 from app.agent_context.derived_contexts import daily_price_context_service
 from app.core.audit_logging import log_fetch_event
@@ -49,6 +46,28 @@ from app.market_data_store import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class _LazyPykrxStock:
+    def __getattr__(self, name: str) -> Any:
+        try:
+            from pykrx import stock as pykrx_stock
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f'PyKRX stock client is unavailable: {exc}') from exc
+        return getattr(pykrx_stock, name)
+
+
+class _LazyPykrxWebIO:
+    def __getattr__(self, name: str) -> Any:
+        try:
+            from pykrx.website.comm import webio as pykrx_webio
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f'PyKRX webio client is unavailable: {exc}') from exc
+        return getattr(pykrx_webio, name)
+
+
+stock = _LazyPykrxStock()
+webio = _LazyPykrxWebIO()
 _PYKRX_REQUEST_TIMEOUT_LOCK = threading.RLock()
 
 DEFAULT_START_DATE = '19560101'

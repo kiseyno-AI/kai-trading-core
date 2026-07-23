@@ -7,7 +7,6 @@ import time
 from typing import Any, Sequence
 
 import pandas as pd
-from pykrx import stock
 
 from app.core.audit_logging import log_fetch_event
 from app.core.settings import settings
@@ -20,6 +19,18 @@ from app.market_data_store import (
 from app.repositories.eod_run_repository import load_eod_run_persisted_symbols, load_latest_eod_collection_run
 
 logger = logging.getLogger(__name__)
+
+
+class _LazyPykrxStock:
+    def __getattr__(self, name: str) -> Any:
+        try:
+            from pykrx import stock as pykrx_stock
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f'PyKRX stock client is unavailable: {exc}') from exc
+        return getattr(pykrx_stock, name)
+
+
+stock = _LazyPykrxStock()
 
 DEFAULT_PYKRX_ENRICHMENT_CATEGORIES: tuple[str, ...] = (
     'sector_classification',

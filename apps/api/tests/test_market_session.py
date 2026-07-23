@@ -232,6 +232,27 @@ class MarketSessionTests(unittest.TestCase):
 
         self.loop_run(scenario())
 
+    def test_market_status_route_falls_back_when_state_lookup_times_out(self):
+        async def scenario():
+            async def slow_market_state():
+                await asyncio.sleep(0.05)
+
+            with patch('app.api.routes_market.MARKET_STATUS_TIMEOUT_SECONDS', 0.01), patch(
+                'app.api.routes_market.persist_market_status_snapshot'
+            ) as persist, patch(
+                'app.api.routes_market.async_get_market_state',
+                side_effect=slow_market_state,
+            ):
+                payload = await market_status()
+
+            self.assertEqual(payload['market'], 'KRX')
+            self.assertEqual(payload['calendar_source'], 'local_weekday_fallback')
+            self.assertEqual(payload['calendar_source_status'], 'fallback')
+            self.assertEqual(payload['reason'], 'market_status_fallback')
+            persist.assert_not_called()
+
+        self.loop_run(scenario())
+
     @staticmethod
     def loop_run(awaitable):
         return asyncio.run(awaitable)

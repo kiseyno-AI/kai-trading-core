@@ -29,6 +29,8 @@ class Settings(BaseSettings):
     db_pool_size: int = 10
     db_max_overflow: int = 20
     db_pool_timeout_seconds: int = 10
+    db_statement_timeout_ms: int = 3000
+    db_lock_timeout_ms: int = 5000
     postgres_host: str = 'localhost'
     postgres_port: int = 5432
     postgres_db: str = 'kai_trading'
