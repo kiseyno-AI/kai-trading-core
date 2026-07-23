@@ -58,6 +58,7 @@ AUTO_DAILY_TRACKED_STAGE_ORDER: tuple[str, ...] = (
     *AUTO_DAILY_FOLLOWUP_STAGE_ORDER,
 )
 MAX_NON_BLOCKING_STAGE_MISSING_RATIO = 0.10
+PYKRX_PROVIDER_OUTAGE_EARLY_ABORT_FAILURES = 20
 
 
 @dataclass(frozen=True)
@@ -1008,6 +1009,31 @@ def run_market_data_pipeline(
                     error_type=type(exc).__name__,
                     error_message=str(exc),
                 )
+                if (
+                    mode == 'daily_auto'
+                    and symbols_succeeded == 0
+                    and symbols_failed >= min(PYKRX_PROVIDER_OUTAGE_EARLY_ABORT_FAILURES, len(symbols))
+                ):
+                    dependencies.log_fetch(
+                        'run_collection',
+                        'failed',
+                        run_id=run_id,
+                        mode=mode,
+                        trigger=trigger,
+                        start_date=normalized_start,
+                        end_date=normalized_end,
+                        latest_available_trade_date=latest_trade_date,
+                        symbols_total=len(symbols),
+                        symbols_succeeded=symbols_succeeded,
+                        symbols_failed=symbols_failed,
+                        bars_upserted=bars_upserted,
+                        error_type='PykrxProviderUnavailable',
+                        error_message=(
+                            'Aborting daily PyKRX price collection after initial consecutive failures; '
+                            'provider appears unavailable.'
+                        ),
+                    )
+                    break
             try:
                 next_symbol = symbols[index + 1].symbol if index + 1 < len(symbols) else None
                 persist_stage_progress(
