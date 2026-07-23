@@ -1156,6 +1156,13 @@ class PykrxBackfillServiceTests(TestCase):
         action_summaries.assert_not_called()
         market_risk.assert_not_called()
         self.assertEqual(fake_run_state_service.finish_runs[-1]['status'], 'failed')
+        price_collection_updates = [
+            item
+            for item in fake_run_state_service.stage_updates
+            if item['stage_id'] == 'price_collection'
+        ]
+        self.assertEqual(price_collection_updates[-1]['status'], 'failed')
+        self.assertEqual(price_collection_updates[-1]['current_step'], 'price_collection_provider_unavailable')
 
     def test_run_collection_aborts_daily_auto_price_loop_after_initial_provider_failures(self) -> None:
         service = PykrxBackfillService()
