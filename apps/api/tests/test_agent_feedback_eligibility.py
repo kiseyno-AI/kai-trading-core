@@ -529,10 +529,14 @@ class AgentFeedbackEligibilityTests(unittest.TestCase):
         ]
 
         with patch('app.agent_context.eligibility.settings.openclaw_feedback_role_cap_signal_decider', 1):
-            funnel = build_agent_feedback_role_funnel(
-                records=records,
-                roles=['signal-decider'],
-            )
+            with patch(
+                'app.agent_context.eligibility.settings.openclaw_feedback_force_include_over_role_cap_broad_scope_enabled',
+                True,
+            ):
+                funnel = build_agent_feedback_role_funnel(
+                    records=records,
+                    roles=['signal-decider'],
+                )
 
         self.assertEqual(funnel['role_symbols']['signal-decider'], ['005930', '035420'])
         diagnostics = funnel['role_diagnostics']['signal-decider']
@@ -541,6 +545,53 @@ class AgentFeedbackEligibilityTests(unittest.TestCase):
         self.assertEqual(diagnostics['role_cap']['forced_included_count'], 1)
         self.assertIn('035420', diagnostics['forced_included_symbols'])
         self.assertIn('000660', diagnostics['cap_excluded_symbols'])
+
+    def test_role_funnel_broad_scope_keeps_forced_symbols_inside_role_cap_by_default(self) -> None:
+        records = [
+            {
+                'symbol': '005930',
+                'candidate_rank': 1,
+                'candidate_score': 100,
+                'hard_blocked': False,
+                'cap_excluded': False,
+                'forced_inclusion_reasons': [],
+            },
+            {
+                'symbol': '000660',
+                'candidate_rank': 2,
+                'candidate_score': 90,
+                'hard_blocked': False,
+                'cap_excluded': False,
+                'forced_inclusion_reasons': [],
+            },
+            {
+                'symbol': '035420',
+                'candidate_rank': 3,
+                'candidate_score': 1,
+                'hard_blocked': False,
+                'cap_excluded': False,
+                'forced_inclusion_reasons': [
+                    {
+                        'code': 'active_exec_watch_item',
+                        'source': 'signal_decider_execution_plan_items',
+                    }
+                ],
+            },
+        ]
+
+        with patch('app.agent_context.eligibility.settings.openclaw_feedback_role_cap_signal_decider', 1):
+            funnel = build_agent_feedback_role_funnel(
+                records=records,
+                roles=['signal-decider'],
+            )
+
+        self.assertEqual(funnel['role_symbols']['signal-decider'], ['005930'])
+        diagnostics = funnel['role_diagnostics']['signal-decider']
+        self.assertEqual(diagnostics['role_cap']['configured_cap'], 1)
+        self.assertEqual(diagnostics['role_cap']['post_cap_symbol_count'], 1)
+        self.assertEqual(diagnostics['role_cap']['forced_included_count'], 1)
+        self.assertIn('035420', diagnostics['forced_included_symbols'])
+        self.assertIn('035420', diagnostics['cap_excluded_symbols'])
 
     def test_role_funnel_requested_symbol_dispatch_bypasses_role_caps(self) -> None:
         records = [

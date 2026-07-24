@@ -151,6 +151,22 @@ class AgentFeedbackPrerequisiteService:
         except (TypeError, ValueError):
             return None
 
+    @staticmethod
+    def _has_pykrx_provider_error(payload: dict[str, Any]) -> bool:
+        errors = payload.get('errors')
+        if not isinstance(errors, list):
+            return False
+        for item in errors:
+            message = ''
+            if isinstance(item, dict):
+                message = str(item.get('error') or '')
+            else:
+                message = str(item or '')
+            normalized = message.lower()
+            if 'pykrx stock client is unavailable' in normalized or 'expecting value' in normalized:
+                return True
+        return False
+
     @classmethod
     def _pykrx_category_gate_item(
         cls,
@@ -158,6 +174,7 @@ class AgentFeedbackPrerequisiteService:
         category: str,
         payload: dict[str, Any],
         missing_category_payload: bool,
+        provider_degraded: bool = False,
     ) -> dict[str, Any]:
         expected_rows = cls._coerce_optional_int(payload.get('expected_rows'))
         present_rows = cls._coerce_optional_int(payload.get('present_rows')) or 0
@@ -167,7 +184,15 @@ class AgentFeedbackPrerequisiteService:
         coverage_status = str(payload.get('coverage_status') or 'missing').strip().lower()
         missing_rows = max(expected_rows - present_rows, 0) if expected_rows is not None else None
 
-        if missing_category_payload or expected_rows is None or expected_rows <= 0:
+        provider_error = cls._has_pykrx_provider_error(payload)
+
+        if provider_degraded and present_rows <= 0 and (expected_rows is None or expected_rows <= 0):
+            gate_status = 'ready'
+            reason = 'pykrx_provider_unavailable_optional_enrichment_degraded'
+        elif provider_error and present_rows <= 0:
+            gate_status = 'ready'
+            reason = 'pykrx_provider_unavailable_optional_enrichment_degraded'
+        elif missing_category_payload or expected_rows is None or expected_rows <= 0:
             gate_status = 'waiting'
             reason = 'coverage_expectation_unavailable'
         elif present_rows <= 0 or coverage_status == 'missing':
@@ -205,7 +230,18 @@ class AgentFeedbackPrerequisiteService:
                 'details': details,
             }
         category_payloads = cls._resolve_pykrx_category_payloads(details=details)
-        details.update(cls.build_pykrx_enrichment_gate_details(category_payloads=category_payloads))
+        result_summary = details.get('result_summary') if isinstance(details.get('result_summary'), dict) else {}
+        provider_degraded = str(result_summary.get('status') or stage_payload.get('status') or '').strip().lower() == 'partial' and any(
+            cls._has_pykrx_provider_error(dict(payload))
+            for payload in category_payloads.values()
+            if isinstance(payload, dict)
+        )
+        details.update(
+            cls.build_pykrx_enrichment_gate_details(
+                category_payloads=category_payloads,
+                provider_degraded=provider_degraded,
+            )
+        )
         return {
             **stage_payload,
             'details': details,
@@ -216,6 +252,12 @@ class AgentFeedbackPrerequisiteService:
         categories = details.get('categories')
         if isinstance(categories, dict) and categories:
             return dict(categories)
+
+        result_summary = details.get('result_summary')
+        if isinstance(result_summary, dict):
+            result_categories = result_summary.get('categories')
+            if isinstance(result_categories, dict) and result_categories:
+                return dict(result_categories)
 
         row_counts = details.get('category_row_counts')
         if not isinstance(row_counts, dict) or not row_counts:
@@ -245,6 +287,7 @@ class AgentFeedbackPrerequisiteService:
         cls,
         *,
         category_payloads: dict[str, Any],
+        provider_degraded: bool = False,
     ) -> dict[str, Any]:
         gate_items = [
             cls._pykrx_category_gate_item(
@@ -255,6 +298,7 @@ class AgentFeedbackPrerequisiteService:
                     else {}
                 ),
                 missing_category_payload=not isinstance(category_payloads.get(category), dict),
+                provider_degraded=provider_degraded,
             )
             for category in PYKRX_DECIDER_ENRICHMENT_REQUIRED_CATEGORIES
         ]

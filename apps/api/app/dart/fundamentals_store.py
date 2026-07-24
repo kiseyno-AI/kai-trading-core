@@ -492,64 +492,141 @@ class DartFundamentalsRepository:
             return states
 
         with session_scope() as session:
-            rows = session.execute(
-                select(DartFundamentalsSnapshot, DartDisclosureEvent)
+            latest_snapshot_rank = func.row_number().over(
+                partition_by=DartFundamentalsSnapshot.stock_code,
+                order_by=(
+                    DartDisclosureEvent.receipt_date.desc().nullslast(),
+                    DartFundamentalsSnapshot.business_year.desc(),
+                    DartFundamentalsSnapshot.report_code.desc(),
+                    DartFundamentalsSnapshot.id.desc(),
+                ),
+            ).label('row_rank')
+            latest_snapshot_subquery = (
+                select(
+                    DartFundamentalsSnapshot.id.label('id'),
+                    DartFundamentalsSnapshot.stock_code.label('stock_code'),
+                    DartFundamentalsSnapshot.business_year.label('business_year'),
+                    DartFundamentalsSnapshot.report_code.label('report_code'),
+                    DartFundamentalsSnapshot.fs_div.label('fs_div'),
+                    DartFundamentalsSnapshot.source_status.label('source_status'),
+                    DartFundamentalsSnapshot.captured_at.label('captured_at'),
+                    DartDisclosureEvent.id.label('event_id'),
+                    DartDisclosureEvent.rcept_no.label('rcept_no'),
+                    DartDisclosureEvent.receipt_date.label('receipt_date'),
+                    DartDisclosureEvent.report_nm.label('report_nm'),
+                    DartDisclosureEvent.fundamentals_capture_status.label('fundamentals_capture_status'),
+                    latest_snapshot_rank,
+                )
                 .join(DartDisclosureEvent, DartDisclosureEvent.id == DartFundamentalsSnapshot.disclosure_event_id)
                 .where(
                     DartFundamentalsSnapshot.stock_code.in_(normalized_codes),
                     DartFundamentalsSnapshot.fs_div == fs_div,
                     DartDisclosureEvent.fundamentals_capture_status == CAPTURE_STATUS_CAPTURED,
                 )
-                .distinct(DartFundamentalsSnapshot.stock_code)
-                .order_by(
-                    DartFundamentalsSnapshot.stock_code.asc(),
-                    DartDisclosureEvent.receipt_date.desc().nullslast(),
-                    DartFundamentalsSnapshot.business_year.desc(),
-                    DartFundamentalsSnapshot.report_code.desc(),
-                    DartFundamentalsSnapshot.id.desc(),
-                )
+                .subquery()
+            )
+            latest_snapshot_rows = session.execute(
+                select(latest_snapshot_subquery).where(latest_snapshot_subquery.c.row_rank == 1)
             ).all()
-
-            for snapshot, event in rows:
-                stock_code = snapshot.stock_code
+            for row in latest_snapshot_rows:
+                latest = row._mapping
+                stock_code = latest.get('stock_code')
                 if not stock_code:
                     continue
+                receipt_date = latest.get('receipt_date')
+                captured_at = latest.get('captured_at')
                 states[stock_code] = {
                     'stock_code': stock_code,
                     'has_fundamentals': True,
-                    'latest_fundamentals_receipt_date': event.receipt_date.isoformat() if event.receipt_date else None,
-                    'latest_resolved_fundamentals_receipt_date': (
-                        event.receipt_date.isoformat() if event.receipt_date else None
-                    ),
+                    'latest_fundamentals_receipt_date': receipt_date.isoformat() if receipt_date else None,
+                    'latest_resolved_fundamentals_receipt_date': receipt_date.isoformat() if receipt_date else None,
                     'latest_snapshot': {
-                        **self._serialize_snapshot(snapshot),
-                        'disclosure': self._serialize_event(event),
+                        'id': latest.get('id'),
+                        'stock_code': stock_code,
+                        'business_year': latest.get('business_year'),
+                        'report_code': latest.get('report_code'),
+                        'fs_div': latest.get('fs_div'),
+                        'statement': {
+                            'source_status': latest.get('source_status'),
+                        },
+                        'filing': {
+                            'id': latest.get('event_id'),
+                            'rcept_no': latest.get('rcept_no'),
+                            'receipt_date': receipt_date.isoformat() if receipt_date else None,
+                            'report_name': latest.get('report_nm'),
+                            'capture_status': latest.get('fundamentals_capture_status'),
+                            'captured_at': captured_at.isoformat() if captured_at else None,
+                        },
+                        'disclosure': {
+                            'id': latest.get('event_id'),
+                            'rcept_no': latest.get('rcept_no'),
+                            'receipt_date': receipt_date.isoformat() if receipt_date else None,
+                            'report_nm': latest.get('report_nm'),
+                            'fundamentals_capture_status': latest.get('fundamentals_capture_status'),
+                        },
                     },
                     'latest_terminal_fundamentals_event': None,
                 }
 
-            terminal_rows = session.execute(
-                select(DartDisclosureEvent)
+            latest_terminal_rank = func.row_number().over(
+                partition_by=DartDisclosureEvent.stock_code,
+                order_by=(
+                    DartDisclosureEvent.receipt_date.desc(),
+                    DartDisclosureEvent.id.desc(),
+                ),
+            ).label('row_rank')
+            latest_terminal_subquery = (
+                select(
+                    DartDisclosureEvent.id.label('id'),
+                    DartDisclosureEvent.rcept_no.label('rcept_no'),
+                    DartDisclosureEvent.corp_code.label('corp_code'),
+                    DartDisclosureEvent.corp_name.label('corp_name'),
+                    DartDisclosureEvent.stock_code.label('stock_code'),
+                    DartDisclosureEvent.corp_cls.label('corp_cls'),
+                    DartDisclosureEvent.report_nm.label('report_nm'),
+                    DartDisclosureEvent.filing_category.label('filing_category'),
+                    DartDisclosureEvent.is_financial_report.label('is_financial_report'),
+                    DartDisclosureEvent.filer_name.label('filer_name'),
+                    DartDisclosureEvent.receipt_date.label('receipt_date'),
+                    DartDisclosureEvent.remark.label('remark'),
+                    DartDisclosureEvent.first_seen_run_id.label('first_seen_run_id'),
+                    DartDisclosureEvent.last_seen_run_id.label('last_seen_run_id'),
+                    DartDisclosureEvent.fundamentals_capture_status.label('fundamentals_capture_status'),
+                    DartDisclosureEvent.fundamentals_capture_attempts.label('fundamentals_capture_attempts'),
+                    DartDisclosureEvent.fundamentals_last_attempt_at.label('fundamentals_last_attempt_at'),
+                    DartDisclosureEvent.fundamentals_last_success_at.label('fundamentals_last_success_at'),
+                    DartDisclosureEvent.fundamentals_last_error.label('fundamentals_last_error'),
+                    DartDisclosureEvent.created_at.label('created_at'),
+                    DartDisclosureEvent.updated_at.label('updated_at'),
+                    latest_terminal_rank,
+                )
                 .where(
                     DartDisclosureEvent.stock_code.in_(normalized_codes),
                     DartDisclosureEvent.is_financial_report.is_(True),
                     DartDisclosureEvent.receipt_date.is_not(None),
                     DartDisclosureEvent.fundamentals_capture_status.in_(TERMINAL_CAPTURE_STATUSES),
                 )
-                .distinct(DartDisclosureEvent.stock_code)
-                .order_by(
-                    DartDisclosureEvent.stock_code.asc(),
-                    DartDisclosureEvent.receipt_date.desc(),
-                    DartDisclosureEvent.id.desc(),
-                )
-            ).scalars()
-            for event in terminal_rows:
-                stock_code = event.stock_code
+                .subquery()
+            )
+            latest_terminal_rows = session.execute(
+                select(latest_terminal_subquery).where(latest_terminal_subquery.c.row_rank == 1)
+            ).all()
+            for row in latest_terminal_rows:
+                event = row._mapping
+                stock_code = event.get('stock_code')
                 if not stock_code:
                     continue
                 state = states[stock_code]
-                terminal_receipt_date = event.receipt_date.isoformat() if event.receipt_date else None
-                state['latest_terminal_fundamentals_event'] = self._serialize_event(event)
+                terminal_receipt_date = event.get('receipt_date').isoformat() if event.get('receipt_date') else None
+                state['latest_terminal_fundamentals_event'] = {
+                    key: (
+                        value.isoformat()
+                        if isinstance(value, (date, datetime))
+                        else value
+                    )
+                    for key, value in event.items()
+                    if key != 'row_rank'
+                }
                 current_resolved_date = state.get('latest_resolved_fundamentals_receipt_date')
                 if terminal_receipt_date and (
                     current_resolved_date is None or terminal_receipt_date > current_resolved_date

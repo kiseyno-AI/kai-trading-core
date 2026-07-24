@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from types import SimpleNamespace
 from contextlib import ExitStack, contextmanager
 from datetime import datetime, timedelta, timezone
@@ -10,6 +11,7 @@ import pandas as pd
 
 from app.eod.auto_pykrx import AutoPykrxEODScheduler
 from app.eod.pykrx_backfill import PYKRX_STAGE_SEQUENCE, PykrxBackfillService, PykrxSymbol
+from app.eod.pykrx_import import suppress_pykrx_login_env
 from app.eod.pykrx_pipeline_runner import (
     _OfficialDailyPipelineTracker,
     _extract_result_counts,
@@ -78,6 +80,27 @@ class _FakeDailyPipelineRunStateService:
 
 
 class PykrxBackfillServiceTests(TestCase):
+    def test_suppress_pykrx_login_env_temporarily_removes_credentials(self) -> None:
+        original_id = os.environ.get('KRX_ID')
+        original_pw = os.environ.get('KRX_PW')
+        os.environ['KRX_ID'] = 'test-id'
+        os.environ['KRX_PW'] = 'test-pw'
+        try:
+            with suppress_pykrx_login_env():
+                self.assertNotIn('KRX_ID', os.environ)
+                self.assertNotIn('KRX_PW', os.environ)
+            self.assertEqual(os.environ.get('KRX_ID'), 'test-id')
+            self.assertEqual(os.environ.get('KRX_PW'), 'test-pw')
+        finally:
+            if original_id is None:
+                os.environ.pop('KRX_ID', None)
+            else:
+                os.environ['KRX_ID'] = original_id
+            if original_pw is None:
+                os.environ.pop('KRX_PW', None)
+            else:
+                os.environ['KRX_PW'] = original_pw
+
     def test_extract_result_counts_reads_agent_feedback_progress_summary(self) -> None:
         result = {
             'status': 'partial',

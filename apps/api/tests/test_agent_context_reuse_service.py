@@ -39,6 +39,9 @@ class _EmptyScalars:
     def all(self):
         return []
 
+    def first(self):
+        return None
+
 
 class _ReuseExecuteResult:
     def all(self):
@@ -116,6 +119,25 @@ class FundamentalReuseServiceTests(unittest.TestCase):
         self.assertTrue(decision.should_dispatch)
         self.assertEqual(decision.reason, 'missing_feedback')
         self.assertIsNone(decision.latest_source_updated_at)
+
+    def test_build_latest_decisions_force_recompute_skips_feedback_lookup(self):
+        service = AgentContextReuseService()
+
+        with patch('app.agent_context.reuse_service.session_scope') as session_scope:
+            decisions = service.build_latest_decisions(
+                market_date='2026-04-16',
+                symbols=['005930', '000660'],
+                roles=['eod-summarizer', 'fundamental-summarizer'],
+                force_recompute=True,
+            )
+
+        session_scope.assert_not_called()
+        for symbol in ('005930', '000660'):
+            for role in ('eod-summarizer', 'fundamental-summarizer'):
+                decision = decisions[symbol][role]
+                self.assertTrue(decision.should_dispatch)
+                self.assertEqual(decision.reason, 'forced_recompute')
+                self.assertIsNone(decision.latest_feedback_id)
 
     def test_retry_snapshot_treats_reused_fundamental_as_completed_boundary(self):
         service = AgentFeedbackRetryService()

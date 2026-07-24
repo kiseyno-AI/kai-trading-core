@@ -2829,24 +2829,21 @@ def _load_latest_prior_rows_for_model(
         select_columns.append(getattr(model, field).label(field))
 
     with session_scope() as session:
-        ranked = (
-            select(
-                *select_columns,
-                func.row_number()
-                .over(
-                    partition_by=model.symbol_id,
-                    order_by=(model.market_date.desc(), model.captured_at.desc(), model.id.desc()),
-                )
-                .label('row_rank'),
-            )
-            .join(Symbol, Symbol.id == model.symbol_id)
-            .where(
-                Symbol.symbol.in_(normalized_symbols),
-                model.market_date < market_date,
-            )
-            .subquery()
-        )
-        rows = session.execute(select(ranked).where(ranked.c.row_rank == 1)).all()
+        symbol_rows = session.execute(
+            select(Symbol.id, Symbol.symbol).where(Symbol.symbol.in_(normalized_symbols))
+        ).all()
+        rows = []
+        for symbol_row in symbol_rows:
+            row = session.execute(
+                select(*select_columns)
+                .join(Symbol, Symbol.id == model.symbol_id)
+                .where(model.symbol_id == symbol_row.id)
+                .where(model.market_date < market_date)
+                .order_by(model.market_date.desc(), model.captured_at.desc(), model.id.desc())
+                .limit(1)
+            ).first()
+            if row is not None:
+                rows.append(row)
 
     return {
         row.symbol: (

@@ -130,7 +130,7 @@ def _rank_percentile_desc(rank: int, total: int) -> float | None:
 DAY_BASED_TRENDING_PERIODS = ('1d', '5d', '20d')
 TRENDING_RANK_INSERT_CHUNK_SIZE = 50
 DAILY_SIGNAL_FEATURE_UPSERT_CHUNK_SIZE = 50
-RECENT_PRICE_BARS_SYMBOL_CHUNK_SIZE = 250
+RECENT_PRICE_BARS_SYMBOL_CHUNK_SIZE = 25
 
 
 def _get_symbol(session, symbol: str) -> Symbol | None:
@@ -657,6 +657,9 @@ def load_daily_bars_for_symbol(
     limit: int = 60,
 ) -> list[dict]:
     with session_scope() as session:
+        symbol_id = session.execute(select(Symbol.id).where(Symbol.symbol == symbol).limit(1)).scalar_one_or_none()
+        if symbol_id is None:
+            return []
         rows = session.execute(
             select(
                 DailyPriceBar.trade_date,
@@ -673,9 +676,8 @@ def load_daily_bars_for_symbol(
                 DailyPriceBar.dividend_yield,
                 DailyPriceBar.dps,
             )
-            .join(Symbol, Symbol.id == DailyPriceBar.symbol_id)
             .where(
-                Symbol.symbol == symbol,
+                DailyPriceBar.symbol_id == symbol_id,
                 DailyPriceBar.trade_date <= _normalize_trade_date(end_date),
             )
             .order_by(DailyPriceBar.trade_date.desc())
@@ -711,6 +713,9 @@ def load_daily_bars_for_symbol_range(
     prefer_recent_limit: bool = True,
 ) -> list[dict]:
     with session_scope() as session:
+        symbol_id = session.execute(select(Symbol.id).where(Symbol.symbol == symbol).limit(1)).scalar_one_or_none()
+        if symbol_id is None:
+            return []
         descending_window = limit is not None and prefer_recent_limit
         stmt = (
             select(
@@ -730,8 +735,7 @@ def load_daily_bars_for_symbol_range(
                 DailyPriceBar.source,
                 DailyPriceBar.captured_at,
             )
-            .join(Symbol, Symbol.id == DailyPriceBar.symbol_id)
-            .where(Symbol.symbol == symbol)
+            .where(DailyPriceBar.symbol_id == symbol_id)
             .order_by(DailyPriceBar.trade_date.desc() if descending_window else DailyPriceBar.trade_date.asc())
         )
         if start_date is not None:
@@ -782,7 +786,7 @@ def load_recent_price_bars_by_symbol(
     for start in range(0, len(normalized_symbols), RECENT_PRICE_BARS_SYMBOL_CHUNK_SIZE):
         symbol_chunk = normalized_symbols[start:start + RECENT_PRICE_BARS_SYMBOL_CHUNK_SIZE]
         with session_scope() as session:
-            ranked = (
+            rows = session.execute(
                 select(
                     Symbol.symbol.label('symbol'),
                     DailyPriceBar.trade_date.label('trade_date'),
@@ -800,43 +804,36 @@ def load_recent_price_bars_by_symbol(
                     DailyPriceBar.dps.label('dps'),
                     DailyPriceBar.source.label('source'),
                     DailyPriceBar.captured_at.label('captured_at'),
-                    func.row_number()
-                    .over(partition_by=DailyPriceBar.symbol_id, order_by=DailyPriceBar.trade_date.desc())
-                    .label('bar_rank'),
                 )
-                .join(Symbol, Symbol.id == DailyPriceBar.symbol_id)
+                .join(DailyPriceBar, DailyPriceBar.symbol_id == Symbol.id)
                 .where(
                     Symbol.symbol.in_(symbol_chunk),
                     DailyPriceBar.trade_date <= normalized_market_date,
                     DailyPriceBar.trade_date >= lower_bound_date,
                 )
-                .subquery()
-            )
-            rows = session.execute(
-                select(ranked)
-                .where(ranked.c.bar_rank <= history_days)
-                .order_by(ranked.c.symbol.asc(), ranked.c.trade_date.desc())
-            ).all()
-
+                .order_by(Symbol.symbol.asc(), DailyPriceBar.trade_date.desc())
+            ).mappings().all()
         for row in rows:
-            mapping = row._mapping
-            grouped.setdefault(mapping['symbol'], []).append(
+            symbol = row['symbol']
+            if len(grouped.setdefault(symbol, [])) >= history_days:
+                continue
+            grouped[symbol].append(
                 {
-                    'trade_date': mapping['trade_date'].isoformat() if mapping['trade_date'] else None,
-                    'open_price': int(mapping['open_price']) if mapping['open_price'] is not None else None,
-                    'high_price': int(mapping['high_price']) if mapping['high_price'] is not None else None,
-                    'low_price': int(mapping['low_price']) if mapping['low_price'] is not None else None,
-                    'close_price': int(mapping['close_price']) if mapping['close_price'] is not None else None,
-                    'volume': int(mapping['volume']) if mapping['volume'] is not None else None,
-                    'turnover': int(mapping['turnover']) if mapping['turnover'] is not None else None,
-                    'per': _round_float(mapping['per'], 6),
-                    'pbr': _round_float(mapping['pbr'], 6),
-                    'bps': _round_float(mapping['bps'], 6),
-                    'eps': _round_float(mapping['eps'], 6),
-                    'dividend_yield': _round_float(mapping['dividend_yield'], 6),
-                    'dps': _round_float(mapping['dps'], 6),
-                    'source': mapping['source'],
-                    'captured_at': mapping['captured_at'].isoformat() if mapping['captured_at'] else None,
+                    'trade_date': row['trade_date'].isoformat() if row['trade_date'] else None,
+                    'open_price': int(row['open_price']) if row['open_price'] is not None else None,
+                    'high_price': int(row['high_price']) if row['high_price'] is not None else None,
+                    'low_price': int(row['low_price']) if row['low_price'] is not None else None,
+                    'close_price': int(row['close_price']) if row['close_price'] is not None else None,
+                    'volume': int(row['volume']) if row['volume'] is not None else None,
+                    'turnover': int(row['turnover']) if row['turnover'] is not None else None,
+                    'per': _round_float(row['per'], 6),
+                    'pbr': _round_float(row['pbr'], 6),
+                    'bps': _round_float(row['bps'], 6),
+                    'eps': _round_float(row['eps'], 6),
+                    'dividend_yield': _round_float(row['dividend_yield'], 6),
+                    'dps': _round_float(row['dps'], 6),
+                    'source': row['source'],
+                    'captured_at': row['captured_at'].isoformat() if row['captured_at'] else None,
                 }
             )
     return grouped
@@ -1518,6 +1515,21 @@ def _apply_trending_order(stmt, metric_expr, *, direction: str):
     return stmt.order_by(func.abs(metric_expr).desc(), Symbol.symbol.asc())
 
 
+def _sort_trending_items(items: list[dict], *, direction: str, limit: int | None) -> list[dict]:
+    if direction == 'up':
+        filtered = [item for item in items if (item.get('metric') or {}).get('value') is not None and item['metric']['value'] > 0]
+        filtered.sort(key=lambda item: (-item['metric']['value'], item.get('symbol') or ''))
+    elif direction == 'down':
+        filtered = [item for item in items if (item.get('metric') or {}).get('value') is not None and item['metric']['value'] < 0]
+        filtered.sort(key=lambda item: (item['metric']['value'], item.get('symbol') or ''))
+    else:
+        filtered = [item for item in items if (item.get('metric') or {}).get('value') is not None]
+        filtered.sort(key=lambda item: (-abs(item['metric']['value']), item.get('symbol') or ''))
+    if limit is not None:
+        return filtered[:limit]
+    return filtered
+
+
 def _load_trending_stocks_from_daily_price_bars(
     *,
     normalized_market_date: date,
@@ -1532,15 +1544,19 @@ def _load_trending_stocks_from_daily_price_bars(
         ).scalar_one_or_none()
         if previous_trade_date is None:
             return []
-
-    previous_close_numeric = cast(previous_bar.close_price, Numeric(20, 6))
-    close_numeric = cast(DailyPriceBar.close_price, Numeric(20, 6))
-    change_expr = DailyPriceBar.close_price - previous_bar.close_price
-    change_pct_expr = ((close_numeric - previous_close_numeric) / func.nullif(previous_close_numeric, 0)) * 100
+        previous_rows = session.execute(
+            select(DailyPriceBar.symbol_id, DailyPriceBar.close_price)
+            .where(DailyPriceBar.trade_date == previous_trade_date)
+            .where(DailyPriceBar.close_price.isnot(None))
+        ).all()
+        previous_closes = {symbol_id: close_price for symbol_id, close_price in previous_rows}
+        if not previous_closes:
+            return []
 
     with session_scope() as session:
         stmt = (
             select(
+                DailyPriceBar.symbol_id.label('symbol_id'),
                 Symbol.symbol.label('symbol'),
                 Symbol.name_ko.label('name_ko'),
                 Symbol.market.label('market'),
@@ -1553,9 +1569,6 @@ def _load_trending_stocks_from_daily_price_bars(
                 DailyPriceBar.turnover.label('turnover'),
                 DailyPriceBar.source.label('price_source'),
                 DailyPriceBar.captured_at.label('price_captured_at'),
-                previous_bar.close_price.label('previous_close_price'),
-                change_expr.label('change'),
-                change_pct_expr.label('metric_value'),
                 DailyTechnicalSnapshot.trend_state.label('trend_state'),
                 DailyTechnicalSnapshot.ma_alignment.label('ma_alignment'),
                 DailyTechnicalSnapshot.breakout_20d.label('breakout_20d'),
@@ -1575,11 +1588,6 @@ def _load_trending_stocks_from_daily_price_bars(
                 DailyActionSummary.captured_at.label('action_captured_at'),
             )
             .join(Symbol, Symbol.id == DailyPriceBar.symbol_id)
-            .join(
-                previous_bar,
-                (previous_bar.symbol_id == DailyPriceBar.symbol_id)
-                & (previous_bar.trade_date == previous_trade_date),
-            )
             .outerjoin(
                 DailyTechnicalSnapshot,
                 (DailyTechnicalSnapshot.symbol_id == DailyPriceBar.symbol_id)
@@ -1592,19 +1600,18 @@ def _load_trending_stocks_from_daily_price_bars(
             )
             .where(DailyPriceBar.trade_date == normalized_market_date)
             .where(Symbol.is_active.is_(True))
-            .where(previous_bar.close_price.isnot(None))
-            .where(change_pct_expr.isnot(None))
         )
         if markets:
             stmt = stmt.where(Symbol.market.in_(markets))
-        stmt = _apply_trending_order(stmt, change_pct_expr, direction=direction)
-        if limit is not None:
-            stmt = stmt.limit(limit)
         rows = session.execute(stmt).all()
 
         items: list[dict] = []
         for row in rows:
-            metric_value = _round_float(row.metric_value)
+            previous_close_price = previous_closes.get(row.symbol_id)
+            if previous_close_price in (None, 0) or row.close_price is None:
+                continue
+            change_value = row.close_price - previous_close_price
+            metric_value = _round_float((Decimal(change_value) / Decimal(previous_close_price)) * Decimal(100))
             items.append(
                 {
                     'symbol': row.symbol,
@@ -1622,8 +1629,8 @@ def _load_trending_stocks_from_daily_price_bars(
                         'high_price': int(row.high_price),
                         'low_price': int(row.low_price),
                         'close_price': int(row.close_price),
-                        'previous_close_price': int(row.previous_close_price),
-                        'change': int(row.change),
+                        'previous_close_price': int(previous_close_price),
+                        'change': int(change_value),
                         'change_pct': metric_value,
                         'volume': int(row.volume),
                         'turnover': int(row.turnover),
@@ -1634,7 +1641,7 @@ def _load_trending_stocks_from_daily_price_bars(
                     'action_summary': _trending_action_summary(row),
                 }
             )
-        return items
+        return _sort_trending_items(items, direction=direction, limit=limit)
 
 
 def _load_trending_stocks_from_snapshots(

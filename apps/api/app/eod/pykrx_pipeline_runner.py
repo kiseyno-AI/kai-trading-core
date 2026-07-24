@@ -956,11 +956,13 @@ def run_market_data_pipeline(
                 frame = dependencies.get_market_ohlcv_by_date(normalized_start, normalized_end, item.symbol)
                 if frame.empty:
                     raise RuntimeError('No OHLCV rows returned.')
-                fundamentals_frame = service._load_symbol_fundamentals(
-                    symbol=item.symbol,
-                    start_date=normalized_start,
-                    end_date=normalized_end,
-                )
+                fundamentals_frame = None
+                if mode not in {'daily_auto', 'daily_stage_run'}:
+                    fundamentals_frame = service._load_symbol_fundamentals(
+                        symbol=item.symbol,
+                        start_date=normalized_start,
+                        end_date=normalized_end,
+                    )
                 bars = service._map_symbol_bars(frame, fundamentals_frame=fundamentals_frame)
                 bars = _enrich_bars_with_market_turnover(
                     bars=bars,
@@ -1564,7 +1566,6 @@ def run_market_data_pipeline(
                 total=0,
                 succeeded=0,
                 failed=1,
-                error_message=trending_rank_error_message,
                 extra={
                     'error_type': type(exc).__name__,
                     'error_message': str(exc),

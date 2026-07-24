@@ -250,6 +250,12 @@ class OpenClawAgentClient:
             configured_timeout if configured_timeout > 0 else DEFAULT_OPENCLAW_AGENT_TIMEOUT_SECONDS
         )
         self.http_timeout_seconds = self.timeout_seconds
+        configured_batch_timeout = float(getattr(settings, 'openclaw_agent_batch_timeout_seconds', 0) or 0)
+        self.batch_http_timeout_seconds = (
+            min(self.http_timeout_seconds, configured_batch_timeout)
+            if configured_batch_timeout > 0
+            else self.http_timeout_seconds
+        )
         self.max_retries = max(0, settings.openclaw_agent_max_retries)
         self.retry_backoff_seconds = max(0, settings.openclaw_agent_retry_backoff_seconds)
 
@@ -1438,7 +1444,7 @@ class OpenClawAgentClient:
                     request_snapshot=build_request_snapshot(body),
                     http_target={'url': url, 'headers': headers},
                 )
-                with httpx.Client(timeout=self.http_timeout_seconds, headers=headers) as client:
+                with httpx.Client(timeout=self.batch_http_timeout_seconds, headers=headers) as client:
                     response = client.post(url, json=body)
                 if response.status_code >= 500:
                     raise AgentDispatchRetryableError(f'OpenClaw batch server error {response.status_code}: {response.text[:300]}')

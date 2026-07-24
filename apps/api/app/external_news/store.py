@@ -212,15 +212,12 @@ def list_recent_external_news_for_symbols(
     if not symbols:
         return output
     candidate_limit_per_symbol = max(limit_per_symbol * 4, limit_per_symbol)
-    rows = list_external_news_items(
-        symbols=symbols,
-        limit=max(len(symbols) * candidate_limit_per_symbol * 2, 100),
-        published_since=since,
-    )
-    for row in rows:
-        bucket = output.setdefault(row['symbol'], [])
-        if len(bucket) < candidate_limit_per_symbol:
-            bucket.append(row)
+    for symbol in symbols:
+        output[symbol] = list_external_news_items(
+            symbols=[symbol],
+            limit=candidate_limit_per_symbol,
+            published_since=since,
+        )
     for symbol, bucket in output.items():
         output[symbol] = sorted(bucket, key=external_news_materiality_sort_key)[:limit_per_symbol]
     return output

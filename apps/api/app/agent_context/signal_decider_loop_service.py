@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 import hashlib
+from types import SimpleNamespace
 from typing import Any, Sequence
 
 from sqlalchemy import case, select
@@ -1452,6 +1453,7 @@ class SignalDeciderLoopRepository:
         decision_actions: Sequence[str] | None = None,
         policy_versions: Sequence[str] | None = None,
         dedupe_feedback_results: bool = False,
+        lightweight_results: bool = False,
         limit: int | None = None,
         offset: int = 0,
     ) -> list[SignalDeciderDecisionSnapshotRecord]:
@@ -1467,6 +1469,138 @@ class SignalDeciderLoopRepository:
             if value
         ]
         with session_scope() as session:
+            if dedupe_feedback_results:
+                id_stmt = select(
+                    SignalDeciderDecisionSnapshot.id,
+                    SignalDeciderDecisionSnapshot.feedback_id,
+                    SignalDeciderDecisionSnapshot.market_date,
+                    SignalDeciderDecisionSnapshot.symbol,
+                    SignalDeciderDecisionSnapshot.agent_name,
+                ).where(
+                    SignalDeciderDecisionSnapshot.agent_name == SIGNAL_DECIDER_AGENT_NAME
+                )
+                if market_date is not None:
+                    id_stmt = id_stmt.where(SignalDeciderDecisionSnapshot.market_date == market_date)
+                if market_date_from is not None:
+                    id_stmt = id_stmt.where(SignalDeciderDecisionSnapshot.market_date >= market_date_from)
+                if market_date_to is not None:
+                    id_stmt = id_stmt.where(SignalDeciderDecisionSnapshot.market_date <= market_date_to)
+                if normalized_symbols:
+                    id_stmt = id_stmt.where(SignalDeciderDecisionSnapshot.symbol.in_(normalized_symbols))
+                if normalized_actions:
+                    id_stmt = id_stmt.where(SignalDeciderDecisionSnapshot.decision_action.in_(normalized_actions))
+                if normalized_policy_versions:
+                    id_stmt = id_stmt.where(SignalDeciderDecisionSnapshot.policy_version.in_(normalized_policy_versions))
+                id_rows = session.execute(
+                    id_stmt.order_by(
+                        SignalDeciderDecisionSnapshot.market_date.desc(),
+                        SignalDeciderDecisionSnapshot.created_at.desc(),
+                        SignalDeciderDecisionSnapshot.id.desc(),
+                    )
+                ).all()
+                deduped_id_rows = _dedupe_decision_snapshot_rows(
+                    [
+                        SimpleNamespace(
+                            id=row.id,
+                            feedback_id=row.feedback_id,
+                            market_date=row.market_date,
+                            symbol=row.symbol,
+                            agent_name=row.agent_name,
+                        )
+                        for row in id_rows
+                    ]
+                )
+                if offset > 0:
+                    deduped_id_rows = deduped_id_rows[offset:]
+                if limit is not None:
+                    deduped_id_rows = deduped_id_rows[:limit]
+                selected_ids = [int(row.id) for row in deduped_id_rows]
+                if not selected_ids:
+                    return []
+                order_by_id = {snapshot_id: index for index, snapshot_id in enumerate(selected_ids)}
+                if lightweight_results:
+                    lightweight_rows = []
+                    for index in range(0, len(selected_ids), 200):
+                        id_chunk = selected_ids[index:index + 200]
+                        lightweight_rows.extend(
+                            session.execute(
+                                select(
+                                    SignalDeciderDecisionSnapshot.id,
+                                    SignalDeciderDecisionSnapshot.feedback_id,
+                                    SignalDeciderDecisionSnapshot.market_date,
+                                    SignalDeciderDecisionSnapshot.symbol,
+                                    SignalDeciderDecisionSnapshot.agent_name,
+                                    SignalDeciderDecisionSnapshot.agent_version,
+                                    SignalDeciderDecisionSnapshot.decision_run_id,
+                                    SignalDeciderDecisionSnapshot.feedback_received_at,
+                                    SignalDeciderDecisionSnapshot.policy_version,
+                                    SignalDeciderDecisionSnapshot.decision_action,
+                                    SignalDeciderDecisionSnapshot.preferred_action,
+                                    SignalDeciderDecisionSnapshot.next_day_open_action,
+                                    SignalDeciderDecisionSnapshot.entry_price_basis,
+                                    SignalDeciderDecisionSnapshot.target_price,
+                                    SignalDeciderDecisionSnapshot.expected_return_pct,
+                                    SignalDeciderDecisionSnapshot.stop_loss_price,
+                                    SignalDeciderDecisionSnapshot.suggested_holding_period,
+                                    SignalDeciderDecisionSnapshot.confidence_score_10,
+                                    SignalDeciderDecisionSnapshot.conviction_score_10,
+                                    SignalDeciderDecisionSnapshot.thesis_summary,
+                                    SignalDeciderDecisionSnapshot.created_at,
+                                    SignalDeciderDecisionSnapshot.updated_at,
+                                )
+                                .where(SignalDeciderDecisionSnapshot.id.in_(id_chunk))
+                            ).all()
+                        )
+                    lightweight_rows.sort(key=lambda row: order_by_id.get(int(row.id), len(order_by_id)))
+                    return [
+                        SignalDeciderDecisionSnapshotRecord(
+                            id=row.id,
+                            feedback_id=row.feedback_id,
+                            market_date=row.market_date,
+                            symbol=row.symbol,
+                            agent_name=row.agent_name,
+                            agent_version=row.agent_version,
+                            decision_run_id=row.decision_run_id,
+                            feedback_received_at=row.feedback_received_at,
+                            policy_version=row.policy_version,
+                            decision_action=row.decision_action,
+                            preferred_action=row.preferred_action,
+                            next_day_open_action=row.next_day_open_action,
+                            entry_price_basis=row.entry_price_basis,
+                            target_price=row.target_price,
+                            expected_return_pct=row.expected_return_pct,
+                            stop_loss_price=row.stop_loss_price,
+                            suggested_holding_period=row.suggested_holding_period,
+                            confidence_score_10=row.confidence_score_10,
+                            conviction_score_10=row.conviction_score_10,
+                            thesis_summary=row.thesis_summary,
+                            supporting_evidence_payload=[],
+                            decision_risks_payload=[],
+                            invalidation_conditions_payload=[],
+                            data_quality_warnings_payload=[],
+                            specialist_disagreement_payload=[],
+                            traceability_payload={},
+                            input_feature_snapshot_payload={},
+                            request_payload={},
+                            response_payload={},
+                            response_summary_payload={},
+                            created_at=row.created_at,
+                            updated_at=row.updated_at,
+                        )
+                        for row in lightweight_rows
+                    ]
+                rows = []
+                for index in range(0, len(selected_ids), 50):
+                    id_chunk = selected_ids[index:index + 50]
+                    rows.extend(
+                        session.execute(
+                            select(SignalDeciderDecisionSnapshot)
+                            .where(SignalDeciderDecisionSnapshot.id.in_(id_chunk))
+                        ).scalars().all()
+                    )
+                rows.sort(key=lambda row: order_by_id.get(int(row.id), len(order_by_id)))
+                return [_serialize_decision_snapshot_row(row) for row in rows]
+
             stmt = select(SignalDeciderDecisionSnapshot).where(
                 SignalDeciderDecisionSnapshot.agent_name == SIGNAL_DECIDER_AGENT_NAME
             )
@@ -1493,12 +1627,6 @@ class SignalDeciderLoopRepository:
                 if limit is not None:
                     stmt = stmt.limit(limit)
             rows = session.execute(stmt).scalars().all()
-            if dedupe_feedback_results:
-                rows = _dedupe_decision_snapshot_rows(rows)
-                if offset > 0:
-                    rows = rows[offset:]
-                if limit is not None:
-                    rows = rows[:limit]
             return [_serialize_decision_snapshot_row(row) for row in rows]
 
     def get_decision_snapshot(self, *, snapshot_id: int) -> SignalDeciderDecisionSnapshotRecord | None:
@@ -3219,6 +3347,7 @@ class SignalDeciderLoopService:
             market_date_to=normalized_to,
             symbols=normalized_symbols or None,
             dedupe_feedback_results=True,
+            lightweight_results=True,
         )
         if not rows:
             return {

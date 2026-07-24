@@ -150,6 +150,8 @@ class Settings(BaseSettings):
     dart_fundamentals_daily_retry_cycles: int = 3
     dart_fundamentals_event_timeout_seconds: int = 60
     dart_fundamentals_stale_run_minutes: int = 60
+    dart_fundamentals_daily_initial_backfill_enabled: bool = False
+    dart_fundamentals_daily_incremental_lookback_days: int = 45
 
     eod_auto_pykrx_enabled: bool = True
     eod_auto_pykrx_poll_seconds: int = 60
@@ -209,11 +211,14 @@ class Settings(BaseSettings):
     openclaw_feedback_force_include_prior_decisions_enabled: bool = True
     openclaw_feedback_force_include_prior_missed_opportunities_enabled: bool = True
     openclaw_feedback_force_include_prior_missed_opportunities_broad_scope_enabled: bool = False
+    openclaw_feedback_force_include_abnormal_movement_broad_scope_enabled: bool = False
+    openclaw_feedback_force_include_over_role_cap_broad_scope_enabled: bool = False
     openclaw_feedback_force_include_event_symbols_enabled: bool = True
     openclaw_feedback_upstream_reuse_enabled: bool = True
     openclaw_feedback_prior_block_history_enabled: bool = True
     openclaw_feedback_fast_path_bypass_prerequisite_gate: bool = True
     openclaw_agent_subtask_poll_seconds: float = 2.0
+    openclaw_agent_batch_timeout_seconds: float = 240.0
     openclaw_agent_slot_cooldown_seconds: float = 600.0
     openclaw_session_cleanup_timeout_seconds: float = 30.0
     openclaw_session_cleanup_batch_limit: int = 100
