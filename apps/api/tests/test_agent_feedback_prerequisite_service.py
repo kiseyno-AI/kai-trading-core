@@ -241,6 +241,51 @@ def test_inspect_feedback_prerequisites_blocks_missing_pykrx_enrichment_category
     ]
 
 
+def test_inspect_feedback_prerequisites_warns_on_pykrx_provider_unavailable_without_coverage_expectation():
+    provider_error = 'PyKRX stock client is unavailable: Expecting value: line 16 column 3 (char 36)'
+    categories = {
+        category: {
+            'category': category,
+            'scope_type': 'market' if category in {'market_breadth', 'investor_flow_market'} else 'symbol',
+            'rows_prepared': 0,
+            'rows_persisted': 0,
+            'errors': [] if category == 'market_breadth' else [{'market': 'KOSPI', 'error': provider_error}],
+            'status': 'partial',
+        }
+        for category in PYKRX_DECIDER_ENRICHMENT_REQUIRED_CATEGORIES
+    }
+    pykrx_stage = {
+        'task': 'pykrx_enrichment',
+        'label': 'pykrx enrichment collect',
+        'status': 'partial',
+        'current_activity': 'Completed with errors pykrx enrichment collect',
+        'details': {
+            'result_summary': {
+                'categories': categories,
+            },
+        },
+    }
+
+    with patch(
+        'app.eod.pipeline_status.eod_pipeline_status_service.read',
+        return_value=_pipeline_status(pykrx_stage=pykrx_stage),
+    ):
+        result = AgentFeedbackPrerequisiteService().inspect_feedback_prerequisites(
+            market_date='2026-07-24',
+            fs_div='CFS',
+        )
+
+    assert result['status'] == 'ready'
+    assert result['ready'] is True
+    assert result['blocked_stage_ids'] == []
+    warning_categories = result['stages']['pykrx_enrichment']['details']['decider_warning_categories']
+    assert len(warning_categories) == len(PYKRX_DECIDER_ENRICHMENT_REQUIRED_CATEGORIES)
+    assert {
+        item['reason']
+        for item in warning_categories
+    } == {'pykrx_provider_unavailable_optional_enrichment_degraded'}
+
+
 def test_inspect_feedback_prerequisites_allows_partial_pykrx_enrichment_coverage_as_warning():
     pykrx_stage = _pykrx_enrichment_stage(
         status='completed',

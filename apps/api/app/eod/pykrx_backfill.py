@@ -18,6 +18,7 @@ from app.eod.pykrx_pipeline_support import (
     build_daily_retry_context,
     build_daily_skip_result,
 )
+from app.eod.pykrx_import import import_pykrx_stock, import_pykrx_webio, suppress_pykrx_login_env
 from app.dart.fundamentals_capture_service import dart_fundamentals_capture_service
 from app.eod.daily_pipeline_state import daily_pipeline_run_state_service
 from app.eod.pykrx_enrichment import pykrx_enrichment_service
@@ -51,7 +52,7 @@ logger = logging.getLogger(__name__)
 class _LazyPykrxStock:
     def __getattr__(self, name: str) -> Any:
         try:
-            from pykrx import stock as pykrx_stock
+            pykrx_stock = import_pykrx_stock()
         except Exception as exc:  # noqa: BLE001
             raise RuntimeError(f'PyKRX stock client is unavailable: {exc}') from exc
         return getattr(pykrx_stock, name)
@@ -60,7 +61,7 @@ class _LazyPykrxStock:
 class _LazyPykrxWebIO:
     def __getattr__(self, name: str) -> Any:
         try:
-            from pykrx.website.comm import webio as pykrx_webio
+            pykrx_webio = import_pykrx_webio()
         except Exception as exc:  # noqa: BLE001
             raise RuntimeError(f'PyKRX webio client is unavailable: {exc}') from exc
         return getattr(pykrx_webio, name)
@@ -145,7 +146,7 @@ def _pykrx_request_timeout(timeout_seconds: int):
 
 
 def _call_pykrx(func, *args, **kwargs):
-    with _pykrx_request_timeout(settings.eod_pykrx_request_timeout_seconds):
+    with suppress_pykrx_login_env(), _pykrx_request_timeout(settings.eod_pykrx_request_timeout_seconds):
         return func(*args, **kwargs)
 
 
@@ -295,6 +296,7 @@ def _update_run_stage_metadata(
 class PykrxBackfillService:
     symbol_pause_seconds = 0.02
     name_pause_seconds = 0.005
+    max_symbol_fundamental_failures_per_run = 3
 
     def refresh_recent_universe(
         self,
@@ -1058,6 +1060,8 @@ class PykrxBackfillService:
         chain_fundamentals_followup: bool = True,
         track_daily_pipeline: bool = False,
     ) -> dict:
+        self._symbol_fundamentals_disabled_for_run = False
+        self._symbol_fundamentals_failure_count_for_run = 0
         return run_market_data_pipeline(
             self,
             dependencies=PykrxPipelineDependencies(
@@ -1097,9 +1101,15 @@ class PykrxBackfillService:
         )
 
     def _load_symbol_fundamentals(self, *, symbol: str, start_date: str, end_date: str):
+        if getattr(self, '_symbol_fundamentals_disabled_for_run', False):
+            return None
         try:
             frame = _get_market_fundamental_by_date(start_date, end_date, symbol)
         except Exception as exc:
+            failure_count = int(getattr(self, '_symbol_fundamentals_failure_count_for_run', 0) or 0) + 1
+            self._symbol_fundamentals_failure_count_for_run = failure_count
+            if failure_count >= self.max_symbol_fundamental_failures_per_run:
+                self._symbol_fundamentals_disabled_for_run = True
             logger.warning('pykrx fundamentals fetch failed for %s between %s and %s: %s', symbol, start_date, end_date, exc)
             _log_pykrx_fetch(
                 'fetch_symbol_fundamentals',
@@ -1109,6 +1119,8 @@ class PykrxBackfillService:
                 end_date=end_date,
                 error_type=type(exc).__name__,
                 error_message=str(exc),
+                disabled_for_run=getattr(self, '_symbol_fundamentals_disabled_for_run', False),
+                failure_count=failure_count,
             )
             return None
         if getattr(frame, 'empty', True):

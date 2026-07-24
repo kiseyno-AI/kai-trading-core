@@ -1393,6 +1393,11 @@ class DartFundamentalsCaptureService:
             stock_codes=selected_stock_codes,
             fs_div=resolved_fs_div,
         )
+        daily_incremental_lookback_days = max(
+            1,
+            int(getattr(settings, 'dart_fundamentals_daily_incremental_lookback_days', 45) or 45),
+        )
+        daily_incremental_min_start_date = resolved_market_date - timedelta(days=daily_incremental_lookback_days)
         run_metadata: dict[str, Any] = {
             'scope': 'daily_incremental_fundamentals_refresh',
             'market_date': resolved_market_date.isoformat(),
@@ -1402,6 +1407,8 @@ class DartFundamentalsCaptureService:
             'symbol_offset': symbol_offset,
             'symbol_limit': symbol_limit,
             'capture_limit': capture_limit,
+            'daily_incremental_lookback_days': daily_incremental_lookback_days,
+            'daily_incremental_min_start_date': daily_incremental_min_start_date.isoformat(),
             'retry_cycles_requested': resolved_retry_cycles,
             'selected_symbols_sample': _limited_sample(selected_stock_codes),
             'stale_refresh_run_ids_failed': stale_refresh_run_ids,
@@ -1453,7 +1460,9 @@ class DartFundamentalsCaptureService:
                 terminal_states = {
                     'fresh',
                     'stale',
+                    'stale_incremental_backfill_deferred',
                     'missing',
+                    'missing_initial_backfill_deferred',
                     'lookup_failed',
                     'terminal_no_newer_events',
                     'missing_no_newer_events',
@@ -1582,6 +1591,17 @@ class DartFundamentalsCaptureService:
 
                 if latest_fundamentals_date is None:
                     symbols_missing += 1
+                if (
+                    latest_resolved_date is None
+                    and not bool(getattr(settings, 'dart_fundamentals_daily_initial_backfill_enabled', False))
+                ):
+                    symbol_result['state'] = 'missing_initial_backfill_deferred'
+                    continue
+                if check_start_date < daily_incremental_min_start_date:
+                    symbol_result['state'] = 'stale_incremental_backfill_deferred'
+                    symbol_result['deferred_until_backfill'] = True
+                    symbol_result['daily_incremental_min_start_date'] = daily_incremental_min_start_date.isoformat()
+                    continue
                 if check_start_date > resolved_market_date:
                     symbol_result['state'] = (
                         _terminal_symbol_state(latest_terminal_status)
@@ -1610,7 +1630,7 @@ class DartFundamentalsCaptureService:
                 check_start_by_symbol[stock_code] = check_start_date
                 sync_groups.setdefault(check_start_date, []).append(corp_record)
 
-            symbols_failed = len(lookup_failed_symbols)
+            symbols_failed = 0
             update_refresh_progress(
                 stage='sync_groups_prepared',
                 extra_metadata={
@@ -1720,8 +1740,9 @@ class DartFundamentalsCaptureService:
                     candidate_receipt_date_from=min(check_start_by_symbol.values()).isoformat(),
                     candidate_receipt_date_to=resolved_market_date.isoformat(),
                 )
+                pending_event_fetch_limit = (capture_limit + 1) if capture_limit is not None else None
                 pending_events = self.repository.list_capture_candidates(
-                    limit=None,
+                    limit=pending_event_fetch_limit,
                     force=False,
                     stock_codes=sync_stock_codes,
                     receipt_date_from=min(check_start_by_symbol.values()),
@@ -1746,6 +1767,8 @@ class DartFundamentalsCaptureService:
                 )
                 seen_event_ids: set[int] = set()
                 for event in pending_events:
+                    if capture_limit is not None and len(candidate_events) >= capture_limit:
+                        break
                     event_id = int(event['id'])
                     if event_id in seen_event_ids:
                         continue
@@ -1757,6 +1780,14 @@ class DartFundamentalsCaptureService:
                         continue
                     candidate_events.append(event)
                     seen_event_ids.add(event_id)
+                has_more_candidate_events = (
+                    capture_limit is not None
+                    and pending_event_fetch_limit is not None
+                    and len(pending_events) >= pending_event_fetch_limit
+                    and len(candidate_events) >= capture_limit
+                )
+            else:
+                has_more_candidate_events = False
 
             events_detected = len(candidate_events)
             candidate_event_ids = [int(event['id']) for event in candidate_events]
@@ -1809,6 +1840,7 @@ class DartFundamentalsCaptureService:
             retry_cycles_completed = 0
 
             over_limit_event_ids = candidate_event_ids[len(event_ids_to_capture):]
+            has_deferred_candidate_events = has_more_candidate_events or bool(over_limit_event_ids)
 
             if event_ids_to_capture:
                 pending_event_ids = list(event_ids_to_capture)
@@ -1819,10 +1851,6 @@ class DartFundamentalsCaptureService:
                 pending_batches: list[list[int]] = []
                 if pending_event_ids:
                     pending_batches.append(list(pending_event_ids))
-                while over_limit_event_ids:
-                    next_batch = over_limit_event_ids[:capture_limit] if capture_limit is not None else list(over_limit_event_ids)
-                    pending_batches.append(list(next_batch))
-                    over_limit_event_ids = over_limit_event_ids[len(next_batch):]
 
                 retryable_next_batches: list[list[int]] = []
                 remaining_retryable_event_ids: list[int] = []
@@ -1883,7 +1911,7 @@ class DartFundamentalsCaptureService:
                         remaining_retryable_event_ids.extend(pending_event_ids)
 
                 pending_event_ids = list(remaining_retryable_event_ids)
-                remaining_candidate_events = len(remaining_retryable_event_ids)
+                remaining_candidate_events = len(remaining_retryable_event_ids) + (1 if has_deferred_candidate_events else 0)
 
                 if capture_runs:
                     final_results_by_event_id: dict[int, dict[str, Any]] = {}
@@ -1964,14 +1992,13 @@ class DartFundamentalsCaptureService:
                 },
             )
             symbols_refreshed = len(refreshed_symbols)
-            symbols_failed = len(lookup_failed_symbols | failed_symbols)
+            symbols_failed = len(failed_symbols)
             symbols_fresh = len(
                 [
                     stock_code
                     for stock_code, latest_date in latest_fundamentals_date_by_symbol.items()
                     if latest_date is not None
                     and stock_code not in stale_symbols
-                    and stock_code not in lookup_failed_symbols
                 ]
             )
             operator_buckets = _build_operator_buckets(
@@ -2040,7 +2067,7 @@ class DartFundamentalsCaptureService:
                 'missing_candidate_symbols_sample': _limited_sample(sorted(missing_candidate_symbols)),
                 'refreshed_symbols_sample': _limited_sample(sorted(refreshed_symbols)),
                 'updated_entries': updated_entries,
-                'failed_symbols_sample': _limited_sample(sorted(lookup_failed_symbols | failed_symbols)),
+                'failed_symbols_sample': _limited_sample(sorted(failed_symbols)),
                 'terminal_no_data_symbols_sample': _limited_sample(
                     sorted(terminal_symbols_by_status.get(CAPTURE_STATUS_NO_DATA, set()))
                 ),

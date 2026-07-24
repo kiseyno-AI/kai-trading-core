@@ -596,9 +596,12 @@ def _load_prior_positive_decision_reasons(
     try:
         with session_scope() as session:
             rows = []
-            for symbol_chunk in _chunk_symbols(symbols):
-                rows.extend(
-                    session.execute(
+            for symbol in symbols:
+                normalized_symbol = _normalize_symbol(symbol)
+                if not normalized_symbol:
+                    continue
+                for agent_name in DECISION_SUPPORT_AGENT_NAMES:
+                    row = session.execute(
                         select(
                             AgentContextFeedback.symbol,
                             AgentContextFeedback.agent_name,
@@ -608,18 +611,17 @@ def _load_prior_positive_decision_reasons(
                             AgentContextFeedback.received_at,
                         )
                         .where(AgentContextFeedback.market_date < market_date)
-                        .where(AgentContextFeedback.symbol.in_(symbol_chunk))
-                        .where(AgentContextFeedback.agent_name.in_(list(DECISION_SUPPORT_AGENT_NAMES)))
-                        .distinct(AgentContextFeedback.symbol, AgentContextFeedback.agent_name)
+                        .where(AgentContextFeedback.symbol == normalized_symbol)
+                        .where(AgentContextFeedback.agent_name == agent_name)
                         .order_by(
-                            AgentContextFeedback.symbol.asc(),
-                            AgentContextFeedback.agent_name.asc(),
                             AgentContextFeedback.market_date.desc(),
                             AgentContextFeedback.received_at.desc(),
                             AgentContextFeedback.id.desc(),
                         )
-                    ).all()
-                )
+                        .limit(1)
+                    ).first()
+                    if row is not None:
+                        rows.append(row)
     except Exception as exc:  # noqa: BLE001
         return {'status': 'source_error', 'error_type': type(exc).__name__, 'message': str(exc)}
 
@@ -968,11 +970,24 @@ def _load_forced_inclusion_reasons(
             ),
         }
 
-    source_diagnostics['prior_decisions'] = _load_prior_positive_decision_reasons(
-        market_date=market_date,
-        symbols=normalized_symbols,
-        reasons_by_symbol=reasons_by_symbol,
+    prior_decisions_broad_scope_enabled = bool(
+        getattr(settings, 'openclaw_feedback_force_include_prior_decisions_broad_scope_enabled', False)
     )
+    prior_decisions_allowed = prior_decisions_broad_scope_enabled or _requested_scope_bypasses_caps(requested_symbols)
+    if prior_decisions_allowed:
+        source_diagnostics['prior_decisions'] = _load_prior_positive_decision_reasons(
+            market_date=market_date,
+            symbols=normalized_symbols,
+            reasons_by_symbol=reasons_by_symbol,
+        )
+    else:
+        source_diagnostics['prior_decisions'] = {
+            'status': 'skipped_broad_scope',
+            'message': (
+                'Prior positive decider enrichment is skipped for broad daily scopes to avoid '
+                'blocking the core eligibility pipeline on historical feedback scans.'
+            ),
+        }
     prior_missed_broad_scope_enabled = bool(
         getattr(settings, 'openclaw_feedback_force_include_prior_missed_opportunities_broad_scope_enabled', False)
     )
@@ -1005,10 +1020,23 @@ def _load_forced_inclusion_reasons(
         symbols=normalized_symbols,
         reasons_by_symbol=reasons_by_symbol,
     )
-    source_diagnostics['abnormal_movement'] = _add_score_signal_forced_reasons(
-        score_by_symbol=score_by_symbol or {},
-        reasons_by_symbol=reasons_by_symbol,
+    abnormal_movement_broad_scope_enabled = bool(
+        getattr(settings, 'openclaw_feedback_force_include_abnormal_movement_broad_scope_enabled', False)
     )
+    abnormal_movement_allowed = abnormal_movement_broad_scope_enabled or _requested_scope_bypasses_caps(requested_symbols)
+    if abnormal_movement_allowed:
+        source_diagnostics['abnormal_movement'] = _add_score_signal_forced_reasons(
+            score_by_symbol=score_by_symbol or {},
+            reasons_by_symbol=reasons_by_symbol,
+        )
+    else:
+        source_diagnostics['abnormal_movement'] = {
+            'status': 'skipped_broad_scope',
+            'message': (
+                'Abnormal movement signals are ranked through candidate scores but do not force-include '
+                'broad daily scopes over role caps.'
+            ),
+        }
     return reasons_by_symbol, source_diagnostics
 
 
@@ -1458,7 +1486,11 @@ def _build_role_scope_selection(
             if len(selected_symbols) >= cap_limit and cap_limit > 0:
                 break
             selected_symbols.add(str(record.get('symbol') or '').strip().upper())
-        selected_symbols.update(forced_reasons_by_symbol)
+        force_over_cap_enabled = bool(
+            getattr(settings, 'openclaw_feedback_force_include_over_role_cap_broad_scope_enabled', False)
+        )
+        if force_over_cap_enabled:
+            selected_symbols.update(forced_reasons_by_symbol)
         if cap_limit <= 0:
             selected_symbols = {str(record.get('symbol') or '').strip().upper() for record in ranked}
 
@@ -1466,7 +1498,7 @@ def _build_role_scope_selection(
     decider_scope_applied = decider_scope_symbols is not None
     normalized_decider_scope = _normalize_symbol_scope(decider_scope_symbols) or []
     if decider_scope_applied:
-        selected_symbols = set(normalized_decider_scope)
+        selected_symbols = set(normalized_decider_scope).intersection(role_cap_selected_symbols)
 
     if decider_scope_applied:
         ranked_symbol_set = {
@@ -1476,7 +1508,7 @@ def _build_role_scope_selection(
         ordered_selected = [
             symbol
             for symbol in normalized_decider_scope
-            if symbol in ranked_symbol_set
+            if symbol in ranked_symbol_set and symbol in selected_symbols
         ]
     else:
         ordered_selected = [

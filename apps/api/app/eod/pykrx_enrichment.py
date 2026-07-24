@@ -10,6 +10,7 @@ import pandas as pd
 
 from app.core.audit_logging import log_fetch_event
 from app.core.settings import settings
+from app.eod.pykrx_import import import_pykrx_stock, suppress_pykrx_login_env
 from app.market_data_store import (
     load_daily_market_relative_contexts,
     load_daily_pykrx_enrichment_rows,
@@ -24,7 +25,7 @@ logger = logging.getLogger(__name__)
 class _LazyPykrxStock:
     def __getattr__(self, name: str) -> Any:
         try:
-            from pykrx import stock as pykrx_stock
+            pykrx_stock = import_pykrx_stock()
         except Exception as exc:  # noqa: BLE001
             raise RuntimeError(f'PyKRX stock client is unavailable: {exc}') from exc
         return getattr(pykrx_stock, name)
@@ -471,7 +472,8 @@ class PykrxEnrichmentService:
         for attempt in range(self._retry_count + 1):
             started_at = time.perf_counter()
             try:
-                frame = func(*args, **kwargs)
+                with suppress_pykrx_login_env():
+                    frame = func(*args, **kwargs)
                 if not isinstance(frame, pd.DataFrame):
                     raise TypeError(f'{operation} returned non-DataFrame payload')
                 cache[cache_key] = frame

@@ -54,7 +54,7 @@ from app.eod.run_stage_support import (
     resolve_run_updated_at,
     select_preferred_eod_run,
 )
-from app.external_news.classifier import external_news_classification_has_contract
+from app.external_news.classifier import ACCESS_STATUS_VALUES, CLASSIFIER_VERSION, MATERIALITY_VALUES
 from app.macro_context.service import macro_context_service
 from app.market.clock import get_market_state
 from app.market.session import build_market_session_metadata
@@ -315,31 +315,50 @@ def _market_date_utc_bounds(market_date: str) -> tuple[datetime, datetime]:
 
 def _load_external_news_counts(*, market_date: str) -> dict[str, Any]:
     start, end = _market_date_utc_bounds(market_date)
+    classification = ExternalNewsItem.payload['classification']
+    contract_filter = and_(
+        classification['classifier'].as_string() == CLASSIFIER_VERSION,
+        classification['materiality'].as_string().in_(list(MATERIALITY_VALUES)),
+        classification['materiality_reason'].as_string().isnot(None),
+        classification['materiality_reason'].as_string() != '',
+        classification['access_status'].as_string().in_(list(ACCESS_STATUS_VALUES)),
+        classification['event_type'].as_string().isnot(None),
+        classification['event_type'].as_string() != '',
+        classification['source_evidence'].isnot(None),
+    )
+    legacy_filter = and_(
+        classification['classifier'].as_string().isnot(None),
+        classification['classifier'].as_string() != '',
+    )
     with session_scope() as session:
-        rows = session.execute(
-            select(ExternalNewsItem.symbol_id, ExternalNewsItem.payload, ExternalNewsItem.collected_at)
+        item_count, symbol_count, latest_collected_at = session.execute(
+            select(
+                func.count(ExternalNewsItem.id),
+                func.count(func.distinct(ExternalNewsItem.symbol_id)),
+                func.max(ExternalNewsItem.collected_at),
+            )
             .where(ExternalNewsItem.collected_at >= start)
             .where(ExternalNewsItem.collected_at < end)
-        ).all()
-    symbol_ids = {row.symbol_id for row in rows if row.symbol_id is not None}
-    contract_classified_count = 0
-    legacy_classified_count = 0
-    latest_collected_at = None
-    for row in rows:
-        payload = row.payload if isinstance(row.payload, dict) else {}
-        classification = payload.get('classification') if isinstance(payload.get('classification'), dict) else {}
-        if external_news_classification_has_contract(classification):
-            contract_classified_count += 1
-        elif classification.get('classifier'):
-            legacy_classified_count += 1
-        if row.collected_at and (latest_collected_at is None or row.collected_at > latest_collected_at):
-            latest_collected_at = row.collected_at
+        ).one()
+        contract_classified_count = session.execute(
+            select(func.count(ExternalNewsItem.id))
+            .where(ExternalNewsItem.collected_at >= start)
+            .where(ExternalNewsItem.collected_at < end)
+            .where(contract_filter)
+        ).scalar_one()
+        legacy_classified_count = session.execute(
+            select(func.count(ExternalNewsItem.id))
+            .where(ExternalNewsItem.collected_at >= start)
+            .where(ExternalNewsItem.collected_at < end)
+            .where(legacy_filter)
+            .where(~contract_filter)
+        ).scalar_one()
     return {
-        'items': len(rows),
-        'symbols': len(symbol_ids),
-        'classified_items': contract_classified_count,
-        'contract_classified_items': contract_classified_count,
-        'legacy_classified_items': legacy_classified_count,
+        'items': int(item_count or 0),
+        'symbols': int(symbol_count or 0),
+        'classified_items': int(contract_classified_count or 0),
+        'contract_classified_items': int(contract_classified_count or 0),
+        'legacy_classified_items': int(legacy_classified_count or 0),
         'updated_at': latest_collected_at.isoformat() if latest_collected_at else None,
     }
 
@@ -429,28 +448,25 @@ def _load_row_count_missing_diagnostics_for_model(
     market_date: date,
     limit: int,
 ) -> dict[str, Any]:
-    target = aliased(model)
-    join_condition = and_(
-        target.symbol_id == DailyPriceBar.symbol_id,
-        target.market_date == market_date,
+    price_symbol_ids = set(
+        session.execute(
+            select(DailyPriceBar.symbol_id)
+            .where(DailyPriceBar.trade_date == market_date)
+        ).scalars().all()
     )
-    missing_count = session.execute(
-        select(func.count(func.distinct(DailyPriceBar.symbol_id)))
-        .select_from(DailyPriceBar)
-        .outerjoin(target, join_condition)
-        .where(DailyPriceBar.trade_date == market_date)
-        .where(target.symbol_id.is_(None))
-    ).scalar_one()
+    persisted_symbol_ids = set(
+        session.execute(
+            select(model.symbol_id)
+            .where(model.market_date == market_date)
+        ).scalars().all()
+    )
+    missing_symbol_ids = sorted(price_symbol_ids - persisted_symbol_ids)
+    missing_count = len(missing_symbol_ids)
     sample_rows = session.execute(
         select(Symbol.symbol, Symbol.name_ko, Symbol.market)
-        .select_from(DailyPriceBar)
-        .join(Symbol, Symbol.id == DailyPriceBar.symbol_id)
-        .outerjoin(target, join_condition)
-        .where(DailyPriceBar.trade_date == market_date)
-        .where(target.symbol_id.is_(None))
+        .where(Symbol.id.in_(missing_symbol_ids[:limit]))
         .order_by(Symbol.symbol.asc())
-        .limit(limit)
-    ).all()
+    ).all() if missing_symbol_ids else []
     details_sample = [
         {
             'symbol': row.symbol,
@@ -460,7 +476,7 @@ def _load_row_count_missing_diagnostics_for_model(
         for row in sample_rows
     ]
     return {
-        'missing_count': int(missing_count or 0),
+        'missing_count': int(missing_count),
         'missing_symbols_sample': [item['symbol'] for item in details_sample],
         'missing_symbol_details_sample': details_sample,
         'missing_sample_limit': limit,
@@ -483,32 +499,28 @@ def _load_row_count_stage_scope_gap(
         }
 
     normalized_market_date = date.fromisoformat(market_date)
-    target = aliased(model)
-    join_condition = and_(
-        target.symbol_id == Symbol.id,
-        target.market_date == normalized_market_date,
-    )
     with session_scope() as session:
-        missing_count = session.execute(
-            select(func.count(func.distinct(Symbol.id)))
-            .select_from(Symbol)
+        price_symbol_rows = session.execute(
+            select(Symbol.id, Symbol.symbol)
             .join(DailyPriceBar, DailyPriceBar.symbol_id == Symbol.id)
-            .outerjoin(target, join_condition)
             .where(DailyPriceBar.trade_date == normalized_market_date)
             .where(Symbol.symbol.in_(normalized_symbols))
-            .where(target.symbol_id.is_(None))
-        ).scalar_one()
+        ).all()
+        price_symbol_ids = {int(row.id) for row in price_symbol_rows}
+        persisted_symbol_ids = set(
+            session.execute(
+                select(model.symbol_id)
+                .where(model.market_date == normalized_market_date)
+                .where(model.symbol_id.in_(price_symbol_ids))
+            ).scalars().all()
+        ) if price_symbol_ids else set()
+        missing_symbol_ids = sorted(price_symbol_ids - persisted_symbol_ids)
+        missing_count = len(missing_symbol_ids)
         sample_rows = session.execute(
             select(Symbol.symbol, Symbol.name_ko, Symbol.market)
-            .select_from(Symbol)
-            .join(DailyPriceBar, DailyPriceBar.symbol_id == Symbol.id)
-            .outerjoin(target, join_condition)
-            .where(DailyPriceBar.trade_date == normalized_market_date)
-            .where(Symbol.symbol.in_(normalized_symbols))
-            .where(target.symbol_id.is_(None))
+            .where(Symbol.id.in_(missing_symbol_ids[:ROW_COUNT_STAGE_MISSING_SAMPLE_LIMIT]))
             .order_by(Symbol.symbol.asc())
-            .limit(ROW_COUNT_STAGE_MISSING_SAMPLE_LIMIT)
-        ).all()
+        ).all() if missing_symbol_ids else []
     details_sample = [
         {
             'symbol': row.symbol,

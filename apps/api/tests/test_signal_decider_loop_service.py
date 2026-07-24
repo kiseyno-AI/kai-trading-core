@@ -313,6 +313,7 @@ class FakeSignalDeciderLoopRepository:
         decision_actions=None,
         policy_versions=None,
         dedupe_feedback_results=False,
+        lightweight_results=False,
         limit=None,
         offset=0,
     ):
@@ -325,6 +326,7 @@ class FakeSignalDeciderLoopRepository:
                 'decision_actions': list(decision_actions or []),
                 'policy_versions': list(policy_versions or []),
                 'dedupe_feedback_results': dedupe_feedback_results,
+                'lightweight_results': lightweight_results,
                 'limit': limit,
                 'offset': offset,
             }

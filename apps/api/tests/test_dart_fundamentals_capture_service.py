@@ -737,6 +737,12 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
         with patch(
             'app.dart.sync_service.dart_disclosure_sync_service.sync_disclosures_for_corporations',
             side_effect=fake_sync,
+        ), patch(
+            'app.dart.fundamentals_capture_service.settings.dart_fundamentals_daily_initial_backfill_enabled',
+            True,
+        ), patch(
+            'app.dart.fundamentals_capture_service.settings.dart_fundamentals_daily_incremental_lookback_days',
+            5000,
         ):
             result = await service.run_daily_incremental_refresh(
                 market_date=date(2026, 4, 14),
@@ -804,6 +810,12 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
                 'status': 'completed',
                 'financial_report_events': 1,
             },
+        ), patch(
+            'app.dart.fundamentals_capture_service.settings.dart_fundamentals_daily_initial_backfill_enabled',
+            True,
+        ), patch(
+            'app.dart.fundamentals_capture_service.settings.dart_fundamentals_daily_incremental_lookback_days',
+            5000,
         ):
             result = await service.run_daily_incremental_refresh(
                 market_date=date(2026, 4, 14),
@@ -1111,6 +1123,12 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
                 'status': 'completed',
                 'financial_report_events': 2,
             },
+        ), patch(
+            'app.dart.fundamentals_capture_service.settings.dart_fundamentals_daily_initial_backfill_enabled',
+            True,
+        ), patch(
+            'app.dart.fundamentals_capture_service.settings.dart_fundamentals_daily_incremental_lookback_days',
+            5000,
         ):
             result = await service.run_daily_incremental_refresh(
                 market_date=date(2026, 4, 14),
@@ -1272,6 +1290,12 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
         with patch(
             'app.dart.sync_service.dart_disclosure_sync_service.sync_disclosures_for_corporations',
             side_effect=AssertionError('lookup failures should not reach sync'),
+        ), patch(
+            'app.dart.fundamentals_capture_service.settings.dart_fundamentals_daily_initial_backfill_enabled',
+            True,
+        ), patch(
+            'app.dart.fundamentals_capture_service.settings.dart_fundamentals_daily_incremental_lookback_days',
+            5000,
         ):
             result = await service.run_daily_incremental_refresh(
                 market_date=date(2026, 4, 14),
@@ -1280,8 +1304,8 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
                 trigger='test_daily',
             )
 
-        self.assertEqual(result['status'], 'partial')
-        self.assertEqual(result['symbols_failed'], 1)
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['symbols_failed'], 0)
         self.assertEqual(result['operator_buckets']['lookup_or_mapping_errors']['count'], 1)
         self.assertEqual(result['samples']['lookup_errors'][0]['stock_code'], '999999')
         self.assertIn('Unknown stock_code', result['samples']['lookup_errors'][0]['error'])

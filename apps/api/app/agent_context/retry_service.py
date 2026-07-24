@@ -317,11 +317,7 @@ class AgentFeedbackRetryService:
         role_states: dict[str, RoleSequenceRoleState] = {}
         for role in normalized_roles:
             role_symbols = normalized_role_scopes.get(role, normalized_symbols)
-            completed_same_day_symbols = (
-                ()
-                if force_recompute
-                else tuple(symbol for symbol in role_symbols if symbol in completed_by_role.get(role, set()))
-            )
+            completed_same_day_symbols = tuple(symbol for symbol in role_symbols if symbol in completed_by_role.get(role, set()))
             reused_symbols = (
                 ()
                 if force_recompute

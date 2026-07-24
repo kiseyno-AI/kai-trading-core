@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Any
 
-from sqlalchemy import and_, case, func, select
+from sqlalchemy import and_, select
 
 from app.db import session_scope
 from app.db_models import (
@@ -306,7 +306,41 @@ class DailyPiotroskiFilterService:
 
     def _load_inputs(self, market_date: date, *, annual_year: int, prior_annual_year: int) -> list[PiotroskiInputs]:
         with session_scope() as session:
-            latest_highlights = (
+            base_rows = session.execute(
+                select(
+                    Symbol.symbol,
+                    Symbol.name_ko,
+                    DailyPriceBar.pbr,
+                    DailyTechnicalSnapshot.return_20d,
+                )
+                .join(DailyPriceBar, and_(DailyPriceBar.symbol_id == Symbol.id, DailyPriceBar.trade_date == market_date))
+                .join(
+                    DailyTechnicalSnapshot,
+                    and_(
+                        DailyTechnicalSnapshot.symbol_id == Symbol.id,
+                        DailyTechnicalSnapshot.market_date == market_date,
+                    ),
+                    isouter=True,
+                )
+                .where(Symbol.is_active.is_(True))
+                .order_by(Symbol.symbol.asc())
+            ).all()
+
+            symbols = [row.symbol for row in base_rows]
+            if not symbols:
+                return []
+
+            metric_keys = {
+                'total_equity',
+                'net_income',
+                'operating_cash_flow',
+                'total_assets',
+                INDEX_DEBT_RATIO,
+                INDEX_CURRENT_RATIO,
+                INDEX_GROSS_MARGIN,
+                INDEX_ASSET_TURNOVER,
+            }
+            highlight_rows = session.execute(
                 select(
                     DartFundamentalsSnapshot.stock_code.label('symbol'),
                     DartFundamentalsSnapshot.business_year.label('business_year'),
@@ -316,67 +350,42 @@ class DailyPiotroskiFilterService:
                 )
                 .join(DartFundamentalsHighlight, DartFundamentalsHighlight.snapshot_id == DartFundamentalsSnapshot.id)
                 .where(
-                    DartFundamentalsSnapshot.stock_code.is_not(None),
+                    DartFundamentalsSnapshot.stock_code.in_(symbols),
                     DartFundamentalsSnapshot.business_year.in_([annual_year, prior_annual_year]),
                     DartFundamentalsSnapshot.report_code == '11011',
                     DartFundamentalsSnapshot.fs_div == 'CFS',
+                    DartFundamentalsHighlight.metric_key.in_(metric_keys),
                 )
-                .subquery()
-            )
-            latest_audit = (
-                select(
-                    DartAuditSignal.stock_code.label('symbol'),
-                    DartAuditSignal.has_audit_issue.label('has_audit_issue'),
-                    func.row_number().over(
-                        partition_by=DartAuditSignal.stock_code,
-                        order_by=DartAuditSignal.receipt_date.desc(),
-                    ).label('rk'),
-                ).subquery()
-            )
-            latest_dilution = (
-                select(
-                    DartDilutionSignal.stock_code.label('symbol'),
-                    DartDilutionSignal.has_dilution_signal.label('has_dilution_signal'),
-                    func.row_number().over(
-                        partition_by=DartDilutionSignal.stock_code,
-                        order_by=DartDilutionSignal.receipt_date.desc(),
-                    ).label('rk'),
-                ).subquery()
-            )
+            ).all()
+            highlights_by_symbol: dict[str, dict[tuple[str, int], Any]] = {}
+            ratios_by_symbol: dict[str, dict[tuple[str, int], Any]] = {}
+            for row in highlight_rows:
+                highlights_by_symbol.setdefault(row.symbol, {})[(row.metric_key, row.business_year)] = row.current_amount
+                ratios_by_symbol.setdefault(row.symbol, {})[(row.metric_key, row.business_year)] = row.ratio_value
 
-            stmt = (
+            audit_rows = session.execute(
                 select(
-                    Symbol.symbol,
-                    Symbol.name_ko,
-                    DailyPriceBar.pbr,
-                    DailyTechnicalSnapshot.return_20d,
-                    latest_audit.c.has_audit_issue,
-                    latest_dilution.c.has_dilution_signal,
-                    func.max(case((and_(latest_highlights.c.metric_key == 'total_equity', latest_highlights.c.business_year == annual_year), latest_highlights.c.current_amount), else_=None)).label('total_equity'),
-                    func.max(case((and_(latest_highlights.c.metric_key == 'net_income', latest_highlights.c.business_year == annual_year), latest_highlights.c.current_amount), else_=None)).label('net_income'),
-                    func.max(case((and_(latest_highlights.c.metric_key == 'net_income', latest_highlights.c.business_year == prior_annual_year), latest_highlights.c.current_amount), else_=None)).label('prior_net_income'),
-                    func.max(case((and_(latest_highlights.c.metric_key == 'operating_cash_flow', latest_highlights.c.business_year == annual_year), latest_highlights.c.current_amount), else_=None)).label('operating_cash_flow'),
-                    func.max(case((and_(latest_highlights.c.metric_key == 'total_assets', latest_highlights.c.business_year == annual_year), latest_highlights.c.current_amount), else_=None)).label('total_assets'),
-                    func.max(case((and_(latest_highlights.c.metric_key == 'total_assets', latest_highlights.c.business_year == prior_annual_year), latest_highlights.c.current_amount), else_=None)).label('prior_total_assets'),
-                    func.max(case((and_(latest_highlights.c.metric_key == INDEX_DEBT_RATIO, latest_highlights.c.business_year == annual_year), latest_highlights.c.ratio_value), else_=None)).label('debt_ratio'),
-                    func.max(case((and_(latest_highlights.c.metric_key == INDEX_DEBT_RATIO, latest_highlights.c.business_year == prior_annual_year), latest_highlights.c.ratio_value), else_=None)).label('prior_debt_ratio'),
-                    func.max(case((and_(latest_highlights.c.metric_key == INDEX_CURRENT_RATIO, latest_highlights.c.business_year == annual_year), latest_highlights.c.ratio_value), else_=None)).label('current_ratio'),
-                    func.max(case((and_(latest_highlights.c.metric_key == INDEX_CURRENT_RATIO, latest_highlights.c.business_year == prior_annual_year), latest_highlights.c.ratio_value), else_=None)).label('prior_current_ratio'),
-                    func.max(case((and_(latest_highlights.c.metric_key == INDEX_GROSS_MARGIN, latest_highlights.c.business_year == annual_year), latest_highlights.c.ratio_value), else_=None)).label('gross_margin'),
-                    func.max(case((and_(latest_highlights.c.metric_key == INDEX_GROSS_MARGIN, latest_highlights.c.business_year == prior_annual_year), latest_highlights.c.ratio_value), else_=None)).label('prior_gross_margin'),
-                    func.max(case((and_(latest_highlights.c.metric_key == INDEX_ASSET_TURNOVER, latest_highlights.c.business_year == annual_year), latest_highlights.c.ratio_value), else_=None)).label('asset_turnover'),
-                    func.max(case((and_(latest_highlights.c.metric_key == INDEX_ASSET_TURNOVER, latest_highlights.c.business_year == prior_annual_year), latest_highlights.c.ratio_value), else_=None)).label('prior_asset_turnover'),
+                    DartAuditSignal.stock_code,
+                    DartAuditSignal.has_audit_issue,
                 )
-                .join(DailyPriceBar, and_(DailyPriceBar.symbol_id == Symbol.id, DailyPriceBar.trade_date == market_date))
-                .join(DailyTechnicalSnapshot, and_(DailyTechnicalSnapshot.symbol_id == Symbol.id, DailyTechnicalSnapshot.market_date == market_date), isouter=True)
-                .join(latest_highlights, latest_highlights.c.symbol == Symbol.symbol, isouter=True)
-                .join(latest_audit, and_(latest_audit.c.symbol == Symbol.symbol, latest_audit.c.rk == 1), isouter=True)
-                .join(latest_dilution, and_(latest_dilution.c.symbol == Symbol.symbol, latest_dilution.c.rk == 1), isouter=True)
-                .where(Symbol.is_active.is_(True))
-                .group_by(Symbol.symbol, Symbol.name_ko, DailyPriceBar.pbr, DailyTechnicalSnapshot.return_20d, latest_audit.c.has_audit_issue, latest_dilution.c.has_dilution_signal)
-                .order_by(Symbol.symbol.asc())
-            )
-            rows = session.execute(stmt).all()
+                .where(DartAuditSignal.stock_code.in_(symbols))
+                .order_by(DartAuditSignal.stock_code.asc(), DartAuditSignal.receipt_date.desc())
+            ).all()
+            latest_audit: dict[str, Any] = {}
+            for row in audit_rows:
+                latest_audit.setdefault(row.stock_code, row.has_audit_issue)
+
+            dilution_rows = session.execute(
+                select(
+                    DartDilutionSignal.stock_code,
+                    DartDilutionSignal.has_dilution_signal,
+                )
+                .where(DartDilutionSignal.stock_code.in_(symbols))
+                .order_by(DartDilutionSignal.stock_code.asc(), DartDilutionSignal.receipt_date.desc())
+            ).all()
+            latest_dilution: dict[str, Any] = {}
+            for row in dilution_rows:
+                latest_dilution.setdefault(row.stock_code, row.has_dilution_signal)
 
         return [
             PiotroskiInputs(
@@ -385,24 +394,42 @@ class DailyPiotroskiFilterService:
                 market_date=market_date,
                 pbr=_as_float(row.pbr),
                 return_20d=_as_float(row.return_20d),
-                total_equity=_as_float(row.total_equity),
-                net_income=_as_float(row.net_income),
-                prior_net_income=_as_float(row.prior_net_income),
-                operating_cash_flow=_as_float(row.operating_cash_flow),
-                total_assets=_as_float(row.total_assets),
-                prior_total_assets=_as_float(row.prior_total_assets),
-                debt_ratio=_as_float(row.debt_ratio),
-                prior_debt_ratio=_as_float(row.prior_debt_ratio),
-                current_ratio=_as_float(row.current_ratio),
-                prior_current_ratio=_as_float(row.prior_current_ratio),
-                gross_margin=_as_float(row.gross_margin),
-                prior_gross_margin=_as_float(row.prior_gross_margin),
-                asset_turnover=_as_float(row.asset_turnover),
-                prior_asset_turnover=_as_float(row.prior_asset_turnover),
-                has_audit_issue=bool(row.has_audit_issue),
-                has_dilution_signal=(None if row.has_dilution_signal is None else bool(row.has_dilution_signal)),
+                total_equity=_as_float(highlights_by_symbol.get(row.symbol, {}).get(('total_equity', annual_year))),
+                net_income=_as_float(highlights_by_symbol.get(row.symbol, {}).get(('net_income', annual_year))),
+                prior_net_income=_as_float(
+                    highlights_by_symbol.get(row.symbol, {}).get(('net_income', prior_annual_year))
+                ),
+                operating_cash_flow=_as_float(
+                    highlights_by_symbol.get(row.symbol, {}).get(('operating_cash_flow', annual_year))
+                ),
+                total_assets=_as_float(highlights_by_symbol.get(row.symbol, {}).get(('total_assets', annual_year))),
+                prior_total_assets=_as_float(
+                    highlights_by_symbol.get(row.symbol, {}).get(('total_assets', prior_annual_year))
+                ),
+                debt_ratio=_as_float(ratios_by_symbol.get(row.symbol, {}).get((INDEX_DEBT_RATIO, annual_year))),
+                prior_debt_ratio=_as_float(
+                    ratios_by_symbol.get(row.symbol, {}).get((INDEX_DEBT_RATIO, prior_annual_year))
+                ),
+                current_ratio=_as_float(ratios_by_symbol.get(row.symbol, {}).get((INDEX_CURRENT_RATIO, annual_year))),
+                prior_current_ratio=_as_float(
+                    ratios_by_symbol.get(row.symbol, {}).get((INDEX_CURRENT_RATIO, prior_annual_year))
+                ),
+                gross_margin=_as_float(ratios_by_symbol.get(row.symbol, {}).get((INDEX_GROSS_MARGIN, annual_year))),
+                prior_gross_margin=_as_float(
+                    ratios_by_symbol.get(row.symbol, {}).get((INDEX_GROSS_MARGIN, prior_annual_year))
+                ),
+                asset_turnover=_as_float(
+                    ratios_by_symbol.get(row.symbol, {}).get((INDEX_ASSET_TURNOVER, annual_year))
+                ),
+                prior_asset_turnover=_as_float(
+                    ratios_by_symbol.get(row.symbol, {}).get((INDEX_ASSET_TURNOVER, prior_annual_year))
+                ),
+                has_audit_issue=bool(latest_audit.get(row.symbol)),
+                has_dilution_signal=(
+                    None if row.symbol not in latest_dilution else bool(latest_dilution.get(row.symbol))
+                ),
             )
-            for row in rows
+            for row in base_rows
         ]
 
 

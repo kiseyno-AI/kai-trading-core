@@ -145,6 +145,27 @@ class AgentContextReuseService:
             raise ValueError('roles is required')
 
         decisions: dict[str, dict[str, FeedbackReuseDecision]] = {symbol: {} for symbol in normalized_symbols}
+        if force_recompute and SIGNAL_DECIDER_AGENT_NAME not in requested_roles:
+            for symbol in normalized_symbols:
+                for role in requested_roles:
+                    agent_name = ROLE_TO_AGENT[role]
+                    decisions[symbol][role] = FeedbackReuseDecision(
+                        symbol=symbol,
+                        agent_name=agent_name,
+                        should_dispatch=True,
+                        reason='forced_recompute',
+                        latest_feedback_id=None,
+                        latest_feedback_received_at=None,
+                        latest_source_updated_at=None,
+                        latest_feedback=None,
+                        reuse_policy_version=(
+                            FUNDAMENTAL_SUMMARY_REUSE_POLICY_VERSION
+                            if role == FUNDAMENTAL_SUMMARIZER_AGENT_NAME
+                            else None
+                        ),
+                    )
+            return decisions
+
         with session_scope() as session:
             symbol_rows = session.execute(
                 select(Symbol.id, Symbol.symbol)
@@ -157,6 +178,31 @@ class AgentContextReuseService:
             for role in requested_roles:
                 agent_name = ROLE_TO_AGENT[role]
                 for chunk in _chunked(normalized_symbols, FEEDBACK_REUSE_SYMBOL_CHUNK_SIZE):
+                    same_day_feedback_rows = session.execute(
+                        select(
+                            AgentContextFeedback.id,
+                            AgentContextFeedback.market_date,
+                            AgentContextFeedback.symbol,
+                            AgentContextFeedback.agent_name,
+                            AgentContextFeedback.run_id,
+                            AgentContextFeedback.summary_payload,
+                            AgentContextFeedback.feedback_payload,
+                            AgentContextFeedback.context_payload,
+                            AgentContextFeedback.received_at,
+                        )
+                        .where(AgentContextFeedback.market_date == normalized_market_date)
+                        .where(AgentContextFeedback.symbol.in_(chunk))
+                        .where(AgentContextFeedback.agent_name == agent_name)
+                    ).all()
+                    for row in same_day_feedback_rows:
+                        if not hasattr(row, 'feedback_payload'):
+                            continue
+                        latest_feedback_map[(row.symbol, agent_name)] = row
+                for symbol in normalized_symbols:
+                    if (symbol, agent_name) in latest_feedback_map:
+                        continue
+                    if role == SIGNAL_DECIDER_AGENT_NAME:
+                        continue
                     feedback_rows = session.execute(
                         select(
                             AgentContextFeedback.id,
@@ -170,10 +216,14 @@ class AgentContextReuseService:
                             AgentContextFeedback.received_at,
                         )
                         .where(AgentContextFeedback.market_date <= normalized_market_date)
-                        .where(AgentContextFeedback.symbol.in_(chunk))
+                        .where(AgentContextFeedback.symbol == symbol)
                         .where(AgentContextFeedback.agent_name == agent_name)
-                        .distinct(AgentContextFeedback.symbol)
-                        .order_by(AgentContextFeedback.symbol.asc(), AgentContextFeedback.market_date.desc(), AgentContextFeedback.received_at.desc(), AgentContextFeedback.id.desc())
+                        .order_by(
+                            AgentContextFeedback.market_date.desc(),
+                            AgentContextFeedback.received_at.desc(),
+                            AgentContextFeedback.id.desc(),
+                        )
+                        .limit(1)
                     ).all()
                     for row in feedback_rows:
                         if not hasattr(row, 'feedback_payload'):
@@ -181,17 +231,21 @@ class AgentContextReuseService:
                         key = (row.symbol, agent_name)
                         if key not in latest_feedback_map:
                             latest_feedback_map[key] = row
-                    failure_rows = session.execute(
+                for symbol in normalized_symbols:
+                    failure_row = session.execute(
                         select(AgentContextFeedbackFailure)
                         .where(AgentContextFeedbackFailure.market_date <= normalized_market_date)
-                        .where(AgentContextFeedbackFailure.symbol.in_(chunk))
+                        .where(AgentContextFeedbackFailure.symbol == symbol)
                         .where(AgentContextFeedbackFailure.agent_name == agent_name)
-                        .order_by(AgentContextFeedbackFailure.symbol.asc(), AgentContextFeedbackFailure.market_date.desc(), AgentContextFeedbackFailure.received_at.desc(), AgentContextFeedbackFailure.id.desc())
-                    ).scalars().all()
-                    for row in failure_rows:
-                        key = (row.symbol, agent_name)
-                        if key not in latest_failure_map:
-                            latest_failure_map[key] = row
+                        .order_by(
+                            AgentContextFeedbackFailure.market_date.desc(),
+                            AgentContextFeedbackFailure.received_at.desc(),
+                            AgentContextFeedbackFailure.id.desc(),
+                        )
+                        .limit(1)
+                    ).scalars().first()
+                    if failure_row is not None:
+                        latest_failure_map[(failure_row.symbol, agent_name)] = failure_row
 
             for symbol in normalized_symbols:
                 symbol_id = symbol_id_map.get(symbol)
