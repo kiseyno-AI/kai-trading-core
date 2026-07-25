@@ -3671,6 +3671,15 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
         result = _build_rule_candidate_report(outcome_kind='bad_buy')
 
         candidates = list(result['rule_candidates']['items'])
+        outcome_path_buckets = result['group_summaries']['outcome_path_buckets']['items']
+        self.assertTrue(
+            any(
+                item['bucket_key'] == 'outcome.path_bucket'
+                and item['bucket_value'] == 'severe_drawdown_before_target'
+                and item['bad_buy_count'] == 3
+                for item in outcome_path_buckets
+            )
+        )
         risk_candidates = [
             candidate
             for candidate in candidates
@@ -3693,6 +3702,16 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
                 and condition['operator'] == 'eq'
                 and condition['value'] == 'buy'
                 for condition in candidate['predicate']['conditions']
+            )
+        )
+        self.assertTrue(
+            any(
+                any(
+                    condition['field'] == 'outcome.path_bucket'
+                    and condition['value'] == 'severe_drawdown_before_target'
+                    for condition in risk_candidate['predicate']['conditions']
+                )
+                for risk_candidate in risk_candidates
             )
         )
 

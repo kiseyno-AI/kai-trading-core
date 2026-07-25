@@ -48,6 +48,8 @@ GROUP_SECTION_ORDER: tuple[str, ...] = (
     'factor_momentum_buckets',
     'factor_quality_buckets',
     'signal_feature_buckets',
+    'outcome_path_buckets',
+    'reward_risk_buckets',
 )
 GROUP_SECTION_LABELS: dict[str, str] = {
     'decision_actions': 'Decision action buckets',
@@ -60,6 +62,8 @@ GROUP_SECTION_LABELS: dict[str, str] = {
     'factor_momentum_buckets': 'Momentum buckets',
     'factor_quality_buckets': 'Quality buckets',
     'signal_feature_buckets': 'Signal-feature buckets',
+    'outcome_path_buckets': 'Outcome-path buckets',
+    'reward_risk_buckets': 'Reward/risk buckets',
 }
 
 
@@ -218,6 +222,63 @@ def _signal_feature_bucket(factor_summary: dict[str, Any]) -> str | None:
     if row_kind:
         return row_kind
     return _normalize_optional_text(signal_features.get('status'))
+
+
+def _outcome_path_bucket(*, decision_action: str, outcome: dict[str, Any], evaluation: dict[str, Any]) -> str | None:
+    if decision_action != 'buy':
+        return None
+    diagnostics = _maybe_dict(evaluation.get('diagnostics'))
+    outcome_diagnostics = _maybe_dict(outcome.get('diagnostics'))
+    if bool(diagnostics.get('severe_drawdown_before_target')):
+        return 'severe_drawdown_before_target'
+    first_target_hit = _normalize_optional_text(outcome_diagnostics.get('first_target_hit_trade_date'))
+    first_stop_hit = _normalize_optional_text(outcome_diagnostics.get('first_stop_loss_hit_trade_date'))
+    target_hit = bool(outcome.get('target_hit'))
+    stop_hit = bool(outcome.get('stop_loss_hit'))
+    if target_hit and stop_hit:
+        if first_stop_hit and (first_target_hit is None or first_stop_hit < first_target_hit):
+            return 'stop_before_target'
+        if first_target_hit and (first_stop_hit is None or first_target_hit < first_stop_hit):
+            return 'target_before_stop'
+        return 'target_stop_collision'
+    if stop_hit:
+        return 'stop_without_target'
+    if target_hit:
+        return 'target_without_stop'
+    return 'neither_target_nor_stop'
+
+
+def _drawdown_bucket(max_drawdown_return_pct: float | None) -> str | None:
+    if max_drawdown_return_pct is None:
+        return None
+    if max_drawdown_return_pct <= -7.0:
+        return 'drawdown_le_minus_7pct'
+    if max_drawdown_return_pct <= -4.0:
+        return 'drawdown_le_minus_4pct'
+    if max_drawdown_return_pct <= -2.0:
+        return 'drawdown_le_minus_2pct'
+    return 'drawdown_contained'
+
+
+def _reward_risk_bucket(*, decision: dict[str, Any], outcome: dict[str, Any]) -> str | None:
+    decision_fields = _maybe_dict(decision.get('decision'))
+    target_price = _to_float(decision_fields.get('target_price'))
+    stop_loss_price = _to_float(decision_fields.get('stop_loss_price'))
+    entry_price = _to_float(outcome.get('entry_price'))
+    if entry_price is None or target_price is None or stop_loss_price is None:
+        return None
+    upside = target_price - entry_price
+    downside = entry_price - stop_loss_price
+    if upside <= 0 or downside <= 0:
+        return 'invalid_reward_risk'
+    ratio = upside / downside
+    if ratio < 1.0:
+        return 'reward_risk_lt_1_0'
+    if ratio < 1.3:
+        return 'reward_risk_lt_1_3'
+    if ratio < 2.0:
+        return 'reward_risk_1_3_to_2_0'
+    return 'reward_risk_gte_2_0'
 
 
 def _new_bucket_stats(
@@ -589,13 +650,30 @@ class SignalDeciderCalibrationService:
         if max_drawdown_return_pct is None:
             max_drawdown_return_pct = _to_float(outcome.get('max_drawdown_return_pct'))
         grade_label = str(evaluation.get('grade_label') or '')
+        decision_action = decision['decision']['action']
+        group_tokens = self._build_group_tokens(
+            decision=decision,
+            factor_summary=factor_summary,
+            liquidity_context=liquidity_context,
+            feature_snapshot=feature_snapshot,
+            scores=scores,
+        )
+        group_tokens.extend(
+            self._build_outcome_group_tokens(
+                decision=decision,
+                outcome=outcome,
+                evaluation=evaluation,
+                decision_action=decision_action,
+                max_drawdown_return_pct=max_drawdown_return_pct,
+            )
+        )
         return {
             'snapshot_id': row.id,
             'feedback_id': row.feedback_id,
             'market_date': row.market_date.isoformat(),
             'symbol': row.symbol,
             'policy_version': decision['policy_version'],
-            'decision_action': decision['decision']['action'],
+            'decision_action': decision_action,
             'wait_reason': decision.get('wait_reason'),
             'grade_label': grade_label,
             'grade_score': _to_float(evaluation.get('grade_score')),
@@ -606,14 +684,54 @@ class SignalDeciderCalibrationService:
             'max_upside_return_pct': max_upside_return_pct,
             'max_drawdown_return_pct': max_drawdown_return_pct,
             'coverage': coverage,
-            'group_tokens': self._build_group_tokens(
-                decision=decision,
-                factor_summary=factor_summary,
-                liquidity_context=liquidity_context,
-                feature_snapshot=feature_snapshot,
-                scores=scores,
-            ),
+            'group_tokens': group_tokens,
         }
+
+    def _build_outcome_group_tokens(
+        self,
+        *,
+        decision: dict[str, Any],
+        outcome: dict[str, Any],
+        evaluation: dict[str, Any],
+        decision_action: str,
+        max_drawdown_return_pct: float | None,
+    ) -> list[CalibrationToken]:
+        tokens: list[CalibrationToken] = []
+        path_bucket = _outcome_path_bucket(
+            decision_action=decision_action,
+            outcome=outcome,
+            evaluation=evaluation,
+        )
+        if path_bucket:
+            tokens.append(
+                CalibrationToken(
+                    category='outcome_path_buckets',
+                    key='outcome.path_bucket',
+                    value=path_bucket,
+                    label=f'Outcome path: {path_bucket}',
+                )
+            )
+        drawdown_bucket = _drawdown_bucket(max_drawdown_return_pct)
+        if decision_action == 'buy' and drawdown_bucket:
+            tokens.append(
+                CalibrationToken(
+                    category='outcome_path_buckets',
+                    key='outcome.drawdown_bucket',
+                    value=drawdown_bucket,
+                    label=f'Max drawdown: {drawdown_bucket}',
+                )
+            )
+        reward_risk_bucket = _reward_risk_bucket(decision=decision, outcome=outcome)
+        if decision_action == 'buy' and reward_risk_bucket:
+            tokens.append(
+                CalibrationToken(
+                    category='reward_risk_buckets',
+                    key='decision.reward_risk_bucket',
+                    value=reward_risk_bucket,
+                    label=f'Reward/risk: {reward_risk_bucket}',
+                )
+            )
+        return tokens
 
     def _build_group_tokens(
         self,
@@ -897,6 +1015,8 @@ class SignalDeciderCalibrationService:
         }
         if 'wait_reason_taxonomy' in categories:
             return 0
+        if categories.intersection({'outcome_path_buckets', 'reward_risk_buckets'}):
+            return 1
         if categories.intersection(
             {
                 'confidence_buckets',
@@ -906,12 +1026,12 @@ class SignalDeciderCalibrationService:
                 'factor_quality_buckets',
             }
         ):
-            return 1
-        if categories.intersection({'liquidity_buckets', 'price_location_buckets'}):
             return 2
-        if 'decision_actions' in categories:
+        if categories.intersection({'liquidity_buckets', 'price_location_buckets'}):
             return 3
-        return 4
+        if 'decision_actions' in categories:
+            return 4
+        return 5
 
     def _build_calibration_hints(
         self,
@@ -986,6 +1106,18 @@ class SignalDeciderCalibrationService:
                 f'Review whether {cluster_label.lower()} is weighted too aggressively in WAIT or REJECT guidance.'
                 if direction == 'negative'
                 else f'Keep {cluster_label.lower()} available as an explicit operator-facing blocker.'
+            )
+        elif categories.intersection(
+            {
+                'outcome_path_buckets',
+                'reward_risk_buckets',
+            }
+        ):
+            kind = 'scoring_guidance'
+            action = (
+                f'Consider preserving or rewarding {cluster_label.lower()} when it recurs.'
+                if direction == 'positive'
+                else f'Consider downgrading or vetoing buy candidates when {cluster_label.lower()} recurs.'
             )
         elif categories.intersection(
             {
