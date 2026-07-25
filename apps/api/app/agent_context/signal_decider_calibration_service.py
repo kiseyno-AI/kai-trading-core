@@ -65,6 +65,9 @@ GROUP_SECTION_LABELS: dict[str, str] = {
     'outcome_path_buckets': 'Outcome-path buckets',
     'reward_risk_buckets': 'Reward/risk buckets',
 }
+OUTCOME_DERIVED_GROUP_CATEGORIES: frozenset[str] = frozenset(
+    {'outcome_path_buckets', 'reward_risk_buckets'}
+)
 
 
 @dataclass(frozen=True)
@@ -709,6 +712,7 @@ class SignalDeciderCalibrationService:
                     key='outcome.path_bucket',
                     value=path_bucket,
                     label=f'Outcome path: {path_bucket}',
+                    cluster_eligible=False,
                 )
             )
         drawdown_bucket = _drawdown_bucket(max_drawdown_return_pct)
@@ -719,6 +723,7 @@ class SignalDeciderCalibrationService:
                     key='outcome.drawdown_bucket',
                     value=drawdown_bucket,
                     label=f'Max drawdown: {drawdown_bucket}',
+                    cluster_eligible=False,
                 )
             )
         reward_risk_bucket = _reward_risk_bucket(decision=decision, outcome=outcome)
@@ -729,6 +734,7 @@ class SignalDeciderCalibrationService:
                     key='decision.reward_risk_bucket',
                     value=reward_risk_bucket,
                     label=f'Reward/risk: {reward_risk_bucket}',
+                    cluster_eligible=False,
                 )
             )
         return tokens
@@ -1015,7 +1021,7 @@ class SignalDeciderCalibrationService:
         }
         if 'wait_reason_taxonomy' in categories:
             return 0
-        if categories.intersection({'outcome_path_buckets', 'reward_risk_buckets'}):
+        if categories.intersection(OUTCOME_DERIVED_GROUP_CATEGORIES):
             return 1
         if categories.intersection(
             {
@@ -1107,12 +1113,7 @@ class SignalDeciderCalibrationService:
                 if direction == 'negative'
                 else f'Keep {cluster_label.lower()} available as an explicit operator-facing blocker.'
             )
-        elif categories.intersection(
-            {
-                'outcome_path_buckets',
-                'reward_risk_buckets',
-            }
-        ):
+        elif categories.intersection(OUTCOME_DERIVED_GROUP_CATEGORIES):
             kind = 'scoring_guidance'
             action = (
                 f'Consider preserving or rewarding {cluster_label.lower()} when it recurs.'
@@ -1231,7 +1232,9 @@ class SignalDeciderCalibrationService:
         tokens = [
             token
             for token in list(cluster.get('tokens') or [])
-            if isinstance(token, dict) and _normalize_optional_text(token.get('key'))
+            if isinstance(token, dict)
+            and _normalize_optional_text(token.get('key'))
+            and str(token.get('category') or '') not in OUTCOME_DERIVED_GROUP_CATEGORIES
         ]
         if not self._has_policy_condition(tokens):
             return []
