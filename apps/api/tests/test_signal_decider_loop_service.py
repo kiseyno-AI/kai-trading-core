@@ -3671,6 +3671,33 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
         result = _build_rule_candidate_report(outcome_kind='bad_buy')
 
         candidates = list(result['rule_candidates']['items'])
+        outcome_categories = {'outcome_path_buckets', 'reward_risk_buckets'}
+        outcome_predicate_fields = {
+            'outcome.path_bucket',
+            'outcome.drawdown_bucket',
+            'decision.reward_risk_bucket',
+        }
+        outcome_path_buckets = result['group_summaries']['outcome_path_buckets']['items']
+        self.assertTrue(
+            any(
+                item['bucket_key'] == 'outcome.path_bucket'
+                and item['bucket_value'] == 'severe_drawdown_before_target'
+                and item['bad_buy_count'] == 3
+                for item in outcome_path_buckets
+            )
+        )
+        reward_risk_buckets = result['group_summaries']['reward_risk_buckets']['items']
+        self.assertTrue(
+            any(
+                item['bucket_key'] == 'decision.reward_risk_bucket'
+                for item in reward_risk_buckets
+            )
+        )
+        for direction in ('positive', 'negative'):
+            for cluster in result['condition_clusters'][direction]:
+                self.assertFalse(
+                    any(token['category'] in outcome_categories for token in cluster['tokens'])
+                )
         risk_candidates = [
             candidate
             for candidate in candidates
@@ -3695,6 +3722,20 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
                 for condition in candidate['predicate']['conditions']
             )
         )
+        non_action_conditions = [
+            condition
+            for condition in candidate['predicate']['conditions']
+            if condition['field'] != 'decision.action'
+        ]
+        self.assertTrue(non_action_conditions)
+        for risk_candidate in risk_candidates:
+            predicate_conditions = list(risk_candidate['predicate']['conditions'])
+            replay_conditions = list(
+                risk_candidate['recommended_replay_config']['predicate']['conditions']
+            )
+            for condition in predicate_conditions + replay_conditions:
+                self.assertNotIn(condition['field'], outcome_predicate_fields)
+                self.assertFalse(str(condition['field']).startswith('outcome.'))
 
     def test_signal_decider_calibration_rule_candidates_warn_on_missed_opportunity_cluster(self):
         result = _build_rule_candidate_report(outcome_kind='missed_opportunity')

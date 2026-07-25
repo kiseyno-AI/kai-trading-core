@@ -9,6 +9,8 @@ The route is read-only. It does not change prompts, policies, or scores in produ
 
 The response also includes `rule_candidates`, a backward-compatible section of deterministic, replay-only policy-rule candidates derived from negative condition clusters. These candidates are not active policy; every item defaults to `activation_status="needs_replay"` and includes a structured predicate plus replay configuration for later validation.
 
+`group_summaries.outcome_path_buckets` and `group_summaries.reward_risk_buckets` describe realized replay outcomes for operator review. They are reporting-only because they are known after the decision horizon matures, so they are excluded from `condition_clusters` and from every `rule_candidates[*].predicate.conditions` replay predicate.
+
 ## Example request
 ```http
 GET /agent-context/signal-decider/calibration?market_date_from=2026-04-20&market_date_to=2026-04-29&symbols=005930&symbols=000660&policy_version=signal_decider_policy_v1&horizon_days=5&evaluation_version=signal_decider_eval_v1&min_sample_size=3&cluster_limit=10
@@ -138,6 +140,53 @@ GET /agent-context/signal-decider/calibration?market_date_from=2026-04-20&market
           "negative_count": 2,
           "positive_rate": 0.0,
           "negative_rate": 0.666667
+        }
+      ]
+    },
+    "outcome_path_buckets": {
+      "label": "Outcome-path buckets",
+      "items": [
+        {
+          "bucket_type": "outcome_path_buckets",
+          "bucket_key": "outcome.path_bucket",
+          "bucket_value": "severe_drawdown_before_target",
+          "bucket_label": "Outcome path: severe_drawdown_before_target",
+          "sample_count": 1,
+          "decision_action_counts": {
+            "buy": 1
+          },
+          "grade_label_counts": {
+            "bad_buy": 1
+          },
+          "positive_count": 0,
+          "negative_count": 1,
+          "positive_rate": 0.0,
+          "negative_rate": 1.0,
+          "bad_buy_rate": 1.0
+        }
+      ]
+    },
+    "reward_risk_buckets": {
+      "label": "Reward/risk buckets",
+      "items": [
+        {
+          "bucket_type": "reward_risk_buckets",
+          "bucket_key": "decision.reward_risk_bucket",
+          "bucket_value": "reward_risk_1_3_to_2_0",
+          "bucket_label": "Reward/risk: reward_risk_1_3_to_2_0",
+          "sample_count": 4,
+          "decision_action_counts": {
+            "buy": 4
+          },
+          "grade_label_counts": {
+            "bad_buy": 1,
+            "good_buy": 3
+          },
+          "positive_count": 3,
+          "negative_count": 1,
+          "positive_rate": 0.75,
+          "negative_rate": 0.25,
+          "bad_buy_rate": 0.25
         }
       ]
     }
