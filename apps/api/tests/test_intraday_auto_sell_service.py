@@ -407,6 +407,51 @@ class IntradayAutoSellServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second['summary']['selected_count'], 0)
         self.assertEqual(len(self.order_service.calls), 1)
 
+    async def test_run_intraday_auto_sell_uses_protective_performance_target(self) -> None:
+        self._seed_next_open_entry(filled_quantity='5', planned_quantity='5')
+        performance_criteria = {
+            'schema_version': 'signal_decider_performance_criteria_v1',
+            'status': 'ready',
+            'sample_count': 10,
+            'performance_buckets': [
+                {
+                    'bucket_key': 'decision.reward_risk_bucket',
+                    'bucket_value': 'reward_risk_1_3_to_2_0',
+                    'sample_count': 5,
+                    'bad_buy_rate': 0.80,
+                    'negative_rate': 0.80,
+                    'avg_close_return_pct': -1.2,
+                }
+            ],
+            'rule_candidates': [],
+        }
+        with session_scope() as session:
+            snapshot = session.execute(
+                select(SignalDeciderDecisionSnapshot).where(
+                    SignalDeciderDecisionSnapshot.symbol == self.symbol,
+                    SignalDeciderDecisionSnapshot.market_date == self.market_date,
+                )
+            ).scalar_one()
+            snapshot.request_payload = {
+                'signal_decider_policy': {
+                    'current_version': 'signal_decider_policy_test',
+                    'performance_criteria': performance_criteria,
+                }
+            }
+        self._set_live_position(quantity='5', sellable_quantity='5')
+        self._set_live_quote(price=53200)
+
+        result = await self._service().run_intraday_auto_sell_if_due(force=True, trigger='test')
+
+        self.assertEqual(result['summary']['submitted_count'], 1)
+        item = result['items'][0]
+        self.assertEqual(item['validation']['trigger']['rule'], 'target_hit')
+        self.assertEqual(item['validation']['trigger']['target_price'], 54000)
+        self.assertEqual(item['validation']['trigger']['effective_target_price'], 53200)
+        self.assertTrue(item['validation']['trigger']['performance_exit']['protective_exit_applied'])
+        warning_codes = {warning['code'] for warning in item['validation']['warnings']}
+        self.assertIn('performance_protective_exit_thresholds_applied', warning_codes)
+
     async def test_retry_uses_new_client_order_id_after_reject_and_cooldown(self) -> None:
         self._seed_next_open_entry(filled_quantity='5', planned_quantity='5')
         self._set_live_position(quantity='5', sellable_quantity='5')

@@ -9,7 +9,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Sequence
 from urllib.parse import quote, urlparse
 
@@ -82,8 +82,14 @@ from app.agent_context.reuse_service import (
     agent_context_reuse_service,
 )
 from app.agent_context.session_cleanup_service import SessionCleanupTarget, agent_feedback_session_cleanup_service
+from app.agent_context.signal_decider_calibration_service import signal_decider_calibration_service
 from app.agent_context.signal_decider_market_context import signal_decider_market_context_builder
-from app.agent_context.signal_decider_loop_service import signal_decider_loop_service
+from app.agent_context.signal_decider_loop_service import (
+    DEFAULT_SIGNAL_DECIDER_EVALUATION_LOOKBACK_DAYS,
+    DEFAULT_SIGNAL_DECIDER_EVALUATION_VERSION,
+    DEFAULT_SIGNAL_DECIDER_REVIEW_PRIMARY_HORIZON,
+    signal_decider_loop_service,
+)
 from app.core.settings import settings
 from app.db import session_scope
 from app.db_models import AgentContextFeedback, EODCollectionRun
@@ -1031,6 +1037,7 @@ class OpenClawAgentClient:
             "If previous_decision_context is present, use it to populate decision_delta, avoid copy-pasting the prior wait narrative, and explain both the stable blockers and the concrete upgrade trigger.\n"
             "Interpret decider_data_quality_context.decision_priority literally: core_execution gaps can justify conservative wait/reject, while auxiliary_context gaps are confidence reducers only by default.\n"
             "Interpret decision_input_quality_context.final_judgment and execution_feasibility as the source-attributed buy-quality guardrail; hard_blocks should prevent buy/watch upgrades unless directly contradicted by fresher supplied evidence.\n"
+            "Interpret signal_decider_policy.performance_criteria as recent replay-backed buy/wait/reject calibration: use win/loss rates, realized/replay returns, drawdown, reward/risk, bad-buy clusters, and missed-opportunity clusters to tighten or relax the actual action threshold instead of only changing wording, labels, or rationale detail.\n"
             "Interpret market_regime_context as the authoritative market/sector regime guardrail: defensive/risk_off should default to wait/reject unless exceptional relative/sector leadership is evident; normal preserves existing sizing/entry rules; aggressive_open and trend_day may support faster or continuation-oriented entries only inside the supplied bounded window, while quantity_multiplier remains an exec-side capped hint and never bypasses stop-loss or account/symbol/notional safety gates.\n"
             "Empty recent news means no captured recent news and is neutral unless separate risk evidence exists.\n"
             "Do not forecast price reaction from news alone; use external news only as source-backed material/noise context, and do not treat headline-only, paywalled, or fetch-failed items as full-text summaries.\n"
@@ -1067,6 +1074,7 @@ class OpenClawAgentClient:
                 "For decision-support outputs, provide explicit target_price and stop_loss_price levels for each symbol whenever possible; short-term-decider must also provide trigger_price and chase_limit_price. If a level is genuinely not supportable, keep the key and explain the limitation in data_quality_warnings.\n"
                 "Interpret decider_data_quality_context.decision_priority literally: core_execution gaps can justify conservative wait/reject, while auxiliary_context gaps are confidence reducers only by default.\n"
                 "Interpret decision_input_quality_context.final_judgment and execution_feasibility as the source-attributed buy-quality guardrail; hard_blocks should prevent buy/watch upgrades unless directly contradicted by fresher supplied evidence.\n"
+                "Interpret signal_decider_policy.performance_criteria as recent replay-backed buy/wait/reject calibration: use win/loss rates, realized/replay returns, drawdown, reward/risk, bad-buy clusters, and missed-opportunity clusters to tighten or relax the actual action threshold instead of only changing wording, labels, or rationale detail.\n"
                 "Interpret market_regime_context as the authoritative market/sector regime guardrail: defensive/risk_off should default to wait/reject unless exceptional relative/sector leadership is evident; normal preserves existing sizing/entry rules; aggressive_open and trend_day may support faster or continuation-oriented entries only inside the supplied bounded window, while quantity_multiplier remains an exec-side capped hint and never bypasses stop-loss or account/symbol/notional safety gates.\n"
                 "Empty recent news means no captured recent news and is neutral unless separate risk evidence exists.\n"
                 "Do not forecast price reaction from news alone; use external news only as source-backed material/noise context, and do not treat headline-only, paywalled, or fetch-failed items as full-text summaries.\n"
@@ -1900,6 +1908,11 @@ class AgentFeedbackOrchestrator:
                 if role == SIGNAL_DECIDER_AGENT_NAME
                 else {}
             )
+            if role == SIGNAL_DECIDER_AGENT_NAME:
+                active_signal_decider_policy = self._attach_signal_decider_performance_criteria(
+                    policy_context=active_signal_decider_policy,
+                    market_date=market_date,
+                )
 
         dispatch_items: list[dict[str, Any]] = []
         for item in symbol_context_items:
@@ -1972,6 +1985,162 @@ class AgentFeedbackOrchestrator:
                 )
             )
         return dispatch_items
+
+    def _attach_signal_decider_performance_criteria(
+        self,
+        *,
+        policy_context: dict[str, Any],
+        market_date: date,
+    ) -> dict[str, Any]:
+        criteria = self._build_signal_decider_performance_criteria(
+            policy_context=policy_context,
+            market_date=market_date,
+        )
+        if not criteria:
+            return policy_context
+        return {
+            **policy_context,
+            'performance_criteria': criteria,
+        }
+
+    def _build_signal_decider_performance_criteria(
+        self,
+        *,
+        policy_context: dict[str, Any],
+        market_date: date,
+    ) -> dict[str, Any] | None:
+        policy_version = str(policy_context.get('current_version') or '').strip() or None
+        market_date_to = market_date - timedelta(days=1)
+        market_date_from = market_date_to - timedelta(days=DEFAULT_SIGNAL_DECIDER_EVALUATION_LOOKBACK_DAYS)
+        try:
+            report = signal_decider_calibration_service.build_report(
+                market_date_from=market_date_from,
+                market_date_to=market_date_to,
+                policy_version=policy_version,
+                horizon_days=DEFAULT_SIGNAL_DECIDER_REVIEW_PRIMARY_HORIZON,
+                evaluation_version=DEFAULT_SIGNAL_DECIDER_EVALUATION_VERSION,
+                min_sample_size=3,
+                cluster_limit=6,
+            )
+        except Exception as exc:  # Calibration context should degrade dispatch, not block the decider.
+            logger.warning('signal_decider_performance_criteria_unavailable: %s', exc)
+            return {
+                'schema_version': 'signal_decider_performance_criteria_v1',
+                'status': 'unavailable',
+                'reason': 'calibration_report_unavailable',
+                'auto_apply_policy_changes': False,
+                'manual_review_only': True,
+            }
+
+        summary = report.get('summary') if isinstance(report.get('summary'), dict) else {}
+        if summary.get('status') not in {'ready', 'insufficient_sample'}:
+            return {
+                'schema_version': 'signal_decider_performance_criteria_v1',
+                'status': summary.get('status') or 'empty',
+                'request': report.get('request') or {},
+                'sample_count': int(summary.get('mature_computed_count') or 0),
+                'auto_apply_policy_changes': False,
+                'manual_review_only': True,
+            }
+
+        return {
+            'schema_version': 'signal_decider_performance_criteria_v1',
+            'status': summary.get('status'),
+            'request': report.get('request') or {},
+            'sample_count': int(summary.get('mature_computed_count') or 0),
+            'overall': {
+                'decision_action_counts': summary.get('decision_action_counts') or {},
+                'grade_label_counts': summary.get('grade_label_counts') or {},
+                'positive_outcome_rate': summary.get('positive_outcome_rate'),
+                'negative_outcome_rate': summary.get('negative_outcome_rate'),
+                'coverage_gap_count': summary.get('coverage_gap_count'),
+            },
+            'performance_buckets': self._compact_signal_decider_performance_buckets(
+                report.get('group_summaries') if isinstance(report.get('group_summaries'), dict) else {}
+            ),
+            'rule_candidates': self._compact_signal_decider_rule_candidates(
+                report.get('rule_candidates') if isinstance(report.get('rule_candidates'), dict) else {}
+            ),
+            'guidance': self._compact_signal_decider_guidance(
+                report.get('calibration_hints') if isinstance(report.get('calibration_hints'), dict) else {}
+            ),
+            'usage_policy': {
+                'use_for_buy_wait_reject_thresholds': True,
+                'tighten_buy_when_matching_bucket_has_bad_buy_or_negative_return': True,
+                'relax_wait_or_reject_when_matching_bucket_has_missed_opportunity': True,
+                'reward_risk_and_outcome_path_override_name_only_reasoning': True,
+                'auto_apply_policy_changes': False,
+                'manual_review_only': True,
+            },
+        }
+
+    @staticmethod
+    def _compact_signal_decider_performance_buckets(group_summaries: dict[str, Any]) -> list[dict[str, Any]]:
+        compacted: list[dict[str, Any]] = []
+        preferred_sections = (
+            'decision_actions',
+            'outcome_path_buckets',
+            'reward_risk_buckets',
+            'confidence_buckets',
+            'factor_signal_score_buckets',
+            'factor_momentum_buckets',
+            'factor_quality_buckets',
+        )
+        for section in preferred_sections:
+            section_payload = group_summaries.get(section)
+            buckets = section_payload.get('items') if isinstance(section_payload, dict) else None
+            if not isinstance(buckets, list):
+                continue
+            for bucket in buckets[:4]:
+                if not isinstance(bucket, dict):
+                    continue
+                compacted.append(
+                    {
+                        'bucket_type': bucket.get('bucket_type') or section,
+                        'bucket_key': bucket.get('bucket_key'),
+                        'bucket_value': bucket.get('bucket_value'),
+                        'sample_count': bucket.get('sample_count'),
+                        'positive_rate': bucket.get('positive_rate'),
+                        'negative_rate': bucket.get('negative_rate'),
+                        'bad_buy_rate': bucket.get('bad_buy_rate'),
+                        'missed_opportunity_rate': bucket.get('missed_opportunity_rate'),
+                        'avg_close_return_pct': bucket.get('avg_close_return_pct'),
+                        'avg_max_upside_return_pct': bucket.get('avg_max_upside_return_pct'),
+                        'avg_max_drawdown_return_pct': bucket.get('avg_max_drawdown_return_pct'),
+                    }
+                )
+        return compacted[:18]
+
+    @staticmethod
+    def _compact_signal_decider_rule_candidates(rule_candidates: dict[str, Any]) -> list[dict[str, Any]]:
+        items = rule_candidates.get('items') if isinstance(rule_candidates, dict) else None
+        if not isinstance(items, list):
+            return []
+        compacted: list[dict[str, Any]] = []
+        for item in items[:8]:
+            if not isinstance(item, dict):
+                continue
+            compacted.append(
+                {
+                    'candidate_id': item.get('candidate_id'),
+                    'candidate_type': item.get('candidate_type'),
+                    'predicate': item.get('predicate'),
+                    'reason': item.get('reason'),
+                    'support_sample_count': item.get('support_sample_count'),
+                    'evaluated_sample_count': item.get('evaluated_sample_count'),
+                    'negative_rate': item.get('negative_rate'),
+                    'activation_status': item.get('activation_status'),
+                }
+            )
+        return compacted
+
+    @staticmethod
+    def _compact_signal_decider_guidance(guidance: dict[str, Any]) -> dict[str, Any]:
+        return {
+            key: list(value)[:3]
+            for key, value in guidance.items()
+            if key in {'prompt_guidance', 'scoring_guidance', 'operator_review'} and isinstance(value, list)
+        }
 
     def _wait_for_subagent_feedback(
         self,

@@ -1398,6 +1398,17 @@ def build_signal_decider_payload(
                     'final_judgment',
                 ],
                 'respect_decision_input_quality_hard_blocks': True,
+                'performance_criteria_authoritative': True,
+                'performance_criteria_sections': [
+                    'overall',
+                    'performance_buckets',
+                    'rule_candidates',
+                    'guidance',
+                ],
+                'use_win_loss_return_drawdown_and_reward_risk_to_adjust_action_thresholds': True,
+                'tighten_buy_threshold_for_bad_buy_or_negative_return_clusters': True,
+                'relax_wait_reject_threshold_for_missed_opportunity_clusters': True,
+                'do_not_limit_decider_improvement_to_reason_names_or_text_detail': True,
                 'pre_decider_enrichment_blocks': [
                     'quote_orderbook_snapshot',
                     'trading_value',
