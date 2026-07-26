@@ -187,6 +187,90 @@ class RepairJsonTailTests(unittest.TestCase):
                 'decision_input_quality_context_authoritative'
             ]
         )
+        self.assertTrue(
+            payload['decision_support_constraints']['missing_context_policy'][
+                'performance_criteria_authoritative'
+            ]
+        )
+        self.assertTrue(
+            payload['decision_support_constraints']['missing_context_policy'][
+                'use_win_loss_return_drawdown_and_reward_risk_to_adjust_action_thresholds'
+            ]
+        )
+        self.assertTrue(
+            payload['decision_support_constraints']['missing_context_policy'][
+                'do_not_limit_decider_improvement_to_reason_names_or_text_detail'
+            ]
+        )
+
+    def test_signal_decider_performance_criteria_compacts_recent_calibration_report(self):
+        service = AgentFeedbackOrchestrator()
+        report = {
+            'request': {
+                'market_date_from': '2026-06-13',
+                'market_date_to': '2026-07-13',
+                'policy_version': 'signal_decider_policy_v1',
+                'horizon_days': 5,
+            },
+            'summary': {
+                'status': 'ready',
+                'mature_computed_count': 12,
+                'decision_action_counts': {'buy': 5, 'wait': 7},
+                'grade_label_counts': {'bad_buy': 4, 'missed_opportunity_after_wait': 3},
+                'positive_outcome_rate': 0.416667,
+                'negative_outcome_rate': 0.583333,
+                'coverage_gap_count': 0,
+            },
+            'group_summaries': {
+                'reward_risk_buckets': {
+                    'items': [
+                        {
+                            'bucket_type': 'reward_risk_buckets',
+                            'bucket_key': 'reward_risk',
+                            'bucket_value': 'reward_risk_lt_1_0',
+                            'sample_count': 4,
+                            'negative_rate': 0.75,
+                            'bad_buy_rate': 0.75,
+                            'avg_close_return_pct': -2.1,
+                            'avg_max_drawdown_return_pct': -4.8,
+                        }
+                    ]
+                }
+            },
+            'rule_candidates': {
+                'items': [
+                    {
+                        'candidate_id': 'rule-1',
+                        'candidate_type': 'buy_veto',
+                        'predicate': {'field': 'reward_risk', 'operator': 'eq', 'value': 'reward_risk_lt_1_0'},
+                        'reason': '3/4 matching buys graded bad.',
+                        'support_sample_count': 3,
+                        'evaluated_sample_count': 4,
+                        'negative_rate': 0.75,
+                        'activation_status': 'needs_replay',
+                    }
+                ]
+            },
+            'calibration_hints': {
+                'scoring_guidance': [{'kind': 'scoring_guidance', 'title': 'Negative cluster'}],
+            },
+        }
+
+        with patch.object(orchestrator_module.signal_decider_calibration_service, 'build_report', return_value=report):
+            criteria = service._build_signal_decider_performance_criteria(
+                policy_context={'current_version': 'signal_decider_policy_v1'},
+                market_date=date(2026, 7, 14),
+            )
+
+        self.assertEqual(criteria['status'], 'ready')
+        self.assertEqual(criteria['sample_count'], 12)
+        self.assertEqual(criteria['overall']['negative_outcome_rate'], 0.583333)
+        self.assertEqual(criteria['performance_buckets'][0]['bucket_value'], 'reward_risk_lt_1_0')
+        self.assertEqual(criteria['performance_buckets'][0]['bad_buy_rate'], 0.75)
+        self.assertEqual(criteria['rule_candidates'][0]['candidate_id'], 'rule-1')
+        self.assertTrue(criteria['usage_policy']['use_for_buy_wait_reject_thresholds'])
+        self.assertTrue(criteria['usage_policy']['reward_risk_and_outcome_path_override_name_only_reasoning'])
+        self.assertFalse(criteria['usage_policy']['auto_apply_policy_changes'])
 
     def test_build_signal_decider_payload_includes_signal_envelopes_without_replacing_raw_blocks(self):
         upstream_summaries = {

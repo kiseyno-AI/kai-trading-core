@@ -35,6 +35,7 @@ from app.orders.next_open_execution import (
     EXECUTION_WINDOW_NEXT_OPEN,
 )
 from app.orders.signal_decider_execution_outcomes import signal_decider_execution_outcome_service
+from app.orders.signal_decider_performance_gates import build_protective_exit_thresholds
 from app.orders.service import (
     TradingOrderPendingSubmissionError,
     TradingOrderRejectedError,
@@ -631,17 +632,42 @@ class SignalDeciderIntradayAutoSellService:
                     )
                 )
 
+            request_payload = (
+                snapshot.request_payload
+                if isinstance(snapshot.request_payload, dict)
+                else {}
+            )
+            performance_exit = build_protective_exit_thresholds(
+                request_payload=request_payload,
+                decision_action='buy',
+                confidence_score_10=snapshot.confidence_score_10,
+                reference_price=source.row.estimated_reference_price,
+                target_price=snapshot.target_price,
+                stop_loss_price=snapshot.stop_loss_price,
+            )
+            effective_target_price = performance_exit.get('effective_target_price') or snapshot.target_price
+            effective_stop_loss_price = performance_exit.get('effective_stop_loss_price') or snapshot.stop_loss_price
+            if performance_exit.get('protective_exit_applied'):
+                warnings.append(
+                    _reason(
+                        'performance_protective_exit_thresholds_applied',
+                        'Recent replay performance matched weak buy criteria, so auto-sell uses tighter effective target/stop thresholds.',
+                        effective_target_price=effective_target_price,
+                        effective_stop_loss_price=effective_stop_loss_price,
+                    )
+                )
+
             trigger_rule: str | None = None
             if (
                 observed_price is not None
                 and observed_price > Decimal('0')
-                and snapshot.target_price
-                and snapshot.stop_loss_price
+                and effective_target_price
+                and effective_stop_loss_price
             ):
                 trigger_rule = self._resolve_trigger_rule(
                     observed_price=observed_price,
-                    target_price=Decimal(str(snapshot.target_price)),
-                    stop_loss_price=Decimal(str(snapshot.stop_loss_price)),
+                    target_price=Decimal(str(effective_target_price)),
+                    stop_loss_price=Decimal(str(effective_stop_loss_price)),
                 )
 
             if latest_attempt is not None:
@@ -693,6 +719,9 @@ class SignalDeciderIntradayAutoSellService:
                     'live_price': _to_json_number(observed_price),
                     'target_price': snapshot.target_price,
                     'stop_loss_price': snapshot.stop_loss_price,
+                    'effective_target_price': effective_target_price,
+                    'effective_stop_loss_price': effective_stop_loss_price,
+                    'performance_exit': performance_exit,
                     'watched_quantity': _decimal_to_text(watched_quantity),
                     'entry_filled_quantity': _decimal_to_text(entry_filled_quantity),
                     'linked_remaining_quantity': _decimal_to_text(linked_remaining_quantity),
@@ -725,6 +754,9 @@ class SignalDeciderIntradayAutoSellService:
                 'linked_entry_filled_quantity': _decimal_to_text(entry_filled_quantity),
                 'target_price': snapshot.target_price,
                 'stop_loss_price': snapshot.stop_loss_price,
+                'effective_target_price': effective_target_price,
+                'effective_stop_loss_price': effective_stop_loss_price,
+                'performance_exit': performance_exit,
                 'suggested_holding_period': snapshot.suggested_holding_period,
                 'holding_period_min_days': holding_min_days,
                 'holding_period_max_days': holding_max_days,

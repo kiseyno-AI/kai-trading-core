@@ -43,6 +43,7 @@ from app.market.session import (
 from app.market_data_store import load_daily_bars_for_symbol_range, load_daily_pykrx_enrichment_rows
 from app.orders.account_scope import parse_kis_account_reference
 from app.orders.signal_decider_execution_outcomes import signal_decider_execution_outcome_service
+from app.orders.signal_decider_performance_gates import evaluate_next_open_performance_gate
 from app.orders.service import (
     TradingOrderPendingSubmissionError,
     TradingOrderRejectedError,
@@ -2097,6 +2098,30 @@ class SignalDeciderNextOpenExecutionService:
                     )
             pricing_note = 'Configured budget rail is used for local quantity preview only.'
 
+        performance_gate: dict[str, Any] = {'status': 'not_applicable'}
+        if decision_agent_name == SIGNAL_DECIDER_AGENT_NAME:
+            performance_gate = evaluate_next_open_performance_gate(
+                request_payload=_snapshot_request_payload(snapshot),
+                decision_action=generic_action,
+                confidence_score_10=snapshot.confidence_score_10,
+                expected_return_pct=snapshot.expected_return_pct,
+                reference_price=estimated_reference_price,
+                target_price=snapshot.target_price,
+                stop_loss_price=snapshot.stop_loss_price,
+                base_min_confidence_score_10=settings.signal_decider_next_open_min_confidence_score_10,
+                base_min_expected_return_pct=settings.signal_decider_next_open_min_expected_return_pct,
+            )
+            blocking_reasons.extend(
+                reason
+                for reason in performance_gate.get('blocking_reasons', [])
+                if isinstance(reason, dict)
+            )
+            warnings.extend(
+                warning
+                for warning in performance_gate.get('warnings', [])
+                if isinstance(warning, dict)
+            )
+
         decision_input_quality_context = _snapshot_decision_input_quality_context(
             snapshot,
             target=target,
@@ -2158,6 +2183,7 @@ class SignalDeciderNextOpenExecutionService:
                 'planned_quantity': _decimal_to_text(planned_quantity),
                 'estimated_notional_krw': _decimal_to_text(estimated_notional),
             },
+            'performance_gate': performance_gate,
             'pre_decider_enrichment_context': pre_decider_enrichment_context,
             'market_regime_context': market_regime_context,
             'decision_input_quality_context': decision_input_quality_context,

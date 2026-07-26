@@ -814,6 +814,54 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('decision_input_quality_liquidity_turnover_hard_block', block_codes)
         self.assertIn('decision_input_quality_source_turnover_missing', block_codes)
 
+    def test_refresh_plan_items_blocks_buy_when_performance_reward_risk_bucket_is_weak(self) -> None:
+        snapshot_id = self._seed_snapshot(symbol='005930')
+        performance_criteria = {
+            'schema_version': 'signal_decider_performance_criteria_v1',
+            'status': 'ready',
+            'sample_count': 12,
+            'overall': {
+                'positive_outcome_rate': 0.30,
+                'negative_outcome_rate': 0.65,
+            },
+            'performance_buckets': [
+                {
+                    'bucket_key': 'decision.reward_risk_bucket',
+                    'bucket_value': 'reward_risk_lt_1_3',
+                    'sample_count': 5,
+                    'bad_buy_rate': 0.80,
+                    'negative_rate': 0.80,
+                    'avg_close_return_pct': -1.7,
+                }
+            ],
+            'rule_candidates': [],
+        }
+        with session_scope() as session:
+            snapshot = session.get(SignalDeciderDecisionSnapshot, snapshot_id)
+            snapshot.target_price = 51000
+            snapshot.stop_loss_price = 49000
+            snapshot.request_payload = {
+                **(snapshot.request_payload or {}),
+                'signal_decider_policy': {
+                    'current_version': self.policy_version,
+                    'performance_criteria': performance_criteria,
+                },
+            }
+        service = self._service(state='PREOPEN', server_time='2026-04-30T08:40:00+09:00')
+
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[{'trade_date': '2026-04-29', 'close_price': 50000}],
+        ):
+            result = service.refresh_plan_items(target_trade_date=self.target_trade_date, trigger='test')
+
+        item = result['items'][0]
+        self.assertEqual(item['eligibility_status'], ELIGIBILITY_BLOCKED)
+        self.assertEqual(item['validation']['performance_gate']['feature_values']['decision.reward_risk_bucket'], 'reward_risk_lt_1_3')
+        block_codes = {reason['code'] for reason in item['validation']['blocking_reasons']}
+        self.assertIn('performance_reward_risk_gate_blocked', block_codes)
+        self.assertIn('performance_adjusted_confidence_below_threshold', block_codes)
+
     def test_refresh_plan_items_reuses_cached_policy_context_by_policy_version(self) -> None:
         self._seed_snapshot(symbol='005930')
         self._seed_snapshot(symbol='000660')
