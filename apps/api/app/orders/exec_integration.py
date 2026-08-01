@@ -5996,6 +5996,8 @@ class SignalDeciderExecIntegrationService:
             return UI_BOARD_STATUS_PARTIAL
         if statuses & ({'watch_buy_submitted'} | REMOTE_SUBMITTED_STATUSES):
             return UI_BOARD_STATUS_SUBMITTED
+        if statuses & {'watch_monitoring_active', 'active', 'monitoring'}:
+            return UI_BOARD_STATUS_ACCEPTED
         if statuses & ({'watch_monitoring_pending'} | REMOTE_SCHEDULED_STATUSES):
             return UI_BOARD_STATUS_SCHEDULED
         if statuses & EXEC_WATCH_READBACK_ACTIVE_STATUSES:

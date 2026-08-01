@@ -763,6 +763,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self,
         *,
         exec_status: str = 'watch_monitoring_active',
+        response_item_status: str | None = None,
     ) -> tuple[dict, dict, int]:
         short_snapshot_id = self._seed_short_term_snapshot()
         short_plan_item_id = self._seed_short_term_plan_item(snapshot_id=short_snapshot_id)
@@ -820,7 +821,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                             'execution_plan_item_id': 'exec-short-watch-1',
                             'symbol': self.symbol,
                             'intent': EXEC_INTENT_INTRADAY_WATCH_BUY,
-                            'status': exec_status,
+                            'status': response_item_status or exec_status,
                             'monitoring_status': exec_status,
                         }
                     ],
@@ -1778,6 +1779,29 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 ).scalars().all(),
                 [],
             )
+
+    async def test_runtime_read_model_prioritizes_active_exec_watch_over_accepted_status(self) -> None:
+        _, _, short_plan_item_id = await self._readback_stale_short_term_watch(
+            exec_status='watch_monitoring_active',
+            response_item_status='accepted',
+        )
+
+        board = await self.service.get_runtime_daily_board(
+            market_date=self.target_trade_date,
+            refresh=False,
+            trigger='test',
+        )
+        short_board_item = next(
+            item
+            for item in board['items']
+            if item['plan_item_id'] == short_plan_item_id
+        )
+
+        self.assertEqual(short_board_item['status'], 'accepted')
+        self.assertEqual(short_board_item['monitoring_state'], 'watching_fill')
+        self.assertTrue(short_board_item['exec_monitoring_active'])
+        self.assertTrue(short_board_item['exec_runtime_showable'])
+        self.assertEqual(short_board_item['exec_runtime_state'], 'exec_approved_watch')
 
     async def test_overview_warns_when_exec_watch_active_but_core_was_blocked_planned(self) -> None:
         overview, short_item, _ = await self._readback_stale_short_term_watch(
