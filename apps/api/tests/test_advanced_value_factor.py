@@ -1,11 +1,22 @@
 import unittest
 from datetime import date
+from types import SimpleNamespace
 from unittest.mock import patch
+from uuid import uuid4
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, text
 
 from app.db import engine, session_scope
-from app.db_models import DailyAdvancedValueFactorResult, Symbol
+from app.db_models import (
+    DailyAdvancedValueFactorResult,
+    DartDisclosureEvent,
+    DartDisclosureSyncRun,
+    DartFundamentalsCaptureRun,
+    DartFundamentalsHighlight,
+    DartFundamentalsRow,
+    DartFundamentalsSnapshot,
+    Symbol,
+)
 from app.market_data_store import load_daily_advanced_value_factor_results
 from app.signals.advanced_value_factor import (
     ADVANCED_VALUE_ELIGIBLE_SCORE,
@@ -648,6 +659,273 @@ class DailyAdvancedValueFactorServiceTests(unittest.TestCase):
         self.assertEqual(result['feature_version'], ADVANCED_VALUE_FACTOR_VERSION)
         self.assertEqual(result['summary']['requested_symbol'], '005930')
         self.assertEqual(result['item'], stored_items[0])
+
+
+class _FakeLoaderResult:
+    def __init__(self, rows: list) -> None:
+        self.rows = rows
+
+    def mappings(self):
+        return self
+
+    def all(self):
+        return self.rows
+
+    def scalars(self):
+        return self.rows
+
+
+class _FakeSessionScope:
+    def __init__(self, session) -> None:
+        self.session = session
+
+    def __enter__(self):
+        return self.session
+
+    def __exit__(self, exc_type, exc, traceback) -> bool:
+        return False
+
+
+class _FakeFundamentalsLoaderSession:
+    def __init__(self, symbols: list[str]) -> None:
+        self.snapshot_rows_by_symbol = {
+            symbol: {
+                'snapshot_id': index + 1,
+                'stock_code': symbol,
+                'corp_name': f'Test Corp {symbol}',
+                'business_year': 2025,
+                'report_code': '11011',
+                'fs_div': 'CFS',
+                'period_type': 'annual',
+                'receipt_date': date(2026, 3, 20),
+                'rcept_no': f'TAV{index + 1:012d}',
+                'captured_at': None,
+                'currency': 'KRW',
+            }
+            for index, symbol in enumerate(symbols)
+        }
+        self.highlight_chunks: list[list[int]] = []
+        self.statement_row_chunks: list[list[int]] = []
+
+    def execute(self, statement, params=None):
+        if params and any(str(key).startswith('symbol_') for key in params):
+            requested_symbols = [
+                params[key]
+                for key in sorted(params)
+                if str(key).startswith('symbol_')
+            ]
+            return _FakeLoaderResult(
+                [
+                    self.snapshot_rows_by_symbol[symbol]
+                    for symbol in requested_symbols
+                    if symbol in self.snapshot_rows_by_symbol
+                ]
+            )
+
+        entity = None
+        column_descriptions = getattr(statement, 'column_descriptions', None)
+        if column_descriptions:
+            entity = column_descriptions[0].get('entity')
+        if entity in {DartFundamentalsHighlight, DartFundamentalsRow}:
+            snapshot_ids = next(
+                value
+                for value in statement.compile().params.values()
+                if isinstance(value, list)
+            )
+            if entity is DartFundamentalsHighlight:
+                self.highlight_chunks.append(list(snapshot_ids))
+                return _FakeLoaderResult(
+                    [
+                        SimpleNamespace(
+                            snapshot_id=snapshot_id,
+                            metric_key='total_equity',
+                            metric_type='balance',
+                            statement_type='BS',
+                            statement_name='financial_statement',
+                            account_id='ifrs-full_Equity',
+                            account_name='자본총계',
+                            current_amount=1000 + snapshot_id,
+                            current_cumulative_amount=None,
+                            ratio_value=None,
+                            currency='KRW',
+                        )
+                        for snapshot_id in snapshot_ids
+                    ]
+                )
+            self.statement_row_chunks.append(list(snapshot_ids))
+            return _FakeLoaderResult([])
+
+        return _FakeLoaderResult([])
+
+
+class DailyAdvancedValueFactorFundamentalsLoaderTests(unittest.TestCase):
+    def test_load_latest_annual_fundamentals_loads_highlights_for_large_universe_without_rows(self) -> None:
+        service = DailyAdvancedValueFactorService()
+        symbols = [f'TAVH{index:04d}' for index in range(501)]
+        fake_session = _FakeFundamentalsLoaderSession(symbols)
+
+        with patch(
+            'app.signals.advanced_value_factor.session_scope',
+            return_value=_FakeSessionScope(fake_session),
+        ):
+            result = service._load_latest_annual_fundamentals(
+                market_date=date(2026, 4, 24),
+                symbols=symbols,
+            )
+
+        self.assertEqual(len(result), len(symbols))
+        self.assertEqual([len(chunk) for chunk in fake_session.highlight_chunks], [500, 1])
+        self.assertEqual(fake_session.statement_row_chunks, [])
+        self.assertEqual(result[symbols[0]].highlights_by_key['total_equity']['current_amount'], 1001)
+        self.assertEqual(result[symbols[-1]].highlights_by_key['total_equity']['current_amount'], 1501)
+        self.assertEqual(result[symbols[0]].statement_rows, [])
+
+
+class DailyAdvancedValueFactorFundamentalsLoaderIntegrationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        DartDisclosureSyncRun.__table__.create(bind=engine, checkfirst=True)
+        DartFundamentalsCaptureRun.__table__.create(bind=engine, checkfirst=True)
+        DartDisclosureEvent.__table__.create(bind=engine, checkfirst=True)
+        DartFundamentalsSnapshot.__table__.create(bind=engine, checkfirst=True)
+        DartFundamentalsHighlight.__table__.create(bind=engine, checkfirst=True)
+        DartFundamentalsRow.__table__.create(bind=engine, checkfirst=True)
+
+    def setUp(self) -> None:
+        self.service = DailyAdvancedValueFactorService()
+        self.created_event_ids: list[int] = []
+        self.created_snapshot_ids: list[int] = []
+
+    def tearDown(self) -> None:
+        if not self.created_event_ids and not self.created_snapshot_ids:
+            return
+        with session_scope() as session:
+            session.execute(text("SET LOCAL statement_timeout = '60s'"))
+            if self.created_snapshot_ids:
+                session.execute(
+                    delete(DartFundamentalsHighlight).where(
+                        DartFundamentalsHighlight.snapshot_id.in_(self.created_snapshot_ids)
+                    )
+                )
+                session.execute(
+                    delete(DartFundamentalsRow).where(
+                        DartFundamentalsRow.snapshot_id.in_(self.created_snapshot_ids)
+                    )
+                )
+                session.execute(
+                    delete(DartFundamentalsSnapshot).where(
+                        DartFundamentalsSnapshot.id.in_(self.created_snapshot_ids)
+                    )
+                )
+            if self.created_event_ids:
+                session.execute(
+                    delete(DartDisclosureEvent).where(DartDisclosureEvent.id.in_(self.created_event_ids))
+                )
+
+    def _create_fundamentals_snapshot(
+        self,
+        *,
+        stock_code: str,
+        business_year: int,
+        receipt_date: date,
+        total_equity: int,
+    ) -> int:
+        suffix = uuid4().hex[:16].upper()
+        rcept_no = f'TAV{suffix}'
+        corp_code = f'C{suffix[:12]}'
+        with session_scope() as session:
+            session.execute(text("SET LOCAL statement_timeout = '60s'"))
+            event = DartDisclosureEvent(
+                rcept_no=rcept_no,
+                corp_code=corp_code,
+                corp_name=f'Test Corp {stock_code}',
+                stock_code=stock_code,
+                corp_cls='Y',
+                report_nm=f'Annual Report ({business_year}.12)',
+                filing_category='annual_report',
+                is_financial_report=True,
+                receipt_date=receipt_date,
+                payload={'rcept_no': rcept_no},
+                fundamentals_capture_status='captured',
+            )
+            session.add(event)
+            session.flush()
+
+            snapshot = DartFundamentalsSnapshot(
+                disclosure_event_id=event.id,
+                capture_run_id=None,
+                rcept_no=rcept_no,
+                corp_code=corp_code,
+                stock_code=stock_code,
+                corp_name=f'Test Corp {stock_code}',
+                business_year=business_year,
+                report_code='11011',
+                filing_category='annual_report',
+                fs_div='CFS',
+                statement_type='financial_statement',
+                period_type='annual',
+                period_end_month=12,
+                currency='KRW',
+                source_status='000',
+                source_message='OK',
+                request_payload={},
+                response_payload={},
+            )
+            session.add(snapshot)
+            session.flush()
+
+            session.add(
+                DartFundamentalsHighlight(
+                    snapshot_id=snapshot.id,
+                    metric_key='total_equity',
+                    metric_type='balance',
+                    statement_type='BS',
+                    statement_name='financial_statement',
+                    account_id='ifrs-full_Equity',
+                    account_name='자본총계',
+                    current_amount=total_equity,
+                    current_cumulative_amount=None,
+                    currency='KRW',
+                )
+            )
+            event_id = event.id
+            snapshot_id = snapshot.id
+
+        self.created_event_ids.append(event_id)
+        self.created_snapshot_ids.append(snapshot_id)
+        return snapshot_id
+
+    def test_load_latest_annual_fundamentals_respects_receipt_date_for_historical_market_date(self) -> None:
+        stock_code = f'TAVD{uuid4().hex[:8].upper()}'
+        older_snapshot_id = self._create_fundamentals_snapshot(
+            stock_code=stock_code,
+            business_year=2024,
+            receipt_date=date(2025, 3, 20),
+            total_equity=900,
+        )
+        newer_snapshot_id = self._create_fundamentals_snapshot(
+            stock_code=stock_code,
+            business_year=2025,
+            receipt_date=date(2026, 3, 20),
+            total_equity=1200,
+        )
+
+        before_filing = self.service._load_latest_annual_fundamentals(
+            market_date=date(2026, 2, 15),
+            symbols=[stock_code],
+        )
+        after_filing = self.service._load_latest_annual_fundamentals(
+            market_date=date(2026, 3, 20),
+            symbols=[stock_code],
+        )
+
+        self.assertEqual(before_filing[stock_code].snapshot_id, older_snapshot_id)
+        self.assertEqual(before_filing[stock_code].business_year, 2024)
+        self.assertEqual(before_filing[stock_code].receipt_date, '2025-03-20')
+        self.assertEqual(before_filing[stock_code].highlights_by_key['total_equity']['current_amount'], 900)
+        self.assertEqual(after_filing[stock_code].snapshot_id, newer_snapshot_id)
+        self.assertEqual(after_filing[stock_code].business_year, 2025)
+        self.assertEqual(after_filing[stock_code].receipt_date, '2026-03-20')
 
 
 class DailyAdvancedValueFactorPersistenceIntegrationTests(unittest.TestCase):

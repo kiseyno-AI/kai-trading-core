@@ -960,15 +960,19 @@ class DailyAdvancedValueFactorService:
                         snap.currency as currency,
                         snap.captured_at as captured_at,
                         snap.rcept_no as rcept_no,
-                        null::date as receipt_date
+                        disclosure.receipt_date as receipt_date
                       from dart_fundamentals_snapshots snap
+                      join dart_disclosure_events disclosure
+                        on disclosure.id = snap.disclosure_event_id
                       where snap.stock_code = requested.stock_code
                         and snap.fs_div = :fs_div
                         and snap.report_code = :report_code
                         and snap.period_type = :period_type
                         and snap.business_year <= :business_year
+                        and disclosure.receipt_date <= :market_date
                       order by
                         snap.business_year desc,
+                        disclosure.receipt_date desc,
                         snap.id desc
                       limit 1
                     ) latest on true
@@ -983,6 +987,7 @@ class DailyAdvancedValueFactorService:
                             'report_code': ADVANCED_VALUE_FUNDAMENTALS_REPORT_CODE,
                             'period_type': ADVANCED_VALUE_FUNDAMENTALS_PERIOD_TYPE,
                             'business_year': market_date.year,
+                            'market_date': market_date,
                         },
                     ).mappings().all()
                 )
@@ -1013,13 +1018,15 @@ class DailyAdvancedValueFactorService:
             snapshot_ids = list(snapshot_metadata_by_id.keys())
             highlights_by_snapshot: dict[int, dict[str, dict[str, Any]]] = defaultdict(dict)
             rows_by_snapshot: dict[int, list[dict[str, Any]]] = defaultdict(list)
-            if len(snapshot_ids) <= ADVANCED_VALUE_FUNDAMENTALS_ROW_FALLBACK_MAX_SNAPSHOTS:
+            for start in range(0, len(snapshot_ids), ADVANCED_VALUE_FUNDAMENTALS_ROW_CHUNK_SIZE):
+                snapshot_id_chunk = snapshot_ids[start:start + ADVANCED_VALUE_FUNDAMENTALS_ROW_CHUNK_SIZE]
                 highlight_rows = session.execute(
                     select(DartFundamentalsHighlight)
-                    .where(DartFundamentalsHighlight.snapshot_id.in_(snapshot_ids))
+                    .where(DartFundamentalsHighlight.snapshot_id.in_(snapshot_id_chunk))
                 ).scalars()
                 for row in highlight_rows:
                     highlights_by_snapshot[row.snapshot_id][row.metric_key] = _serialize_highlight_row(row)
+            if len(snapshot_ids) <= ADVANCED_VALUE_FUNDAMENTALS_ROW_FALLBACK_MAX_SNAPSHOTS:
                 for start in range(0, len(snapshot_ids), ADVANCED_VALUE_FUNDAMENTALS_ROW_CHUNK_SIZE):
                     snapshot_id_chunk = snapshot_ids[start:start + ADVANCED_VALUE_FUNDAMENTALS_ROW_CHUNK_SIZE]
                     statement_rows = session.execute(
