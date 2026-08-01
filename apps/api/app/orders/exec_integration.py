@@ -213,6 +213,12 @@ EXEC_AGENT_ACCEPTED_ENTRY_STATUSES = {
     'watch_monitoring_active',
     'working',
 }
+EXEC_WATCH_STATE_SYNC_SCHEMA_VERSION = 'exec_watch_state_sync_v1'
+EXEC_WATCH_STATE_SYNC_WARNING_CODE = 'exec_watch_state_divergence'
+EXEC_WATCH_READBACK_ACTIVE_STATUSES = EXEC_MONITORING_ACTIVE_STATUSES | EXEC_AGENT_ACCEPTED_ENTRY_STATUSES | {
+    'watch_buy_submitted',
+    'watch_monitoring_pending',
+}
 MARKET_REGIME_AGGRESSIVE_OPEN_MULTIPLIER_CAP = Decimal('2.0')
 MARKET_REGIME_TREND_DAY_MULTIPLIER_CAP = Decimal('1.25')
 MARKET_REGIME_DEFAULT_MULTIPLIER_CAP = Decimal('1.0')
@@ -3630,6 +3636,302 @@ class SignalDeciderExecIntegrationService:
             'error': None,
         }
 
+    @staticmethod
+    def _looks_like_exec_plan_item(payload: dict[str, Any]) -> bool:
+        if any(
+            _normalize_optional_text(payload.get(key))
+            for key in (
+                'core_item_key',
+                'client_key',
+                'external_item_key',
+                'execution_plan_item_id',
+                'plan_item_id',
+                'id',
+            )
+        ):
+            return True
+        return bool(
+            _normalize_optional_text(payload.get('symbol'))
+            and _normalize_optional_text(payload.get('intent') or payload.get('handoff_intent'))
+        )
+
+    @classmethod
+    def _collect_exec_plan_readback_items(cls, *, plans_result: dict[str, Any]) -> list[dict[str, Any]]:
+        payload = plans_result.get('payload') if isinstance(plans_result.get('payload'), dict) else {}
+        plan_items: list[dict[str, Any]] = []
+
+        def collect_from(candidate: Any) -> None:
+            if not isinstance(candidate, dict):
+                return
+            nested_items: list[dict[str, Any]] = []
+            for key in ('items', 'plan_items', 'execution_plan_items', 'execution_items', 'orders'):
+                value = candidate.get(key)
+                if isinstance(value, list):
+                    nested_items.extend(item for item in value if isinstance(item, dict))
+            nested_plan = candidate.get('plan') if isinstance(candidate.get('plan'), dict) else None
+            if nested_plan is not None:
+                collect_from(nested_plan)
+            if nested_items:
+                for nested_item in nested_items:
+                    collect_from(nested_item)
+                return
+            if cls._looks_like_exec_plan_item(candidate):
+                plan_items.append(candidate)
+
+        for item in _collect_items(payload):
+            collect_from(item)
+        collect_from(payload.get('plan') if isinstance(payload, dict) else None)
+        return plan_items
+
+    @staticmethod
+    def _exec_plan_item_status(payload: dict[str, Any]) -> str | None:
+        for key in (
+            'status',
+            'state',
+            'plan_item_status',
+            'decision_status',
+            'monitoring_status',
+            'monitoring_state',
+            'watch_status',
+            'lifecycle_status',
+        ):
+            status = _normalize_status(payload.get(key))
+            if status:
+                return status
+        monitoring = payload.get('monitoring') if isinstance(payload.get('monitoring'), dict) else {}
+        for key in ('status', 'state', 'monitoring_status', 'monitoring_state', 'watch_status'):
+            status = _normalize_status(monitoring.get(key))
+            if status:
+                return status
+        return None
+
+    @staticmethod
+    def _exec_plan_item_ids(payload: dict[str, Any]) -> set[str]:
+        values = {
+            _normalize_optional_text(payload.get(key))
+            for key in (
+                'execution_plan_item_id',
+                'plan_item_id',
+                'id',
+                'exec_plan_item_id',
+            )
+        }
+        return {value for value in values if value}
+
+    @staticmethod
+    def _exec_plan_item_core_keys(payload: dict[str, Any]) -> set[str]:
+        values = {
+            _normalize_optional_text(payload.get(key))
+            for key in (
+                'core_item_key',
+                'client_key',
+                'external_item_key',
+            )
+        }
+        return {value for value in values if value}
+
+    @classmethod
+    def _match_exec_plan_readback_item(
+        cls,
+        *,
+        link: dict[str, Any],
+        plan_items: Sequence[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        link_core_key = _normalize_optional_text(link.get('core_item_key'))
+        if link_core_key:
+            for item in plan_items:
+                if link_core_key in cls._exec_plan_item_core_keys(item):
+                    return item
+
+        link_item_id = _normalize_optional_text(link.get('exec_plan_item_id'))
+        if link_item_id:
+            for item in plan_items:
+                if link_item_id in cls._exec_plan_item_ids(item):
+                    return item
+
+        link_symbol = _normalize_optional_text(link.get('symbol'))
+        link_intent = _normalize_optional_text(link.get('intent'), lowercase=True)
+        if link_symbol and link_intent:
+            for item in plan_items:
+                item_symbol = _normalize_optional_text(item.get('symbol'))
+                item_intent = _normalize_optional_text(
+                    item.get('intent') or item.get('handoff_intent') or item.get('monitoring_intent'),
+                    lowercase=True,
+                )
+                if item_symbol == link_symbol and item_intent == link_intent:
+                    return item
+        return None
+
+    @classmethod
+    def _merge_exec_plan_readback_links(
+        cls,
+        *,
+        item_links: Sequence[dict[str, Any]],
+        plans_result: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        plan_items = cls._collect_exec_plan_readback_items(plans_result=plans_result)
+        if not plan_items:
+            return [dict(link) for link in item_links if isinstance(link, dict)]
+
+        merged_links: list[dict[str, Any]] = []
+        for raw_link in item_links:
+            if not isinstance(raw_link, dict):
+                continue
+            link = dict(raw_link)
+            matched_item = cls._match_exec_plan_readback_item(link=link, plan_items=plan_items)
+            if matched_item is None:
+                merged_links.append(link)
+                continue
+
+            status = cls._exec_plan_item_status(matched_item)
+            if status:
+                link['remote_status'] = status
+            exec_plan_item_id = (
+                _normalize_optional_text(matched_item.get('execution_plan_item_id'))
+                or _normalize_optional_text(matched_item.get('plan_item_id'))
+                or _normalize_optional_text(matched_item.get('id'))
+            )
+            if exec_plan_item_id:
+                link['exec_plan_item_id'] = exec_plan_item_id
+            response_item = dict(link.get('response_item') or {})
+            compact_item = compact_exec_response_item(matched_item)
+            if compact_item:
+                response_item.update(compact_item)
+            if response_item:
+                link['response_item'] = response_item
+            merged_links.append(link)
+        return merged_links
+
+    @classmethod
+    def _entry_link_active_statuses(cls, *, item_links: Sequence[dict[str, Any]]) -> list[str]:
+        statuses: set[str] = set()
+        for link in item_links:
+            if not isinstance(link, dict):
+                continue
+            if _normalize_optional_text(link.get('intent'), lowercase=True) not in EXEC_ENTRY_BUY_INTENTS:
+                continue
+            statuses.update(
+                status
+                for status in cls._entry_link_statuses(link)
+                if status in EXEC_WATCH_READBACK_ACTIVE_STATUSES
+            )
+        return sorted(statuses)
+
+    @staticmethod
+    def _append_warning_once(warnings: Sequence[Any], warning: dict[str, Any]) -> list[Any]:
+        values = list(warnings)
+        warning_code = _normalize_optional_text(warning.get('code'))
+        if warning_code and any(
+            isinstance(item, dict) and _normalize_optional_text(item.get('code')) == warning_code
+            for item in values
+        ):
+            return values
+        values.append(warning)
+        return values
+
+    @classmethod
+    def _is_short_term_watch_buy_row(cls, row: SignalDeciderExecutionPlanItem) -> bool:
+        if _normalize_decision_agent_name(row.decision_agent_name) != SHORT_TERM_DECIDER_AGENT_NAME:
+            return False
+        if _normalize_optional_text(row.planned_side, lowercase=True) != 'buy':
+            return False
+        traceability = row.traceability_payload if isinstance(row.traceability_payload, dict) else {}
+        validation = row.validation_payload if isinstance(row.validation_payload, dict) else {}
+        short_term = validation.get('short_term') if isinstance(validation.get('short_term'), dict) else {}
+        raw_action = _normalize_optional_text(
+            traceability.get('raw_action')
+            or traceability.get('tactical_action')
+            or short_term.get('raw_action')
+            or short_term.get('tactical_action'),
+            lowercase=True,
+        )
+        handoff_intent = _normalize_optional_text(
+            traceability.get('handoff_intent') or short_term.get('handoff_intent'),
+            lowercase=True,
+        )
+        return bool(
+            raw_action in {'scalp_buy_candidate', 'watch_for_trigger'}
+            or handoff_intent in {'tactical_buy', EXEC_INTENT_INTRADAY_WATCH_BUY, EXEC_INTENT_NEXT_OPEN_BUY}
+        )
+
+    def _sync_short_term_exec_watch_state(
+        self,
+        *,
+        row: SignalDeciderExecutionPlanItem,
+        item_links: Sequence[dict[str, Any]],
+        now: datetime,
+        trigger: str,
+    ) -> dict[str, Any] | None:
+        if not self._is_short_term_watch_buy_row(row):
+            return None
+        active_statuses = self._entry_link_active_statuses(item_links=item_links)
+        if not active_statuses:
+            return None
+
+        original_eligibility_status = _normalize_optional_text(row.eligibility_status, lowercase=True)
+        original_execution_status = _normalize_optional_text(row.execution_status, lowercase=True)
+        core_was_blocked_or_planned = bool(
+            original_eligibility_status == ELIGIBILITY_BLOCKED
+            or original_execution_status == EXECUTION_STATUS_PLANNED
+        )
+        if not core_was_blocked_or_planned:
+            return None
+        validation = row.validation_payload if isinstance(row.validation_payload, dict) else {}
+        traceability = row.traceability_payload if isinstance(row.traceability_payload, dict) else {}
+        blocking_reasons = validation.get('blocking_reasons') if isinstance(validation.get('blocking_reasons'), list) else []
+        warnings = validation.get('warnings') if isinstance(validation.get('warnings'), list) else []
+        exec_watch_status = (
+            'exec_watch_monitoring_active'
+            if any(status in {'watch_monitoring_active', 'active', 'monitoring', 'open', 'working'} for status in active_statuses)
+            else 'exec_watch_monitoring_pending'
+        )
+        audit = {
+            'schema_version': EXEC_WATCH_STATE_SYNC_SCHEMA_VERSION,
+            'status': exec_watch_status,
+            'synced_at': now.isoformat(),
+            'trigger': trigger,
+            'source': 'exec_readback',
+            'active_exec_statuses': active_statuses,
+            'core_state_before': {
+                'eligibility_status': original_eligibility_status,
+                'execution_status': original_execution_status,
+            },
+            'core_state_after': {
+                'eligibility_status': original_eligibility_status,
+                'execution_status': EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING,
+            },
+            'divergence': core_was_blocked_or_planned,
+            'preserved_blocking_reason_count': len(blocking_reasons),
+            'preserved_warning_count': len(warnings),
+        }
+
+        row.execution_status = EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING
+        row.traceability_payload = {
+            **traceability,
+            'handoff_active': True,
+            'exec_monitoring_active': True,
+            'exec_agent_approved': True,
+            'approval_state': 'approved',
+            'exec_watch_state_sync': audit,
+        }
+        warning = {
+            'code': EXEC_WATCH_STATE_SYNC_WARNING_CODE,
+            'message': (
+                'Exec readback shows active or pending watch monitoring while core still had blocked/planned '
+                'state; preserving original gate evidence and surfacing Exec watch state for monitoring.'
+            ),
+            'severity': 'warning',
+            'exec_watch_status': exec_watch_status,
+            'active_exec_statuses': active_statuses,
+        }
+        row.validation_payload = {
+            **validation,
+            'blocking_reasons': blocking_reasons,
+            'warnings': self._append_warning_once(warnings, warning),
+            'exec_watch_state_sync': audit,
+        }
+        return audit
+
     def _persist_group_readback(
         self,
         *,
@@ -3654,7 +3956,10 @@ class SignalDeciderExecIntegrationService:
                     if isinstance(existing_submission.get('exec_dispatch'), dict)
                     else {}
                 )
-                item_links = exec_dispatch.get('item_links') or []
+                item_links = self._merge_exec_plan_readback_links(
+                    item_links=exec_dispatch.get('item_links') or [],
+                    plans_result=plans_result,
+                )
                 matched_orders = self._match_remote_orders(row=row, item_links=item_links, orders=orders_result['items'])
                 matched_executions = self._match_remote_executions(
                     row=row,
@@ -3705,6 +4010,12 @@ class SignalDeciderExecIntegrationService:
                     'derived_state': derived_state,
                 }
                 compact_readback = compact_exec_readback(readback)
+                core_state_sync = self._sync_short_term_exec_watch_state(
+                    row=row,
+                    item_links=item_links,
+                    now=now,
+                    trigger=trigger,
+                ) or exec_dispatch.get('core_state_sync')
                 exec_dispatch = {
                     'plan_id': exec_dispatch.get('plan_id'),
                     'plan_fingerprint': exec_dispatch.get('plan_fingerprint'),
@@ -3722,6 +4033,8 @@ class SignalDeciderExecIntegrationService:
                     'last_response_summary': exec_dispatch.get('last_response_summary'),
                     'readback': compact_readback,
                 }
+                if isinstance(core_state_sync, dict):
+                    exec_dispatch['core_state_sync'] = core_state_sync
                 submission = {
                     **existing_submission,
                     'exec_dispatch': exec_dispatch,
@@ -3852,6 +4165,7 @@ class SignalDeciderExecIntegrationService:
                 'exit_filled_quantity': None,
                 'open_quantity': None,
                 'closed_quantity': None,
+                'plan_item_status_counts': {},
                 'order_status_counts': {},
                 'endpoint_statuses': endpoint_statuses,
             }
@@ -3885,6 +4199,7 @@ class SignalDeciderExecIntegrationService:
             for link in item_links
             if _normalize_status(link.get('remote_status'))
         }
+        plan_item_status_counts = Counter(status for status in item_statuses if status)
         status_set = item_statuses.union(set(order_status_counts.keys()))
         has_entry_fill_evidence = (
             buy_quantity > Decimal('0')
@@ -3901,8 +4216,12 @@ class SignalDeciderExecIntegrationService:
             derived_status = 'closed'
         elif open_quantity > 0 or has_entry_fill_evidence:
             derived_status = 'open'
+        elif any(status in REMOTE_SUBMITTED_STATUSES for status in item_statuses):
+            derived_status = 'working'
         elif any(status in REMOTE_ACTIVE_STATUSES for status in order_status_counts):
             derived_status = 'working'
+        elif any(status in EXEC_WATCH_READBACK_ACTIVE_STATUSES for status in item_statuses):
+            derived_status = EXEC_DISPATCH_STATUS_ACCEPTED
         elif any(status in REMOTE_CANCELLED_STATUSES for status in status_set):
             derived_status = UI_BOARD_STATUS_CANCELLED
         elif any(status in REMOTE_TERMINAL_FAILURE_STATUSES for status in status_set):
@@ -3915,8 +4234,43 @@ class SignalDeciderExecIntegrationService:
             'open_quantity': _decimal_to_text(open_quantity if open_quantity > 0 else Decimal('0')),
             'closed_quantity': _decimal_to_text(sell_quantity if sell_quantity > 0 else Decimal('0')),
             'has_plan_attributed_fill_evidence': has_plan_fill_evidence,
+            'plan_item_status_counts': dict(sorted(plan_item_status_counts.items())),
             'order_status_counts': dict(sorted(order_status_counts.items())),
             'endpoint_statuses': endpoint_statuses,
+        }
+
+    @staticmethod
+    def _build_core_state_divergence_warning(
+        *,
+        sync_audit: dict[str, Any] | None,
+        item: dict[str, Any],
+        active_statuses: Sequence[str] | None = None,
+    ) -> dict[str, Any] | None:
+        if isinstance(sync_audit, dict) and not bool(sync_audit.get('divergence')):
+            return None
+        statuses = list(active_statuses or [])
+        if not statuses and isinstance(sync_audit, dict):
+            statuses = [
+                str(status)
+                for status in (sync_audit.get('active_exec_statuses') or [])
+                if _normalize_optional_text(status)
+            ]
+        if not statuses:
+            return None
+        core_state_before = sync_audit.get('core_state_before') if isinstance(sync_audit, dict) else None
+        if not isinstance(core_state_before, dict):
+            core_state_before = {
+                'eligibility_status': item.get('eligibility_status'),
+                'execution_status': item.get('execution_status'),
+            }
+        return {
+            'code': EXEC_WATCH_STATE_SYNC_WARNING_CODE,
+            'message': (
+                'Exec has active or pending watch monitoring while core still had blocked/planned state; '
+                'runtime views are using Exec watch truth and preserving original core gate evidence.'
+            ),
+            'core_state_before': core_state_before,
+            'exec_statuses': statuses,
         }
 
     def _augment_exec_overview_item(self, item: dict[str, Any]) -> dict[str, Any]:
@@ -3924,6 +4278,7 @@ class SignalDeciderExecIntegrationService:
         exec_dispatch = submission.get('exec_dispatch') if isinstance(submission.get('exec_dispatch'), dict) else {}
         readback = exec_dispatch.get('readback') if isinstance(exec_dispatch.get('readback'), dict) else {}
         traceability = item.get('traceability') if isinstance(item.get('traceability'), dict) else {}
+        validation = item.get('validation') if isinstance(item.get('validation'), dict) else {}
         decision_agent_name = _normalize_decision_agent_name(
             item.get('decision_agent_name') or traceability.get('decision_agent_name') or traceability.get('agent_name')
         )
@@ -3973,6 +4328,27 @@ class SignalDeciderExecIntegrationService:
             or remote_status in EXEC_MONITORING_ACTIVE_STATUSES
         )
         exec_monitoring_active = bool(held_position or (exec_agent_approved and active_remote and not terminal))
+        active_exec_statuses = self._entry_link_active_statuses(item_links=dispatch_payload.get('item_links') or [])
+        core_was_blocked_or_planned = bool(
+            item.get('eligibility_status') == ELIGIBILITY_BLOCKED
+            or _normalize_status(item.get('execution_status')) == EXECUTION_STATUS_PLANNED
+        )
+        sync_audit = (
+            exec_dispatch.get('core_state_sync')
+            if isinstance(exec_dispatch.get('core_state_sync'), dict)
+            else validation.get('exec_watch_state_sync')
+            if isinstance(validation.get('exec_watch_state_sync'), dict)
+            else None
+        )
+        divergence_warning = self._build_core_state_divergence_warning(
+            sync_audit=sync_audit
+            if isinstance(sync_audit, dict)
+            else {'divergence': core_was_blocked_or_planned},
+            item=item,
+            active_statuses=active_exec_statuses
+            if decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME and core_was_blocked_or_planned and exec_monitoring_active
+            else [],
+        )
         if exec_agent_approved:
             approval_state = 'approved'
         elif exec_agent_rejected:
@@ -4000,6 +4376,8 @@ class SignalDeciderExecIntegrationService:
             'exec_agent_reason_code': agent_decision['reason_code'],
             'exec_agent_target_profile': agent_decision['target_profile'],
             'exec_agent_target_tag': agent_decision['target_tag'],
+            'exec_watch_state_sync': sync_audit,
+            'core_state_divergence_warning': divergence_warning,
             'target_price': traceability.get('target_price'),
             'stop_loss_price': traceability.get('stop_loss_price'),
             'trigger_price': traceability.get('trigger_price'),
@@ -4019,6 +4397,7 @@ class SignalDeciderExecIntegrationService:
                 'exit_filled_quantity': derived_state.get('exit_filled_quantity'),
                 'open_quantity': derived_state.get('open_quantity'),
                 'closed_quantity': derived_state.get('closed_quantity'),
+                'plan_item_status_counts': derived_state.get('plan_item_status_counts') or {},
                 'orders': _extract_field(readback, 'orders', 'items') or [],
                 'executions': _extract_field(readback, 'executions', 'items') or [],
                 'positions': _extract_field(readback, 'positions', 'items') or [],
@@ -4035,6 +4414,29 @@ class SignalDeciderExecIntegrationService:
             _normalize_status((item.get('remote_state') or {}).get('derived_status')) or 'unknown'
             for item in items
         )
+        divergence_items = [
+            item
+            for item in items
+            if isinstance(item.get('core_state_divergence_warning'), dict)
+        ]
+        warnings = []
+        if divergence_items:
+            warnings.append(
+                {
+                    'code': EXEC_WATCH_STATE_SYNC_WARNING_CODE,
+                    'message': (
+                        'Exec has active or pending watch monitoring for rows that core still had as blocked/planned.'
+                    ),
+                    'count': len(divergence_items),
+                    'symbols': sorted(
+                        {
+                            str(item.get('symbol'))
+                            for item in divergence_items
+                            if _normalize_optional_text(item.get('symbol'))
+                        }
+                    ),
+                }
+            )
         return {
             **plan_summary,
             'decision_agent_counts': dict(
@@ -4053,6 +4455,8 @@ class SignalDeciderExecIntegrationService:
             'remote_closed_count': sum(
                 1 for item in items if (item.get('remote_state') or {}).get('derived_status') == 'closed'
             ),
+            'core_exec_state_divergence_count': len(divergence_items),
+            'warnings': warnings,
         }
 
     def _build_intraday_watch_item(self, item: dict[str, Any]) -> dict[str, Any]:
@@ -4078,6 +4482,8 @@ class SignalDeciderExecIntegrationService:
             'exec_monitoring_active': item.get('exec_monitoring_active'),
             'exec_agent_approved': item.get('exec_agent_approved'),
             'approval_state': item.get('approval_state'),
+            'exec_watch_state_sync': item.get('exec_watch_state_sync'),
+            'core_state_divergence_warning': item.get('core_state_divergence_warning'),
             'eligibility_status': item.get('eligibility_status'),
             'execution_status': item.get('execution_status'),
             'target_price': item.get('target_price'),
@@ -4353,7 +4759,7 @@ class SignalDeciderExecIntegrationService:
             statuses = cls._entry_link_statuses(link)
             if statuses & EXEC_MONITORING_TERMINAL_STATUSES:
                 continue
-            if statuses & EXEC_AGENT_ACCEPTED_ENTRY_STATUSES:
+            if statuses & EXEC_WATCH_READBACK_ACTIVE_STATUSES:
                 return True
         return False
 
@@ -4705,6 +5111,8 @@ class SignalDeciderExecIntegrationService:
             'handoff_intent': item.get('handoff_intent'),
             'handoff_active': item.get('handoff_active'),
             'approval_state': item.get('approval_state'),
+            'exec_watch_state_sync': item.get('exec_watch_state_sync'),
+            'core_state_divergence_warning': item.get('core_state_divergence_warning'),
             'status': status,
             'monitoring_state': monitoring_state,
             **exec_contract,
@@ -4830,6 +5238,11 @@ class SignalDeciderExecIntegrationService:
                 if (reason := _normalize_optional_text(item.get('exec_runtime_exclusion_reason'), lowercase=True))
             }
         )
+        divergence_warnings = [
+            warning
+            for item in items
+            if isinstance((warning := item.get('core_state_divergence_warning')), dict)
+        ]
         exec_runtime_showable = any(bool(item.get('exec_runtime_showable')) for item in items)
         exec_monitoring_active = any(bool(item.get('exec_monitoring_active')) for item in items)
         return {
@@ -4845,6 +5258,8 @@ class SignalDeciderExecIntegrationService:
             if exec_runtime_showable
             else (exclusion_reasons[0] if exclusion_reasons else 'stale_no_active_monitoring'),
             'exec_runtime_exclusion_reasons': [] if exec_runtime_showable else exclusion_reasons,
+            'core_state_divergence_count': len(divergence_warnings),
+            'core_state_divergence_warnings': divergence_warnings,
             'exec_agent_approved': any(bool(item.get('exec_agent_approved')) for item in items),
             'exec_agent_action': first_value('exec_agent_action'),
             'exec_agent_reason_code': first_value('exec_agent_reason_code'),
@@ -5067,6 +5482,10 @@ class SignalDeciderExecIntegrationService:
             'display_price_available_count': sum(1 for item in items if item.get('display_price_available')),
             'price_status_counts': dict(sorted(price_status_counts.items())),
             'price_source_counts': dict(sorted(price_source_counts.items())),
+            'core_state_divergence_count': sum(
+                int(_safe_decimal(item.get('core_state_divergence_count')) or Decimal('0'))
+                for item in items
+            ),
         }
 
     def _build_runtime_symbol_detail_item(
@@ -5565,6 +5984,26 @@ class SignalDeciderExecIntegrationService:
                 omitted_count += 1
         return ids, omitted_count
 
+    @classmethod
+    def _exec_watch_board_status_from_links(cls, *, item: dict[str, Any]) -> str | None:
+        if _normalize_decision_agent_name(item.get('decision_agent_name')) != SHORT_TERM_DECIDER_AGENT_NAME:
+            return None
+        dispatch = item.get('dispatch') if isinstance(item.get('dispatch'), dict) else {}
+        statuses = set(cls._entry_link_active_statuses(item_links=dispatch.get('item_links') or []))
+        if not statuses:
+            return None
+        if statuses & REMOTE_PARTIAL_STATUSES:
+            return UI_BOARD_STATUS_PARTIAL
+        if statuses & ({'watch_buy_submitted'} | REMOTE_SUBMITTED_STATUSES):
+            return UI_BOARD_STATUS_SUBMITTED
+        if statuses & {'watch_monitoring_active', 'active', 'monitoring'}:
+            return UI_BOARD_STATUS_ACCEPTED
+        if statuses & ({'watch_monitoring_pending'} | REMOTE_SCHEDULED_STATUSES):
+            return UI_BOARD_STATUS_SCHEDULED
+        if statuses & EXEC_WATCH_READBACK_ACTIVE_STATUSES:
+            return UI_BOARD_STATUS_ACCEPTED
+        return None
+
     def _normalize_board_item_status(
         self,
         *,
@@ -5608,6 +6047,9 @@ class SignalDeciderExecIntegrationService:
             EXEC_DISPATCH_STATUS_UNAVAILABLE,
         }:
             return UI_BOARD_STATUS_FAILED
+        exec_watch_board_status = self._exec_watch_board_status_from_links(item=item)
+        if exec_watch_board_status is not None:
+            return exec_watch_board_status
         if eligibility_status == ELIGIBILITY_BLOCKED:
             return UI_BOARD_STATUS_FAILED
         if dispatch_status in {EXEC_DISPATCH_STATUS_ACCEPTED, EXEC_DISPATCH_STATUS_PARTIAL}:

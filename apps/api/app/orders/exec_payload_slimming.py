@@ -268,6 +268,9 @@ def compact_exec_response_item(item: Any) -> dict[str, Any] | None:
         'approval_action',
         'decision_action',
         'risk_decision',
+        'monitoring_status',
+        'monitoring_state',
+        'watch_status',
         'target_profile',
         'target_tag',
         'special_tactical_scalp',
@@ -756,6 +759,9 @@ def slim_signal_decider_exec_submission_payload(
     readback = compact_exec_readback(exec_dispatch.get('readback'))
     if readback:
         slimmed_exec['readback'] = readback
+    core_state_sync = exec_dispatch.get('core_state_sync')
+    if isinstance(core_state_sync, dict):
+        slimmed_exec['core_state_sync'] = _shallow_slim(core_state_sync)
 
     slimmed_payload = {
         'mode': payload.get('mode') or 'exec_dispatch',

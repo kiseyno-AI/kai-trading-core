@@ -5,6 +5,8 @@ Read the current symbol-level exec monitoring view from core. The route is dashb
 
 Each item includes explicit exec-runtime ownership fields so dashboard clients do not infer behavior from labels. Use `exec_runtime_showable=true` for the exec-owned card. Rows are showable when an exec-agent approved watch candidate has active monitoring or when an account/exec position is currently held. Accepted or active same-day entry links from exec count as approval evidence for this read model unless the persisted exec-agent payload explicitly rejects or marks approval false. Core-only, rejected, expired, failed, cancelled, or stale rows carry `exec_runtime_exclusion_reason` when present in the broader monitored read model. Symbol groups expose `tactical_actions` and `handoff_intents` when short-term decider candidates are part of the active watch set.
 
+If a short-term watch is active or pending in Exec while the original core row still carries blocked/planned gate state, the grouped item exposes `core_state_divergence_count` and `core_state_divergence_warnings`. The original validation evidence remains attached to the underlying plan item; the monitored-symbol read model uses Exec watch truth only for display and realtime subscription priority.
+
 Price fields are display-oriented: realtime websocket prices are preferred, then local current-quote/cache fallback, then recent daily close. Fallback prices are labeled with `price_source`, `price_status`, `display_price_available`, and realtime subscription metadata so capacity-limited symbols do not look like true data gaps.
 
 ## Contract source
@@ -70,7 +72,8 @@ GET /execution/runtime/monitored-symbols?market_date=2026-04-30&refresh=true
     },
     "price_source_counts": {
       "cached_quote": 1
-    }
+    },
+    "core_state_divergence_count": 1
   },
   "realtime_subscription": {
     "desired_symbols": [
@@ -99,6 +102,15 @@ GET /execution/runtime/monitored-symbols?market_date=2026-04-30&refresh=true
       "exec_runtime_state": "held_position",
       "exec_runtime_exclusion_reason": null,
       "exec_runtime_exclusion_reasons": [],
+      "core_state_divergence_count": 1,
+      "core_state_divergence_warnings": [
+        {
+          "code": "exec_watch_state_divergence",
+          "exec_statuses": [
+            "watch_monitoring_active"
+          ]
+        }
+      ],
       "exec_agent_approved": false,
       "exec_agent_action": null,
       "exec_agent_reason_code": null,
