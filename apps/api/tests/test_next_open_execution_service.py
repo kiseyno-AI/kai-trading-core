@@ -1241,6 +1241,37 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(item['eligibility_status'], ELIGIBILITY_BLOCKED)
         self.assertEqual(item['validation']['blocking_reasons'][0]['code'], 'trigger_price_missing')
 
+    def test_refresh_plan_items_delegates_soft_watch_quality_blocks_to_exec_monitoring(self) -> None:
+        self._seed_short_term_snapshot(
+            symbol='000660',
+            tactical_action='watch_for_trigger',
+            input_feature_snapshot_payload={
+                'buy_quality_score': 45,
+                'raw_trading_value_krw': 250000000,
+                'trigger_price': 250000,
+                'target_price': 260000,
+                'stop_loss_price': 245000,
+                'meta': {'source_agent_name': 'short-term-decider'},
+            },
+        )
+        service = self._service(state='PREOPEN', server_time='2026-04-30T08:40:00+09:00')
+
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[{'trade_date': '2026-04-29', 'close_price': 250000}],
+        ):
+            result = service.refresh_plan_items(target_trade_date=self.target_trade_date, trigger='test')
+
+        item = next(item for item in result['items'] if item['symbol'] == '000660')
+        self.assertEqual(item['decision_agent_name'], 'short-term-decider')
+        self.assertEqual(item['eligibility_status'], ELIGIBILITY_ELIGIBLE)
+        self.assertEqual(item['validation']['blocking_reasons'], [])
+        self.assertTrue(item['handoff_active'])
+        self.assertTrue(item['exec_monitoring_active'])
+        warning_codes = {warning['code'] for warning in item['validation']['warnings']}
+        self.assertIn('short_term_buy_quality_score_block_delegated_to_exec_watch', warning_codes)
+        self.assertIn('short_term_liquidity_floor_block_delegated_to_exec_watch', warning_codes)
+
     def test_refresh_plan_items_blocks_short_term_rows_above_chase_limit(self) -> None:
         self._seed_short_term_snapshot(
             symbol='000660',

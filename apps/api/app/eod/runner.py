@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from contextlib import suppress
-from datetime import datetime, time
+from datetime import datetime, timedelta, timezone, time
 
 from app.core.settings import settings
 from app.eod.auto_pykrx import auto_pykrx_eod_scheduler
@@ -19,6 +19,7 @@ from app.orders.reconciliation import trading_order_reconciliation_service
 logger = logging.getLogger(__name__)
 PREOPEN_EXEC_DISPATCH_TIME_KST = time(8, 0)
 BACKGROUND_RUNNER_STEP_TIMEOUT_SECONDS = 45
+BACKGROUND_RUNNER_TIMEOUT_COOLDOWN_SECONDS = 600
 
 
 def is_preopen_exec_dispatch_due(market: object) -> bool:
@@ -39,6 +40,28 @@ class EODBackgroundRunner:
         self.interval_seconds = interval_seconds
         self._task: asyncio.Task | None = None
         self._running = False
+        self._step_timeout_cooldowns: dict[str, datetime] = {}
+        self._blocking_step_tasks: dict[str, asyncio.Task] = {}
+
+    def _step_in_timeout_cooldown(self, name: str) -> bool:
+        cooldown_until = self._step_timeout_cooldowns.get(name)
+        if cooldown_until is None:
+            return False
+        now = datetime.now(timezone.utc)
+        if cooldown_until <= now:
+            self._step_timeout_cooldowns.pop(name, None)
+            return False
+        logger.info(
+            'Background runner skipping step during timeout cooldown: %s until %s',
+            name,
+            cooldown_until.isoformat(),
+        )
+        return True
+
+    def _mark_step_timed_out(self, name: str) -> None:
+        self._step_timeout_cooldowns[name] = datetime.now(timezone.utc) + timedelta(
+            seconds=BACKGROUND_RUNNER_TIMEOUT_COOLDOWN_SECONDS
+        )
 
     async def start(self) -> None:
         if self._task and not self._task.done():
@@ -49,6 +72,11 @@ class EODBackgroundRunner:
     async def stop(self) -> None:
         self._running = False
         await auto_pykrx_eod_scheduler.stop()
+        for task in list(self._blocking_step_tasks.values()):
+            task.cancel()
+        if self._blocking_step_tasks:
+            await asyncio.gather(*self._blocking_step_tasks.values(), return_exceptions=True)
+            self._blocking_step_tasks.clear()
         if self._task:
             self._task.cancel()
             with suppress(asyncio.CancelledError):
@@ -56,23 +84,53 @@ class EODBackgroundRunner:
             self._task = None
 
     async def _run_blocking_step(self, name: str, func) -> None:
+        running_task = self._blocking_step_tasks.get(name)
+        if running_task is not None and not running_task.done():
+            logger.info('Background runner blocking step already in flight: %s', name)
+            return
+        if running_task is not None:
+            self._blocking_step_tasks.pop(name, None)
+        if self._step_in_timeout_cooldown(name):
+            return
+        task = asyncio.create_task(asyncio.to_thread(func), name=f'eod-background-blocking:{name}')
+        self._blocking_step_tasks[name] = task
+        task.add_done_callback(lambda completed, step_name=name: self._finalize_blocking_step(step_name, completed))
         try:
-            await asyncio.wait_for(asyncio.to_thread(func), timeout=BACKGROUND_RUNNER_STEP_TIMEOUT_SECONDS)
+            await asyncio.wait_for(asyncio.shield(task), timeout=BACKGROUND_RUNNER_STEP_TIMEOUT_SECONDS)
         except asyncio.TimeoutError:
+            self._mark_step_timed_out(name)
             logger.warning(
-                'Background runner blocking step timed out after %ss: %s',
+                'Background runner blocking step still running after %ss: %s; keeping single-flight lock and cooling down for %ss',
                 BACKGROUND_RUNNER_STEP_TIMEOUT_SECONDS,
                 name,
+                BACKGROUND_RUNNER_TIMEOUT_COOLDOWN_SECONDS,
             )
 
+    def _finalize_blocking_step(self, name: str, task: asyncio.Task) -> None:
+        if self._blocking_step_tasks.get(name) is task:
+            self._blocking_step_tasks.pop(name, None)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.warning('Background runner blocking step failed: %s: %s', name, exc)
+        else:
+            self._step_timeout_cooldowns.pop(name, None)
+
     async def _run_async_step(self, name: str, awaitable) -> None:
+        if self._step_in_timeout_cooldown(name):
+            with suppress(Exception):
+                awaitable.close()
+            return
         try:
             await asyncio.wait_for(awaitable, timeout=BACKGROUND_RUNNER_STEP_TIMEOUT_SECONDS)
         except asyncio.TimeoutError:
+            self._mark_step_timed_out(name)
             logger.warning(
-                'Background runner async step timed out after %ss: %s',
+                'Background runner async step timed out after %ss: %s; cooling down for %ss',
                 BACKGROUND_RUNNER_STEP_TIMEOUT_SECONDS,
                 name,
+                BACKGROUND_RUNNER_TIMEOUT_COOLDOWN_SECONDS,
             )
 
     def _schedule_exec_readback_refresh(self, *, target_trade_date: str, trigger: str) -> None:
@@ -147,6 +205,9 @@ class EODBackgroundRunner:
                         'auto_pykrx_schedule_daily_pipeline_if_due',
                         auto_pykrx_eod_scheduler.schedule_daily_pipeline_if_due(),
                     )
+                    if auto_pykrx_eod_scheduler.state.active_task:
+                        await asyncio.sleep(self.interval_seconds)
+                        continue
                 if runtime_background_enabled:
                     await self._run_async_step(
                         'trading_order_reconciliation_periodic',

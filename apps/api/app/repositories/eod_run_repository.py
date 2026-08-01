@@ -200,7 +200,7 @@ def count_eod_run_persisted_symbols(run_id: int) -> int:
     with session_scope() as session:
         return int(
             session.execute(
-                select(func.count(func.distinct(DailyPriceBar.symbol_id)))
+                select(func.count(DailyPriceBar.id))
                 .select_from(DailyPriceBar)
                 .where(DailyPriceBar.eod_run_id == run_id)
             ).scalar_one()
@@ -223,7 +223,7 @@ def load_eod_run_stage_counts(run_id: int) -> dict[str, dict]:
     with session_scope() as session:
         price_persisted, price_updated_at = session.execute(
             select(
-                func.count(func.distinct(DailyPriceBar.symbol_id)),
+                func.count(DailyPriceBar.id),
                 func.max(DailyPriceBar.captured_at),
             )
             .select_from(DailyPriceBar)
@@ -231,7 +231,7 @@ def load_eod_run_stage_counts(run_id: int) -> dict[str, dict]:
         ).one()
         technical_persisted, technical_updated_at = session.execute(
             select(
-                func.count(func.distinct(DailyTechnicalSnapshot.symbol_id)),
+                func.count(DailyTechnicalSnapshot.id),
                 func.max(DailyTechnicalSnapshot.captured_at),
             )
             .select_from(DailyTechnicalSnapshot)
@@ -239,21 +239,29 @@ def load_eod_run_stage_counts(run_id: int) -> dict[str, dict]:
         ).one()
         action_persisted, action_updated_at = session.execute(
             select(
-                func.count(func.distinct(DailyActionSummary.symbol_id)),
+                func.count(DailyActionSummary.id),
                 func.max(DailyActionSummary.captured_at),
             )
             .select_from(DailyActionSummary)
             .where(DailyActionSummary.eod_run_id == run_id)
         ).one()
-        trending_rows, trending_periods, trending_updated_at = session.execute(
+        trending_rows, trending_updated_at = session.execute(
             select(
                 func.count(DailyTrendingRank.id),
-                func.count(func.distinct(DailyTrendingRank.period)),
                 func.max(DailyTrendingRank.captured_at),
             )
             .select_from(DailyTrendingRank)
             .where(DailyTrendingRank.eod_run_id == run_id)
         ).one()
+        trending_periods = session.execute(
+            select(func.count())
+            .select_from(
+                select(DailyTrendingRank.period)
+                .where(DailyTrendingRank.eod_run_id == run_id)
+                .group_by(DailyTrendingRank.period)
+                .subquery()
+            )
+        ).scalar_one()
 
     return {
         'price_collection': {

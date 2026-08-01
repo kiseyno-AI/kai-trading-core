@@ -876,9 +876,15 @@ class AgentFeedbackRetryService:
             for role, symbols in role_funnel.get('role_symbols', {}).items()
             if isinstance(symbols, list)
         }
+        scoped_role_symbol_total = sum(
+            len(role_symbol_scopes.get(role, ()))
+            for role in roles
+        )
         scoped_feedback_symbols = _ordered_symbol_union(
             [role_symbol_scopes.get(role, ()) for role in roles]
         ) or list(eligible_symbols)
+        if scoped_role_symbol_total <= 0:
+            scoped_role_symbol_total = len(scoped_feedback_symbols) * max(1, len(roles))
         skipped_symbols = (
             [symbol for symbol in requested_symbols or () if symbol not in set(eligible_symbols)]
             if requested_symbols is not None
@@ -981,7 +987,7 @@ class AgentFeedbackRetryService:
         agent_context_feedback_run_state_service.start_run(
             run_id=request_run_id,
             market_date=config.market_date,
-            symbols_total=len(scoped_feedback_symbols),
+            symbols_total=scoped_role_symbol_total,
             request_payload=request_payload,
             summary_payload=self._build_run_summary_payload(
                 market_date=config.market_date,

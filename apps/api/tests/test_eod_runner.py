@@ -77,6 +77,32 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertGreaterEqual(to_thread.await_count, 2)
 
+    async def test_blocking_step_timeout_keeps_single_flight_until_worker_finishes(self) -> None:
+        runner = EODBackgroundRunner(interval_seconds=0)
+        calls = 0
+        release = asyncio.Event()
+
+        async def slow_worker() -> None:
+            nonlocal calls
+            calls += 1
+            await release.wait()
+
+        async def fake_to_thread(_func) -> None:
+            await slow_worker()
+
+        with (
+            patch('app.eod.runner.asyncio.to_thread', side_effect=fake_to_thread),
+            patch('app.eod.runner.BACKGROUND_RUNNER_STEP_TIMEOUT_SECONDS', 0.01),
+        ):
+            await runner._run_blocking_step('slow_refresh', lambda: None)
+            await runner._run_blocking_step('slow_refresh', lambda: None)
+            self.assertEqual(calls, 1)
+            self.assertIn('slow_refresh', runner._blocking_step_tasks)
+            release.set()
+            await asyncio.wait_for(runner._blocking_step_tasks['slow_refresh'], timeout=0.25)
+
+        self.assertNotIn('slow_refresh', runner._blocking_step_tasks)
+
     async def test_open_loop_runs_next_open_execution_submission(self) -> None:
         runner = EODBackgroundRunner(interval_seconds=0)
         market_state = MarketState(
@@ -389,6 +415,59 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
         ):
             runner._running = True
             await runner._run_loop()
+
+        schedule_daily.assert_awaited_once_with()
+        reconcile.assert_not_awaited()
+        refresh_snapshot.assert_not_awaited()
+        refresh_portfolio.assert_not_awaited()
+
+    async def test_closed_loop_skips_noncritical_background_work_when_daily_pipeline_active(self) -> None:
+        runner = EODBackgroundRunner(interval_seconds=0)
+        market_state = MarketState(
+            market='KRX',
+            state='CLOSED',
+            is_trading_day=True,
+            is_open=False,
+            server_time='2026-04-30T16:00:00+09:00',
+            session_open_at='2026-04-30T09:00:00+09:00',
+            session_close_at='2026-04-30T15:30:00+09:00',
+        )
+
+        async def stop_after_tick(_seconds: int) -> None:
+            runner._running = False
+
+        async def mark_pipeline_active() -> None:
+            from app.eod.runner import auto_pykrx_eod_scheduler
+
+            auto_pykrx_eod_scheduler.state.active_task = True
+
+        with (
+            patch('app.eod.runner.async_get_market_state', return_value=market_state),
+            patch(
+                'app.eod.runner.auto_pykrx_eod_scheduler.schedule_daily_pipeline_if_due',
+                new=AsyncMock(side_effect=mark_pipeline_active),
+            ) as schedule_daily,
+            patch(
+                'app.eod.runner.trading_order_reconciliation_service.run_periodic_if_due',
+                new=AsyncMock(),
+            ) as reconcile,
+            patch(
+                'app.eod.runner.market_snapshot_service.refresh_market_snapshot_if_due',
+                new=AsyncMock(),
+            ) as refresh_snapshot,
+            patch(
+                'app.eod.runner.portfolio_summary_service.refresh_portfolio_summary_if_due',
+                new=AsyncMock(),
+            ) as refresh_portfolio,
+            patch('app.eod.runner.asyncio.sleep', side_effect=stop_after_tick),
+        ):
+            try:
+                runner._running = True
+                await runner._run_loop()
+            finally:
+                from app.eod.runner import auto_pykrx_eod_scheduler
+
+                auto_pykrx_eod_scheduler.state.active_task = False
 
         schedule_daily.assert_awaited_once_with()
         reconcile.assert_not_awaited()

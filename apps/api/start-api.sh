@@ -44,6 +44,13 @@ source .env
 set +a
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
 
+if [ "${DB_STATEMENT_TIMEOUT_MS:-0}" -lt 600000 ] 2>/dev/null; then
+  export DB_STATEMENT_TIMEOUT_MS=600000
+fi
+if [ "${DB_LOCK_TIMEOUT_MS:-0}" -lt 60000 ] 2>/dev/null; then
+  export DB_LOCK_TIMEOUT_MS=60000
+fi
+
 if is_truthy "${DB_AUTO_UPGRADE:-true}"; then
   PREFLIGHT_JSON=""
   if ! PREFLIGHT_JSON="$("$PYTHON_BIN" -m app.internal.deploy_hygiene preflight --format json)"; then

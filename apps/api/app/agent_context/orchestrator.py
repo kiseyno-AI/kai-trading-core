@@ -244,7 +244,8 @@ def _ordered_union(values: Sequence[Sequence[str]]) -> list[str]:
     return ordered
 
 
-DEFAULT_OPENCLAW_AGENT_TIMEOUT_SECONDS = 120.0
+DEFAULT_OPENCLAW_AGENT_TIMEOUT_SECONDS = 300.0
+DEFAULT_OPENCLAW_AGENT_BATCH_TIMEOUT_SECONDS = 300.0
 
 
 class OpenClawAgentClient:
@@ -258,9 +259,9 @@ class OpenClawAgentClient:
         self.http_timeout_seconds = self.timeout_seconds
         configured_batch_timeout = float(getattr(settings, 'openclaw_agent_batch_timeout_seconds', 0) or 0)
         self.batch_http_timeout_seconds = (
-            min(self.http_timeout_seconds, configured_batch_timeout)
+            min(self.http_timeout_seconds, configured_batch_timeout, DEFAULT_OPENCLAW_AGENT_BATCH_TIMEOUT_SECONDS)
             if configured_batch_timeout > 0
-            else self.http_timeout_seconds
+            else min(self.http_timeout_seconds, DEFAULT_OPENCLAW_AGENT_BATCH_TIMEOUT_SECONDS)
         )
         self.max_retries = max(0, settings.openclaw_agent_max_retries)
         self.retry_backoff_seconds = max(0, settings.openclaw_agent_retry_backoff_seconds)
@@ -3537,8 +3538,32 @@ class AgentFeedbackOrchestrator:
                             batch_symbols=[str(item.get('symbol')) for item in batch_with_session],
                         )
 
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=role_parallelism) as executor:
+                    executor = concurrent.futures.ThreadPoolExecutor(max_workers=role_parallelism)
+                    try:
                         future_map: dict[concurrent.futures.Future[dict[str, Any]], tuple[int, list[dict[str, Any]]]] = {}
+                        future_started_at: dict[concurrent.futures.Future[dict[str, Any]], float] = {}
+                        client_batch_timeout = float(
+                            getattr(
+                                self._get_client(),
+                                'batch_http_timeout_seconds',
+                                getattr(settings, 'openclaw_agent_batch_timeout_seconds', 0)
+                                or DEFAULT_OPENCLAW_AGENT_BATCH_TIMEOUT_SECONDS,
+                            )
+                            or DEFAULT_OPENCLAW_AGENT_BATCH_TIMEOUT_SECONDS
+                        )
+                        configured_batch_timeout = float(
+                            getattr(settings, 'openclaw_agent_batch_timeout_seconds', 0)
+                            or DEFAULT_OPENCLAW_AGENT_BATCH_TIMEOUT_SECONDS
+                        )
+                        batch_timeout_seconds = max(
+                            1.0,
+                            min(
+                                client_batch_timeout,
+                                configured_batch_timeout,
+                                DEFAULT_OPENCLAW_AGENT_BATCH_TIMEOUT_SECONDS,
+                            ),
+                        )
+                        poll_seconds = max(0.25, float(getattr(settings, 'openclaw_agent_subtask_poll_seconds', 2.0) or 2.0))
 
                         def submit_next() -> None:
                             if not queue:
@@ -3552,17 +3577,41 @@ class AgentFeedbackOrchestrator:
                                 batch_items=batch,
                             )
                             future_map[future] = (slot, batch)
+                            future_started_at[future] = time.monotonic()
 
                         for _ in range(min(role_parallelism, len(queue))):
                             submit_next()
 
                         while future_map:
-                            done, _ = concurrent.futures.wait(list(future_map.keys()), return_when=concurrent.futures.FIRST_COMPLETED)
+                            done, _ = concurrent.futures.wait(
+                                list(future_map.keys()),
+                                timeout=poll_seconds,
+                                return_when=concurrent.futures.FIRST_COMPLETED,
+                            )
+                            now_monotonic = time.monotonic()
+                            timed_out = {
+                                future
+                                for future, started_at in future_started_at.items()
+                                if future in future_map and now_monotonic - started_at >= batch_timeout_seconds
+                            }
+                            done = set(done) | timed_out
                             for future in done:
                                 slot, batch = future_map.pop(future)
+                                started_at = future_started_at.pop(future, now_monotonic)
                                 should_submit_next = False
                                 staged_batch_outcomes = False
                                 try:
+                                    if future in timed_out:
+                                        future.cancel()
+                                        raise AgentDispatchRetryableError(
+                                            f'OpenClaw batch dispatch timed out after {batch_timeout_seconds:.1f}s',
+                                            details={
+                                                'failure_kind': FeedbackFailureKind.OPENCLAW_TRANSPORT_TIMEOUT.value,
+                                                'failure_mode': FeedbackFailureKind.OPENCLAW_TRANSPORT_TIMEOUT.value,
+                                                'timeout_seconds': batch_timeout_seconds,
+                                                'elapsed_seconds': round(now_monotonic - started_at, 3),
+                                            },
+                                        )
                                     batch_result = future.result()
                                     decoded_items = batch_result.get('decoded', {}).get('items', [])
                                     by_symbol = {
@@ -3912,6 +3961,8 @@ class AgentFeedbackOrchestrator:
                                     mark_activity(role, slot, done=True)
                                 if should_submit_next:
                                     submit_next()
+                    finally:
+                        executor.shutdown(wait=False, cancel_futures=True)
 
                     role_flush_result = self._flush_pending_run_buffers(
                         market_date=normalized_market_date,

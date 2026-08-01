@@ -39,6 +39,7 @@ from app.core.audit_logging import (
 )
 from app.core.settings import settings
 from app.db import check_database, init_database
+from app.db_pool_watchdog import db_pool_watchdog
 from app.eod.daily_pipeline_state import daily_pipeline_run_state_service
 from app.eod.runner import background_runner
 from app.market.snapshot import market_snapshot_service
@@ -104,6 +105,7 @@ async def lifespan(_: FastAPI):
         logger.warning('Database initialization failed; starting in degraded mode: %s', exc)
     await kis_realtime_order_notice_service.start()
     await kis_realtime_price_service.start()
+    await db_pool_watchdog.start()
     if settings.startup_maintenance_enabled:
         startup_maintenance_task = asyncio.create_task(_run_startup_maintenance(), name='startup-maintenance')
     if settings.background_runner_enabled or settings.eod_auto_pykrx_enabled:
@@ -117,6 +119,7 @@ async def lifespan(_: FastAPI):
                 await startup_maintenance_task
         await kis_realtime_price_service.stop()
         await kis_realtime_order_notice_service.stop()
+        await db_pool_watchdog.stop()
         await background_runner.stop()
 
 
