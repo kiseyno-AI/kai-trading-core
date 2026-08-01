@@ -7,6 +7,8 @@ Signal-decider and short-term entries dispatched in `SIGNAL_DECIDER_EXEC_INTEGRA
 
 Each exec item also carries `risk_context.decider_handoff_context`, which preserves execution/risk context, input feature snapshots, pre-decider enrichment context, response payload/summary, normalized tactical output fields, risk/data-quality warnings, and traceability ids. Accepted rows without an agent-approved positive quantity remain delegated sizing candidates in core (`execution_status="delegated_for_exec_agent_sizing"`) until exec readback reports scheduled/submitted/filled/monitoring outcomes.
 
+Exec readback can also repair stale short-term watch display state without creating broker orders. When a `short-term-decider` watch-buy row is still `blocked/planned` in core but Exec reports the linked entry as accepted, pending, submitted, or `watch_monitoring_active`, core promotes the row's `execution_status` to `delegated_for_exec_agent_sizing`, keeps the original `eligibility_status` and validation `blocking_reasons`, and stores the audit under `validation.exec_watch_state_sync` plus `submission.exec_dispatch.core_state_sync`. The item exposes `core_state_divergence_warning`, and `summary.core_exec_state_divergence_count` with `summary.warnings` tells consumers that Exec watch truth is overriding stale core display state for monitoring only.
+
 Exec handoffs now include `risk_context.decision_input_quality_context`, `risk_context.execution_feasibility_context`, and the same envelope under `risk_context.decider_handoff_context.decider_input_context.decision_input_quality_context`. The `quantity_policy` for exec-agent-sized buys also carries sizing hints such as `liquidity_tier`, `max_safe_notional_krw`, and `sizing_hints`. Exec should treat stale/fallback quote and missing raw turnover as hard blocks or major discounts, while empty news/disclosures stay neutral secondary context unless separate adverse-event evidence exists.
 
 Buy-oriented exec handoffs also include `risk_context.market_regime_context` and the same payload under `risk_context.decider_handoff_context.decider_input_context.market_regime_context`. Core derives it from PyKRX market breadth, sector/category peer context, and market-relative strength with deterministic `normal`, `caution`, `risk_off`, `unavailable`, and `stale` posture semantics. This is the core-owned context contract for kiseyno-AI/kai-trading-exec#140, allowing exec-side buy approval to apply market/sector guardrails without querying core.
@@ -60,7 +62,15 @@ GET /trading/orders/exec/signal-decider?target_trade_date=2026-04-30&symbol=0059
       "open": 2
     },
     "remote_open_count": 2,
-    "remote_closed_count": 0
+    "remote_closed_count": 0,
+    "core_exec_state_divergence_count": 1,
+    "warnings": [
+      {
+        "code": "exec_watch_state_divergence",
+        "count": 1,
+        "symbols": ["005930"]
+      }
+    ]
   },
   "items": [
     {
@@ -138,6 +148,25 @@ GET /trading/orders/exec/signal-decider?target_trade_date=2026-04-30&symbol=0059
       "exec_monitoring_active": true,
       "exec_agent_approved": true,
       "approval_state": "approved",
+      "exec_watch_state_sync": {
+        "schema_version": "exec_watch_state_sync_v1",
+        "status": "exec_watch_monitoring_active",
+        "source": "exec_readback",
+        "divergence": true,
+        "core_state_before": {
+          "eligibility_status": "blocked",
+          "execution_status": "planned"
+        },
+        "core_state_after": {
+          "eligibility_status": "blocked",
+          "execution_status": "delegated_for_exec_agent_sizing"
+        },
+        "active_exec_statuses": ["watch_monitoring_active"]
+      },
+      "core_state_divergence_warning": {
+        "code": "exec_watch_state_divergence",
+        "exec_statuses": ["watch_monitoring_active"]
+      },
       "target_price": 54000,
       "stop_loss_price": 49000,
       "signal_decider_alignment": "wait_conflict_block",

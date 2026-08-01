@@ -238,8 +238,10 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         suffix = uuid4().hex[:8].upper()
         self.policy_version = f'signal_decider_policy_exec_{suffix.lower()}'
         self.account_reference = f'KIS:98{suffix[:6]}-01'
-        self.symbol = '005930'
+        self.symbol = f'T{suffix[:5]}'
         self.seeded_symbols = {self.symbol}
+        self.main_client_order_id = f'SDNO-20260430-{self.symbol}'
+        self.short_term_client_order_id = f'STDE-20260430-{self.symbol}'
         self.market_date = date(2026, 4, 29)
         self.target_trade_date = date(2026, 4, 30)
         self.original_settings = {
@@ -623,7 +625,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 estimated_notional_krw='250000',
                 eligibility_status='eligible',
                 execution_status='planned',
-                client_order_id='SDNO-20260430-005930',
+                client_order_id=self.main_client_order_id,
                 validation_payload={'blocking_reasons': [], 'warnings': []},
                 traceability_payload={
                     'decision_snapshot_id': self.snapshot_id,
@@ -680,7 +682,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 estimated_notional_krw='1493500',
                 eligibility_status='eligible',
                 execution_status='planned',
-                client_order_id='STDE-20260430-005930',
+                client_order_id=self.short_term_client_order_id,
                 validation_payload={
                     'blocking_reasons': [],
                     'warnings': [],
@@ -756,6 +758,91 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 'blocking_reasons': [{'code': 'stale_planning_block', 'message': 'stale planning block'}],
             }
             session.flush()
+
+    async def _readback_stale_short_term_watch(
+        self,
+        *,
+        exec_status: str = 'watch_monitoring_active',
+    ) -> tuple[dict, dict, int]:
+        short_snapshot_id = self._seed_short_term_snapshot()
+        short_plan_item_id = self._seed_short_term_plan_item(snapshot_id=short_snapshot_id)
+        dispatch_result = await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            account_reference=self.account_reference,
+            refresh_plan=False,
+            dry_run=False,
+            force=True,
+            trigger='test',
+        )
+        short_group = next(
+            group
+            for group in dispatch_result['dispatch']['groups']
+            if group['decision_agent_name'] == 'short-term-decider'
+        )
+        short_plan_id = short_group['plan_id']
+        original_blocking_reason = {
+            'code': 'manual_recovery_gate_block',
+            'message': 'Original core quality gate remained blocked before exec restore.',
+        }
+        original_warning = {
+            'code': 'original_soft_gate_warning',
+            'message': 'Original soft gate warning is preserved.',
+        }
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, short_plan_item_id)
+            row.eligibility_status = 'blocked'
+            row.execution_status = 'planned'
+            row.validation_payload = {
+                **(row.validation_payload or {}),
+                'blocking_reasons': [original_blocking_reason],
+                'warnings': [original_warning],
+            }
+            row.traceability_payload = {
+                **(row.traceability_payload or {}),
+                'exec_monitoring_active': False,
+                'approval_state': 'blocked',
+            }
+            session.flush()
+
+        self.client.runtime_response = {
+            'mode': 'mock',
+            'ready': True,
+            'monitoring': {'alive': True},
+        }
+        self.client.plan_response = {
+            'items': [
+                {
+                    'external_plan_id': short_plan_id,
+                    'status': 'accepted',
+                    'items': [
+                        {
+                            'core_item_key': f'core-plan-{short_plan_item_id}:{EXEC_INTENT_INTRADAY_WATCH_BUY}',
+                            'execution_plan_item_id': 'exec-short-watch-1',
+                            'symbol': self.symbol,
+                            'intent': EXEC_INTENT_INTRADAY_WATCH_BUY,
+                            'status': exec_status,
+                            'monitoring_status': exec_status,
+                        }
+                    ],
+                }
+            ]
+        }
+        self.client.order_response = {'items': []}
+        self.client.execution_response = {'items': []}
+        self.client.position_response = {'items': []}
+
+        overview = await self.service.list_signal_decider_exec_overview(
+            target_trade_date=self.target_trade_date,
+            symbol=self.symbol,
+            refresh=True,
+            trigger='test',
+        )
+        short_item = next(
+            item
+            for item in overview['items']
+            if item['plan_item_id'] == short_plan_item_id
+        )
+        return overview, short_item, short_plan_item_id
 
     async def test_dispatch_next_open_plan_blocks_when_source_pykrx_enrichment_missing(self) -> None:
         blocked_preflight = {
@@ -1618,6 +1705,93 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         signal_item = next(item for item in result['items'] if item['decision_agent_name'] == 'signal-decider')
         self.assertEqual(signal_item['execution_status'], EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING)
         self.assertEqual(result['summary']['delegated_for_exec_agent_sizing_count'], 2)
+
+    async def test_readback_promotes_blocked_planned_short_term_watch_to_delegated(self) -> None:
+        overview, short_item, short_plan_item_id = await self._readback_stale_short_term_watch(
+            exec_status='watch_monitoring_active',
+        )
+
+        self.assertTrue(short_item['exec_monitoring_active'])
+        self.assertTrue(short_item['exec_agent_approved'])
+        self.assertEqual(short_item['approval_state'], 'approved')
+        self.assertEqual(short_item['execution_status'], EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING)
+        self.assertEqual(short_item['eligibility_status'], 'blocked')
+        self.assertEqual(short_item['validation']['blocking_reasons'][0]['code'], 'manual_recovery_gate_block')
+        self.assertIn(
+            'exec_watch_state_divergence',
+            {warning['code'] for warning in short_item['validation']['warnings']},
+        )
+        self.assertEqual(short_item['remote_state']['plan_item_status_counts']['watch_monitoring_active'], 1)
+        self.assertEqual(overview['summary']['core_exec_state_divergence_count'], 1)
+
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, short_plan_item_id)
+            self.assertEqual(row.execution_status, EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING)
+            self.assertEqual(row.eligibility_status, 'blocked')
+            self.assertEqual(row.validation_payload['blocking_reasons'][0]['code'], 'manual_recovery_gate_block')
+            self.assertEqual(row.validation_payload['warnings'][0]['code'], 'original_soft_gate_warning')
+            self.assertIn(
+                'exec_watch_state_divergence',
+                {warning['code'] for warning in row.validation_payload['warnings']},
+            )
+            audit = row.submission_payload['exec_dispatch']['core_state_sync']
+            self.assertTrue(audit['divergence'])
+            self.assertEqual(audit['core_state_before']['eligibility_status'], 'blocked')
+            self.assertEqual(audit['core_state_before']['execution_status'], 'planned')
+            self.assertEqual(audit['core_state_after']['execution_status'], EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING)
+
+    async def test_runtime_read_model_uses_exec_watch_status_without_broker_orders(self) -> None:
+        _, _, short_plan_item_id = await self._readback_stale_short_term_watch(
+            exec_status='watch_monitoring_pending',
+        )
+
+        board = await self.service.get_runtime_daily_board(
+            market_date=self.target_trade_date,
+            refresh=False,
+            trigger='test',
+        )
+        short_board_item = next(
+            item
+            for item in board['items']
+            if item['plan_item_id'] == short_plan_item_id
+        )
+
+        self.assertEqual(short_board_item['status'], 'scheduled')
+        self.assertEqual(short_board_item['monitoring_state'], 'watching_fill')
+        self.assertTrue(short_board_item['exec_monitoring_active'])
+        self.assertTrue(short_board_item['exec_runtime_showable'])
+        self.assertEqual(short_board_item['exec_runtime_state'], 'exec_approved_watch')
+        self.assertEqual(short_board_item['core_state_divergence_warning']['code'], 'exec_watch_state_divergence')
+        self.assertEqual(short_board_item['open_quantity'], 0)
+        self.assertIsNone(short_board_item['broker_order_id'])
+
+        with session_scope() as session:
+            self.assertEqual(
+                session.execute(
+                    select(OrderRequest).where(OrderRequest.client_order_id == self.short_term_client_order_id)
+                ).scalars().all(),
+                [],
+            )
+            self.assertEqual(
+                session.execute(
+                    select(BrokerOrder).where(BrokerOrder.client_order_id == self.short_term_client_order_id)
+                ).scalars().all(),
+                [],
+            )
+
+    async def test_overview_warns_when_exec_watch_active_but_core_was_blocked_planned(self) -> None:
+        overview, short_item, _ = await self._readback_stale_short_term_watch(
+            exec_status='watch_buy_submitted',
+        )
+
+        self.assertEqual(overview['summary']['core_exec_state_divergence_count'], 1)
+        self.assertEqual(overview['summary']['warnings'][0]['code'], 'exec_watch_state_divergence')
+        self.assertEqual(overview['summary']['warnings'][0]['symbols'], [self.symbol])
+        warning = short_item['core_state_divergence_warning']
+        self.assertEqual(warning['code'], 'exec_watch_state_divergence')
+        self.assertEqual(warning['core_state_before']['eligibility_status'], 'blocked')
+        self.assertEqual(warning['core_state_before']['execution_status'], 'planned')
+        self.assertEqual(warning['exec_statuses'], ['watch_buy_submitted'])
 
     async def test_dispatch_next_open_plan_short_term_missing_target_stop_skips_watch_handoff(self) -> None:
         short_snapshot_id = self._seed_short_term_snapshot(target_price=None, stop_loss_price=None)
