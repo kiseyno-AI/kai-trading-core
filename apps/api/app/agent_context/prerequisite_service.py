@@ -62,6 +62,11 @@ class AgentFeedbackPrerequisiteService:
         explicit_gate_status = str(
             stage_payload.get('gate_status') or details.get('gate_status') or ''
         ).strip().lower()
+        if str(stage_payload.get('task') or '') != PYKRX_ENRICHMENT_PREREQUISITE_STAGE_ID:
+            if AgentFeedbackPrerequisiteService._has_complete_persisted_stage_coverage(stage_payload):
+                return 'ready'
+            if status == 'partial' and AgentFeedbackPrerequisiteService._is_nonblocking_fundamentals_partial(stage_payload):
+                return 'ready'
         if explicit_gate_status in {'ready', 'blocked', 'waiting'}:
             return explicit_gate_status
         if str(stage_payload.get('task') or '') == PYKRX_ENRICHMENT_PREREQUISITE_STAGE_ID:
@@ -121,6 +126,40 @@ class AgentFeedbackPrerequisiteService:
         if remaining_retryable_events is not None:
             return remaining_retryable_events == 0
         return True
+
+    @staticmethod
+    def _has_complete_persisted_stage_coverage(stage_payload: dict[str, Any]) -> bool:
+        details = stage_payload.get('details') if isinstance(stage_payload.get('details'), dict) else {}
+        expected_rows = AgentFeedbackPrerequisiteService._coerce_positive_int(
+            details.get('expected_rows'),
+            stage_payload.get('total'),
+        )
+        rows_persisted = AgentFeedbackPrerequisiteService._coerce_positive_int(
+            details.get('rows_persisted'),
+            stage_payload.get('succeeded'),
+            stage_payload.get('processed'),
+        )
+        return expected_rows > 0 and rows_persisted >= expected_rows
+
+    @staticmethod
+    def _is_nonblocking_fundamentals_partial(stage_payload: dict[str, Any]) -> bool:
+        if str(stage_payload.get('task') or '') != 'fundamentals_daily_refresh':
+            return False
+        details = stage_payload.get('details') if isinstance(stage_payload.get('details'), dict) else {}
+        result_summary = details.get('result_summary') if isinstance(details.get('result_summary'), dict) else {}
+        partial_reasons = result_summary.get('partial_reasons')
+        if not isinstance(partial_reasons, list) or set(partial_reasons) != {'piotroski_filter_followup_failed'}:
+            return False
+        symbols_failed = AgentFeedbackPrerequisiteService._coerce_optional_int(result_summary.get('symbols_failed')) or 0
+        events_failed = AgentFeedbackPrerequisiteService._coerce_optional_int(result_summary.get('events_failed')) or 0
+        remaining_retryable_events = AgentFeedbackPrerequisiteService._coerce_optional_int(
+            result_summary.get('remaining_retryable_events')
+        )
+        if remaining_retryable_events is None:
+            remaining_retryable_events = AgentFeedbackPrerequisiteService._coerce_optional_int(
+                details.get('remaining_retryable_events')
+            )
+        return symbols_failed == 0 and events_failed == 0 and (remaining_retryable_events in (None, 0))
 
     @staticmethod
     def _coerce_positive_int(*values: Any) -> int:
@@ -361,6 +400,7 @@ class AgentFeedbackPrerequisiteService:
                     market_date=normalized_market_date.isoformat(),
                 )
             )
+            stage_payload.setdefault('task', stage_id)
             if stage_id == PYKRX_ENRICHMENT_PREREQUISITE_STAGE_ID:
                 stage_payload = self._augment_pykrx_enrichment_prerequisite_stage(stage_payload)
             gate_status = self._classify_stage_gate_status(stage_payload)

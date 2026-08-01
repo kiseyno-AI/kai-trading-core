@@ -6,11 +6,10 @@ from datetime import date
 import re
 from typing import Any, Sequence
 
-from sqlalchemy import func, select
+from sqlalchemy import or_, select, text
 
 from app.db import session_scope
 from app.db_models import (
-    DartDisclosureEvent,
     DartFundamentalsHighlight,
     DartFundamentalsRow,
     DartFundamentalsSnapshot,
@@ -25,7 +24,9 @@ from app.market_data_store import (
 
 ADVANCED_VALUE_FACTOR_VERSION = 'advanced_value_v1'
 ADVANCED_VALUE_FACTOR_SOURCE = ADVANCED_VALUE_FACTOR_VERSION
+ADVANCED_VALUE_FUNDAMENTALS_SNAPSHOT_CHUNK_SIZE = 500
 ADVANCED_VALUE_FUNDAMENTALS_ROW_CHUNK_SIZE = 500
+ADVANCED_VALUE_FUNDAMENTALS_ROW_FALLBACK_MAX_SNAPSHOTS = 500
 ADVANCED_VALUE_FUNDAMENTALS_FS_DIV = 'CFS'
 ADVANCED_VALUE_FUNDAMENTALS_REPORT_CODE = '11011'
 ADVANCED_VALUE_FUNDAMENTALS_PERIOD_TYPE = 'annual'
@@ -211,6 +212,19 @@ AMORTIZATION_MATCHER = {
     },
 }
 
+FUNDAMENTALS_FALLBACK_MATCHERS = (
+    TOTAL_LIABILITIES_MATCHER,
+    TOTAL_EQUITY_MATCHER,
+    OPERATING_INCOME_MATCHER,
+    OPERATING_CASH_FLOW_MATCHER,
+    CASH_AND_CASH_EQUIVALENTS_MATCHER,
+    CAPEX_PPE_MATCHER,
+    CAPEX_INTANGIBLE_MATCHER,
+    DEPRECIATION_AND_AMORTIZATION_MATCHER,
+    DEPRECIATION_MATCHER,
+    AMORTIZATION_MATCHER,
+)
+
 
 def _round(value: float | None, digits: int = 6) -> float | None:
     if value is None:
@@ -237,6 +251,27 @@ def _normalize_symbols(symbols: Sequence[str] | None) -> list[str] | None:
     if symbols is None:
         return None
     return list(dict.fromkeys(_normalize_symbol(symbol) for symbol in symbols))
+
+
+def _matcher_values(key: str) -> set[str]:
+    values: set[str] = set()
+    for matcher in FUNDAMENTALS_FALLBACK_MATCHERS:
+        values.update(str(value).strip() for value in matcher.get(key, set()) if str(value or '').strip())
+    return values
+
+
+def _fallback_statement_row_filter():
+    account_ids = _matcher_values('account_ids')
+    account_names = _matcher_values('account_names')
+    contains_tokens = _matcher_values('account_name_contains')
+    conditions = []
+    if account_ids:
+        conditions.append(DartFundamentalsRow.account_id.in_(account_ids))
+    if account_names:
+        conditions.append(DartFundamentalsRow.account_name.in_(account_names))
+    for token in contains_tokens:
+        conditions.append(DartFundamentalsRow.account_name.ilike(f'%{token}%'))
+    return or_(*conditions)
 
 
 def _percentile_from_rank(rank: int, total: int) -> float:
@@ -889,54 +924,80 @@ class DailyAdvancedValueFactorService:
 
         normalized_symbols = list(dict.fromkeys(symbols))
         with session_scope() as session:
-            ranked_snapshots = (
-                select(
-                    DartFundamentalsSnapshot.id.label('snapshot_id'),
-                    DartFundamentalsSnapshot.stock_code.label('stock_code'),
-                    DartFundamentalsSnapshot.corp_name.label('corp_name'),
-                    DartFundamentalsSnapshot.business_year.label('business_year'),
-                    DartFundamentalsSnapshot.report_code.label('report_code'),
-                    DartFundamentalsSnapshot.fs_div.label('fs_div'),
-                    DartFundamentalsSnapshot.period_type.label('period_type'),
-                    DartFundamentalsSnapshot.currency.label('currency'),
-                    DartFundamentalsSnapshot.captured_at.label('captured_at'),
-                    DartDisclosureEvent.rcept_no.label('rcept_no'),
-                    DartDisclosureEvent.receipt_date.label('receipt_date'),
-                    func.row_number()
-                    .over(
-                        partition_by=DartFundamentalsSnapshot.stock_code,
-                        order_by=(
-                            DartDisclosureEvent.receipt_date.desc(),
-                            DartFundamentalsSnapshot.business_year.desc(),
-                            DartFundamentalsSnapshot.id.desc(),
-                        ),
+            session.execute(text("SET LOCAL statement_timeout = '60s'"))
+            snapshot_rows = []
+            for start in range(0, len(normalized_symbols), ADVANCED_VALUE_FUNDAMENTALS_SNAPSHOT_CHUNK_SIZE):
+                symbol_chunk = normalized_symbols[start:start + ADVANCED_VALUE_FUNDAMENTALS_SNAPSHOT_CHUNK_SIZE]
+                symbol_params = {f'symbol_{index}': symbol for index, symbol in enumerate(symbol_chunk)}
+                requested_values_sql = ', '.join(f'(:symbol_{index})' for index in range(len(symbol_chunk)))
+                latest_snapshot_stmt = text(
+                    f"""
+                    with requested(stock_code) as (
+                      values {requested_values_sql}
                     )
-                    .label('snapshot_rank'),
+                    select
+                      latest.snapshot_id as snapshot_id,
+                      latest.stock_code as stock_code,
+                      latest.corp_name as corp_name,
+                      latest.business_year as business_year,
+                      latest.report_code as report_code,
+                      latest.fs_div as fs_div,
+                      latest.period_type as period_type,
+                      latest.currency as currency,
+                      latest.captured_at as captured_at,
+                      latest.rcept_no as rcept_no,
+                      latest.receipt_date as receipt_date
+                    from requested
+                    join lateral (
+                      select
+                        snap.id as snapshot_id,
+                        snap.stock_code as stock_code,
+                        snap.corp_name as corp_name,
+                        snap.business_year as business_year,
+                        snap.report_code as report_code,
+                        snap.fs_div as fs_div,
+                        snap.period_type as period_type,
+                        snap.currency as currency,
+                        snap.captured_at as captured_at,
+                        snap.rcept_no as rcept_no,
+                        disclosure.receipt_date as receipt_date
+                      from dart_fundamentals_snapshots snap
+                      join dart_disclosure_events disclosure
+                        on disclosure.id = snap.disclosure_event_id
+                      where snap.stock_code = requested.stock_code
+                        and snap.fs_div = :fs_div
+                        and snap.report_code = :report_code
+                        and snap.period_type = :period_type
+                        and snap.business_year <= :business_year
+                        and disclosure.receipt_date <= :market_date
+                      order by
+                        snap.business_year desc,
+                        disclosure.receipt_date desc,
+                        snap.id desc
+                      limit 1
+                    ) latest on true
+                    """
                 )
-                .join(
-                    DartDisclosureEvent,
-                    DartDisclosureEvent.id == DartFundamentalsSnapshot.disclosure_event_id,
+                snapshot_rows.extend(
+                    session.execute(
+                        latest_snapshot_stmt,
+                        {
+                            **symbol_params,
+                            'fs_div': ADVANCED_VALUE_FUNDAMENTALS_FS_DIV,
+                            'report_code': ADVANCED_VALUE_FUNDAMENTALS_REPORT_CODE,
+                            'period_type': ADVANCED_VALUE_FUNDAMENTALS_PERIOD_TYPE,
+                            'business_year': market_date.year,
+                            'market_date': market_date,
+                        },
+                    ).mappings().all()
                 )
-                .where(
-                    DartFundamentalsSnapshot.stock_code.in_(normalized_symbols),
-                    DartFundamentalsSnapshot.fs_div == ADVANCED_VALUE_FUNDAMENTALS_FS_DIV,
-                    DartFundamentalsSnapshot.report_code == ADVANCED_VALUE_FUNDAMENTALS_REPORT_CODE,
-                    DartFundamentalsSnapshot.period_type == ADVANCED_VALUE_FUNDAMENTALS_PERIOD_TYPE,
-                    DartDisclosureEvent.receipt_date.is_not(None),
-                    DartDisclosureEvent.receipt_date <= market_date,
-                )
-                .subquery()
-            )
-            snapshot_rows = session.execute(
-                select(ranked_snapshots).where(ranked_snapshots.c.snapshot_rank == 1)
-            ).all()
             if not snapshot_rows:
                 return {}
 
             snapshot_metadata_by_id: dict[int, dict[str, Any]] = {}
             snapshot_id_by_symbol: dict[str, int] = {}
             for row in snapshot_rows:
-                mapping = row._mapping
+                mapping = row._mapping if hasattr(row, '_mapping') else row
                 snapshot_id = int(mapping['snapshot_id'])
                 stock_code = str(mapping['stock_code'])
                 snapshot_metadata_by_id[snapshot_id] = {
@@ -955,27 +1016,33 @@ class DailyAdvancedValueFactorService:
                 snapshot_id_by_symbol[stock_code] = snapshot_id
 
             snapshot_ids = list(snapshot_metadata_by_id.keys())
-            highlight_rows = session.execute(
-                select(DartFundamentalsHighlight)
-                .where(DartFundamentalsHighlight.snapshot_id.in_(snapshot_ids))
-            ).scalars()
             highlights_by_snapshot: dict[int, dict[str, dict[str, Any]]] = defaultdict(dict)
             rows_by_snapshot: dict[int, list[dict[str, Any]]] = defaultdict(list)
-            for row in highlight_rows:
-                highlights_by_snapshot[row.snapshot_id][row.metric_key] = _serialize_highlight_row(row)
             for start in range(0, len(snapshot_ids), ADVANCED_VALUE_FUNDAMENTALS_ROW_CHUNK_SIZE):
                 snapshot_id_chunk = snapshot_ids[start:start + ADVANCED_VALUE_FUNDAMENTALS_ROW_CHUNK_SIZE]
-                statement_rows = session.execute(
-                    select(DartFundamentalsRow)
-                    .where(DartFundamentalsRow.snapshot_id.in_(snapshot_id_chunk))
-                    .order_by(
-                        DartFundamentalsRow.snapshot_id.asc(),
-                        DartFundamentalsRow.row_order.asc(),
-                        DartFundamentalsRow.id.asc(),
-                    )
+                highlight_rows = session.execute(
+                    select(DartFundamentalsHighlight)
+                    .where(DartFundamentalsHighlight.snapshot_id.in_(snapshot_id_chunk))
                 ).scalars()
-                for row in statement_rows:
-                    rows_by_snapshot[row.snapshot_id].append(_serialize_statement_row(row))
+                for row in highlight_rows:
+                    highlights_by_snapshot[row.snapshot_id][row.metric_key] = _serialize_highlight_row(row)
+            if len(snapshot_ids) <= ADVANCED_VALUE_FUNDAMENTALS_ROW_FALLBACK_MAX_SNAPSHOTS:
+                for start in range(0, len(snapshot_ids), ADVANCED_VALUE_FUNDAMENTALS_ROW_CHUNK_SIZE):
+                    snapshot_id_chunk = snapshot_ids[start:start + ADVANCED_VALUE_FUNDAMENTALS_ROW_CHUNK_SIZE]
+                    statement_rows = session.execute(
+                        select(DartFundamentalsRow)
+                        .where(
+                            DartFundamentalsRow.snapshot_id.in_(snapshot_id_chunk),
+                            _fallback_statement_row_filter(),
+                        )
+                        .order_by(
+                            DartFundamentalsRow.snapshot_id.asc(),
+                            DartFundamentalsRow.row_order.asc(),
+                            DartFundamentalsRow.id.asc(),
+                        )
+                    ).scalars()
+                    for row in statement_rows:
+                        rows_by_snapshot[row.snapshot_id].append(_serialize_statement_row(row))
 
             result: dict[str, AnnualFundamentalsSnapshot] = {}
             for symbol, snapshot_id in snapshot_id_by_symbol.items():

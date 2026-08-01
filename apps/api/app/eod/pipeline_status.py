@@ -245,7 +245,7 @@ def _load_factor_stage_counts(*, market_date: str) -> dict[str, dict[str, Any]]:
         for stage_id, model in FACTOR_STAGE_MODELS.items():
             persisted, updated_at = session.execute(
                 select(
-                    func.count(func.distinct(model.symbol_id)),
+                    func.count(model.id),
                     func.max(model.captured_at),
                 )
                 .select_from(model)
@@ -263,7 +263,7 @@ def _load_signal_feature_counts(*, market_date: str) -> dict[str, Any]:
     with session_scope() as session:
         persisted, updated_at = session.execute(
             select(
-                func.count(func.distinct(DailySignalFeature.symbol_id)),
+                func.count(DailySignalFeature.id),
                 func.max(DailySignalFeature.captured_at),
             )
             .select_from(DailySignalFeature)
@@ -403,7 +403,7 @@ def _load_row_count_stage_counts(*, market_date: str) -> dict[str, dict[str, Any
     with session_scope() as session:
         price_symbol_count = int(
             session.execute(
-                select(func.count(func.distinct(DailyPriceBar.symbol_id)))
+                select(func.count(DailyPriceBar.id))
                 .select_from(DailyPriceBar)
                 .where(DailyPriceBar.trade_date == normalized_market_date)
             ).scalar_one()
@@ -412,7 +412,7 @@ def _load_row_count_stage_counts(*, market_date: str) -> dict[str, dict[str, Any
         for stage_id, model in ROW_COUNT_STAGE_MODELS.items():
             persisted, updated_at = session.execute(
                 select(
-                    func.count(func.distinct(model.symbol_id)),
+                    func.count(model.id),
                     func.max(model.captured_at),
                 )
                 .select_from(model)
@@ -834,6 +834,15 @@ class EODPipelineStatusService:
             market_date=resolved_market_date,
             aggregate=dict(self.signal_decider_counts_loader(market_date=resolved_market_date) or {}),
         )
+        stored_row_count_stage_overrides = {
+            stage_id: {
+                **stages[stage_id],
+                'details': dict(stages[stage_id].get('details') or {}),
+            }
+            for stage_id in ROW_COUNT_STAGE_MODELS
+            if stage_id in stages
+            and int(dict(row_count_stage_counts.get(stage_id) or {}).get('persisted') or 0) > 0
+        }
         for stage_id in PIPELINE_STAGE_ORDER:
             if stage_id in stages:
                 continue
@@ -868,6 +877,9 @@ class EODPipelineStatusService:
                 official_run=official_run,
                 market_date=resolved_market_date,
             )
+        for stage_id, stored_stage in stored_row_count_stage_overrides.items():
+            if stage_id in stages:
+                stages[stage_id] = stored_stage
         stages = self._mark_preopen_stage_skips(stages=stages)
         stages = self._normalize_stage_contract(stages)
         overall_status = self._resolve_overall_status(stages)
@@ -1107,6 +1119,7 @@ class EODPipelineStatusService:
                 continue
             fallback_stage = stages.get(stage_id) or {}
             if not self._should_overlay_live_eod_run_stage_progress(
+                stage_id=stage_id,
                 fallback_stage=fallback_stage,
                 progress=progress,
             ):
@@ -1123,11 +1136,17 @@ class EODPipelineStatusService:
     @staticmethod
     def _should_overlay_live_eod_run_stage_progress(
         *,
+        stage_id: str,
         fallback_stage: dict[str, Any],
         progress: dict[str, Any],
     ) -> bool:
         progress_status = _normalize_status(str(progress.get('status') or '')) or 'pending'
         fallback_status = str(fallback_stage.get('status') or '').strip().lower()
+        if EODPipelineStatusService._should_preserve_stored_coverage_stage(
+            stage_id=stage_id,
+            fallback_stage=fallback_stage,
+        ):
+            return False
         if progress_status == 'running':
             return fallback_status != 'running'
         if fallback_status == 'pending':
@@ -1298,6 +1317,11 @@ class EODPipelineStatusService:
             official_stage = official_stages.get(stage_id)
             if not isinstance(official_stage, dict):
                 continue
+            if self._should_preserve_stored_coverage_stage(
+                stage_id=stage_id,
+                fallback_stage=stages.get(stage_id) or {},
+            ):
+                continue
             overlaid[stage_id] = self._build_official_stage(
                 stage_id=stage_id,
                 market_date=market_date,
@@ -1324,6 +1348,11 @@ class EODPipelineStatusService:
             official_run = history_item.get('run') if isinstance(history_item.get('run'), dict) else None
             if not isinstance(official_stage, dict) or not isinstance(official_run, dict):
                 continue
+            if self._should_preserve_stored_coverage_stage(
+                stage_id=stage_id,
+                fallback_stage=fallback_stage,
+            ):
+                continue
             if not self._should_overlay_official_stage_history(
                 fallback_stage=fallback_stage,
                 official_stage=official_stage,
@@ -1341,6 +1370,26 @@ class EODPipelineStatusService:
             details['progress_source'] = 'official_stage_history'
             overlaid[stage_id]['details'] = details
         return overlaid
+
+    @staticmethod
+    def _should_preserve_stored_coverage_stage(
+        *,
+        stage_id: str,
+        fallback_stage: dict[str, Any],
+    ) -> bool:
+        details = fallback_stage.get('details') if isinstance(fallback_stage.get('details'), dict) else {}
+        if stage_id != 'pykrx_enrichment':
+            if stage_id not in FACTOR_STAGE_MODELS and stage_id not in {'composite_factors'}:
+                return False
+            return (
+                str(fallback_stage.get('status') or '').strip().lower() == 'completed'
+                and int(details.get('rows_persisted') or fallback_stage.get('succeeded') or 0) > 0
+            )
+        return (
+            str(fallback_stage.get('status') or '').strip().lower() == 'completed'
+            and str(fallback_stage.get('gate_status') or details.get('decider_category_gate_status') or '').strip().lower() == 'ready'
+            and bool(details.get('categories'))
+        )
 
     @staticmethod
     def _should_overlay_official_stage_history(
@@ -1940,26 +1989,26 @@ class EODPipelineStatusService:
             if category not in missing_categories and str(item.get('coverage_status') or '') != 'complete'
         ]
         failed_count = len(missing_categories)
+        coverage_complete = bool(category_rows) and present_count >= total and failed_count == 0
         source_status = None
         if not category_rows or (all_missing and latest_captured_at is None):
             counts = build_stage_counts(total=total, succeeded=0, failed=0, processed=0)
             status = 'pending'
         else:
-            soft_complete = present_count >= total and failed_count == 0
             counts = build_stage_counts(
                 total=total,
-                succeeded=total if soft_complete else present_count,
+                succeeded=total if coverage_complete else present_count,
                 failed=failed_count,
-                processed=total if soft_complete else present_count + failed_count,
+                processed=total if coverage_complete else present_count + failed_count,
             )
-            if soft_complete:
+            if coverage_complete:
                 status = 'completed'
                 source_status = 'completed_with_coverage_warnings' if coverage_warning_categories else 'completed'
             else:
                 status = 'partial'
                 source_status = 'partial'
         progress_status = _normalize_status(progress.get('status'))
-        if progress_status in {'running', 'failed'}:
+        if progress_status in {'running', 'failed'} and not coverage_complete:
             status = progress_status
             source_status = progress.get('status') or source_status
             counts = build_stage_counts(

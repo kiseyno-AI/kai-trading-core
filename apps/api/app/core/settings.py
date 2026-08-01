@@ -31,6 +31,11 @@ class Settings(BaseSettings):
     db_pool_timeout_seconds: int = 10
     db_statement_timeout_ms: int = 3000
     db_lock_timeout_ms: int = 5000
+    db_pool_watchdog_enabled: bool = False
+    db_pool_watchdog_interval_seconds: float = 10.0
+    db_pool_watchdog_cancel_after_seconds: int = 30
+    db_pool_watchdog_active_connection_threshold: int = 8
+    db_pool_watchdog_cancel_limit: int = 10
     postgres_host: str = 'localhost'
     postgres_port: int = 5432
     postgres_db: str = 'kai_trading'
@@ -218,7 +223,7 @@ class Settings(BaseSettings):
     openclaw_feedback_prior_block_history_enabled: bool = True
     openclaw_feedback_fast_path_bypass_prerequisite_gate: bool = True
     openclaw_agent_subtask_poll_seconds: float = 2.0
-    openclaw_agent_batch_timeout_seconds: float = 240.0
+    openclaw_agent_batch_timeout_seconds: float = 300.0
     openclaw_agent_slot_cooldown_seconds: float = 600.0
     openclaw_session_cleanup_timeout_seconds: float = 30.0
     openclaw_session_cleanup_batch_limit: int = 100

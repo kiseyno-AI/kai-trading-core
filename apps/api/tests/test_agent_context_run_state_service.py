@@ -221,23 +221,24 @@ class AgentContextFeedbackRunStateServiceTests(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(result['run_id'], 'matching-run')
 
-    def test_find_latest_run_skips_stale_running_rows(self):
+    def test_find_latest_run_marks_stale_running_rows_abandoned(self):
         service = AgentContextFeedbackRunStateService()
         market_date = date.fromisoformat('2026-04-14')
+        stale_row = _build_run_row(
+            row_id=2,
+            run_id='stale-running-run',
+            market_date=market_date,
+            started_at=datetime.now(timezone.utc) - timedelta(hours=2),
+            updated_at=datetime.now(timezone.utc) - timedelta(hours=1),
+            status='running',
+            request_payload={
+                'symbols': ['005930'],
+                'roles': ['signal-decider'],
+            },
+        )
         fake_session = FakeRunStateSession(
             [
-                _build_run_row(
-                    row_id=2,
-                    run_id='stale-running-run',
-                    market_date=market_date,
-                    started_at=datetime.now(timezone.utc) - timedelta(hours=2),
-                    updated_at=datetime.now(timezone.utc) - timedelta(hours=1),
-                    status='running',
-                    request_payload={
-                        'symbols': ['005930'],
-                        'roles': ['signal-decider'],
-                    },
-                ),
+                stale_row,
                 _build_run_row(
                     row_id=1,
                     run_id='completed-run',
@@ -264,6 +265,13 @@ class AgentContextFeedbackRunStateServiceTests(unittest.TestCase):
 
         self.assertIsNotNone(result)
         self.assertEqual(result['run_id'], 'completed-run')
+        self.assertEqual(stale_row.status, 'abandoned')
+        self.assertIsNotNone(stale_row.completed_at)
+        self.assertGreaterEqual(stale_row.failed_count, 0)
+        self.assertEqual(
+            stale_row.summary_payload['stale_running_abandoned_reason'],
+            'Marked abandoned after 30 minutes without completion.',
+        )
 
     def test_resolve_run_requested_symbols_prefers_actual_dispatch_scope(self):
         service = AgentContextFeedbackRunStateService()

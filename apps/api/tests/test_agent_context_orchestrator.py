@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import tempfile
 import threading
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -829,6 +830,20 @@ class RecordingBatchClient:
             'completed_at': '2026-04-14T01:01:00+00:00',
             'session_ref': {'session_key': kwargs['batch_items'][0]['session_key']},
         }
+
+
+class HangingBatchClient:
+    batch_http_timeout_seconds = 1.0
+
+    def __init__(self):
+        self.calls = []
+        self._lock = threading.Lock()
+
+    def dispatch_batch(self, **kwargs):
+        with self._lock:
+            self.calls.append(kwargs)
+        time.sleep(2)
+        return {'decoded': {'items': []}}
 
 
 class SignalDeciderBatchClient:
@@ -3556,6 +3571,50 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         final_log = next(entry for entry in captured_logs if entry['stage'] == 'run_finished')
         self.assertEqual(final_log['request_run_id'], request_run_id)
         self.assertEqual(final_log['terminal_status'], 'completed')
+
+    def test_dispatch_for_symbols_times_out_hung_batch_and_finishes(self):
+        service = AgentFeedbackOrchestrator()
+        client = HangingBatchClient()
+        service.client = client
+        feedback_service = FakeFeedbackService()
+        failure_service = RecordingFailureService()
+        cleanup_service = FakeSessionCleanupService()
+        run_state_service = RecordingRunStateService()
+        captured_logs = []
+        fake_settings = SimpleNamespace(
+            openclaw_agent_symbol_chunk_size=1,
+            openclaw_agent_parallel_subtasks=1,
+            openclaw_agent_subtask_poll_seconds=0.01,
+        )
+
+        started_at = time.monotonic()
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            with patch.object(orchestrator_module, 'agent_context_feedback_run_state_service', run_state_service):
+                with patch.object(orchestrator_module, 'agent_context_read_service', DynamicFakeAgentContextReadService()):
+                    with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
+                        with patch.object(orchestrator_module, 'agent_context_feedback_failure_service', failure_service):
+                            with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
+                                with _patch_feedback_eligibility('005930'):
+                                    with patch.object(
+                                        orchestrator_module,
+                                        'log_agent_feedback_event',
+                                        side_effect=lambda stage, **payload: captured_logs.append({'stage': stage, **payload}),
+                                    ):
+                                        result = service.dispatch_for_symbols(
+                                            market_date='2026-04-14',
+                                            symbols=['005930'],
+                                            roles=['eod-summarizer'],
+                                            reuse_existing=False,
+                                        )
+
+        self.assertLess(time.monotonic() - started_at, 5)
+        self.assertEqual(result['summary']['status'], 'failed')
+        self.assertEqual(result['summary']['failed'], 1)
+        self.assertEqual(len(failure_service.recorded), 1)
+        self.assertEqual(failure_service.recorded[0]['failure_kind'], 'openclaw_transport_timeout')
+        final_log = next(entry for entry in captured_logs if entry['stage'] == 'run_finished')
+        self.assertEqual(final_log['terminal_status'], 'failed')
+        self.assertEqual(run_state_service.finished[-1]['status'], 'failed')
 
     def test_dispatch_for_symbols_logs_stale_reuse_signal(self):
         service = AgentFeedbackOrchestrator()

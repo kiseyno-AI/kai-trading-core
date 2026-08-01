@@ -4046,14 +4046,21 @@ def upsert_daily_pykrx_enrichment_rows(
     if not rows:
         return 0
 
+    def _chunks(items: list[dict[str, Any]], size: int = 100) -> list[list[dict[str, Any]]]:
+        return [items[index:index + size] for index in range(0, len(items), size)]
+
     refreshed_at = datetime.utcnow()
     symbol_inputs: dict[str, dict[str, Any]] = {}
+    row_symbols: set[str] = set()
     for raw in rows:
         symbol = raw.get('symbol')
         if symbol is None:
             continue
         normalized_symbol = str(symbol).strip().upper().zfill(6) if str(symbol).strip().isdigit() else str(symbol).strip().upper()
         if not normalized_symbol:
+            continue
+        row_symbols.add(normalized_symbol)
+        if raw.get('skip_symbol_upsert'):
             continue
         symbol_inputs[normalized_symbol] = {
             'symbol': normalized_symbol,
@@ -4067,29 +4074,38 @@ def upsert_daily_pykrx_enrichment_rows(
         }
 
     with session_scope() as session:
+        session.execute(text("SET LOCAL statement_timeout = '10min'"))
         symbol_id_by_symbol: dict[str, int] = {}
         if symbol_inputs:
             symbol_rows = list(symbol_inputs.values())
-            statement = pg_insert(Symbol).values(symbol_rows)
-            session.execute(
-                statement.on_conflict_do_update(
-                    index_elements=[Symbol.symbol],
-                    set_={
-                        'standard_code': statement.excluded.standard_code,
-                        'name_ko': statement.excluded.name_ko,
-                        'market': statement.excluded.market,
-                        'instrument_type': statement.excluded.instrument_type,
-                        'source': statement.excluded.source,
-                        'is_active': statement.excluded.is_active,
-                        'last_refreshed_at': statement.excluded.last_refreshed_at,
-                        'updated_at': refreshed_at,
-                    },
+            for symbol_chunk in _chunks(symbol_rows):
+                statement = pg_insert(Symbol).values(symbol_chunk)
+                session.execute(
+                    statement.on_conflict_do_update(
+                        index_elements=[Symbol.symbol],
+                        set_={
+                            'standard_code': statement.excluded.standard_code,
+                            'name_ko': statement.excluded.name_ko,
+                            'market': statement.excluded.market,
+                            'instrument_type': statement.excluded.instrument_type,
+                            'source': statement.excluded.source,
+                            'is_active': statement.excluded.is_active,
+                            'last_refreshed_at': statement.excluded.last_refreshed_at,
+                            'updated_at': refreshed_at,
+                        },
+                    )
                 )
-            )
             symbol_id_by_symbol = {
                 symbol: symbol_id
                 for symbol, symbol_id in session.execute(
-                    select(Symbol.symbol, Symbol.id).where(Symbol.symbol.in_(list(symbol_inputs.keys())))
+                    select(Symbol.symbol, Symbol.id).where(Symbol.symbol.in_(sorted(row_symbols)))
+                ).all()
+            }
+        elif row_symbols:
+            symbol_id_by_symbol = {
+                symbol: symbol_id
+                for symbol, symbol_id in session.execute(
+                    select(Symbol.symbol, Symbol.id).where(Symbol.symbol.in_(sorted(row_symbols)))
                 ).all()
             }
 
@@ -4102,8 +4118,8 @@ def upsert_daily_pykrx_enrichment_rows(
             symbol = raw.get('symbol')
             normalized_symbol = None
             if symbol is not None:
-                text = str(symbol).strip().upper()
-                normalized_symbol = text.zfill(6) if text.isdigit() else text
+                symbol_text = str(symbol).strip().upper()
+                normalized_symbol = symbol_text.zfill(6) if symbol_text.isdigit() else symbol_text
             values.append(
                 {
                     'symbol_id': symbol_id_by_symbol.get(normalized_symbol) if normalized_symbol else None,
@@ -4119,19 +4135,20 @@ def upsert_daily_pykrx_enrichment_rows(
                 }
             )
 
-        statement = pg_insert(DailyPykrxEnrichmentRow).values(values)
-        session.execute(
-            statement.on_conflict_do_update(
-                constraint='uq_daily_pykrx_enrichment_rows_scope',
-                set_={
-                    'symbol_id': statement.excluded.symbol_id,
-                    'market': statement.excluded.market,
-                    'payload': statement.excluded.payload,
-                    'captured_at': statement.excluded.captured_at,
-                    'updated_at': refreshed_at,
-                },
+        for value_chunk in _chunks(values):
+            statement = pg_insert(DailyPykrxEnrichmentRow).values(value_chunk)
+            session.execute(
+                statement.on_conflict_do_update(
+                    constraint='uq_daily_pykrx_enrichment_rows_scope',
+                    set_={
+                        'symbol_id': statement.excluded.symbol_id,
+                        'market': statement.excluded.market,
+                        'payload': statement.excluded.payload,
+                        'captured_at': statement.excluded.captured_at,
+                        'updated_at': refreshed_at,
+                    },
+                )
             )
-        )
     return len(values)
 
 

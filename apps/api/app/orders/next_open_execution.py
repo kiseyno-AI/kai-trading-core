@@ -98,6 +98,15 @@ SHORT_TERM_MIN_REWARD_RISK_RATIO = Decimal('1.80')
 SHORT_TERM_MIN_BUY_QUALITY_SCORE = Decimal('60')
 SHORT_TERM_HARD_MIN_BUY_QUALITY_SCORE = Decimal('50')
 SHORT_TERM_RELAXED_DECISION_INPUT_HARD_BLOCK_CODES = frozenset({'source_turnover_missing'})
+SHORT_TERM_WATCH_DELEGATED_ENTRY_QUALITY_BLOCK_CODES = frozenset(
+    {
+        'short_term_buy_quality_score_block',
+        'short_term_high_atr_chase_block',
+        'short_term_high_atr_weak_trend_block',
+        'short_term_liquidity_floor_block',
+        'short_term_reward_risk_ratio_block',
+    }
+)
 SHORT_TERM_CONTINUATION_SETUP_MARKERS = (
     '눌림',
     '재상승',
@@ -761,6 +770,40 @@ def _calendar_requires_operator_override(market_state: MarketState) -> bool:
 
 def _reason(code: str, message: str) -> dict[str, str]:
     return {'code': code, 'message': message}
+
+
+def _delegate_short_term_watch_entry_quality_blocks_to_warnings(
+    *,
+    tactical_action: str | None,
+    handoff_intent: str | None,
+    blocks: Sequence[dict[str, str]],
+    warnings: Sequence[dict[str, str]],
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    if tactical_action != 'watch_for_trigger' or handoff_intent != 'intraday_watch_buy':
+        return list(blocks), list(warnings)
+    delegated_blocks: list[dict[str, str]] = []
+    delegated_warnings = list(warnings)
+    existing_warning_codes = {
+        str(warning.get('code') or '').strip() for warning in delegated_warnings if isinstance(warning, dict)
+    }
+    for block in blocks:
+        code = str(block.get('code') or '').strip()
+        if code not in SHORT_TERM_WATCH_DELEGATED_ENTRY_QUALITY_BLOCK_CODES:
+            delegated_blocks.append(block)
+            continue
+        warning_code = f'{code}_delegated_to_exec_watch'
+        if warning_code not in existing_warning_codes:
+            delegated_warnings.append(
+                _reason(
+                    warning_code,
+                    (
+                        f"{block.get('message') or 'Short-term entry quality needs trigger-time confirmation.'} "
+                        'Delegated to exec intraday watch; trigger-time exec-agent must confirm before any buy.'
+                    ),
+                )
+            )
+            existing_warning_codes.add(warning_code)
+    return delegated_blocks, delegated_warnings
 
 
 def _should_relax_short_term_decision_input_hard_block(
@@ -1926,6 +1969,12 @@ class SignalDeciderNextOpenExecutionService:
                 snapshot=snapshot,
                 signal_decider_crosscheck=signal_decider_crosscheck,
                 tactical_action=short_term_tactical_action,
+            )
+            entry_quality_blocks, entry_quality_warnings = _delegate_short_term_watch_entry_quality_blocks_to_warnings(
+                tactical_action=short_term_tactical_action,
+                handoff_intent=handoff_intent,
+                blocks=entry_quality_blocks,
+                warnings=entry_quality_warnings,
             )
             blocking_reasons.extend(entry_quality_blocks)
             warnings.extend(entry_quality_warnings)

@@ -7,9 +7,12 @@ import time
 from typing import Any, Sequence
 
 import pandas as pd
+from sqlalchemy import func, select
 
 from app.core.audit_logging import log_fetch_event
 from app.core.settings import settings
+from app.db import session_scope
+from app.db_models import DailyPriceBar, DailyPykrxEnrichmentRow, Symbol
 from app.eod.pykrx_import import import_pykrx_stock, suppress_pykrx_login_env
 from app.market_data_store import (
     load_daily_market_relative_contexts,
@@ -184,6 +187,11 @@ def _row_market(row: dict[str, Any]) -> str:
     return str(row.get('market') or '').strip().upper()
 
 
+def _normalize_symbol(value: Any) -> str:
+    text = str(value or '').strip().upper()
+    return text.zfill(6) if text.isdigit() else text
+
+
 def _frame_value(frame: pd.DataFrame, symbol: str, column: Any) -> Any:
     if frame.empty or symbol not in frame.index:
         return None
@@ -248,11 +256,32 @@ class PykrxEnrichmentService:
         normalized_markets = _normalize_markets(markets) or ['KOSPI', 'KOSDAQ', 'KONEX']
         normalized_symbols = _normalize_symbols(symbols)
         resolved_categories = _normalize_categories(categories)
-        active_symbol_rows = load_symbols(
-            is_active=True,
-            markets=normalized_markets,
-            symbols=normalized_symbols or None,
-            limit=max(len(normalized_symbols), 5000) if normalized_symbols else 5000,
+        price_universe_rows = (
+            self._daily_price_rows_for_fallback(
+                market_date_iso=market_date_iso,
+                markets=normalized_markets,
+                symbol_filter=set(),
+            )
+            if not normalized_symbols
+            else []
+        )
+        active_symbol_rows = (
+            [
+                {
+                    'symbol': item['symbol'],
+                    'market': item['market'],
+                    'name_ko': item.get('name_ko'),
+                    'standard_code': item.get('standard_code'),
+                }
+                for item in price_universe_rows
+            ]
+            if price_universe_rows
+            else load_symbols(
+                is_active=True,
+                markets=normalized_markets,
+                symbols=normalized_symbols or None,
+                limit=max(len(normalized_symbols), 5000) if normalized_symbols else 5000,
+            )
         )
         symbol_meta = {item['symbol']: item for item in active_symbol_rows}
         symbol_filter = set(normalized_symbols) if normalized_symbols else {item['symbol'] for item in active_symbol_rows}
@@ -324,9 +353,30 @@ class PykrxEnrichmentService:
                 raise ValueError(f'Unsupported pykrx enrichment category: {category}')
 
             persisted_count = upsert_daily_pykrx_enrichment_rows(rows=category_rows)
+            fallback_result: dict[str, Any] | None = None
+            if persisted_count <= 0 and (details.get('errors') or category in SYMBOL_ENRICHMENT_CATEGORIES):
+                fallback_rows, fallback_result = self._collect_fallback_rows(
+                    category=category,
+                    market_date_iso=market_date_iso,
+                    markets=normalized_markets,
+                    symbol_filter=symbol_filter,
+                    symbol_meta=symbol_meta,
+                )
+                if fallback_rows:
+                    persisted_count = upsert_daily_pykrx_enrichment_rows(rows=fallback_rows)
+                    details['fallback'] = {
+                        **fallback_result,
+                        'rows_persisted': persisted_count,
+                    }
             details['rows_persisted'] = persisted_count
-            details['status'] = 'partial' if details.get('errors') else 'completed'
-            if details.get('errors'):
+            details['status'] = (
+                'recovered'
+                if persisted_count > 0 and fallback_result is not None
+                else 'completed'
+                if persisted_count > 0 and not details.get('errors')
+                else 'partial'
+            )
+            if details.get('errors') and persisted_count <= 0:
                 categories_with_errors.append(category)
             category_results[category] = details
 
@@ -336,7 +386,12 @@ class PykrxEnrichmentService:
             symbols=normalized_symbols,
             categories=resolved_categories,
         )
-        status = 'partial' if categories_with_errors else 'completed'
+        recovered_categories = [
+            category
+            for category, details in category_results.items()
+            if details.get('fallback') and int(details.get('rows_persisted') or 0) > 0
+        ]
+        status = 'partial' if categories_with_errors else ('recovered' if recovered_categories else 'completed')
         _log_pykrx_enrichment_fetch(
             'collect_for_market_date',
             status,
@@ -349,6 +404,7 @@ class PykrxEnrichmentService:
                 for category, details in category_results.items()
             },
             failed_categories=categories_with_errors,
+            recovered_categories=recovered_categories,
             requested_symbol_count=coverage.get('requested_symbol_count'),
             requested_market_count=coverage.get('requested_market_count'),
         )
@@ -512,6 +568,278 @@ class PykrxEnrichmentService:
         symbol_meta: dict[str, dict[str, Any]],
     ) -> set[str]:
         return symbol_filter or set(symbol_meta)
+
+    def _collect_fallback_rows(
+        self,
+        *,
+        category: str,
+        market_date_iso: str,
+        markets: Sequence[str],
+        symbol_filter: set[str],
+        symbol_meta: dict[str, dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        if category == 'valuation_snapshot':
+            return self._collect_valuation_snapshot_rows_from_daily_price_bars(
+                market_date_iso=market_date_iso,
+                markets=markets,
+                symbol_filter=symbol_filter,
+                symbol_meta=symbol_meta,
+            )
+        if category == 'sector_classification':
+            return self._collect_sector_rows_from_symbols(
+                market_date_iso=market_date_iso,
+                markets=markets,
+                symbol_filter=symbol_filter,
+                symbol_meta=symbol_meta,
+            )
+        return self._collect_rows_from_latest_enrichment(
+            category=category,
+            market_date_iso=market_date_iso,
+            markets=markets,
+            symbol_filter=symbol_filter,
+            symbol_meta=symbol_meta,
+        )
+
+    def _daily_price_rows_for_fallback(
+        self,
+        *,
+        market_date_iso: str,
+        markets: Sequence[str],
+        symbol_filter: set[str],
+    ) -> list[dict[str, Any]]:
+        normalized_markets = set(_normalize_markets(markets))
+        allowed_symbols = {_normalize_symbol(symbol) for symbol in symbol_filter if _normalize_symbol(symbol)}
+        with session_scope() as session:
+            stmt = (
+                select(DailyPriceBar, Symbol)
+                .join(Symbol, Symbol.id == DailyPriceBar.symbol_id)
+                .where(DailyPriceBar.trade_date == date.fromisoformat(market_date_iso))
+            )
+            if normalized_markets:
+                stmt = stmt.where(Symbol.market.in_(sorted(normalized_markets)))
+            if allowed_symbols:
+                stmt = stmt.where(Symbol.symbol.in_(sorted(allowed_symbols)))
+            stmt = stmt.order_by(Symbol.market.asc(), Symbol.symbol.asc())
+            rows = session.execute(stmt).all()
+            return [
+                {
+                    'symbol': symbol.symbol,
+                    'market': symbol.market,
+                    'name_ko': symbol.name_ko,
+                    'standard_code': symbol.standard_code,
+                    'open_price': int(bar.open_price),
+                    'high_price': int(bar.high_price),
+                    'low_price': int(bar.low_price),
+                    'close_price': int(bar.close_price),
+                    'volume': int(bar.volume),
+                    'turnover': int(bar.turnover),
+                    'per': _to_float(bar.per),
+                    'pbr': _to_float(bar.pbr),
+                    'bps': _to_float(bar.bps),
+                    'eps': _to_float(bar.eps),
+                    'dividend_yield': _to_float(bar.dividend_yield),
+                    'dps': _to_float(bar.dps),
+                    'source': bar.source,
+                }
+                for bar, symbol in rows
+            ]
+
+    def _collect_valuation_snapshot_rows_from_daily_price_bars(
+        self,
+        *,
+        market_date_iso: str,
+        markets: Sequence[str],
+        symbol_filter: set[str],
+        symbol_meta: dict[str, dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        price_rows = self._daily_price_rows_for_fallback(
+            market_date_iso=market_date_iso,
+            markets=markets,
+            symbol_filter=symbol_filter,
+        )
+        rows: list[dict[str, Any]] = []
+        for price_row in price_rows:
+            symbol = _normalize_symbol(price_row.get('symbol'))
+            symbol_info = symbol_meta.get(symbol) or {}
+            rows.append(
+                {
+                    'market_date': market_date_iso,
+                    'market': price_row.get('market'),
+                    'category': 'valuation_snapshot',
+                    'scope_type': 'symbol',
+                    'scope_key': symbol,
+                    'source': 'daily_price_bars_reconstructed',
+                    'symbol': symbol,
+                    'skip_symbol_upsert': True,
+                    'name_ko': price_row.get('name_ko') or symbol_info.get('name_ko') or symbol,
+                    'standard_code': price_row.get('standard_code') or symbol_info.get('standard_code'),
+                    'payload': {
+                        'market': price_row.get('market'),
+                        'close_price': price_row.get('close_price'),
+                        'market_cap': None,
+                        'volume': price_row.get('volume'),
+                        'trading_value': price_row.get('turnover'),
+                        'listed_shares': None,
+                        'bps': price_row.get('bps'),
+                        'per': price_row.get('per'),
+                        'pbr': price_row.get('pbr'),
+                        'eps': price_row.get('eps'),
+                        'dividend_yield': price_row.get('dividend_yield'),
+                        'dps': price_row.get('dps'),
+                        'reconstructed_from': 'daily_price_bars',
+                        'price_source': price_row.get('source'),
+                    },
+                }
+            )
+        return rows, {
+            'category': 'valuation_snapshot',
+            'scope_type': 'symbol',
+            'fallback_source': 'daily_price_bars',
+            'rows_prepared': len(rows),
+        }
+
+    def _collect_sector_rows_from_symbols(
+        self,
+        *,
+        market_date_iso: str,
+        markets: Sequence[str],
+        symbol_filter: set[str],
+        symbol_meta: dict[str, dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        price_rows = self._daily_price_rows_for_fallback(
+            market_date_iso=market_date_iso,
+            markets=[market for market in markets if market in SECTOR_SUPPORTED_MARKETS],
+            symbol_filter=symbol_filter,
+        )
+        rows: list[dict[str, Any]] = []
+        for price_row in price_rows:
+            symbol = _normalize_symbol(price_row.get('symbol'))
+            symbol_info = symbol_meta.get(symbol) or {}
+            rows.append(
+                {
+                    'market_date': market_date_iso,
+                    'market': price_row.get('market'),
+                    'category': 'sector_classification',
+                    'scope_type': 'symbol',
+                    'scope_key': symbol,
+                    'source': 'daily_price_bars_reconstructed',
+                    'symbol': symbol,
+                    'skip_symbol_upsert': True,
+                    'name_ko': price_row.get('name_ko') or symbol_info.get('name_ko') or symbol,
+                    'standard_code': price_row.get('standard_code') or symbol_info.get('standard_code'),
+                    'payload': {
+                        'market': price_row.get('market'),
+                        'sector_name': symbol_info.get('sector_name'),
+                        'close_price': price_row.get('close_price'),
+                        'change': None,
+                        'change_pct': None,
+                        'market_cap': None,
+                        'reconstructed_from': 'daily_price_bars',
+                        'price_source': price_row.get('source'),
+                    },
+                }
+            )
+        return rows, {
+            'category': 'sector_classification',
+            'scope_type': 'symbol',
+            'fallback_source': 'daily_price_bars',
+            'rows_prepared': len(rows),
+        }
+
+    def _collect_rows_from_latest_enrichment(
+        self,
+        *,
+        category: str,
+        market_date_iso: str,
+        markets: Sequence[str],
+        symbol_filter: set[str],
+        symbol_meta: dict[str, dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        normalized_markets = set(_normalize_markets(markets))
+        allowed_symbols = {_normalize_symbol(symbol) for symbol in symbol_filter if _normalize_symbol(symbol)}
+        with session_scope() as session:
+            latest_date = session.execute(
+                select(func.max(DailyPykrxEnrichmentRow.market_date)).where(
+                    DailyPykrxEnrichmentRow.market_date < date.fromisoformat(market_date_iso),
+                    DailyPykrxEnrichmentRow.category == category,
+                )
+            ).scalar_one_or_none()
+            if latest_date is None:
+                return [], {
+                    'category': category,
+                    'scope_type': CATEGORY_SCOPE_TYPE[category],
+                    'fallback_source': 'latest_pykrx_enrichment',
+                    'rows_prepared': 0,
+                    'reason': 'no_prior_enrichment_rows',
+                }
+            stmt = (
+                select(DailyPykrxEnrichmentRow, Symbol)
+                .outerjoin(Symbol, Symbol.id == DailyPykrxEnrichmentRow.symbol_id)
+                .where(
+                    DailyPykrxEnrichmentRow.market_date == latest_date,
+                    DailyPykrxEnrichmentRow.category == category,
+                )
+            )
+            if normalized_markets:
+                stmt = stmt.where(DailyPykrxEnrichmentRow.market.in_(sorted(normalized_markets)))
+            rows = [
+                {
+                    'market': row.market,
+                    'scope_type': row.scope_type,
+                    'scope_key': row.scope_key,
+                    'payload': dict(row.payload or {}),
+                    'symbol': symbol.symbol if symbol is not None else None,
+                    'name_ko': symbol.name_ko if symbol is not None else None,
+                    'standard_code': symbol.standard_code if symbol is not None else None,
+                }
+                for row, symbol in session.execute(stmt).all()
+            ]
+
+        prepared: list[dict[str, Any]] = []
+        for row in rows:
+            scope_type = str(row.get('scope_type') or CATEGORY_SCOPE_TYPE[category]).strip().lower()
+            scope_key = str(row.get('scope_key') or '').strip()
+            normalized_symbol = _normalize_symbol(row.get('symbol') or scope_key)
+            if scope_type == 'symbol' and allowed_symbols and normalized_symbol not in allowed_symbols:
+                continue
+            symbol_info = symbol_meta.get(normalized_symbol) or {}
+            payload = dict(row.get('payload') or {})
+            payload['carried_forward_from_market_date'] = latest_date.isoformat()
+            payload['carried_forward_reason'] = 'pykrx_upstream_unavailable'
+            prepared.append(
+                {
+                    'market_date': market_date_iso,
+                    'market': row.get('market'),
+                    'category': category,
+                    'scope_type': scope_type,
+                    'scope_key': normalized_symbol if scope_type == 'symbol' else scope_key,
+                    'source': 'pykrx_carry_forward',
+                    'symbol': normalized_symbol if scope_type == 'symbol' else None,
+                    'skip_symbol_upsert': True,
+                    'name_ko': (
+                        row.get('name_ko')
+                        if row.get('name_ko')
+                        else symbol_info.get('name_ko')
+                        if symbol_info
+                        else normalized_symbol
+                    ),
+                    'standard_code': (
+                        row.get('standard_code')
+                        if row.get('standard_code')
+                        else symbol_info.get('standard_code')
+                        if symbol_info
+                        else None
+                    ),
+                    'payload': payload,
+                }
+            )
+        return prepared, {
+            'category': category,
+            'scope_type': CATEGORY_SCOPE_TYPE[category],
+            'fallback_source': 'latest_pykrx_enrichment',
+            'source_market_date': latest_date.isoformat(),
+            'rows_prepared': len(prepared),
+        }
 
     def _collect_sector_classification_rows(
         self,
@@ -1171,6 +1499,21 @@ class PykrxEnrichmentService:
                     symbols=persisted_symbols,
                     limit=max(len(persisted_symbols), 1),
                 )
+        price_rows = self._daily_price_rows_for_fallback(
+            market_date_iso=market_date,
+            markets=markets,
+            symbol_filter=set(),
+        )
+        if price_rows:
+            return [
+                {
+                    'symbol': row['symbol'],
+                    'market': row['market'],
+                    'name_ko': row.get('name_ko'),
+                    'standard_code': row.get('standard_code'),
+                }
+                for row in price_rows
+            ]
         return load_symbols(
             is_active=True,
             markets=list(markets) or None,

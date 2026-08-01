@@ -27,6 +27,7 @@ LOW_PBR_PERCENTILE = 0.30
 BOTTOM_MOMENTUM_PERCENTILE = 0.30
 PIOTROSKI_PASS_SCORE = 7
 LATEST_FALLBACK_POLICY = 'latest_on_or_before_requested_market_date'
+PIOTROSKI_INPUT_QUERY_CHUNK_SIZE = 500
 
 INDEX_GROSS_MARGIN = 'M211300'
 INDEX_CURRENT_RATIO = 'M221200'
@@ -83,6 +84,12 @@ def _percentile_rank(values: list[float], current: float, *, ascending: bool) ->
 
 def _signal_result(value: bool | None) -> PiotroskiSignalResult:
     return PiotroskiSignalResult(value=value, available=value is not None)
+
+
+def _chunks(items: list[str], size: int) -> list[list[str]]:
+    if size <= 0:
+        return [items]
+    return [items[index:index + size] for index in range(0, len(items), size)]
 
 
 def _compute_signals(item: PiotroskiInputs) -> tuple[dict[str, PiotroskiSignalResult], int, int]:
@@ -340,52 +347,55 @@ class DailyPiotroskiFilterService:
                 INDEX_GROSS_MARGIN,
                 INDEX_ASSET_TURNOVER,
             }
-            highlight_rows = session.execute(
-                select(
-                    DartFundamentalsSnapshot.stock_code.label('symbol'),
-                    DartFundamentalsSnapshot.business_year.label('business_year'),
-                    DartFundamentalsHighlight.metric_key.label('metric_key'),
-                    DartFundamentalsHighlight.current_amount.label('current_amount'),
-                    DartFundamentalsHighlight.ratio_value.label('ratio_value'),
-                )
-                .join(DartFundamentalsHighlight, DartFundamentalsHighlight.snapshot_id == DartFundamentalsSnapshot.id)
-                .where(
-                    DartFundamentalsSnapshot.stock_code.in_(symbols),
-                    DartFundamentalsSnapshot.business_year.in_([annual_year, prior_annual_year]),
-                    DartFundamentalsSnapshot.report_code == '11011',
-                    DartFundamentalsSnapshot.fs_div == 'CFS',
-                    DartFundamentalsHighlight.metric_key.in_(metric_keys),
-                )
-            ).all()
             highlights_by_symbol: dict[str, dict[tuple[str, int], Any]] = {}
             ratios_by_symbol: dict[str, dict[tuple[str, int], Any]] = {}
-            for row in highlight_rows:
-                highlights_by_symbol.setdefault(row.symbol, {})[(row.metric_key, row.business_year)] = row.current_amount
-                ratios_by_symbol.setdefault(row.symbol, {})[(row.metric_key, row.business_year)] = row.ratio_value
+            for symbol_chunk in _chunks(symbols, PIOTROSKI_INPUT_QUERY_CHUNK_SIZE):
+                highlight_rows = session.execute(
+                    select(
+                        DartFundamentalsSnapshot.stock_code.label('symbol'),
+                        DartFundamentalsSnapshot.business_year.label('business_year'),
+                        DartFundamentalsHighlight.metric_key.label('metric_key'),
+                        DartFundamentalsHighlight.current_amount.label('current_amount'),
+                        DartFundamentalsHighlight.ratio_value.label('ratio_value'),
+                    )
+                    .join(DartFundamentalsHighlight, DartFundamentalsHighlight.snapshot_id == DartFundamentalsSnapshot.id)
+                    .where(
+                        DartFundamentalsSnapshot.stock_code.in_(symbol_chunk),
+                        DartFundamentalsSnapshot.business_year.in_([annual_year, prior_annual_year]),
+                        DartFundamentalsSnapshot.report_code == '11011',
+                        DartFundamentalsSnapshot.fs_div == 'CFS',
+                        DartFundamentalsHighlight.metric_key.in_(metric_keys),
+                    )
+                ).all()
+                for row in highlight_rows:
+                    highlights_by_symbol.setdefault(row.symbol, {})[(row.metric_key, row.business_year)] = row.current_amount
+                    ratios_by_symbol.setdefault(row.symbol, {})[(row.metric_key, row.business_year)] = row.ratio_value
 
-            audit_rows = session.execute(
-                select(
-                    DartAuditSignal.stock_code,
-                    DartAuditSignal.has_audit_issue,
-                )
-                .where(DartAuditSignal.stock_code.in_(symbols))
-                .order_by(DartAuditSignal.stock_code.asc(), DartAuditSignal.receipt_date.desc())
-            ).all()
             latest_audit: dict[str, Any] = {}
-            for row in audit_rows:
-                latest_audit.setdefault(row.stock_code, row.has_audit_issue)
+            for symbol_chunk in _chunks(symbols, PIOTROSKI_INPUT_QUERY_CHUNK_SIZE):
+                audit_rows = session.execute(
+                    select(
+                        DartAuditSignal.stock_code,
+                        DartAuditSignal.has_audit_issue,
+                    )
+                    .where(DartAuditSignal.stock_code.in_(symbol_chunk))
+                    .order_by(DartAuditSignal.stock_code.asc(), DartAuditSignal.receipt_date.desc())
+                ).all()
+                for row in audit_rows:
+                    latest_audit.setdefault(row.stock_code, row.has_audit_issue)
 
-            dilution_rows = session.execute(
-                select(
-                    DartDilutionSignal.stock_code,
-                    DartDilutionSignal.has_dilution_signal,
-                )
-                .where(DartDilutionSignal.stock_code.in_(symbols))
-                .order_by(DartDilutionSignal.stock_code.asc(), DartDilutionSignal.receipt_date.desc())
-            ).all()
             latest_dilution: dict[str, Any] = {}
-            for row in dilution_rows:
-                latest_dilution.setdefault(row.stock_code, row.has_dilution_signal)
+            for symbol_chunk in _chunks(symbols, PIOTROSKI_INPUT_QUERY_CHUNK_SIZE):
+                dilution_rows = session.execute(
+                    select(
+                        DartDilutionSignal.stock_code,
+                        DartDilutionSignal.has_dilution_signal,
+                    )
+                    .where(DartDilutionSignal.stock_code.in_(symbol_chunk))
+                    .order_by(DartDilutionSignal.stock_code.asc(), DartDilutionSignal.receipt_date.desc())
+                ).all()
+                for row in dilution_rows:
+                    latest_dilution.setdefault(row.stock_code, row.has_dilution_signal)
 
         return [
             PiotroskiInputs(

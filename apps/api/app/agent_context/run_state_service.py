@@ -145,6 +145,40 @@ class AgentContextFeedbackRunStateService:
         max_age_minutes = max(1, int(settings.eod_auto_pykrx_stale_run_minutes or 30))
         return datetime.now(timezone.utc) - updated_at > timedelta(minutes=max_age_minutes)
 
+    def _mark_stale_running_rows_abandoned(self, *, market_date: date) -> int:
+        now = datetime.now(timezone.utc)
+        abandoned = 0
+        with session_scope() as session:
+            rows = (
+                session.execute(
+                    select(AgentContextFeedbackRun)
+                    .where(
+                        AgentContextFeedbackRun.market_date == market_date,
+                        AgentContextFeedbackRun.status == 'running',
+                    )
+                    .order_by(AgentContextFeedbackRun.started_at.asc(), AgentContextFeedbackRun.id.asc())
+                )
+                .scalars()
+                .all()
+            )
+            for row in rows:
+                snapshot = self._serialize_run(row)
+                if not self._is_stale_running_row(snapshot):
+                    continue
+                failed_remaining = max(int(row.symbols_total or 0) - int(row.completed_count or 0), 0)
+                row.status = 'abandoned'
+                row.failed_count = max(int(row.failed_count or 0), failed_remaining)
+                row.completed_at = now
+                row.updated_at = now
+                summary_payload = dict(row.summary_payload or {})
+                summary_payload['stale_running_abandoned_at'] = now.isoformat()
+                summary_payload['stale_running_abandoned_reason'] = (
+                    f'Marked abandoned after {settings.eod_auto_pykrx_stale_run_minutes} minutes without completion.'
+                )
+                row.summary_payload = summary_payload
+                abandoned += 1
+        return abandoned
+
     def start_run(
         self,
         *,
@@ -248,6 +282,7 @@ class AgentContextFeedbackRunStateService:
         request_modes: list[str] | tuple[str, ...] | None = None,
         feedback_scope_mode: str | None = None,
     ) -> dict[str, Any] | None:
+        self._mark_stale_running_rows_abandoned(market_date=market_date)
         with session_scope() as session:
             serialized_rows = [
                 self._serialize_run(row)
@@ -263,6 +298,8 @@ class AgentContextFeedbackRunStateService:
         normalized_modes = set(self._normalize_scope(list(request_modes) if request_modes is not None else None))
         normalized_feedback_scope_mode = str(feedback_scope_mode or '').strip()
         for row in serialized_rows:
+            if str(row.get('status') or '').strip().lower() == 'abandoned':
+                continue
             if self._is_stale_running_row(row):
                 continue
             request_payload = row.get('request_payload') if isinstance(row.get('request_payload'), dict) else {}
