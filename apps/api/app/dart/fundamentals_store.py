@@ -829,7 +829,7 @@ class DartFundamentalsRepository:
                 .order_by(DartFundamentalsHighlight.snapshot_id.asc(), DartFundamentalsHighlight.metric_key.asc())
             ).scalars()
             statement_row_counts = session.execute(
-                select(DartFundamentalsRow.snapshot_id, func.count(DartFundamentalsRow.id))
+                select(DartFundamentalsRow.snapshot_id, func.count())
                 .where(DartFundamentalsRow.snapshot_id.in_(snapshot_ids))
                 .group_by(DartFundamentalsRow.snapshot_id)
             ).all()

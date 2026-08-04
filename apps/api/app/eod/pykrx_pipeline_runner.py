@@ -86,6 +86,8 @@ class PykrxPipelineDependencies:
 
 def _normalize_stage_status(value: Any) -> str:
     status = str(value or '').strip().lower()
+    if status == 'ok':
+        return 'completed'
     if status in {'completed_with_errors', 'warning'}:
         return 'partial'
     if status in {'disabled', 'not_configured'}:
@@ -137,6 +139,8 @@ def _gap_policy_details(*, failed: int, total: int) -> dict[str, Any]:
 
 def _resolve_result_status(result: dict[str, Any]) -> str:
     if result.get('triggered') is False:
+        if _is_already_completed_followup_result(result):
+            return 'completed'
         status = _normalize_stage_status(result.get('status'))
         return status if status in {'waiting', 'blocked', 'failed', 'partial'} else 'skipped'
     status = _normalize_stage_status(result.get('status'))
@@ -157,6 +161,21 @@ def _resolve_result_status(result: dict[str, Any]) -> str:
     if result.get('error') or result.get('error_message'):
         return 'failed'
     return 'completed'
+
+
+def _is_already_completed_followup_result(result: dict[str, Any]) -> bool:
+    if result.get('triggered') is not False:
+        return False
+    if str(result.get('reason') or '').strip().lower() != 'already_completed':
+        return False
+    existing_run = result.get('existing_run') if isinstance(result.get('existing_run'), dict) else {}
+    existing_status = str(existing_run.get('status') or result.get('status') or '').strip().lower()
+    return existing_status in {'completed', 'partial', 'completed_with_errors'}
+
+
+def _is_satisfied_followup_result(result: dict[str, Any]) -> bool:
+    status = _resolve_result_status(result)
+    return status in {'completed', 'partial'}
 
 
 def _extract_result_counts(result: dict[str, Any], *, default_total: int = 0) -> dict[str, int]:
@@ -662,6 +681,7 @@ def _run_daily_agent_feedback_followup(
 
     from app.agent_context.prerequisite_service import agent_feedback_prerequisite_service
     from app.agent_context.retry_service import FeedbackRetryCycleConfig, agent_feedback_retry_service
+    from app.agent_context.roles import DECISION_SUPPORT_AGENT_NAMES
     from app.agent_context.run_modes import FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH
     from app.core.settings import settings
 
@@ -671,6 +691,7 @@ def _run_daily_agent_feedback_followup(
     bypass_prerequisite_gate_enabled = (
         bool(settings.openclaw_feedback_fast_path_bypass_prerequisite_gate)
         and feedback_scope_mode == FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH
+        and set(roles).issubset(set(DECISION_SUPPORT_AGENT_NAMES))
     )
     prerequisites_ready = bool(prerequisites['ready'])
     bypass_prerequisite_gate = bypass_prerequisite_gate_enabled and not prerequisites_ready
@@ -1959,7 +1980,18 @@ def run_market_data_pipeline(
                 if raw_stage_result
                 else _resolve_result_status(factor_result)
             )
+            if factor_result.get('triggered') is True and not raw_stage_result:
+                stage_status = 'failed'
+                raw_stage_result = {
+                    'status': 'failed',
+                    'reason': 'factor_followup_missing_stage_result',
+                    'market_date': factor_result.get('market_date'),
+                }
             counts = _extract_result_counts(nested_result, default_total=0)
+            if stage_status == 'failed' and counts['failed'] <= 0:
+                counts['failed'] = 1
+                counts['processed'] = max(counts['processed'], 1)
+                counts['total'] = max(counts['total'], 1)
             persist_stage_progress(
                 stage=stage_id,
                 status=stage_status,
@@ -1974,6 +2006,16 @@ def run_market_data_pipeline(
                     'result_summary': _compact_result_summary(nested_result or raw_stage_result),
                 },
             )
+
+    def build_blocked_followup_result(stage_id: str, reason: str, *, upstream_status: str | None = None) -> dict[str, Any]:
+        return {
+            'triggered': False,
+            'status': 'blocked',
+            'reason': reason,
+            'market_date': latest_trade_date,
+            'upstream_status': upstream_status,
+            'stage': stage_id,
+        }
 
     def run_factor_followup() -> dict[str, Any]:
         record_followup_start('momentum_factors', 'Running daily factor scoring follow-up')
@@ -2008,8 +2050,8 @@ def run_market_data_pipeline(
                     )
                 ),
             )
-            fundamentals_status = str(result['fundamentals_followup'].get('status') or '').strip().lower()
-            if fundamentals_status in {'completed', 'partial'}:
+            fundamentals_status = _resolve_result_status(result['fundamentals_followup'])
+            if _is_satisfied_followup_result(result['fundamentals_followup']):
                 result['factor_scoring_followup'] = run_factor_followup()
                 result['external_news_followup'] = run_followup_stage(
                     'external_news_collect',
@@ -2022,6 +2064,7 @@ def run_market_data_pipeline(
             else:
                 result['factor_scoring_followup'] = {
                     'triggered': False,
+                    'status': 'blocked',
                     'reason': 'fundamentals_followup_incomplete',
                     'market_date': latest_trade_date,
                     'fundamentals_status': fundamentals_status or None,
@@ -2034,36 +2077,82 @@ def run_market_data_pipeline(
                     'fundamentals_status': fundamentals_status or None,
                 }
                 record_followup_result('external_news_collect', result['external_news_followup'])
+            factor_status = _resolve_result_status(result.get('factor_scoring_followup') or {})
             result['intraday_snapshot_followup'] = _run_daily_intraday_snapshot_followup(
                 market_date=latest_trade_date,
                 enabled=bool(dependencies.settings.kis_intraday_snapshot_enabled),
             )
-            result['feedback_followup'] = run_followup_stage(
-                'agent_feedback_summaries',
-                activity='Running agent feedback summary follow-up',
-                call=lambda: _run_daily_feedback_followup(
-                    market_date=latest_trade_date,
-                    enabled=bool(dependencies.settings.openclaw_feedback_trigger_after_fundamentals_refresh),
-                    progress_callback=feedback_progress_callback,
-                ),
-            )
-            result['signal_decider_followup'] = run_followup_stage(
-                'signal_decider',
-                activity='Running signal-decider follow-up',
-                call=lambda: _run_daily_signal_decider_followup(
-                    market_date=latest_trade_date,
-                    enabled=bool(dependencies.settings.openclaw_feedback_trigger_after_fundamentals_refresh),
-                    progress_callback=signal_decider_progress_callback,
-                ),
-            )
-            result['signal_decider_evaluation_followup'] = run_followup_stage(
-                'signal_decider_evaluations',
-                activity='Running signal-decider evaluation follow-up',
-                call=lambda: _run_daily_signal_decider_evaluation_followup(
-                    market_date=latest_trade_date,
-                    enabled=True,
-                ),
-            )
+            if factor_status in {'completed', 'partial'}:
+                result['feedback_followup'] = run_followup_stage(
+                    'agent_feedback_summaries',
+                    activity='Running agent feedback summary follow-up',
+                    call=lambda: _run_daily_feedback_followup(
+                        market_date=latest_trade_date,
+                        enabled=bool(dependencies.settings.openclaw_feedback_trigger_after_fundamentals_refresh),
+                        progress_callback=feedback_progress_callback,
+                    ),
+                )
+                feedback_status = _resolve_result_status(result['feedback_followup'])
+                if feedback_status in {'completed', 'partial'}:
+                    result['signal_decider_followup'] = run_followup_stage(
+                        'signal_decider',
+                        activity='Running signal-decider follow-up',
+                        call=lambda: _run_daily_signal_decider_followup(
+                            market_date=latest_trade_date,
+                            enabled=bool(dependencies.settings.openclaw_feedback_trigger_after_fundamentals_refresh),
+                            progress_callback=signal_decider_progress_callback,
+                        ),
+                    )
+                    signal_decider_status = _resolve_result_status(result['signal_decider_followup'])
+                else:
+                    result['signal_decider_followup'] = build_blocked_followup_result(
+                        'signal_decider',
+                        'feedback_followup_incomplete',
+                        upstream_status=feedback_status,
+                    )
+                    record_followup_result('signal_decider', result['signal_decider_followup'])
+                    signal_decider_status = 'blocked'
+                if signal_decider_status in {'completed', 'partial'}:
+                    result['signal_decider_evaluation_followup'] = run_followup_stage(
+                        'signal_decider_evaluations',
+                        activity='Running signal-decider evaluation follow-up',
+                        call=lambda: _run_daily_signal_decider_evaluation_followup(
+                            market_date=latest_trade_date,
+                            enabled=True,
+                        ),
+                    )
+                else:
+                    result['signal_decider_evaluation_followup'] = build_blocked_followup_result(
+                        'signal_decider_evaluations',
+                        'signal_decider_followup_incomplete',
+                        upstream_status=signal_decider_status,
+                    )
+                    record_followup_result(
+                        'signal_decider_evaluations',
+                        result['signal_decider_evaluation_followup'],
+                    )
+            else:
+                result['feedback_followup'] = build_blocked_followup_result(
+                    'agent_feedback_summaries',
+                    'factor_scoring_followup_incomplete',
+                    upstream_status=factor_status,
+                )
+                record_followup_result('agent_feedback_summaries', result['feedback_followup'])
+                result['signal_decider_followup'] = build_blocked_followup_result(
+                    'signal_decider',
+                    'factor_scoring_followup_incomplete',
+                    upstream_status=factor_status,
+                )
+                record_followup_result('signal_decider', result['signal_decider_followup'])
+                result['signal_decider_evaluation_followup'] = build_blocked_followup_result(
+                    'signal_decider_evaluations',
+                    'factor_scoring_followup_incomplete',
+                    upstream_status=factor_status,
+                )
+                record_followup_result(
+                    'signal_decider_evaluations',
+                    result['signal_decider_evaluation_followup'],
+                )
         elif chain_fundamentals_followup and mode == 'daily_auto' and status in {'completed', 'completed_with_errors'}:
             result['fundamentals_followup'] = {
                 'triggered': False,
@@ -2073,6 +2162,7 @@ def run_market_data_pipeline(
             record_followup_result('fundamentals_daily_refresh', result['fundamentals_followup'])
             result['factor_scoring_followup'] = {
                 'triggered': False,
+                'status': 'blocked',
                 'reason': 'dart_api_key_not_configured',
                 'market_date': latest_trade_date,
             }
@@ -2089,31 +2179,26 @@ def run_market_data_pipeline(
                 market_date=latest_trade_date,
                 enabled=bool(dependencies.settings.kis_intraday_snapshot_enabled),
             )
-            result['feedback_followup'] = run_followup_stage(
+            result['feedback_followup'] = build_blocked_followup_result(
                 'agent_feedback_summaries',
-                activity='Running agent feedback summary follow-up',
-                call=lambda: _run_daily_feedback_followup(
-                    market_date=latest_trade_date,
-                    enabled=bool(dependencies.settings.openclaw_feedback_trigger_after_fundamentals_refresh),
-                    progress_callback=feedback_progress_callback,
-                ),
+                'factor_scoring_followup_incomplete',
+                upstream_status='blocked',
             )
-            result['signal_decider_followup'] = run_followup_stage(
+            record_followup_result('agent_feedback_summaries', result['feedback_followup'])
+            result['signal_decider_followup'] = build_blocked_followup_result(
                 'signal_decider',
-                activity='Running signal-decider follow-up',
-                call=lambda: _run_daily_signal_decider_followup(
-                    market_date=latest_trade_date,
-                    enabled=bool(dependencies.settings.openclaw_feedback_trigger_after_fundamentals_refresh),
-                    progress_callback=signal_decider_progress_callback,
-                ),
+                'factor_scoring_followup_incomplete',
+                upstream_status='blocked',
             )
-            result['signal_decider_evaluation_followup'] = run_followup_stage(
+            record_followup_result('signal_decider', result['signal_decider_followup'])
+            result['signal_decider_evaluation_followup'] = build_blocked_followup_result(
                 'signal_decider_evaluations',
-                activity='Running signal-decider evaluation follow-up',
-                call=lambda: _run_daily_signal_decider_evaluation_followup(
-                    market_date=latest_trade_date,
-                    enabled=True,
-                ),
+                'factor_scoring_followup_incomplete',
+                upstream_status='blocked',
+            )
+            record_followup_result(
+                'signal_decider_evaluations',
+                result['signal_decider_evaluation_followup'],
             )
     except Exception as exc:
         daily_pipeline_tracker.finish_run(status='failed', error_message=str(exc))

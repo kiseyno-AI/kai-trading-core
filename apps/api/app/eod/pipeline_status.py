@@ -887,6 +887,10 @@ class EODPipelineStatusService:
         if official_run_status in {'running', 'interrupted', 'abandoned'}:
             overall_status = official_run_status
         summary = self._build_stage_summary(stages=stages)
+        official_current_stage = str((official_run or {}).get('current_stage') or '').strip()
+        if official_run_status in {'running', 'interrupted', 'abandoned'} and official_current_stage in stages:
+            summary['current_stage'] = official_current_stage
+            summary['current_stage_status'] = stages[official_current_stage].get('status')
         gate_summary = self._build_gate_summary(stages=stages)
         return {
             'market_date': resolved_market_date,

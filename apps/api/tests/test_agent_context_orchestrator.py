@@ -1899,7 +1899,9 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         feedback_service = FakeFeedbackService()
         cleanup_service = FakeSessionCleanupService()
         fake_settings = SimpleNamespace(openclaw_agent_symbol_chunk_size=1, openclaw_agent_parallel_subtasks=2)
+        reuse_calls = []
         def build_latest_decisions(**kwargs):
+            reuse_calls.append(kwargs)
             roles = tuple(kwargs['roles'])
             if set(roles) == set(orchestrator_module.UPSTREAM_SUMMARY_ROLES):
                 return {}
@@ -2011,12 +2013,19 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
                                         market_date='2026-04-14',
                                         symbols=['005930'],
                                         reuse_existing=True,
+                                        force_recompute=True,
                                     )
 
         self.assertEqual(
             result['request']['roles'],
             ['eod-summarizer', 'technical-summarizer', 'fundamental-summarizer', 'short-term-decider', 'signal-decider'],
         )
+        upstream_reuse_call = next(
+            call
+            for call in reuse_calls
+            if set(call['roles']) == set(orchestrator_module.UPSTREAM_SUMMARY_ROLES)
+        )
+        self.assertFalse(upstream_reuse_call['force_recompute'])
         self.assertEqual(len(client.decider_payloads), 2)
         short_term_payload = next(payload for payload in client.decider_payloads if payload['role'] == 'short-term-decider')
         self.assertEqual(short_term_payload['orchestration']['request_model'], 'openclaw/short-term-decider')
