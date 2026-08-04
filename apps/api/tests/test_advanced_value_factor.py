@@ -708,12 +708,16 @@ class _FakeFundamentalsLoaderSession:
         self.statement_row_chunks: list[list[int]] = []
 
     def execute(self, statement, params=None):
-        if params and any(str(key).startswith('symbol_') for key in params):
-            requested_symbols = [
-                params[key]
-                for key in sorted(params)
-                if str(key).startswith('symbol_')
-            ]
+        compiled_params = getattr(statement.compile(), 'params', {}) if hasattr(statement, 'compile') else {}
+        requested_symbols = next(
+            (
+                value
+                for key, value in compiled_params.items()
+                if 'stock_code' in str(key) and isinstance(value, list)
+            ),
+            None,
+        )
+        if requested_symbols is not None:
             return _FakeLoaderResult(
                 [
                     self.snapshot_rows_by_symbol[symbol]
@@ -774,7 +778,7 @@ class DailyAdvancedValueFactorFundamentalsLoaderTests(unittest.TestCase):
             )
 
         self.assertEqual(len(result), len(symbols))
-        self.assertEqual([len(chunk) for chunk in fake_session.highlight_chunks], [500, 1])
+        self.assertEqual([len(chunk) for chunk in fake_session.highlight_chunks], [100, 100, 100, 100, 100, 1])
         self.assertEqual(fake_session.statement_row_chunks, [])
         self.assertEqual(result[symbols[0]].highlights_by_key['total_equity']['current_amount'], 1001)
         self.assertEqual(result[symbols[-1]].highlights_by_key['total_equity']['current_amount'], 1501)

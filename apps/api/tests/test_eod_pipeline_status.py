@@ -328,6 +328,7 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
             market_state_loader=lambda: _FakeMarketState(),
             pykrx_run_loader=lambda **_: None,
             pykrx_stage_counts_loader=lambda *_: {},
+            pykrx_enrichment_loader=lambda **_: {},
             live_symbol_count_loader=lambda: 3579,
             fundamentals_refresh_loader=lambda **_: None,
         )

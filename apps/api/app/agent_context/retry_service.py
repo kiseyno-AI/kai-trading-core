@@ -1057,6 +1057,7 @@ class AgentFeedbackRetryService:
                         roles=roles,
                         eligible_symbols=scoped_feedback_symbols,
                         role_symbol_scopes=role_symbol_scopes,
+                        force_recompute=effective_force_recompute,
                         reuse_existing=config.reuse_existing,
                     )
                     completed_roles_before = tuple(
@@ -1126,7 +1127,7 @@ class AgentFeedbackRetryService:
                                     market_date=config.market_date,
                                     symbols=dispatch_chunk,
                                     roles=[role],
-                                    reuse_existing=False if effective_force_recompute else config.reuse_existing,
+                                    reuse_existing=False,
                                     force=force,
                                     force_recompute=effective_force_recompute,
                                     auto_scope=requested_symbols is None,
@@ -1230,6 +1231,7 @@ class AgentFeedbackRetryService:
                         roles=roles,
                         eligible_symbols=scoped_feedback_symbols,
                         role_symbol_scopes=role_symbol_scopes,
+                        force_recompute=effective_force_recompute,
                         reuse_existing=config.reuse_existing,
                     )
                     role_state_after = snapshot_after_role.role_states[role]
@@ -1298,6 +1300,7 @@ class AgentFeedbackRetryService:
                     roles=roles,
                     eligible_symbols=scoped_feedback_symbols,
                     role_symbol_scopes=role_symbol_scopes,
+                    force_recompute=effective_force_recompute,
                     reuse_existing=config.reuse_existing,
                 )
                 cycle_state = runtime_feedback_state_store.get_run(
@@ -1347,6 +1350,7 @@ class AgentFeedbackRetryService:
                 roles=roles,
                 eligible_symbols=scoped_feedback_symbols,
                 role_symbol_scopes=role_symbol_scopes,
+                force_recompute=effective_force_recompute,
                 reuse_existing=config.reuse_existing,
             )
             final_state_before_finish = runtime_feedback_state_store.get_run(
@@ -1437,6 +1441,7 @@ class AgentFeedbackRetryService:
                 roles=roles,
                 eligible_symbols=scoped_feedback_symbols,
                 role_symbol_scopes=role_symbol_scopes,
+                force_recompute=effective_force_recompute,
                 reuse_existing=config.reuse_existing,
             ),
             retry_attempted_symbols_by_role=(

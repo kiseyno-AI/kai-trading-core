@@ -60,6 +60,35 @@ def _ready_pykrx_enrichment_result(*, market_date: str = '2026-04-03') -> dict:
     }
 
 
+def _completed_factor_followup_result(*, market_date: str = '2026-04-03') -> dict:
+    stages = {
+        stage_id: {
+            'status': 'completed',
+            'result': {
+                'market_date': market_date,
+                'results_persisted': 1,
+                'results_failed': 0,
+            },
+        }
+        for stage_id in (
+            'momentum_factors',
+            'value_factors',
+            'low_risk_factors',
+            'beta_factors',
+            'advanced_value_factors',
+            'unified_value_factors',
+            'quality_factors',
+            'composite_factors',
+        )
+    }
+    return {
+        'triggered': True,
+        'status': 'completed',
+        'market_date': market_date,
+        'stages': stages,
+    }
+
+
 class _FakeDailyPipelineRunStateService:
     def __init__(self) -> None:
         self.start_runs: list[dict] = []
@@ -878,7 +907,7 @@ class PykrxBackfillServiceTests(TestCase):
             factor_followup = stack.enter_context(
                 patch(
                     'app.eod.pykrx_pipeline_runner._run_daily_factor_followup',
-                    return_value={'triggered': True, 'status': 'completed', 'stages': {}},
+                    return_value=_completed_factor_followup_result(),
                 )
             )
             external_news_followup = stack.enter_context(
@@ -942,7 +971,7 @@ class PykrxBackfillServiceTests(TestCase):
         evaluation_followup.assert_called_once_with(market_date='2026-04-03', enabled=True)
         self.assertEqual(
             result['factor_scoring_followup'],
-            {'triggered': True, 'status': 'completed', 'stages': {}},
+            _completed_factor_followup_result(),
         )
         self.assertEqual(
             result['external_news_followup'],
@@ -1052,7 +1081,7 @@ class PykrxBackfillServiceTests(TestCase):
             stack.enter_context(
                 patch(
                     'app.eod.pykrx_pipeline_runner._run_daily_factor_followup',
-                    return_value={'triggered': True, 'status': 'completed', 'stages': {}},
+                    return_value=_completed_factor_followup_result(),
                 )
             )
             stack.enter_context(
@@ -1105,9 +1134,9 @@ class PykrxBackfillServiceTests(TestCase):
         self.assertIn(('fundamentals_daily_refresh', 'running'), stage_statuses)
         self.assertIn(('fundamentals_daily_refresh', 'completed'), stage_statuses)
         self.assertIn(('momentum_factors', 'running'), stage_statuses)
-        self.assertIn(('signal_decider', 'running'), stage_statuses)
-        self.assertIn(('signal_decider_evaluations', 'running'), stage_statuses)
-        self.assertEqual(fake_run_state_service.finish_runs[-1]['status'], 'completed')
+        self.assertIn(('signal_decider', 'blocked'), stage_statuses)
+        self.assertIn(('signal_decider_evaluations', 'blocked'), stage_statuses)
+        self.assertEqual(fake_run_state_service.finish_runs[-1]['status'], 'blocked')
         self.assertEqual(
             fake_run_state_service.finish_runs[-1]['run_metadata']['eod_collection_run_id'],
             12,
@@ -1434,24 +1463,35 @@ class PykrxBackfillServiceTests(TestCase):
             result['factor_scoring_followup'],
             {
                 'triggered': False,
+                'status': 'blocked',
                 'reason': 'dart_api_key_not_configured',
                 'market_date': '2026-04-03',
             },
         )
         self.assertIn('external_news_followup', result)
-        signal_decider_followup.assert_called_once_with(
-            market_date='2026-04-03',
-            enabled=False,
-            progress_callback=ANY,
-        )
-        evaluation_followup.assert_called_once_with(market_date='2026-04-03', enabled=True)
+        signal_decider_followup.assert_not_called()
+        evaluation_followup.assert_not_called()
         self.assertEqual(
             result['signal_decider_followup'],
-            {'triggered': True, 'status': 'completed', 'decision_snapshots': 1},
+            {
+                'triggered': False,
+                'status': 'blocked',
+                'reason': 'factor_scoring_followup_incomplete',
+                'market_date': '2026-04-03',
+                'upstream_status': 'blocked',
+                'stage': 'signal_decider',
+            },
         )
         self.assertEqual(
             result['signal_decider_evaluation_followup'],
-            {'triggered': True, 'status': 'warning', 'summary': {'not_computed_count': 1}},
+            {
+                'triggered': False,
+                'status': 'blocked',
+                'reason': 'factor_scoring_followup_incomplete',
+                'market_date': '2026-04-03',
+                'upstream_status': 'blocked',
+                'stage': 'signal_decider_evaluations',
+            },
         )
         fundamentals_refresh.assert_not_called()
 

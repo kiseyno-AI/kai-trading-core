@@ -6,10 +6,11 @@ from datetime import date
 import re
 from typing import Any, Sequence
 
-from sqlalchemy import or_, select, text
+from sqlalchemy import func, or_, select, text
 
 from app.db import session_scope
 from app.db_models import (
+    DartDisclosureEvent,
     DartFundamentalsHighlight,
     DartFundamentalsRow,
     DartFundamentalsSnapshot,
@@ -24,8 +25,8 @@ from app.market_data_store import (
 
 ADVANCED_VALUE_FACTOR_VERSION = 'advanced_value_v1'
 ADVANCED_VALUE_FACTOR_SOURCE = ADVANCED_VALUE_FACTOR_VERSION
-ADVANCED_VALUE_FUNDAMENTALS_SNAPSHOT_CHUNK_SIZE = 500
-ADVANCED_VALUE_FUNDAMENTALS_ROW_CHUNK_SIZE = 500
+ADVANCED_VALUE_FUNDAMENTALS_SNAPSHOT_CHUNK_SIZE = 100
+ADVANCED_VALUE_FUNDAMENTALS_ROW_CHUNK_SIZE = 100
 ADVANCED_VALUE_FUNDAMENTALS_ROW_FALLBACK_MAX_SNAPSHOTS = 500
 ADVANCED_VALUE_FUNDAMENTALS_FS_DIV = 'CFS'
 ADVANCED_VALUE_FUNDAMENTALS_REPORT_CODE = '11011'
@@ -928,67 +929,43 @@ class DailyAdvancedValueFactorService:
             snapshot_rows = []
             for start in range(0, len(normalized_symbols), ADVANCED_VALUE_FUNDAMENTALS_SNAPSHOT_CHUNK_SIZE):
                 symbol_chunk = normalized_symbols[start:start + ADVANCED_VALUE_FUNDAMENTALS_SNAPSHOT_CHUNK_SIZE]
-                symbol_params = {f'symbol_{index}': symbol for index, symbol in enumerate(symbol_chunk)}
-                requested_values_sql = ', '.join(f'(:symbol_{index})' for index in range(len(symbol_chunk)))
-                latest_snapshot_stmt = text(
-                    f"""
-                    with requested(stock_code) as (
-                      values {requested_values_sql}
+                latest_rank = func.row_number().over(
+                    partition_by=DartFundamentalsSnapshot.stock_code,
+                    order_by=(
+                        DartFundamentalsSnapshot.business_year.desc(),
+                        DartDisclosureEvent.receipt_date.desc().nullslast(),
+                        DartFundamentalsSnapshot.id.desc(),
+                    ),
+                ).label('row_rank')
+                latest_snapshot_subquery = (
+                    select(
+                        DartFundamentalsSnapshot.id.label('snapshot_id'),
+                        DartFundamentalsSnapshot.stock_code.label('stock_code'),
+                        DartFundamentalsSnapshot.corp_name.label('corp_name'),
+                        DartFundamentalsSnapshot.business_year.label('business_year'),
+                        DartFundamentalsSnapshot.report_code.label('report_code'),
+                        DartFundamentalsSnapshot.fs_div.label('fs_div'),
+                        DartFundamentalsSnapshot.period_type.label('period_type'),
+                        DartFundamentalsSnapshot.currency.label('currency'),
+                        DartFundamentalsSnapshot.captured_at.label('captured_at'),
+                        DartFundamentalsSnapshot.rcept_no.label('rcept_no'),
+                        DartDisclosureEvent.receipt_date.label('receipt_date'),
+                        latest_rank,
                     )
-                    select
-                      latest.snapshot_id as snapshot_id,
-                      latest.stock_code as stock_code,
-                      latest.corp_name as corp_name,
-                      latest.business_year as business_year,
-                      latest.report_code as report_code,
-                      latest.fs_div as fs_div,
-                      latest.period_type as period_type,
-                      latest.currency as currency,
-                      latest.captured_at as captured_at,
-                      latest.rcept_no as rcept_no,
-                      latest.receipt_date as receipt_date
-                    from requested
-                    join lateral (
-                      select
-                        snap.id as snapshot_id,
-                        snap.stock_code as stock_code,
-                        snap.corp_name as corp_name,
-                        snap.business_year as business_year,
-                        snap.report_code as report_code,
-                        snap.fs_div as fs_div,
-                        snap.period_type as period_type,
-                        snap.currency as currency,
-                        snap.captured_at as captured_at,
-                        snap.rcept_no as rcept_no,
-                        disclosure.receipt_date as receipt_date
-                      from dart_fundamentals_snapshots snap
-                      join dart_disclosure_events disclosure
-                        on disclosure.id = snap.disclosure_event_id
-                      where snap.stock_code = requested.stock_code
-                        and snap.fs_div = :fs_div
-                        and snap.report_code = :report_code
-                        and snap.period_type = :period_type
-                        and snap.business_year <= :business_year
-                        and disclosure.receipt_date <= :market_date
-                      order by
-                        snap.business_year desc,
-                        disclosure.receipt_date desc,
-                        snap.id desc
-                      limit 1
-                    ) latest on true
-                    """
+                    .join(DartDisclosureEvent, DartDisclosureEvent.id == DartFundamentalsSnapshot.disclosure_event_id)
+                    .where(
+                        DartFundamentalsSnapshot.stock_code.in_(symbol_chunk),
+                        DartFundamentalsSnapshot.fs_div == ADVANCED_VALUE_FUNDAMENTALS_FS_DIV,
+                        DartFundamentalsSnapshot.report_code == ADVANCED_VALUE_FUNDAMENTALS_REPORT_CODE,
+                        DartFundamentalsSnapshot.period_type == ADVANCED_VALUE_FUNDAMENTALS_PERIOD_TYPE,
+                        DartFundamentalsSnapshot.business_year <= market_date.year,
+                        DartDisclosureEvent.receipt_date <= market_date,
+                    )
+                    .subquery()
                 )
                 snapshot_rows.extend(
                     session.execute(
-                        latest_snapshot_stmt,
-                        {
-                            **symbol_params,
-                            'fs_div': ADVANCED_VALUE_FUNDAMENTALS_FS_DIV,
-                            'report_code': ADVANCED_VALUE_FUNDAMENTALS_REPORT_CODE,
-                            'period_type': ADVANCED_VALUE_FUNDAMENTALS_PERIOD_TYPE,
-                            'business_year': market_date.year,
-                            'market_date': market_date,
-                        },
+                        select(latest_snapshot_subquery).where(latest_snapshot_subquery.c.row_rank == 1)
                     ).mappings().all()
                 )
             if not snapshot_rows:

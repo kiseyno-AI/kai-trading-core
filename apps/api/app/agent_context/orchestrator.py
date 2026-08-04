@@ -2959,13 +2959,19 @@ class AgentFeedbackOrchestrator:
                 'failures': [],
                 'prerequisites': prerequisites,
             }
-        dispatch_symbols, skipped_symbols, eligibility_diagnostics = (
-            _split_requested_symbols_by_agent_feedback_eligibility_with_diagnostics(
-                market_date=normalized_market_date,
-                requested_symbols=requested_symbols,
+        if auto_scope and role_symbol_scopes is not None and funnel_diagnostics is not None:
+            dispatch_symbols = _ordered_union(role_symbol_scopes.values())
+            skipped_symbols = []
+            eligibility_diagnostics = {}
+            public_eligibility_diagnostics = {}
+        else:
+            dispatch_symbols, skipped_symbols, eligibility_diagnostics = (
+                _split_requested_symbols_by_agent_feedback_eligibility_with_diagnostics(
+                    market_date=normalized_market_date,
+                    requested_symbols=requested_symbols,
+                )
             )
-        )
-        public_eligibility_diagnostics = _public_eligibility_diagnostics(eligibility_diagnostics)
+            public_eligibility_diagnostics = _public_eligibility_diagnostics(eligibility_diagnostics)
         soft_penalized_symbols = list(public_eligibility_diagnostics.get('soft_penalized_symbols') or [])
         if funnel_diagnostics is None:
             records_by_symbol = eligibility_diagnostics.get('records_by_symbol') if isinstance(eligibility_diagnostics, dict) else {}
@@ -3376,7 +3382,7 @@ class AgentFeedbackOrchestrator:
                         market_date=normalized_market_date,
                         symbols=scoped_dispatch_symbols,
                         roles=UPSTREAM_SUMMARY_ROLES,
-                        force_recompute=force_recompute,
+                        force_recompute=False,
                     )
                 symbols_requiring_context = scoped_dispatch_symbols
                 if reuse_decisions:
