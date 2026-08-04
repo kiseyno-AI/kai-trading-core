@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 from sqlalchemy import select
+from sqlalchemy.orm import defer
 
 from app.agent_context.decision_input_quality import build_decision_input_quality_envelope
 from app.agent_context.roles import SHORT_TERM_DECIDER_AGENT_NAME, SIGNAL_DECIDER_AGENT_NAME
@@ -996,6 +997,7 @@ class SignalDeciderExecIntegrationService:
             existing_rows = self._load_next_open_rows(
                 target_trade_date=resolved_target_date,
                 account_reference=resolved_account_reference,
+                include_payloads=False,
             )
             has_eligible_short_term_watch = any(
                 _normalize_decision_agent_name(row.decision_agent_name) == SHORT_TERM_DECIDER_AGENT_NAME
@@ -2669,6 +2671,7 @@ class SignalDeciderExecIntegrationService:
         target_trade_date: date,
         account_reference: str | None = None,
         symbol: str | None = None,
+        include_payloads: bool = True,
     ) -> list[SignalDeciderExecutionPlanItem]:
         with session_scope() as session:
             query = (
@@ -2684,6 +2687,12 @@ class SignalDeciderExecIntegrationService:
                     SignalDeciderExecutionPlanItem.id.asc(),
                 )
             )
+            if not include_payloads:
+                query = query.options(
+                    defer(SignalDeciderExecutionPlanItem.validation_payload),
+                    defer(SignalDeciderExecutionPlanItem.traceability_payload),
+                    defer(SignalDeciderExecutionPlanItem.submission_payload),
+                )
             if account_reference:
                 query = query.where(SignalDeciderExecutionPlanItem.account_reference == account_reference)
             if symbol:
@@ -3565,6 +3574,7 @@ class SignalDeciderExecIntegrationService:
             target_trade_date=target_trade_date,
             account_reference=account_reference,
             symbol=symbol,
+            include_payloads=False,
         )
         grouped = self._group_rows_by_plan_id(rows)
         for plan_id, group_rows in grouped.items():
