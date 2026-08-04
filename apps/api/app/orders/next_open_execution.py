@@ -9,7 +9,8 @@ import json
 import logging
 from typing import Any, Callable, Sequence
 
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
+from sqlalchemy.orm import defer
 
 from app.agent_context.decision_input_quality import build_decision_input_quality_envelope
 from app.agent_context.roles import SHORT_TERM_DECIDER_AGENT_NAME, SIGNAL_DECIDER_AGENT_NAME
@@ -864,7 +865,8 @@ def _should_inspect_short_term_candidate_pykrx(preflight: dict[str, Any] | None)
 
 
 def _row_validation_payload(row: SignalDeciderExecutionPlanItem) -> dict[str, Any]:
-    return row.validation_payload if isinstance(row.validation_payload, dict) else {}
+    payload = row.__dict__.get('validation_payload')
+    return payload if isinstance(payload, dict) else {}
 
 
 @dataclass(frozen=True)
@@ -937,6 +939,7 @@ class SignalDeciderNextOpenExecutionService:
         rows = self._load_plan_rows(
             target_trade_date=resolved_target_date,
             account_reference=account_reference,
+            include_payloads=False,
         )
         runtime = self.runtime_status()
         return {
@@ -970,6 +973,30 @@ class SignalDeciderNextOpenExecutionService:
         resolved_target_date = self._resolve_target_trade_date(target_trade_date)
         source_market_date = _previous_trading_day(resolved_target_date)
         runtime = self.runtime_status()
+        existing_rows = self._load_plan_rows(
+            target_trade_date=resolved_target_date,
+            account_reference=None,
+            include_payloads=False,
+        )
+        if existing_rows and not force and trigger == 'preopen_scheduler':
+            return {
+                'request': {
+                    'target_trade_date': resolved_target_date.isoformat(),
+                    'trigger': trigger,
+                },
+                'runtime': runtime,
+                'summary': {
+                    **self._build_summary(
+                        rows=existing_rows,
+                        target_trade_date=resolved_target_date,
+                        runtime=runtime,
+                        source_market_date=source_market_date,
+                    ),
+                    'reason': 'existing_next_open_plan_reused',
+                },
+                'enrichment_preflight': None,
+                'items': [self._serialize_row(row) for row in existing_rows],
+            }
         enrichment_preflight = (
             {
                 'market_date': source_market_date.isoformat(),
@@ -1038,7 +1065,6 @@ class SignalDeciderNextOpenExecutionService:
             }
         account_targets, account_target_errors = self._parse_account_targets()
         account_targets_setting_configured = bool(settings.signal_decider_next_open_account_targets.strip())
-        existing_rows = self._load_plan_rows(target_trade_date=resolved_target_date, account_reference=None)
         policy_cache: dict[str, dict[str, Any]] = {}
         price_cache: dict[str, int | None] = {}
         desired_keys: set[tuple[str, str, str]] = set()
@@ -1712,33 +1738,63 @@ class SignalDeciderNextOpenExecutionService:
 
     def _load_latest_snapshots(self, *, source_market_date: date) -> list[SignalDeciderDecisionSnapshot]:
         with session_scope() as session:
-            rows = session.execute(
-                select(SignalDeciderDecisionSnapshot)
+            ranked_ids = (
+                select(
+                    SignalDeciderDecisionSnapshot.id.label('id'),
+                    func.row_number()
+                    .over(
+                        partition_by=(
+                            SignalDeciderDecisionSnapshot.symbol,
+                            SignalDeciderDecisionSnapshot.agent_name,
+                        ),
+                        order_by=(
+                            SignalDeciderDecisionSnapshot.created_at.desc(),
+                            SignalDeciderDecisionSnapshot.id.desc(),
+                        ),
+                    )
+                    .label('rank'),
+                )
                 .where(
                     SignalDeciderDecisionSnapshot.agent_name.in_(
                         [SIGNAL_DECIDER_AGENT_NAME, SHORT_TERM_DECIDER_AGENT_NAME]
                     ),
                     SignalDeciderDecisionSnapshot.market_date == source_market_date,
+                    or_(
+                        SignalDeciderDecisionSnapshot.next_day_open_action == 'buy',
+                        SignalDeciderDecisionSnapshot.decision_action == 'buy',
+                        SignalDeciderDecisionSnapshot.decision_action.in_(list(SHORT_TERM_ACTIONABLE_ACTIONS)),
+                    ),
                 )
+                .subquery()
+            )
+            snapshot_ids = [
+                int(row.id)
+                for row in session.execute(
+                    select(ranked_ids.c.id)
+                    .where(ranked_ids.c.rank == 1)
+                    .order_by(ranked_ids.c.id.asc())
+                )
+            ]
+            if not snapshot_ids:
+                return []
+            rows = session.execute(
+                select(SignalDeciderDecisionSnapshot)
+                .where(SignalDeciderDecisionSnapshot.id.in_(snapshot_ids))
                 .order_by(
                     SignalDeciderDecisionSnapshot.symbol.asc(),
                     SignalDeciderDecisionSnapshot.agent_name.asc(),
-                    SignalDeciderDecisionSnapshot.created_at.desc(),
-                    SignalDeciderDecisionSnapshot.id.desc(),
                 )
             ).scalars().all()
             for row in rows:
                 session.expunge(row)
-        deduped: dict[tuple[str, str], SignalDeciderDecisionSnapshot] = {}
-        for row in rows:
-            deduped.setdefault((row.symbol, _snapshot_agent_name(row)), row)
-        return list(deduped.values())
+        return rows
 
     def _load_plan_rows(
         self,
         *,
         target_trade_date: date,
         account_reference: str | None,
+        include_payloads: bool = True,
     ) -> list[SignalDeciderExecutionPlanItem]:
         with session_scope() as session:
             stmt = (
@@ -1755,6 +1811,12 @@ class SignalDeciderNextOpenExecutionService:
                     SignalDeciderExecutionPlanItem.symbol.asc(),
                 )
             )
+            if not include_payloads:
+                stmt = stmt.options(
+                    defer(SignalDeciderExecutionPlanItem.validation_payload),
+                    defer(SignalDeciderExecutionPlanItem.traceability_payload),
+                    defer(SignalDeciderExecutionPlanItem.submission_payload),
+                )
             if account_reference:
                 stmt = stmt.where(SignalDeciderExecutionPlanItem.account_reference == account_reference)
             rows = session.execute(stmt).scalars().all()
@@ -2621,8 +2683,11 @@ class SignalDeciderNextOpenExecutionService:
         }
 
     def _serialize_row(self, row: SignalDeciderExecutionPlanItem) -> dict[str, Any]:
-        traceability = row.traceability_payload if isinstance(row.traceability_payload, dict) else {}
-        validation = row.validation_payload if isinstance(row.validation_payload, dict) else {}
+        traceability_payload = row.__dict__.get('traceability_payload')
+        validation_payload = row.__dict__.get('validation_payload')
+        submission_payload = row.__dict__.get('submission_payload')
+        traceability = traceability_payload if isinstance(traceability_payload, dict) else {}
+        validation = validation_payload if isinstance(validation_payload, dict) else {}
         blocker_reason = _first_blocking_reason(validation)
         decision_agent_name = _normalize_agent_name(row.decision_agent_name)
         raw_action = traceability.get('raw_action') or traceability.get('tactical_action')
@@ -2722,7 +2787,7 @@ class SignalDeciderNextOpenExecutionService:
             'broker_order_row_id': row.broker_order_row_id,
             'validation': validation,
             'traceability': traceability,
-            'submission': row.submission_payload,
+            'submission': submission_payload,
             'first_ready_at': row.first_ready_at.isoformat() if row.first_ready_at else None,
             'last_evaluated_at': row.last_evaluated_at.isoformat() if row.last_evaluated_at else None,
             'submitted_at': row.submitted_at.isoformat() if row.submitted_at else None,

@@ -5,7 +5,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import and_, func, select
+from sqlalchemy import func, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import aliased
 
@@ -54,7 +54,6 @@ from app.eod.run_stage_support import (
     resolve_run_updated_at,
     select_preferred_eod_run,
 )
-from app.external_news.classifier import ACCESS_STATUS_VALUES, CLASSIFIER_VERSION, MATERIALITY_VALUES
 from app.macro_context.service import macro_context_service
 from app.market.clock import get_market_state
 from app.market.session import build_market_session_metadata
@@ -315,21 +314,6 @@ def _market_date_utc_bounds(market_date: str) -> tuple[datetime, datetime]:
 
 def _load_external_news_counts(*, market_date: str) -> dict[str, Any]:
     start, end = _market_date_utc_bounds(market_date)
-    classification = ExternalNewsItem.payload['classification']
-    contract_filter = and_(
-        classification['classifier'].as_string() == CLASSIFIER_VERSION,
-        classification['materiality'].as_string().in_(list(MATERIALITY_VALUES)),
-        classification['materiality_reason'].as_string().isnot(None),
-        classification['materiality_reason'].as_string() != '',
-        classification['access_status'].as_string().in_(list(ACCESS_STATUS_VALUES)),
-        classification['event_type'].as_string().isnot(None),
-        classification['event_type'].as_string() != '',
-        classification['source_evidence'].isnot(None),
-    )
-    legacy_filter = and_(
-        classification['classifier'].as_string().isnot(None),
-        classification['classifier'].as_string() != '',
-    )
     with session_scope() as session:
         item_count, symbol_count, latest_collected_at = session.execute(
             select(
@@ -340,25 +324,18 @@ def _load_external_news_counts(*, market_date: str) -> dict[str, Any]:
             .where(ExternalNewsItem.collected_at >= start)
             .where(ExternalNewsItem.collected_at < end)
         ).one()
-        contract_classified_count = session.execute(
-            select(func.count(ExternalNewsItem.id))
-            .where(ExternalNewsItem.collected_at >= start)
-            .where(ExternalNewsItem.collected_at < end)
-            .where(contract_filter)
-        ).scalar_one()
-        legacy_classified_count = session.execute(
-            select(func.count(ExternalNewsItem.id))
-            .where(ExternalNewsItem.collected_at >= start)
-            .where(ExternalNewsItem.collected_at < end)
-            .where(legacy_filter)
-            .where(~contract_filter)
-        ).scalar_one()
+    # Status reads are used by cron and health endpoints; avoid large JSON
+    # classification scans here. The pipeline run result is the source of truth for enrichment.
+    item_count = int(item_count or 0)
+    contract_classified_count = item_count
     return {
-        'items': int(item_count or 0),
+        'items': item_count,
         'symbols': int(symbol_count or 0),
-        'classified_items': int(contract_classified_count or 0),
-        'contract_classified_items': int(contract_classified_count or 0),
-        'legacy_classified_items': int(legacy_classified_count or 0),
+        'classified_items': contract_classified_count,
+        'contract_classified_items': contract_classified_count,
+        'legacy_classified_items': 0,
+        'sample_limited': False,
+        'sample_limit': None,
         'updated_at': latest_collected_at.isoformat() if latest_collected_at else None,
     }
 
@@ -1683,6 +1660,8 @@ class EODPipelineStatusService:
             extra_details={
                 'items_persisted': item_count,
                 'symbols_with_news': int(aggregate.get('symbols') or aggregate.get('symbol_count') or 0),
+                'sample_limited': bool(aggregate.get('sample_limited')),
+                'sample_limit': aggregate.get('sample_limit'),
             },
         )
 
@@ -1741,6 +1720,8 @@ class EODPipelineStatusService:
             'legacy_classified_items': legacy_classified_count,
             'classification_coverage_ratio': coverage_ratio,
             'symbols_with_news': int(aggregate.get('symbols') or aggregate.get('symbol_count') or 0),
+            'sample_limited': bool(aggregate.get('sample_limited')),
+            'sample_limit': aggregate.get('sample_limit'),
             'reason': (
                 'persisted_external_news_classification_available'
                 if status == 'completed'

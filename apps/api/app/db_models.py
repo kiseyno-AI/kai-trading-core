@@ -165,6 +165,8 @@ class ExternalNewsItem(Base, TimestampMixin):
     __table_args__ = (
         UniqueConstraint('provider', 'url', name='uq_external_news_items_provider_url'),
         UniqueConstraint('provider', 'provider_item_id', name='uq_external_news_items_provider_item_id'),
+        Index('ix_external_news_items_collected_at', 'collected_at'),
+        Index('ix_external_news_items_collected_symbol', 'collected_at', 'symbol_id'),
         Index('ix_external_news_items_symbol_published', 'symbol_id', 'published_at'),
         Index('ix_external_news_items_symbol_collected_published', 'symbol_id', 'collected_at', 'published_at'),
         Index('ix_external_news_items_provider_collected', 'provider', 'collected_at'),
