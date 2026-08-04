@@ -9,7 +9,7 @@ import json
 import logging
 from typing import Any, Callable, Sequence
 
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
 
 from app.agent_context.decision_input_quality import build_decision_input_quality_envelope
 from app.agent_context.roles import SHORT_TERM_DECIDER_AGENT_NAME, SIGNAL_DECIDER_AGENT_NAME
@@ -985,6 +985,27 @@ class SignalDeciderNextOpenExecutionService:
             )
         )
         enrichment_preflight_blocked = not force and not enrichment_preflight.get('allowed')
+        existing_rows = self._load_plan_rows(target_trade_date=resolved_target_date, account_reference=None)
+        if existing_rows and not force and trigger == 'preopen_scheduler':
+            return {
+                'request': {
+                    'target_trade_date': resolved_target_date.isoformat(),
+                    'trigger': trigger,
+                },
+                'runtime': runtime,
+                'summary': {
+                    **self._build_summary(
+                        rows=existing_rows,
+                        target_trade_date=resolved_target_date,
+                        runtime=runtime,
+                        source_market_date=source_market_date,
+                        enrichment_preflight=enrichment_preflight,
+                    ),
+                    'reason': 'existing_next_open_plan_reused',
+                },
+                'enrichment_preflight': enrichment_preflight,
+                'items': [self._serialize_row(row) for row in existing_rows],
+            }
         snapshots = self._load_latest_snapshots(source_market_date=source_market_date)
         signal_decider_action_by_symbol = _latest_signal_decider_action_by_symbol(snapshots)
         actionable_short_term_symbols = [
@@ -1038,7 +1059,6 @@ class SignalDeciderNextOpenExecutionService:
             }
         account_targets, account_target_errors = self._parse_account_targets()
         account_targets_setting_configured = bool(settings.signal_decider_next_open_account_targets.strip())
-        existing_rows = self._load_plan_rows(target_trade_date=resolved_target_date, account_reference=None)
         policy_cache: dict[str, dict[str, Any]] = {}
         price_cache: dict[str, int | None] = {}
         desired_keys: set[tuple[str, str, str]] = set()
@@ -1712,27 +1732,56 @@ class SignalDeciderNextOpenExecutionService:
 
     def _load_latest_snapshots(self, *, source_market_date: date) -> list[SignalDeciderDecisionSnapshot]:
         with session_scope() as session:
-            rows = session.execute(
-                select(SignalDeciderDecisionSnapshot)
+            ranked_ids = (
+                select(
+                    SignalDeciderDecisionSnapshot.id.label('id'),
+                    func.row_number()
+                    .over(
+                        partition_by=(
+                            SignalDeciderDecisionSnapshot.symbol,
+                            SignalDeciderDecisionSnapshot.agent_name,
+                        ),
+                        order_by=(
+                            SignalDeciderDecisionSnapshot.created_at.desc(),
+                            SignalDeciderDecisionSnapshot.id.desc(),
+                        ),
+                    )
+                    .label('rank'),
+                )
                 .where(
                     SignalDeciderDecisionSnapshot.agent_name.in_(
                         [SIGNAL_DECIDER_AGENT_NAME, SHORT_TERM_DECIDER_AGENT_NAME]
                     ),
                     SignalDeciderDecisionSnapshot.market_date == source_market_date,
+                    or_(
+                        SignalDeciderDecisionSnapshot.next_day_open_action == 'buy',
+                        SignalDeciderDecisionSnapshot.decision_action == 'buy',
+                        SignalDeciderDecisionSnapshot.decision_action.in_(list(SHORT_TERM_ACTIONABLE_ACTIONS)),
+                    ),
                 )
+                .subquery()
+            )
+            snapshot_ids = [
+                int(row.id)
+                for row in session.execute(
+                    select(ranked_ids.c.id)
+                    .where(ranked_ids.c.rank == 1)
+                    .order_by(ranked_ids.c.id.asc())
+                )
+            ]
+            if not snapshot_ids:
+                return []
+            rows = session.execute(
+                select(SignalDeciderDecisionSnapshot)
+                .where(SignalDeciderDecisionSnapshot.id.in_(snapshot_ids))
                 .order_by(
                     SignalDeciderDecisionSnapshot.symbol.asc(),
                     SignalDeciderDecisionSnapshot.agent_name.asc(),
-                    SignalDeciderDecisionSnapshot.created_at.desc(),
-                    SignalDeciderDecisionSnapshot.id.desc(),
                 )
             ).scalars().all()
             for row in rows:
                 session.expunge(row)
-        deduped: dict[tuple[str, str], SignalDeciderDecisionSnapshot] = {}
-        for row in rows:
-            deduped.setdefault((row.symbol, _snapshot_agent_name(row)), row)
-        return list(deduped.values())
+        return rows
 
     def _load_plan_rows(
         self,
