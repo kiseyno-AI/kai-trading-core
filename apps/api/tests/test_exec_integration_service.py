@@ -224,6 +224,53 @@ class MarketRegimeSizingPolicyTests(unittest.TestCase):
         )
 
 
+class ExecIntegrationDashboardCacheTests(unittest.IsolatedAsyncioTestCase):
+    async def test_dashboard_payload_build_is_singleflight_per_cache_key(self) -> None:
+        service = SignalDeciderExecIntegrationService(client=FakeExecClient())
+        market_date = date(2026, 8, 5)
+        refresh_state = {'requested': False, 'status': 'idle'}
+        build_calls = 0
+
+        async def build() -> dict:
+            nonlocal build_calls
+            build_calls += 1
+            await asyncio.sleep(0.01)
+            payload = {
+                'request': {'market_date': market_date.isoformat(), 'refresh': False},
+                'freshness': {'status': 'fresh', 'is_stale': False, 'is_partial': False},
+                'refresh': refresh_state,
+                'items': [{'symbol': '005930'}],
+            }
+            service._store_dashboard_cached_payload(
+                endpoint='monitored_symbols',
+                market_date=market_date,
+                symbol=None,
+                payload=payload,
+            )
+            return payload
+
+        first, second = await asyncio.gather(
+            service._build_dashboard_payload_singleflight(
+                endpoint='monitored_symbols',
+                market_date=market_date,
+                symbol=None,
+                refresh_state=refresh_state,
+                build=build,
+            ),
+            service._build_dashboard_payload_singleflight(
+                endpoint='monitored_symbols',
+                market_date=market_date,
+                symbol=None,
+                refresh_state=refresh_state,
+                build=build,
+            ),
+        )
+
+        self.assertEqual(build_calls, 1)
+        self.assertEqual(first['items'], [{'symbol': '005930'}])
+        self.assertEqual(second['freshness']['served_from_cache'], True)
+
+
 class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
     @classmethod
     def setUpClass(cls) -> None:

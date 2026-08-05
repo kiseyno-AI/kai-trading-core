@@ -791,6 +791,7 @@ class SignalDeciderExecIntegrationService:
             0.0,
         )
         self._dashboard_cache: dict[tuple[str, str, str | None], DashboardReadModelCacheRecord] = {}
+        self._dashboard_build_locks: dict[tuple[str, str, str | None], asyncio.Lock] = {}
         self._dashboard_refresh_tasks: dict[tuple[str, str | None, str | None], asyncio.Task] = {}
         self._dashboard_refresh_state: dict[tuple[str, str | None, str | None], dict[str, Any]] = {}
 
@@ -1513,27 +1514,18 @@ class SignalDeciderExecIntegrationService:
         if cached is not None:
             return cached
 
-        overview = await self._load_dashboard_read_model_overview(
-            target_trade_date=resolved_market_date,
-            account_reference=None,
-            symbol=None,
-            trigger=trigger,
-        )
-        payload = await asyncio.to_thread(
-            self._build_runtime_daily_board_payload,
-            market_date=resolved_market_date,
-            refresh=refresh,
-            overview=overview,
-            refresh_state=refresh_state,
-            served_from_cache=False,
-        )
-        self._store_dashboard_cached_payload(
+        return await self._build_dashboard_payload_singleflight(
             endpoint=DASHBOARD_ENDPOINT_DAILY_BOARD,
             market_date=resolved_market_date,
             symbol=None,
-            payload=payload,
+            refresh_state=refresh_state,
+            build=lambda: self._build_and_cache_runtime_daily_board(
+                market_date=resolved_market_date,
+                refresh=refresh,
+                refresh_state=refresh_state,
+                trigger=trigger,
+            ),
         )
-        return payload
 
     async def list_runtime_monitored_symbols(
         self,
@@ -1564,34 +1556,21 @@ class SignalDeciderExecIntegrationService:
             )
             return cached
 
-        board = await self.get_runtime_daily_board(
+        payload = await self._build_dashboard_payload_singleflight(
+            endpoint=DASHBOARD_ENDPOINT_MONITORED_SYMBOLS,
             market_date=resolved_market_date,
-            refresh=False,
-            trigger=trigger,
-        )
-        live_holding_symbols = await self._load_live_portfolio_holding_symbols(trigger=trigger)
-        live_exec_monitoring_symbols = await self._load_live_exec_monitoring_symbols(
-            market_date=resolved_market_date,
-            trigger=trigger,
-        )
-        payload = await asyncio.to_thread(
-            self._build_runtime_monitored_symbols_payload,
-            board=board,
-            refresh=refresh,
+            symbol=None,
             refresh_state=refresh_state,
-            served_from_cache=False,
-            live_holding_symbols=live_holding_symbols,
-            live_exec_monitoring_symbols=live_exec_monitoring_symbols,
+            build=lambda: self._build_and_cache_runtime_monitored_symbols(
+                market_date=resolved_market_date,
+                refresh=refresh,
+                refresh_state=refresh_state,
+                trigger=trigger,
+            ),
         )
         self._observe_runtime_symbols_for_realtime_prices(
             (item.get('symbol') for item in payload['items']),
             trigger=trigger,
-        )
-        self._store_dashboard_cached_payload(
-            endpoint=DASHBOARD_ENDPOINT_MONITORED_SYMBOLS,
-            market_date=resolved_market_date,
-            symbol=None,
-            payload=payload,
         )
         return payload
 
@@ -1846,16 +1825,104 @@ class SignalDeciderExecIntegrationService:
         if cached is not None:
             return cached
 
-        overview = await self._load_dashboard_read_model_overview(
-            target_trade_date=resolved_market_date,
-            account_reference=None,
+        return await self._build_dashboard_payload_singleflight(
+            endpoint=DASHBOARD_ENDPOINT_SYMBOL_DETAIL,
+            market_date=resolved_market_date,
             symbol=resolved_symbol,
+            refresh_state=refresh_state,
+            build=lambda: self._build_and_cache_runtime_symbol_detail(
+                market_date=resolved_market_date,
+                symbol=resolved_symbol,
+                refresh=refresh,
+                refresh_state=refresh_state,
+                trigger=trigger,
+            ),
+        )
+
+    async def _build_and_cache_runtime_daily_board(
+        self,
+        *,
+        market_date: date,
+        refresh: bool,
+        refresh_state: dict[str, Any],
+        trigger: str,
+    ) -> dict[str, Any]:
+        overview = await self._load_dashboard_read_model_overview(
+            target_trade_date=market_date,
+            account_reference=None,
+            symbol=None,
+            trigger=trigger,
+        )
+        payload = await asyncio.to_thread(
+            self._build_runtime_daily_board_payload,
+            market_date=market_date,
+            refresh=refresh,
+            overview=overview,
+            refresh_state=refresh_state,
+            served_from_cache=False,
+        )
+        self._store_dashboard_cached_payload(
+            endpoint=DASHBOARD_ENDPOINT_DAILY_BOARD,
+            market_date=market_date,
+            symbol=None,
+            payload=payload,
+        )
+        return payload
+
+    async def _build_and_cache_runtime_monitored_symbols(
+        self,
+        *,
+        market_date: date,
+        refresh: bool,
+        refresh_state: dict[str, Any],
+        trigger: str,
+    ) -> dict[str, Any]:
+        board = await self.get_runtime_daily_board(
+            market_date=market_date,
+            refresh=False,
+            trigger=trigger,
+        )
+        live_holding_symbols = await self._load_live_portfolio_holding_symbols(trigger=trigger)
+        live_exec_monitoring_symbols = await self._load_live_exec_monitoring_symbols(
+            market_date=market_date,
+            trigger=trigger,
+        )
+        payload = await asyncio.to_thread(
+            self._build_runtime_monitored_symbols_payload,
+            board=board,
+            refresh=refresh,
+            refresh_state=refresh_state,
+            served_from_cache=False,
+            live_holding_symbols=live_holding_symbols,
+            live_exec_monitoring_symbols=live_exec_monitoring_symbols,
+        )
+        self._store_dashboard_cached_payload(
+            endpoint=DASHBOARD_ENDPOINT_MONITORED_SYMBOLS,
+            market_date=market_date,
+            symbol=None,
+            payload=payload,
+        )
+        return payload
+
+    async def _build_and_cache_runtime_symbol_detail(
+        self,
+        *,
+        market_date: date,
+        symbol: str,
+        refresh: bool,
+        refresh_state: dict[str, Any],
+        trigger: str,
+    ) -> dict[str, Any]:
+        overview = await self._load_dashboard_read_model_overview(
+            target_trade_date=market_date,
+            account_reference=None,
+            symbol=symbol,
             trigger=trigger,
         )
         payload = await asyncio.to_thread(
             self._build_runtime_symbol_detail_payload,
-            market_date=resolved_market_date,
-            symbol=resolved_symbol,
+            market_date=market_date,
+            symbol=symbol,
             refresh=refresh,
             overview=overview,
             refresh_state=refresh_state,
@@ -1863,8 +1930,8 @@ class SignalDeciderExecIntegrationService:
         )
         self._store_dashboard_cached_payload(
             endpoint=DASHBOARD_ENDPOINT_SYMBOL_DETAIL,
-            market_date=resolved_market_date,
-            symbol=resolved_symbol,
+            market_date=market_date,
+            symbol=symbol,
             payload=payload,
         )
         return payload
@@ -2443,6 +2510,32 @@ class SignalDeciderExecIntegrationService:
         if not allow_stale and self._dashboard_cache_is_due(record):
             return None
         return self._decorate_dashboard_cached_payload(record, refresh_state=refresh_state)
+
+    async def _build_dashboard_payload_singleflight(
+        self,
+        *,
+        endpoint: str,
+        market_date: date,
+        symbol: str | None,
+        refresh_state: dict[str, Any],
+        build,
+    ) -> dict[str, Any]:
+        cache_key = self._dashboard_cache_key(endpoint, market_date, symbol)
+        lock = self._dashboard_build_locks.get(cache_key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._dashboard_build_locks[cache_key] = lock
+        async with lock:
+            cached = self._load_dashboard_cached_payload(
+                endpoint=endpoint,
+                market_date=market_date,
+                symbol=symbol,
+                refresh_state=refresh_state,
+                allow_stale=False,
+            )
+            if cached is not None:
+                return cached
+            return await build()
 
     def _store_dashboard_cached_payload(
         self,
