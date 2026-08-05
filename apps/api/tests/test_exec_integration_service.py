@@ -2666,6 +2666,33 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(item['exec_runtime_exclusion_reason'])
         self.assertIn('watch_monitoring_active', item['monitoring_statuses'])
 
+    async def test_runtime_monitored_symbols_extracts_exec_monitored_symbol_list(self) -> None:
+        payload = {
+            'liveness': {
+                'autonomous': {
+                    'monitoring': {
+                        'last_cycle': {
+                            'monitored_symbols': ['005930', '000660', '005930'],
+                            'items': [
+                                {
+                                    'symbol': 'SHOULD_NOT_LIMIT_TO_ITEMS',
+                                    'intent': 'intraday_watch_buy',
+                                    'status': 'watch_monitoring_active',
+                                }
+                            ],
+                        }
+                    }
+                }
+            }
+        }
+
+        symbols = self.service._extract_live_exec_monitoring_symbols(
+            payload=payload,
+            market_date=self.target_trade_date,
+        )
+
+        self.assertEqual(symbols, {'005930', '000660'})
+
     async def test_runtime_monitored_symbols_include_historical_held_position(self) -> None:
         with session_scope() as session:
             row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)

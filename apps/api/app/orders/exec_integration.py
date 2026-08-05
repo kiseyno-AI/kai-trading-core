@@ -1611,6 +1611,16 @@ class SignalDeciderExecIntegrationService:
         if not isinstance(monitoring, dict):
             return set()
         last_cycle = monitoring.get('last_cycle') if isinstance(monitoring.get('last_cycle'), dict) else {}
+        monitored_symbols = last_cycle.get('monitored_symbols')
+        if isinstance(monitored_symbols, list):
+            symbols = {
+                symbol
+                for raw_symbol in monitored_symbols
+                for symbol in [_normalize_optional_text(raw_symbol)]
+                if symbol
+            }
+            if symbols:
+                return symbols
         items = last_cycle.get('items') if isinstance(last_cycle.get('items'), list) else []
         symbols: set[str] = set()
         market_date_text = market_date.isoformat()
