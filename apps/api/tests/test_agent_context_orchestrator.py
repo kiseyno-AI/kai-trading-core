@@ -832,6 +832,29 @@ class RecordingBatchClient:
         }
 
 
+class PreflightFailingClient:
+    def __init__(self):
+        self.preflight_calls = 0
+        self.calls = []
+
+    def preflight_dispatch_auth(self):
+        self.preflight_calls += 1
+        return {
+            'ok': False,
+            'status': 'failed',
+            'failure_kind': 'openclaw_auth_missing',
+            'failure_status': 'auth/missing',
+            'failure_category': 'auth',
+            'retryable': False,
+            'error': 'OPENCLAW_GATEWAY_TOKEN is not configured',
+            'token_configured': False,
+        }
+
+    def dispatch_batch(self, **kwargs):
+        self.calls.append(kwargs)
+        raise AssertionError('dispatch_batch should not run after auth preflight failure')
+
+
 class HangingBatchClient:
     batch_http_timeout_seconds = 1.0
 
@@ -1291,6 +1314,42 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         )
         self.assertEqual(client.http_timeout_seconds, client.timeout_seconds)
 
+    def test_openclaw_auth_preflight_maps_gateway_auth_rejection(self):
+        fake_settings = SimpleNamespace(
+            openclaw_base_url='https://openclaw.example',
+            openclaw_gateway_token='gateway-token',
+            openclaw_agent_timeout_seconds=30,
+            openclaw_agent_max_retries=0,
+            openclaw_agent_retry_backoff_seconds=0,
+            openclaw_agent_max_prompt_chars=0,
+        )
+
+        for status_code in (401, 403):
+            with self.subTest(status_code=status_code):
+                http_calls: list[dict] = []
+
+                def fake_client_factory(*args, **kwargs):
+                    return FakeHTTPClient(
+                        response=FakeHTTPResponse(status_code, {'error': 'unauthorized'}),
+                        calls=http_calls,
+                        **kwargs,
+                    )
+
+                with patch.object(orchestrator_module, 'settings', fake_settings):
+                    with patch('app.agent_context.orchestrator.httpx.Client', side_effect=fake_client_factory):
+                        client = OpenClawAgentClient()
+                        result = client.preflight_dispatch_auth()
+
+                self.assertFalse(result['ok'])
+                self.assertEqual(result['status'], 'failed')
+                self.assertEqual(result['failure_kind'], 'openclaw_auth_rejected')
+                self.assertEqual(result['failure_status'], 'auth/rejected')
+                self.assertFalse(result['retryable'])
+                self.assertTrue(result['token_configured'])
+                self.assertEqual(result['response_status_code'], status_code)
+                self.assertEqual(http_calls[0]['url'], 'https://openclaw.example/tools/invoke')
+                self.assertEqual(http_calls[0]['json']['tool'], 'sessions_history')
+
     def test_signal_decider_batch_message_requires_exact_symbol_batch_envelope(self):
         fake_settings = SimpleNamespace(
             openclaw_base_url='https://openclaw.example',
@@ -1517,6 +1576,61 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         )
         self.assertTrue(
             all(failure['failure_kind'] == 'dispatch_incomplete' for failure in failure_service.recorded)
+        )
+
+    def test_dispatch_for_symbols_persists_run_level_openclaw_auth_failure(self):
+        service = AgentFeedbackOrchestrator()
+        client = PreflightFailingClient()
+        service.client = client
+        runtime_store = RuntimeFeedbackStateStore()
+        feedback_service = FakeFeedbackService()
+        failure_service = RecordingFailureService()
+        run_state_service = RecordingRunStateService()
+        read_service = RecordingAgentContextReadService()
+        cleanup_service = FakeSessionCleanupService()
+        fake_settings = SimpleNamespace(openclaw_agent_symbol_chunk_size=1, openclaw_agent_parallel_subtasks=1)
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            with patch.object(orchestrator_module, 'runtime_feedback_state_store', runtime_store):
+                with patch.object(orchestrator_module, 'agent_context_feedback_run_state_service', run_state_service):
+                    with patch.object(orchestrator_module, 'agent_context_read_service', read_service):
+                        with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
+                            with patch.object(orchestrator_module, 'agent_context_feedback_failure_service', failure_service):
+                                with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
+                                    with _patch_feedback_eligibility('005930', '000660'):
+                                        result = service.dispatch_for_symbols(
+                                            market_date='2026-04-14',
+                                            symbols=['005930', '000660'],
+                                            roles=['eod-summarizer'],
+                                            reuse_existing=False,
+                                            request_run_id='auth-preflight-test-run',
+                                        )
+
+        self.assertEqual(client.preflight_calls, 1)
+        self.assertEqual(client.calls, [])
+        self.assertEqual(read_service.calls, [])
+        self.assertEqual(feedback_service.bulk_calls, [])
+        self.assertEqual(result['summary']['status'], 'failed')
+        self.assertEqual(result['summary']['completed'], 0)
+        self.assertEqual(result['summary']['computed_count'], 0)
+        self.assertEqual(result['summary']['reused_count'], 0)
+        self.assertEqual(result['summary']['failed'], 1)
+        self.assertTrue(result['summary']['run_level_failure'])
+        self.assertEqual(result['summary']['failure_kind'], 'openclaw_auth_missing')
+        self.assertEqual(len(failure_service.recorded), 1)
+        recorded = failure_service.recorded[0]
+        self.assertEqual(recorded['symbol'], orchestrator_module.RUN_LEVEL_FAILURE_SYMBOL)
+        self.assertEqual(recorded['agent_name'], orchestrator_module.OPENCLAW_GATEWAY_AGENT_NAME)
+        self.assertEqual(recorded['failure_kind'], 'openclaw_auth_missing')
+        self.assertFalse(recorded['retryable'])
+        self.assertEqual(recorded['context']['origin'], 'openclaw_dispatch_auth_preflight')
+        self.assertEqual(recorded['context']['affected_symbols'], ['005930', '000660'])
+        self.assertEqual(run_state_service.finished[0]['status'], 'failed')
+        self.assertEqual(run_state_service.finished[0]['completed_count'], 0)
+        self.assertEqual(run_state_service.finished[0]['failed_count'], 1)
+        self.assertNotIn(
+            'dispatch_incomplete',
+            {failure.get('failure_kind') for failure in result['failures']},
         )
 
     def test_dispatch_for_symbols_returns_blocked_gate_when_prerequisites_are_not_ready(self):

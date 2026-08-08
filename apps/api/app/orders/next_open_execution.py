@@ -13,7 +13,9 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import defer
 
 from app.agent_context.decision_input_quality import build_decision_input_quality_envelope
+from app.agent_context.feedback_failure_service import agent_context_feedback_failure_service
 from app.agent_context.roles import SHORT_TERM_DECIDER_AGENT_NAME, SIGNAL_DECIDER_AGENT_NAME
+from app.agent_context.run_state_service import agent_context_feedback_run_state_service
 from app.orders.signal_decider_alignment_gate import (
     ALIGNMENT_GATE_ACTION_BLOCK,
     ALIGNMENT_GATE_ACTION_REPORT_ONLY_BLOCK,
@@ -923,6 +925,90 @@ class SignalDeciderNextOpenExecutionService:
             return await result
         return result
 
+    def _build_agent_context_completeness_context(
+        self,
+        *,
+        source_market_date: date,
+        candidate_symbols: Sequence[str] | None = None,
+    ) -> dict[str, Any]:
+        normalized_symbols = sorted(
+            {
+                str(symbol or '').strip().upper()
+                for symbol in (candidate_symbols or [])
+                if str(symbol or '').strip()
+            }
+        )
+        try:
+            latest_run = agent_context_feedback_run_state_service.find_latest_run(
+                market_date=source_market_date,
+                requested_symbols=normalized_symbols or None,
+            )
+            run_id = str(latest_run.get('run_id')).strip() if isinstance(latest_run, dict) and latest_run.get('run_id') else None
+            if run_id:
+                failure_summary = agent_context_feedback_failure_service.get_grouped_summary(
+                    market_date=source_market_date,
+                    run_id=run_id,
+                    limit=20,
+                )
+            else:
+                failure_summary = {'summary': {'failure_count': 0, 'group_count': 0}, 'groups': []}
+        except Exception as exc:  # noqa: BLE001
+            return {
+                'schema_version': 'agent_context_completeness_v1',
+                'source_market_date': source_market_date.isoformat(),
+                'status': 'unavailable',
+                'has_incomplete_agent_context': None,
+                'reason': 'agent_context_completeness_lookup_failed',
+                'error_type': type(exc).__name__,
+            }
+
+        summary = failure_summary.get('summary') if isinstance(failure_summary, dict) else {}
+        groups = failure_summary.get('groups') if isinstance(failure_summary, dict) else []
+        failure_groups = [group for group in groups if isinstance(group, dict)][:20] if isinstance(groups, list) else []
+        failure_count = int(summary.get('failure_count') or 0) if isinstance(summary, dict) else 0
+        run_status = (
+            str(latest_run.get('status') or '').strip().lower()
+            if isinstance(latest_run, dict)
+            else None
+        )
+        incomplete_run_statuses = {'running', 'failed', 'partial', 'abandoned'}
+        has_incomplete_agent_context = bool(failure_count > 0 or run_status in incomplete_run_statuses)
+        if has_incomplete_agent_context:
+            status = 'incomplete'
+        elif latest_run is None:
+            status = 'unknown'
+        else:
+            status = 'complete'
+        return {
+            'schema_version': 'agent_context_completeness_v1',
+            'source_market_date': source_market_date.isoformat(),
+            'candidate_symbols': normalized_symbols,
+            'candidate_set_basis': 'latest_signal_decider_snapshots',
+            'status': status,
+            'has_incomplete_agent_context': has_incomplete_agent_context if latest_run is not None or failure_count else None,
+            'latest_run': (
+                {
+                    'run_id': latest_run.get('run_id'),
+                    'status': latest_run.get('status'),
+                    'symbols_total': latest_run.get('symbols_total'),
+                    'completed_count': latest_run.get('completed_count'),
+                    'failed_count': latest_run.get('failed_count'),
+                    'started_at': latest_run.get('started_at').isoformat()
+                    if hasattr(latest_run.get('started_at'), 'isoformat')
+                    else latest_run.get('started_at'),
+                    'completed_at': latest_run.get('completed_at').isoformat()
+                    if hasattr(latest_run.get('completed_at'), 'isoformat')
+                    else latest_run.get('completed_at'),
+                }
+                if isinstance(latest_run, dict)
+                else None
+            ),
+            'failure_count': failure_count,
+            'failure_group_count': int(summary.get('group_count') or 0) if isinstance(summary, dict) else 0,
+            'by_failure_kind': summary.get('by_failure_kind') if isinstance(summary, dict) else {},
+            'failure_groups': failure_groups,
+        }
+
     def list_plan_items(
         self,
         *,
@@ -931,6 +1017,7 @@ class SignalDeciderNextOpenExecutionService:
         refresh: bool = False,
     ) -> dict[str, Any]:
         resolved_target_date = self._resolve_target_trade_date(target_trade_date)
+        source_market_date = _previous_trading_day(resolved_target_date)
         if refresh:
             self.refresh_plan_items(
                 target_trade_date=resolved_target_date,
@@ -940,6 +1027,10 @@ class SignalDeciderNextOpenExecutionService:
             target_trade_date=resolved_target_date,
             account_reference=account_reference,
             include_payloads=False,
+        )
+        agent_context_completeness = self._build_agent_context_completeness_context(
+            source_market_date=source_market_date,
+            candidate_symbols=[row.symbol for row in rows],
         )
         runtime = self.runtime_status()
         return {
@@ -953,6 +1044,8 @@ class SignalDeciderNextOpenExecutionService:
                 rows=rows,
                 target_trade_date=resolved_target_date,
                 runtime=runtime,
+                source_market_date=source_market_date,
+                agent_context_completeness=agent_context_completeness,
             ),
             'items': [self._serialize_row(row) for row in rows],
         }
@@ -978,6 +1071,10 @@ class SignalDeciderNextOpenExecutionService:
             account_reference=None,
             include_payloads=False,
         )
+        agent_context_completeness = self._build_agent_context_completeness_context(
+            source_market_date=source_market_date,
+            candidate_symbols=[row.symbol for row in existing_rows],
+        )
         if existing_rows and not force and trigger == 'preopen_scheduler':
             return {
                 'request': {
@@ -991,6 +1088,7 @@ class SignalDeciderNextOpenExecutionService:
                         target_trade_date=resolved_target_date,
                         runtime=runtime,
                         source_market_date=source_market_date,
+                        agent_context_completeness=agent_context_completeness,
                     ),
                     'reason': 'existing_next_open_plan_reused',
                 },
@@ -1013,6 +1111,10 @@ class SignalDeciderNextOpenExecutionService:
         )
         enrichment_preflight_blocked = not force and not enrichment_preflight.get('allowed')
         snapshots = self._load_latest_snapshots(source_market_date=source_market_date)
+        agent_context_completeness = self._build_agent_context_completeness_context(
+            source_market_date=source_market_date,
+            candidate_symbols=[snapshot.symbol for snapshot in snapshots],
+        )
         signal_decider_action_by_symbol = _latest_signal_decider_action_by_symbol(snapshots)
         actionable_short_term_symbols = [
             snapshot.symbol for snapshot in snapshots if _is_actionable_short_term_snapshot(snapshot)
@@ -1054,6 +1156,7 @@ class SignalDeciderNextOpenExecutionService:
                         runtime=runtime,
                         source_market_date=source_market_date,
                         enrichment_preflight=enrichment_preflight,
+                        agent_context_completeness=agent_context_completeness,
                     ),
                     'reason': 'pykrx_enrichment_preflight_blocked',
                     'enrichment_preflight_allowed': False,
@@ -1173,6 +1276,7 @@ class SignalDeciderNextOpenExecutionService:
                             if decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
                             else None
                         ),
+                        agent_context_completeness=agent_context_completeness,
                     )
                     if account_target_blocking_reasons:
                         validation['blocking_reasons'] = [
@@ -1229,6 +1333,7 @@ class SignalDeciderNextOpenExecutionService:
                 runtime=runtime,
                 source_market_date=source_market_date,
                 enrichment_preflight=enrichment_preflight,
+                agent_context_completeness=agent_context_completeness,
                 reason='pykrx_enrichment_preflight_blocked' if enrichment_preflight_blocked else None,
             ),
             'enrichment_preflight': enrichment_preflight,
@@ -1834,6 +1939,7 @@ class SignalDeciderNextOpenExecutionService:
         enrichment_preflight: dict[str, Any] | None = None,
         candidate_enrichment: dict[str, Any] | None = None,
         signal_decider_crosscheck: dict[str, Any] | None = None,
+        agent_context_completeness: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         decision_agent_name = _snapshot_agent_name(snapshot)
         response_payload = _snapshot_response_payload(snapshot)
@@ -1866,6 +1972,29 @@ class SignalDeciderNextOpenExecutionService:
                 _reason(
                     'missing_upstream_roles',
                     f'Missing upstream roles: {", ".join(missing_upstream_roles)}.',
+                )
+            )
+        agent_context_completeness_payload = (
+            agent_context_completeness
+            if isinstance(agent_context_completeness, dict)
+            else {}
+        )
+        if agent_context_completeness_payload.get('has_incomplete_agent_context') is True:
+            failure_count = int(agent_context_completeness_payload.get('failure_count') or 0)
+            latest_run = (
+                agent_context_completeness_payload.get('latest_run')
+                if isinstance(agent_context_completeness_payload.get('latest_run'), dict)
+                else {}
+            )
+            warnings.append(
+                _reason(
+                    'agent_context_incomplete_candidate_set',
+                    (
+                        'Candidate set is based on incomplete agent context'
+                        f" from run {latest_run.get('run_id') or 'unknown'}"
+                        f" ({latest_run.get('status') or agent_context_completeness_payload.get('status')});"
+                        f' grouped failure count: {failure_count}.'
+                    ),
                 )
             )
 
@@ -2295,6 +2424,7 @@ class SignalDeciderNextOpenExecutionService:
                 'estimated_notional_krw': _decimal_to_text(estimated_notional),
             },
             'performance_gate': performance_gate,
+            'agent_context_completeness': agent_context_completeness_payload,
             'pre_decider_enrichment_context': pre_decider_enrichment_context,
             'market_regime_context': market_regime_context,
             'decision_input_quality_context': decision_input_quality_context,
@@ -2517,6 +2647,7 @@ class SignalDeciderNextOpenExecutionService:
             'response_payload_summary': _to_json_safe(response_payload),
             'decision_traceability': _snapshot_traceability_payload(snapshot),
             'signal_traceability': _snapshot_traceability_payload(snapshot),
+            'agent_context_completeness': validation_payload.get('agent_context_completeness') or {},
         }
         if decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME:
             alignment_gate_payload = (
@@ -2599,9 +2730,15 @@ class SignalDeciderNextOpenExecutionService:
         runtime: dict[str, Any],
         source_market_date: date | None = None,
         enrichment_preflight: dict[str, Any] | None = None,
+        agent_context_completeness: dict[str, Any] | None = None,
         reason: str | None = None,
     ) -> dict[str, Any]:
         source_market_date = source_market_date or _previous_trading_day(target_trade_date)
+        agent_context_payload = (
+            agent_context_completeness
+            if isinstance(agent_context_completeness, dict)
+            else {}
+        )
         counts = {
             'items_total': len(rows),
             'eligible_count': sum(1 for row in rows if row.eligibility_status == ELIGIBILITY_ELIGIBLE),
@@ -2680,6 +2817,11 @@ class SignalDeciderNextOpenExecutionService:
             'enrichment_failed_categories': (
                 enrichment_preflight.get('failed_categories') if enrichment_preflight is not None else []
             ),
+            'agent_context_completeness_status': agent_context_payload.get('status'),
+            'agent_context_incomplete': agent_context_payload.get('has_incomplete_agent_context'),
+            'agent_context_failure_count': agent_context_payload.get('failure_count'),
+            'agent_context_failure_groups': agent_context_payload.get('failure_groups') or [],
+            'agent_context_completeness': agent_context_payload,
         }
 
     def _serialize_row(self, row: SignalDeciderExecutionPlanItem) -> dict[str, Any]:
@@ -2785,6 +2927,9 @@ class SignalDeciderNextOpenExecutionService:
             'client_order_id': row.client_order_id,
             'order_request_id': row.order_request_id,
             'broker_order_row_id': row.broker_order_row_id,
+            'agent_context_completeness': validation.get('agent_context_completeness')
+            or traceability.get('agent_context_completeness')
+            or {},
             'validation': validation,
             'traceability': traceability,
             'submission': submission_payload,
@@ -2837,6 +2982,7 @@ class SignalDeciderNextOpenExecutionService:
                 'target_price': traceability.get('target_price'),
                 'stop_loss_price': traceability.get('stop_loss_price'),
                 'suggested_holding_period': traceability.get('suggested_holding_period'),
+                'agent_context_completeness': traceability.get('agent_context_completeness') or {},
                 'trigger': trigger,
             }
         }
