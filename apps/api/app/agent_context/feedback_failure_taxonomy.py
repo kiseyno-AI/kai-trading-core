@@ -7,6 +7,8 @@ from typing import Any, Iterable, Mapping
 
 class FeedbackFailureKind(str, Enum):
     DEPENDENCY_MISSING_UPSTREAM = 'dependency_missing_upstream'
+    OPENCLAW_AUTH_MISSING = 'openclaw_auth_missing'
+    OPENCLAW_AUTH_REJECTED = 'openclaw_auth_rejected'
     OPENCLAW_TRANSPORT_TIMEOUT = 'openclaw_transport_timeout'
     OPENCLAW_TRANSPORT_ERROR = 'openclaw_transport_error'
     OPENCLAW_RESPONSE_INVALID_JSON = 'openclaw_response_invalid_json'
@@ -18,6 +20,8 @@ class FeedbackFailureKind(str, Enum):
 
 class FeedbackFailureStatus(str, Enum):
     DEPENDENCY_MISSING_UPSTREAM = 'dependency/missing-upstream'
+    AUTH_MISSING = 'auth/missing'
+    AUTH_REJECTED = 'auth/rejected'
     TRANSPORT_TIMEOUT = 'transport/timeout'
     TRANSPORT_ERROR = 'transport/error'
     RESPONSE_INVALID_JSON = 'response/invalid-json'
@@ -118,7 +122,10 @@ def classify_feedback_failure(
 
     missing_roles = context_payload.get('missing_roles')
     if (
-        'missing_decider_upstream_summaries' in haystack
+        'dependency_missing_upstream' in haystack
+        or failure_kind == FeedbackFailureKind.DEPENDENCY_MISSING_UPSTREAM.value
+        or failure_kind == FeedbackFailureStatus.DEPENDENCY_MISSING_UPSTREAM.value
+        or 'missing_decider_upstream_summaries' in haystack
         or 'blocked_missing_upstream_summaries' in haystack
         or (isinstance(missing_roles, list) and missing_roles)
     ):
@@ -127,6 +134,33 @@ def classify_feedback_failure(
             failure_status=FeedbackFailureStatus.DEPENDENCY_MISSING_UPSTREAM.value,
             failure_category='dependency',
             reason='missing upstream summarizer feedback required by decider role',
+        )
+
+    if (
+        'openclaw_auth_missing' in haystack
+        or 'openclaw_gateway_token is not configured' in haystack
+        or 'openclaw_gateway_token missing' in haystack
+        or 'gateway token is not configured' in haystack
+    ):
+        return FeedbackFailureClassification(
+            failure_kind=FeedbackFailureKind.OPENCLAW_AUTH_MISSING.value,
+            failure_status=FeedbackFailureStatus.AUTH_MISSING.value,
+            failure_category='auth',
+            reason='OpenClaw gateway token is not configured locally',
+        )
+
+    if (
+        'openclaw_auth_rejected' in haystack
+        or 'unauthorized' in haystack
+        or 'forbidden' in haystack
+        or 401 in status_codes
+        or 403 in status_codes
+    ):
+        return FeedbackFailureClassification(
+            failure_kind=FeedbackFailureKind.OPENCLAW_AUTH_REJECTED.value,
+            failure_status=FeedbackFailureStatus.AUTH_REJECTED.value,
+            failure_category='auth',
+            reason='OpenClaw gateway rejected the configured bearer token',
         )
 
     if 'dispatch_incomplete' in haystack or 'terminal feedback missing' in haystack:

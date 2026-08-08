@@ -545,6 +545,90 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn('035420', items_by_symbol)
 
+    def test_refresh_plan_items_marks_incomplete_agent_context_candidate_set(self) -> None:
+        self.market_date = date(2026, 8, 3)
+        self.target_trade_date = date(2026, 8, 4)
+        self.calendar_client = FakeCalendarClient(
+            [
+                {'bass_dt': '20260803', 'opnd_yn': 'Y'},
+                {'bass_dt': '20260804', 'opnd_yn': 'Y'},
+            ]
+        )
+        set_krx_calendar_provider(KisKrxTradingCalendarProvider(client=self.calendar_client))
+        self._seed_snapshot(symbol='005930')
+        run_id = f'agent-context-test-{uuid4().hex[:10]}'
+        service = self._service(state='PREOPEN', server_time='2026-04-30T08:40:00+09:00')
+        latest_run = {
+            'run_id': run_id,
+            'status': 'partial',
+            'symbols_total': 1,
+            'completed_count': 0,
+            'failed_count': 1,
+            'started_at': datetime(2026, 4, 29, 5, 45, tzinfo=timezone.utc),
+            'completed_at': datetime(2026, 4, 29, 5, 46, tzinfo=timezone.utc),
+        }
+        failure_summary = {
+            'summary': {
+                'failure_count': 1,
+                'group_count': 1,
+                'by_failure_kind': {'openclaw_auth_rejected': 1},
+            },
+            'groups': [
+                {
+                    'market_date': '2026-08-03',
+                    'run_id': run_id,
+                    'agent_name': 'openclaw-gateway',
+                    'failure_kind': 'openclaw_auth_rejected',
+                    'failure_status': 'auth/rejected',
+                    'category': 'dependency',
+                    'failure_count': 1,
+                }
+            ],
+        }
+
+        def fake_find_latest_run(*, market_date: date, requested_symbols: list[str] | None = None):
+            if requested_symbols == ['005930']:
+                return latest_run
+            return None
+
+        with (
+            patch(
+                'app.orders.next_open_execution.agent_context_feedback_run_state_service.find_latest_run',
+                side_effect=fake_find_latest_run,
+            ) as find_latest_run,
+            patch(
+                'app.orders.next_open_execution.agent_context_feedback_failure_service.get_grouped_summary',
+                return_value=failure_summary,
+            ) as get_grouped_summary,
+            patch(
+                'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+                return_value=[{'trade_date': '2026-08-03', 'close_price': 50000}],
+            ),
+        ):
+            result = service.refresh_plan_items(target_trade_date=self.target_trade_date, trigger='test')
+
+        find_latest_run.assert_any_call(
+            market_date=self.market_date,
+            requested_symbols=['005930'],
+        )
+        get_grouped_summary.assert_called_once_with(
+            market_date=self.market_date,
+            run_id=run_id,
+            limit=20,
+        )
+        self.assertEqual(result['summary']['agent_context_completeness_status'], 'incomplete')
+        self.assertTrue(result['summary']['agent_context_incomplete'])
+        self.assertEqual(result['summary']['agent_context_failure_count'], 1)
+        item = result['items'][0]
+        completeness = item['agent_context_completeness']
+        self.assertEqual(completeness['status'], 'incomplete')
+        self.assertTrue(completeness['has_incomplete_agent_context'])
+        self.assertEqual(completeness['latest_run']['run_id'], run_id)
+        self.assertEqual(completeness['failure_groups'][0]['failure_kind'], 'openclaw_auth_rejected')
+        warning_codes = {warning['code'] for warning in item['validation']['warnings']}
+        self.assertIn('agent_context_incomplete_candidate_set', warning_codes)
+        self.assertEqual(item['traceability']['agent_context_completeness']['status'], 'incomplete')
+
     def test_refresh_plan_items_blocks_existing_rows_when_pykrx_enrichment_missing(self) -> None:
         self._seed_snapshot(symbol='005930')
         service = self._service(state='PREOPEN', server_time='2026-04-30T08:40:00+09:00')

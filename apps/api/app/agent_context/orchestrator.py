@@ -246,6 +246,8 @@ def _ordered_union(values: Sequence[Sequence[str]]) -> list[str]:
 
 DEFAULT_OPENCLAW_AGENT_TIMEOUT_SECONDS = 300.0
 DEFAULT_OPENCLAW_AGENT_BATCH_TIMEOUT_SECONDS = 300.0
+RUN_LEVEL_FAILURE_SYMBOL = '__RUN__'
+OPENCLAW_GATEWAY_AGENT_NAME = 'openclaw-gateway'
 
 
 class OpenClawAgentClient:
@@ -299,6 +301,84 @@ class OpenClawAgentClient:
         if isinstance(messages, list):
             return messages
         return []
+
+    def preflight_dispatch_auth(self) -> dict[str, Any]:
+        if not self.gateway_token:
+            return {
+                'ok': False,
+                'status': 'failed',
+                'failure_kind': FeedbackFailureKind.OPENCLAW_AUTH_MISSING.value,
+                'failure_status': 'auth/missing',
+                'failure_category': 'auth',
+                'retryable': False,
+                'error': 'OPENCLAW_GATEWAY_TOKEN is not configured',
+                'token_configured': False,
+            }
+
+        try:
+            url = self._sessions_history_url()
+        except AgentDispatchTerminalError as exc:
+            return {
+                'ok': True,
+                'status': 'inconclusive',
+                'reason': 'openclaw_base_url_invalid',
+                'error_type': type(exc).__name__,
+                'error': str(exc),
+                'token_configured': True,
+            }
+
+        body = {
+            'tool': 'sessions_history',
+            'args': {
+                'sessionKey': f'core-auth-preflight/{uuid.uuid4().hex[:12]}',
+                'limit': 1,
+                'includeTools': False,
+            },
+        }
+        timeout_seconds = max(1.0, min(float(self.http_timeout_seconds or 0) or 1.0, 5.0))
+        try:
+            with httpx.Client(timeout=timeout_seconds, headers=self._headers()) as client:
+                response = client.post(url, json=body)
+        except Exception as exc:  # noqa: BLE001
+            return {
+                'ok': True,
+                'status': 'inconclusive',
+                'reason': 'openclaw_auth_preflight_transport_unavailable',
+                'error_type': type(exc).__name__,
+                'error': str(exc),
+                'token_configured': True,
+                'timeout_seconds': timeout_seconds,
+            }
+
+        response_text_excerpt = self._response_text_excerpt(response, limit=300)
+        if response.status_code in (401, 403):
+            return {
+                'ok': False,
+                'status': 'failed',
+                'failure_kind': FeedbackFailureKind.OPENCLAW_AUTH_REJECTED.value,
+                'failure_status': 'auth/rejected',
+                'failure_category': 'auth',
+                'retryable': False,
+                'error': f'OpenClaw gateway rejected auth with HTTP {response.status_code}',
+                'token_configured': True,
+                'response_status_code': response.status_code,
+                'response_text_excerpt': response_text_excerpt,
+            }
+        if response.status_code >= 400:
+            return {
+                'ok': True,
+                'status': 'inconclusive',
+                'reason': 'openclaw_auth_preflight_non_auth_http_error',
+                'token_configured': True,
+                'response_status_code': response.status_code,
+                'response_text_excerpt': response_text_excerpt,
+            }
+        return {
+            'ok': True,
+            'status': 'ready',
+            'token_configured': True,
+            'response_status_code': response.status_code,
+        }
 
     def _headers(self) -> dict[str, str]:
         headers = {'Content-Type': 'application/json'}
@@ -2172,6 +2252,56 @@ class AgentFeedbackOrchestrator:
             self.client = OpenClawAgentClient()
         return self.client
 
+    def _preflight_openclaw_dispatch_auth(
+        self,
+        *,
+        market_date: date,
+        request_run_id: str,
+        requested_roles: Sequence[str],
+        scoped_dispatch_symbols: Sequence[str],
+    ) -> dict[str, Any]:
+        client = self._get_client()
+        preflight = getattr(client, 'preflight_dispatch_auth', None)
+        if not callable(preflight):
+            return {
+                'ok': True,
+                'status': 'skipped',
+                'reason': 'client_without_preflight_support',
+            }
+        try:
+            result = preflight()
+        except Exception as exc:  # noqa: BLE001
+            result = {
+                'ok': True,
+                'status': 'inconclusive',
+                'reason': 'openclaw_auth_preflight_exception',
+                'error_type': type(exc).__name__,
+                'error': str(exc),
+            }
+        if not isinstance(result, dict):
+            result = {
+                'ok': True,
+                'status': 'skipped',
+                'reason': 'client_preflight_returned_non_mapping',
+            }
+        log_agent_feedback_event(
+            'openclaw_dispatch_auth_preflight',
+            status=str(result.get('status') or 'unknown'),
+            market_date=market_date.isoformat(),
+            request_run_id=request_run_id,
+            agent_name=OPENCLAW_GATEWAY_AGENT_NAME,
+            role=OPENCLAW_GATEWAY_AGENT_NAME,
+            batch_symbols=list(scoped_dispatch_symbols),
+            requested_roles=list(requested_roles),
+            failure_kind=result.get('failure_kind'),
+            failure_context={
+                key: value
+                for key, value in result.items()
+                if key not in {'response_text_excerpt'}
+            },
+        )
+        return result
+
     @staticmethod
     def _session_key_from_response(response: dict[str, Any] | None) -> str | None:
         session_ref = response.get('session_ref') if isinstance(response, dict) else None
@@ -3348,6 +3478,103 @@ class AgentFeedbackOrchestrator:
         finalization_error: Exception | None = None
         final_status = 'failed'
         final_flush_result: dict[str, Any] | None = None
+        skip_terminal_reconciliation = False
+        openclaw_dispatch_preflight_checked = False
+
+        def run_openclaw_dispatch_preflight(live_dispatch_symbols: Sequence[str]) -> bool:
+            nonlocal openclaw_dispatch_preflight_checked
+            nonlocal response_payload
+            nonlocal skip_terminal_reconciliation
+
+            preflight_symbols = _ordered_union([list(live_dispatch_symbols)])
+            if not preflight_symbols:
+                return True
+            if openclaw_dispatch_preflight_checked:
+                return True
+
+            openclaw_dispatch_preflight_checked = True
+            openclaw_dispatch_preflight = self._preflight_openclaw_dispatch_auth(
+                market_date=normalized_market_date,
+                request_run_id=request_run_id,
+                requested_roles=requested_role_names,
+                scoped_dispatch_symbols=preflight_symbols,
+            )
+            sanitized_openclaw_dispatch_preflight = {
+                key: value
+                for key, value in openclaw_dispatch_preflight.items()
+                if key not in {'response_text_excerpt'}
+            }
+            request_payload['openclaw_dispatch_preflight'] = sanitized_openclaw_dispatch_preflight
+            if openclaw_dispatch_preflight.get('ok') is not False:
+                return True
+
+            skip_terminal_reconciliation = True
+            failure_kind = str(
+                openclaw_dispatch_preflight.get('failure_kind')
+                or FeedbackFailureKind.DISPATCH_FAILED.value
+            )
+            failure_error = str(
+                openclaw_dispatch_preflight.get('error')
+                or openclaw_dispatch_preflight.get('reason')
+                or 'OpenClaw dispatch auth preflight failed'
+            )
+            failure_context = {
+                'origin': 'openclaw_dispatch_auth_preflight',
+                'request_run_id': request_run_id,
+                'affected_symbols': preflight_symbols,
+                'affected_roles': list(requested_role_names),
+                'preflight': sanitized_openclaw_dispatch_preflight,
+            }
+            failure = _build_failed_dispatch_item(
+                role=OPENCLAW_GATEWAY_AGENT_NAME,
+                agent_name=OPENCLAW_GATEWAY_AGENT_NAME,
+                symbol=RUN_LEVEL_FAILURE_SYMBOL,
+                error=failure_error,
+                retryable=bool(openclaw_dispatch_preflight.get('retryable', False)),
+                failure_kind=failure_kind,
+                context=failure_context,
+                batch_symbols=preflight_symbols,
+            )
+            all_failures.append(failure)
+            buffer_failure(
+                OPENCLAW_GATEWAY_AGENT_NAME,
+                RUN_LEVEL_FAILURE_SYMBOL,
+                failure_error,
+                bool(openclaw_dispatch_preflight.get('retryable', False)),
+                failure_kind=failure_kind,
+                context=failure_context,
+                agent_name=OPENCLAW_GATEWAY_AGENT_NAME,
+                batch_symbols=preflight_symbols,
+            )
+            preflight_flush_result = self._flush_and_checkpoint_pending_run_buffers(
+                market_date=normalized_market_date,
+                request_run_id=request_run_id,
+                request_payload=request_payload,
+                reason='openclaw_auth_preflight_failed',
+                lifecycle_stage='run_level_preflight_failed',
+                current_role=OPENCLAW_GATEWAY_AGENT_NAME,
+                status='failed',
+            )
+            response_payload = {
+                'request': request_payload,
+                'summary': {
+                    'status': 'failed',
+                    'completed': 0,
+                    'computed_count': 0,
+                    'reused_count': 0,
+                    'stale_count': 0,
+                    'failed': 1,
+                    'skipped': len(skipped_symbols),
+                    'flushed_to_db': 0,
+                    'run_level_failure': True,
+                    'failure_kind': failure_kind,
+                    'openclaw_dispatch_preflight': request_payload['openclaw_dispatch_preflight'],
+                    'failure_rows_persisted': preflight_flush_result.get('failure_rows_persisted'),
+                },
+                'items': [],
+                'failures': all_failures,
+            }
+            return False
 
         try:
             if not scoped_dispatch_symbols:
@@ -3366,7 +3593,7 @@ class AgentFeedbackOrchestrator:
                 }
             else:
                 reuse_decisions = {}
-                if reuse_existing:
+                if not skip_terminal_reconciliation and reuse_existing:
                     reuse_decisions = agent_context_reuse_service.build_latest_decisions(
                         market_date=normalized_market_date,
                         symbols=scoped_dispatch_symbols,
@@ -3375,7 +3602,8 @@ class AgentFeedbackOrchestrator:
                     )
                 upstream_reuse_decisions = {}
                 if (
-                    bool(getattr(settings, 'openclaw_feedback_upstream_reuse_enabled', True))
+                    not skip_terminal_reconciliation
+                    and bool(getattr(settings, 'openclaw_feedback_upstream_reuse_enabled', True))
                     and any(spec.role in DECISION_SUPPORT_AGENT_NAMES for spec in specs)
                 ):
                     upstream_reuse_decisions = agent_context_reuse_service.build_latest_decisions(
@@ -3384,7 +3612,7 @@ class AgentFeedbackOrchestrator:
                         roles=UPSTREAM_SUMMARY_ROLES,
                         force_recompute=False,
                     )
-                symbols_requiring_context = scoped_dispatch_symbols
+                symbols_requiring_context = [] if skip_terminal_reconciliation else scoped_dispatch_symbols
                 if reuse_decisions:
                     symbols_requiring_context = [
                         symbol
@@ -3397,6 +3625,8 @@ class AgentFeedbackOrchestrator:
                             )
                         )
                     ]
+                if symbols_requiring_context and not run_openclaw_dispatch_preflight(symbols_requiring_context):
+                    symbols_requiring_context = []
                 if symbols_requiring_context:
                     symbol_context = agent_context_read_service.get_symbol_day_context(
                         market_date=normalized_market_date,
@@ -3408,16 +3638,17 @@ class AgentFeedbackOrchestrator:
                         items=symbol_context.get('items') or [],
                         diagnostics=eligibility_diagnostics,
                     )
-                self._checkpoint_run_state(
-                    market_date=normalized_market_date,
-                    request_run_id=request_run_id,
-                    request_payload=request_payload,
-                    lifecycle_stage='dispatch_initialized',
-                    current_role=state.current_role,
-                    status='running',
-                )
+                if not skip_terminal_reconciliation:
+                    self._checkpoint_run_state(
+                        market_date=normalized_market_date,
+                        request_run_id=request_run_id,
+                        request_payload=request_payload,
+                        lifecycle_stage='dispatch_initialized',
+                        current_role=state.current_role,
+                        status='running',
+                    )
 
-                for spec in specs:
+                for spec in ([] if skip_terminal_reconciliation else specs):
                     role = spec.role
 
                     def _set_current_role(current: RuntimeFeedbackRunState) -> None:
@@ -3968,7 +4199,9 @@ class AgentFeedbackOrchestrator:
                                 if should_submit_next:
                                     submit_next()
                     finally:
-                        executor.shutdown(wait=False, cancel_futures=True)
+                        shutdown = getattr(executor, 'shutdown', None)
+                        if shutdown is not None:
+                            shutdown(wait=False, cancel_futures=True)
 
                     role_flush_result = self._flush_pending_run_buffers(
                         market_date=normalized_market_date,
@@ -4024,26 +4257,27 @@ class AgentFeedbackOrchestrator:
                         flush_result=role_flush_result,
                     )
 
-                final_snapshot = runtime_feedback_state_store.get_run(normalized_market_date, run_id=request_run_id) or state
-                progress_counts = final_snapshot.to_progress_summary()
-                completed_count = int(progress_counts.get('completed_feedback_count') or 0)
-                failed_count = len(final_snapshot.buffered_failures)
-                final_status = _resolve_dispatch_status(completed=completed_count, failed=failed_count)
-                response_payload = {
-                    'request': request_payload,
-                    'summary': {
-                        'status': final_status,
-                        'completed': completed_count,
-                        'computed_count': int(progress_counts.get('computed_feedback_count') or 0),
-                        'reused_count': int(progress_counts.get('reused_feedback_count') or 0),
-                        'stale_count': int(progress_counts.get('stale_feedback_count') or 0),
-                        'failed': failed_count,
-                        'skipped': len(skipped_symbols),
-                        'flushed_to_db': final_snapshot.flushed_feedback_count,
-                    },
-                    'items': all_items,
-                    'failures': all_failures,
-                }
+                if not skip_terminal_reconciliation:
+                    final_snapshot = runtime_feedback_state_store.get_run(normalized_market_date, run_id=request_run_id) or state
+                    progress_counts = final_snapshot.to_progress_summary()
+                    completed_count = int(progress_counts.get('completed_feedback_count') or 0)
+                    failed_count = len(final_snapshot.buffered_failures)
+                    final_status = _resolve_dispatch_status(completed=completed_count, failed=failed_count)
+                    response_payload = {
+                        'request': request_payload,
+                        'summary': {
+                            'status': final_status,
+                            'completed': completed_count,
+                            'computed_count': int(progress_counts.get('computed_feedback_count') or 0),
+                            'reused_count': int(progress_counts.get('reused_feedback_count') or 0),
+                            'stale_count': int(progress_counts.get('stale_feedback_count') or 0),
+                            'failed': failed_count,
+                            'skipped': len(skipped_symbols),
+                            'flushed_to_db': final_snapshot.flushed_feedback_count,
+                        },
+                        'items': all_items,
+                        'failures': all_failures,
+                    }
         except Exception as exc:  # noqa: BLE001
             raised_exception = exc
         finally:
@@ -4070,6 +4304,7 @@ class AgentFeedbackOrchestrator:
                 if (
                     final_snapshot is not None
                     and scoped_dispatch_symbols
+                    and not skip_terminal_reconciliation
                     and raised_exception is None
                     and finalization_error is None
                 ):

@@ -17,6 +17,8 @@ Validation and exec handoffs also preserve `market_regime_context` for buy-orien
 
 Before planning, local submit, or exec dispatch proceeds, Core checks source-market-date PyKRX enrichment coverage for `sector_classification`, `investor_flow_symbol`, and `short_selling`. If any required category is missing or effectively zero coverage, classic `signal-decider` immediate next-open buys are blocked with `reason="pykrx_enrichment_preflight_blocked"` and no local signal-decider order is submitted unless `force=true` is supplied. Actionable `short-term-decider` watch rows are still materialized when candidate-level trigger/chase fields exist; the preflight failure is attached as degraded warning metadata so operators can distinguish “watch candidates exist but are degraded” from “no candidates exist.”
 
+Plan refresh and list responses also expose `agent_context_completeness` so candidate sets based on incomplete OpenClaw feedback are not mistaken for ordinary weak/no-signal output. The summary includes `agent_context_completeness_status`, `agent_context_incomplete`, and `agent_context_failure_count`; each row carries the same payload in `agent_context_completeness`, `validation.agent_context_completeness`, and `traceability.agent_context_completeness`. Incomplete context adds a `agent_context_incomplete_candidate_set` warning.
+
 Requested `target_trade_date` values are normalized to the next KRX open date on or after the request date using the shared KIS `chk-holiday` calendar. Live local submission, intraday auto-sell submission, and exec dispatch fail closed when calendar truth is only available from fallback metadata; `force=true` is the operator override.
 
 In exec-dispatch mode, watcher candidates are not blocked solely because `data_quality_warnings` are present. Core carries those warnings into the validation and exec handoff so the exec-side account-aware agent can make the final sizing/risk decision. Short-term tactical rows are still blocked when required trigger/chase/target/stop levels are missing, when the latest available reference price is already above the chase limit, or when the decision-input quality envelope emits hard blocks.
@@ -61,6 +63,9 @@ Content-Type: application/json
     "enrichment_preflight_allowed": true,
     "enrichment_preflight_status": "ready",
     "enrichment_failed_categories": [],
+    "agent_context_completeness_status": "complete",
+    "agent_context_incomplete": false,
+    "agent_context_failure_count": 0,
     "decision_agent_counts": {
       "short-term-decider": 1,
       "signal-decider": 1
@@ -109,6 +114,11 @@ Content-Type: application/json
       "eligibility_status": "eligible",
       "execution_status": "planned",
       "client_order_id": "SDNO-20260430-005930",
+      "agent_context_completeness": {
+        "schema_version": "agent_context_completeness_v1",
+        "status": "complete",
+        "has_incomplete_agent_context": false
+      },
       "traceability": {
         "source_market_date": "2026-04-29",
         "target_trade_date": "2026-04-30",

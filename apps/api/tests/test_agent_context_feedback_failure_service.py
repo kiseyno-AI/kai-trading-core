@@ -1,6 +1,7 @@
 import unittest
 from contextlib import contextmanager
 from datetime import date, datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from sqlalchemy.orm.exc import DetachedInstanceError
@@ -36,6 +37,25 @@ class FakeSession:
 
     def execute(self, statement):
         return FakeMappingResult(self.row)
+
+
+class FakeScalarResult:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def scalars(self):
+        return self
+
+    def all(self):
+        return self.rows
+
+
+class FakeRowsSession:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def execute(self, statement):
+        return FakeScalarResult(self.rows)
 
 
 class AgentContextFeedbackFailureServiceTests(unittest.TestCase):
@@ -171,6 +191,61 @@ class AgentContextFeedbackFailureServiceTests(unittest.TestCase):
         self.assertEqual(result['failure_kind'], 'dependency_missing_upstream')
         self.assertEqual(result['summary']['raw_failure_kind'], 'missing_decider_upstream_summaries:fundamental-summarizer')
         self.assertEqual(result['summary']['failure_status'], 'dependency/missing-upstream')
+
+    def test_get_grouped_summary_groups_by_date_run_agent_and_failure_kind(self):
+        service = AgentContextFeedbackFailureService()
+        rows = [
+            SimpleNamespace(
+                market_date=date(2026, 4, 14),
+                run_id='run-1',
+                agent_name='signal-decider',
+                failure_kind='dependency_missing_upstream',
+                retryable=True,
+                symbol='005930',
+                received_at=datetime(2026, 4, 14, 1, 0, tzinfo=timezone.utc),
+                id=1,
+            ),
+            SimpleNamespace(
+                market_date=date(2026, 4, 14),
+                run_id='run-1',
+                agent_name='signal-decider',
+                failure_kind='dependency_missing_upstream',
+                retryable=True,
+                symbol='000660',
+                received_at=datetime(2026, 4, 14, 1, 2, tzinfo=timezone.utc),
+                id=2,
+            ),
+            SimpleNamespace(
+                market_date=date(2026, 4, 14),
+                run_id='run-2',
+                agent_name='openclaw-gateway',
+                failure_kind='openclaw_auth_rejected',
+                retryable=False,
+                symbol='__RUN__',
+                received_at=datetime(2026, 4, 14, 2, 0, tzinfo=timezone.utc),
+                id=3,
+            ),
+        ]
+        fake_session = FakeRowsSession(rows)
+
+        @contextmanager
+        def fake_session_scope():
+            yield fake_session
+
+        with patch('app.agent_context.feedback_failure_service.session_scope', fake_session_scope):
+            result = service.get_grouped_summary(market_date='2026-04-14', limit=10)
+
+        self.assertEqual(result['summary']['group_count'], 2)
+        self.assertEqual(result['summary']['failure_count'], 3)
+        self.assertEqual(result['summary']['retryable_count'], 2)
+        self.assertEqual(result['summary']['by_failure_kind']['dependency_missing_upstream'], 2)
+        self.assertEqual(result['summary']['by_failure_kind']['openclaw_auth_rejected'], 1)
+        groups_by_kind = {group['failure_kind']: group for group in result['groups']}
+        self.assertEqual(groups_by_kind['dependency_missing_upstream']['failure_count'], 2)
+        self.assertEqual(groups_by_kind['dependency_missing_upstream']['symbols_sample'], ['005930', '000660'])
+        self.assertEqual(groups_by_kind['dependency_missing_upstream']['failure_status'], 'dependency/missing-upstream')
+        self.assertEqual(groups_by_kind['openclaw_auth_rejected']['agent_name'], 'openclaw-gateway')
+        self.assertEqual(groups_by_kind['openclaw_auth_rejected']['failure_status'], 'auth/rejected')
 
 
 if __name__ == '__main__':

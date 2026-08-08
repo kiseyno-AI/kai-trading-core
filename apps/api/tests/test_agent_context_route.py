@@ -128,6 +128,35 @@ class FakeAgentContextMissingDataReportService:
         }
 
 
+class FakeAgentContextFeedbackFailureService:
+    def __init__(self):
+        self.last_args = None
+
+    def get_grouped_summary(self, **kwargs):
+        self.last_args = kwargs
+        return {
+            'request': {
+                'market_date': kwargs['market_date'].isoformat() if kwargs['market_date'] is not None else None,
+                'market_date_from': kwargs['market_date_from'].isoformat() if kwargs['market_date_from'] is not None else None,
+                'market_date_to': kwargs['market_date_to'].isoformat() if kwargs['market_date_to'] is not None else None,
+                'run_id': kwargs['run_id'],
+                'agent_name': kwargs['agent_name'],
+                'failure_kind': kwargs['failure_kind'],
+                'limit': kwargs['limit'],
+            },
+            'summary': {'group_count': 1, 'failure_count': 2},
+            'groups': [
+                {
+                    'market_date': '2026-05-05',
+                    'run_id': kwargs['run_id'],
+                    'agent_name': kwargs['agent_name'],
+                    'failure_kind': kwargs['failure_kind'],
+                    'failure_count': 2,
+                }
+            ],
+        }
+
+
 class FakeDeciderCoverageReportService:
     def __init__(self):
         self.last_args = None
@@ -1655,6 +1684,35 @@ class AgentContextRouteTests(unittest.TestCase):
         self.assertEqual(fake_service.last_args['agent_name'], 'technical-summarizer')
         self.assertEqual(fake_service.last_args['categories'], ['factor_score_coverage'])
         self.assertEqual(response.json()['summary']['feedback_rows_matched'], 2)
+
+    def test_agent_feedback_failure_summary_route_calls_service(self):
+        fake_service = FakeAgentContextFeedbackFailureService()
+        original_service = routes_agent_context.agent_context_feedback_failure_service
+        routes_agent_context.agent_context_feedback_failure_service = fake_service
+        try:
+            client = TestClient(self.app)
+            response = client.get(
+                '/agent-context/feedback/failure-summary',
+                params=[
+                    ('market_date_from', '2026-05-05'),
+                    ('market_date_to', '2026-05-06'),
+                    ('run_id', 'symbol-run-2026-05-05-auth'),
+                    ('agent_name', 'openclaw-gateway'),
+                    ('failure_kind', 'openclaw_auth_rejected'),
+                    ('limit', '25'),
+                ],
+            )
+        finally:
+            routes_agent_context.agent_context_feedback_failure_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(fake_service.last_args['market_date_from'], date.fromisoformat('2026-05-05'))
+        self.assertEqual(fake_service.last_args['market_date_to'], date.fromisoformat('2026-05-06'))
+        self.assertEqual(fake_service.last_args['run_id'], 'symbol-run-2026-05-05-auth')
+        self.assertEqual(fake_service.last_args['agent_name'], 'openclaw-gateway')
+        self.assertEqual(fake_service.last_args['failure_kind'], 'openclaw_auth_rejected')
+        self.assertEqual(fake_service.last_args['limit'], 25)
+        self.assertEqual(response.json()['summary']['group_count'], 1)
 
     def test_agent_feedback_decider_coverage_route_calls_service(self):
         fake_service = FakeDeciderCoverageReportService()

@@ -21,6 +21,7 @@ from app.agent_context.eligibility import (
     resolve_agent_feedback_scope,
 )
 from app.agent_context.feedback_service import agent_context_feedback_service
+from app.agent_context.feedback_failure_service import agent_context_feedback_failure_service
 from app.agent_context.prerequisite_service import agent_feedback_prerequisite_service
 from app.agent_context.missing_data_report_service import agent_context_missing_data_report_service
 from app.agent_context.orchestrator import agent_feedback_orchestrator
@@ -1166,6 +1167,32 @@ async def get_agent_feedback_data_gap_summary(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f'Agent feedback data-gap summary failed: {exc}') from exc
+
+
+@router.get('/feedback/failure-summary')
+async def get_agent_feedback_failure_summary(
+    market_date: date | None = Query(default=None),
+    market_date_from: date | None = Query(default=None),
+    market_date_to: date | None = Query(default=None),
+    run_id: str | None = Query(default=None),
+    agent_name: str | None = Query(default=None),
+    failure_kind: str | None = Query(default=None),
+    limit: int = Query(default=200, ge=1, le=500),
+) -> dict:
+    try:
+        return agent_context_feedback_failure_service.get_grouped_summary(
+            market_date=market_date,
+            market_date_from=market_date_from,
+            market_date_to=market_date_to,
+            run_id=run_id,
+            agent_name=agent_name,
+            failure_kind=failure_kind,
+            limit=limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'Agent feedback failure summary failed: {exc}') from exc
 
 
 @router.get('/feedback/decider-coverage')

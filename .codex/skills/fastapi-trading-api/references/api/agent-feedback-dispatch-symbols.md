@@ -8,6 +8,8 @@ Explicit requested-symbol dispatch bypasses the automatic broad and role caps us
 Each normal dispatch also creates a durable `agent_context_feedback_runs` row, checkpoints role progress as the run advances, and finalizes that run row even when the cycle exits partially. When `wait_for_completion=false`, Core now creates the durable queued run row before returning and reuses the same `request_run_id` when the background work starts.
 Normal dispatch now also gates on same-day feedback prerequisites: PyKRX enrichment coverage, DART fundamentals refresh, market-risk filter, Piotroski filter, and the factor/scoring stages must all be terminal and successful enough for agent context. The PyKRX gate includes decider-required category details with expected and present row counts. When prerequisites are still running or incomplete, the route returns `summary.status=waiting|blocked`, `summary.gated=true`, and a `prerequisites` block instead of starting dispatch. Operators can bypass that guard only with `force=true`.
 
+Before live OpenClaw dispatch starts, Core preflights gateway auth. Missing `OPENCLAW_GATEWAY_TOKEN` or HTTP 401/403 from the gateway persists one run-level failure in `agent_context_feedback_failures` with `agent_name="openclaw-gateway"` and `symbol="__RUN__"`, then returns `summary.status="failed"` without loading symbol context or queuing batches. Operators can inspect grouped auth failures with `GET /agent-context/feedback/failure-summary`.
+
 For `fundamental-summarizer`, `reuse_existing=true` reuses a prior trading date only when the stored fundamental input fingerprint matches the current DART/disclosure/valuation input fingerprint. `force_recompute=true` bypasses reuse explicitly without changing the prerequisite gate behavior.
 
 ## Example request
@@ -151,5 +153,28 @@ Completed synchronous responses include reuse accounting in `summary`:
       }
     ]
   }
+}
+```
+
+## Auth preflight failure
+```json
+{
+  "summary": {
+    "status": "failed",
+    "completed": 0,
+    "computed_count": 0,
+    "reused_count": 0,
+    "failed": 1,
+    "run_level_failure": true,
+    "failure_kind": "openclaw_auth_missing"
+  },
+  "failures": [
+    {
+      "agent_name": "openclaw-gateway",
+      "symbol": "__RUN__",
+      "failure_kind": "openclaw_auth_missing",
+      "retryable": false
+    }
+  ]
 }
 ```
