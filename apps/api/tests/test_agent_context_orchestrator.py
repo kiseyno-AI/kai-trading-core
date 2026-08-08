@@ -1489,7 +1489,10 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         service = AgentFeedbackOrchestrator()
         client = RecordingBatchClient()
         service.client = client
+        runtime_store = RuntimeFeedbackStateStore()
         feedback_service = FakeFeedbackService()
+        failure_service = RecordingFailureService()
+        run_state_service = RecordingRunStateService()
         cleanup_service = FakeSessionCleanupService()
         read_service = RecordingAgentContextReadService()
         reuse_service = SimpleNamespace(
@@ -1501,17 +1504,20 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         fake_settings = SimpleNamespace(openclaw_agent_symbol_chunk_size=1, openclaw_agent_parallel_subtasks=20)
 
         with patch.object(orchestrator_module, 'settings', fake_settings):
-            with patch.object(orchestrator_module, 'agent_context_read_service', read_service):
-                with patch.object(orchestrator_module, 'agent_context_reuse_service', reuse_service):
-                    with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
-                        with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
-                            with _patch_feedback_eligibility('005930', '000660'):
-                                result = service.dispatch_for_symbols(
-                                    market_date='2026-04-14',
-                                    symbols=['005930', '000660'],
-                                    roles=['eod-summarizer'],
-                                    reuse_existing=True,
-                                )
+            with patch.object(orchestrator_module, 'runtime_feedback_state_store', runtime_store):
+                with patch.object(orchestrator_module, 'agent_context_read_service', read_service):
+                    with patch.object(orchestrator_module, 'agent_context_reuse_service', reuse_service):
+                        with patch.object(orchestrator_module, 'agent_context_feedback_run_state_service', run_state_service):
+                            with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
+                                with patch.object(orchestrator_module, 'agent_context_feedback_failure_service', failure_service):
+                                    with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
+                                        with _patch_feedback_eligibility('005930', '000660'):
+                                            result = service.dispatch_for_symbols(
+                                                market_date='2026-04-14',
+                                                symbols=['005930', '000660'],
+                                                roles=['eod-summarizer'],
+                                                reuse_existing=True,
+                                            )
 
         dispatched_symbols = [
             item['symbol']
@@ -1521,7 +1527,129 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertEqual(read_service.calls[0]['symbols'], ['000660'])
         self.assertEqual(dispatched_symbols, ['000660'])
         self.assertEqual([item['symbol'] for item in feedback_service.bulk_items], ['000660'])
+        self.assertEqual(failure_service.recorded, [])
+        self.assertEqual(run_state_service.finished[0]['status'], 'completed')
         self.assertEqual([target.symbol for target in cleanup_service.targets], ['000660'])
+
+    def test_reuse_existing_cached_only_skips_openclaw_auth_preflight(self):
+        service = AgentFeedbackOrchestrator()
+        client = PreflightFailingClient()
+        service.client = client
+        runtime_store = RuntimeFeedbackStateStore()
+        feedback_service = FakeFeedbackService()
+        failure_service = RecordingFailureService()
+        run_state_service = RecordingRunStateService()
+        read_service = RecordingAgentContextReadService()
+        cleanup_service = FakeSessionCleanupService()
+        events = []
+
+        def build_latest_decisions(**kwargs):
+            events.append('reuse')
+            return {
+                '005930': {'eod-summarizer': _reuse_decision(False)},
+                '000660': {'eod-summarizer': _reuse_decision(False)},
+            }
+
+        reuse_service = SimpleNamespace(build_latest_decisions=build_latest_decisions)
+        fake_settings = SimpleNamespace(openclaw_agent_symbol_chunk_size=1, openclaw_agent_parallel_subtasks=1)
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            with patch.object(orchestrator_module, 'runtime_feedback_state_store', runtime_store):
+                with patch.object(orchestrator_module, 'agent_context_reuse_service', reuse_service):
+                    with patch.object(orchestrator_module, 'agent_context_feedback_run_state_service', run_state_service):
+                        with patch.object(orchestrator_module, 'agent_context_read_service', read_service):
+                            with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
+                                with patch.object(orchestrator_module, 'agent_context_feedback_failure_service', failure_service):
+                                    with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
+                                        with _patch_feedback_eligibility('005930', '000660'):
+                                            result = service.dispatch_for_symbols(
+                                                market_date='2026-04-14',
+                                                symbols=['005930', '000660'],
+                                                roles=['eod-summarizer'],
+                                                reuse_existing=True,
+                                                request_run_id='cached-only-reuse-test-run',
+                                            )
+
+        self.assertEqual(events, ['reuse'])
+        self.assertEqual(client.preflight_calls, 0)
+        self.assertEqual(client.calls, [])
+        self.assertEqual(read_service.calls, [])
+        self.assertEqual(feedback_service.bulk_calls, [])
+        self.assertEqual(failure_service.recorded, [])
+        self.assertEqual(result['summary']['status'], 'completed')
+        self.assertEqual(result['summary']['completed'], 2)
+        self.assertEqual(result['summary']['computed_count'], 0)
+        self.assertEqual(result['summary']['reused_count'], 2)
+        self.assertEqual(result['summary']['failed'], 0)
+        self.assertEqual(run_state_service.finished[0]['status'], 'completed')
+        self.assertEqual(run_state_service.finished[0]['completed_count'], 2)
+
+    def test_reuse_existing_live_symbol_runs_openclaw_auth_preflight_before_dispatch(self):
+        service = AgentFeedbackOrchestrator()
+        events = []
+
+        class EventPreflightFailingClient(PreflightFailingClient):
+            def preflight_dispatch_auth(self):
+                events.append('preflight')
+                return super().preflight_dispatch_auth()
+
+        client = EventPreflightFailingClient()
+        service.client = client
+        runtime_store = RuntimeFeedbackStateStore()
+        feedback_service = FakeFeedbackService()
+        failure_service = RecordingFailureService()
+        run_state_service = RecordingRunStateService()
+        read_service = RecordingAgentContextReadService()
+        cleanup_service = FakeSessionCleanupService()
+
+        def build_latest_decisions(**kwargs):
+            events.append('reuse')
+            return {
+                '005930': {'eod-summarizer': _reuse_decision(False)},
+                '000660': {'eod-summarizer': _reuse_decision(True)},
+            }
+
+        reuse_service = SimpleNamespace(build_latest_decisions=build_latest_decisions)
+        fake_settings = SimpleNamespace(openclaw_agent_symbol_chunk_size=1, openclaw_agent_parallel_subtasks=1)
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            with patch.object(orchestrator_module, 'runtime_feedback_state_store', runtime_store):
+                with patch.object(orchestrator_module, 'agent_context_reuse_service', reuse_service):
+                    with patch.object(orchestrator_module, 'agent_context_feedback_run_state_service', run_state_service):
+                        with patch.object(orchestrator_module, 'agent_context_read_service', read_service):
+                            with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
+                                with patch.object(orchestrator_module, 'agent_context_feedback_failure_service', failure_service):
+                                    with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
+                                        with _patch_feedback_eligibility('005930', '000660'):
+                                            result = service.dispatch_for_symbols(
+                                                market_date='2026-04-14',
+                                                symbols=['005930', '000660'],
+                                                roles=['eod-summarizer'],
+                                                reuse_existing=True,
+                                                request_run_id='mixed-reuse-auth-preflight-test-run',
+                                            )
+
+        self.assertEqual(events, ['reuse', 'preflight'])
+        self.assertEqual(client.preflight_calls, 1)
+        self.assertEqual(client.calls, [])
+        self.assertEqual(read_service.calls, [])
+        self.assertEqual(feedback_service.bulk_calls, [])
+        self.assertEqual(result['summary']['status'], 'failed')
+        self.assertEqual(result['summary']['completed'], 0)
+        self.assertEqual(result['summary']['computed_count'], 0)
+        self.assertEqual(result['summary']['reused_count'], 0)
+        self.assertEqual(result['summary']['failed'], 1)
+        self.assertTrue(result['summary']['run_level_failure'])
+        self.assertEqual(result['summary']['failure_kind'], 'openclaw_auth_missing')
+        self.assertEqual(len(failure_service.recorded), 1)
+        recorded = failure_service.recorded[0]
+        self.assertEqual(recorded['symbol'], orchestrator_module.RUN_LEVEL_FAILURE_SYMBOL)
+        self.assertEqual(recorded['agent_name'], orchestrator_module.OPENCLAW_GATEWAY_AGENT_NAME)
+        self.assertEqual(recorded['failure_kind'], 'openclaw_auth_missing')
+        self.assertEqual(recorded['context']['origin'], 'openclaw_dispatch_auth_preflight')
+        self.assertEqual(recorded['context']['affected_symbols'], ['000660'])
+        self.assertEqual(run_state_service.finished[0]['status'], 'failed')
+        self.assertEqual(run_state_service.finished[0]['completed_count'], 0)
 
     def test_dispatch_finalization_counts_reused_successes_with_missing_terminal_failures(self):
         service = AgentFeedbackOrchestrator()

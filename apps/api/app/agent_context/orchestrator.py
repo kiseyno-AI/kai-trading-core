@@ -3479,6 +3479,102 @@ class AgentFeedbackOrchestrator:
         final_status = 'failed'
         final_flush_result: dict[str, Any] | None = None
         skip_terminal_reconciliation = False
+        openclaw_dispatch_preflight_checked = False
+
+        def run_openclaw_dispatch_preflight(live_dispatch_symbols: Sequence[str]) -> bool:
+            nonlocal openclaw_dispatch_preflight_checked
+            nonlocal response_payload
+            nonlocal skip_terminal_reconciliation
+
+            preflight_symbols = _ordered_union([list(live_dispatch_symbols)])
+            if not preflight_symbols:
+                return True
+            if openclaw_dispatch_preflight_checked:
+                return True
+
+            openclaw_dispatch_preflight_checked = True
+            openclaw_dispatch_preflight = self._preflight_openclaw_dispatch_auth(
+                market_date=normalized_market_date,
+                request_run_id=request_run_id,
+                requested_roles=requested_role_names,
+                scoped_dispatch_symbols=preflight_symbols,
+            )
+            sanitized_openclaw_dispatch_preflight = {
+                key: value
+                for key, value in openclaw_dispatch_preflight.items()
+                if key not in {'response_text_excerpt'}
+            }
+            request_payload['openclaw_dispatch_preflight'] = sanitized_openclaw_dispatch_preflight
+            if openclaw_dispatch_preflight.get('ok') is not False:
+                return True
+
+            skip_terminal_reconciliation = True
+            failure_kind = str(
+                openclaw_dispatch_preflight.get('failure_kind')
+                or FeedbackFailureKind.DISPATCH_FAILED.value
+            )
+            failure_error = str(
+                openclaw_dispatch_preflight.get('error')
+                or openclaw_dispatch_preflight.get('reason')
+                or 'OpenClaw dispatch auth preflight failed'
+            )
+            failure_context = {
+                'origin': 'openclaw_dispatch_auth_preflight',
+                'request_run_id': request_run_id,
+                'affected_symbols': preflight_symbols,
+                'affected_roles': list(requested_role_names),
+                'preflight': sanitized_openclaw_dispatch_preflight,
+            }
+            failure = _build_failed_dispatch_item(
+                role=OPENCLAW_GATEWAY_AGENT_NAME,
+                agent_name=OPENCLAW_GATEWAY_AGENT_NAME,
+                symbol=RUN_LEVEL_FAILURE_SYMBOL,
+                error=failure_error,
+                retryable=bool(openclaw_dispatch_preflight.get('retryable', False)),
+                failure_kind=failure_kind,
+                context=failure_context,
+                batch_symbols=preflight_symbols,
+            )
+            all_failures.append(failure)
+            buffer_failure(
+                OPENCLAW_GATEWAY_AGENT_NAME,
+                RUN_LEVEL_FAILURE_SYMBOL,
+                failure_error,
+                bool(openclaw_dispatch_preflight.get('retryable', False)),
+                failure_kind=failure_kind,
+                context=failure_context,
+                agent_name=OPENCLAW_GATEWAY_AGENT_NAME,
+                batch_symbols=preflight_symbols,
+            )
+            preflight_flush_result = self._flush_and_checkpoint_pending_run_buffers(
+                market_date=normalized_market_date,
+                request_run_id=request_run_id,
+                request_payload=request_payload,
+                reason='openclaw_auth_preflight_failed',
+                lifecycle_stage='run_level_preflight_failed',
+                current_role=OPENCLAW_GATEWAY_AGENT_NAME,
+                status='failed',
+            )
+            response_payload = {
+                'request': request_payload,
+                'summary': {
+                    'status': 'failed',
+                    'completed': 0,
+                    'computed_count': 0,
+                    'reused_count': 0,
+                    'stale_count': 0,
+                    'failed': 1,
+                    'skipped': len(skipped_symbols),
+                    'flushed_to_db': 0,
+                    'run_level_failure': True,
+                    'failure_kind': failure_kind,
+                    'openclaw_dispatch_preflight': request_payload['openclaw_dispatch_preflight'],
+                    'failure_rows_persisted': preflight_flush_result.get('failure_rows_persisted'),
+                },
+                'items': [],
+                'failures': all_failures,
+            }
+            return False
 
         try:
             if not scoped_dispatch_symbols:
@@ -3496,85 +3592,6 @@ class AgentFeedbackOrchestrator:
                     'failures': [],
                 }
             else:
-                openclaw_dispatch_preflight = self._preflight_openclaw_dispatch_auth(
-                    market_date=normalized_market_date,
-                    request_run_id=request_run_id,
-                    requested_roles=requested_role_names,
-                    scoped_dispatch_symbols=scoped_dispatch_symbols,
-                )
-                sanitized_openclaw_dispatch_preflight = {
-                    key: value
-                    for key, value in openclaw_dispatch_preflight.items()
-                    if key not in {'response_text_excerpt'}
-                }
-                request_payload['openclaw_dispatch_preflight'] = sanitized_openclaw_dispatch_preflight
-                if openclaw_dispatch_preflight.get('ok') is False:
-                    skip_terminal_reconciliation = True
-                    failure_kind = str(
-                        openclaw_dispatch_preflight.get('failure_kind')
-                        or FeedbackFailureKind.DISPATCH_FAILED.value
-                    )
-                    failure_error = str(
-                        openclaw_dispatch_preflight.get('error')
-                        or openclaw_dispatch_preflight.get('reason')
-                        or 'OpenClaw dispatch auth preflight failed'
-                    )
-                    failure_context = {
-                        'origin': 'openclaw_dispatch_auth_preflight',
-                        'request_run_id': request_run_id,
-                        'affected_symbols': list(scoped_dispatch_symbols),
-                        'affected_roles': list(requested_role_names),
-                        'preflight': sanitized_openclaw_dispatch_preflight,
-                    }
-                    failure = _build_failed_dispatch_item(
-                        role=OPENCLAW_GATEWAY_AGENT_NAME,
-                        agent_name=OPENCLAW_GATEWAY_AGENT_NAME,
-                        symbol=RUN_LEVEL_FAILURE_SYMBOL,
-                        error=failure_error,
-                        retryable=bool(openclaw_dispatch_preflight.get('retryable', False)),
-                        failure_kind=failure_kind,
-                        context=failure_context,
-                        batch_symbols=scoped_dispatch_symbols,
-                    )
-                    all_failures.append(failure)
-                    buffer_failure(
-                        OPENCLAW_GATEWAY_AGENT_NAME,
-                        RUN_LEVEL_FAILURE_SYMBOL,
-                        failure_error,
-                        bool(openclaw_dispatch_preflight.get('retryable', False)),
-                        failure_kind=failure_kind,
-                        context=failure_context,
-                        agent_name=OPENCLAW_GATEWAY_AGENT_NAME,
-                        batch_symbols=scoped_dispatch_symbols,
-                    )
-                    preflight_flush_result = self._flush_and_checkpoint_pending_run_buffers(
-                        market_date=normalized_market_date,
-                        request_run_id=request_run_id,
-                        request_payload=request_payload,
-                        reason='openclaw_auth_preflight_failed',
-                        lifecycle_stage='run_level_preflight_failed',
-                        current_role=OPENCLAW_GATEWAY_AGENT_NAME,
-                        status='failed',
-                    )
-                    response_payload = {
-                        'request': request_payload,
-                        'summary': {
-                            'status': 'failed',
-                            'completed': 0,
-                            'computed_count': 0,
-                            'reused_count': 0,
-                            'stale_count': 0,
-                            'failed': 1,
-                            'skipped': len(skipped_symbols),
-                            'flushed_to_db': 0,
-                            'run_level_failure': True,
-                            'failure_kind': failure_kind,
-                            'openclaw_dispatch_preflight': request_payload['openclaw_dispatch_preflight'],
-                            'failure_rows_persisted': preflight_flush_result.get('failure_rows_persisted'),
-                        },
-                        'items': [],
-                        'failures': all_failures,
-                    }
                 reuse_decisions = {}
                 if not skip_terminal_reconciliation and reuse_existing:
                     reuse_decisions = agent_context_reuse_service.build_latest_decisions(
@@ -3608,6 +3625,8 @@ class AgentFeedbackOrchestrator:
                             )
                         )
                     ]
+                if symbols_requiring_context and not run_openclaw_dispatch_preflight(symbols_requiring_context):
+                    symbols_requiring_context = []
                 if symbols_requiring_context:
                     symbol_context = agent_context_read_service.get_symbol_day_context(
                         market_date=normalized_market_date,
