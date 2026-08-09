@@ -1842,57 +1842,55 @@ def replace_daily_trending_ranks(
             .where(DailyTrendingRank.period == normalized_period)
         )
 
-    if not ranked_items:
-        return 0
+        if not ranked_items:
+            return 0
 
-    with session_scope() as session:
         symbol_rows = session.execute(select(Symbol.symbol, Symbol.id).where(Symbol.symbol.in_(symbols))).all()
 
-    symbol_ids = {symbol: symbol_id for symbol, symbol_id in symbol_rows}
-    values = []
-    for item in ranked_items:
-        symbol_id = symbol_ids.get(item['symbol'])
-        if symbol_id is None:
-            continue
-        metric = item['metric']
-        stored_ranks = item['stored_ranks']
-        should_persist_rank = any(
-            rank is not None and rank <= TRENDING_RANK_PERSIST_LIMIT
-            for rank in (
-                stored_ranks['absolute_rank'],
-                stored_ranks['up_rank'],
-                stored_ranks['down_rank'],
+        symbol_ids = {symbol: symbol_id for symbol, symbol_id in symbol_rows}
+        values = []
+        for item in ranked_items:
+            symbol_id = symbol_ids.get(item['symbol'])
+            if symbol_id is None:
+                continue
+            metric = item['metric']
+            stored_ranks = item['stored_ranks']
+            should_persist_rank = any(
+                rank is not None and rank <= TRENDING_RANK_PERSIST_LIMIT
+                for rank in (
+                    stored_ranks['absolute_rank'],
+                    stored_ranks['up_rank'],
+                    stored_ranks['down_rank'],
+                )
             )
-        )
-        if not should_persist_rank:
-            continue
-        values.append(
-            {
-                'symbol_id': symbol_id,
-                'eod_run_id': run_id,
-                'market_date': normalized_market_date,
-                'period': normalized_period,
-                'source': source,
-                'metric_name': metric['name'],
-                'metric_value': metric['value'],
-                'trend_direction': item['trend_direction'],
-                'absolute_rank': stored_ranks['absolute_rank'],
-                'up_rank': stored_ranks['up_rank'],
-                'down_rank': stored_ranks['down_rank'],
-                'price_payload': item.get('price'),
-                'technical_payload': item.get('technical'),
-                'action_summary_payload': item.get('action_summary'),
-                'captured_at': refreshed_at,
-                'created_at': refreshed_at,
-                'updated_at': refreshed_at,
-            }
-        )
+            if not should_persist_rank:
+                continue
+            values.append(
+                {
+                    'symbol_id': symbol_id,
+                    'eod_run_id': run_id,
+                    'market_date': normalized_market_date,
+                    'period': normalized_period,
+                    'source': source,
+                    'metric_name': metric['name'],
+                    'metric_value': metric['value'],
+                    'trend_direction': item['trend_direction'],
+                    'absolute_rank': stored_ranks['absolute_rank'],
+                    'up_rank': stored_ranks['up_rank'],
+                    'down_rank': stored_ranks['down_rank'],
+                    'price_payload': item.get('price'),
+                    'technical_payload': item.get('technical'),
+                    'action_summary_payload': item.get('action_summary'),
+                    'captured_at': refreshed_at,
+                    'created_at': refreshed_at,
+                    'updated_at': refreshed_at,
+                }
+            )
 
-    if not values:
-        return 0
+        if not values:
+            return 0
 
-    for start in range(0, len(values), TRENDING_RANK_INSERT_CHUNK_SIZE):
-        with session_scope() as session:
+        for start in range(0, len(values), TRENDING_RANK_INSERT_CHUNK_SIZE):
             session.execute(pg_insert(DailyTrendingRank).values(values[start:start + TRENDING_RANK_INSERT_CHUNK_SIZE]))
     return len(values)
 
