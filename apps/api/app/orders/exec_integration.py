@@ -1509,7 +1509,7 @@ class SignalDeciderExecIntegrationService:
             market_date=resolved_market_date,
             symbol=None,
             refresh_state=refresh_state,
-            allow_stale=False,
+            allow_stale=True,
         )
         if cached is not None:
             return cached
@@ -1547,7 +1547,7 @@ class SignalDeciderExecIntegrationService:
             market_date=resolved_market_date,
             symbol=None,
             refresh_state=refresh_state,
-            allow_stale=False,
+            allow_stale=True,
         )
         if cached is not None:
             self._observe_runtime_symbols_for_realtime_prices(
@@ -1830,7 +1830,7 @@ class SignalDeciderExecIntegrationService:
             market_date=resolved_market_date,
             symbol=resolved_symbol,
             refresh_state=refresh_state,
-            allow_stale=False,
+            allow_stale=True,
         )
         if cached is not None:
             return cached

@@ -186,6 +186,10 @@ def _noop_stage_history_loader(*, market_date: str) -> dict[str, dict[str, Any]]
     return {}
 
 
+def _noop_pykrx_enrichment_loader(*, market_date: str) -> dict[str, Any]:
+    return {}
+
+
 def _noop_persisted_output_counts_loader(*, market_date: str) -> dict[str, Any]:
     return {}
 
@@ -374,7 +378,11 @@ def _load_signal_decider_output_counts(*, market_date: str) -> dict[str, Any]:
     }
 
 
-def _load_row_count_stage_counts(*, market_date: str) -> dict[str, dict[str, Any]]:
+def _load_row_count_stage_counts(
+    *,
+    market_date: str,
+    include_missing_diagnostics: bool = True,
+) -> dict[str, dict[str, Any]]:
     normalized_market_date = date.fromisoformat(market_date)
     counts: dict[str, dict[str, Any]] = {}
     with session_scope() as session:
@@ -396,7 +404,15 @@ def _load_row_count_stage_counts(*, market_date: str) -> dict[str, dict[str, Any
                 .where(model.market_date == normalized_market_date)
             ).one()
             persisted_count = int(persisted or 0)
-            if price_symbol_count > 0 and persisted_count >= price_symbol_count:
+            if not include_missing_diagnostics:
+                missing_diagnostics = {
+                    'missing_count': None,
+                    'missing_symbols_sample': [],
+                    'missing_symbol_details_sample': [],
+                    'missing_sample_limit': ROW_COUNT_STAGE_MISSING_SAMPLE_LIMIT,
+                    'missing_diagnostics_omitted': True,
+                }
+            elif price_symbol_count > 0 and persisted_count >= price_symbol_count:
                 missing_diagnostics = {
                     'missing_count': 0,
                     'missing_symbols_sample': [],
@@ -666,7 +682,7 @@ class EODPipelineStatusService:
     price_bar_count_loader: Callable = _noop_price_bar_count_loader
     technical_snapshot_count_loader: Callable = _noop_price_bar_count_loader
     action_summary_count_loader: Callable = _noop_price_bar_count_loader
-    pykrx_enrichment_loader: Callable = _load_pykrx_enrichment_coverage
+    pykrx_enrichment_loader: Callable = _noop_pykrx_enrichment_loader
     official_run_loader: Callable = _load_latest_daily_pipeline_run
     official_stage_history_loader: Callable = _noop_stage_history_loader
     feedback_run_loader: Callable = _noop_feedback_run_loader
@@ -684,6 +700,8 @@ class EODPipelineStatusService:
         include_feedback_context: bool = True,
         feedback_run_context: dict[str, Any] | None = None,
         include_feedback_stage: bool = True,
+        include_row_count_diagnostics: bool = True,
+        include_pykrx_enrichment_coverage: bool = True,
     ) -> dict[str, Any]:
         market_state = self.market_state_loader()
         # The default operator view stays on the current Seoul calendar date.
@@ -710,18 +728,32 @@ class EODPipelineStatusService:
             stage_counts=pykrx_stage_counts,
             live_symbols_total=live_symbols_total,
         )
+        pykrx_enrichment_coverage = (
+            dict(self.pykrx_enrichment_loader(market_date=resolved_market_date) or {})
+            if include_pykrx_enrichment_coverage
+            else {}
+        )
         pykrx_enrichment_stage = self._build_pykrx_enrichment_stage(
             market_date=resolved_market_date,
-            coverage=dict(self.pykrx_enrichment_loader(market_date=resolved_market_date) or {}),
+            coverage=pykrx_enrichment_coverage,
             run=pykrx_run,
         )
         fundamentals_stage = self._build_fundamentals_stage(
             market_date=resolved_market_date,
             fs_div=resolved_fs_div,
         )
-        row_count_stage_counts = dict(
-            self.row_count_stage_counts_loader(market_date=resolved_market_date) or {}
-        )
+        try:
+            row_count_stage_counts = dict(
+                self.row_count_stage_counts_loader(
+                    market_date=resolved_market_date,
+                    include_missing_diagnostics=include_row_count_diagnostics,
+                )
+                or {}
+            )
+        except TypeError:
+            row_count_stage_counts = dict(
+                self.row_count_stage_counts_loader(market_date=resolved_market_date) or {}
+            )
         if any(stage_id not in row_count_stage_counts for stage_id in FACTOR_STAGE_MODELS):
             legacy_factor_stage_counts = dict(
                 self.factor_stage_counts_loader(market_date=resolved_market_date) or {}
@@ -2768,6 +2800,7 @@ class EODPipelineStatusService:
 eod_pipeline_status_service = EODPipelineStatusService(
     factor_stage_counts_loader=_load_factor_stage_counts,
     row_count_stage_counts_loader=_load_row_count_stage_counts,
+    pykrx_enrichment_loader=_load_pykrx_enrichment_coverage,
     official_stage_history_loader=_load_daily_pipeline_stage_history,
     signal_feature_counts_loader=_load_signal_feature_counts,
     external_news_counts_loader=_load_external_news_counts,

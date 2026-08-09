@@ -70,7 +70,7 @@
 - `GET /trading/orders/realtime-health`
 - `GET /trading/orders/exec/runtime?refresh=true`
 - `GET /trading/orders/exec/signal-decider?target_trade_date=YYYY-MM-DD&account_reference=KIS:12345678-01&symbol=005930&refresh=false`
-- `GET /execution/runtime/status?refresh=true`
+- `GET /execution/runtime/status?refresh=false`
 - `GET /execution/runtime/monitored-symbols?market_date=YYYY-MM-DD&refresh=true`
 - `GET /execution/runtime/daily-board?market_date=YYYY-MM-DD&refresh=true`
 - `GET /execution/runtime/symbols/005930?market_date=YYYY-MM-DD&refresh=true`
@@ -120,7 +120,7 @@
 - `GET /disclosures/dart/filings/xbrl?rcept_no=20250312000123&report_code=11011`
 - `GET /eod/status`
 - `GET /eod/freshness`
-- `GET /eod/pipeline/status?market_date=YYYY-MM-DD&fs_div=CFS`
+- `GET /eod/pipeline/status?market_date=YYYY-MM-DD&fs_div=CFS&include_diagnostics=false&include_feedback_context=false`
 - `GET /eod/pipeline/stages`
 - `POST /eod/pipeline/run`
 - `POST /eod/master/refresh-if-due?force=false`
@@ -361,7 +361,7 @@
 
 ## EOD pipeline status notes
 - Canonical semantics live in `docs/EOD_STATUS_SEMANTICS_CONTRACT.md`.
-- `GET /eod/pipeline/status` is the operator-facing live status API for the post-close EOD pipeline.
+- `GET /eod/pipeline/status` is the operator-facing live status API for the post-close EOD pipeline. Its default read is polling-safe: expensive row-count missing diagnostics, PyKRX enrichment coverage scans, and feedback-run context are omitted unless `include_diagnostics=true` and/or `include_feedback_context=true` is passed.
 - It stays separate from `GET /eod/freshness`: freshness answers whether the stored data is available, while pipeline status answers which stage is running now and what work is currently in progress.
 - The payload now also includes both `market` and `market_session` blocks. `market` reflects the current exchange clock state, while `market_session` reflects the semantics of the requested `market_date`, including the latest valid trading date and whether quote or intraday data should be expected for that date.
 - Its default `market_date` is also the current Seoul calendar date from `server_time[:10]`; weekends, holidays, and other break-days do not auto-resolve to the previous trading date unless the caller passes `market_date` explicitly.
@@ -372,8 +372,8 @@
 - Direct `market_risk_filter` API and CLI runs create official run state and checkpoint KIS fetch progress before result rows are persisted. Stage-orchestrated DART fundamentals and agent-feedback retry stages also publish their native progress checkpoints into the official daily stage rows.
 - `signal_features`, `external_news_collect`, `external_news_enrich`, `macro_context_refresh`, and `signal_decider` infer availability from persisted `daily_signal_features`, `external_news_items` classification state, `macro_context_observations`, `agent_context_feedback`, and `signal_decider_decision_snapshots` rows. External-news enrich completion is based on the current material/noise/source-status contract (`materiality`, `materiality_reason`, `event_type`, `access_status`, and `source_evidence`), with legacy classifier rows reported separately. A resumed run that only contains `signal_decider_evaluations` must not make those same-day persisted outputs look pending.
 - `master_refresh` and `pykrx_universe_refresh` are pre-open/global stages. When same-date downstream output exists but those global stages have no stage row, they are reported as `skipped` with a reason instead of becoming the misleading current actionable stage.
-- `pykrx_enrichment` reads persisted `daily_pykrx_enrichment_rows` coverage for the requested date and overlays live PyKRX run metadata when the scheduled stage is running, partial, or failed before rows are fully visible. It reports per-category completion across sector classification, breadth, investor flow, short-selling, valuation snapshot, and foreign ownership slices, plus progress extras such as downstream preflight status and failed categories when present. Its execution/storage status stays separate from decider gate readiness through stage-level `gate_status` fields and top-level `gate_summary`.
-- Row-count-derived stages such as `market_risk_filter` expose `missing_count`, `missing_symbols_sample`, `coverage_ratio`, `gate_status`, `severity`, and `blocking_status` diagnostics when stored rows do not cover the same-date price-bar universe. If active feedback is running with zero failures and the missing `market_risk_filter` rows are outside that run's requested symbol scope, Core reports the row gap as `severity=degraded`, `blocking_status=non_blocking`, and `gate_status=ready` while keeping the missing symbols visible.
+- When diagnostics are requested, `pykrx_enrichment` reads persisted `daily_pykrx_enrichment_rows` coverage for the requested date and overlays live PyKRX run metadata when the scheduled stage is running, partial, or failed before rows are fully visible. It reports per-category completion across sector classification, breadth, investor flow, short-selling, valuation snapshot, and foreign ownership slices, plus progress extras such as downstream preflight status and failed categories when present. Its execution/storage status stays separate from decider gate readiness through stage-level `gate_status` fields and top-level `gate_summary`.
+- With diagnostics enabled, row-count-derived stages such as `market_risk_filter` expose `missing_count`, `missing_symbols_sample`, `coverage_ratio`, `gate_status`, `severity`, and `blocking_status` diagnostics when stored rows do not cover the same-date price-bar universe. If active feedback is running with zero failures and the missing `market_risk_filter` rows are outside that run's requested symbol scope, Core reports the row gap as `severity=degraded`, `blocking_status=non_blocking`, and `gate_status=ready` while keeping the missing symbols visible.
 - When a same-day agent feedback run is active, `GET /eod/pipeline/status` reflects it under `agent_feedback_summaries` from `agent_context_feedback_runs` or runtime feedback state even when no official daily pipeline stage row exists. This lets dashboards distinguish active feedback progress from non-blocking upstream coverage gaps and from feedback failures or stalls.
 - `agent_feedback_summaries` reconciles stale durable run snapshots against persisted child feedback/failure rows before rendering status. Its `updated_at` follows the latest successful or failed child activity, and `details` includes active roles, target/completed/failed symbol counts, role-level progress, latest successful feedback timestamp, and latest failed feedback timestamp when present.
 - Those same PyKRX enrichment slices are joined into `GET /agent-context/symbol-day` under `pre_decider_enrichment_context.flow_short_sector_context`, and `valuation_snapshot.trading_value` is the preferred raw trading-value source for decider handoff.

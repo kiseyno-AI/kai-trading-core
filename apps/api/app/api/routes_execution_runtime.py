@@ -12,7 +12,7 @@ router = APIRouter(prefix='/execution/runtime', tags=['execution:runtime'])
 
 @router.get('/status')
 async def get_execution_runtime_status(
-    refresh: bool = Query(default=True),
+    refresh: bool = Query(default=False),
 ) -> dict[str, Any]:
     try:
         return await signal_decider_exec_integration_service.dashboard_runtime_status(refresh=refresh)
