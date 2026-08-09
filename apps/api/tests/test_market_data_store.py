@@ -462,6 +462,82 @@ class PykrxEnrichmentStoreIntegrationTests(unittest.TestCase):
         self.assertEqual(pbr, 1.1)
         self.assertEqual(dividend_yield, 2.5)
 
+    def test_sparse_valuation_snapshot_preserves_existing_daily_price_bar_fundamentals(self) -> None:
+        persist_daily_price_bar(
+            {
+                'symbol': '661501',
+                'market': 'KOSPI',
+                'business_date': '2026-04-23',
+                'open_price': 1000,
+                'high_price': 1100,
+                'low_price': 900,
+                'close_price': 1050,
+                'volume': 10000,
+                'turnover': 10500000,
+                'per': 9.9,
+                'pbr': 1.4,
+                'bps': 750.0,
+                'eps': 106.0,
+                'dividend_yield': 2.8,
+                'dps': 31.0,
+                'source': 'pykrx',
+            }
+        )
+
+        inserted = upsert_daily_pykrx_enrichment_rows(
+            rows=[
+                {
+                    'market_date': '2026-04-23',
+                    'market': 'KOSPI',
+                    'category': 'valuation_snapshot',
+                    'scope_type': 'symbol',
+                    'scope_key': '661501',
+                    'source': 'daily_price_bars_carry_forward',
+                    'symbol': '661501',
+                    'name_ko': 'Value Alpha',
+                    'standard_code': 'KR7661501001',
+                    'payload': {
+                        'per': 10.8,
+                        'pbr': None,
+                    },
+                }
+            ]
+        )
+
+        self.assertEqual(inserted, 1)
+        with session_scope() as session:
+            price_row = (
+                session.execute(
+                    select(DailyPriceBar)
+                    .join(Symbol, Symbol.id == DailyPriceBar.symbol_id)
+                    .where(Symbol.symbol == '661501', DailyPriceBar.trade_date == date(2026, 4, 23))
+                )
+                .scalars()
+                .one()
+            )
+            values = {
+                'per': float(price_row.per),
+                'pbr': float(price_row.pbr),
+                'bps': float(price_row.bps),
+                'eps': float(price_row.eps),
+                'dividend_yield': float(price_row.dividend_yield),
+                'dps': float(price_row.dps),
+            }
+            source = price_row.source
+
+        self.assertEqual(
+            values,
+            {
+                'per': 10.8,
+                'pbr': 1.4,
+                'bps': 750.0,
+                'eps': 106.0,
+                'dividend_yield': 2.8,
+                'dps': 31.0,
+            },
+        )
+        self.assertEqual(source, 'daily_price_bars_carry_forward')
+
 
 class KISIntradaySnapshotStoreIntegrationTests(unittest.TestCase):
     @classmethod

@@ -71,7 +71,7 @@ CATEGORY_SUPPORTED_MARKETS = {
     'sector_classification': SECTOR_SUPPORTED_MARKETS,
 }
 SYMBOL_INVESTOR_GROUPS: tuple[str, ...] = ('개인', '외국인', '기관합계')
-VALUATION_SNAPSHOT_REQUIRED_PAYLOAD_KEYS = ('per', 'pbr', 'market_cap', 'dividend_yield')
+VALUATION_SNAPSHOT_REQUIRED_METRIC_KEYS = ('per', 'pbr', 'dividend_yield')
 
 
 def _log_pykrx_enrichment_fetch(operation: str, status: str, **fields: Any) -> None:
@@ -191,7 +191,7 @@ def _row_market(row: dict[str, Any]) -> str:
 def _has_valuation_snapshot_payload(rows: Sequence[dict[str, Any]]) -> bool:
     for row in rows:
         payload = dict(row.get('payload') or {})
-        if any(payload.get(key) is not None for key in VALUATION_SNAPSHOT_REQUIRED_PAYLOAD_KEYS):
+        if any(payload.get(key) is not None for key in VALUATION_SNAPSHOT_REQUIRED_METRIC_KEYS):
             return True
     return False
 

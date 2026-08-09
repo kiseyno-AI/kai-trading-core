@@ -292,6 +292,125 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
         self.assertIsNone(rows[0]['payload']['per'])
 
     @patch('app.eod.pykrx_enrichment.load_symbols')
+    def test_collect_for_market_date_falls_back_for_market_cap_only_valuation_rows(self, load_symbols_mock):
+        load_symbols_mock.return_value = [
+            {
+                'symbol': '005930',
+                'name_ko': '삼성전자',
+                'market': 'KOSPI',
+                'standard_code': 'KR7005930003',
+                'instrument_type': 'equity',
+            }
+        ]
+        market_cap_only_rows = [
+            {
+                'market_date': '2026-06-09',
+                'market': 'KOSPI',
+                'category': 'valuation_snapshot',
+                'scope_type': 'symbol',
+                'scope_key': '005930',
+                'source': 'pykrx',
+                'symbol': '005930',
+                'name_ko': '삼성전자',
+                'standard_code': 'KR7005930003',
+                'payload': {
+                    'market_cap': 420000000000,
+                    'per': None,
+                    'pbr': None,
+                    'bps': None,
+                    'eps': None,
+                    'dividend_yield': None,
+                    'dps': None,
+                },
+            }
+        ]
+        fallback_rows = [
+            {
+                'market_date': '2026-06-09',
+                'market': 'KOSPI',
+                'category': 'valuation_snapshot',
+                'scope_type': 'symbol',
+                'scope_key': '005930',
+                'source': 'daily_price_bars_carry_forward',
+                'symbol': '005930',
+                'skip_symbol_upsert': True,
+                'name_ko': '삼성전자',
+                'standard_code': 'KR7005930003',
+                'payload': {
+                    'market_cap': None,
+                    'per': 11.4,
+                    'pbr': 1.2,
+                    'dividend_yield': 2.1,
+                    'carried_forward_from_market_date': '2026-06-08',
+                },
+            }
+        ]
+        upsert_calls: list[list[dict]] = []
+
+        def upsert_side_effect(*, rows):
+            upsert_calls.append([deepcopy(row) for row in rows])
+            return len(rows)
+
+        with (
+            patch.object(
+                PykrxEnrichmentService,
+                '_collect_valuation_snapshot_rows',
+                return_value=(
+                    market_cap_only_rows,
+                    {
+                        'category': 'valuation_snapshot',
+                        'scope_type': 'symbol',
+                        'rows_prepared': 1,
+                        'errors': [{'market': 'KOSPI', 'operation': 'valuation_fundamentals', 'error': 'missing'}],
+                    },
+                ),
+            ),
+            patch.object(
+                PykrxEnrichmentService,
+                '_collect_fallback_rows',
+                return_value=(
+                    fallback_rows,
+                    {
+                        'category': 'valuation_snapshot',
+                        'scope_type': 'symbol',
+                        'fallback_source': 'daily_price_bars',
+                        'source_market_date': '2026-06-08',
+                        'rows_prepared': 1,
+                    },
+                ),
+            ) as fallback_mock,
+            patch.object(
+                PykrxEnrichmentService,
+                '_build_coverage_summary',
+                return_value={
+                    'requested_symbol_count': 1,
+                    'requested_market_count': 1,
+                    'categories': {
+                        'valuation_snapshot': {
+                            'coverage_status': 'complete',
+                            'present_rows': 1,
+                            'expected_rows': 1,
+                        }
+                    },
+                },
+            ),
+            patch('app.eod.pykrx_enrichment.upsert_daily_pykrx_enrichment_rows', side_effect=upsert_side_effect),
+        ):
+            result = PykrxEnrichmentService().collect_for_market_date(
+                market_date='2026-06-09',
+                markets=['KOSPI'],
+                symbols=['005930'],
+                categories=['valuation_snapshot'],
+            )
+
+        fallback_mock.assert_called_once()
+        self.assertEqual(len(upsert_calls), 2)
+        self.assertEqual(upsert_calls[0][0]['payload']['market_cap'], 420000000000)
+        self.assertEqual(upsert_calls[1][0]['payload']['per'], 11.4)
+        self.assertEqual(result['status'], 'recovered')
+        self.assertEqual(result['categories']['valuation_snapshot']['fallback']['rows_persisted'], 1)
+
+    @patch('app.eod.pykrx_enrichment.load_symbols')
     def test_inspect_reports_partial_coverage_for_missing_categories(self, load_symbols_mock):
         load_symbols_mock.return_value = [
             {

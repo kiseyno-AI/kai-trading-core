@@ -4240,28 +4240,29 @@ def upsert_daily_pykrx_enrichment_rows(
                 for key in ('per', 'pbr', 'bps', 'eps', 'dividend_yield', 'dps')
             )
         ]
+        valuation_metric_fields = ('per', 'pbr', 'bps', 'eps', 'dividend_yield', 'dps')
         for value in valuation_updates:
             payload = dict(value.get('payload') or {})
+            update_values = {
+                field: _as_decimal(payload[field])
+                for field in valuation_metric_fields
+                if payload.get(field) is not None
+            }
+            if not update_values:
+                continue
+            update_values.update(
+                {
+                    'source': value['source'],
+                    'captured_at': value['captured_at'],
+                }
+            )
             session.execute(
                 update(DailyPriceBar)
                 .where(
                     DailyPriceBar.symbol_id == value['symbol_id'],
                     DailyPriceBar.trade_date == value['market_date'],
                 )
-                .values(
-                    per=_as_decimal(payload['per']) if payload.get('per') is not None else None,
-                    pbr=_as_decimal(payload['pbr']) if payload.get('pbr') is not None else None,
-                    bps=_as_decimal(payload['bps']) if payload.get('bps') is not None else None,
-                    eps=_as_decimal(payload['eps']) if payload.get('eps') is not None else None,
-                    dividend_yield=(
-                        _as_decimal(payload['dividend_yield'])
-                        if payload.get('dividend_yield') is not None
-                        else None
-                    ),
-                    dps=_as_decimal(payload['dps']) if payload.get('dps') is not None else None,
-                    source=value['source'],
-                    captured_at=value['captured_at'],
-                )
+                .values(**update_values)
             )
     return len(values)
 
