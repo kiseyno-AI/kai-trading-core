@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 import logging
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.db import session_scope
@@ -185,7 +185,22 @@ def load_symbols(
     symbols: list[str] | None = None,
     limit: int | None = None,
 ) -> list[dict]:
+    if symbols and len(symbols) > 500 and limit is None:
+        items: list[dict] = []
+        for start in range(0, len(symbols), 500):
+            items.extend(
+                load_symbols(
+                    is_active=is_active,
+                    source=source,
+                    markets=markets,
+                    symbols=symbols[start:start + 500],
+                    limit=None,
+                )
+            )
+        return sorted(items, key=lambda item: (item.get('market') or '', item.get('symbol') or ''))
+
     with session_scope() as session:
+        session.execute(text("SET LOCAL statement_timeout = '60s'"))
         stmt = select(
             Symbol.id,
             Symbol.symbol,

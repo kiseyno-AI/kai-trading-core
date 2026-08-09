@@ -18,6 +18,7 @@ from app.market_data_store import (
     load_daily_market_relative_contexts,
     load_daily_pykrx_enrichment_rows,
     load_current_kis_intraday_snapshot,
+    persist_daily_price_bar,
     upsert_daily_pykrx_enrichment_rows,
     persist_kis_intraday_snapshot,
 )
@@ -305,6 +306,7 @@ class PykrxEnrichmentStoreIntegrationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         Symbol.__table__.create(bind=engine, checkfirst=True)
+        DailyPriceBar.__table__.create(bind=engine, checkfirst=True)
         DailyPykrxEnrichmentRow.__table__.create(bind=engine, checkfirst=True)
 
     def setUp(self) -> None:
@@ -316,9 +318,9 @@ class PykrxEnrichmentStoreIntegrationTests(unittest.TestCase):
                 session.execute(select(Symbol.id).where(Symbol.symbol.in_(self.symbols))).scalars().all()
             )
             if symbol_ids:
+                session.execute(delete(DailyPriceBar).where(DailyPriceBar.symbol_id.in_(symbol_ids)))
                 session.execute(delete(DailyPykrxEnrichmentRow).where(DailyPykrxEnrichmentRow.symbol_id.in_(symbol_ids)))
             session.execute(delete(DailyPykrxEnrichmentRow).where(DailyPykrxEnrichmentRow.scope_key.in_(self.symbols)))
-            session.execute(delete(Symbol).where(Symbol.symbol.in_(self.symbols)))
 
     def test_upsert_and_load_daily_pykrx_enrichment_rows(self) -> None:
         inserted = upsert_daily_pykrx_enrichment_rows(
@@ -395,6 +397,70 @@ class PykrxEnrichmentStoreIntegrationTests(unittest.TestCase):
         self.assertEqual(valuation_row['name_ko'], 'Value Alpha')
         self.assertEqual(valuation_row['payload']['per'], 10.8)
         self.assertEqual(foreign_row['payload']['foreign_ownership_ratio_pct'], 33.1)
+
+    def test_valuation_snapshot_updates_daily_price_bar_fundamentals(self) -> None:
+        persist_daily_price_bar(
+            {
+                'symbol': '661501',
+                'market': 'KOSPI',
+                'business_date': '2026-04-22',
+                'open_price': 1000,
+                'high_price': 1100,
+                'low_price': 900,
+                'close_price': 1050,
+                'volume': 10000,
+                'turnover': 10500000,
+                'per': None,
+                'pbr': None,
+                'bps': None,
+                'eps': None,
+                'dividend_yield': None,
+                'dps': None,
+                'source': 'pykrx',
+            }
+        )
+
+        inserted = upsert_daily_pykrx_enrichment_rows(
+            rows=[
+                {
+                    'market_date': '2026-04-22',
+                    'market': 'KOSPI',
+                    'category': 'valuation_snapshot',
+                    'scope_type': 'symbol',
+                    'scope_key': '661501',
+                    'source': 'pykrx',
+                    'symbol': '661501',
+                    'name_ko': 'Value Alpha',
+                    'standard_code': 'KR7661501001',
+                    'payload': {
+                        'per': 10.8,
+                        'pbr': 1.1,
+                        'bps': 952.4,
+                        'eps': 97.2,
+                        'dividend_yield': 2.5,
+                        'dps': 26.0,
+                    },
+                }
+            ]
+        )
+
+        self.assertEqual(inserted, 1)
+        with session_scope() as session:
+            price_row = (
+                session.execute(
+                    select(DailyPriceBar)
+                    .join(Symbol, Symbol.id == DailyPriceBar.symbol_id)
+                    .where(Symbol.symbol == '661501', DailyPriceBar.trade_date == date(2026, 4, 22))
+                )
+                .scalars()
+                .one()
+            )
+            per = float(price_row.per)
+            pbr = float(price_row.pbr)
+            dividend_yield = float(price_row.dividend_yield)
+        self.assertEqual(per, 10.8)
+        self.assertEqual(pbr, 1.1)
+        self.assertEqual(dividend_yield, 2.5)
 
 
 class KISIntradaySnapshotStoreIntegrationTests(unittest.TestCase):

@@ -71,6 +71,7 @@ CATEGORY_SUPPORTED_MARKETS = {
     'sector_classification': SECTOR_SUPPORTED_MARKETS,
 }
 SYMBOL_INVESTOR_GROUPS: tuple[str, ...] = ('개인', '외국인', '기관합계')
+VALUATION_SNAPSHOT_REQUIRED_PAYLOAD_KEYS = ('per', 'pbr', 'market_cap', 'dividend_yield')
 
 
 def _log_pykrx_enrichment_fetch(operation: str, status: str, **fields: Any) -> None:
@@ -185,6 +186,14 @@ def _coverage_status(*, present_rows: int, expected_rows: int) -> str:
 
 def _row_market(row: dict[str, Any]) -> str:
     return str(row.get('market') or '').strip().upper()
+
+
+def _has_valuation_snapshot_payload(rows: Sequence[dict[str, Any]]) -> bool:
+    for row in rows:
+        payload = dict(row.get('payload') or {})
+        if any(payload.get(key) is not None for key in VALUATION_SNAPSHOT_REQUIRED_PAYLOAD_KEYS):
+            return True
+    return False
 
 
 def _normalize_symbol(value: Any) -> str:
@@ -353,8 +362,16 @@ class PykrxEnrichmentService:
                 raise ValueError(f'Unsupported pykrx enrichment category: {category}')
 
             persisted_count = upsert_daily_pykrx_enrichment_rows(rows=category_rows)
+            should_fallback = persisted_count <= 0 and (details.get('errors') or category in SYMBOL_ENRICHMENT_CATEGORIES)
+            if (
+                category == 'valuation_snapshot'
+                and persisted_count > 0
+                and details.get('errors')
+                and not _has_valuation_snapshot_payload(category_rows)
+            ):
+                should_fallback = True
             fallback_result: dict[str, Any] | None = None
-            if persisted_count <= 0 and (details.get('errors') or category in SYMBOL_ENRICHMENT_CATEGORIES):
+            if should_fallback:
                 fallback_rows, fallback_result = self._collect_fallback_rows(
                     category=category,
                     market_date_iso=market_date_iso,
@@ -579,6 +596,15 @@ class PykrxEnrichmentService:
         symbol_meta: dict[str, dict[str, Any]],
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         if category == 'valuation_snapshot':
+            latest_price_date = self._latest_price_bar_valuation_date(market_date_iso=market_date_iso, markets=markets)
+            if latest_price_date is not None:
+                return self._collect_valuation_snapshot_rows_from_daily_price_bars(
+                    market_date_iso=market_date_iso,
+                    markets=markets,
+                    symbol_filter=symbol_filter,
+                    symbol_meta=symbol_meta,
+                    source_market_date_iso=latest_price_date.isoformat(),
+                )
             return self._collect_valuation_snapshot_rows_from_daily_price_bars(
                 market_date_iso=market_date_iso,
                 markets=markets,
@@ -600,20 +626,41 @@ class PykrxEnrichmentService:
             symbol_meta=symbol_meta,
         )
 
+    def _latest_price_bar_valuation_date(
+        self,
+        *,
+        market_date_iso: str,
+        markets: Sequence[str],
+    ) -> date | None:
+        with session_scope() as session:
+            stmt = (
+                select(DailyPriceBar.trade_date)
+                .where(
+                    DailyPriceBar.trade_date < date.fromisoformat(market_date_iso),
+                    DailyPriceBar.per.isnot(None),
+                    DailyPriceBar.pbr.isnot(None),
+                )
+                .order_by(DailyPriceBar.trade_date.desc())
+                .limit(1)
+            )
+            return session.execute(stmt).scalar_one_or_none()
+
     def _daily_price_rows_for_fallback(
         self,
         *,
         market_date_iso: str,
         markets: Sequence[str],
         symbol_filter: set[str],
+        source_market_date_iso: str | None = None,
     ) -> list[dict[str, Any]]:
+        source_market_date_iso = source_market_date_iso or market_date_iso
         normalized_markets = set(_normalize_markets(markets))
         allowed_symbols = {_normalize_symbol(symbol) for symbol in symbol_filter if _normalize_symbol(symbol)}
         with session_scope() as session:
             stmt = (
                 select(DailyPriceBar, Symbol)
                 .join(Symbol, Symbol.id == DailyPriceBar.symbol_id)
-                .where(DailyPriceBar.trade_date == date.fromisoformat(market_date_iso))
+                .where(DailyPriceBar.trade_date == date.fromisoformat(source_market_date_iso))
             )
             if normalized_markets:
                 stmt = stmt.where(Symbol.market.in_(sorted(normalized_markets)))
@@ -651,11 +698,14 @@ class PykrxEnrichmentService:
         markets: Sequence[str],
         symbol_filter: set[str],
         symbol_meta: dict[str, dict[str, Any]],
+        source_market_date_iso: str | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        source_market_date_iso = source_market_date_iso or market_date_iso
         price_rows = self._daily_price_rows_for_fallback(
             market_date_iso=market_date_iso,
             markets=markets,
             symbol_filter=symbol_filter,
+            source_market_date_iso=source_market_date_iso,
         )
         rows: list[dict[str, Any]] = []
         for price_row in price_rows:
@@ -668,7 +718,11 @@ class PykrxEnrichmentService:
                     'category': 'valuation_snapshot',
                     'scope_type': 'symbol',
                     'scope_key': symbol,
-                    'source': 'daily_price_bars_reconstructed',
+                    'source': (
+                        'daily_price_bars_carry_forward'
+                        if source_market_date_iso != market_date_iso
+                        else 'daily_price_bars_reconstructed'
+                    ),
                     'symbol': symbol,
                     'skip_symbol_upsert': True,
                     'name_ko': price_row.get('name_ko') or symbol_info.get('name_ko') or symbol,
@@ -687,6 +741,9 @@ class PykrxEnrichmentService:
                         'dividend_yield': price_row.get('dividend_yield'),
                         'dps': price_row.get('dps'),
                         'reconstructed_from': 'daily_price_bars',
+                        'carried_forward_from_market_date': (
+                            source_market_date_iso if source_market_date_iso != market_date_iso else None
+                        ),
                         'price_source': price_row.get('source'),
                     },
                 }
@@ -695,6 +752,7 @@ class PykrxEnrichmentService:
             'category': 'valuation_snapshot',
             'scope_type': 'symbol',
             'fallback_source': 'daily_price_bars',
+            'source_market_date': source_market_date_iso,
             'rows_prepared': len(rows),
         }
 
@@ -758,12 +816,20 @@ class PykrxEnrichmentService:
         normalized_markets = set(_normalize_markets(markets))
         allowed_symbols = {_normalize_symbol(symbol) for symbol in symbol_filter if _normalize_symbol(symbol)}
         with session_scope() as session:
-            latest_date = session.execute(
-                select(func.max(DailyPykrxEnrichmentRow.market_date)).where(
-                    DailyPykrxEnrichmentRow.market_date < date.fromisoformat(market_date_iso),
-                    DailyPykrxEnrichmentRow.category == category,
-                )
-            ).scalar_one_or_none()
+            candidate_dates = [
+                item[0]
+                for item in session.execute(
+                    select(DailyPykrxEnrichmentRow.market_date)
+                    .where(
+                        DailyPykrxEnrichmentRow.market_date < date.fromisoformat(market_date_iso),
+                        DailyPykrxEnrichmentRow.category == category,
+                    )
+                    .group_by(DailyPykrxEnrichmentRow.market_date)
+                    .order_by(DailyPykrxEnrichmentRow.market_date.desc())
+                    .limit(20)
+                ).all()
+            ]
+            latest_date = candidate_dates[0] if candidate_dates else None
             if latest_date is None:
                 return [], {
                     'category': category,
@@ -772,28 +838,42 @@ class PykrxEnrichmentService:
                     'rows_prepared': 0,
                     'reason': 'no_prior_enrichment_rows',
                 }
-            stmt = (
-                select(DailyPykrxEnrichmentRow, Symbol)
-                .outerjoin(Symbol, Symbol.id == DailyPykrxEnrichmentRow.symbol_id)
-                .where(
-                    DailyPykrxEnrichmentRow.market_date == latest_date,
-                    DailyPykrxEnrichmentRow.category == category,
+            rows: list[dict[str, Any]] = []
+            for candidate_date in candidate_dates:
+                stmt = (
+                    select(DailyPykrxEnrichmentRow, Symbol)
+                    .outerjoin(Symbol, Symbol.id == DailyPykrxEnrichmentRow.symbol_id)
+                    .where(
+                        DailyPykrxEnrichmentRow.market_date == candidate_date,
+                        DailyPykrxEnrichmentRow.category == category,
+                    )
                 )
-            )
-            if normalized_markets:
-                stmt = stmt.where(DailyPykrxEnrichmentRow.market.in_(sorted(normalized_markets)))
-            rows = [
-                {
-                    'market': row.market,
-                    'scope_type': row.scope_type,
-                    'scope_key': row.scope_key,
-                    'payload': dict(row.payload or {}),
-                    'symbol': symbol.symbol if symbol is not None else None,
-                    'name_ko': symbol.name_ko if symbol is not None else None,
-                    'standard_code': symbol.standard_code if symbol is not None else None,
+                if normalized_markets:
+                    stmt = stmt.where(DailyPykrxEnrichmentRow.market.in_(sorted(normalized_markets)))
+                candidate_rows = [
+                    {
+                        'market': row.market,
+                        'scope_type': row.scope_type,
+                        'scope_key': row.scope_key,
+                        'payload': dict(row.payload or {}),
+                        'symbol': symbol.symbol if symbol is not None else None,
+                        'name_ko': symbol.name_ko if symbol is not None else None,
+                        'standard_code': symbol.standard_code if symbol is not None else None,
+                    }
+                    for row, symbol in session.execute(stmt).all()
+                ]
+                if category != 'valuation_snapshot' or _has_valuation_snapshot_payload(candidate_rows):
+                    latest_date = candidate_date
+                    rows = candidate_rows
+                    break
+            if not rows:
+                return [], {
+                    'category': category,
+                    'scope_type': CATEGORY_SCOPE_TYPE[category],
+                    'fallback_source': 'latest_pykrx_enrichment',
+                    'rows_prepared': 0,
+                    'reason': 'no_prior_enrichment_rows_with_payload',
                 }
-                for row, symbol in session.execute(stmt).all()
-            ]
 
         prepared: list[dict[str, Any]] = []
         for row in rows:
