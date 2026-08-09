@@ -131,7 +131,7 @@ DAY_BASED_TRENDING_PERIODS = ('1d', '5d', '20d')
 TRENDING_RANK_INSERT_CHUNK_SIZE = 50
 TRENDING_RANK_PERSIST_LIMIT = 250
 DAILY_SIGNAL_FEATURE_UPSERT_CHUNK_SIZE = 50
-RECENT_PRICE_BARS_SYMBOL_CHUNK_SIZE = 25
+RECENT_PRICE_BARS_SYMBOL_CHUNK_SIZE = 5
 
 
 def _get_symbol(session, symbol: str) -> Symbol | None:
@@ -784,9 +784,10 @@ def load_recent_price_bars_by_symbol(
     lower_bound_date = normalized_market_date - timedelta(days=max(history_days * 7, 14))
 
     grouped: dict[str, list[dict]] = {symbol: [] for symbol in normalized_symbols}
-    for start in range(0, len(normalized_symbols), RECENT_PRICE_BARS_SYMBOL_CHUNK_SIZE):
-        symbol_chunk = normalized_symbols[start:start + RECENT_PRICE_BARS_SYMBOL_CHUNK_SIZE]
+    if history_days == 1 and len(normalized_symbols) > 100:
+        requested_symbol_set = set(normalized_symbols)
         with session_scope() as session:
+            session.execute(text("SET LOCAL statement_timeout = '60s'"))
             rows = session.execute(
                 select(
                     Symbol.symbol.label('symbol'),
@@ -806,16 +807,79 @@ def load_recent_price_bars_by_symbol(
                     DailyPriceBar.source.label('source'),
                     DailyPriceBar.captured_at.label('captured_at'),
                 )
-                .join(DailyPriceBar, DailyPriceBar.symbol_id == Symbol.id)
-                .where(
-                    Symbol.symbol.in_(symbol_chunk),
-                    DailyPriceBar.trade_date <= normalized_market_date,
-                    DailyPriceBar.trade_date >= lower_bound_date,
-                )
-                .order_by(Symbol.symbol.asc(), DailyPriceBar.trade_date.desc())
+                .join(Symbol, Symbol.id == DailyPriceBar.symbol_id)
+                .where(DailyPriceBar.trade_date == normalized_market_date)
+                .order_by(Symbol.symbol.asc())
             ).mappings().all()
         for row in rows:
             symbol = row['symbol']
+            if symbol not in requested_symbol_set:
+                continue
+            grouped[symbol].append(
+                {
+                    'trade_date': row['trade_date'].isoformat() if row['trade_date'] else None,
+                    'open_price': int(row['open_price']) if row['open_price'] is not None else None,
+                    'high_price': int(row['high_price']) if row['high_price'] is not None else None,
+                    'low_price': int(row['low_price']) if row['low_price'] is not None else None,
+                    'close_price': int(row['close_price']) if row['close_price'] is not None else None,
+                    'volume': int(row['volume']) if row['volume'] is not None else None,
+                    'turnover': int(row['turnover']) if row['turnover'] is not None else None,
+                    'per': _round_float(row['per'], 6),
+                    'pbr': _round_float(row['pbr'], 6),
+                    'bps': _round_float(row['bps'], 6),
+                    'eps': _round_float(row['eps'], 6),
+                    'dividend_yield': _round_float(row['dividend_yield'], 6),
+                    'dps': _round_float(row['dps'], 6),
+                    'source': row['source'],
+                    'captured_at': row['captured_at'].isoformat() if row['captured_at'] else None,
+                }
+            )
+        return grouped
+    for start in range(0, len(normalized_symbols), RECENT_PRICE_BARS_SYMBOL_CHUNK_SIZE):
+        symbol_chunk = normalized_symbols[start:start + RECENT_PRICE_BARS_SYMBOL_CHUNK_SIZE]
+        with session_scope() as session:
+            session.execute(text("SET LOCAL statement_timeout = '60s'"))
+            symbol_id_rows = session.execute(
+                select(Symbol.id, Symbol.symbol).where(Symbol.symbol.in_(symbol_chunk))
+            ).all()
+            symbol_by_id = {row.id: row.symbol for row in symbol_id_rows}
+            symbol_ids = list(symbol_by_id)
+            if not symbol_ids:
+                continue
+            stmt = (
+                select(
+                    DailyPriceBar.symbol_id.label('symbol_id'),
+                    DailyPriceBar.trade_date.label('trade_date'),
+                    DailyPriceBar.open_price.label('open_price'),
+                    DailyPriceBar.high_price.label('high_price'),
+                    DailyPriceBar.low_price.label('low_price'),
+                    DailyPriceBar.close_price.label('close_price'),
+                    DailyPriceBar.volume.label('volume'),
+                    DailyPriceBar.turnover.label('turnover'),
+                    DailyPriceBar.per.label('per'),
+                    DailyPriceBar.pbr.label('pbr'),
+                    DailyPriceBar.bps.label('bps'),
+                    DailyPriceBar.eps.label('eps'),
+                    DailyPriceBar.dividend_yield.label('dividend_yield'),
+                    DailyPriceBar.dps.label('dps'),
+                    DailyPriceBar.source.label('source'),
+                    DailyPriceBar.captured_at.label('captured_at'),
+                )
+                .where(
+                    DailyPriceBar.symbol_id.in_(symbol_ids),
+                    DailyPriceBar.trade_date <= normalized_market_date,
+                )
+                .order_by(DailyPriceBar.symbol_id.asc(), DailyPriceBar.trade_date.desc())
+            )
+            if history_days == 1:
+                stmt = stmt.where(DailyPriceBar.trade_date == normalized_market_date)
+            else:
+                stmt = stmt.where(DailyPriceBar.trade_date >= lower_bound_date)
+            rows = session.execute(stmt).mappings().all()
+        for row in rows:
+            symbol = symbol_by_id.get(row['symbol_id'])
+            if symbol is None:
+                continue
             if len(grouped.setdefault(symbol, [])) >= history_days:
                 continue
             grouped[symbol].append(
@@ -4062,7 +4126,7 @@ def upsert_daily_pykrx_enrichment_rows(
     if not rows:
         return 0
 
-    def _chunks(items: list[dict[str, Any]], size: int = 100) -> list[list[dict[str, Any]]]:
+    def _chunks(items: list[dict[str, Any]], size: int = 25) -> list[list[dict[str, Any]]]:
         return [items[index:index + size] for index in range(0, len(items), size)]
 
     refreshed_at = datetime.utcnow()
@@ -4164,6 +4228,41 @@ def upsert_daily_pykrx_enrichment_rows(
                         'updated_at': refreshed_at,
                     },
                 )
+            )
+        valuation_updates = [
+            value
+            for value in values
+            if value['category'] == 'valuation_snapshot'
+            and value['scope_type'] == 'symbol'
+            and value.get('symbol_id') is not None
+            and any(
+                (value.get('payload') or {}).get(key) is not None
+                for key in ('per', 'pbr', 'bps', 'eps', 'dividend_yield', 'dps')
+            )
+        ]
+        valuation_metric_fields = ('per', 'pbr', 'bps', 'eps', 'dividend_yield', 'dps')
+        for value in valuation_updates:
+            payload = dict(value.get('payload') or {})
+            update_values = {
+                field: _as_decimal(payload[field])
+                for field in valuation_metric_fields
+                if payload.get(field) is not None
+            }
+            if not update_values:
+                continue
+            update_values.update(
+                {
+                    'source': value['source'],
+                    'captured_at': value['captured_at'],
+                }
+            )
+            session.execute(
+                update(DailyPriceBar)
+                .where(
+                    DailyPriceBar.symbol_id == value['symbol_id'],
+                    DailyPriceBar.trade_date == value['market_date'],
+                )
+                .values(**update_values)
             )
     return len(values)
 
