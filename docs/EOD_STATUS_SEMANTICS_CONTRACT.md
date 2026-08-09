@@ -101,6 +101,7 @@ It freezes the behavior currently shipped on `main` so future web work, core ref
 - The default `market_date` is the current Seoul calendar date from `market_state.server_time[:10]`.
 - On weekends, holidays, and other break-days, callers must pass an explicit `market_date` if they want to inspect the previous trading day's pipeline run instead of the current calendar date.
 - `fs_div` defaults to the configured DART fundamentals default and is normalized to uppercase.
+- Default reads are polling-safe. Expensive PyKRX enrichment coverage scans, row-count missing-symbol diagnostics, and feedback-run context are omitted unless `include_diagnostics=true` and/or `include_feedback_context=true` is passed.
 
 ### pykrx stages
 
@@ -138,7 +139,7 @@ It freezes the behavior currently shipped on `main` so future web work, core ref
 - Those stages are default-selected members of the daily process. A default daily run is not complete for a market date until their stored rows exist.
 - Factor-stage counts are derived from the persisted result tables for the requested `market_date`, not from dedicated run rows.
 - Factor-stage `total` is anchored to the same-market-date price-collection universe when available, so missing factor rows remain visible as incomplete daily scoring coverage instead of collapsing into a false completed state.
-- Row-count-derived partial stages expose coverage diagnostics in `details`, including `missing_count`, `missing_symbols_sample`, `coverage_ratio`, `gate_status`, `severity`, and `blocking_status`.
+- With diagnostics enabled, row-count-derived partial stages expose coverage diagnostics in `details`, including `missing_count`, `missing_symbols_sample`, `coverage_ratio`, `gate_status`, `severity`, and `blocking_status`.
 - A partial row-count stage can be `severity=degraded` and `blocking_status=non_blocking` when it is sufficiently complete for downstream feedback. For `market_risk_filter`, an active feedback run with `run_status=running`, `failed_items=0`, and no missing rows inside that run's requested symbol scope is explicitly reported as `gate_status=ready`, `gate_reason=missing_rows_outside_active_feedback_scope`; the missing full-universe rows remain visible through the diagnostics.
 - Factor stages can currently surface `pending`, `partial`, or `completed`.
   They do not expose a live `running` state because the repo does not persist standalone run-progress rows for those factor families.

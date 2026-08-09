@@ -1588,6 +1588,8 @@ If a UX or frontend team needs to plan against the current system, the most impo
 
 For `/execution/runtime/status`, Core preserves exec-owned summary dictionaries such as `symbols`, `daily_pnl`, `weekly_pnl`, `monthly_pnl`, and `actionable_alerts` so the dashboard can display sell-fill coverage and FIFO P/L without re-deriving execution truth in Core.
 
+The default `/execution/runtime/status` read is local/cache-only. Use `refresh=true` only for an explicit operator refresh that should contact exec runtime.
+
 These cover most currently meaningful user-facing flows.
 
 ---

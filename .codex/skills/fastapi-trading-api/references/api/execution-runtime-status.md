@@ -8,8 +8,10 @@ Status literals and serialized payload keys are validated by `apps/api/app/order
 
 ## Example request
 ```http
-GET /execution/runtime/status?refresh=true
+GET /execution/runtime/status
 ```
+
+The default read is local/cache-only. Pass `refresh=true` only for an explicit operator refresh that should contact the exec runtime.
 
 ## Example response
 ```json

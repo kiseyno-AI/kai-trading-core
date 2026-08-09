@@ -273,6 +273,16 @@ class MacroContextObservation(Base, TimestampMixin):
 
 class EODCollectionRun(Base):
     __tablename__ = 'eod_collection_runs'
+    __table_args__ = (
+        Index(
+            'ix_eod_collection_runs_market_trade_source_started_id',
+            'market',
+            'trade_date',
+            'source',
+            'started_at',
+            'id',
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     market: Mapped[str] = mapped_column(String(32), nullable=False, default='KRX')

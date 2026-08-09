@@ -111,12 +111,18 @@ async def get_eod_screening_results(
 async def get_eod_pipeline_status(
     market_date: str | None = None,
     fs_div: str | None = None,
+    include_diagnostics: bool = Query(default=False),
+    include_feedback_context: bool = Query(default=False),
 ) -> dict:
     try:
         return await asyncio.to_thread(
             eod_pipeline_status_service.read,
             market_date=market_date,
             fs_div=fs_div,
+            include_feedback_context=include_feedback_context,
+            include_feedback_stage=include_feedback_context,
+            include_row_count_diagnostics=include_diagnostics,
+            include_pykrx_enrichment_coverage=include_diagnostics,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

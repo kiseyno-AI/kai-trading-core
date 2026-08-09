@@ -17,7 +17,9 @@ The response now also includes `market` and `market_session` blocks. `market` is
 
 The `pykrx_enrichment` stage is also the operator status source for the decider enrichment join. Completed storage coverage for `valuation_snapshot`, `investor_flow_symbol`, `investor_flow_market`, `short_selling`, `sector_classification`, and `market_breadth` means `GET /agent-context/symbol-day` can populate `pre_decider_enrichment_context.trading_value` and `flow_short_sector_context`. Decider gate readiness is reported separately through stage-level `gate_status` fields and the top-level `gate_summary`, so `pykrx_enrichment.status` can be `completed` while `gate_status` is `blocked` due below-threshold category coverage. Scheduled PyKRX daily runs publish live `pykrx_enrichment` stage progress before rows are fully visible, including downstream preflight status, category row counts, and failed categories. Live quote/orderbook snapshots are outside the EOD stage and appear in symbol-day context as available, unavailable, or `stale_eod` with a timestamp when the market is closed.
 
-Row-count-derived stages expose missing-row diagnostics when they are partial. For example, `market_risk_filter.details.missing_count` and `missing_symbols_sample` show the full-universe coverage gap, while `gate_status`, `severity`, and `blocking_status` tell feedback/dashboard consumers whether that gap blocks the active feedback scope.
+By default, dashboard/status reads omit expensive row-count missing-symbol samples, PyKRX coverage scans, and feedback-run context so polling cannot consume the same database capacity as the daily pipeline. Pass `include_diagnostics=true` to include PyKRX enrichment coverage and row-count missing diagnostics. Pass `include_feedback_context=true` to include the live/durable `agent_feedback_summaries` stage.
+
+When diagnostics are enabled, row-count-derived stages expose missing-row diagnostics when they are partial. For example, `market_risk_filter.details.missing_count` and `missing_symbols_sample` show the full-universe coverage gap, while `gate_status`, `severity`, and `blocking_status` tell feedback/dashboard consumers whether that gap blocks the active feedback scope.
 
 When a same-day feedback run is active, `agent_feedback_summaries` reflects the run from feedback runtime/durable state even if no official daily pipeline stage row exists. That keeps active feedback progress separate from upstream degraded coverage.
 
@@ -29,7 +31,7 @@ Pre-open/global stages such as `master_refresh` and `pykrx_universe_refresh` may
 
 ## Example request
 ```http
-GET /eod/pipeline/status?market_date=2026-04-21&fs_div=CFS
+GET /eod/pipeline/status?market_date=2026-04-21&fs_div=CFS&include_diagnostics=true&include_feedback_context=true
 ```
 
 ## Example response

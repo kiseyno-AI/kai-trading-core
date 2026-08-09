@@ -95,7 +95,7 @@ class ExecutionRuntimeRouteTests(unittest.TestCase):
         self.assertEqual(detail_response.status_code, 200)
         self.assertEqual(detail_response.json()['symbol'], '005930')
 
-        self.assertTrue(self.service.status_calls[0]['refresh'])
+        self.assertFalse(self.service.status_calls[0]['refresh'])
         self.assertEqual(self.service.monitored_calls[0]['market_date'].isoformat(), '2026-04-30')
         self.assertFalse(self.service.monitored_calls[0]['refresh'])
         self.assertEqual(self.service.board_calls[0]['market_date'].isoformat(), '2026-04-30')
