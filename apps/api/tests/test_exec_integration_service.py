@@ -40,6 +40,7 @@ from app.orders.exec_payload_slimming import (
 )
 from app.orders.next_open_execution import (
     EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING,
+    EXECUTION_STATUS_SUBMIT_FAILED,
     EXECUTION_STATUS_SUBMITTED,
     _short_term_entry_quality_blocks,
     signal_decider_next_open_execution_service,
@@ -131,25 +132,72 @@ class FailingRuntimeExecClient(FakeExecClient):
         )
 
 
+def _accepted_plan_readback_for_payload(payload: dict) -> dict:
+    return {
+        'items': [
+            {
+                'external_plan_id': payload['plan_id'],
+                'status': 'accepted',
+                'items': [
+                    {
+                        'core_item_key': item['core_item_key'],
+                        'execution_plan_id': payload['plan_id'],
+                        'execution_plan_item_id': f"exec-item-{index}",
+                        'symbol': item['symbol'],
+                        'intent': item['intent'],
+                        'status': 'accepted',
+                    }
+                    for index, item in enumerate(payload['items'], start=1)
+                ],
+            }
+        ]
+    }
+
+
 class TimeoutAfterAcceptExecClient(FakeExecClient):
     async def post_execution_plan(self, payload: dict) -> dict:
         self.post_calls.append(payload)
+        self.plan_response = _accepted_plan_readback_for_payload(payload)
+        raise SignalDeciderExecClientError(
+            'exec request timed out',
+            code='unavailable',
+            retryable=True,
+        )
+
+
+class DuplicateConflictAfterAcceptExecClient(FakeExecClient):
+    async def post_execution_plan(self, payload: dict) -> dict:
+        self.post_calls.append(payload)
+        self.plan_response = _accepted_plan_readback_for_payload(payload)
+        raise SignalDeciderExecClientError(
+            'exec plan already exists',
+            code='failed',
+            retryable=False,
+            status_code=409,
+        )
+
+
+class TimeoutWithStaleSamePlanReadbackExecClient(FakeExecClient):
+    async def post_execution_plan(self, payload: dict) -> dict:
+        self.post_calls.append(payload)
+        stale_items = []
+        for index, item in enumerate(payload['items'], start=1):
+            stale_item = {
+                'execution_plan_id': payload['plan_id'],
+                'execution_plan_item_id': f"stale-exec-item-{index}",
+                'symbol': item['symbol'],
+                'intent': item['intent'],
+                'status': 'accepted',
+            }
+            if index % 2 == 0:
+                stale_item['core_item_key'] = f"stale-{item['core_item_key']}"
+            stale_items.append(stale_item)
         self.plan_response = {
             'items': [
                 {
                     'external_plan_id': payload['plan_id'],
                     'status': 'accepted',
-                    'items': [
-                        {
-                            'core_item_key': item['core_item_key'],
-                            'execution_plan_id': payload['plan_id'],
-                            'execution_plan_item_id': f"exec-item-{index}",
-                            'symbol': item['symbol'],
-                            'intent': item['intent'],
-                            'status': 'accepted',
-                        }
-                        for index, item in enumerate(payload['items'], start=1)
-                    ],
+                    'items': stale_items,
                 }
             ]
         }
@@ -1978,6 +2026,80 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             exec_dispatch = short_row.submission_payload['exec_dispatch']
             self.assertEqual(exec_dispatch['dispatch_status'], 'accepted')
             self.assertIsNone(exec_dispatch['last_error'])
+
+    async def test_dispatch_next_open_plan_recovers_409_duplicate_from_matching_readback(self) -> None:
+        self.client = DuplicateConflictAfterAcceptExecClient()
+        self.service = SignalDeciderExecIntegrationService(client=self.client)
+
+        result = await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            account_reference=self.account_reference,
+            refresh_plan=False,
+            dry_run=False,
+            force=True,
+            trigger='test',
+        )
+
+        self.assertEqual(result['summary']['failed_group_count'], 0)
+        self.assertEqual(result['summary']['dispatched_group_count'], 1)
+        self.assertEqual(len(self.client.post_calls), 1)
+        self.assertEqual(len(self.client.plan_calls), 1)
+        group = result['dispatch']['groups'][0]
+        self.assertTrue(group['recovered_from_duplicate'])
+        self.assertFalse(group['recovered_from_retryable_error'])
+        self.assertEqual(group['dispatch_status'], 'accepted')
+
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            exec_dispatch = row.submission_payload['exec_dispatch']
+            self.assertEqual(exec_dispatch['dispatch_status'], 'accepted')
+            self.assertIsNone(exec_dispatch['last_error'])
+            self.assertEqual(
+                {link['core_item_key'] for link in exec_dispatch['item_links']},
+                {
+                    f'core-plan-{self.plan_item_id}:next_open_buy',
+                    f'core-plan-{self.plan_item_id}:target_sell',
+                    f'core-plan-{self.plan_item_id}:stop_sell',
+                },
+            )
+
+    async def test_dispatch_next_open_plan_rejects_stale_timeout_readback_without_matching_core_keys(self) -> None:
+        self.client = TimeoutWithStaleSamePlanReadbackExecClient()
+        self.service = SignalDeciderExecIntegrationService(client=self.client)
+
+        result = await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            account_reference=self.account_reference,
+            refresh_plan=False,
+            dry_run=False,
+            force=True,
+            trigger='test',
+        )
+
+        self.assertEqual(result['summary']['failed_group_count'], 1)
+        self.assertEqual(result['summary']['dispatched_group_count'], 0)
+        self.assertEqual(len(self.client.post_calls), 1)
+        self.assertEqual(len(self.client.plan_calls), 1)
+        group = result['dispatch']['groups'][0]
+        self.assertEqual(group['dispatch_status'], 'unavailable')
+        self.assertNotIn('recovered_from_duplicate', group)
+        self.assertNotIn('recovered_from_retryable_error', group)
+
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            self.assertEqual(row.execution_status, EXECUTION_STATUS_SUBMIT_FAILED)
+            exec_dispatch = row.submission_payload['exec_dispatch']
+            self.assertEqual(exec_dispatch['dispatch_status'], 'unavailable')
+            self.assertIsNone(exec_dispatch.get('last_success_at'))
+            self.assertEqual(exec_dispatch['last_error']['code'], 'unavailable')
+            self.assertEqual(
+                {link['core_item_key'] for link in exec_dispatch['item_links']},
+                {
+                    f'core-plan-{self.plan_item_id}:next_open_buy',
+                    f'core-plan-{self.plan_item_id}:target_sell',
+                    f'core-plan-{self.plan_item_id}:stop_sell',
+                },
+            )
 
     async def test_dispatch_next_open_plan_short_term_idempotent_redispatch_skips_duplicate_payload(self) -> None:
         short_snapshot_id = self._seed_short_term_snapshot()

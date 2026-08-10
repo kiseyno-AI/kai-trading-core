@@ -1328,32 +1328,38 @@ class SignalDeciderExecIntegrationService:
         if status not in {EXEC_DISPATCH_STATUS_ACCEPTED, EXEC_DISPATCH_STATUS_PARTIAL, 'accepted'}:
             return None
         exec_items = _collect_items(plan)
-        by_symbol_intent: dict[tuple[str | None, str | None], dict[str, Any]] = {}
+        items_by_core_key: dict[str, dict[str, Any]] = {}
         for item in exec_items:
-            by_symbol_intent[
-                (
-                    _normalize_optional_text(item.get('symbol')),
-                    _normalize_optional_text(item.get('intent')),
-                )
-            ] = item
-        recovered_items: list[dict[str, Any]] = []
+            for core_key in self._exec_plan_item_core_keys(item):
+                items_by_core_key[core_key] = item
+
+        submitted_links: list[dict[str, Any]] = []
+        submitted_core_keys: set[str] = set()
         for links in row_links.values():
             for link in links:
-                item = by_symbol_intent.get(
-                    (
-                        _normalize_optional_text(link.get('symbol')),
-                        _normalize_optional_text(link.get('intent')),
-                    )
-                )
-                if item is None:
-                    continue
-                recovered_items.append(
-                    {
-                        **item,
-                        'core_item_key': link.get('core_item_key'),
-                        'status': item.get('status') or EXEC_DISPATCH_STATUS_ACCEPTED,
-                    }
-                )
+                core_key = _normalize_optional_text(link.get('core_item_key'))
+                if core_key:
+                    submitted_links.append(link)
+                    submitted_core_keys.add(core_key)
+
+        if not submitted_core_keys:
+            return None
+        if not submitted_core_keys.issubset(set(items_by_core_key)):
+            return None
+
+        recovered_items: list[dict[str, Any]] = []
+        for link in submitted_links:
+            core_key = _normalize_optional_text(link.get('core_item_key'))
+            item = items_by_core_key.get(core_key or '')
+            if item is None:
+                return None
+            recovered_items.append(
+                {
+                    **item,
+                    'core_item_key': core_key,
+                    'status': item.get('status') or EXEC_DISPATCH_STATUS_ACCEPTED,
+                }
+            )
         if not recovered_items:
             return None
         return {
