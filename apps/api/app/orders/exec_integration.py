@@ -998,7 +998,7 @@ class SignalDeciderExecIntegrationService:
             existing_rows = self._load_next_open_rows(
                 target_trade_date=resolved_target_date,
                 account_reference=resolved_account_reference,
-                include_payloads=False,
+                include_payloads=True,
             )
             has_eligible_short_term_watch = any(
                 _normalize_decision_agent_name(row.decision_agent_name) == SHORT_TERM_DECIDER_AGENT_NAME
@@ -1165,7 +1165,12 @@ class SignalDeciderExecIntegrationService:
             try:
                 response_payload = await self.client.post_execution_plan(plan_payload)
             except SignalDeciderExecClientError as exc:
-                if exc.status_code == 409:
+                recoverable_dispatch_error = bool(
+                    exc.status_code == 409
+                    or exc.retryable
+                    or exc.code == EXEC_DISPATCH_STATUS_UNAVAILABLE
+                )
+                if recoverable_dispatch_error:
                     response_payload = await self._recover_duplicate_dispatch_response(
                         plan_id=plan_id,
                         row_links=row_links,
@@ -1186,7 +1191,14 @@ class SignalDeciderExecIntegrationService:
                                 'account_reference': account_key,
                                 'decision_agent_name': decision_agent_name,
                                 'plan_id': plan_id,
-                                'recovered_from_duplicate': True,
+                                'recovered_from_duplicate': exc.status_code == 409,
+                                'recovered_from_retryable_error': exc.status_code != 409,
+                                'recovery_error': _serialize_error(
+                                    code=exc.code,
+                                    message=str(exc),
+                                    retryable=exc.retryable,
+                                    status_code=exc.status_code,
+                                ),
                                 **persisted_group_result,
                             }
                         )
@@ -1316,32 +1328,38 @@ class SignalDeciderExecIntegrationService:
         if status not in {EXEC_DISPATCH_STATUS_ACCEPTED, EXEC_DISPATCH_STATUS_PARTIAL, 'accepted'}:
             return None
         exec_items = _collect_items(plan)
-        by_symbol_intent: dict[tuple[str | None, str | None], dict[str, Any]] = {}
+        items_by_core_key: dict[str, dict[str, Any]] = {}
         for item in exec_items:
-            by_symbol_intent[
-                (
-                    _normalize_optional_text(item.get('symbol')),
-                    _normalize_optional_text(item.get('intent')),
-                )
-            ] = item
-        recovered_items: list[dict[str, Any]] = []
+            for core_key in self._exec_plan_item_core_keys(item):
+                items_by_core_key[core_key] = item
+
+        submitted_links: list[dict[str, Any]] = []
+        submitted_core_keys: set[str] = set()
         for links in row_links.values():
             for link in links:
-                item = by_symbol_intent.get(
-                    (
-                        _normalize_optional_text(link.get('symbol')),
-                        _normalize_optional_text(link.get('intent')),
-                    )
-                )
-                if item is None:
-                    continue
-                recovered_items.append(
-                    {
-                        **item,
-                        'core_item_key': link.get('core_item_key'),
-                        'status': item.get('status') or EXEC_DISPATCH_STATUS_ACCEPTED,
-                    }
-                )
+                core_key = _normalize_optional_text(link.get('core_item_key'))
+                if core_key:
+                    submitted_links.append(link)
+                    submitted_core_keys.add(core_key)
+
+        if not submitted_core_keys:
+            return None
+        if not submitted_core_keys.issubset(set(items_by_core_key)):
+            return None
+
+        recovered_items: list[dict[str, Any]] = []
+        for link in submitted_links:
+            core_key = _normalize_optional_text(link.get('core_item_key'))
+            item = items_by_core_key.get(core_key or '')
+            if item is None:
+                return None
+            recovered_items.append(
+                {
+                    **item,
+                    'core_item_key': core_key,
+                    'status': item.get('status') or EXEC_DISPATCH_STATUS_ACCEPTED,
+                }
+            )
         if not recovered_items:
             return None
         return {
@@ -1384,7 +1402,14 @@ class SignalDeciderExecIntegrationService:
             account_reference=resolved_account_reference,
             refresh=False,
         )
-        base_items = plan_view.get('items') or []
+        overview_rows = await asyncio.to_thread(
+            self._load_next_open_rows,
+            target_trade_date=resolved_target_date,
+            account_reference=resolved_account_reference,
+            symbol=resolved_symbol,
+            include_payloads=True,
+        )
+        base_items = [self._serialize_execution_plan_row_for_runtime(row) for row in overview_rows]
         if resolved_symbol:
             base_items = [item for item in base_items if _normalize_optional_text(item.get('symbol')) == resolved_symbol]
         items = [self._augment_exec_overview_item(item) for item in base_items]
@@ -3677,7 +3702,7 @@ class SignalDeciderExecIntegrationService:
             target_trade_date=target_trade_date,
             account_reference=account_reference,
             symbol=symbol,
-            include_payloads=False,
+            include_payloads=True,
         )
         grouped = self._group_rows_by_plan_id(rows)
         for plan_id, group_rows in grouped.items():
@@ -3983,11 +4008,12 @@ class SignalDeciderExecIntegrationService:
 
         original_eligibility_status = _normalize_optional_text(row.eligibility_status, lowercase=True)
         original_execution_status = _normalize_optional_text(row.execution_status, lowercase=True)
-        core_was_blocked_or_planned = bool(
+        core_needs_exec_watch_sync = bool(
             original_eligibility_status == ELIGIBILITY_BLOCKED
             or original_execution_status == EXECUTION_STATUS_PLANNED
+            or original_execution_status == EXECUTION_STATUS_SUBMIT_FAILED
         )
-        if not core_was_blocked_or_planned:
+        if not core_needs_exec_watch_sync:
             return None
         validation = row.validation_payload if isinstance(row.validation_payload, dict) else {}
         traceability = row.traceability_payload if isinstance(row.traceability_payload, dict) else {}
@@ -4013,7 +4039,7 @@ class SignalDeciderExecIntegrationService:
                 'eligibility_status': original_eligibility_status,
                 'execution_status': EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING,
             },
-            'divergence': core_was_blocked_or_planned,
+            'divergence': core_needs_exec_watch_sync,
             'preserved_blocking_reason_count': len(blocking_reasons),
             'preserved_warning_count': len(warnings),
         }
@@ -4031,7 +4057,7 @@ class SignalDeciderExecIntegrationService:
             'code': EXEC_WATCH_STATE_SYNC_WARNING_CODE,
             'message': (
                 'Exec readback shows active or pending watch monitoring while core still had blocked/planned '
-                'state; preserving original gate evidence and surfacing Exec watch state for monitoring.'
+                'or failed state; preserving original gate evidence and surfacing Exec watch state for monitoring.'
             ),
             'severity': 'warning',
             'exec_watch_status': exec_watch_status,
