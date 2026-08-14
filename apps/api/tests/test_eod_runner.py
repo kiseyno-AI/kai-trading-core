@@ -257,6 +257,13 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
             patch('app.eod.runner.async_get_market_state', return_value=market_state),
             patch('app.eod.runner.signal_decider_exec_integration_service.should_delegate_execution', return_value=True),
             patch(
+                'app.eod.runner.signal_decider_next_open_execution_service.refresh_plan_if_due'
+            ) as refresh_plan,
+            patch(
+                'app.eod.runner.signal_decider_exec_integration_service.dispatch_next_open_plan',
+                new=AsyncMock(return_value={'summary': {'delegated_to_exec': True}}),
+            ) as dispatch_exec,
+            patch(
                 'app.eod.runner.signal_decider_exec_integration_service.schedule_signal_decider_exec_readback_refresh',
                 return_value={
                     'request': {'target_trade_date': '2026-04-30'},
@@ -272,6 +279,12 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
             runner._running = True
             await runner._run_loop()
 
+        refresh_plan.assert_called_once_with(target_trade_date='2026-04-30')
+        dispatch_exec.assert_awaited_once_with(
+            target_trade_date='2026-04-30',
+            refresh_plan=False,
+            trigger='market_open_exec_dispatch',
+        )
         schedule_refresh.assert_called_once_with(
             target_trade_date='2026-04-30',
             trigger='market_open_scheduler',
@@ -293,6 +306,7 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
         class SlowExecReadbackService:
             def __init__(self) -> None:
                 self.calls: list[dict] = []
+                self.dispatch_calls: list[dict] = []
                 self.refresh_started = asyncio.Event()
                 self.release_refresh = asyncio.Event()
                 self.refresh_state = {
@@ -303,6 +317,10 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
 
             def should_delegate_execution(self) -> bool:
                 return True
+
+            async def dispatch_next_open_plan(self, **kwargs) -> dict:
+                self.dispatch_calls.append(kwargs)
+                return {'summary': {'delegated_to_exec': True}}
 
             def schedule_signal_decider_exec_readback_refresh(self, **kwargs) -> dict:
                 self.calls.append(kwargs)
@@ -339,6 +357,7 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
             with (
                 patch('app.eod.runner.async_get_market_state', return_value=market_state),
                 patch('app.eod.runner.signal_decider_exec_integration_service', fake_service),
+                patch('app.eod.runner.signal_decider_next_open_execution_service.refresh_plan_if_due'),
                 patch(
                     'app.eod.runner.trading_order_reconciliation_service.run_periodic_if_due',
                     new=AsyncMock(),
@@ -364,6 +383,16 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
                         'target_trade_date': '2026-04-30',
                         'trigger': 'market_open_scheduler',
                         'timeout_seconds': BACKGROUND_RUNNER_STEP_TIMEOUT_SECONDS,
+                    }
+                ],
+            )
+            self.assertEqual(
+                fake_service.dispatch_calls,
+                [
+                    {
+                        'target_trade_date': '2026-04-30',
+                        'refresh_plan': False,
+                        'trigger': 'market_open_exec_dispatch',
                     }
                 ],
             )

@@ -878,6 +878,58 @@ class NextOpenAccountTarget:
     budget_krw: Decimal
 
 
+def _preopen_plan_covers_latest_snapshots(
+    *,
+    existing_rows: Sequence[SignalDeciderExecutionPlanItem],
+    snapshots: Sequence[SignalDeciderDecisionSnapshot],
+    account_targets: Sequence[NextOpenAccountTarget],
+) -> bool:
+    expected_snapshots: dict[tuple[str, str, str], SignalDeciderDecisionSnapshot] = {}
+    for snapshot in snapshots:
+        if not _is_actionable_snapshot(snapshot):
+            continue
+        decision_agent_name = _snapshot_agent_name(snapshot)
+        targets = list(account_targets)
+        if not targets and decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME:
+            targets = [
+                NextOpenAccountTarget(
+                    label=UNSPECIFIED_ROUTE_ACCOUNT_LABEL,
+                    account_reference=UNSPECIFIED_ROUTE_ACCOUNT_REFERENCE,
+                    budget_krw=UNSPECIFIED_ROUTE_ACCOUNT_BUDGET_KRW,
+                )
+            ]
+        for target in targets:
+            expected_snapshots[(target.account_reference, snapshot.symbol, decision_agent_name)] = snapshot
+
+    existing_by_key = {
+        (row.account_reference, row.symbol, _normalize_agent_name(row.decision_agent_name)): row
+        for row in existing_rows
+    }
+    for key, snapshot in expected_snapshots.items():
+        row = existing_by_key.get(key)
+        if row is None or int(row.decision_snapshot_id) != int(snapshot.id):
+            return False
+        snapshot_updated_at = _normalized_utc_datetime(getattr(snapshot, 'updated_at', None))
+        row_updated_at = _normalized_utc_datetime(getattr(row, 'updated_at', None))
+        if snapshot_updated_at is not None and row_updated_at is not None and snapshot_updated_at > row_updated_at:
+            return False
+    for key, row in existing_by_key.items():
+        if _is_dispatch_terminal_status(row.execution_status):
+            continue
+        expected_snapshot = expected_snapshots.get(key)
+        if expected_snapshot is None or int(expected_snapshot.id) != int(row.decision_snapshot_id):
+            return False
+    return True
+
+
+def _normalized_utc_datetime(value: Any) -> datetime | None:
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
 class SignalDeciderNextOpenExecutionService:
     def __init__(
         self,
@@ -1075,7 +1127,18 @@ class SignalDeciderNextOpenExecutionService:
             source_market_date=source_market_date,
             candidate_symbols=[row.symbol for row in existing_rows],
         )
-        if existing_rows and not force and trigger == 'preopen_scheduler':
+        snapshots = self._load_latest_snapshots(source_market_date=source_market_date)
+        account_targets, account_target_errors = self._parse_account_targets()
+        if (
+            existing_rows
+            and not force
+            and trigger == 'preopen_scheduler'
+            and _preopen_plan_covers_latest_snapshots(
+                existing_rows=existing_rows,
+                snapshots=snapshots,
+                account_targets=account_targets,
+            )
+        ):
             return {
                 'request': {
                     'target_trade_date': resolved_target_date.isoformat(),
@@ -1110,7 +1173,6 @@ class SignalDeciderNextOpenExecutionService:
             )
         )
         enrichment_preflight_blocked = not force and not enrichment_preflight.get('allowed')
-        snapshots = self._load_latest_snapshots(source_market_date=source_market_date)
         agent_context_completeness = self._build_agent_context_completeness_context(
             source_market_date=source_market_date,
             candidate_symbols=[snapshot.symbol for snapshot in snapshots],
@@ -1166,7 +1228,6 @@ class SignalDeciderNextOpenExecutionService:
                 'enrichment_preflight': enrichment_preflight,
                 'items': [self._serialize_row(row) for row in rows],
             }
-        account_targets, account_target_errors = self._parse_account_targets()
         account_targets_setting_configured = bool(settings.signal_decider_next_open_account_targets.strip())
         policy_cache: dict[str, dict[str, Any]] = {}
         price_cache: dict[str, int | None] = {}
