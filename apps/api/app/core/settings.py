@@ -26,12 +26,18 @@ class Settings(BaseSettings):
 
     db_auto_upgrade: bool = True
     database_url: Optional[str] = None
-    db_pool_size: int = 10
-    db_max_overflow: int = 20
-    db_pool_timeout_seconds: int = 10
+    db_pool_size: int = Field(default=10, ge=1, le=200)
+    db_max_overflow: int = Field(default=10, ge=0, le=200)
+    db_pool_timeout_seconds: int = Field(default=5, ge=1, le=120)
+    db_pool_recycle_seconds: int = Field(default=900, ge=0, le=86_400)
+    db_pool_use_lifo: bool = True
+    db_connect_timeout_seconds: int = Field(default=5, ge=1, le=120)
+    db_healthcheck_timeout_seconds: float = Field(default=2.0, gt=0, le=30)
+    db_long_checkout_warning_seconds: float = Field(default=10.0, gt=0, le=3600)
     db_statement_timeout_ms: int = 3000
     db_lock_timeout_ms: int = 5000
     db_pool_watchdog_enabled: bool = False
+    db_pool_watchdog_cancel_enabled: bool = False
     db_pool_watchdog_interval_seconds: float = 10.0
     db_pool_watchdog_cancel_after_seconds: int = 30
     db_pool_watchdog_active_connection_threshold: int = 8

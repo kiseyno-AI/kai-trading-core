@@ -38,7 +38,7 @@ from app.core.audit_logging import (
     set_request_id,
 )
 from app.core.settings import settings
-from app.db import check_database, init_database
+from app.db import check_database, init_database, pool_status
 from app.db_pool_watchdog import db_pool_watchdog
 from app.eod.daily_pipeline_state import daily_pipeline_run_state_service
 from app.eod.runner import background_runner
@@ -203,7 +203,17 @@ app.include_router(crypto_router)
 
 @app.get('/health')
 async def health() -> dict:
-    db_ok, db_error = check_database()
+    try:
+        db_ok, db_error = await asyncio.wait_for(
+            asyncio.to_thread(check_database),
+            timeout=settings.db_healthcheck_timeout_seconds,
+        )
+    except asyncio.TimeoutError:
+        db_ok = False
+        db_error = (
+            f'database health check timed out after {settings.db_healthcheck_timeout_seconds}s; '
+            f'pool_status={pool_status()}'
+        )
     return {
         'status': 'ok' if db_ok else 'degraded',
         'app': settings.app_name,
@@ -211,5 +221,6 @@ async def health() -> dict:
         'database': {
             'connected': db_ok,
             'error': db_error,
+            'pool': pool_status(),
         },
     }

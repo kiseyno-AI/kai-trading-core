@@ -47,6 +47,7 @@ class PoolWatchdogSweep:
     active_count: int
     slow_read_count: int
     slow_read_pids: list[int]
+    cancelled_pids: list[int]
 
 
 class DatabasePoolWatchdog:
@@ -82,6 +83,7 @@ class DatabasePoolWatchdog:
                                 'active_count': sweep.active_count,
                                 'slow_read_count': sweep.slow_read_count,
                                 'slow_read_pids': sweep.slow_read_pids,
+                                'cancelled_pids': sweep.cancelled_pids,
                             }
                         },
                     )
@@ -94,7 +96,11 @@ class DatabasePoolWatchdog:
         active_threshold = max(1, int(settings.db_pool_watchdog_active_connection_threshold))
         observe_limit = max(1, int(settings.db_pool_watchdog_cancel_limit))
 
-        with psycopg.connect(_psycopg_url(), autocommit=True) as conn:
+        with psycopg.connect(
+            _psycopg_url(),
+            autocommit=True,
+            connect_timeout=max(1, int(settings.db_connect_timeout_seconds)),
+        ) as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
@@ -111,6 +117,7 @@ class DatabasePoolWatchdog:
                         active_count=active_count,
                         slow_read_count=0,
                         slow_read_pids=[],
+                        cancelled_pids=[],
                     )
 
                 cur.execute(
@@ -131,11 +138,18 @@ class DatabasePoolWatchdog:
                     for row in cur.fetchall()
                     if _is_observed_read_query(row[1])
                 ][:observe_limit]
+                cancelled_pids: list[int] = []
+                if settings.db_pool_watchdog_cancel_enabled:
+                    for pid in slow_read_pids:
+                        cur.execute('select pg_cancel_backend(%s)', (pid,))
+                        if bool(cur.fetchone()[0]):
+                            cancelled_pids.append(pid)
 
         return PoolWatchdogSweep(
             active_count=active_count,
             slow_read_count=len(slow_read_pids),
             slow_read_pids=slow_read_pids,
+            cancelled_pids=cancelled_pids,
         )
 
 
