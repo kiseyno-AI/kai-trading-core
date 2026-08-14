@@ -10,7 +10,7 @@ NEGATIVE_RATE_TIGHTEN_THRESHOLD = Decimal('0.60')
 MIN_PERFORMANCE_SAMPLE_COUNT = 3
 CONFIDENCE_TIGHTEN_DELTA = Decimal('1.0')
 EXPECTED_RETURN_TIGHTEN_DELTA = Decimal('1.0')
-MIN_REWARD_RISK_WHEN_TIGHTENED = Decimal('1.30')
+DEFAULT_MIN_REWARD_RISK_RATIO = Decimal('1.30')
 PROTECTIVE_TARGET_UPSIDE_MULTIPLIER = Decimal('0.80')
 PROTECTIVE_STOP_DOWNSIDE_MULTIPLIER = Decimal('0.70')
 
@@ -77,6 +77,21 @@ def _reward_risk_bucket(
     return 'reward_risk_gte_2_0'
 
 
+def _reward_risk_ratio(
+    *,
+    reference_price: Decimal | None,
+    target_price: Decimal | None,
+    stop_loss_price: Decimal | None,
+) -> Decimal | None:
+    if reference_price is None or target_price is None or stop_loss_price is None:
+        return None
+    upside = target_price - reference_price
+    downside = reference_price - stop_loss_price
+    if upside <= 0 or downside <= 0:
+        return None
+    return upside / downside
+
+
 def _criteria_from_request_payload(request_payload: dict[str, Any]) -> dict[str, Any]:
     policy = _maybe_dict(request_payload.get('signal_decider_policy'))
     criteria = _maybe_dict(policy.get('performance_criteria'))
@@ -108,6 +123,16 @@ def _decision_feature_values(
     )
     if reward_risk:
         values['decision.reward_risk_bucket'] = reward_risk
+    reward_risk_ratio = _reward_risk_ratio(
+        reference_price=reference,
+        target_price=target,
+        stop_loss_price=stop,
+    )
+    if reward_risk_ratio is not None:
+        values['decision.reward_risk_ratio'] = format(
+            reward_risk_ratio.quantize(Decimal('0.0001')),
+            'f',
+        )
     return values
 
 
@@ -154,23 +179,16 @@ def evaluate_next_open_performance_gate(
     stop_loss_price: Any,
     base_min_confidence_score_10: Any,
     base_min_expected_return_pct: Any,
+    base_min_reward_risk_ratio: Any = DEFAULT_MIN_REWARD_RISK_RATIO,
 ) -> dict[str, Any]:
     criteria = _criteria_from_request_payload(request_payload)
     base_min_confidence = _to_decimal(base_min_confidence_score_10) or Decimal('0')
     base_min_expected_return = _to_decimal(base_min_expected_return_pct) or Decimal('0')
+    min_reward_risk = _to_decimal(base_min_reward_risk_ratio)
+    if min_reward_risk is None:
+        min_reward_risk = DEFAULT_MIN_REWARD_RISK_RATIO
     adjusted_min_confidence = base_min_confidence
     adjusted_min_expected_return = base_min_expected_return
-    if not criteria:
-        return {
-            'status': 'absent',
-            'adjusted_min_confidence_score_10': str(adjusted_min_confidence),
-            'adjusted_min_expected_return_pct': str(adjusted_min_expected_return),
-            'blocking_reasons': [],
-            'warnings': [],
-            'matched_negative_buckets': [],
-            'matched_rule_candidates': [],
-        }
-
     feature_values = _decision_feature_values(
         decision_action=decision_action,
         confidence_score_10=confidence_score_10,
@@ -178,6 +196,44 @@ def evaluate_next_open_performance_gate(
         target_price=target_price,
         stop_loss_price=stop_loss_price,
     )
+    blocking_reasons: list[dict[str, Any]] = []
+    reward_risk_bucket = feature_values.get('decision.reward_risk_bucket')
+    reward_risk_ratio = _reward_risk_ratio(
+        reference_price=_to_decimal(reference_price),
+        target_price=_to_decimal(target_price),
+        stop_loss_price=_to_decimal(stop_loss_price),
+    )
+    if decision_action.strip().lower() == 'buy':
+        if reward_risk_bucket == 'invalid_reward_risk':
+            blocking_reasons.append(
+                {
+                    'code': 'reward_risk_structure_invalid',
+                    'message': 'Buy target and stop must provide positive upside and downside from the reference price.',
+                    'reward_risk_bucket': reward_risk_bucket,
+                }
+            )
+        elif reward_risk_ratio is not None and reward_risk_ratio < min_reward_risk:
+            blocking_reasons.append(
+                {
+                    'code': 'reward_risk_ratio_below_threshold',
+                    'message': 'Expected upside is too small relative to stop distance for next-open buy eligibility.',
+                    'reward_risk_ratio': format(reward_risk_ratio.quantize(Decimal('0.0001')), 'f'),
+                    'min_reward_risk_ratio': format(min_reward_risk, 'f'),
+                }
+            )
+    if not criteria:
+        return {
+            'status': 'absent',
+            'feature_values': feature_values,
+            'adjusted_min_confidence_score_10': str(adjusted_min_confidence),
+            'adjusted_min_expected_return_pct': str(adjusted_min_expected_return),
+            'min_reward_risk_ratio': format(min_reward_risk, 'f'),
+            'blocking_reasons': blocking_reasons,
+            'warnings': [],
+            'matched_negative_buckets': [],
+            'matched_rule_candidates': [],
+        }
+
     overall = _maybe_dict(criteria.get('overall'))
     if (
         _to_decimal(overall.get('negative_outcome_rate')) is not None
@@ -216,7 +272,6 @@ def evaluate_next_open_performance_gate(
         if _predicate_matches(_maybe_dict(candidate.get('predicate')), feature_values=feature_values):
             matched_rule_candidates.append(candidate)
 
-    blocking_reasons: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
     if matched_negative_buckets or matched_rule_candidates:
         adjusted_min_confidence += CONFIDENCE_TIGHTEN_DELTA
@@ -270,6 +325,7 @@ def evaluate_next_open_performance_gate(
         'feature_values': feature_values,
         'adjusted_min_confidence_score_10': str(adjusted_min_confidence),
         'adjusted_min_expected_return_pct': str(adjusted_min_expected_return),
+        'min_reward_risk_ratio': format(min_reward_risk, 'f'),
         'blocking_reasons': blocking_reasons,
         'warnings': warnings,
         'matched_negative_buckets': matched_negative_buckets[:4],
@@ -309,6 +365,7 @@ def build_protective_exit_thresholds(
         stop_loss_price=stop,
         base_min_confidence_score_10=Decimal('0'),
         base_min_expected_return_pct=Decimal('-999'),
+        base_min_reward_risk_ratio=Decimal('0'),
     )
     weak_match = bool(gate.get('matched_negative_buckets') or gate.get('matched_rule_candidates'))
     if not weak_match:
