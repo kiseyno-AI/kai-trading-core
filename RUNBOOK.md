@@ -122,6 +122,22 @@ Before first startup on a fresh machine, from `apps/api`:
 3. `alembic upgrade head`
 4. `python -c "from app.main import app"`
 
+## Database pool operations
+
+`GET /health` reports configured capacity and current checked-in, checked-out,
+and overflow counts. Health checks are single-flight, so overlapping probes
+fail fast instead of stacking connection attempts during an outage.
+Connections are pre-pinged, recycled after
+`DB_POOL_RECYCLE_SECONDS`, and use LIFO reuse by default so idle server-side
+connections can expire cleanly. Size `DB_POOL_SIZE + DB_MAX_OVERFLOW` against
+the total number of API/worker processes, not one process in isolation.
+
+Check logs for long checkout warnings before increasing capacity. A long-held
+transaction or upstream call inside a database session will otherwise consume
+any larger pool too. `DB_POOL_WATCHDOG_CANCEL_ENABLED` remains off by default;
+when explicitly enabled, the watchdog only cancels known read-only analytics
+queries older than the configured threshold and never cancels write queries.
+
 ## Deployment migration hygiene
 
 Use these commands from `apps/api` when you want deploy-time schema checks to fail early and explain drift more clearly:
@@ -319,7 +335,7 @@ Local overrides:
 
 - Set `EOD_AUTO_PYKRX_ENABLED=false` in `apps/api/.env` to disable the recurring scheduler.
 - Tune `EOD_AUTO_PYKRX_AFTER_CLOSE_MINUTES`, `EOD_AUTO_PYKRX_POLL_SECONDS`, `EOD_AUTO_PYKRX_MARKETS`, `EOD_AUTO_PYKRX_REFRESH_UNIVERSE`, `EOD_AUTO_PYKRX_STALE_RUN_MINUTES`, and `EOD_PYKRX_REQUEST_TIMEOUT_SECONDS` in `apps/api/.env`, then restart the API.
-- Use `SIGNAL_DECIDER_NEXT_OPEN_ENABLED`, `SIGNAL_DECIDER_NEXT_OPEN_DRY_RUN`, `SIGNAL_DECIDER_NEXT_OPEN_ACCOUNT_TARGETS`, `SIGNAL_DECIDER_NEXT_OPEN_MIN_CONFIDENCE_SCORE_10`, `SIGNAL_DECIDER_NEXT_OPEN_MIN_EXPECTED_RETURN_PCT`, `SIGNAL_DECIDER_WAIT_CONFLICT_GATE_MODE`, and the `SIGNAL_DECIDER_NEXT_OPEN_REQUIRE_*` / `...BLOCK_ON_*` guardrails in `apps/api/.env`, then restart the API. Keep the WAIT-conflict gate at `report_only` until actual-outcome replay supports a hard block.
+- Use `SIGNAL_DECIDER_NEXT_OPEN_ENABLED`, `SIGNAL_DECIDER_NEXT_OPEN_DRY_RUN`, `SIGNAL_DECIDER_NEXT_OPEN_ACCOUNT_TARGETS`, `SIGNAL_DECIDER_NEXT_OPEN_MIN_CONFIDENCE_SCORE_10`, `SIGNAL_DECIDER_NEXT_OPEN_MIN_EXPECTED_RETURN_PCT`, `SIGNAL_DECIDER_NEXT_OPEN_MIN_REWARD_RISK_RATIO`, `SIGNAL_DECIDER_WAIT_CONFLICT_GATE_MODE`, and the `SIGNAL_DECIDER_NEXT_OPEN_REQUIRE_*` / `...BLOCK_ON_*` guardrails in `apps/api/.env`, then restart the API. Keep the WAIT-conflict gate at `report_only` until actual-outcome replay supports a hard block.
 - Use `SIGNAL_DECIDER_EXEC_INTEGRATION_MODE=disabled|observe|dispatch`, `SIGNAL_DECIDER_EXEC_BASE_URL`, optional `SIGNAL_DECIDER_EXEC_BEARER_TOKEN`, `SIGNAL_DECIDER_EXEC_RUNTIME_MODE`, and `SIGNAL_DECIDER_EXEC_REQUEST_TIMEOUT_SECONDS` in `apps/api/.env` to control the core-to-exec integration lane, then restart the API.
 - In `dispatch` mode, eligible `signal-decider` next-open buys and actionable `short-term-decider` watcher candidates with `confidence_score_10 >= 6.0` are handed to exec for account-aware sizing at/after 08:00 KST. Core sends budget/reference/target/stop/confidence/risk context, does not force buy quantity from budget/reference fallback sizing, and leaves accepted rows delegated unless exec returns a positive agent-approved quantity.
 - Use `GET /eod/status` to inspect the scheduler state and last result.

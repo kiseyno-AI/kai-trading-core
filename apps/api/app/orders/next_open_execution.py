@@ -2411,6 +2411,7 @@ class SignalDeciderNextOpenExecutionService:
                 stop_loss_price=snapshot.stop_loss_price,
                 base_min_confidence_score_10=settings.signal_decider_next_open_min_confidence_score_10,
                 base_min_expected_return_pct=settings.signal_decider_next_open_min_expected_return_pct,
+                base_min_reward_risk_ratio=settings.signal_decider_next_open_min_reward_risk_ratio,
             )
             blocking_reasons.extend(
                 reason
