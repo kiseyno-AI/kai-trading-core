@@ -183,6 +183,20 @@ class EODBackgroundRunner:
                         )
                 elif runtime_background_enabled and market.state == 'OPEN':
                     if signal_decider_exec_integration_service.should_delegate_execution():
+                        await self._run_blocking_step(
+                            'signal_decider_open_execution_refresh_plan_if_due',
+                            lambda: signal_decider_next_open_execution_service.refresh_plan_if_due(
+                                target_trade_date=market.server_time[:10]
+                            ),
+                        )
+                        await self._run_async_step(
+                            'signal_decider_exec_dispatch_open_plan',
+                            signal_decider_exec_integration_service.dispatch_next_open_plan(
+                                target_trade_date=market.server_time[:10],
+                                refresh_plan=False,
+                                trigger='market_open_exec_dispatch',
+                            ),
+                        )
                         self._schedule_exec_readback_refresh(
                             target_trade_date=market.server_time[:10],
                             trigger='market_open_scheduler',

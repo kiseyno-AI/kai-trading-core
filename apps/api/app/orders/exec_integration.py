@@ -583,6 +583,40 @@ def _fingerprint_exec_plan(payload: dict[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _row_has_accepted_exec_dispatch(row: SignalDeciderExecutionPlanItem) -> bool:
+    submission = row.submission_payload if isinstance(row.submission_payload, dict) else {}
+    exec_dispatch = submission.get('exec_dispatch') if isinstance(submission.get('exec_dispatch'), dict) else {}
+    return _normalize_status(exec_dispatch.get('dispatch_status')) in {
+        EXEC_DISPATCH_STATUS_ACCEPTED,
+        EXEC_DISPATCH_STATUS_PARTIAL,
+    }
+
+
+def _delta_dispatch_batch_key(rows: Sequence[SignalDeciderExecutionPlanItem]) -> str:
+    identities = sorted(
+        f'{row.id}:{row.decision_snapshot_id}:{row.symbol}'
+        for row in rows
+    )
+    return hashlib.sha256('|'.join(identities).encode('utf-8')).hexdigest()[:12]
+
+
+def _delta_dispatch_plan_id(base_plan_id: str, batch_key: str) -> str:
+    suffix = f'-delta-{batch_key}'
+    return f'{base_plan_id[:128 - len(suffix)]}{suffix}'
+
+
+def _partition_exec_dispatch_rows(
+    rows: Sequence[SignalDeciderExecutionPlanItem],
+    *,
+    force: bool,
+) -> tuple[list[SignalDeciderExecutionPlanItem], list[SignalDeciderExecutionPlanItem]]:
+    if force:
+        return [], list(rows)
+    already_dispatched = [row for row in rows if _row_has_accepted_exec_dispatch(row)]
+    pending = [row for row in rows if not _row_has_accepted_exec_dispatch(row)]
+    return already_dispatched, pending
+
+
 def _normalize_status(value: Any) -> str | None:
     normalized = _normalize_optional_text(value, lowercase=True)
     return normalized.replace(' ', '_') if normalized else None
@@ -1090,16 +1124,49 @@ class SignalDeciderExecIntegrationService:
                     }
                 )
                 continue
+
+            already_dispatched_rows, dispatch_rows = _partition_exec_dispatch_rows(
+                eligible_rows,
+                force=force,
+            )
+            if not dispatch_rows:
+                plan_payload, _ = self._build_exec_plan_payload(
+                    rows=eligible_rows,
+                    snapshots=snapshots,
+                    trigger=trigger,
+                )
+                translated_item_count += len(plan_payload['items'])
+                skipped_group_count += 1
+                group_results.append(
+                    {
+                        'account_reference': account_key,
+                        'decision_agent_name': decision_agent_name,
+                        'plan_id': _normalize_optional_text(plan_payload.get('plan_id')) or 'unknown-plan',
+                        'dispatch_status': EXEC_DISPATCH_STATUS_ALREADY_DISPATCHED,
+                        'eligible_count': len(eligible_rows),
+                        'already_dispatched_count': len(already_dispatched_rows),
+                        'dispatch_candidate_count': 0,
+                        'translated_item_count': len(plan_payload['items']),
+                    }
+                )
+                continue
+
+            delta_batch_key = (
+                _delta_dispatch_batch_key(dispatch_rows)
+                if already_dispatched_rows
+                else None
+            )
             plan_payload, row_links = self._build_exec_plan_payload(
-                rows=eligible_rows,
+                rows=dispatch_rows,
                 snapshots=snapshots,
                 trigger=trigger,
+                delta_batch_key=delta_batch_key,
             )
             translated_item_count += len(plan_payload['items'])
             plan_id = _normalize_optional_text(plan_payload.get('plan_id')) or 'unknown-plan'
             fingerprint = _fingerprint_exec_plan(plan_payload)
 
-            if not force and self._rows_match_existing_dispatch(eligible_rows, plan_id=plan_id, fingerprint=fingerprint):
+            if not force and self._rows_match_existing_dispatch(dispatch_rows, plan_id=plan_id, fingerprint=fingerprint):
                 skipped_group_count += 1
                 group_results.append(
                     {
@@ -1108,6 +1175,8 @@ class SignalDeciderExecIntegrationService:
                         'plan_id': plan_id,
                         'dispatch_status': EXEC_DISPATCH_STATUS_ALREADY_DISPATCHED,
                         'eligible_count': len(eligible_rows),
+                        'already_dispatched_count': len(already_dispatched_rows),
+                        'dispatch_candidate_count': len(dispatch_rows),
                         'translated_item_count': len(plan_payload['items']),
                     }
                 )
@@ -1130,6 +1199,8 @@ class SignalDeciderExecIntegrationService:
                         'plan_id': plan_id,
                         'dispatch_status': EXEC_DISPATCH_STATUS_PREVIEW,
                         'eligible_count': len(eligible_rows),
+                        'already_dispatched_count': len(already_dispatched_rows),
+                        'dispatch_candidate_count': len(dispatch_rows),
                         'translated_item_count': len(plan_payload['items']),
                     }
                 )
@@ -1138,7 +1209,7 @@ class SignalDeciderExecIntegrationService:
             if integration['config_status'] != 'ready':
                 failed_group_count += 1
                 self._persist_dispatch_failure(
-                    rows=eligible_rows,
+                    rows=dispatch_rows,
                     row_links=row_links,
                     plan_id=plan_id,
                     fingerprint=fingerprint,
@@ -1157,6 +1228,8 @@ class SignalDeciderExecIntegrationService:
                         'plan_id': plan_id,
                         'dispatch_status': EXEC_DISPATCH_STATUS_NOT_CONFIGURED,
                         'eligible_count': len(eligible_rows),
+                        'already_dispatched_count': len(already_dispatched_rows),
+                        'dispatch_candidate_count': len(dispatch_rows),
                         'translated_item_count': len(plan_payload['items']),
                     }
                 )
@@ -1177,7 +1250,7 @@ class SignalDeciderExecIntegrationService:
                     )
                     if response_payload is not None:
                         persisted_group_result = self._persist_dispatch_success(
-                            rows=eligible_rows,
+                            rows=dispatch_rows,
                             row_links=row_links,
                             plan_id=plan_id,
                             fingerprint=fingerprint,
@@ -1191,6 +1264,8 @@ class SignalDeciderExecIntegrationService:
                                 'account_reference': account_key,
                                 'decision_agent_name': decision_agent_name,
                                 'plan_id': plan_id,
+                                'already_dispatched_count': len(already_dispatched_rows),
+                                'dispatch_candidate_count': len(dispatch_rows),
                                 'recovered_from_duplicate': exc.status_code == 409,
                                 'recovered_from_retryable_error': exc.status_code != 409,
                                 'recovery_error': _serialize_error(
@@ -1206,7 +1281,7 @@ class SignalDeciderExecIntegrationService:
                 status = self._client_error_status(exc)
                 failed_group_count += 1
                 self._persist_dispatch_failure(
-                    rows=eligible_rows,
+                    rows=dispatch_rows,
                     row_links=row_links,
                     plan_id=plan_id,
                     fingerprint=fingerprint,
@@ -1227,6 +1302,8 @@ class SignalDeciderExecIntegrationService:
                         'plan_id': plan_id,
                         'dispatch_status': status,
                         'eligible_count': len(eligible_rows),
+                        'already_dispatched_count': len(already_dispatched_rows),
+                        'dispatch_candidate_count': len(dispatch_rows),
                         'translated_item_count': len(plan_payload['items']),
                         'error': _serialize_error(
                             code=exc.code,
@@ -1239,7 +1316,7 @@ class SignalDeciderExecIntegrationService:
                 continue
 
             persisted_group_result = self._persist_dispatch_success(
-                rows=eligible_rows,
+                rows=dispatch_rows,
                 row_links=row_links,
                 plan_id=plan_id,
                 fingerprint=fingerprint,
@@ -1253,6 +1330,8 @@ class SignalDeciderExecIntegrationService:
                     'account_reference': account_key,
                     'decision_agent_name': decision_agent_name,
                     'plan_id': plan_id,
+                    'already_dispatched_count': len(already_dispatched_rows),
+                    'dispatch_candidate_count': len(dispatch_rows),
                     **persisted_group_result,
                 }
             )
@@ -3081,6 +3160,7 @@ class SignalDeciderExecIntegrationService:
         rows: Sequence[SignalDeciderExecutionPlanItem],
         snapshots: dict[int, SignalDeciderDecisionSnapshot],
         trigger: str,
+        delta_batch_key: str | None = None,
     ) -> tuple[dict[str, Any], dict[int, list[dict[str, Any]]]]:
         first_row = rows[0]
         decision_agent_name = _normalize_decision_agent_name(first_row.decision_agent_name)
@@ -3089,6 +3169,8 @@ class SignalDeciderExecIntegrationService:
             f'core-{_sanitize_key(decision_agent_name)}-{first_row.target_trade_date.strftime("%Y%m%d")}-'
             f'{_sanitize_key(first_row.account_reference)}'
         )
+        if delta_batch_key:
+            plan_id = _delta_dispatch_plan_id(plan_id, delta_batch_key)
         runtime_mode = _normalize_optional_text(settings.signal_decider_exec_runtime_mode, lowercase=True) or 'mock'
         dispatch_source = _normalize_optional_text(settings.signal_decider_exec_dispatch_source) or 'kai-trading-core'
         items: list[dict[str, Any]] = []
@@ -3459,6 +3541,8 @@ class SignalDeciderExecIntegrationService:
                 'account_label': first_row.account_label,
                 'source_market_date': source_market_date,
                 'target_trade_date': first_row.target_trade_date.isoformat(),
+                'dispatch_batch_type': 'delta' if delta_batch_key else 'initial',
+                'dispatch_batch_key': delta_batch_key,
             },
         }
         return serialize_execution_plan_dispatch_payload(payload), row_links

@@ -1,6 +1,7 @@
 from datetime import date, datetime, timezone
 from decimal import Decimal
 import json
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 from uuid import uuid4
@@ -30,9 +31,121 @@ from app.orders.next_open_execution import (
     ELIGIBILITY_BLOCKED,
     ELIGIBILITY_ELIGIBLE,
     SignalDeciderNextOpenExecutionService,
+    NextOpenAccountTarget,
+    _preopen_plan_covers_latest_snapshots,
     _previous_trading_day,
 )
 from app.orders.store import upsert_broker_order, upsert_order_request
+
+
+def _preopen_snapshot(
+    snapshot_id: int,
+    symbol: str,
+    action: str = 'buy',
+    updated_at: datetime | None = None,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=snapshot_id,
+        symbol=symbol,
+        agent_name='signal-decider',
+        next_day_open_action=action,
+        decision_action=action,
+        updated_at=updated_at,
+    )
+
+
+def _preopen_plan_row(
+    snapshot_id: int,
+    symbol: str,
+    updated_at: datetime | None = None,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        account_reference='KIS:12345678-01',
+        symbol=symbol,
+        decision_agent_name='signal-decider',
+        decision_snapshot_id=snapshot_id,
+        execution_status='planned',
+        updated_at=updated_at,
+    )
+
+
+def test_preopen_plan_refresh_detects_late_actionable_feedback() -> None:
+    target = NextOpenAccountTarget(
+        label='Main',
+        account_reference='KIS:12345678-01',
+        budget_krw=Decimal('1000000'),
+    )
+
+    covered = _preopen_plan_covers_latest_snapshots(
+        existing_rows=[_preopen_plan_row(1, '005930')],
+        snapshots=[_preopen_snapshot(1, '005930'), _preopen_snapshot(2, '000660')],
+        account_targets=[target],
+    )
+
+    assert covered is False
+
+
+def test_preopen_plan_reuses_only_exact_latest_feedback_set() -> None:
+    target = NextOpenAccountTarget(
+        label='Main',
+        account_reference='KIS:12345678-01',
+        budget_krw=Decimal('1000000'),
+    )
+    snapshots = [_preopen_snapshot(1, '005930'), _preopen_snapshot(2, '000660')]
+
+    assert _preopen_plan_covers_latest_snapshots(
+        existing_rows=[_preopen_plan_row(1, '005930'), _preopen_plan_row(2, '000660')],
+        snapshots=snapshots,
+        account_targets=[target],
+    ) is True
+    assert _preopen_plan_covers_latest_snapshots(
+        existing_rows=[_preopen_plan_row(1, '005930'), _preopen_plan_row(2, '000660')],
+        snapshots=[_preopen_snapshot(3, '005930', action='wait'), _preopen_snapshot(2, '000660')],
+        account_targets=[target],
+    ) is False
+
+
+def test_preopen_plan_detects_unrouted_short_term_watch_feedback() -> None:
+    snapshot = SimpleNamespace(
+        id=7,
+        symbol='035420',
+        agent_name='short-term-decider',
+        response_payload={'tactical_action': 'watch_for_trigger'},
+    )
+    row = SimpleNamespace(
+        account_reference='KIS:00000000-00',
+        symbol='035420',
+        decision_agent_name='short-term-decider',
+        decision_snapshot_id=7,
+        execution_status='planned',
+    )
+
+    assert _preopen_plan_covers_latest_snapshots(
+        existing_rows=[],
+        snapshots=[snapshot],
+        account_targets=[],
+    ) is False
+    assert _preopen_plan_covers_latest_snapshots(
+        existing_rows=[row],
+        snapshots=[snapshot],
+        account_targets=[],
+    ) is True
+
+
+def test_preopen_plan_refreshes_when_same_snapshot_row_was_updated() -> None:
+    target = NextOpenAccountTarget(
+        label='Main',
+        account_reference='KIS:12345678-01',
+        budget_krw=Decimal('1000000'),
+    )
+    row_updated_at = datetime(2026, 4, 29, 20, 0, tzinfo=timezone.utc)
+    snapshot_updated_at = datetime(2026, 4, 29, 20, 5, tzinfo=timezone.utc)
+
+    assert _preopen_plan_covers_latest_snapshots(
+        existing_rows=[_preopen_plan_row(1, '005930', updated_at=row_updated_at)],
+        snapshots=[_preopen_snapshot(1, '005930', updated_at=snapshot_updated_at)],
+        account_targets=[target],
+    ) is False
 
 
 class FakeOrderService:
