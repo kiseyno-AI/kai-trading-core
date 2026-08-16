@@ -2134,6 +2134,74 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertEqual([call['spec'].role for call in client.calls], ['eod-summarizer', 'fundamental-summarizer'])
         self.assertEqual(result['summary']['completed'], 2)
 
+    def test_dispatch_for_symbols_blocks_requested_scope_when_market_risk_coverage_collapses(self):
+        service = AgentFeedbackOrchestrator()
+        client = RecordingBatchClient()
+        service.client = client
+        requested_symbols = [f'{index:06d}' for index in range(1, 81)]
+        dispatch_symbols = [requested_symbols[0]]
+        skipped_symbols = requested_symbols[1:]
+        records_by_symbol = {
+            requested_symbols[0]: {
+                'symbol': requested_symbols[0],
+                'eligible': True,
+                'hard_blocked': False,
+                'cap_excluded': False,
+                'hard_block_reasons': [],
+                'soft_penalties': [],
+            },
+            **{
+                symbol: {
+                    'symbol': symbol,
+                    'eligible': False,
+                    'hard_blocked': True,
+                    'cap_excluded': False,
+                    'hard_block_reasons': [
+                        {
+                            'code': 'missing_market_risk_filter',
+                            'source': 'market_risk_filter',
+                        }
+                    ],
+                    'soft_penalties': [],
+                }
+                for symbol in skipped_symbols
+            },
+        }
+        diagnostics = {
+            'rule_version': 'agent_feedback_short_term_momentum_v1',
+            'requested_symbol_count': len(requested_symbols),
+            'evaluated_symbol_count': len(requested_symbols),
+            'dispatched_symbol_count': len(dispatch_symbols),
+            'hard_blocked_symbol_count': len(skipped_symbols),
+            'hard_blocked_symbols': skipped_symbols,
+            'records_by_symbol': records_by_symbol,
+        }
+
+        with patch.object(
+            orchestrator_module,
+            '_split_requested_symbols_by_agent_feedback_eligibility_with_diagnostics',
+            return_value=(dispatch_symbols, skipped_symbols, diagnostics),
+        ):
+            result = service.dispatch_for_symbols(
+                market_date='2026-08-14',
+                symbols=requested_symbols,
+                roles=['signal-decider'],
+                reuse_existing=False,
+            )
+
+        self.assertEqual(result['summary']['status'], 'blocked')
+        self.assertTrue(result['summary']['gated'])
+        self.assertEqual(
+            result['summary']['gate_reason'],
+            'requested_scope_missing_market_risk_filter_coverage',
+        )
+        self.assertEqual(result['prerequisites']['blocked_stage_ids'], ['market_risk_filter'])
+        self.assertEqual(
+            result['prerequisites']['eligibility_scope_gate']['dispatch_symbol_count'],
+            1,
+        )
+        self.assertEqual(client.calls, [])
+
     def test_default_symbol_dispatch_builds_signal_decider_payload_from_full_upstream_summaries(self):
         service = AgentFeedbackOrchestrator()
         client = SignalDeciderBatchClient()

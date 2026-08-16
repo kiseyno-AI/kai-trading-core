@@ -199,6 +199,47 @@ def _public_eligibility_diagnostics(diagnostics: dict[str, Any]) -> dict[str, An
     }
 
 
+def _requested_scope_eligibility_collapse(
+    *,
+    requested_symbols: Sequence[str],
+    dispatch_symbols: Sequence[str],
+    diagnostics: dict[str, Any],
+) -> dict[str, Any] | None:
+    requested_count = len(_normalize_requested_symbols(requested_symbols))
+    if requested_count < 10:
+        return None
+    records_by_symbol = diagnostics.get('records_by_symbol') if isinstance(diagnostics, dict) else {}
+    if not isinstance(records_by_symbol, dict):
+        return None
+    missing_market_risk_symbols: list[str] = []
+    for symbol, record in records_by_symbol.items():
+        hard_block_reasons = record.get('hard_block_reasons') if isinstance(record, dict) else []
+        if not isinstance(hard_block_reasons, list):
+            continue
+        if any(
+            isinstance(reason, dict) and reason.get('code') == 'missing_market_risk_filter'
+            for reason in hard_block_reasons
+        ):
+            missing_market_risk_symbols.append(str(symbol))
+    missing_ratio = len(missing_market_risk_symbols) / requested_count if requested_count else 0.0
+    dispatch_ratio = len(dispatch_symbols) / requested_count if requested_count else 1.0
+    if missing_ratio < 0.25 and len(dispatch_symbols) >= 5:
+        return None
+    if not missing_market_risk_symbols:
+        return None
+    return {
+        'status': 'blocked',
+        'ready': False,
+        'reason': 'requested_scope_missing_market_risk_filter_coverage',
+        'requested_symbol_count': requested_count,
+        'dispatch_symbol_count': len(dispatch_symbols),
+        'dispatch_ratio': round(dispatch_ratio, 6),
+        'missing_market_risk_symbol_count': len(missing_market_risk_symbols),
+        'missing_market_risk_ratio': round(missing_ratio, 6),
+        'missing_market_risk_symbols_sample': missing_market_risk_symbols[:20],
+    }
+
+
 def _attach_agent_feedback_eligibility_context(
     *,
     items: Sequence[dict[str, Any]],
@@ -3102,6 +3143,58 @@ class AgentFeedbackOrchestrator:
                 )
             )
             public_eligibility_diagnostics = _public_eligibility_diagnostics(eligibility_diagnostics)
+            eligibility_collapse = _requested_scope_eligibility_collapse(
+                requested_symbols=requested_symbols,
+                dispatch_symbols=dispatch_symbols,
+                diagnostics=eligibility_diagnostics,
+            )
+            if not force and eligibility_collapse is not None:
+                return {
+                    'request': {
+                        'market_date': normalized_market_date.isoformat(),
+                        'symbols': dispatch_symbols,
+                        'requested_symbols': requested_symbols,
+                        'request_run_id': None,
+                        'roles': requested_role_names,
+                        'fs_div': fs_div,
+                        'disclosures_limit': disclosures_limit,
+                        'reuse_existing': reuse_existing,
+                        'force_recompute': force_recompute,
+                        'scope': resolve_agent_feedback_scope(requested_symbols=requested_symbols),
+                        'auto_scope': auto_scope,
+                        'eligibility_rule': AGENT_FEEDBACK_ELIGIBILITY_RULE,
+                        'eligibility_filters': list(AGENT_FEEDBACK_ELIGIBILITY_FILTERS),
+                        'skipped_symbols': skipped_symbols,
+                        'eligibility_diagnostics': public_eligibility_diagnostics,
+                        'funnel_diagnostics': funnel_diagnostics,
+                        'mode': 'role_sequential_runtime_buffered',
+                    },
+                    'summary': {
+                        'status': 'blocked',
+                        'completed': 0,
+                        'failed': 0,
+                        'skipped': len(skipped_symbols),
+                        'flushed_to_db': 0,
+                        'gated': True,
+                        'gate_reason': eligibility_collapse['reason'],
+                    },
+                    'items': [],
+                    'failures': [],
+                    'prerequisites': {
+                        'status': 'blocked',
+                        'ready': False,
+                        'blocked_stage_ids': ['market_risk_filter'],
+                        'missing_prerequisites': [
+                            {
+                                'stage': 'market_risk_filter',
+                                'gate_status': 'blocked',
+                                'reason': eligibility_collapse['reason'],
+                                'details': eligibility_collapse,
+                            }
+                        ],
+                        'eligibility_scope_gate': eligibility_collapse,
+                    },
+                }
         soft_penalized_symbols = list(public_eligibility_diagnostics.get('soft_penalized_symbols') or [])
         if funnel_diagnostics is None:
             records_by_symbol = eligibility_diagnostics.get('records_by_symbol') if isinstance(eligibility_diagnostics, dict) else {}
