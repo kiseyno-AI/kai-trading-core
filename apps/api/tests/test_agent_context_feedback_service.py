@@ -1,9 +1,11 @@
 from datetime import date
 import unittest
+from unittest.mock import patch
 
 from app.agent_context.feedback_service import (
     AgentContextFeedbackService,
     _dedupe_feedback_items_for_upsert,
+    _feedback_write_session_scope,
 )
 
 
@@ -98,6 +100,14 @@ class FakeSignalDeciderLoopService:
 
 
 class AgentContextFeedbackServiceTests(unittest.TestCase):
+    def test_feedback_write_session_uses_bounded_domain_timeouts(self):
+        sentinel = object()
+        with patch('app.agent_context.feedback_service.session_scope', return_value=sentinel) as mocked:
+            result = _feedback_write_session_scope()
+
+        self.assertIs(result, sentinel)
+        mocked.assert_called_once_with(statement_timeout_ms=30_000, lock_timeout_ms=15_000)
+
     def test_dedupe_feedback_items_for_upsert_keeps_last_duplicate_per_conflict_key(self):
         items = [
             {'market_date': date(2026, 4, 14), 'symbol': '005930', 'agent_name': 'openclaw'},

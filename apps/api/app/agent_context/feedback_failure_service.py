@@ -10,6 +10,7 @@ from sqlalchemy.dialects.postgresql import insert
 
 from app.agent_context.feedback_service import _normalize_agent_name, _normalize_json_object, _normalize_market_date, _normalize_optional_text, _normalize_symbol
 from app.agent_context.feedback_failure_taxonomy import classify_feedback_failure
+from app.core.settings import settings
 from app.db import session_scope
 from app.db_models import AgentContextFeedbackFailure
 
@@ -84,7 +85,10 @@ class AgentContextFeedbackFailureService:
         )
         run_id_value = _normalize_optional_text(run_id, field_name='run_id', max_length=128)
         received_at = datetime.now(timezone.utc)
-        with session_scope() as session:
+        with session_scope(
+            statement_timeout_ms=settings.agent_feedback_db_statement_timeout_ms,
+            lock_timeout_ms=settings.agent_feedback_db_lock_timeout_ms,
+        ) as session:
             stmt = insert(AgentContextFeedbackFailure).values(
                 market_date=market_date_value,
                 symbol=symbol_value,

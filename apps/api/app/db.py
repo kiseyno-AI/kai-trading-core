@@ -105,9 +105,17 @@ def _log_database_disconnect(exception_context) -> None:
 
 
 @contextmanager
-def session_scope():
+def session_scope(
+    *,
+    statement_timeout_ms: int | None = None,
+    lock_timeout_ms: int | None = None,
+):
     session = SessionLocal()
     try:
+        if statement_timeout_ms is not None:
+            session.execute(text(f'SET LOCAL statement_timeout = {int(statement_timeout_ms)}'))
+        if lock_timeout_ms is not None:
+            session.execute(text(f'SET LOCAL lock_timeout = {int(lock_timeout_ms)}'))
         yield session
         session.commit()
     except Exception:
