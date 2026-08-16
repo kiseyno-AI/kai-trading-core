@@ -10,6 +10,41 @@ from app.signals.market_risk_filter import (
 )
 from app.signals.market_risk_snapshot import DEFAULT_MARKET_CODE
 
+MIN_BLOCKING_MARKET_RISK_COVERAGE_RATIO = 0.5
+
+
+def _market_risk_filter_coverage_gate(result: dict[str, Any]) -> dict[str, Any]:
+    requested_symbols = list(result.get('requested_symbols') or [])
+    requested_count = len(requested_symbols)
+    if requested_count <= 1:
+        return {
+            'gate_status': 'ready',
+            'coverage_ratio': 1.0,
+            'requested_symbol_count': requested_count,
+            'results_persisted': int(result.get('results_persisted') or 0),
+            'missing_count': len(result.get('missing_symbols') or []),
+        }
+    results_persisted = int(result.get('results_persisted') or 0)
+    coverage_ratio = min(results_persisted, requested_count) / requested_count
+    missing_symbols = list(result.get('missing_symbols') or [])
+    blocking = coverage_ratio < MIN_BLOCKING_MARKET_RISK_COVERAGE_RATIO
+    return {
+        'gate_status': 'blocked' if blocking else 'ready',
+        'blocking_status': 'blocking' if blocking else 'non_blocking',
+        'severity': 'blocking' if blocking else 'degraded',
+        'gate_reason': (
+            'market_risk_filter_coverage_below_minimum'
+            if blocking
+            else 'market_risk_filter_coverage_above_minimum'
+        ),
+        'coverage_ratio': round(coverage_ratio, 6),
+        'minimum_coverage_ratio': MIN_BLOCKING_MARKET_RISK_COVERAGE_RATIO,
+        'requested_symbol_count': requested_count,
+        'results_persisted': results_persisted,
+        'missing_count': max(requested_count - results_persisted, len(missing_symbols)),
+        'missing_symbols_sample': missing_symbols[:20],
+    }
+
 
 async def run_tracked_market_risk_filter(
     *,
@@ -87,7 +122,10 @@ async def run_tracked_market_risk_filter(
             market_code=market_code,
             progress_callback=_progress,
         )
+        coverage_gate = _market_risk_filter_coverage_gate(result)
         status = DailyPipelineStageService._resolve_result_status(result)
+        if coverage_gate['gate_status'] == 'blocked' and status == 'completed':
+            status = 'partial'
         counts = DailyPipelineStageService._extract_stage_counts(stage_id=stage_id, result=result)
         resolved_run_state_service.finish_stage(
             pipeline_run_id=pipeline_run_id,
@@ -102,7 +140,10 @@ async def run_tracked_market_risk_filter(
             current_activity=f'{DailyPipelineStageService._status_activity_prefix(status)} {definition.label}',
             error_message=str(result.get('error') or result.get('error_message') or '') or None,
             source_run_ids=DailyPipelineStageService._extract_stage_source_run_ids(result),
-            details=DailyPipelineStageService._build_stage_run_details(stage_id=stage_id, result=result),
+            details={
+                **DailyPipelineStageService._build_stage_run_details(stage_id=stage_id, result=result),
+                **coverage_gate,
+            },
         )
         final_run = resolved_run_state_service.finish_run(
             pipeline_run_id=pipeline_run_id,

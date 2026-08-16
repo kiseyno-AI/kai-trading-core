@@ -39,6 +39,30 @@ def _payload_with_classification(item: ProviderNewsItem) -> dict[str, Any]:
     return payload
 
 
+def _dedupe_provider_news_items(items: Sequence[ProviderNewsItem]) -> tuple[list[ProviderNewsItem], int]:
+    deduped: list[ProviderNewsItem] = []
+    skipped = 0
+    seen_keys: set[tuple[str, str]] = set()
+    seen_urls: set[tuple[str, str]] = set()
+    for item in items:
+        if not item.url:
+            skipped += 1
+            continue
+        provider_key = (item.provider, item.provider_item_id) if item.provider_item_id else None
+        url_key = (item.provider, item.url)
+        if provider_key is not None and provider_key in seen_keys:
+            skipped += 1
+            continue
+        if url_key in seen_urls:
+            skipped += 1
+            continue
+        if provider_key is not None:
+            seen_keys.add(provider_key)
+        seen_urls.add(url_key)
+        deduped.append(item)
+    return deduped, skipped
+
+
 def _serialize(row: ExternalNewsItem, *, symbol: str, name_ko: str | None, market: str | None) -> dict[str, Any]:
     payload = row.payload or {}
     classification = _classification_from_payload(payload)
@@ -80,16 +104,13 @@ def persist_external_news_items(*, symbol: str, items: Sequence[ProviderNewsItem
     now = _utcnow()
     inserted = 0
     updated = 0
-    skipped = 0
+    deduped_items, skipped = _dedupe_provider_news_items(items)
     with session_scope() as session:
         symbol_row = _get_symbol(session, symbol)
         if symbol_row is None:
             return {'inserted': 0, 'updated': 0, 'skipped': len(items), 'reason': 'symbol_not_found'}
 
-        for item in items:
-            if not item.url:
-                skipped += 1
-                continue
+        for item in deduped_items:
             dedupe_conditions = [ExternalNewsItem.url == item.url]
             if item.provider_item_id:
                 dedupe_conditions.append(ExternalNewsItem.provider_item_id == item.provider_item_id)

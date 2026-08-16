@@ -131,7 +131,7 @@ DAY_BASED_TRENDING_PERIODS = ('1d', '5d', '20d')
 TRENDING_RANK_INSERT_CHUNK_SIZE = 50
 TRENDING_RANK_PERSIST_LIMIT = 250
 DAILY_SIGNAL_FEATURE_UPSERT_CHUNK_SIZE = 50
-RECENT_PRICE_BARS_SYMBOL_CHUNK_SIZE = 5
+RECENT_PRICE_BARS_SYMBOL_CHUNK_SIZE = 200
 
 
 def _get_symbol(session, symbol: str) -> Symbol | None:
@@ -787,7 +787,7 @@ def load_recent_price_bars_by_symbol(
     if history_days == 1 and len(normalized_symbols) > 100:
         requested_symbol_set = set(normalized_symbols)
         with session_scope() as session:
-            session.execute(text("SET LOCAL statement_timeout = '60s'"))
+            session.execute(text("SET LOCAL statement_timeout = '300s'"))
             rows = session.execute(
                 select(
                     Symbol.symbol.label('symbol'),
@@ -838,7 +838,7 @@ def load_recent_price_bars_by_symbol(
     for start in range(0, len(normalized_symbols), RECENT_PRICE_BARS_SYMBOL_CHUNK_SIZE):
         symbol_chunk = normalized_symbols[start:start + RECENT_PRICE_BARS_SYMBOL_CHUNK_SIZE]
         with session_scope() as session:
-            session.execute(text("SET LOCAL statement_timeout = '60s'"))
+            session.execute(text("SET LOCAL statement_timeout = '300s'"))
             symbol_id_rows = session.execute(
                 select(Symbol.id, Symbol.symbol).where(Symbol.symbol.in_(symbol_chunk))
             ).all()

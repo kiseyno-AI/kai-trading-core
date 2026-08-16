@@ -12,6 +12,7 @@ from app.external_news.classifier import classify_external_news_item
 from app.external_news.provider import NaverNewsSearchProvider
 from app.external_news.service import ExternalNewsService
 from app.external_news.provider import ExternalNewsItem
+from app.external_news.store import _dedupe_provider_news_items
 from app.agent_context.read_service import (
     _build_decider_disclosures_news_quality_context,
     _build_external_news_freshness_provenance,
@@ -54,6 +55,57 @@ class FakeExternalNewsProvider:
                 payload={'query': query},
             )
         ]
+
+
+def test_dedupe_provider_news_items_skips_duplicate_provider_ids_and_urls() -> None:
+    published_at = datetime(2026, 5, 8, 0, 0, tzinfo=timezone.utc)
+    items = [
+        ExternalNewsItem(
+            provider='fake_news',
+            provider_item_id='item-1',
+            title='first',
+            description=None,
+            url='https://example.test/news/1',
+            source_url=None,
+            published_at=published_at,
+            payload={},
+        ),
+        ExternalNewsItem(
+            provider='fake_news',
+            provider_item_id='item-1',
+            title='duplicate id',
+            description=None,
+            url='https://example.test/news/1-copy',
+            source_url=None,
+            published_at=published_at,
+            payload={},
+        ),
+        ExternalNewsItem(
+            provider='fake_news',
+            provider_item_id='item-2',
+            title='duplicate url',
+            description=None,
+            url='https://example.test/news/1',
+            source_url=None,
+            published_at=published_at,
+            payload={},
+        ),
+        ExternalNewsItem(
+            provider='fake_news',
+            provider_item_id='item-3',
+            title='second',
+            description=None,
+            url='https://example.test/news/2',
+            source_url=None,
+            published_at=published_at,
+            payload={},
+        ),
+    ]
+
+    deduped, skipped = _dedupe_provider_news_items(items)
+
+    assert [item.title for item in deduped] == ['first', 'second']
+    assert skipped == 2
 
 
 class ExternalNewsServiceTests(unittest.IsolatedAsyncioTestCase):
