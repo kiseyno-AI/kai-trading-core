@@ -223,9 +223,9 @@ def _requested_scope_eligibility_collapse(
             missing_market_risk_symbols.append(str(symbol))
     missing_ratio = len(missing_market_risk_symbols) / requested_count if requested_count else 0.0
     dispatch_ratio = len(dispatch_symbols) / requested_count if requested_count else 1.0
-    if missing_ratio < 0.25 and len(dispatch_symbols) >= 5:
-        return None
     if not missing_market_risk_symbols:
+        return None
+    if missing_ratio < 0.25:
         return None
     return {
         'status': 'blocked',
