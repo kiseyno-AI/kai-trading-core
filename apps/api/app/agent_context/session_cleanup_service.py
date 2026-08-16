@@ -92,7 +92,10 @@ class AgentFeedbackSessionCleanupService:
 
     def _record_failure(self, *, target: SessionCleanupTarget, result: dict[str, Any]) -> dict[str, Any]:
         now = datetime.now(UTC)
-        with session_scope() as session:
+        with session_scope(
+            statement_timeout_ms=settings.agent_feedback_db_statement_timeout_ms,
+            lock_timeout_ms=settings.agent_feedback_db_lock_timeout_ms,
+        ) as session:
             existing = session.execute(
                 select(AgentFeedbackSessionCleanupFailure).where(AgentFeedbackSessionCleanupFailure.session_key == target.session_key)
             ).scalar_one_or_none()

@@ -9,10 +9,18 @@ from sqlalchemy.orm import Query
 
 from app.db import session_scope
 from app.db_models import AgentContextFeedback
+from app.core.settings import settings
 from app.agent_context.missing_data_taxonomy import build_missing_data_categories, enrich_missing_data_categories
 from app.agent_context.signal_decider_loop_service import signal_decider_loop_service
 
 BULK_UPSERT_CHUNK_SIZE = 100
+
+
+def _feedback_write_session_scope():
+    return session_scope(
+        statement_timeout_ms=settings.agent_feedback_db_statement_timeout_ms,
+        lock_timeout_ms=settings.agent_feedback_db_lock_timeout_ms,
+    )
 
 
 def _normalize_market_date(value: str | date) -> date:
@@ -194,7 +202,7 @@ class AgentContextFeedbackRepository:
         context_payload: dict[str, Any] | None,
     ) -> dict[str, Any]:
         received_at = datetime.now(timezone.utc)
-        with session_scope() as session:
+        with _feedback_write_session_scope() as session:
             stmt = insert(AgentContextFeedback).values(
                 market_date=market_date,
                 symbol=symbol,
@@ -281,7 +289,7 @@ class AgentContextFeedbackRepository:
 
         resolved_chunk_size = max(1, chunk_size)
         accepted: list[dict[str, Any]] = []
-        with session_scope() as session:
+        with _feedback_write_session_scope() as session:
             for start in range(0, len(deduped_items), resolved_chunk_size):
                 chunk = list(deduped_items[start:start + resolved_chunk_size])
                 received_at = datetime.now(timezone.utc)

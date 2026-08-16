@@ -36,6 +36,8 @@ class Settings(BaseSettings):
     db_long_checkout_warning_seconds: float = Field(default=10.0, gt=0, le=3600)
     db_statement_timeout_ms: int = 3000
     db_lock_timeout_ms: int = 5000
+    agent_feedback_db_statement_timeout_ms: int = Field(default=30_000, ge=3_000, le=300_000)
+    agent_feedback_db_lock_timeout_ms: int = Field(default=15_000, ge=1_000, le=120_000)
     db_pool_watchdog_enabled: bool = False
     db_pool_watchdog_cancel_enabled: bool = False
     db_pool_watchdog_interval_seconds: float = 10.0

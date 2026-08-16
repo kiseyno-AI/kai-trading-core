@@ -106,7 +106,9 @@ class AgentContextFeedbackFailureServiceTests(unittest.TestCase):
         fake_session = FakeSession(row)
 
         @contextmanager
-        def fake_session_scope():
+        def fake_session_scope(**kwargs):
+            self.assertEqual(kwargs['statement_timeout_ms'], 30_000)
+            self.assertEqual(kwargs['lock_timeout_ms'], 15_000)
             try:
                 yield fake_session
             finally:
@@ -170,7 +172,9 @@ class AgentContextFeedbackFailureServiceTests(unittest.TestCase):
         fake_session = FakeSession(row)
 
         @contextmanager
-        def fake_session_scope():
+        def fake_session_scope(**kwargs):
+            self.assertEqual(kwargs['statement_timeout_ms'], 30_000)
+            self.assertEqual(kwargs['lock_timeout_ms'], 15_000)
             try:
                 yield fake_session
             finally:
