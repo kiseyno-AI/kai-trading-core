@@ -12,7 +12,7 @@ from sqlalchemy import func, select
 
 from app.core.audit_logging import log_fetch_event
 from app.core.settings import settings
-from app.brokers.kis.client import KISClient
+from app.brokers.kis.provider import kis_client
 from app.db import session_scope
 from app.db_models import DailyPriceBar, DailyPykrxEnrichmentRow, Symbol
 from app.eod.pykrx_import import import_pykrx_stock, suppress_pykrx_login_env
@@ -469,18 +469,17 @@ class PykrxEnrichmentService:
         symbol_meta: dict[str, dict[str, Any]],
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         async def collect() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-            client = KISClient(use_mock=False)
             rows: list[dict[str, Any]] = []
             errors: list[dict[str, Any]] = []
             for symbol in symbols:
                 try:
                     if category == 'investor_flow_symbol':
-                        response = await client.fetch_domestic_investor_trade_daily(
+                        response = await kis_client.fetch_domestic_investor_trade_daily(
                             symbol,
                             trade_date=market_date_yyyymmdd,
                         )
                     else:
-                        response = await client.fetch_domestic_daily_short_sale(
+                        response = await kis_client.fetch_domestic_daily_short_sale(
                             symbol,
                             start_date=market_date_yyyymmdd,
                             end_date=market_date_yyyymmdd,
