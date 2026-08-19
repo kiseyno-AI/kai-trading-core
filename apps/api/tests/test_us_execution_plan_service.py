@@ -5,7 +5,7 @@ from app.orders.execution_handoff_contract import EXECUTION_PLAN_DISPATCH_SCHEMA
 from app.us_equities.execution_plan_service import USExecutionPlanService
 
 
-def _row(symbol: str, *, action: str = 'buy', warnings=None, confidence=8.0) -> dict:
+def _row(symbol: str, *, action: str = 'buy', warnings=None, confidence=8.0, risk_flags=None) -> dict:
     return {
         'feedback_id': 101,
         'run_id': 'us-run-1',
@@ -22,13 +22,14 @@ def _row(symbol: str, *, action: str = 'buy', warnings=None, confidence=8.0) -> 
             'role': 'signal-decider',
             'agent_name': 'signal-decider',
             'symbol': symbol,
+            'market_date': '2026-08-19',
             'next_day_open_action': action,
             'preferred_action': action,
             'target_price': 60.0,
             'stop_loss_price': 45.0,
             'confidence_score_10': confidence,
             'data_quality_warnings': list(warnings or []),
-            'risk_flags': [],
+            'risk_flags': list(risk_flags or []),
         },
     }
 
@@ -84,6 +85,29 @@ def test_rejects_wait_low_confidence_and_data_warning_before_exec_feedback() -> 
         'confidence_below_threshold',
         'agent_data_quality_warning',
     ]
+
+
+def test_rejects_structurally_mismatched_agent_feedback() -> None:
+    row = _row('AAPL', risk_flags=['symbol_mismatch'])
+    row['normalized_feedback_payload']['symbol'] = 'MSFT'
+    service = USExecutionPlanService(feedback_loader=lambda **kwargs: [row])
+
+    result = service.build(source_market_date=date(2026, 8, 19), agent_run_id='us-run-1')
+
+    assert result['status'] == 'empty'
+    assert result['rejections'] == [{'symbol': 'AAPL', 'reason': 'agent_structural_mismatch'}]
+
+
+def test_execution_plan_identity_is_stable_per_run_and_distinct_across_reruns() -> None:
+    service = USExecutionPlanService(feedback_loader=lambda **kwargs: [_row('AAPL')])
+
+    first = service.build(source_market_date=date(2026, 8, 19), agent_run_id='us-run-1')
+    retry = service.build(source_market_date=date(2026, 8, 19), agent_run_id='us-run-1')
+    rerun = service.build(source_market_date=date(2026, 8, 19), agent_run_id='us-run-2')
+
+    assert first['payload']['plan_id'] == retry['payload']['plan_id']
+    assert first['payload']['plan_id'] != rerun['payload']['plan_id']
+    assert len(first['payload']['plan_id']) <= 128
 
 
 def test_dispatch_defaults_to_preview_without_calling_exec() -> None:

@@ -91,6 +91,47 @@ class USSECFundamentalTests(unittest.TestCase):
 
         self.assertTrue(snapshot.metrics.has_bankruptcy_or_delinquency_flag)
 
+    def test_ttm_prefers_ytd_10q_facts_over_same_accession_standalone_quarter(self):
+        companyfacts = {'facts': {'us-gaap': {
+            'RevenueFromContractWithCustomerExcludingAssessedTax': {'units': {'USD': [
+                {
+                    'start': '2024-01-01', 'end': '2024-12-31', 'val': 1000, 'accn': 'annual',
+                    'fy': 2024, 'fp': 'FY', 'form': '10-K', 'filed': '2025-02-20',
+                },
+                {
+                    'start': '2024-04-01', 'end': '2024-06-30', 'val': 270, 'accn': 'prior-q2',
+                    'fy': 2024, 'fp': 'Q2', 'form': '10-Q', 'filed': '2024-08-01',
+                },
+                {
+                    'start': '2024-01-01', 'end': '2024-06-30', 'val': 500, 'accn': 'prior-q2',
+                    'fy': 2024, 'fp': 'Q2', 'form': '10-Q', 'filed': '2024-08-01',
+                },
+                {
+                    'start': '2025-04-01', 'end': '2025-06-30', 'val': 320, 'accn': 'current-q2',
+                    'fy': 2025, 'fp': 'Q2', 'form': '10-Q', 'filed': '2025-08-01',
+                },
+                {
+                    'start': '2025-01-01', 'end': '2025-06-30', 'val': 600, 'accn': 'current-q2',
+                    'fy': 2025, 'fp': 'Q2', 'form': '10-Q', 'filed': '2025-08-01',
+                },
+            ]}},
+        }}}
+        submissions = {'filings': {'recent': {
+            'accessionNumber': ['current-q2'],
+            'filingDate': ['2025-08-01'],
+            'reportDate': ['2025-06-30'],
+            'form': ['10-Q'],
+            'items': [''],
+        }}}
+
+        snapshot = parse_sec_fundamental_snapshot(
+            symbol='YTD', cik='0000000003', companyfacts=companyfacts, submissions=submissions,
+            market_date=date(2025, 8, 2),
+        )
+
+        self.assertIsNotNone(snapshot)
+        self.assertEqual(snapshot.revenue_usd, Decimal('1100'))
+
 
 if __name__ == '__main__':
     unittest.main()

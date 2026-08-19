@@ -112,7 +112,7 @@ def _ttm_value(entries: list[dict[str, Any]]) -> Decimal | None:
         return None
     latest_interim = max(
         (row for row in periodic if row['_form'].startswith('10-Q') and row['_end'] > latest_annual['_end']),
-        key=lambda row: (row['_end'], row['_filed']),
+        key=lambda row: (row['_end'], row['_filed'], _duration_days(row) or -1),
         default=None,
     )
     if latest_interim is None:
@@ -134,7 +134,11 @@ def _ttm_value(entries: list[dict[str, Any]]) -> Decimal | None:
             or abs((_duration_days(row) or 0) - current_duration) <= 35
         )
     ]
-    prior_interim = max(comparable, key=lambda row: (row['_end'], row['_filed']), default=None)
+    prior_interim = max(
+        comparable,
+        key=lambda row: (row['_end'], row['_filed'], _duration_days(row) or -1),
+        default=None,
+    )
     if prior_interim is None:
         return latest_annual['_value']
     return latest_annual['_value'] + latest_interim['_value'] - prior_interim['_value']

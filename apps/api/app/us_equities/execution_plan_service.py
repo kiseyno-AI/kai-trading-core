@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_UP
 from typing import Any, Callable
@@ -14,6 +15,13 @@ from app.orders.execution_handoff_contract import (
 )
 from app.repositories.us_equity_repository import load_us_signal_feedback
 from app.us_equities.kis_market_codes import to_kis_order_exchange
+
+
+STRUCTURAL_AGENT_RISK_FLAGS = {
+    'role_mismatch',
+    'symbol_mismatch',
+    'market_date_mismatch',
+}
 
 
 def _decimal(value: object) -> Decimal | None:
@@ -148,7 +156,12 @@ class USExecutionPlanService:
                 ]
             )
 
-        plan_id = f"core-us-signal-decider-{resolved_target.strftime('%Y%m%d')}-kis"
+        run_identity = (
+            hashlib.sha256(agent_run_id.encode('utf-8')).hexdigest()[:12]
+            if agent_run_id
+            else 'preview'
+        )
+        plan_id = f"core-us-signal-decider-{resolved_target.strftime('%Y%m%d')}-kis-{run_identity}"
         payload = serialize_execution_plan_dispatch_payload(
             {
                 'plan_id': plan_id,
@@ -209,10 +222,22 @@ class USExecutionPlanService:
         *,
         source_market_date: date,
     ) -> tuple[dict[str, Any] | None, str | None]:
-        del source_market_date
         feedback = row.get('normalized_feedback_payload')
         if not isinstance(feedback, dict):
             return None, 'missing_signal_feedback'
+        risk_flags = {
+            str(value).strip().lower()
+            for value in feedback.get('risk_flags') or []
+            if str(value).strip()
+        }
+        structurally_valid = (
+            str(feedback.get('role') or '').strip().lower() == 'signal-decider'
+            and str(feedback.get('symbol') or '').strip().upper() == str(row.get('symbol') or '').strip().upper()
+            and str(feedback.get('market_date') or '').strip() == source_market_date.isoformat()
+            and not (risk_flags & STRUCTURAL_AGENT_RISK_FLAGS)
+        )
+        if not structurally_valid:
+            return None, 'agent_structural_mismatch'
         if str(feedback.get('next_day_open_action') or feedback.get('preferred_action') or '').lower() != 'buy':
             return None, 'agent_action_not_buy'
         if feedback.get('data_quality_warnings'):
