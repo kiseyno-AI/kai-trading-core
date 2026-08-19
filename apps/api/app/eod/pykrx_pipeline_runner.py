@@ -738,7 +738,9 @@ def _run_daily_signal_decider_evaluation_followup(*, market_date: str, enabled: 
     return signal_decider_evaluation_maintenance_service.refresh_recent_coverage(
         as_of_market_date=market_date,
         refresh_calendar=True,
-        calendar_lookback_days=0,
+        # Cover the longest 10-session outcome horizon plus weekends/holidays
+        # without rebuilding the full 30-day evaluation window every day.
+        calendar_lookback_days=21,
         trigger='eod_pykrx_followup',
     )
 

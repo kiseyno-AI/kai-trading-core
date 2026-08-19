@@ -12,7 +12,7 @@ from sqlalchemy import func, select
 
 from app.core.audit_logging import log_fetch_event
 from app.core.settings import settings
-from app.brokers.kis.provider import kis_client
+from app.brokers.kis.provider import kis_real_client
 from app.db import session_scope
 from app.db_models import DailyPriceBar, DailyPykrxEnrichmentRow, Symbol
 from app.eod.pykrx_import import import_pykrx_stock, suppress_pykrx_login_env
@@ -474,12 +474,12 @@ class PykrxEnrichmentService:
             for symbol in symbols:
                 try:
                     if category == 'investor_flow_symbol':
-                        response = await kis_client.fetch_domestic_investor_trade_daily(
+                        response = await kis_real_client.fetch_domestic_investor_trade_daily(
                             symbol,
                             trade_date=market_date_yyyymmdd,
                         )
                     else:
-                        response = await kis_client.fetch_domestic_daily_short_sale(
+                        response = await kis_real_client.fetch_domestic_daily_short_sale(
                             symbol,
                             start_date=market_date_yyyymmdd,
                             end_date=market_date_yyyymmdd,
@@ -523,7 +523,18 @@ class PykrxEnrichmentService:
                     errors.append({'symbol': symbol, 'error': str(exc)})
             return rows, errors
 
-        rows, errors = asyncio.run(collect())
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            rows, errors = asyncio.run(collect())
+        else:
+            # This synchronous collector is also reached from async FastAPI
+            # execution paths. Run its coroutine on a dedicated loop/thread
+            # instead of nesting asyncio.run() in the request loop.
+            from concurrent.futures import ThreadPoolExecutor
+
+            with ThreadPoolExecutor(max_workers=1, thread_name_prefix='kis-enrichment') as executor:
+                rows, errors = executor.submit(lambda: asyncio.run(collect())).result()
         return rows, {
             'provider': 'kis_open_api',
             'category': category,

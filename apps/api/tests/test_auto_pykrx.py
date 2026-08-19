@@ -110,7 +110,7 @@ class _FakeDailyPipelineRunStateService:
 
 
 class PykrxBackfillServiceTests(TestCase):
-    def test_daily_signal_decider_evaluation_refreshes_only_today_calendar(self) -> None:
+    def test_daily_signal_decider_evaluation_refreshes_maturing_calendar_window(self) -> None:
         with patch(
             'app.agent_context.signal_decider_evaluation_maintenance_service.'
             'signal_decider_evaluation_maintenance_service.refresh_recent_coverage',
@@ -125,7 +125,7 @@ class PykrxBackfillServiceTests(TestCase):
         refresh_recent_coverage.assert_called_once_with(
             as_of_market_date='2026-08-19',
             refresh_calendar=True,
-            calendar_lookback_days=0,
+            calendar_lookback_days=21,
             trigger='eod_pykrx_followup',
         )
 

@@ -607,7 +607,7 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
 
 
 class KisCandidateFallbackTests(unittest.TestCase):
-    @patch('app.eod.pykrx_enrichment.kis_client.fetch_domestic_investor_trade_daily', new_callable=AsyncMock)
+    @patch('app.eod.pykrx_enrichment.kis_real_client.fetch_domestic_investor_trade_daily', new_callable=AsyncMock)
     def test_candidate_fallback_maps_kis_investor_flow(self, fetch_mock):
         fetch_mock.return_value = {
             'output2': [{
@@ -629,7 +629,7 @@ class KisCandidateFallbackTests(unittest.TestCase):
         self.assertEqual(rows[0]['source'], 'kis_open_api')
         self.assertEqual(rows[0]['payload']['investor_groups']['외국인']['net_volume'], 10)
 
-    @patch('app.eod.pykrx_enrichment.kis_client.fetch_domestic_daily_short_sale', new_callable=AsyncMock)
+    @patch('app.eod.pykrx_enrichment.kis_real_client.fetch_domestic_daily_short_sale', new_callable=AsyncMock)
     def test_candidate_fallback_keeps_unavailable_short_balance_explicit(self, fetch_mock):
         fetch_mock.return_value = {'output2': [{
             'stck_bsop_date': '20260819', 'ssts_cntg_qty': '123', 'stnd_vol_smtn': '1000',
@@ -643,6 +643,21 @@ class KisCandidateFallbackTests(unittest.TestCase):
         )
         self.assertEqual(rows[0]['payload']['short_volume']['short_volume'], 123)
         self.assertEqual(rows[0]['payload']['missing_fields'], ['short_balance'])
+
+
+class KisCandidateFallbackAsyncContextTests(unittest.IsolatedAsyncioTestCase):
+    @patch('app.eod.pykrx_enrichment.kis_real_client.fetch_domestic_investor_trade_daily', new_callable=AsyncMock)
+    async def test_candidate_fallback_is_safe_inside_running_event_loop(self, fetch_mock):
+        fetch_mock.return_value = {'output2': [{'stck_bsop_date': '20260819'}]}
+
+        rows, details = PykrxEnrichmentService()._collect_kis_candidate_fallback_rows(
+            category='investor_flow_symbol', market_date_iso='2026-08-19',
+            market_date_yyyymmdd='20260819', symbols=['004370'],
+            symbol_meta={'004370': {'market': 'KOSPI', 'name_ko': '농심'}},
+        )
+
+        self.assertEqual(details['rows_prepared'], 1)
+        self.assertEqual(rows[0]['source'], 'kis_open_api')
 
 
 if __name__ == '__main__':
