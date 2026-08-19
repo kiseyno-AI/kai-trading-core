@@ -738,6 +738,7 @@ def _run_daily_signal_decider_evaluation_followup(*, market_date: str, enabled: 
     return signal_decider_evaluation_maintenance_service.refresh_recent_coverage(
         as_of_market_date=market_date,
         refresh_calendar=True,
+        calendar_lookback_days=0,
         trigger='eod_pykrx_followup',
     )
 

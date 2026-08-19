@@ -21,8 +21,16 @@ from app.agent_context.signal_decider_loop_service import (
     _resolve_review_horizons,
     signal_decider_loop_service,
 )
-from app.db import session_scope
+from app.core.settings import settings
+from app.db import session_scope as _base_session_scope
 from app.db_models import SignalDeciderCalendarReviewItem, SignalDeciderCalendarReviewRun
+
+
+def session_scope():
+    return _base_session_scope(
+        statement_timeout_ms=settings.signal_decider_db_statement_timeout_ms,
+        lock_timeout_ms=settings.signal_decider_db_lock_timeout_ms,
+    )
 
 
 def _serialize_run_row(row: SignalDeciderCalendarReviewRun) -> dict[str, Any]:
