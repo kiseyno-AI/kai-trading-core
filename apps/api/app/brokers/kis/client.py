@@ -7,6 +7,7 @@ import httpx
 
 from app.core.audit_logging import request_with_audit
 from app.core.settings import settings
+from app.us_equities.kis_market_codes import to_kis_price_exchange
 
 
 class KISClientError(RuntimeError):
@@ -386,6 +387,143 @@ class KISClient:
                 'fid_cond_mrkt_div_code': market_code,
                 'fid_input_iscd': symbol,
             },
+        )
+
+    async def fetch_overseas_quote(self, *, exchange: str, symbol: str) -> dict[str, Any]:
+        normalized_symbol = symbol.strip().upper()
+        if not normalized_symbol:
+            raise ValueError('symbol is required')
+        return await self._get(
+            '/uapi/overseas-price/v1/quotations/price',
+            tr_id='HHDFS00000300',
+            params={
+                'AUTH': '',
+                'EXCD': to_kis_price_exchange(exchange),
+                'SYMB': normalized_symbol,
+            },
+        )
+
+    async def fetch_overseas_quote_detail(self, *, exchange: str, symbol: str) -> dict[str, Any]:
+        normalized_symbol = symbol.strip().upper()
+        if not normalized_symbol:
+            raise ValueError('symbol is required')
+        return await self._get(
+            '/uapi/overseas-price/v1/quotations/price-detail',
+            tr_id='HHDFS76200200',
+            params={
+                'AUTH': '',
+                'EXCD': to_kis_price_exchange(exchange),
+                'SYMB': normalized_symbol,
+            },
+        )
+
+    async def fetch_overseas_daily_prices(
+        self,
+        *,
+        exchange: str,
+        symbol: str,
+        as_of_date: str = '',
+        adjusted: bool = True,
+    ) -> dict[str, Any]:
+        normalized_symbol = symbol.strip().upper()
+        if not normalized_symbol:
+            raise ValueError('symbol is required')
+        return await self._get(
+            '/uapi/overseas-price/v1/quotations/dailyprice',
+            tr_id='HHDFS76240000',
+            params={
+                'AUTH': '',
+                'EXCD': to_kis_price_exchange(exchange),
+                'SYMB': normalized_symbol,
+                'GUBN': '0',
+                'BYMD': as_of_date.strip(),
+                'MODP': '1' if adjusted else '0',
+            },
+        )
+
+    async def _fetch_overseas_ranking(
+        self,
+        *,
+        path: str,
+        tr_id: str,
+        params: dict[str, Any],
+        max_pages: int,
+    ) -> dict[str, Any]:
+        rows: list[dict[str, Any]] = []
+        summaries: list[dict[str, Any]] = []
+        raw_pages: list[dict[str, Any]] = []
+        tr_cont = ''
+        continuation_pending = False
+        request_params = {**params, 'KEYB': str(params.get('KEYB') or ''), 'AUTH': str(params.get('AUTH') or '')}
+        for _ in range(max_pages):
+            body, response_tr_cont = await self._get_response(
+                path,
+                tr_id=tr_id,
+                params=request_params,
+                tr_cont=tr_cont,
+            )
+            raw_pages.append(body)
+            output1 = body.get('output1')
+            if isinstance(output1, dict):
+                summaries.append(output1)
+            elif isinstance(output1, list):
+                summaries.extend(item for item in output1 if isinstance(item, dict))
+            output2 = body.get('output2')
+            if isinstance(output2, dict):
+                rows.append(output2)
+            elif isinstance(output2, list):
+                rows.extend(item for item in output2 if isinstance(item, dict))
+            request_params['KEYB'] = str(body.get('keyb') or body.get('KEYB') or '')
+            continuation_pending = response_tr_cont in {'M', 'F'}
+            if not continuation_pending:
+                break
+            tr_cont = 'N'
+        return {
+            'output1': summaries,
+            'output2': rows,
+            'page_count': len(raw_pages),
+            'max_pages_reached': continuation_pending and len(raw_pages) >= max_pages,
+            'raw_pages': raw_pages,
+        }
+
+    async def fetch_overseas_market_cap_ranking(
+        self,
+        *,
+        exchange: str,
+        volume_range: str = '0',
+        max_pages: int = 10,
+    ) -> dict[str, Any]:
+        return await self._fetch_overseas_ranking(
+            path='/uapi/overseas-stock/v1/ranking/market-cap',
+            tr_id='HHDFS76350100',
+            params={
+                'EXCD': to_kis_price_exchange(exchange),
+                'VOL_RANG': volume_range,
+            },
+            max_pages=max_pages,
+        )
+
+    async def fetch_overseas_trading_value_ranking(
+        self,
+        *,
+        exchange: str,
+        period_code: str = '5',
+        volume_range: str = '0',
+        minimum_price: str = '5',
+        maximum_price: str = '',
+        max_pages: int = 10,
+    ) -> dict[str, Any]:
+        return await self._fetch_overseas_ranking(
+            path='/uapi/overseas-stock/v1/ranking/trade-pbmn',
+            tr_id='HHDFS76320010',
+            params={
+                'EXCD': to_kis_price_exchange(exchange),
+                'NDAY': period_code,
+                'VOL_RANG': volume_range,
+                'PRC1': minimum_price,
+                'PRC2': maximum_price,
+            },
+            max_pages=max_pages,
         )
 
     async def fetch_domestic_orderbook(self, symbol: str, market_code: str = 'J') -> dict:

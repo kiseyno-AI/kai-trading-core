@@ -1,3 +1,4 @@
+from decimal import Decimal
 from typing import Optional
 
 from pydantic import AliasChoices, Field
@@ -76,6 +77,12 @@ class Settings(BaseSettings):
     kis_realtime_mock_ws_url: str = 'ws://ops.koreainvestment.com:31000'
     kis_realtime_reconnect_base_delay_seconds: float = 3.0
     kis_realtime_reconnect_max_delay_seconds: float = 30.0
+    us_equity_price_prefilter_cap: int = Field(default=600, ge=50, le=3000)
+    us_equity_ranking_max_pages: int = Field(default=3, ge=1, le=20)
+    us_equity_history_max_pages: int = Field(default=4, ge=1, le=10)
+    us_equity_history_concurrency: int = Field(default=2, ge=1, le=10)
+    us_equity_history_request_pause_seconds: float = Field(default=0.12, ge=0, le=5)
+    us_equity_sec_concurrency: int = Field(default=8, ge=1, le=10)
     kis_order_reconcile_enabled: bool = True
     kis_order_reconcile_startup_enabled: bool = True
     kis_order_reconcile_on_reconnect_enabled: bool = True
@@ -107,6 +114,17 @@ class Settings(BaseSettings):
     signal_decider_exec_dispatch_source: str = 'kai-trading-core'
     signal_decider_exec_runtime_mode: str = 'mock'
     signal_decider_exec_request_timeout_seconds: float = 10.0
+    us_equity_execution_enabled: bool = False
+    us_equity_exec_max_candidates: int = Field(default=10, ge=1, le=80)
+    us_equity_exec_per_symbol_budget_usd: Decimal = Field(default=Decimal('100'), gt=0)
+    us_equity_exec_min_confidence_score_10: float = Field(default=7.0, ge=1, le=10)
+    us_equity_exec_min_reward_risk_ratio: float = Field(default=1.5, gt=0, le=10)
+    us_equity_exec_limit_buffer_pct: Decimal = Field(default=Decimal('0.50'), ge=0, le=5)
+    us_equity_auto_pipeline_enabled: bool = False
+    us_equity_auto_pipeline_local_time: str = '18:00'
+    us_equity_auto_pipeline_interval_seconds: int = Field(default=60, ge=15, le=3600)
+    us_equity_auto_pipeline_exec_dry_run: bool = True
+    us_equity_auto_pipeline_stale_after_minutes: int = Field(default=180, ge=30, le=1440)
     signal_decider_exec_dashboard_cache_ttl_seconds: int = 5
     signal_decider_exec_dashboard_refresh_debounce_seconds: float = 15.0
     signal_decider_exec_dashboard_refresh_timeout_seconds: float = 2.0
@@ -168,6 +186,22 @@ class Settings(BaseSettings):
     dart_fundamentals_stale_run_minutes: int = 60
     dart_fundamentals_daily_initial_backfill_enabled: bool = False
     dart_fundamentals_daily_incremental_lookback_days: int = 45
+
+    sec_edgar_user_agent: str = ''
+    sec_edgar_data_base_url: str = 'https://data.sec.gov'
+    sec_edgar_www_base_url: str = 'https://www.sec.gov'
+    sec_edgar_request_timeout_seconds: float = 20.0
+    sec_edgar_requests_per_second: float = Field(default=8.0, gt=0, le=10)
+
+    nasdaq_trader_base_url: str = 'https://www.nasdaqtrader.com'
+    nasdaq_trader_request_timeout_seconds: float = 20.0
+    us_equity_universe_min_nasdaq_rows: int = 1_000
+    us_equity_universe_min_kis_rows: int = 1_000
+    us_equity_universe_min_sec_rows: int = 1_000
+    us_equity_universe_min_integrated_rows: int = 100
+
+    kis_overseas_master_base_url: str = 'https://new.real.download.dws.co.kr'
+    kis_overseas_master_request_timeout_seconds: float = 30.0
 
     eod_auto_pykrx_enabled: bool = True
     eod_auto_pykrx_poll_seconds: int = 60

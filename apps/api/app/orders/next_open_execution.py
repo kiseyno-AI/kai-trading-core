@@ -9,7 +9,7 @@ import json
 import logging
 from typing import Any, Callable, Sequence
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import defer
 
 from app.agent_context.decision_input_quality import build_decision_input_quality_envelope
@@ -1969,9 +1969,17 @@ class SignalDeciderNextOpenExecutionService:
                     ),
                     SignalDeciderDecisionSnapshot.market_date == source_market_date,
                     or_(
-                        SignalDeciderDecisionSnapshot.next_day_open_action == 'buy',
-                        SignalDeciderDecisionSnapshot.decision_action == 'buy',
-                        SignalDeciderDecisionSnapshot.decision_action.in_(list(SHORT_TERM_ACTIONABLE_ACTIONS)),
+                        SignalDeciderDecisionSnapshot.agent_name == SIGNAL_DECIDER_AGENT_NAME,
+                        and_(
+                            SignalDeciderDecisionSnapshot.agent_name == SHORT_TERM_DECIDER_AGENT_NAME,
+                            or_(
+                                SignalDeciderDecisionSnapshot.next_day_open_action == 'buy',
+                                SignalDeciderDecisionSnapshot.decision_action == 'buy',
+                                SignalDeciderDecisionSnapshot.decision_action.in_(
+                                    list(SHORT_TERM_ACTIONABLE_ACTIONS)
+                                ),
+                            ),
+                        ),
                     ),
                 )
                 .subquery()

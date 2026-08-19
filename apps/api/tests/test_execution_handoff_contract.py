@@ -8,6 +8,7 @@ from app.orders.exec_integration import SignalDeciderExecIntegrationService
 from app.orders.execution_handoff_contract import (
     EXEC_AGENT_DECIDER_HANDOFF_SCHEMA_VERSION,
     EXECUTION_PLAN_DISPATCH_SCHEMA_VERSION,
+    LEGACY_EXECUTION_PLAN_DISPATCH_SCHEMA_VERSION,
     EXECUTION_RUNTIME_DASHBOARD_READ_MODEL_SCHEMA_VERSION,
     EXECUTION_RUNTIME_TODAY_ACTIVITY_SCHEMA_VERSION,
     PORTFOLIO_SUMMARY_READ_MODEL_SOURCE,
@@ -24,6 +25,46 @@ from app.orders.execution_handoff_contract import (
 
 class ExecutionHandoffContractTests(unittest.TestCase):
     maxDiff = None
+
+    def _dispatch_payload(self, *, schema_version: str, item: dict) -> dict:
+        return {
+            'plan_id': 'test-plan',
+            'source': 'test',
+            'mode': 'mock',
+            'market_date': '2026-08-19',
+            'strategy_run_id': 'test-run',
+            'requested_at': '2026-08-19T00:00:00+00:00',
+            'items': [{
+                'core_item_key': 'item-1',
+                'agent_name': 'signal-decider',
+                'decision_agent_name': 'signal-decider',
+                'symbol': '005930',
+                'side': 'buy',
+                'intent': 'next_open_buy',
+                'quantity_policy': {'type': 'fixed_quantity', 'quantity': '1'},
+                'risk_context': {},
+                'decision_snapshot_id': '1',
+                **item,
+            }],
+            'metadata': {'schema_version': schema_version},
+        }
+
+    def test_v2_krx_dispatch_is_backfilled_for_compatibility(self) -> None:
+        payload = serialize_execution_plan_dispatch_payload(
+            self._dispatch_payload(schema_version=LEGACY_EXECUTION_PLAN_DISPATCH_SCHEMA_VERSION, item={})
+        )
+
+        item = payload['items'][0]
+        self.assertEqual((item['market'], item['exchange'], item['currency']), ('KRX', 'KRX', 'KRW'))
+
+    def test_v3_us_dispatch_rejects_missing_routing_fields(self) -> None:
+        with self.assertRaisesRegex(ValueError, 'missing routing fields'):
+            serialize_execution_plan_dispatch_payload(
+                self._dispatch_payload(
+                    schema_version=EXECUTION_PLAN_DISPATCH_SCHEMA_VERSION,
+                    item={'symbol': 'AAPL', 'market': 'US', 'currency': 'USD'},
+                )
+            )
 
     def _runtime(self, *, status: str = 'ready') -> dict:
         return {
@@ -306,6 +347,12 @@ class ExecutionHandoffContractTests(unittest.TestCase):
                         'agent_name': 'signal-decider',
                         'decision_agent_name': 'signal-decider',
                         'symbol': '005930',
+                        'asset_class': 'stock',
+                        'market': 'KRX',
+                        'exchange': 'KRX',
+                        'currency': 'KRW',
+                        'broker': 'kis',
+                        'session_policy': {'session': 'regular', 'timezone': 'Asia/Seoul', 'allow_extended_hours': False},
                         'side': 'buy',
                         'intent': 'next_open_buy',
                         'quantity_policy': {'type': 'exec_agent_sized', 'budget_krw': '1500000'},
@@ -324,6 +371,12 @@ class ExecutionHandoffContractTests(unittest.TestCase):
                         'agent_name': 'signal-decider',
                         'decision_agent_name': 'signal-decider',
                         'symbol': '005930',
+                        'asset_class': 'stock',
+                        'market': 'KRX',
+                        'exchange': 'KRX',
+                        'currency': 'KRW',
+                        'broker': 'kis',
+                        'session_policy': {'session': 'regular', 'timezone': 'Asia/Seoul', 'allow_extended_hours': False},
                         'side': 'sell',
                         'intent': 'target_sell',
                         'quantity_policy': {
@@ -341,6 +394,12 @@ class ExecutionHandoffContractTests(unittest.TestCase):
                         'agent_name': 'signal-decider',
                         'decision_agent_name': 'signal-decider',
                         'symbol': '005930',
+                        'asset_class': 'stock',
+                        'market': 'KRX',
+                        'exchange': 'KRX',
+                        'currency': 'KRW',
+                        'broker': 'kis',
+                        'session_policy': {'session': 'regular', 'timezone': 'Asia/Seoul', 'allow_extended_hours': False},
                         'side': 'sell',
                         'intent': 'stop_sell',
                         'quantity_policy': {
