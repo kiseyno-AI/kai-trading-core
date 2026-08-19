@@ -717,4 +717,19 @@
 - KIS balance inquiry
 - KIS account positions
 
+## US equity universe notes
+- `POST /us-equities/universe/refresh` builds the US execution universe from three official sources: Nasdaq Trader `nasdaqlisted.txt` and `otherlisted.txt`, the public KIS overseas master archives for NASDAQ/NYSE/NYSE American, and the SEC ticker/CIK/exchange mapping.
+- The refresh excludes test issues, ETFs, abnormal Nasdaq financial statuses, unsupported exchanges and security types, ADRs, and securities that KIS does not expose as USD-denominated stock products. Every exclusion is returned with an explicit reason count.
+- Symbols with class-share separators are normalized to a canonical dot form for internal identity (`BRK.B`), while the exact KIS broker symbol (`BRK/B`) remains in `standard_code` and `source_payload` for order routing.
+- `SEC_EDGAR_USER_AGENT` is required and must identify the requester plus an administrative contact email. SEC traffic is rate-limited to at most 10 requests per second; the default is 8.
+- `persist=false` performs a read-only cross-source dry run. `persist=true` upserts active rows with `source=us_integrated_master` and deactivates missing symbols only within the three US execution markets.
+- `GET /us-equities/universe` reads the persisted active integrated universe and returns market, currency, exchange, SEC CIK, KIS symbol, and source provenance fields.
+- `POST /us-equities/prices/collect-and-screen` uses KIS market-cap/trading-value rankings to cap the expensive history phase at 600 symbols, stores adjusted USD OHLCV in the isolated `us_equity_price_bars` table, and retains at most 300 liquid/risk-screened candidates.
+- `POST /us-equities/fundamentals/collect-and-screen` requests SEC Companyfacts and Submissions only for the price shortlist, computes TTM revenue/operating cash flow/net income plus balance-sheet and dilution checks, and retains at most 150 candidates.
+- `POST /us-equities/agents/dispatch` builds a US-only context with USD, exchange, New York calendar, KIS price provenance, and SEC accession provenance. Role caps are 150/120/100/80/80 for EOD, technical, fundamental, short-term, and signal roles.
+- `POST /us-equities/execution-plans/dispatch` converts only validated US signal-decider buys into KIS handoff v3 entry/target/stop items. It defaults to `dry_run=true`; live transmission also requires `US_EQUITY_EXECUTION_ENABLED=true`, while exec applies its independent KIS US safety gates.
+- `US_EQUITY_AUTO_PIPELINE_ENABLED=true` starts an independent XNYS-calendar scheduler at `US_EQUITY_AUTO_PIPELINE_LOCAL_TIME` (default 18:00 America/New_York). It runs universe → prices → SEC fundamentals → agents → execution preview once per US session and does not depend on the KRX market clock. Execution remains preview-only by default.
+- `GET /us-equities/screening/{market_date}` exposes stored price/fundamental decisions and explicit exclusion reasons without mixing KRX factor cross-sections.
+- Core execution handoff schema `signal_decider_exec_plan_v3` requires `asset_class`, `market`, `exchange`, `currency`, `broker`, and `session_policy` for US items. Legacy v2 KRX items are backfilled, while incomplete US items fail closed.
+
 - Automatic daily EOD capture now chains into DART fundamentals daily refresh by default in environments where `DART_API_KEY` is configured, so price -> PyKRX enrichment -> technical -> action -> fundamentals -> filtering -> factor/scoring -> agent feedback can run as one daily cycle. The agent-feedback follow-up remains gated by `OPENCLAW_FEEDBACK_TRIGGER_AFTER_FUNDAMENTALS_REFRESH=true` plus same-day prerequisites for PyKRX enrichment, filtering, and factor/scoring completeness.

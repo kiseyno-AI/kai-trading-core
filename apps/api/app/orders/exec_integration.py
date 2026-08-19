@@ -73,6 +73,7 @@ from app.quotes.display_prices import (
 )
 from app.quotes.kis_realtime_prices import kis_realtime_price_service
 from app.repositories.symbol_repository import load_symbols
+from app.us_equities.kis_market_codes import to_kis_order_exchange
 
 INTEGRATION_MODE_DISABLED = 'disabled'
 INTEGRATION_MODE_OBSERVE = 'observe'
@@ -3181,6 +3182,42 @@ class SignalDeciderExecIntegrationService:
             snapshot = snapshots.get(int(row.decision_snapshot_id))
             row_decision_agent_name = _normalize_decision_agent_name(row.decision_agent_name)
             traceability = row.traceability_payload if isinstance(row.traceability_payload, dict) else {}
+            raw_market = _normalize_optional_text(traceability.get('market')) or 'KRX'
+            raw_exchange = _normalize_optional_text(traceability.get('exchange')) or raw_market
+            is_us_equity = raw_market.upper() in {'US', 'NASDAQ', 'NYSE', 'NYSE_AMERICAN'}
+            if is_us_equity:
+                canonical_exchange = (
+                    raw_exchange
+                    if raw_exchange.upper() in {'NASD', 'NYSE', 'AMEX'}
+                    else to_kis_order_exchange(raw_exchange)
+                )
+                execution_scope = {
+                    'asset_class': 'us_equity',
+                    'market': 'US',
+                    'exchange': canonical_exchange.upper(),
+                    'currency': 'USD',
+                    'broker': 'kis',
+                    'session_policy': traceability.get('session_policy')
+                    or {
+                        'session': 'regular',
+                        'timezone': 'America/New_York',
+                        'allow_extended_hours': False,
+                        'whole_shares_only': True,
+                    },
+                }
+            else:
+                execution_scope = {
+                    'asset_class': 'stock',
+                    'market': 'KRX',
+                    'exchange': 'KRX',
+                    'currency': 'KRW',
+                    'broker': 'kis',
+                    'session_policy': {
+                        'session': 'regular',
+                        'timezone': 'Asia/Seoul',
+                        'allow_extended_hours': False,
+                    },
+                }
             validation = row.validation_payload if isinstance(row.validation_payload, dict) else {}
             validation = _strip_signal_decider_fixed_sizing_preview(
                 validation,
@@ -3396,6 +3433,7 @@ class SignalDeciderExecIntegrationService:
                 'agent_name': row_decision_agent_name,
                 'decision_agent_name': row_decision_agent_name,
                 'symbol': row.symbol,
+                **execution_scope,
                 'side': 'buy',
                 'intent': entry_intent,
                 'handoff_intent': handoff_intent,
@@ -3461,6 +3499,7 @@ class SignalDeciderExecIntegrationService:
                         'agent_name': row_decision_agent_name,
                         'decision_agent_name': row_decision_agent_name,
                         'symbol': row.symbol,
+                        **execution_scope,
                         'side': 'sell',
                         'intent': EXEC_INTENT_TARGET_SELL,
                         'quantity_policy': target_quantity_policy,
@@ -3480,6 +3519,7 @@ class SignalDeciderExecIntegrationService:
                         'intent': EXEC_INTENT_TARGET_SELL,
                         'side': 'sell',
                         'symbol': row.symbol,
+                        **execution_scope,
                         'trigger_price': target_price,
                     }
                 )

@@ -1,4 +1,5 @@
 from datetime import date, datetime
+from decimal import Decimal
 
 from sqlalchemy import (
     JSON,
@@ -44,7 +45,13 @@ class Symbol(Base, TimestampMixin):
     symbol: Mapped[str] = mapped_column(String(32), unique=True, index=True, nullable=False)
     standard_code: Mapped[str | None] = mapped_column(String(32))
     name_ko: Mapped[str] = mapped_column(String(255), nullable=False)
+    name_en: Mapped[str | None] = mapped_column(String(255))
     market: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    country_code: Mapped[str | None] = mapped_column(String(2), index=True)
+    currency_code: Mapped[str | None] = mapped_column(String(3), index=True)
+    exchange_code: Mapped[str | None] = mapped_column(String(32), index=True)
+    regulatory_id: Mapped[str | None] = mapped_column(String(32), index=True)
+    source_payload: Mapped[dict] = mapped_column(MutableDict.as_mutable(JSON), nullable=False, default=dict)
     instrument_type: Mapped[str] = mapped_column(String(32), default='equity', nullable=False)
     source: Mapped[str] = mapped_column(String(32), default='app', nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
@@ -576,6 +583,117 @@ class DailyPriceBar(Base):
     dps: Mapped[float | None] = mapped_column(Numeric(18, 6))
     source: Mapped[str] = mapped_column(String(32), nullable=False, default='kis')
     captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class USMarketDataCollectionRun(Base, TimestampMixin):
+    __tablename__ = 'us_market_data_collection_runs'
+    __table_args__ = (
+        Index('ix_us_market_data_runs_date_status', 'market_date', 'status'),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    market_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default='running', index=True)
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default='kis')
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    universe_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    price_history_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    price_eligible_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    fundamental_eligible_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    error_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    summary_payload: Mapped[dict] = mapped_column(MutableDict.as_mutable(JSON), nullable=False, default=dict)
+
+
+class USEquityPriceBar(Base):
+    __tablename__ = 'us_equity_price_bars'
+    __table_args__ = (
+        UniqueConstraint('symbol_id', 'trade_date', 'source', name='uq_us_equity_price_bars_symbol_date_source'),
+        Index('ix_us_equity_price_bars_date_symbol', 'trade_date', 'symbol_id'),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol_id: Mapped[int] = mapped_column(ForeignKey('symbols.id', ondelete='CASCADE'), nullable=False, index=True)
+    collection_run_id: Mapped[int | None] = mapped_column(
+        ForeignKey('us_market_data_collection_runs.id', ondelete='SET NULL'),
+        index=True,
+    )
+    trade_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    open_price: Mapped[Decimal] = mapped_column(Numeric(20, 6), nullable=False)
+    high_price: Mapped[Decimal] = mapped_column(Numeric(20, 6), nullable=False)
+    low_price: Mapped[Decimal] = mapped_column(Numeric(20, 6), nullable=False)
+    close_price: Mapped[Decimal] = mapped_column(Numeric(20, 6), nullable=False)
+    volume: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    turnover_usd: Mapped[Decimal] = mapped_column(Numeric(24, 6), nullable=False)
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default='kis')
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class USEquityFundamentalSnapshot(Base, TimestampMixin):
+    __tablename__ = 'us_equity_fundamental_snapshots'
+    __table_args__ = (
+        UniqueConstraint('symbol_id', 'accession_number', name='uq_us_fundamentals_symbol_accession'),
+        Index('ix_us_fundamentals_filed_symbol', 'filed_date', 'symbol_id'),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol_id: Mapped[int] = mapped_column(ForeignKey('symbols.id', ondelete='CASCADE'), nullable=False, index=True)
+    cik: Mapped[str] = mapped_column(String(10), nullable=False, index=True)
+    accession_number: Mapped[str] = mapped_column(String(32), nullable=False)
+    form: Mapped[str] = mapped_column(String(16), nullable=False)
+    filed_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    period_end_date: Mapped[date | None] = mapped_column(Date)
+    fiscal_year: Mapped[int | None] = mapped_column(Integer)
+    fiscal_period: Mapped[str | None] = mapped_column(String(16))
+    revenue_usd: Mapped[Decimal | None] = mapped_column(Numeric(28, 6))
+    operating_cash_flow_usd: Mapped[Decimal | None] = mapped_column(Numeric(28, 6))
+    net_income_usd: Mapped[Decimal | None] = mapped_column(Numeric(28, 6))
+    assets_usd: Mapped[Decimal | None] = mapped_column(Numeric(28, 6))
+    liabilities_usd: Mapped[Decimal | None] = mapped_column(Numeric(28, 6))
+    equity_usd: Mapped[Decimal | None] = mapped_column(Numeric(28, 6))
+    shares_outstanding: Mapped[Decimal | None] = mapped_column(Numeric(28, 6))
+    source_payload: Mapped[dict] = mapped_column(MutableDict.as_mutable(JSON), nullable=False, default=dict)
+
+
+class USEquityScreeningSnapshot(Base, TimestampMixin):
+    __tablename__ = 'us_equity_screening_snapshots'
+    __table_args__ = (
+        UniqueConstraint('symbol_id', 'market_date', name='uq_us_equity_screening_symbol_date'),
+        Index('ix_us_screening_date_eligible_rank', 'market_date', 'eligible_for_agent', 'rank'),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol_id: Mapped[int] = mapped_column(ForeignKey('symbols.id', ondelete='CASCADE'), nullable=False, index=True)
+    collection_run_id: Mapped[int | None] = mapped_column(
+        ForeignKey('us_market_data_collection_runs.id', ondelete='SET NULL'),
+        index=True,
+    )
+    market_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    stage: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    eligible_for_agent: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, index=True)
+    rank: Mapped[int | None] = mapped_column(Integer)
+    composite_score: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
+    metrics_payload: Mapped[dict] = mapped_column(MutableDict.as_mutable(JSON), nullable=False, default=dict)
+    decision_payload: Mapped[dict] = mapped_column(MutableDict.as_mutable(JSON), nullable=False, default=dict)
+
+
+class USAgentFeedback(Base, TimestampMixin):
+    __tablename__ = 'us_agent_feedback'
+    __table_args__ = (
+        UniqueConstraint('market_date', 'symbol_id', 'agent_name', name='uq_us_agent_feedback_date_symbol_agent'),
+        Index('ix_us_agent_feedback_date_agent', 'market_date', 'agent_name'),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    market_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    symbol_id: Mapped[int] = mapped_column(ForeignKey('symbols.id', ondelete='CASCADE'), nullable=False, index=True)
+    agent_name: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    run_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default='completed', index=True)
+    context_payload: Mapped[dict] = mapped_column(MutableDict.as_mutable(JSON), nullable=False, default=dict)
+    response_payload: Mapped[dict] = mapped_column(MutableDict.as_mutable(JSON), nullable=False, default=dict)
+    normalized_feedback_payload: Mapped[dict] = mapped_column(MutableDict.as_mutable(JSON), nullable=False, default=dict)
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
 class DailyPriceContext(Base, TimestampMixin):

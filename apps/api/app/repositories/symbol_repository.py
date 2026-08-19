@@ -88,10 +88,19 @@ def _build_symbol_universe_rows(items: list, *, source: str, instrument_type: st
     for entry in items:
         symbol = _coerce_required_text(getattr(entry, 'symbol', None))
         market = _coerce_required_text(getattr(entry, 'market', None))
-        if symbol and symbol.isdigit():
-            symbol = symbol.zfill(6)
+        if symbol:
+            symbol = symbol.upper()
+            if symbol.isdigit():
+                symbol = symbol.zfill(6)
         name_ko = _coerce_optional_text(getattr(entry, 'name_ko', None)) or symbol
+        name_en = _coerce_optional_text(getattr(entry, 'name_en', None))
         standard_code = _coerce_optional_text(getattr(entry, 'standard_code', None))
+        country_code = _coerce_optional_text(getattr(entry, 'country_code', None))
+        currency_code = _coerce_optional_text(getattr(entry, 'currency_code', None))
+        exchange_code = _coerce_optional_text(getattr(entry, 'exchange_code', None))
+        regulatory_id = _coerce_optional_text(getattr(entry, 'regulatory_id', None))
+        raw_source_payload = getattr(entry, 'source_payload', None)
+        source_payload = raw_source_payload if isinstance(raw_source_payload, dict) else {}
         if not symbol or not market:
             skipped_items += 1
             logger.warning(
@@ -106,7 +115,13 @@ def _build_symbol_universe_rows(items: list, *, source: str, instrument_type: st
                 'symbol': symbol,
                 'standard_code': standard_code,
                 'name_ko': name_ko,
+                'name_en': name_en,
                 'market': market,
+                'country_code': country_code,
+                'currency_code': currency_code,
+                'exchange_code': exchange_code,
+                'regulatory_id': regulatory_id,
+                'source_payload': source_payload,
                 'instrument_type': instrument_type,
                 'source': source,
                 'is_active': True,
@@ -149,7 +164,13 @@ def upsert_symbol_universe(
                 set_={
                     'standard_code': statement.excluded.standard_code,
                     'name_ko': statement.excluded.name_ko,
+                    'name_en': statement.excluded.name_en,
                     'market': statement.excluded.market,
+                    'country_code': statement.excluded.country_code,
+                    'currency_code': statement.excluded.currency_code,
+                    'exchange_code': statement.excluded.exchange_code,
+                    'regulatory_id': statement.excluded.regulatory_id,
+                    'source_payload': statement.excluded.source_payload,
                     'instrument_type': statement.excluded.instrument_type,
                     'source': statement.excluded.source,
                     'is_active': statement.excluded.is_active,
@@ -206,7 +227,13 @@ def load_symbols(
             Symbol.symbol,
             Symbol.standard_code,
             Symbol.name_ko,
+            Symbol.name_en,
             Symbol.market,
+            Symbol.country_code,
+            Symbol.currency_code,
+            Symbol.exchange_code,
+            Symbol.regulatory_id,
+            Symbol.source_payload,
             Symbol.instrument_type,
             Symbol.source,
             Symbol.is_active,

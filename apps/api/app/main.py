@@ -27,6 +27,7 @@ from app.api.routes_symbols import router as symbols_router
 from app.api.routes_portfolio import router as portfolio_router
 from app.api.routes_trading_accounts import router as trading_accounts_router
 from app.api.routes_trading import router as trading_router
+from app.api.routes_us_equities import router as us_equities_router
 from app.agent_context.signal_decider_evaluation_maintenance_service import (
     signal_decider_evaluation_maintenance_service,
 )
@@ -48,6 +49,7 @@ from app.orders.portfolio_summary_service import portfolio_summary_service
 from app.orders.reconciliation import trading_order_reconciliation_service
 from app.orders.kis_realtime_order_notices import kis_realtime_order_notice_service
 from app.quotes.kis_realtime_prices import kis_realtime_price_service
+from app.us_equities.scheduler import us_equity_pipeline_scheduler
 from app.scanner.state import scanner_state
 
 configure_file_logging()
@@ -110,6 +112,8 @@ async def lifespan(_: FastAPI):
         startup_maintenance_task = asyncio.create_task(_run_startup_maintenance(), name='startup-maintenance')
     if settings.background_runner_enabled or settings.eod_auto_pykrx_enabled:
         await background_runner.start()
+    if settings.us_equity_auto_pipeline_enabled:
+        await us_equity_pipeline_scheduler.start()
     try:
         yield
     finally:
@@ -120,6 +124,7 @@ async def lifespan(_: FastAPI):
         await kis_realtime_price_service.stop()
         await kis_realtime_order_notice_service.stop()
         await db_pool_watchdog.stop()
+        await us_equity_pipeline_scheduler.stop()
         await background_runner.stop()
 
 
@@ -199,6 +204,7 @@ app.include_router(dart_router)
 app.include_router(external_news_router)
 app.include_router(agent_context_router)
 app.include_router(crypto_router)
+app.include_router(us_equities_router)
 
 
 @app.get('/health')

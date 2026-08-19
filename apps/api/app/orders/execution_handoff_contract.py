@@ -5,7 +5,8 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 EXECUTION_HANDOFF_CONTRACT_VERSION = 'execution_handoff_contract_v1'
-EXECUTION_PLAN_DISPATCH_SCHEMA_VERSION = 'signal_decider_exec_plan_v2'
+LEGACY_EXECUTION_PLAN_DISPATCH_SCHEMA_VERSION = 'signal_decider_exec_plan_v2'
+EXECUTION_PLAN_DISPATCH_SCHEMA_VERSION = 'signal_decider_exec_plan_v3'
 EXEC_AGENT_DECIDER_HANDOFF_SCHEMA_VERSION = 'exec_agent_decider_handoff_v1'
 EXECUTION_RUNTIME_DASHBOARD_READ_MODEL_SCHEMA_VERSION = 'execution_runtime_dashboard_read_model_v1'
 EXECUTION_RUNTIME_TODAY_ACTIVITY_SCHEMA_VERSION = 'execution_runtime_today_activity_v1'
@@ -299,6 +300,12 @@ class ExecutionPlanDispatchItemPayload(_ContractModel):
     agent_name: str
     decision_agent_name: str
     symbol: str
+    asset_class: str | None = None
+    market: str | None = None
+    exchange: str | None = None
+    currency: str | None = None
+    broker: str | None = None
+    session_policy: dict[str, Any] | None = None
     side: ExecutionDispatchItemSide
     intent: str
     quantity_policy: dict[str, Any]
@@ -391,7 +398,44 @@ def serialize_execution_symbol_detail_payload(payload: dict[str, Any]) -> dict[s
 
 
 def serialize_execution_plan_dispatch_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    return _dump(ExecutionPlanDispatchPayload, payload)
+    normalized = {**payload, 'items': [dict(item) for item in payload.get('items') or []]}
+    metadata = normalized.get('metadata') if isinstance(normalized.get('metadata'), dict) else {}
+    schema_version = str(metadata.get('schema_version') or LEGACY_EXECUTION_PLAN_DISPATCH_SCHEMA_VERSION)
+    required = ('asset_class', 'market', 'exchange', 'currency', 'broker', 'session_policy')
+    for item in normalized['items']:
+        market = str(item.get('market') or '').strip().upper()
+        currency = str(item.get('currency') or '').strip().upper()
+        is_us = market in {'US', 'NASDAQ', 'NYSE', 'NYSE_AMERICAN'} or currency == 'USD'
+        missing = [field for field in required if not item.get(field)]
+        if is_us and missing:
+            raise ValueError(f'US execution item is missing routing fields: {", ".join(missing)}')
+        if schema_version == LEGACY_EXECUTION_PLAN_DISPATCH_SCHEMA_VERSION and missing:
+            item.update(
+                {
+                    'asset_class': item.get('asset_class') or 'stock',
+                    'market': item.get('market') or 'KRX',
+                    'exchange': item.get('exchange') or 'KRX',
+                    'currency': item.get('currency') or 'KRW',
+                    'broker': item.get('broker') or 'kis',
+                    'session_policy': item.get('session_policy')
+                    or {
+                        'session': 'regular',
+                        'timezone': 'Asia/Seoul',
+                        'allow_extended_hours': False,
+                    },
+                }
+            )
+        elif missing:
+            raise ValueError(f'Execution item is missing routing fields: {", ".join(missing)}')
+        if str(item.get('broker') or '').lower() != 'kis':
+            raise ValueError('KIS execution handoff requires broker=kis')
+        if str(item.get('currency') or '').upper() == 'USD' and str(item.get('exchange') or '').upper() not in {
+            'NASD',
+            'NYSE',
+            'AMEX',
+        }:
+            raise ValueError('USD equity execution requires NASD, NYSE, or AMEX order exchange code')
+    return _dump(ExecutionPlanDispatchPayload, normalized)
 
 
 def serialize_exec_agent_decider_handoff_payload(payload: dict[str, Any]) -> dict[str, Any]:
