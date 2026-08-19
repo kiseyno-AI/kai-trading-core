@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+import asyncio
 from datetime import date, datetime
 import logging
 import time
@@ -11,6 +12,7 @@ from sqlalchemy import func, select
 
 from app.core.audit_logging import log_fetch_event
 from app.core.settings import settings
+from app.brokers.kis.client import KISClient
 from app.db import session_scope
 from app.db_models import DailyPriceBar, DailyPykrxEnrichmentRow, Symbol
 from app.eod.pykrx_import import import_pykrx_stock, suppress_pykrx_login_env
@@ -259,6 +261,7 @@ class PykrxEnrichmentService:
         markets: Sequence[str],
         symbols: Sequence[str] | None = None,
         categories: Sequence[str] | None = None,
+        allow_kis_candidate_fallback: bool = False,
     ) -> dict[str, Any]:
         market_date_iso = _normalize_iso_date(market_date)
         market_date_yyyymmdd = _normalize_yyyymmdd(market_date)
@@ -361,6 +364,27 @@ class PykrxEnrichmentService:
             else:  # pragma: no cover - guarded by validation
                 raise ValueError(f'Unsupported pykrx enrichment category: {category}')
 
+            if (
+                allow_kis_candidate_fallback
+                and normalized_symbols
+                and category in {'investor_flow_symbol', 'short_selling'}
+            ):
+                present_symbols = {
+                    _normalize_symbol(row.get('symbol') or row.get('scope_key'))
+                    for row in category_rows
+                }
+                missing_symbols = [symbol for symbol in normalized_symbols if symbol not in present_symbols]
+                if missing_symbols:
+                    kis_rows, kis_details = self._collect_kis_candidate_fallback_rows(
+                        category=category,
+                        market_date_iso=market_date_iso,
+                        market_date_yyyymmdd=market_date_yyyymmdd,
+                        symbols=missing_symbols,
+                        symbol_meta=symbol_meta,
+                    )
+                    category_rows.extend(kis_rows)
+                    details['kis_candidate_fallback'] = kis_details
+
             persisted_count = upsert_daily_pykrx_enrichment_rows(rows=category_rows)
             should_fallback = persisted_count <= 0 and (details.get('errors') or category in SYMBOL_ENRICHMENT_CATEGORIES)
             if (
@@ -433,6 +457,122 @@ class PykrxEnrichmentService:
             'status': status,
             'categories': category_results,
             'coverage': coverage,
+        }
+
+    def _collect_kis_candidate_fallback_rows(
+        self,
+        *,
+        category: str,
+        market_date_iso: str,
+        market_date_yyyymmdd: str,
+        symbols: Sequence[str],
+        symbol_meta: dict[str, dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        async def collect() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+            client = KISClient(use_mock=False)
+            rows: list[dict[str, Any]] = []
+            errors: list[dict[str, Any]] = []
+            for symbol in symbols:
+                try:
+                    if category == 'investor_flow_symbol':
+                        response = await client.fetch_domestic_investor_trade_daily(
+                            symbol,
+                            trade_date=market_date_yyyymmdd,
+                        )
+                    else:
+                        response = await client.fetch_domestic_daily_short_sale(
+                            symbol,
+                            start_date=market_date_yyyymmdd,
+                            end_date=market_date_yyyymmdd,
+                        )
+                    output_rows = response.get('output2') or response.get('output1') or []
+                    if isinstance(output_rows, dict):
+                        output_rows = [output_rows]
+                    record = next(
+                        (
+                            item for item in output_rows
+                            if isinstance(item, dict)
+                            and str(item.get('stck_bsop_date') or '') == market_date_yyyymmdd
+                        ),
+                        None,
+                    )
+                    if record is None:
+                        errors.append({'symbol': symbol, 'error': 'no_matching_trade_date'})
+                        continue
+                    symbol_info = symbol_meta.get(symbol) or {}
+                    payload = (
+                        self._build_kis_investor_flow_payload(record=record, market=symbol_info.get('market'))
+                        if category == 'investor_flow_symbol'
+                        else self._build_kis_short_selling_payload(record=record, market=symbol_info.get('market'))
+                    )
+                    rows.append(
+                        {
+                            'market_date': market_date_iso,
+                            'market': symbol_info.get('market'),
+                            'category': category,
+                            'scope_type': 'symbol',
+                            'scope_key': symbol,
+                            'source': 'kis_open_api',
+                            'symbol': symbol,
+                            'skip_symbol_upsert': True,
+                            'name_ko': symbol_info.get('name_ko') or symbol,
+                            'standard_code': symbol_info.get('standard_code'),
+                            'payload': payload,
+                        }
+                    )
+                except Exception as exc:  # noqa: BLE001 - preserve PyKRX partial data
+                    errors.append({'symbol': symbol, 'error': str(exc)})
+            return rows, errors
+
+        rows, errors = asyncio.run(collect())
+        return rows, {
+            'provider': 'kis_open_api',
+            'category': category,
+            'symbols_requested': list(symbols),
+            'rows_prepared': len(rows),
+            'errors': errors,
+        }
+
+    @staticmethod
+    def _build_kis_investor_flow_payload(*, record: dict[str, Any], market: str | None) -> dict[str, Any]:
+        groups = {
+            '개인': ('prsn',),
+            '외국인': ('frgn',),
+            '기관합계': ('orgn',),
+        }
+        investor_groups: dict[str, dict[str, int | None]] = {}
+        for label, (prefix,) in groups.items():
+            investor_groups[label] = {
+                'sell_volume': _to_int(record.get(f'{prefix}_seln_vol')),
+                'buy_volume': _to_int(record.get(f'{prefix}_shnu_vol')),
+                'net_volume': _to_int(record.get(f'{prefix}_ntby_qty')),
+                'sell_value': _to_int(record.get(f'{prefix}_seln_tr_pbmn')),
+                'buy_value': _to_int(record.get(f'{prefix}_shnu_tr_pbmn')),
+                'net_value': _to_int(record.get(f'{prefix}_ntby_tr_pbmn')),
+            }
+        return {
+            'market': market,
+            'window_start_date': str(record.get('stck_bsop_date') or ''),
+            'window_end_date': str(record.get('stck_bsop_date') or ''),
+            'investor_groups': investor_groups,
+            'provider': 'kis_open_api',
+        }
+
+    @staticmethod
+    def _build_kis_short_selling_payload(*, record: dict[str, Any], market: str | None) -> dict[str, Any]:
+        return {
+            'market': market,
+            'short_volume': {
+                'short_volume': _to_int(record.get('ssts_cntg_qty')),
+                'total_volume': _to_int(record.get('stnd_vol_smtn') or record.get('acml_vol')),
+                'short_volume_ratio_pct': _to_float(record.get('ssts_vol_rlim')),
+                'short_value': _to_int(record.get('ssts_tr_pbmn')),
+                'total_value': _to_int(record.get('stnd_tr_pbmn_smtn') or record.get('acml_tr_pbmn')),
+                'short_value_ratio_pct': _to_float(record.get('ssts_tr_pbmn_rlim')),
+            },
+            'short_balance': {},
+            'missing_fields': ['short_balance'],
+            'provider': 'kis_open_api',
         }
 
     def inspect(

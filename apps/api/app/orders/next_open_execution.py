@@ -1187,7 +1187,7 @@ class SignalDeciderNextOpenExecutionService:
             and _should_inspect_short_term_candidate_pykrx(enrichment_preflight)
         )
         candidate_enrichment_by_symbol = (
-            self._inspect_candidate_pykrx_enrichment(
+            self._repair_and_inspect_candidate_pykrx_enrichment(
                 source_market_date=source_market_date,
                 symbols=actionable_short_term_symbols,
                 categories=(
@@ -1810,6 +1810,49 @@ class SignalDeciderNextOpenExecutionService:
                 'source': 'candidate_symbol_pykrx_enrichment',
             }
         return result
+
+    def _repair_and_inspect_candidate_pykrx_enrichment(
+        self,
+        *,
+        source_market_date: date,
+        symbols: Sequence[str],
+        categories: Sequence[str],
+    ) -> dict[str, dict[str, Any]]:
+        initial = self._inspect_candidate_pykrx_enrichment(
+            source_market_date=source_market_date,
+            symbols=symbols,
+            categories=categories,
+        )
+        missing_categories = sorted(
+            {
+                category
+                for item in initial.values()
+                for category in (item.get('missing_categories') or [])
+                if category in {'investor_flow_symbol', 'short_selling'}
+            }
+        )
+        missing_symbols = sorted(
+            {
+                symbol
+                for symbol, item in initial.items()
+                if any(category in missing_categories for category in (item.get('missing_categories') or []))
+            }
+        )
+        if missing_symbols and missing_categories:
+            from app.eod.pykrx_enrichment import pykrx_enrichment_service
+
+            pykrx_enrichment_service.collect_for_market_date(
+                market_date=source_market_date,
+                markets=['KOSPI', 'KOSDAQ', 'KONEX'],
+                symbols=missing_symbols,
+                categories=missing_categories,
+                allow_kis_candidate_fallback=True,
+            )
+        return self._inspect_candidate_pykrx_enrichment(
+            source_market_date=source_market_date,
+            symbols=symbols,
+            categories=categories,
+        )
 
     def _apply_enrichment_preflight_to_validation(
         self,

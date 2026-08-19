@@ -549,6 +549,44 @@ class KISClient:
             },
         )
 
+    async def fetch_domestic_investor_trade_daily(
+        self,
+        symbol: str,
+        *,
+        trade_date: str,
+        market_code: str = 'J',
+    ) -> dict:
+        return await self._get(
+            '/uapi/domestic-stock/v1/quotations/investor-trade-by-stock-daily',
+            tr_id='FHPTJ04160001',
+            params={
+                'FID_COND_MRKT_DIV_CODE': market_code,
+                'FID_INPUT_ISCD': symbol,
+                'FID_INPUT_DATE_1': trade_date,
+                'FID_ORG_ADJ_PRC': '',
+                'FID_ETC_CLS_CODE': '',
+            },
+        )
+
+    async def fetch_domestic_daily_short_sale(
+        self,
+        symbol: str,
+        *,
+        start_date: str,
+        end_date: str,
+        market_code: str = 'J',
+    ) -> dict:
+        return await self._get(
+            '/uapi/domestic-stock/v1/quotations/daily-short-sale',
+            tr_id='FHPST04830000',
+            params={
+                'FID_COND_MRKT_DIV_CODE': market_code,
+                'FID_INPUT_ISCD': symbol,
+                'FID_INPUT_DATE_1': start_date,
+                'FID_INPUT_DATE_2': end_date,
+            },
+        )
+
     async def fetch_domestic_news_titles(
         self,
         *,

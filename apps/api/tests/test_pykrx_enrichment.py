@@ -1,6 +1,6 @@
 import unittest
 from copy import deepcopy
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pandas as pd
 
@@ -604,6 +604,45 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
         self.assertEqual(coverage['expected_rows'], 2)
         self.assertEqual(coverage['present_rows'], 2)
         self.assertEqual(coverage['coverage_ratio'], 1.0)
+
+
+class KisCandidateFallbackTests(unittest.TestCase):
+    @patch('app.eod.pykrx_enrichment.KISClient.fetch_domestic_investor_trade_daily', new_callable=AsyncMock)
+    def test_candidate_fallback_maps_kis_investor_flow(self, fetch_mock):
+        fetch_mock.return_value = {
+            'output2': [{
+                'stck_bsop_date': '20260819',
+                'prsn_seln_vol': '10', 'prsn_shnu_vol': '20', 'prsn_ntby_qty': '10',
+                'prsn_seln_tr_pbmn': '100', 'prsn_shnu_tr_pbmn': '200', 'prsn_ntby_tr_pbmn': '100',
+                'frgn_seln_vol': '30', 'frgn_shnu_vol': '40', 'frgn_ntby_qty': '10',
+                'frgn_seln_tr_pbmn': '300', 'frgn_shnu_tr_pbmn': '400', 'frgn_ntby_tr_pbmn': '100',
+                'orgn_seln_vol': '50', 'orgn_shnu_vol': '60', 'orgn_ntby_qty': '10',
+                'orgn_seln_tr_pbmn': '500', 'orgn_shnu_tr_pbmn': '600', 'orgn_ntby_tr_pbmn': '100',
+            }],
+        }
+        rows, details = PykrxEnrichmentService()._collect_kis_candidate_fallback_rows(
+            category='investor_flow_symbol', market_date_iso='2026-08-19',
+            market_date_yyyymmdd='20260819', symbols=['004370'],
+            symbol_meta={'004370': {'market': 'KOSPI', 'name_ko': '농심'}},
+        )
+        self.assertEqual(details['rows_prepared'], 1)
+        self.assertEqual(rows[0]['source'], 'kis_open_api')
+        self.assertEqual(rows[0]['payload']['investor_groups']['외국인']['net_volume'], 10)
+
+    @patch('app.eod.pykrx_enrichment.KISClient.fetch_domestic_daily_short_sale', new_callable=AsyncMock)
+    def test_candidate_fallback_keeps_unavailable_short_balance_explicit(self, fetch_mock):
+        fetch_mock.return_value = {'output2': [{
+            'stck_bsop_date': '20260819', 'ssts_cntg_qty': '123', 'stnd_vol_smtn': '1000',
+            'ssts_vol_rlim': '12.3', 'ssts_tr_pbmn': '456000',
+            'stnd_tr_pbmn_smtn': '5000000', 'ssts_tr_pbmn_rlim': '9.12',
+        }]}
+        rows, _ = PykrxEnrichmentService()._collect_kis_candidate_fallback_rows(
+            category='short_selling', market_date_iso='2026-08-19',
+            market_date_yyyymmdd='20260819', symbols=['004370'],
+            symbol_meta={'004370': {'market': 'KOSPI', 'name_ko': '농심'}},
+        )
+        self.assertEqual(rows[0]['payload']['short_volume']['short_volume'], 123)
+        self.assertEqual(rows[0]['payload']['missing_fields'], ['short_balance'])
 
 
 if __name__ == '__main__':

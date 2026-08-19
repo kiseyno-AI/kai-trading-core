@@ -3,7 +3,7 @@ from decimal import Decimal
 import json
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
 from sqlalchemy import delete
@@ -1701,3 +1701,36 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(refreshed_item['estimated_reference_price'], submitted_item['estimated_reference_price'])
         self.assertEqual(refreshed_item['planned_quantity'], submitted_item['planned_quantity'])
         self.assertEqual(refreshed_item['submitted_at'], submitted_item['submitted_at'])
+
+
+class CandidateEnrichmentRepairTests(unittest.TestCase):
+    @patch('app.eod.pykrx_enrichment.pykrx_enrichment_service')
+    def test_repairs_only_missing_candidate_categories_then_reinspects(self, enrichment_service):
+        service = SignalDeciderNextOpenExecutionService.__new__(SignalDeciderNextOpenExecutionService)
+        service._inspect_candidate_pykrx_enrichment = MagicMock(side_effect=[
+            {
+                '004370': {
+                    'missing_categories': ['investor_flow_symbol', 'short_selling'],
+                },
+                '005930': {'missing_categories': []},
+            },
+            {
+                '004370': {'missing_categories': []},
+                '005930': {'missing_categories': []},
+            },
+        ])
+
+        result = service._repair_and_inspect_candidate_pykrx_enrichment(
+            source_market_date=date(2026, 8, 19),
+            symbols=['004370', '005930'],
+            categories=['sector_classification', 'investor_flow_symbol', 'short_selling'],
+        )
+
+        enrichment_service.collect_for_market_date.assert_called_once_with(
+            market_date=date(2026, 8, 19),
+            markets=['KOSPI', 'KOSDAQ', 'KONEX'],
+            symbols=['004370'],
+            categories=['investor_flow_symbol', 'short_selling'],
+            allow_kis_candidate_fallback=True,
+        )
+        self.assertEqual(result['004370']['missing_categories'], [])

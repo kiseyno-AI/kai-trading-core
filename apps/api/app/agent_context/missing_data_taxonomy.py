@@ -212,11 +212,14 @@ CATEGORY_DEFINITIONS: tuple[MissingDataCategoryDefinition, ...] = (
         default_decider_effect='supporting_gap',
         empty_is_neutral_by_default=False,
         internal_tables=('daily_pykrx_enrichment_rows',),
-        external_providers=('PyKRX EOD investor flow and short-selling statistics',),
+        external_providers=(
+            'PyKRX EOD investor flow and short-selling statistics',
+            'KIS OpenAPI candidate-only investor trade and daily short-sale fallback',
+        ),
         operator_hint=(
-            'Daily PyKRX enrichment now persists investor-flow and short-selling context without live broker '
-            'credentials, but coverage still depends on market/date availability and only the wired categories surface in '
-            'agent context today.'
+            'Daily PyKRX enrichment is the universe-wide primary source. Missing actionable candidates are retried through '
+            'KIS OpenAPI; KIS daily short-sale data does not include short-balance data, so that field remains explicitly '
+            'partial instead of being inferred.'
         ),
         keywords=(
             '수급',
