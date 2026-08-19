@@ -127,6 +127,7 @@ class SignalDeciderEvaluationMaintenanceService:
         evaluation_version: str | None = None,
         force_recompute: bool = False,
         refresh_calendar: bool = True,
+        calendar_lookback_days: int | None = None,
         fail_on_mature_gaps: bool = False,
         trigger: str = 'manual',
     ) -> dict[str, Any]:
@@ -147,6 +148,7 @@ class SignalDeciderEvaluationMaintenanceService:
             'evaluation_version': evaluation_version,
             'force_recompute': force_recompute,
             'refresh_calendar': refresh_calendar,
+            'calendar_lookback_days': calendar_lookback_days,
             'fail_on_mature_gaps': fail_on_mature_gaps,
             'trigger': trigger,
         }
@@ -180,18 +182,39 @@ class SignalDeciderEvaluationMaintenanceService:
         calendar_result = None
         calendar_summary = None
         if refresh_calendar:
-            calendar_result = self.calendar_review_service.refresh_recent_reviews(
-                as_of_market_date=normalized_market_date,
-                lookback_days=resolved_lookback_days,
-                symbols=normalized_symbols,
-                horizons=normalized_horizons,
-                primary_horizons=normalized_primary_horizons,
-                evaluation_version=evaluation_version,
-                force_recompute=force_recompute,
-                trigger=trigger,
-                refresh_evaluations=False,
-                evaluation_refresh_summary=evaluation_summary,
+            resolved_calendar_lookback_days = (
+                resolved_lookback_days
+                if calendar_lookback_days is None
+                else max(0, int(calendar_lookback_days))
             )
+            if resolved_calendar_lookback_days == 0:
+                calendar_result = self.calendar_review_service.refresh_reviews(
+                    market_date_from=normalized_market_date,
+                    market_date_to=normalized_market_date,
+                    as_of_market_date=normalized_market_date,
+                    lookback_days=0,
+                    symbols=normalized_symbols,
+                    horizons=normalized_horizons,
+                    primary_horizons=normalized_primary_horizons,
+                    evaluation_version=evaluation_version,
+                    force_recompute=force_recompute,
+                    trigger=trigger,
+                    refresh_evaluations=False,
+                    evaluation_refresh_summary=evaluation_summary,
+                )
+            else:
+                calendar_result = self.calendar_review_service.refresh_recent_reviews(
+                    as_of_market_date=normalized_market_date,
+                    lookback_days=resolved_calendar_lookback_days,
+                    symbols=normalized_symbols,
+                    horizons=normalized_horizons,
+                    primary_horizons=normalized_primary_horizons,
+                    evaluation_version=evaluation_version,
+                    force_recompute=force_recompute,
+                    trigger=trigger,
+                    refresh_evaluations=False,
+                    evaluation_refresh_summary=evaluation_summary,
+                )
             calendar_summary = dict(calendar_result.get('summary') or {})
         warning_message = self._mature_gap_warning_message(
             self._extract_coverage_counts(evaluation_summary)['not_computed_count']

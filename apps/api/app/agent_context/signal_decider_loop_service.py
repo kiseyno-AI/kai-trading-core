@@ -16,7 +16,8 @@ from app.agent_context.decision_delta import build_decision_delta
 from app.agent_context.roles import SHORT_TERM_DECIDER_AGENT_NAME, SIGNAL_DECIDER_AGENT_NAME
 from app.agent_context.wait_reason_taxonomy import derive_wait_reason
 from app.market.session import next_krx_trading_date
-from app.db import session_scope
+from app.core.settings import settings
+from app.db import session_scope as _base_session_scope
 from app.db_models import (
     AgentContextFeedback,
     SignalDeciderDecisionSnapshot,
@@ -35,17 +36,26 @@ DEFAULT_SIGNAL_DECIDER_POLICY_CREATED_BY = 'system:bootstrap'
 DEFAULT_SIGNAL_DECIDER_POLICY_ACTIVATION_MODE = 'manual_only'
 DEFAULT_POLICY_CANDIDATE_STATUS = 'generated'
 DEFAULT_SIGNAL_DECIDER_EVALUATION_LOOKBACK_DAYS = 30
-# Keep multi-row INSERT/UPSERT calls well below PostgreSQL/psycopg's
-# 65,535-parameter limit. Realized outcomes currently bind ~30 params/row,
-# so a 1,000 row chunk leaves margin for future columns.
-SIGNAL_DECIDER_BULK_UPSERT_CHUNK_SIZE = 1000
+# Keep multi-row INSERT/UPSERT calls small because signal-decider rows contain
+# large JSON payloads and maintain several indexes. This also stays well below
+# PostgreSQL/psycopg's 65,535-parameter limit.
+SIGNAL_DECIDER_BULK_UPSERT_CHUNK_SIZE = 50
+
+
+def session_scope():
+    return _base_session_scope(
+        statement_timeout_ms=settings.signal_decider_db_statement_timeout_ms,
+        lock_timeout_ms=settings.signal_decider_db_lock_timeout_ms,
+    )
 
 
 def _iter_bulk_upsert_chunks(
     items: Sequence[dict[str, Any]],
     *,
-    chunk_size: int = SIGNAL_DECIDER_BULK_UPSERT_CHUNK_SIZE,
+    chunk_size: int | None = None,
 ) -> list[list[dict[str, Any]]]:
+    if chunk_size is None:
+        chunk_size = SIGNAL_DECIDER_BULK_UPSERT_CHUNK_SIZE
     if chunk_size < 1:
         raise ValueError('chunk_size must be >= 1')
     item_list = list(items)

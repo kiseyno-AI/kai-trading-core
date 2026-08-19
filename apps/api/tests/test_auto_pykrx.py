@@ -17,6 +17,7 @@ from app.eod.pykrx_pipeline_runner import (
     _extract_result_counts,
     _normalize_stage_status,
     _run_daily_feedback_followup,
+    _run_daily_signal_decider_evaluation_followup,
     _run_daily_signal_decider_followup,
 )
 from app.market.clock import KST, MarketState
@@ -109,6 +110,25 @@ class _FakeDailyPipelineRunStateService:
 
 
 class PykrxBackfillServiceTests(TestCase):
+    def test_daily_signal_decider_evaluation_refreshes_only_today_calendar(self) -> None:
+        with patch(
+            'app.agent_context.signal_decider_evaluation_maintenance_service.'
+            'signal_decider_evaluation_maintenance_service.refresh_recent_coverage',
+            return_value={'status': 'completed'},
+        ) as refresh_recent_coverage:
+            result = _run_daily_signal_decider_evaluation_followup(
+                market_date='2026-08-19',
+                enabled=True,
+            )
+
+        self.assertEqual(result, {'status': 'completed'})
+        refresh_recent_coverage.assert_called_once_with(
+            as_of_market_date='2026-08-19',
+            refresh_calendar=True,
+            calendar_lookback_days=0,
+            trigger='eod_pykrx_followup',
+        )
+
     def test_suppress_pykrx_login_env_temporarily_removes_credentials(self) -> None:
         original_id = os.environ.get('KRX_ID')
         original_pw = os.environ.get('KRX_PW')

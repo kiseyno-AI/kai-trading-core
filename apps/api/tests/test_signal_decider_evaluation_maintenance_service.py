@@ -111,6 +111,32 @@ class SignalDeciderEvaluationMaintenanceServiceTests(unittest.TestCase):
         self.assertEqual(calendar_service.recent_args['evaluation_refresh_summary'], evaluation_summary)
         self.assertEqual(result['summary']['calendar_refresh']['review_rows_upserted'], 5)
 
+    def test_refresh_recent_coverage_can_limit_calendar_refresh_to_as_of_date(self) -> None:
+        evaluation_summary = {'not_computed_count': 0}
+        loop_service = _FakeLoopService(recent_result={'summary': evaluation_summary})
+        calendar_service = _FakeCalendarService()
+        service = SignalDeciderEvaluationMaintenanceService(
+            loop_service=loop_service,
+            calendar_review_service=calendar_service,
+            prerequisite_service=_FakePrerequisiteService(),
+        )
+
+        result = service.refresh_recent_coverage(
+            as_of_market_date='2026-05-08',
+            lookback_days=30,
+            refresh_calendar=True,
+            calendar_lookback_days=0,
+        )
+
+        self.assertTrue(result['triggered'])
+        self.assertIsNone(calendar_service.recent_args)
+        self.assertEqual(calendar_service.range_args['market_date_from'].isoformat(), '2026-05-08')
+        self.assertEqual(calendar_service.range_args['market_date_to'].isoformat(), '2026-05-08')
+        self.assertEqual(calendar_service.range_args['lookback_days'], 0)
+        self.assertFalse(calendar_service.range_args['refresh_evaluations'])
+        self.assertEqual(result['request']['calendar_lookback_days'], 0)
+        self.assertEqual(result['summary']['calendar_refresh']['review_rows_upserted'], 7)
+
     def test_repair_coverage_range_fails_when_mature_not_computed_remains(self) -> None:
         evaluation_summary = {
             'status': 'failed',
