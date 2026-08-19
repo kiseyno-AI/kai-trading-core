@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Iterable
 
@@ -11,6 +11,7 @@ from app.db import session_scope
 from app.db_models import (
     Symbol,
     USAgentFeedback,
+    USEquityPipelineRun,
     USEquityFundamentalSnapshot,
     USEquityPriceBar,
     USEquityScreeningSnapshot,
@@ -18,6 +19,113 @@ from app.db_models import (
 )
 from app.us_equities.market_data import USPriceBar
 from app.us_equities.sec_fundamentals import SECFundamentalSnapshotData
+
+
+US_EQUITY_PIPELINE_VERSION = 'us_equity_v1'
+
+
+def claim_us_equity_pipeline_run(
+    *,
+    market_date: date,
+    run_id: str,
+    stale_after_minutes: int,
+    force: bool = False,
+) -> dict:
+    now = datetime.now(timezone.utc)
+    with session_scope() as session:
+        inserted_id = session.execute(
+            pg_insert(USEquityPipelineRun)
+            .values(
+                market_date=market_date,
+                pipeline_version=US_EQUITY_PIPELINE_VERSION,
+                run_id=run_id,
+                status='running',
+                attempt_count=1,
+                started_at=now,
+                heartbeat_at=now,
+                stages_payload={},
+            )
+            .on_conflict_do_nothing(constraint='uq_us_equity_pipeline_date_version')
+            .returning(USEquityPipelineRun.id)
+        ).scalar_one_or_none()
+        row = session.execute(
+            select(USEquityPipelineRun)
+            .where(
+                USEquityPipelineRun.market_date == market_date,
+                USEquityPipelineRun.pipeline_version == US_EQUITY_PIPELINE_VERSION,
+            )
+            .with_for_update()
+        ).scalar_one()
+        if inserted_id is not None:
+            return {'claimed': True, 'status': 'running', 'run_id': run_id, 'attempt_count': 1}
+        heartbeat = row.heartbeat_at
+        if heartbeat.tzinfo is None:
+            heartbeat = heartbeat.replace(tzinfo=timezone.utc)
+        stale = heartbeat < now - timedelta(minutes=stale_after_minutes)
+        if row.status == 'completed' and not force:
+            return {'claimed': False, 'status': 'already_completed', 'run_id': row.run_id}
+        if row.status == 'running' and not stale:
+            return {'claimed': False, 'status': 'already_running', 'run_id': row.run_id}
+        row.run_id = run_id
+        row.status = 'running'
+        row.attempt_count += 1
+        row.started_at = now
+        row.heartbeat_at = now
+        row.finished_at = None
+        row.stages_payload = {}
+        row.last_error = None
+        return {
+            'claimed': True,
+            'status': 'reclaimed' if stale else 'forced' if force else 'retry',
+            'run_id': run_id,
+            'attempt_count': row.attempt_count,
+        }
+
+
+def touch_us_equity_pipeline_run(*, market_date: date, run_id: str) -> bool:
+    with session_scope() as session:
+        result = session.execute(
+            update(USEquityPipelineRun)
+            .where(
+                USEquityPipelineRun.market_date == market_date,
+                USEquityPipelineRun.pipeline_version == US_EQUITY_PIPELINE_VERSION,
+                USEquityPipelineRun.run_id == run_id,
+                USEquityPipelineRun.status == 'running',
+            )
+            .values(heartbeat_at=datetime.now(timezone.utc))
+        )
+        return bool(result.rowcount)
+
+
+def update_us_equity_pipeline_run(
+    *,
+    market_date: date,
+    run_id: str,
+    status: str,
+    stages: dict,
+    error: str | None = None,
+) -> bool:
+    now = datetime.now(timezone.utc)
+    values = {
+        'status': status,
+        'heartbeat_at': now,
+        'stages_payload': stages,
+        'last_error': error,
+    }
+    if status in {'completed', 'failed'}:
+        values['finished_at'] = now
+    with session_scope() as session:
+        result = session.execute(
+            update(USEquityPipelineRun)
+            .where(
+                USEquityPipelineRun.market_date == market_date,
+                USEquityPipelineRun.pipeline_version == US_EQUITY_PIPELINE_VERSION,
+                USEquityPipelineRun.run_id == run_id,
+                USEquityPipelineRun.status == 'running',
+            )
+            .values(**values)
+        )
+        return bool(result.rowcount)
 
 
 def create_us_market_data_run(*, market_date: date, universe_count: int, source: str = 'kis') -> int:
@@ -140,10 +248,9 @@ def upsert_us_screening_snapshots(*, rows: Iterable[dict]) -> int:
         statement = pg_insert(USEquityScreeningSnapshot).values(values)
         session.execute(
             statement.on_conflict_do_update(
-                constraint='uq_us_equity_screening_symbol_date',
+                constraint='uq_us_equity_screening_symbol_date_stage',
                 set_={
                     'collection_run_id': statement.excluded.collection_run_id,
-                    'stage': statement.excluded.stage,
                     'eligible_for_agent': statement.excluded.eligible_for_agent,
                     'rank': statement.excluded.rank,
                     'composite_score': statement.excluded.composite_score,
@@ -302,9 +409,9 @@ def upsert_us_agent_feedback(
         return int(record_id)
 
 
-def load_us_signal_feedback(*, market_date: date, limit: int = 80) -> list[dict]:
+def load_us_signal_feedback(*, market_date: date, limit: int = 80, run_id: str | None = None) -> list[dict]:
     with session_scope() as session:
-        rows = session.execute(
+        statement = (
             select(
                 USAgentFeedback.id.label('feedback_id'),
                 USAgentFeedback.run_id,
@@ -333,8 +440,10 @@ def load_us_signal_feedback(*, market_date: date, limit: int = 80) -> list[dict]
                 USEquityScreeningSnapshot.eligible_for_agent.is_(True),
             )
             .order_by(USEquityScreeningSnapshot.rank.asc(), Symbol.symbol.asc())
-            .limit(limit)
-        ).all()
+        )
+        if run_id is not None:
+            statement = statement.where(USAgentFeedback.run_id == run_id)
+        rows = session.execute(statement.limit(limit)).all()
         return [dict(row._mapping) for row in rows]
 
 

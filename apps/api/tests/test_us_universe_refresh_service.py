@@ -33,6 +33,7 @@ class USUniverseRefreshServiceTests(unittest.IsolatedAsyncioTestCase):
             kis_master_client=kis_client,
             sec_client=sec_client,
             persister=persister,
+            minimum_counts={},
         )
 
         result = await service.refresh(persist=True, preview_limit=5)
@@ -56,11 +57,30 @@ class USUniverseRefreshServiceTests(unittest.IsolatedAsyncioTestCase):
             kis_master_client=kis_client,
             sec_client=sec_client,
             persister=persister,
+            minimum_counts={},
         )
 
         result = await service.refresh(persist=False)
 
         self.assertEqual(result['persisted_count'], 0)
+        persister.assert_not_called()
+
+    async def test_truncated_source_fails_before_persistence(self):
+        listed_client = Mock(fetch_universe=AsyncMock(return_value=[]))
+        kis_client = Mock(fetch_us_universe=AsyncMock(return_value=[]))
+        sec_client = Mock(fetch_company_ticker_exchange_mapping=AsyncMock(return_value=[]))
+        persister = Mock()
+        service = USUniverseRefreshService(
+            nasdaq_client=listed_client,
+            kis_master_client=kis_client,
+            sec_client=sec_client,
+            persister=persister,
+            minimum_counts={'nasdaq_trader_rows': 1},
+        )
+
+        with self.assertRaisesRegex(ValueError, 'nasdaq_trader_rows=0<1'):
+            await service.refresh(persist=True)
+
         persister.assert_not_called()
 
 

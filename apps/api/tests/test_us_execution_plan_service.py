@@ -34,11 +34,15 @@ def _row(symbol: str, *, action: str = 'buy', warnings=None, confidence=8.0) -> 
 
 
 def test_builds_bounded_us_kis_entry_and_exit_plan() -> None:
-    service = USExecutionPlanService(feedback_loader=lambda **kwargs: [_row('AAPL')])
+    loader_calls = []
+    service = USExecutionPlanService(
+        feedback_loader=lambda **kwargs: loader_calls.append(kwargs) or [_row('AAPL')]
+    )
 
     result = service.build(
         source_market_date=date(2026, 8, 19),
         target_trade_date=date(2026, 8, 20),
+        agent_run_id='us-run-1',
     )
 
     assert result['status'] == 'ready'
@@ -58,6 +62,9 @@ def test_builds_bounded_us_kis_entry_and_exit_plan() -> None:
     assert entry['broker'] == 'kis'
     assert entry['limit_price'] == '50.25'
     assert entry['quantity_policy'] == {'kind': 'shares', 'quantity': 1}
+    assert payload['strategy_run_id'] == 'us-run-1'
+    assert payload['metadata']['agent_run_id'] == 'us-run-1'
+    assert loader_calls == [{'market_date': date(2026, 8, 19), 'limit': 80, 'run_id': 'us-run-1'}]
 
 
 def test_rejects_wait_low_confidence_and_data_warning_before_exec_feedback() -> None:
@@ -95,6 +102,17 @@ def test_dispatch_defaults_to_preview_without_calling_exec() -> None:
 
     assert result['dry_run'] is True
     assert result['status'] == 'ready'
+
+
+def test_non_preview_dispatch_requires_current_agent_run_id() -> None:
+    service = USExecutionPlanService(feedback_loader=lambda **kwargs: [_row('AAPL')])
+
+    try:
+        asyncio.run(service.dispatch(source_market_date=date(2026, 8, 19), dry_run=False))
+    except ValueError as exc:
+        assert str(exc) == 'agent_run_id is required for non-preview US equity execution dispatch'
+    else:
+        raise AssertionError('non-preview dispatch must reject an unscoped agent run')
 
 
 def test_default_target_trade_date_skips_us_exchange_holiday() -> None:

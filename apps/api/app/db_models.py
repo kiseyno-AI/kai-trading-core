@@ -658,7 +658,10 @@ class USEquityFundamentalSnapshot(Base, TimestampMixin):
 class USEquityScreeningSnapshot(Base, TimestampMixin):
     __tablename__ = 'us_equity_screening_snapshots'
     __table_args__ = (
-        UniqueConstraint('symbol_id', 'market_date', name='uq_us_equity_screening_symbol_date'),
+        UniqueConstraint(
+            'symbol_id', 'market_date', 'stage',
+            name='uq_us_equity_screening_symbol_date_stage',
+        ),
         Index('ix_us_screening_date_eligible_rank', 'market_date', 'eligible_for_agent', 'rank'),
     )
 
@@ -694,6 +697,26 @@ class USAgentFeedback(Base, TimestampMixin):
     response_payload: Mapped[dict] = mapped_column(MutableDict.as_mutable(JSON), nullable=False, default=dict)
     normalized_feedback_payload: Mapped[dict] = mapped_column(MutableDict.as_mutable(JSON), nullable=False, default=dict)
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class USEquityPipelineRun(Base, TimestampMixin):
+    __tablename__ = 'us_equity_pipeline_runs'
+    __table_args__ = (
+        UniqueConstraint('market_date', 'pipeline_version', name='uq_us_equity_pipeline_date_version'),
+        Index('ix_us_equity_pipeline_status_heartbeat', 'status', 'heartbeat_at'),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    market_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    pipeline_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    run_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    heartbeat_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    stages_payload: Mapped[dict] = mapped_column(MutableDict.as_mutable(JSON), nullable=False, default=dict)
+    last_error: Mapped[str | None] = mapped_column(Text)
 
 
 class DailyPriceContext(Base, TimestampMixin):

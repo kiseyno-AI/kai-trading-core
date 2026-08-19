@@ -54,10 +54,11 @@ class USExecutionPlanService:
         source_market_date: date,
         target_trade_date: date | None = None,
         max_candidates: int | None = None,
+        agent_run_id: str | None = None,
     ) -> dict[str, Any]:
         resolved_target = target_trade_date or _next_us_session(source_market_date)
         cap = min(max_candidates or settings.us_equity_exec_max_candidates, 80)
-        rows = self._feedback_loader(market_date=source_market_date, limit=80)
+        rows = self._feedback_loader(market_date=source_market_date, limit=80, run_id=agent_run_id)
         accepted: list[dict[str, Any]] = []
         rejected: list[dict[str, str]] = []
         for row in rows:
@@ -82,6 +83,8 @@ class USExecutionPlanService:
                 'exchange': candidate['exchange'],
                 'currency': 'USD',
                 'broker': 'kis',
+                'provider': 'kis',
+                'venue': 'kis',
                 'session_policy': {
                     'session': 'regular',
                     'timezone': 'America/New_York',
@@ -106,6 +109,7 @@ class USExecutionPlanService:
                     {
                         **common,
                         'core_item_key': entry_key,
+                        'source_plan_item_id': entry_key,
                         'side': 'buy',
                         'intent': 'next_open_buy',
                         'quantity_policy': {'kind': 'shares', 'quantity': candidate['quantity']},
@@ -116,6 +120,7 @@ class USExecutionPlanService:
                     {
                         **common,
                         'core_item_key': f"us:{source_market_date.isoformat()}:{candidate['symbol']}:target_sell",
+                        'source_plan_item_id': f"us:{source_market_date.isoformat()}:{candidate['symbol']}:target_sell",
                         'side': 'sell',
                         'intent': 'target_sell',
                         'quantity_policy': {
@@ -129,6 +134,7 @@ class USExecutionPlanService:
                     {
                         **common,
                         'core_item_key': f"us:{source_market_date.isoformat()}:{candidate['symbol']}:stop_sell",
+                        'source_plan_item_id': f"us:{source_market_date.isoformat()}:{candidate['symbol']}:stop_sell",
                         'side': 'sell',
                         'intent': 'stop_sell',
                         'quantity_policy': {
@@ -149,7 +155,7 @@ class USExecutionPlanService:
                 'source': settings.signal_decider_exec_dispatch_source or 'kai-trading-core',
                 'mode': settings.signal_decider_exec_runtime_mode,
                 'market_date': resolved_target.isoformat(),
-                'strategy_run_id': f'us-signal-decider:{source_market_date.isoformat()}',
+                'strategy_run_id': agent_run_id or f'us-signal-decider-preview:{source_market_date.isoformat()}',
                 'requested_at': datetime.now(timezone.utc).isoformat(),
                 'items': items,
                 'metadata': {
@@ -157,6 +163,7 @@ class USExecutionPlanService:
                     'market': 'US',
                     'currency': 'USD',
                     'source_market_date': source_market_date.isoformat(),
+                    'agent_run_id': agent_run_id,
                 },
             }
         )
@@ -177,11 +184,15 @@ class USExecutionPlanService:
         target_trade_date: date | None = None,
         max_candidates: int | None = None,
         dry_run: bool = True,
+        agent_run_id: str | None = None,
     ) -> dict[str, Any]:
+        if not dry_run and not agent_run_id:
+            raise ValueError('agent_run_id is required for non-preview US equity execution dispatch')
         result = self.build(
             source_market_date=source_market_date,
             target_trade_date=target_trade_date,
             max_candidates=max_candidates,
+            agent_run_id=agent_run_id,
         )
         result['dry_run'] = dry_run
         if dry_run or not result['payload']['items']:

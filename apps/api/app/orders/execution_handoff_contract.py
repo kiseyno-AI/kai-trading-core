@@ -297,6 +297,7 @@ class ExecutionSymbolDetailPayload(_ContractModel):
 
 class ExecutionPlanDispatchItemPayload(_ContractModel):
     core_item_key: str
+    source_plan_item_id: str | None = None
     agent_name: str
     decision_agent_name: str
     symbol: str
@@ -305,6 +306,8 @@ class ExecutionPlanDispatchItemPayload(_ContractModel):
     exchange: str | None = None
     currency: str | None = None
     broker: str | None = None
+    provider: str | None = None
+    venue: str | None = None
     session_policy: dict[str, Any] | None = None
     side: ExecutionDispatchItemSide
     intent: str
@@ -401,8 +404,14 @@ def serialize_execution_plan_dispatch_payload(payload: dict[str, Any]) -> dict[s
     normalized = {**payload, 'items': [dict(item) for item in payload.get('items') or []]}
     metadata = normalized.get('metadata') if isinstance(normalized.get('metadata'), dict) else {}
     schema_version = str(metadata.get('schema_version') or LEGACY_EXECUTION_PLAN_DISPATCH_SCHEMA_VERSION)
-    required = ('asset_class', 'market', 'exchange', 'currency', 'broker', 'session_policy')
+    required = (
+        'asset_class', 'market', 'exchange', 'currency', 'broker',
+        'provider', 'venue', 'session_policy', 'source_plan_item_id',
+    )
     for item in normalized['items']:
+        item['provider'] = item.get('provider') or item.get('broker')
+        item['venue'] = item.get('venue') or item.get('broker')
+        item['source_plan_item_id'] = item.get('source_plan_item_id') or item.get('core_item_key')
         market = str(item.get('market') or '').strip().upper()
         currency = str(item.get('currency') or '').strip().upper()
         is_us = market in {'US', 'NASDAQ', 'NYSE', 'NYSE_AMERICAN'} or currency == 'USD'
@@ -417,6 +426,9 @@ def serialize_execution_plan_dispatch_payload(payload: dict[str, Any]) -> dict[s
                     'exchange': item.get('exchange') or 'KRX',
                     'currency': item.get('currency') or 'KRW',
                     'broker': item.get('broker') or 'kis',
+                    'provider': item.get('provider') or item.get('broker') or 'kis',
+                    'venue': item.get('venue') or item.get('broker') or 'kis',
+                    'source_plan_item_id': item.get('source_plan_item_id') or item.get('core_item_key'),
                     'session_policy': item.get('session_policy')
                     or {
                         'session': 'regular',

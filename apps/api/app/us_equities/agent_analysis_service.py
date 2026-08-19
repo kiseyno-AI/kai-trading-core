@@ -20,6 +20,31 @@ US_AGENT_ROLE_CAPS = {
     'signal-decider': 80,
 }
 
+US_AGENT_ROLE_DEPENDENCIES: dict[str, tuple[str, ...]] = {
+    'short-term-decider': (
+        'eod-summarizer',
+        'technical-summarizer',
+        'fundamental-summarizer',
+    ),
+    'signal-decider': (
+        'eod-summarizer',
+        'technical-summarizer',
+        'fundamental-summarizer',
+    ),
+}
+
+
+def _expand_roles(roles: Sequence[str] | None) -> set[str]:
+    requested = set(roles or US_AGENT_ROLE_CAPS)
+    pending = list(requested)
+    while pending:
+        role = pending.pop()
+        for dependency in US_AGENT_ROLE_DEPENDENCIES.get(role, ()):
+            if dependency not in requested:
+                requested.add(dependency)
+                pending.append(dependency)
+    return requested
+
 
 def build_us_agent_context(item: dict, *, market_date: date) -> dict[str, Any]:
     return {
@@ -65,7 +90,7 @@ class USAgentAnalysisService:
         candidates = self._candidate_loader(market_date=market_date, limit=150)
         if not candidates:
             raise ValueError('No fundamental-screen candidates found for the requested market date')
-        requested = set(roles or US_AGENT_ROLE_CAPS)
+        requested = _expand_roles(roles)
         unknown = requested - set(US_AGENT_ROLE_CAPS)
         if unknown:
             raise ValueError(f'Unsupported US agent roles: {", ".join(sorted(unknown))}')
@@ -105,11 +130,25 @@ class USAgentAnalysisService:
                 batch_symbols = symbols[start:start + max(1, batch_size)]
                 batch_items = []
                 for symbol in batch_symbols:
+                    missing_dependencies = [
+                        dependency
+                        for dependency in US_AGENT_ROLE_DEPENDENCIES.get(role, ())
+                        if dependency not in feedback_by_symbol.get(symbol, {})
+                    ]
+                    if missing_dependencies:
+                        failures.append({
+                            'role': role,
+                            'symbol': symbol,
+                            'error': f"missing_upstream_feedback:{','.join(missing_dependencies)}",
+                        })
+                        continue
                     context = dict(prepared['contexts'][symbol])
                     context['upstream_agent_feedback'] = feedback_by_symbol.get(symbol, {})
                     context['request_run_id'] = run_id
                     context['session_key'] = f'feedback-us/{role}/{market_date.isoformat()}/{start // max(1, batch_size):03d}'
                     batch_items.append(context)
+                if not batch_items:
+                    continue
                 try:
                     batch_result = dispatcher.dispatch_batch(
                         spec=spec,

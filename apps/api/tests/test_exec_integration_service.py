@@ -1326,6 +1326,25 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             intents,
             [EXEC_INTENT_NEXT_OPEN_BUY, EXEC_INTENT_TARGET_SELL, EXEC_INTENT_STOP_SELL],
         )
+        for item in payload['items']:
+            self.assertEqual(
+                {
+                    key: item[key]
+                    for key in ('asset_class', 'market', 'exchange', 'currency', 'broker', 'session_policy')
+                },
+                {
+                    'asset_class': 'stock',
+                    'market': 'KRX',
+                    'exchange': 'KRX',
+                    'currency': 'KRW',
+                    'broker': 'kis',
+                    'session_policy': {
+                        'session': 'regular',
+                        'timezone': 'Asia/Seoul',
+                        'allow_extended_hours': False,
+                    },
+                },
+            )
         entry_item = payload['items'][0]
         self.assertEqual(entry_item['quantity_policy']['type'], 'exec_agent_sized')
         self.assertNotIn('quantity', entry_item['quantity_policy'])

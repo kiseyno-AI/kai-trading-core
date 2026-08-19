@@ -39,6 +39,7 @@ class USExecutionPlanRequest(BaseModel):
     target_trade_date: date | None = None
     max_candidates: int | None = Field(default=None, ge=1, le=80)
     dry_run: bool = True
+    agent_run_id: str | None = Field(default=None, min_length=1, max_length=128)
 
 
 @router.post('/universe/refresh')
@@ -141,6 +142,7 @@ async def dispatch_us_equity_execution_plan(payload: USExecutionPlanRequest) -> 
             target_trade_date=payload.target_trade_date,
             max_candidates=payload.max_candidates,
             dry_run=payload.dry_run,
+            agent_run_id=payload.agent_run_id,
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc

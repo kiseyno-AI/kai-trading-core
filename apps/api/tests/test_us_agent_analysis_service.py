@@ -38,6 +38,14 @@ class FakeDispatcher:
         ]}}
 
 
+class MissingFundamentalDispatcher(FakeDispatcher):
+    def dispatch_batch(self, *, spec, market_date, batch_items):
+        result = super().dispatch_batch(spec=spec, market_date=market_date, batch_items=batch_items)
+        if spec.role == 'fundamental-summarizer':
+            result['decoded']['items'] = []
+        return result
+
+
 class USAgentAnalysisServiceTests(unittest.TestCase):
     def test_ten_thousand_candidates_are_deterministically_bounded_by_role_caps(self):
         rows = [_candidate(index) for index in range(10_000)]
@@ -71,6 +79,42 @@ class USAgentAnalysisServiceTests(unittest.TestCase):
         self.assertEqual(result['status'], 'completed')
         self.assertEqual(result['completed'], 2)
         self.assertEqual(result['failed'], 0)
+
+    def test_decider_request_expands_required_upstream_roles(self):
+        service = USAgentAnalysisService(candidate_loader=lambda **kwargs: [_candidate(0)])
+
+        prepared = service.prepare(
+            market_date=date(2026, 8, 19),
+            roles=['signal-decider'],
+        )
+
+        self.assertEqual(list(prepared['role_scopes']), [
+            'eod-summarizer',
+            'technical-summarizer',
+            'fundamental-summarizer',
+            'signal-decider',
+        ])
+
+    def test_decider_is_blocked_when_upstream_feedback_is_missing(self):
+        service = USAgentAnalysisService(
+            candidate_loader=lambda **kwargs: [_candidate(0)],
+            dispatcher_getter=lambda: MissingFundamentalDispatcher(),
+        )
+
+        result = service.dispatch(
+            market_date=date(2026, 8, 19),
+            roles=['signal-decider'],
+            persist=False,
+        )
+
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['completed'], 2)
+        self.assertEqual(result['failed'], 2)
+        self.assertTrue(any(
+            item['role'] == 'signal-decider'
+            and item['error'] == 'missing_upstream_feedback:fundamental-summarizer'
+            for item in result['failures']
+        ))
 
 
 if __name__ == '__main__':

@@ -3197,6 +3197,8 @@ class SignalDeciderExecIntegrationService:
                     'exchange': canonical_exchange.upper(),
                     'currency': 'USD',
                     'broker': 'kis',
+                    'provider': 'kis',
+                    'venue': 'kis',
                     'session_policy': traceability.get('session_policy')
                     or {
                         'session': 'regular',
@@ -3212,6 +3214,8 @@ class SignalDeciderExecIntegrationService:
                     'exchange': 'KRX',
                     'currency': 'KRW',
                     'broker': 'kis',
+                    'provider': 'kis',
+                    'venue': 'kis',
                     'session_policy': {
                         'session': 'regular',
                         'timezone': 'Asia/Seoul',
@@ -3430,6 +3434,7 @@ class SignalDeciderExecIntegrationService:
             )
             entry_item = {
                 'core_item_key': core_entry_key,
+                'source_plan_item_id': core_entry_key,
                 'agent_name': row_decision_agent_name,
                 'decision_agent_name': row_decision_agent_name,
                 'symbol': row.symbol,
@@ -3496,6 +3501,7 @@ class SignalDeciderExecIntegrationService:
                 items.append(
                     {
                         'core_item_key': target_key,
+                        'source_plan_item_id': target_key,
                         'agent_name': row_decision_agent_name,
                         'decision_agent_name': row_decision_agent_name,
                         'symbol': row.symbol,
@@ -3535,9 +3541,11 @@ class SignalDeciderExecIntegrationService:
                 items.append(
                     {
                         'core_item_key': stop_key,
+                        'source_plan_item_id': stop_key,
                         'agent_name': row_decision_agent_name,
                         'decision_agent_name': row_decision_agent_name,
                         'symbol': row.symbol,
+                        **execution_scope,
                         'side': 'sell',
                         'intent': EXEC_INTENT_STOP_SELL,
                         'quantity_policy': stop_quantity_policy,

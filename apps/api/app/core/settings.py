@@ -124,6 +124,7 @@ class Settings(BaseSettings):
     us_equity_auto_pipeline_local_time: str = '18:00'
     us_equity_auto_pipeline_interval_seconds: int = Field(default=60, ge=15, le=3600)
     us_equity_auto_pipeline_exec_dry_run: bool = True
+    us_equity_auto_pipeline_stale_after_minutes: int = Field(default=180, ge=30, le=1440)
     signal_decider_exec_dashboard_cache_ttl_seconds: int = 5
     signal_decider_exec_dashboard_refresh_debounce_seconds: float = 15.0
     signal_decider_exec_dashboard_refresh_timeout_seconds: float = 2.0
@@ -194,6 +195,10 @@ class Settings(BaseSettings):
 
     nasdaq_trader_base_url: str = 'https://www.nasdaqtrader.com'
     nasdaq_trader_request_timeout_seconds: float = 20.0
+    us_equity_universe_min_nasdaq_rows: int = 1_000
+    us_equity_universe_min_kis_rows: int = 1_000
+    us_equity_universe_min_sec_rows: int = 1_000
+    us_equity_universe_min_integrated_rows: int = 100
 
     kis_overseas_master_base_url: str = 'https://new.real.download.dws.co.kr'
     kis_overseas_master_request_timeout_seconds: float = 30.0
