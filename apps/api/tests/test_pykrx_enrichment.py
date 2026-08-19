@@ -607,7 +607,7 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
 
 
 class KisCandidateFallbackTests(unittest.TestCase):
-    @patch('app.eod.pykrx_enrichment.KISClient.fetch_domestic_investor_trade_daily', new_callable=AsyncMock)
+    @patch('app.eod.pykrx_enrichment.kis_client.fetch_domestic_investor_trade_daily', new_callable=AsyncMock)
     def test_candidate_fallback_maps_kis_investor_flow(self, fetch_mock):
         fetch_mock.return_value = {
             'output2': [{
@@ -629,7 +629,7 @@ class KisCandidateFallbackTests(unittest.TestCase):
         self.assertEqual(rows[0]['source'], 'kis_open_api')
         self.assertEqual(rows[0]['payload']['investor_groups']['외국인']['net_volume'], 10)
 
-    @patch('app.eod.pykrx_enrichment.KISClient.fetch_domestic_daily_short_sale', new_callable=AsyncMock)
+    @patch('app.eod.pykrx_enrichment.kis_client.fetch_domestic_daily_short_sale', new_callable=AsyncMock)
     def test_candidate_fallback_keeps_unavailable_short_balance_explicit(self, fetch_mock):
         fetch_mock.return_value = {'output2': [{
             'stck_bsop_date': '20260819', 'ssts_cntg_qty': '123', 'stnd_vol_smtn': '1000',
