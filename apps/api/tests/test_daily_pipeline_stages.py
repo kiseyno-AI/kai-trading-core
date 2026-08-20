@@ -204,6 +204,14 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             payload['default_daily_stage_order'].index('signal_decider'),
         )
         self.assertIn('signal_decider', payload['default_daily_stage_order'])
+        self.assertLess(
+            payload['default_daily_stage_order'].index('signal_decider'),
+            payload['default_daily_stage_order'].index('next_open_execution_plan'),
+        )
+        self.assertLess(
+            payload['default_daily_stage_order'].index('next_open_execution_plan'),
+            payload['default_daily_stage_order'].index('signal_decider_evaluations'),
+        )
         self.assertIn('unified_value_factors', payload['stage_order'])
         self.assertIn('quality_factors', payload['stage_order'])
         unified_value_stage = next(
@@ -695,6 +703,53 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         self.assertEqual(result, {'results_persisted': 2})
         self.assertEqual(compute_quality.call_args.kwargs['market_date'], '2026-04-24')
         self.assertEqual(compute_quality.call_args.kwargs['symbols'], ['005930', '000660'])
+
+    def test_execute_stage_refreshes_next_open_plan_after_decider(self) -> None:
+        service = DailyPipelineStageService()
+
+        with patch(
+            'app.orders.next_open_execution.signal_decider_next_open_execution_service.refresh_plan_items',
+            return_value={'summary': {'items_total': 2, 'eligible_count': 1}},
+        ) as refresh_plan:
+            result = service._execute_stage(
+                stage_id='next_open_execution_plan',
+                market_date='2026-04-14',
+                symbols=None,
+                markets=None,
+                force=False,
+                fs_div='CFS',
+                symbol_limit=None,
+                symbol_offset=0,
+                capture_limit=500,
+                retry_cycles=None,
+                feedback_max_cycles=3,
+                feedback_outer_batch_size=20,
+                reuse_existing_feedback=True,
+            )
+
+        self.assertEqual(result['summary']['items_total'], 2)
+        refresh_plan.assert_called_once_with(
+            target_trade_date='2026-04-15',
+            trigger='daily_pipeline_post_decider',
+            force=False,
+        )
+
+    def test_next_open_plan_stage_counts_eligible_and_blocked_rows(self) -> None:
+        counts = DailyPipelineStageService._extract_stage_counts(
+            stage_id='next_open_execution_plan',
+            result={
+                'summary': {
+                    'items_total': 18,
+                    'eligible_count': 14,
+                    'blocked_count': 4,
+                }
+            },
+        )
+
+        self.assertEqual(
+            counts,
+            {'processed': 18, 'total': 18, 'succeeded': 14, 'failed': 4},
+        )
 
 
 if __name__ == '__main__':

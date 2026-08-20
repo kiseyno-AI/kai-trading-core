@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from typing import Any, Callable, Sequence
 
 from app.agent_context.retry_service import FeedbackRetryCycleConfig, agent_feedback_retry_service
@@ -86,6 +86,7 @@ DAILY_STAGE_ORDER: tuple[str, ...] = (
     'macro_context_refresh',
     'agent_feedback_summaries',
     'signal_decider',
+    'next_open_execution_plan',
     'signal_decider_evaluations',
 )
 DEFAULT_DAILY_STAGE_ORDER: tuple[str, ...] = (
@@ -102,6 +103,7 @@ DEFAULT_DAILY_STAGE_ORDER: tuple[str, ...] = (
     'macro_context_refresh',
     'agent_feedback_summaries',
     'signal_decider',
+    'next_open_execution_plan',
     'signal_decider_evaluations',
 )
 
@@ -445,6 +447,17 @@ STAGE_DEFINITIONS: dict[str, DailyStageDefinition] = {
         supports_force=True,
         inspect_routes=('/agent-context/signal-decider/evaluations', '/agent-context/signal-decider/diagnostics'),
         output_tables=('signal_decider_realized_outcomes', 'signal_decider_evaluations'),
+        default_selected=True,
+    ),
+    'next_open_execution_plan': DailyStageDefinition(
+        id='next_open_execution_plan',
+        label='next-open execution plan refresh',
+        group='execution_planning',
+        description='Materialize persisted next-open execution plan rows immediately after decision-support deciders complete.',
+        depends_on=('signal_decider',),
+        supports_force=True,
+        inspect_routes=('/trading/orders/next-open-execution',),
+        output_tables=('signal_decider_execution_plan_items',),
         default_selected=True,
     ),
 }
@@ -806,6 +819,17 @@ class DailyPipelineStageService:
                 'succeeded': succeeded,
                 'failed': failed,
             }
+        if stage_id == 'next_open_execution_plan':
+            summary = result.get('summary') if isinstance(result.get('summary'), dict) else {}
+            total = _int(summary.get('items_total'))
+            eligible = _int(summary.get('eligible_count'))
+            blocked = _int(summary.get('blocked_count'))
+            return {
+                'processed': eligible + blocked,
+                'total': total,
+                'succeeded': eligible,
+                'failed': blocked,
+            }
 
         count_pairs = (
             ('snapshots_persisted', 'snapshots_failed'),
@@ -1073,6 +1097,15 @@ class DailyPipelineStageService:
                     reuse_existing=reuse_existing_feedback,
                     progress_callback=progress_callback,
                 ),
+                force=force,
+            )
+        if stage_id == 'next_open_execution_plan':
+            from app.orders.next_open_execution import signal_decider_next_open_execution_service
+
+            target_trade_date = (date.fromisoformat(market_date) + timedelta(days=1)).isoformat()
+            return signal_decider_next_open_execution_service.refresh_plan_items(
+                target_trade_date=target_trade_date,
+                trigger='daily_pipeline_post_decider',
                 force=force,
             )
         if stage_id == 'signal_decider_evaluations':

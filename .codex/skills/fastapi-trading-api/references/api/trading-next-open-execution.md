@@ -3,6 +3,8 @@
 ## Summary
 Inspect or execute the persisted next-open buy plan derived from the latest previous-trading-day decision snapshots. The planner now includes both classic `signal-decider` next-open buys and actionable `short-term-decider` tactical candidates, stores blocked-vs-eligible validation results durably with explicit decider identity, and the submit hook either reuses the existing trading-order persistence flow or, when `SIGNAL_DECIDER_EXEC_INTEGRATION_MODE=dispatch`, translates eligible rows into normalized exec plan items and delegates sizing/execution authority to `kai-trading-exec`.
 
+The daily EOD pipeline refreshes this persisted plan immediately after the decision-support decider stage completes. PREOPEN refresh remains as an idempotent safety net, but operators no longer need to wait until the next morning for buy snapshots to become inspectable execution-plan rows.
+
 For dispatch-mode buy candidates, core sends sizing context as a candidate contract (`quantity_policy.type='exec_agent_sized'`) so exec can make final share decisions using account/feedback/context rails, budgets, reference/entry context, confidence, and target/stop metadata. Core-local disabled mode keeps the legacy fixed-share signal-decider submit path.
 
 Short-term validation now preserves the decider request's `pre_decider_enrichment_context` in both `validation.pre_decider_enrichment_context` and `validation.short_term.pre_decider_enrichment_context`. Operators can inspect the quote/orderbook snapshot status, raw-vs-estimated trading value provenance, investor/short-selling flow, and sector-peer context that were available before dispatch validation.

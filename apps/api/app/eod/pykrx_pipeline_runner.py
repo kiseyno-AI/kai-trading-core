@@ -45,6 +45,7 @@ AUTO_DAILY_FOLLOWUP_STAGE_ORDER: tuple[str, ...] = (
     'external_news_collect',
     'agent_feedback_summaries',
     'signal_decider',
+    'next_open_execution_plan',
     'signal_decider_evaluations',
 )
 AUTO_DAILY_TRACKED_STAGE_ORDER: tuple[str, ...] = (
@@ -659,6 +660,25 @@ def _run_daily_signal_decider_followup(
         roles=DECISION_SUPPORT_AGENT_NAMES,
         feedback_scope_mode=FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
         progress_callback=progress_callback,
+    )
+
+
+def _run_daily_next_open_execution_plan_followup(*, market_date: str, enabled: bool) -> dict[str, Any]:
+    if not enabled:
+        return {
+            'triggered': False,
+            'reason': 'followup_disabled',
+            'market_date': market_date,
+        }
+
+    from datetime import date, timedelta
+
+    from app.orders.next_open_execution import signal_decider_next_open_execution_service
+
+    target_trade_date = (date.fromisoformat(market_date) + timedelta(days=1)).isoformat()
+    return signal_decider_next_open_execution_service.refresh_plan_items(
+        target_trade_date=target_trade_date,
+        trigger='eod_post_decider',
     )
 
 
@@ -2116,6 +2136,14 @@ def run_market_data_pipeline(
                     record_followup_result('signal_decider', result['signal_decider_followup'])
                     signal_decider_status = 'blocked'
                 if signal_decider_status in {'completed', 'partial'}:
+                    result['next_open_execution_plan_followup'] = run_followup_stage(
+                        'next_open_execution_plan',
+                        activity='Refreshing next-open execution plan after signal deciders',
+                        call=lambda: _run_daily_next_open_execution_plan_followup(
+                            market_date=latest_trade_date,
+                            enabled=True,
+                        ),
+                    )
                     result['signal_decider_evaluation_followup'] = run_followup_stage(
                         'signal_decider_evaluations',
                         activity='Running signal-decider evaluation follow-up',
@@ -2125,6 +2153,15 @@ def run_market_data_pipeline(
                         ),
                     )
                 else:
+                    result['next_open_execution_plan_followup'] = build_blocked_followup_result(
+                        'next_open_execution_plan',
+                        'signal_decider_followup_incomplete',
+                        upstream_status=signal_decider_status,
+                    )
+                    record_followup_result(
+                        'next_open_execution_plan',
+                        result['next_open_execution_plan_followup'],
+                    )
                     result['signal_decider_evaluation_followup'] = build_blocked_followup_result(
                         'signal_decider_evaluations',
                         'signal_decider_followup_incomplete',
@@ -2147,6 +2184,15 @@ def run_market_data_pipeline(
                     upstream_status=factor_status,
                 )
                 record_followup_result('signal_decider', result['signal_decider_followup'])
+                result['next_open_execution_plan_followup'] = build_blocked_followup_result(
+                    'next_open_execution_plan',
+                    'factor_scoring_followup_incomplete',
+                    upstream_status=factor_status,
+                )
+                record_followup_result(
+                    'next_open_execution_plan',
+                    result['next_open_execution_plan_followup'],
+                )
                 result['signal_decider_evaluation_followup'] = build_blocked_followup_result(
                     'signal_decider_evaluations',
                     'factor_scoring_followup_incomplete',
@@ -2194,6 +2240,15 @@ def run_market_data_pipeline(
                 upstream_status='blocked',
             )
             record_followup_result('signal_decider', result['signal_decider_followup'])
+            result['next_open_execution_plan_followup'] = build_blocked_followup_result(
+                'next_open_execution_plan',
+                'factor_scoring_followup_incomplete',
+                upstream_status='blocked',
+            )
+            record_followup_result(
+                'next_open_execution_plan',
+                result['next_open_execution_plan_followup'],
+            )
             result['signal_decider_evaluation_followup'] = build_blocked_followup_result(
                 'signal_decider_evaluations',
                 'factor_scoring_followup_incomplete',
