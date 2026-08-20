@@ -1002,7 +1002,8 @@ class SignalDeciderExecIntegrationService:
 
         enrichment_preflight: dict[str, Any] | None = None
         if refresh_plan:
-            refresh_result = signal_decider_next_open_execution_service.refresh_plan_items(
+            refresh_result = await asyncio.to_thread(
+                signal_decider_next_open_execution_service.refresh_plan_items,
                 target_trade_date=resolved_target_date,
                 trigger=f'{trigger}_plan_refresh',
                 force=force,
@@ -1022,11 +1023,10 @@ class SignalDeciderExecIntegrationService:
                 'category_row_counts': {},
             }
         else:
-            enrichment_preflight = (
-                signal_decider_next_open_execution_service.inspect_source_market_enrichment_preflight(
-                    source_market_date=source_market_date,
-                    trigger=f'{trigger}_dispatch',
-                )
+            enrichment_preflight = await asyncio.to_thread(
+                signal_decider_next_open_execution_service.inspect_source_market_enrichment_preflight,
+                source_market_date=source_market_date,
+                trigger=f'{trigger}_dispatch',
             )
 
         if enrichment_preflight is not None and not force and not enrichment_preflight.get('allowed'):

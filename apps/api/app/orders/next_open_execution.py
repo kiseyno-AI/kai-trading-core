@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections import Counter
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
@@ -1532,7 +1533,8 @@ class SignalDeciderNextOpenExecutionService:
                     'items': [],
                 }
 
-        refresh_result = self.refresh_plan_items(
+        refresh_result = await asyncio.to_thread(
+            self.refresh_plan_items,
             target_trade_date=resolved_target_date,
             trigger=f'{trigger}_prepare',
             force=force,

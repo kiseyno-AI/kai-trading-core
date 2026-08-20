@@ -580,6 +580,26 @@ class DailyPipelineStageService:
                 market_date=resolved_market_date,
                 symbols=resolved_symbols,
             )
+            if stage_id == 'next_open_execution_plan':
+                decider_outcome = stage_outcomes.get('signal_decider')
+                decider_status = str((decider_outcome or {}).get('status') or '').strip().lower()
+                if decider_outcome is not None and decider_status != 'completed':
+                    stage_result = {
+                        'triggered': False,
+                        'status': 'blocked',
+                        'reason': 'signal_decider_stage_incomplete',
+                        'market_date': resolved_market_date,
+                        'upstream_status': decider_status or 'unknown',
+                    }
+                    stage_outcomes[stage_id] = self._build_stage_outcome(stage_id, stage_result)
+                    self._finish_tracked_stage(
+                        pipeline_run_id=pipeline_run_id,
+                        stage_id=stage_id,
+                        market_date=resolved_market_date,
+                        outcome=stage_outcomes[stage_id],
+                        result=stage_result,
+                    )
+                    continue
             try:
                 stage_result = self._execute_stage(
                     stage_id,
