@@ -63,10 +63,16 @@ class USFundamentalCollectionService:
         self,
         *,
         market_date: date,
+        collection_run_id: int,
         persist: bool = True,
         policy: USScreeningPolicy | None = None,
     ) -> dict[str, Any]:
-        candidates = await asyncio.to_thread(self._candidate_loader, market_date=market_date, limit=300)
+        candidates = await asyncio.to_thread(
+            self._candidate_loader,
+            market_date=market_date,
+            collection_run_id=collection_run_id,
+            limit=300,
+        )
         if not candidates:
             raise ValueError('No price-screen candidates found for the requested market date')
         client = self._sec_client or SECEdgarClient()
@@ -157,6 +163,7 @@ class USFundamentalCollectionService:
         return {
             'status': 'completed' if not errors else 'completed_with_errors',
             'market_date': market_date.isoformat(),
+            'collection_run_id': collection_run_id,
             'persist': persist,
             'counts': {
                 'price_candidates': len(candidates),

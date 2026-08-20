@@ -59,12 +59,15 @@ class USFundamentalCollectionServiceTests(unittest.IsolatedAsyncioTestCase):
             candidate_loader=lambda **kwargs: candidates,
         )
 
-        result = await service.collect_and_screen(market_date=date(2025, 6, 1), persist=False)
+        result = await service.collect_and_screen(
+            market_date=date(2025, 6, 1), collection_run_id=7, persist=False
+        )
 
         self.assertEqual(result['counts']['price_candidates'], 2)
         self.assertEqual(result['counts']['sec_snapshots_collected'], 2)
         self.assertEqual(result['counts']['agent_candidates'], 2)
         self.assertEqual(set(result['selected_symbols']), {'AAPL', 'MSFT'})
+        self.assertEqual(result['collection_run_id'], 7)
 
     async def test_missing_cik_is_isolated_as_symbol_error(self):
         service = USFundamentalCollectionService(
@@ -74,7 +77,9 @@ class USFundamentalCollectionServiceTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
-        result = await service.collect_and_screen(market_date=date(2025, 6, 1), persist=False)
+        result = await service.collect_and_screen(
+            market_date=date(2025, 6, 1), collection_run_id=7, persist=False
+        )
 
         self.assertEqual(result['status'], 'completed_with_errors')
         self.assertEqual(result['counts']['agent_candidates'], 0)

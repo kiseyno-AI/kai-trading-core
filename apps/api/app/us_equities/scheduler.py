@@ -30,14 +30,33 @@ _STAGE_CHECKPOINT_FIELDS = (
     'status',
     'market_date',
     'run_id',
+    'collection_run_id',
     'persist',
     'dry_run',
     'completed',
     'failed',
+    'current_role',
+    'completed_batches',
+    'total_batches',
     'accepted_candidate_count',
     'rejected_candidate_count',
     'counts',
 )
+
+
+def _require_completed_stage(stage_name: str, result: dict) -> None:
+    if result.get('status') != 'completed':
+        raise RuntimeError(f'US {stage_name} stage did not complete cleanly')
+    counts = result.get('counts') if isinstance(result.get('counts'), dict) else {}
+    error_count = int(result.get('error_count') or counts.get('errors') or 0)
+    failed_count = int(result.get('failed') or 0)
+    if error_count or failed_count:
+        raise RuntimeError(f'US {stage_name} stage reported errors')
+    role_counts = result.get('role_counts')
+    if isinstance(role_counts, dict):
+        expected = sum(int(value or 0) for value in role_counts.values())
+        if int(result.get('completed') or 0) != expected:
+            raise RuntimeError(f'US {stage_name} stage did not complete its full role scope')
 
 
 def _scheduled_time(value: str) -> time:
@@ -149,25 +168,49 @@ class USEquityPipelineScheduler:
         )
         try:
             stages['universe'] = await us_universe_refresh_service.refresh(persist=True, preview_limit=0)
+            _require_completed_stage('universe', stages['universe'])
             await self._heartbeat(market_date=market_date, run_id=run_id, stages=stages)
             stages['prices'] = await us_price_collection_service.collect_and_screen(
                 market_date=market_date,
                 persist=True,
             )
+            _require_completed_stage('prices', stages['prices'])
+            collection_run_id = stages['prices'].get('run_id')
+            if collection_run_id is None:
+                raise RuntimeError('US prices stage did not return a collection_run_id')
             await self._heartbeat(market_date=market_date, run_id=run_id, stages=stages)
             stages['fundamentals'] = await us_fundamental_collection_service.collect_and_screen(
                 market_date=market_date,
+                collection_run_id=int(collection_run_id),
                 persist=True,
             )
+            _require_completed_stage('fundamentals', stages['fundamentals'])
+            if int(stages['fundamentals'].get('collection_run_id') or -1) != int(collection_run_id):
+                raise RuntimeError('US fundamentals stage returned mismatched collection lineage')
             await self._heartbeat(market_date=market_date, run_id=run_id, stages=stages)
+
+            def persist_agent_progress(progress: dict) -> None:
+                stages['agents'] = progress
+                updated = update_us_equity_pipeline_run(
+                    market_date=market_date,
+                    run_id=run_id,
+                    status='running',
+                    stages=_stage_checkpoints(stages),
+                )
+                if not updated:
+                    raise RuntimeError('Lost durable US-equity pipeline run ownership during agent dispatch')
+
             stages['agents'] = await asyncio.to_thread(
                 us_agent_analysis_service.dispatch,
                 market_date=market_date,
+                collection_run_id=int(collection_run_id),
                 persist=True,
-                batch_size=5,
+                batch_size=1,
+                progress_callback=persist_agent_progress,
             )
-            if stages['agents'].get('status') != 'completed' or int(stages['agents'].get('failed') or 0) != 0:
-                raise RuntimeError('US agent analysis did not complete without failures')
+            _require_completed_stage('agent analysis', stages['agents'])
+            if int(stages['agents'].get('collection_run_id') or -1) != int(collection_run_id):
+                raise RuntimeError('US agent stage returned mismatched collection lineage')
             await self._heartbeat(market_date=market_date, run_id=run_id, stages=stages)
             stages['execution'] = await us_execution_plan_service.dispatch(
                 source_market_date=market_date,

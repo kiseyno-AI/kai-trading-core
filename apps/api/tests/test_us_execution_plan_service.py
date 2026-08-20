@@ -16,7 +16,10 @@ def _row(symbol: str, *, action: str = 'buy', warnings=None, confidence=8.0, ris
         'exchange_code': 'NASDAQ',
         'rank': 1,
         'composite_score': '0.9',
-        'metrics_payload': {'price': {'latest_price': '50.00'}},
+        # A later same-date screen may exist, but execution must use the price
+        # persisted with the explicitly selected agent run.
+        'metrics_payload': {'price': {'latest_price': '999.00'}},
+        'context_payload': {'symbol_day_context': {'price_screen': {'latest_price': '50.00'}}},
         'decision_payload': {},
         'normalized_feedback_payload': {
             'role': 'signal-decider',
@@ -76,7 +79,7 @@ def test_rejects_wait_low_confidence_and_data_warning_before_exec_feedback() -> 
     ]
     service = USExecutionPlanService(feedback_loader=lambda **kwargs: rows)
 
-    result = service.build(source_market_date=date(2026, 8, 19))
+    result = service.build(source_market_date=date(2026, 8, 19), agent_run_id='us-run-1')
 
     assert result['status'] == 'empty'
     assert result['payload']['items'] == []
@@ -121,7 +124,9 @@ def test_dispatch_defaults_to_preview_without_calling_exec() -> None:
     )
 
     result = asyncio.run(
-        service.dispatch(source_market_date=date(2026, 8, 19), dry_run=True)
+        service.dispatch(
+            source_market_date=date(2026, 8, 19), dry_run=True, agent_run_id='us-run-1'
+        )
     )
 
     assert result['dry_run'] is True
@@ -134,7 +139,7 @@ def test_non_preview_dispatch_requires_current_agent_run_id() -> None:
     try:
         asyncio.run(service.dispatch(source_market_date=date(2026, 8, 19), dry_run=False))
     except ValueError as exc:
-        assert str(exc) == 'agent_run_id is required for non-preview US equity execution dispatch'
+        assert str(exc) == 'agent_run_id is required for US equity execution planning'
     else:
         raise AssertionError('non-preview dispatch must reject an unscoped agent run')
 
@@ -142,6 +147,6 @@ def test_non_preview_dispatch_requires_current_agent_run_id() -> None:
 def test_default_target_trade_date_skips_us_exchange_holiday() -> None:
     service = USExecutionPlanService(feedback_loader=lambda **kwargs: [_row('AAPL')])
 
-    result = service.build(source_market_date=date(2026, 7, 2))
+    result = service.build(source_market_date=date(2026, 7, 2), agent_run_id='us-run-1')
 
     assert result['target_trade_date'] == '2026-07-06'

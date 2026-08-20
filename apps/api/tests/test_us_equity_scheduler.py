@@ -47,16 +47,30 @@ def test_scheduler_uses_durable_claim_before_starting_pipeline(monkeypatch) -> N
 
 
 def test_scheduler_blocks_execution_when_agent_stage_is_partial(monkeypatch) -> None:
-    class AsyncStage:
+    class UniverseStage:
         async def refresh(self, **kwargs):
             return {'status': 'completed'}
 
+    class PriceStage:
         async def collect_and_screen(self, **kwargs):
-            return {'status': 'completed'}
+            return {'status': 'completed', 'run_id': 77, 'counts': {'errors': 0}}
+
+    class FundamentalStage:
+        async def collect_and_screen(self, **kwargs):
+            return {
+                'status': 'completed',
+                'collection_run_id': kwargs['collection_run_id'],
+                'counts': {'errors': 0},
+            }
 
     class PartialAgents:
         def dispatch(self, **kwargs):
-            return {'status': 'partial', 'failed': 1, 'run_id': 'agent-run'}
+            return {
+                'status': 'partial',
+                'failed': 1,
+                'run_id': 'agent-run',
+                'collection_run_id': kwargs['collection_run_id'],
+            }
 
     execution_calls = []
 
@@ -66,9 +80,9 @@ def test_scheduler_blocks_execution_when_agent_stage_is_partial(monkeypatch) -> 
             return {'status': 'dispatched'}
 
     updates = []
-    monkeypatch.setattr(scheduler_module, 'us_universe_refresh_service', AsyncStage())
-    monkeypatch.setattr(scheduler_module, 'us_price_collection_service', AsyncStage())
-    monkeypatch.setattr(scheduler_module, 'us_fundamental_collection_service', AsyncStage())
+    monkeypatch.setattr(scheduler_module, 'us_universe_refresh_service', UniverseStage())
+    monkeypatch.setattr(scheduler_module, 'us_price_collection_service', PriceStage())
+    monkeypatch.setattr(scheduler_module, 'us_fundamental_collection_service', FundamentalStage())
     monkeypatch.setattr(scheduler_module, 'us_agent_analysis_service', PartialAgents())
     monkeypatch.setattr(scheduler_module, 'us_execution_plan_service', Execution())
     monkeypatch.setattr(
@@ -84,6 +98,114 @@ def test_scheduler_blocks_execution_when_agent_stage_is_partial(monkeypatch) -> 
     assert result['status'] == 'failed'
     assert execution_calls == []
     assert updates[-1]['status'] == 'failed'
+
+
+def test_scheduler_blocks_downstream_stages_when_price_collection_has_errors(monkeypatch) -> None:
+    class UniverseStage:
+        async def refresh(self, **kwargs):
+            return {'status': 'completed'}
+
+    class PartialPrices:
+        async def collect_and_screen(self, **kwargs):
+            return {
+                'status': 'completed_with_errors',
+                'run_id': 77,
+                'counts': {'errors': 1},
+            }
+
+    downstream_calls = []
+
+    class Downstream:
+        async def collect_and_screen(self, **kwargs):
+            downstream_calls.append(kwargs)
+            return {'status': 'completed'}
+
+    monkeypatch.setattr(scheduler_module, 'us_universe_refresh_service', UniverseStage())
+    monkeypatch.setattr(scheduler_module, 'us_price_collection_service', PartialPrices())
+    monkeypatch.setattr(scheduler_module, 'us_fundamental_collection_service', Downstream())
+    monkeypatch.setattr(
+        scheduler_module,
+        'update_us_equity_pipeline_run',
+        lambda **kwargs: True,
+    )
+
+    result = asyncio.run(
+        USEquityPipelineScheduler()._run_pipeline(date(2026, 8, 19), run_id='pipeline-run')
+    )
+
+    assert result['status'] == 'failed'
+    assert downstream_calls == []
+
+
+def test_scheduler_uses_single_symbol_batches_and_persists_agent_progress(monkeypatch) -> None:
+    class UniverseStage:
+        async def refresh(self, **kwargs):
+            return {'status': 'completed'}
+
+    class PriceStage:
+        async def collect_and_screen(self, **kwargs):
+            return {'status': 'completed', 'run_id': 77, 'counts': {'errors': 0}}
+
+    class FundamentalStage:
+        async def collect_and_screen(self, **kwargs):
+            assert kwargs['collection_run_id'] == 77
+            return {
+                'status': 'completed',
+                'collection_run_id': 77,
+                'counts': {'errors': 0},
+            }
+
+    agent_calls = []
+
+    class Agents:
+        def dispatch(self, **kwargs):
+            agent_calls.append(kwargs)
+            kwargs['progress_callback']({
+                'status': 'running',
+                'run_id': 'agent-run',
+                'collection_run_id': 77,
+                'current_role': 'eod-summarizer',
+                'completed_batches': 1,
+                'total_batches': 1,
+                'completed': 1,
+                'failed': 0,
+            })
+            return {
+                'status': 'completed',
+                'run_id': 'agent-run',
+                'collection_run_id': 77,
+                'role_counts': {'eod-summarizer': 1},
+                'completed': 1,
+                'failed': 0,
+            }
+
+    class Execution:
+        async def dispatch(self, **kwargs):
+            return {'status': 'ready', 'dry_run': True}
+
+    updates = []
+    monkeypatch.setattr(scheduler_module, 'us_universe_refresh_service', UniverseStage())
+    monkeypatch.setattr(scheduler_module, 'us_price_collection_service', PriceStage())
+    monkeypatch.setattr(scheduler_module, 'us_fundamental_collection_service', FundamentalStage())
+    monkeypatch.setattr(scheduler_module, 'us_agent_analysis_service', Agents())
+    monkeypatch.setattr(scheduler_module, 'us_execution_plan_service', Execution())
+    monkeypatch.setattr(
+        scheduler_module,
+        'update_us_equity_pipeline_run',
+        lambda **kwargs: updates.append(kwargs) or True,
+    )
+
+    result = asyncio.run(
+        USEquityPipelineScheduler()._run_pipeline(date(2026, 8, 19), run_id='pipeline-run')
+    )
+
+    assert result['status'] == 'completed'
+    assert agent_calls[0]['collection_run_id'] == 77
+    assert agent_calls[0]['batch_size'] == 1
+    assert any(
+        update['stages'].get('agents', {}).get('completed_batches') == 1
+        for update in updates
+    )
 
 
 def test_scheduler_renews_durable_lease_during_long_stage(monkeypatch) -> None:

@@ -5737,16 +5737,23 @@ class AgentContextReadService:
         factor_row_counts = {family: 0 for family in PERSISTED_FACTOR_FAMILIES}
 
         for symbol in normalized_symbols:
+            company_row = symbol_map.get(symbol)
+            company_market = str(company_row.get('market') or '').strip().upper() if company_row else ''
+            symbol_market_session = (
+                request_market_session
+                if company_market in {'US', 'NASDAQ', 'NASD', 'NYSE', 'AMEX', 'NYSE ARCA'}
+                else None
+            )
             raw_quote_row = quote_map.get(symbol)
             quote_context = _build_quote_context(
                 raw_quote_row,
                 market_date=normalized_market_date,
-                market_session=request_market_session,
+                market_session=symbol_market_session,
             )
             intraday_execution_row = intraday_execution_map.get(symbol)
             intraday_execution_context = _build_intraday_execution_context(
                 intraday_execution_row,
-                market_session=request_market_session,
+                market_session=symbol_market_session,
             )
             price_context = price_context_map.get(symbol)
             price_context_history = price_context_history_map.get(symbol, [])
@@ -5755,8 +5762,6 @@ class AgentContextReadService:
             signal_features = signal_feature_map.get(symbol)
             market_relative_context = _build_market_relative_context(market_relative_map.get(symbol))
             latest_prior_low_risk_row = ((latest_prior_rows.get('factor_rows') or {}).get('low_risk') or {}).get(symbol)
-            company_row = symbol_map.get(symbol)
-            company_market = str(company_row.get('market') or '').strip().upper() if company_row else ''
             symbol_enrichment_rows = dict(pykrx_enrichment_by_symbol.get(symbol) or {})
             market_enrichment_rows = dict(pykrx_enrichment_by_market.get(company_market) or {})
             sector_peer_context = _build_sector_peer_context(
@@ -5879,7 +5884,7 @@ class AgentContextReadService:
                 ),
                 'intraday_execution_context': _build_intraday_execution_completeness(
                     intraday_execution_row,
-                    market_session=request_market_session,
+                    market_session=symbol_market_session,
                 ),
                 'market_relative_context': _build_market_relative_completeness(market_relative_context),
                 'sector_peer_mapping': _build_context_block_completeness(
@@ -5921,7 +5926,7 @@ class AgentContextReadService:
             quote_context_provenance = _build_quote_freshness_provenance(
                 row=raw_quote_row,
                 requested_market_date=normalized_market_date,
-                market_session=request_market_session,
+                market_session=symbol_market_session,
             )
             price_context_provenance = _build_price_context_freshness_provenance(
                 price_context=price_context,
@@ -5939,7 +5944,7 @@ class AgentContextReadService:
             intraday_execution_provenance = _build_intraday_execution_freshness_provenance(
                 row=intraday_execution_row,
                 requested_market_date=normalized_market_date,
-                market_session=request_market_session,
+                market_session=symbol_market_session,
             )
             market_relative_context_provenance = _build_market_relative_freshness_provenance(
                 row=market_relative_map.get(symbol),
@@ -6104,7 +6109,7 @@ class AgentContextReadService:
             )
             pre_decider_enrichment_context = _build_pre_decider_enrichment_context(
                 requested_market_date=normalized_market_date,
-                market_session=request_market_session,
+                market_session=symbol_market_session,
                 quote_context=quote_context,
                 quote_freshness_provenance=quote_context_provenance,
                 intraday_execution_context=intraday_execution_context,
@@ -6249,7 +6254,7 @@ class AgentContextReadService:
                 {
                     'symbol': symbol,
                     'market_date': normalized_market_date.isoformat(),
-                    'market_session': request_market_session,
+                    'market_session': symbol_market_session or request_market_session,
                     'market_data_phase_contract': pre_decider_enrichment_context.get('market_data_phase_contract'),
                     'company': company,
                     'quote_context': quote_context,

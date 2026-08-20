@@ -66,12 +66,13 @@ class USEquitiesRouteTests(unittest.IsolatedAsyncioTestCase):
             async with httpx.AsyncClient(transport=transport, base_url='http://test') as client:
                 response = await client.post(
                     '/us-equities/fundamentals/collect-and-screen',
-                    json={'market_date': '2026-08-19', 'persist': False},
+                    json={'market_date': '2026-08-19', 'collection_run_id': 77, 'persist': False},
                 )
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), payload)
         collect.assert_awaited_once()
+        self.assertEqual(collect.await_args.kwargs['collection_run_id'], 77)
 
     async def test_execution_plan_route_defaults_to_dry_run(self):
         payload = {'status': 'ready', 'dry_run': True, 'payload': {'items': []}}
@@ -83,14 +84,36 @@ class USEquitiesRouteTests(unittest.IsolatedAsyncioTestCase):
             async with httpx.AsyncClient(transport=transport, base_url='http://test') as client:
                 response = await client.post(
                     '/us-equities/execution-plans/dispatch',
-                    json={'source_market_date': '2026-08-19'},
+                    json={'source_market_date': '2026-08-19', 'agent_run_id': 'us-run-1'},
                 )
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), payload)
         dispatch.assert_awaited_once()
         self.assertTrue(dispatch.await_args.kwargs['dry_run'])
+        self.assertEqual(dispatch.await_args.kwargs['agent_run_id'], 'us-run-1')
         self.assertEqual(dispatch.await_args.kwargs['source_market_date'].isoformat(), '2026-08-19')
+
+    async def test_agent_dispatch_route_passes_required_collection_lineage(self):
+        payload = {'status': 'completed', 'collection_run_id': 77, 'run_id': 'agent-run'}
+        with patch(
+            'app.api.routes_us_equities.us_agent_analysis_service.dispatch',
+            return_value=payload,
+        ) as dispatch:
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url='http://test') as client:
+                response = await client.post(
+                    '/us-equities/agents/dispatch',
+                    json={
+                        'market_date': '2026-08-19',
+                        'collection_run_id': 77,
+                        'persist': False,
+                    },
+                )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), payload)
+        self.assertEqual(dispatch.call_args.kwargs['collection_run_id'], 77)
 
 
 if __name__ == '__main__':

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 import re
+from threading import Lock
 import time
 from typing import Any, Awaitable, Callable
 
@@ -77,18 +78,44 @@ class _AsyncRateLimiter:
         self.minimum_interval_seconds = 1.0 / requests_per_second
         self._clock = clock
         self._sleep = sleep
-        self._lock = asyncio.Lock()
-        self._last_request_at: float | None = None
+        self._lock = Lock()
+        self._next_request_at: float | None = None
+
+    def tighten(self, requests_per_second: float) -> None:
+        if requests_per_second <= 0 or requests_per_second > 10:
+            raise ValueError('SEC requests_per_second must be greater than 0 and no more than 10')
+        with self._lock:
+            self.minimum_interval_seconds = max(
+                self.minimum_interval_seconds,
+                1.0 / requests_per_second,
+            )
 
     async def wait(self) -> None:
-        async with self._lock:
-            now = self._clock()
-            if self._last_request_at is not None:
-                remaining = self.minimum_interval_seconds - (now - self._last_request_at)
-                if remaining > 0:
-                    await self._sleep(remaining)
-                    now = self._clock()
-            self._last_request_at = now
+        now = self._clock()
+        with self._lock:
+            request_at = max(now, self._next_request_at or now)
+            self._next_request_at = request_at + self.minimum_interval_seconds
+        remaining = request_at - now
+        if remaining > 0:
+            await self._sleep(remaining)
+
+
+_PROCESS_RATE_LIMITER: _AsyncRateLimiter | None = None
+_PROCESS_RATE_LIMITER_LOCK = Lock()
+
+
+def _process_rate_limiter(requests_per_second: float) -> _AsyncRateLimiter:
+    global _PROCESS_RATE_LIMITER
+    normalized_rate = float(requests_per_second)
+    with _PROCESS_RATE_LIMITER_LOCK:
+        if _PROCESS_RATE_LIMITER is None:
+            _PROCESS_RATE_LIMITER = _AsyncRateLimiter(normalized_rate)
+        else:
+            # All clients coordinate through one process-wide schedule.  A
+            # stricter client may lower the shared ceiling, but a later faster
+            # client can never open a parallel lane or loosen that ceiling.
+            _PROCESS_RATE_LIMITER.tighten(normalized_rate)
+        return _PROCESS_RATE_LIMITER
 
 
 class SECEdgarClient:
@@ -111,8 +138,10 @@ class SECEdgarClient:
         self.www_base_url = (www_base_url or settings.sec_edgar_www_base_url).rstrip('/')
         self.timeout_seconds = timeout_seconds or settings.sec_edgar_request_timeout_seconds
         self._transport = transport
-        self._rate_limiter = _AsyncRateLimiter(
-            requests_per_second or settings.sec_edgar_requests_per_second
+        self._rate_limiter = _process_rate_limiter(
+            settings.sec_edgar_requests_per_second
+            if requests_per_second is None
+            else requests_per_second
         )
 
     async def fetch_submissions(self, cik: int | str) -> dict[str, Any]:
