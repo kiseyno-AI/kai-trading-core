@@ -751,6 +751,31 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             {'processed': 18, 'total': 18, 'succeeded': 14, 'failed': 4},
         )
 
+    def test_run_blocks_next_open_plan_when_signal_decider_is_incomplete(self) -> None:
+        service = DailyPipelineStageService()
+
+        def execute(stage_id, **_):
+            if stage_id == 'signal_decider':
+                return {'status': 'blocked', 'reason': 'feedback_prerequisites_not_ready'}
+            raise AssertionError('next-open plan refresh must not run after a blocked decider')
+
+        with (
+            patch.object(service, '_normalize_market_date', return_value='2026-04-14'),
+            patch.object(service, '_execute_stage', side_effect=execute) as execute_stage,
+        ):
+            result = service.run(
+                market_date='2026-04-14',
+                stages=['signal_decider', 'next_open_execution_plan'],
+            )
+
+        self.assertEqual(result['stages']['signal_decider']['status'], 'blocked')
+        self.assertEqual(result['stages']['next_open_execution_plan']['status'], 'blocked')
+        self.assertEqual(
+            result['stages']['next_open_execution_plan']['result']['reason'],
+            'signal_decider_stage_incomplete',
+        )
+        self.assertEqual([call.args[0] for call in execute_stage.call_args_list], ['signal_decider'])
+
 
 if __name__ == '__main__':
     unittest.main()
