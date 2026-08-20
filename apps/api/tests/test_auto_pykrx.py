@@ -17,6 +17,7 @@ from app.eod.pykrx_pipeline_runner import (
     _extract_result_counts,
     _normalize_stage_status,
     _run_daily_feedback_followup,
+    _run_daily_next_open_execution_plan_followup,
     _run_daily_signal_decider_evaluation_followup,
     _run_daily_signal_decider_followup,
 )
@@ -59,6 +60,24 @@ def _ready_pykrx_enrichment_result(*, market_date: str = '2026-04-03') -> dict:
         },
         'summary': {'categories_failed': 0},
     }
+
+
+class NextOpenExecutionPlanFollowupTests(TestCase):
+    def test_refreshes_plan_for_day_after_market_date(self) -> None:
+        with patch(
+            'app.orders.next_open_execution.signal_decider_next_open_execution_service.refresh_plan_items',
+            return_value={'summary': {'items_total': 3}},
+        ) as refresh_plan:
+            result = _run_daily_next_open_execution_plan_followup(
+                market_date='2026-04-03',
+                enabled=True,
+            )
+
+        self.assertEqual(result['summary']['items_total'], 3)
+        refresh_plan.assert_called_once_with(
+            target_trade_date='2026-04-04',
+            trigger='eod_post_decider',
+        )
 
 
 def _completed_factor_followup_result(*, market_date: str = '2026-04-03') -> dict:
@@ -110,6 +129,18 @@ class _FakeDailyPipelineRunStateService:
 
 
 class PykrxBackfillServiceTests(TestCase):
+    def setUp(self) -> None:
+        self.next_open_plan_patcher = patch(
+            'app.eod.pykrx_pipeline_runner._run_daily_next_open_execution_plan_followup',
+            return_value={
+                'triggered': True,
+                'status': 'completed',
+                'summary': {'items_total': 2, 'eligible_count': 1},
+            },
+        )
+        self.next_open_plan_patcher.start()
+        self.addCleanup(self.next_open_plan_patcher.stop)
+
     def test_daily_signal_decider_evaluation_refreshes_maturing_calendar_window(self) -> None:
         with patch(
             'app.agent_context.signal_decider_evaluation_maintenance_service.'
