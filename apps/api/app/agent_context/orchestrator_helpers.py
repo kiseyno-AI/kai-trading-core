@@ -470,6 +470,10 @@ def _compact_symbol_day_context_for_decider(context: dict[str, Any]) -> dict[str
     """Keep decision-relevant symbol context without shipping bulky raw provenance."""
     keep_keys = {
         'symbol',
+        'market',
+        'exchange',
+        'currency',
+        'calendar_timezone',
         'market_date',
         'company',
         'market_session',
@@ -490,6 +494,9 @@ def _compact_symbol_day_context_for_decider(context: dict[str, Any]) -> dict[str
         'recent_dart_events',
         'recent_external_news',
         'fundamentals',
+        'price_screen',
+        'fundamental_screen',
+        'screening_decision',
     }
     compacted = {key: context.get(key) for key in keep_keys if key in context}
     completeness = context.get('context_completeness')
@@ -503,7 +510,17 @@ def _compact_symbol_day_context_for_decider(context: dict[str, Any]) -> dict[str
     if isinstance(provenance, dict):
         compacted['context_provenance'] = {
             key: provenance.get(key)
-            for key in ('summary', 'missing_sources', 'stale_sources', 'source_status_counts')
+            for key in (
+                'summary',
+                'missing_sources',
+                'stale_sources',
+                'source_status_counts',
+                'universe',
+                'prices',
+                'fundamentals',
+                'screening_rank',
+                'screening_score',
+            )
             if key in provenance
         }
     return compacted
@@ -627,9 +644,11 @@ def trim_batch_item_for_prompt(item: dict[str, Any]) -> dict[str, Any]:
     trimmed = json.loads(json.dumps(item, ensure_ascii=False))
     symbol_day_context = trimmed.get('symbol_day_context')
     if isinstance(symbol_day_context, dict):
-        trimmed['symbol_day_context'] = trim_batch_item_for_prompt(
-            _compact_symbol_day_context_for_decider(symbol_day_context)
-        )
+        compact_symbol_context = _compact_symbol_day_context_for_decider(symbol_day_context)
+        trimmed_symbol_context = trim_batch_item_for_prompt(compact_symbol_context)
+        if isinstance(compact_symbol_context.get('context_provenance'), dict):
+            trimmed_symbol_context['context_provenance'] = compact_symbol_context['context_provenance']
+        trimmed['symbol_day_context'] = trimmed_symbol_context
     else:
         bulky_duplicate_keys = {
             'context_provenance',

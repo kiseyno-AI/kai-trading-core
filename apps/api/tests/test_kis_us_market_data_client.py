@@ -58,6 +58,7 @@ class KISUSMarketDataClientTests(unittest.IsolatedAsyncioTestCase):
         result = await client.fetch_overseas_market_cap_ranking(exchange='NASDAQ', max_pages=3)
 
         self.assertEqual([item['symb'] for item in result['output2']], ['AAPL', 'MSFT'])
+        self.assertEqual(client.calls[0][2]['CURR_GB'], '0')
         self.assertEqual(client.calls[1][2]['KEYB'], 'NEXT')
         self.assertEqual(client.calls[1][3], 'N')
         self.assertEqual(result['page_count'], 2)

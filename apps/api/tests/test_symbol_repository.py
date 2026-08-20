@@ -5,7 +5,11 @@ from types import SimpleNamespace
 
 import pandas as pd
 
-from app.repositories.symbol_repository import _build_symbol_universe_rows
+from app.repositories.symbol_repository import (
+    SYMBOL_UNIVERSE_UPSERT_BATCH_SIZE,
+    _build_symbol_universe_rows,
+    _iter_symbol_universe_chunks,
+)
 
 
 def test_build_symbol_universe_rows_sanitizes_non_scalar_fields() -> None:
@@ -80,3 +84,18 @@ def test_build_symbol_universe_rows_preserves_us_market_metadata() -> None:
     assert rows[0]['exchange_code'] == 'NYSE'
     assert rows[0]['regulatory_id'] == '0001067983'
     assert rows[0]['source_payload'] == {'kis_symbol': 'BRK/B'}
+
+
+def test_symbol_universe_chunks_keep_large_upserts_below_driver_parameter_limit() -> None:
+    rows = [{'symbol': f'US{index:05d}'} for index in range(4_945)]
+
+    chunks = list(_iter_symbol_universe_chunks(rows))
+
+    assert [len(chunk) for chunk in chunks] == [
+        SYMBOL_UNIVERSE_UPSERT_BATCH_SIZE,
+        SYMBOL_UNIVERSE_UPSERT_BATCH_SIZE,
+        SYMBOL_UNIVERSE_UPSERT_BATCH_SIZE,
+        SYMBOL_UNIVERSE_UPSERT_BATCH_SIZE,
+        4_945 - (4 * SYMBOL_UNIVERSE_UPSERT_BATCH_SIZE),
+    ]
+    assert [row for chunk in chunks for row in chunk] == rows

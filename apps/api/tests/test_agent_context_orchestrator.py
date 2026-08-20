@@ -529,6 +529,45 @@ class RepairJsonTailTests(unittest.TestCase):
             'small_probe',
         )
 
+    def test_trim_batch_item_for_prompt_preserves_us_screening_context(self):
+        trimmed = trim_batch_item_for_prompt(
+            {
+                'symbol': 'NVDA',
+                'market_date': '2026-08-19',
+                'symbol_day_context': {
+                    'symbol': 'NVDA',
+                    'market': 'US',
+                    'exchange': 'NASDAQ',
+                    'currency': 'USD',
+                    'calendar_timezone': 'America/New_York',
+                    'price_screen': {
+                        'latest_price': '217.56',
+                        'momentum_6m': '0.1587',
+                        'median_dollar_volume_20d': '24686407629',
+                    },
+                    'fundamental_screen': {
+                        'ttm_revenue': '253491000000',
+                        'ttm_operating_cash_flow': '125648000000',
+                    },
+                    'screening_decision': {'selected': True},
+                    'context_provenance': {
+                        'prices': 'kis_overseas_dailyprice_adjusted',
+                        'fundamentals': 'sec_edgar_companyfacts+submissions',
+                        'screening_rank': 1,
+                    },
+                },
+            }
+        )
+
+        context = trimmed['symbol_day_context']
+        self.assertEqual(context['market'], 'US')
+        self.assertEqual(context['exchange'], 'NASDAQ')
+        self.assertEqual(context['currency'], 'USD')
+        self.assertEqual(context['price_screen']['latest_price'], '217.56')
+        self.assertEqual(context['fundamental_screen']['ttm_revenue'], '253491000000')
+        self.assertTrue(context['screening_decision']['selected'])
+        self.assertEqual(context['context_provenance']['screening_rank'], 1)
+
 
 class FakeFuture:
     def __init__(self, *, result, cancel_result):
