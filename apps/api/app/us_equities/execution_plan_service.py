@@ -64,6 +64,8 @@ class USExecutionPlanService:
         max_candidates: int | None = None,
         agent_run_id: str | None = None,
     ) -> dict[str, Any]:
+        if not agent_run_id:
+            raise ValueError('agent_run_id is required for US equity execution planning')
         resolved_target = target_trade_date or _next_us_session(source_market_date)
         cap = min(max_candidates or settings.us_equity_exec_max_candidates, 80)
         rows = self._feedback_loader(market_date=source_market_date, limit=80, run_id=agent_run_id)
@@ -159,7 +161,7 @@ class USExecutionPlanService:
         run_identity = (
             hashlib.sha256(agent_run_id.encode('utf-8')).hexdigest()[:12]
             if agent_run_id
-            else 'preview'
+            else 'unreachable'
         )
         plan_id = f"core-us-signal-decider-{resolved_target.strftime('%Y%m%d')}-kis-{run_identity}"
         payload = serialize_execution_plan_dispatch_payload(
@@ -168,7 +170,7 @@ class USExecutionPlanService:
                 'source': settings.signal_decider_exec_dispatch_source or 'kai-trading-core',
                 'mode': settings.signal_decider_exec_runtime_mode,
                 'market_date': resolved_target.isoformat(),
-                'strategy_run_id': agent_run_id or f'us-signal-decider-preview:{source_market_date.isoformat()}',
+                'strategy_run_id': agent_run_id,
                 'requested_at': datetime.now(timezone.utc).isoformat(),
                 'items': items,
                 'metadata': {
@@ -199,8 +201,8 @@ class USExecutionPlanService:
         dry_run: bool = True,
         agent_run_id: str | None = None,
     ) -> dict[str, Any]:
-        if not dry_run and not agent_run_id:
-            raise ValueError('agent_run_id is required for non-preview US equity execution dispatch')
+        if not agent_run_id:
+            raise ValueError('agent_run_id is required for US equity execution planning')
         result = self.build(
             source_market_date=source_market_date,
             target_trade_date=target_trade_date,
@@ -245,7 +247,11 @@ class USExecutionPlanService:
         confidence = _decimal(feedback.get('confidence_score_10'))
         if confidence is None or confidence < Decimal(str(settings.us_equity_exec_min_confidence_score_10)):
             return None, 'confidence_below_threshold'
-        price_metrics = (row.get('metrics_payload') or {}).get('price') or {}
+        persisted_context = row.get('context_payload') or {}
+        symbol_day_context = persisted_context.get('symbol_day_context') or {}
+        price_metrics = symbol_day_context.get('price_screen') or (
+            (row.get('metrics_payload') or {}).get('price') or {}
+        )
         latest_price = _decimal(price_metrics.get('latest_price'))
         target_price = _decimal(feedback.get('target_price'))
         stop_price = _decimal(feedback.get('stop_loss_price'))

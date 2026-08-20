@@ -146,6 +146,16 @@ def _reuse_decision(*, symbol: str, agent_name: str, should_dispatch: bool = Fal
 
 
 class AgentContextProgressServiceTests(unittest.TestCase):
+    def setUp(self):
+        # Progress unit tests use a synthetic session and must never fall
+        # through to the production prerequisite service/database.
+        prerequisite_patcher = patch(
+            'app.agent_context.progress_service.agent_feedback_prerequisite_service.inspect_feedback_prerequisites',
+            return_value={'ready': True, 'status': 'ready', 'missing_prerequisites': []},
+        )
+        prerequisite_patcher.start()
+        self.addCleanup(prerequisite_patcher.stop)
+
     def test_feedback_progress_uses_durable_run_snapshot_when_runtime_state_missing(self):
         fake_session = FakeProgressSession()
         run_snapshot = {

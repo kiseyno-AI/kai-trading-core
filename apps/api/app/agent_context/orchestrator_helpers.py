@@ -478,8 +478,11 @@ def _compact_symbol_day_context_for_decider(context: dict[str, Any]) -> dict[str
         'company',
         'market_session',
         'market_data_phase_contract',
+        'decider_data_quality_context',
+        'decision_input_quality_context',
         'quote_context',
         'price_context',
+        'liquidity_context',
         'technical_snapshot',
         'action_summary',
         'intraday_execution_context',
@@ -518,6 +521,7 @@ def _compact_symbol_day_context_for_decider(context: dict[str, Any]) -> dict[str
                 'universe',
                 'prices',
                 'fundamentals',
+                'collection_run_id',
                 'screening_rank',
                 'screening_score',
             )
@@ -707,6 +711,7 @@ def trim_batch_item_for_prompt(item: dict[str, Any]) -> dict[str, Any]:
                         'equity',
                         'operating_cash_flow',
                         'free_cash_flow',
+                        'shares_outstanding_growth_yoy',
                         'summary',
                         'data_quality',
                     )

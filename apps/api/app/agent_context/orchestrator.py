@@ -1001,6 +1001,28 @@ class OpenClawAgentClient:
             if str(item.get('symbol') or '').strip()
         ]
         assigned_symbols_json = json.dumps(assigned_symbols, ensure_ascii=False)
+        is_us_batch = any(
+            str((item.get('symbol_day_context') or {}).get('market') or '').upper() == 'US'
+            for item in batch_items
+            if isinstance(item, dict)
+        )
+        short_term_example_levels = (
+            (103.0, 105.0, 109.0, 99.0)
+            if is_us_batch
+            else (10300, 10500, 10900, 9900)
+        )
+        signal_example_levels = (105.0, 98.0) if is_us_batch else (10500, 9800)
+        signal_wait_reason = (
+            {
+                'code': 'insufficient_risk_reward',
+                'summary': '전일 종가 기준 목표수익 대비 손실위험이 충분히 유리하지 않습니다.',
+            }
+            if is_us_batch
+            else {
+                'code': 'stale_quote_orderbook',
+                'summary': '실시간 호가 신선도가 떨어져 진입 가격 신뢰가 부족합니다.',
+            }
+        )
 
         def _signal_decider_batch_rules(symbols: Sequence[str]) -> str:
             if spec.role not in DECISION_SUPPORT_AGENT_NAMES:
@@ -1034,10 +1056,10 @@ class OpenClawAgentClient:
                     'code': 'unsuitable_execution_timing',
                     'summary': '돌파 트리거 확인 전이라 진입 시점이 아직 이릅니다.',
                 },
-                'trigger_price': 10300,
-                'chase_limit_price': 10500,
-                'target_price': 10900,
-                'stop_loss_price': 9900,
+                'trigger_price': short_term_example_levels[0],
+                'chase_limit_price': short_term_example_levels[1],
+                'target_price': short_term_example_levels[2],
+                'stop_loss_price': short_term_example_levels[3],
                 'expected_holding_period': '1-2 trading days',
                 'confidence_score_10': 6,
                 'conviction_score_10': 5,
@@ -1079,14 +1101,11 @@ class OpenClawAgentClient:
                 'market_date': market_date.isoformat(),
                 'preferred_action': 'wait',
                 'next_day_open_action': 'wait',
-                'wait_reason': {
-                    'code': 'stale_quote_orderbook',
-                    'summary': '실시간 호가 신선도가 떨어져 진입 가격 신뢰가 부족합니다.',
-                },
+                'wait_reason': signal_wait_reason,
                 'entry_price_basis': 'next_open',
-                'target_price': 10500,
+                'target_price': signal_example_levels[0],
                 'expected_return_pct': None,
-                'stop_loss_price': 9800,
+                'stop_loss_price': signal_example_levels[1],
                 'suggested_holding_period': '3-10 trading days',
                 'confidence_score_10': 6,
                 'conviction_score_10': 5,

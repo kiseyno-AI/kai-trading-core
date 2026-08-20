@@ -683,7 +683,10 @@ class USEquityScreeningSnapshot(Base, TimestampMixin):
 class USAgentFeedback(Base, TimestampMixin):
     __tablename__ = 'us_agent_feedback'
     __table_args__ = (
-        UniqueConstraint('market_date', 'symbol_id', 'agent_name', name='uq_us_agent_feedback_date_symbol_agent'),
+        UniqueConstraint(
+            'run_id', 'market_date', 'symbol_id', 'agent_name',
+            name='uq_us_agent_feedback_run_date_symbol_agent',
+        ),
         Index('ix_us_agent_feedback_date_agent', 'market_date', 'agent_name'),
     )
 

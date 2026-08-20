@@ -30,11 +30,13 @@ class USPriceCollectionRequest(BaseModel):
 
 class USFundamentalCollectionRequest(BaseModel):
     market_date: date
+    collection_run_id: int = Field(ge=1)
     persist: bool = True
 
 
 class USAgentDispatchRequest(BaseModel):
     market_date: date
+    collection_run_id: int = Field(ge=1)
     roles: list[str] | None = None
     persist: bool = True
     batch_size: int = Field(default=5, ge=1, le=20)
@@ -45,7 +47,7 @@ class USExecutionPlanRequest(BaseModel):
     target_trade_date: date | None = None
     max_candidates: int | None = Field(default=None, ge=1, le=80)
     dry_run: bool = True
-    agent_run_id: str | None = Field(default=None, min_length=1, max_length=128)
+    agent_run_id: str = Field(min_length=1, max_length=128)
 
 
 @router.post('/universe/refresh')
@@ -115,6 +117,7 @@ async def collect_and_screen_us_equity_fundamentals(payload: USFundamentalCollec
     try:
         return await us_fundamental_collection_service.collect_and_screen(
             market_date=payload.market_date,
+            collection_run_id=payload.collection_run_id,
             persist=payload.persist,
         )
     except SECEdgarConfigurationError as exc:
@@ -131,6 +134,7 @@ async def dispatch_us_equity_agents(payload: USAgentDispatchRequest) -> dict:
         return await asyncio.to_thread(
             us_agent_analysis_service.dispatch,
             market_date=payload.market_date,
+            collection_run_id=payload.collection_run_id,
             roles=payload.roles,
             persist=payload.persist,
             batch_size=payload.batch_size,

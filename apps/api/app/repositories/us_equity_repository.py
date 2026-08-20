@@ -4,7 +4,7 @@ from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Iterable
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.db import session_scope
@@ -301,8 +301,19 @@ def upsert_us_fundamental_snapshot(*, symbol_id: int, snapshot: SECFundamentalSn
     return 1
 
 
-def load_us_price_screen_candidates(*, market_date: date, limit: int = 300) -> list[dict]:
+def load_us_price_screen_candidates(
+    *,
+    market_date: date,
+    collection_run_id: int,
+    limit: int = 300,
+) -> list[dict]:
     with session_scope() as session:
+        latest_run_id = (
+            select(func.max(USMarketDataCollectionRun.id))
+            .where(USMarketDataCollectionRun.market_date == market_date)
+            .correlate(None)
+            .scalar_subquery()
+        )
         rows = session.execute(
             select(
                 Symbol.id,
@@ -316,8 +327,15 @@ def load_us_price_screen_candidates(*, market_date: date, limit: int = 300) -> l
                 USEquityScreeningSnapshot.decision_payload,
             )
             .join(Symbol, Symbol.id == USEquityScreeningSnapshot.symbol_id)
+            .join(
+                USMarketDataCollectionRun,
+                USMarketDataCollectionRun.id == USEquityScreeningSnapshot.collection_run_id,
+            )
             .where(
                 USEquityScreeningSnapshot.market_date == market_date,
+                USEquityScreeningSnapshot.collection_run_id == collection_run_id,
+                USMarketDataCollectionRun.id == latest_run_id,
+                USMarketDataCollectionRun.status == 'completed',
                 USEquityScreeningSnapshot.stage == 'price_screen',
                 USEquityScreeningSnapshot.eligible_for_agent.is_(True),
             )
@@ -327,8 +345,19 @@ def load_us_price_screen_candidates(*, market_date: date, limit: int = 300) -> l
         return [dict(row._mapping) for row in rows]
 
 
-def load_us_agent_candidates(*, market_date: date, limit: int = 150) -> list[dict]:
+def load_us_agent_candidates(
+    *,
+    market_date: date,
+    collection_run_id: int,
+    limit: int = 150,
+) -> list[dict]:
     with session_scope() as session:
+        latest_run_id = (
+            select(func.max(USMarketDataCollectionRun.id))
+            .where(USMarketDataCollectionRun.market_date == market_date)
+            .correlate(None)
+            .scalar_subquery()
+        )
         rows = session.execute(
             select(
                 Symbol.id,
@@ -344,8 +373,15 @@ def load_us_agent_candidates(*, market_date: date, limit: int = 150) -> list[dic
                 USEquityScreeningSnapshot.decision_payload,
             )
             .join(Symbol, Symbol.id == USEquityScreeningSnapshot.symbol_id)
+            .join(
+                USMarketDataCollectionRun,
+                USMarketDataCollectionRun.id == USEquityScreeningSnapshot.collection_run_id,
+            )
             .where(
                 USEquityScreeningSnapshot.market_date == market_date,
+                USEquityScreeningSnapshot.collection_run_id == collection_run_id,
+                USMarketDataCollectionRun.id == latest_run_id,
+                USMarketDataCollectionRun.status == 'completed',
                 USEquityScreeningSnapshot.stage == 'fundamental_screen',
                 USEquityScreeningSnapshot.eligible_for_agent.is_(True),
             )
@@ -367,6 +403,8 @@ def update_us_market_data_run_fundamentals(
             return
         row.fundamental_eligible_count = fundamental_eligible_count
         row.error_count += error_count_delta
+        if error_count_delta:
+            row.status = 'completed_with_errors'
 
 
 def upsert_us_agent_feedback(
@@ -394,9 +432,8 @@ def upsert_us_agent_feedback(
         )
         record_id = session.execute(
             statement.on_conflict_do_update(
-                constraint='uq_us_agent_feedback_date_symbol_agent',
+                constraint='uq_us_agent_feedback_run_date_symbol_agent',
                 set_={
-                    'run_id': statement.excluded.run_id,
                     'status': statement.excluded.status,
                     'context_payload': statement.excluded.context_payload,
                     'response_payload': statement.excluded.response_payload,
@@ -409,40 +446,29 @@ def upsert_us_agent_feedback(
         return int(record_id)
 
 
-def load_us_signal_feedback(*, market_date: date, limit: int = 80, run_id: str | None = None) -> list[dict]:
+def load_us_signal_feedback(*, market_date: date, run_id: str, limit: int = 80) -> list[dict]:
     with session_scope() as session:
         statement = (
             select(
                 USAgentFeedback.id.label('feedback_id'),
                 USAgentFeedback.run_id,
+                USAgentFeedback.context_payload,
                 USAgentFeedback.normalized_feedback_payload,
                 Symbol.id.label('symbol_id'),
                 Symbol.symbol,
                 Symbol.standard_code,
                 Symbol.market,
                 Symbol.exchange_code,
-                USEquityScreeningSnapshot.rank,
-                USEquityScreeningSnapshot.composite_score,
-                USEquityScreeningSnapshot.metrics_payload,
-                USEquityScreeningSnapshot.decision_payload,
             )
             .join(Symbol, Symbol.id == USAgentFeedback.symbol_id)
-            .join(
-                USEquityScreeningSnapshot,
-                (USEquityScreeningSnapshot.symbol_id == Symbol.id)
-                & (USEquityScreeningSnapshot.market_date == USAgentFeedback.market_date),
-            )
             .where(
                 USAgentFeedback.market_date == market_date,
                 USAgentFeedback.agent_name == 'signal-decider',
                 USAgentFeedback.status == 'completed',
-                USEquityScreeningSnapshot.stage == 'fundamental_screen',
-                USEquityScreeningSnapshot.eligible_for_agent.is_(True),
             )
-            .order_by(USEquityScreeningSnapshot.rank.asc(), Symbol.symbol.asc())
+            .order_by(Symbol.symbol.asc())
         )
-        if run_id is not None:
-            statement = statement.where(USAgentFeedback.run_id == run_id)
+        statement = statement.where(USAgentFeedback.run_id == run_id)
         rows = session.execute(statement.limit(limit)).all()
         return [dict(row._mapping) for row in rows]
 
