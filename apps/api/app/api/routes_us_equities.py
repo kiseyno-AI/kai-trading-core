@@ -25,6 +25,12 @@ class USUniverseRefreshRequest(BaseModel):
 class USPriceCollectionRequest(BaseModel):
     market_date: date
     persist: bool = True
+    prefilter_cap: int | None = Field(default=None, ge=1, le=600)
+
+
+class USFundamentalCollectionRequest(BaseModel):
+    market_date: date
+    persist: bool = True
 
 
 class USAgentDispatchRequest(BaseModel):
@@ -78,6 +84,7 @@ async def collect_and_screen_us_equity_prices(payload: USPriceCollectionRequest)
         return await us_price_collection_service.collect_and_screen(
             market_date=payload.market_date,
             persist=payload.persist,
+            prefilter_cap=payload.prefilter_cap,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -104,7 +111,7 @@ async def read_us_equity_screening(
 
 
 @router.post('/fundamentals/collect-and-screen')
-async def collect_and_screen_us_equity_fundamentals(payload: USPriceCollectionRequest) -> dict:
+async def collect_and_screen_us_equity_fundamentals(payload: USFundamentalCollectionRequest) -> dict:
     try:
         return await us_fundamental_collection_service.collect_and_screen(
             market_date=payload.market_date,

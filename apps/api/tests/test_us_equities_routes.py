@@ -46,7 +46,7 @@ class USEquitiesRouteTests(unittest.IsolatedAsyncioTestCase):
             async with httpx.AsyncClient(transport=transport, base_url='http://test') as client:
                 response = await client.post(
                     '/us-equities/prices/collect-and-screen',
-                    json={'market_date': '2026-08-19', 'persist': False},
+                    json={'market_date': '2026-08-19', 'persist': False, 'prefilter_cap': 50},
                 )
 
         self.assertEqual(response.status_code, 200)
@@ -54,6 +54,7 @@ class USEquitiesRouteTests(unittest.IsolatedAsyncioTestCase):
         collect.assert_awaited_once()
         self.assertEqual(collect.await_args.kwargs['market_date'].isoformat(), '2026-08-19')
         self.assertFalse(collect.await_args.kwargs['persist'])
+        self.assertEqual(collect.await_args.kwargs['prefilter_cap'], 50)
 
     async def test_fundamental_collection_route_is_explicitly_dated(self):
         payload = {'status': 'completed', 'market_date': '2026-08-19', 'counts': {'agent_candidates': 2}}

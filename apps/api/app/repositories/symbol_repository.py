@@ -12,6 +12,12 @@ from app.scanner.state import scanner_state
 
 
 logger = logging.getLogger(__name__)
+SYMBOL_UNIVERSE_UPSERT_BATCH_SIZE = 1_000
+
+
+def _iter_symbol_universe_chunks(rows: list[dict]):
+    for start in range(0, len(rows), SYMBOL_UNIVERSE_UPSERT_BATCH_SIZE):
+        yield rows[start:start + SYMBOL_UNIVERSE_UPSERT_BATCH_SIZE]
 
 
 def _get_symbol(session, symbol: str) -> Symbol | None:
@@ -157,28 +163,29 @@ def upsert_symbol_universe(
         return 0
 
     with session_scope() as session:
-        statement = pg_insert(Symbol).values(symbol_rows)
-        session.execute(
-            statement.on_conflict_do_update(
-                index_elements=[Symbol.symbol],
-                set_={
-                    'standard_code': statement.excluded.standard_code,
-                    'name_ko': statement.excluded.name_ko,
-                    'name_en': statement.excluded.name_en,
-                    'market': statement.excluded.market,
-                    'country_code': statement.excluded.country_code,
-                    'currency_code': statement.excluded.currency_code,
-                    'exchange_code': statement.excluded.exchange_code,
-                    'regulatory_id': statement.excluded.regulatory_id,
-                    'source_payload': statement.excluded.source_payload,
-                    'instrument_type': statement.excluded.instrument_type,
-                    'source': statement.excluded.source,
-                    'is_active': statement.excluded.is_active,
-                    'last_refreshed_at': statement.excluded.last_refreshed_at,
-                    'updated_at': refreshed_at,
-                },
+        for symbol_chunk in _iter_symbol_universe_chunks(symbol_rows):
+            statement = pg_insert(Symbol).values(symbol_chunk)
+            session.execute(
+                statement.on_conflict_do_update(
+                    index_elements=[Symbol.symbol],
+                    set_={
+                        'standard_code': statement.excluded.standard_code,
+                        'name_ko': statement.excluded.name_ko,
+                        'name_en': statement.excluded.name_en,
+                        'market': statement.excluded.market,
+                        'country_code': statement.excluded.country_code,
+                        'currency_code': statement.excluded.currency_code,
+                        'exchange_code': statement.excluded.exchange_code,
+                        'regulatory_id': statement.excluded.regulatory_id,
+                        'source_payload': statement.excluded.source_payload,
+                        'instrument_type': statement.excluded.instrument_type,
+                        'source': statement.excluded.source,
+                        'is_active': statement.excluded.is_active,
+                        'last_refreshed_at': statement.excluded.last_refreshed_at,
+                        'updated_at': refreshed_at,
+                    },
+                )
             )
-        )
         stale_source_names = [source] if stale_sources is None else stale_sources
         if stale_source_names:
             valid_symbols = [row['symbol'] for row in symbol_rows]

@@ -8,6 +8,7 @@ from decimal import Decimal
 from typing import Any, Callable
 
 from app.brokers.kis.client import KISClient
+from app.brokers.kis.provider import kis_client as process_wide_kis_client
 from app.core.settings import settings
 from app.repositories.us_equity_repository import (
     create_us_market_data_run,
@@ -81,7 +82,7 @@ class USPriceCollectionService:
         kis_client: KISClient | None = None,
         symbol_loader: Callable[..., list[dict]] = load_active_us_symbols,
     ) -> None:
-        self._kis_client = kis_client or KISClient()
+        self._kis_client = kis_client or process_wide_kis_client
         self._symbol_loader = symbol_loader
 
     async def _load_rankings(self) -> list[dict[str, Any]]:
@@ -137,6 +138,7 @@ class USPriceCollectionService:
         *,
         market_date: date,
         persist: bool = True,
+        prefilter_cap: int | None = None,
         policy: USScreeningPolicy | None = None,
     ) -> dict[str, Any]:
         symbols = await asyncio.to_thread(self._symbol_loader)
@@ -156,7 +158,10 @@ class USPriceCollectionService:
             candidates = build_ranked_prefilter(
                 symbols,
                 rankings,
-                cap=settings.us_equity_price_prefilter_cap,
+                cap=min(
+                    prefilter_cap or settings.us_equity_price_prefilter_cap,
+                    settings.us_equity_price_prefilter_cap,
+                ),
             )
             semaphore = asyncio.Semaphore(settings.us_equity_history_concurrency)
             errors: dict[str, str] = {}

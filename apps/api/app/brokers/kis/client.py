@@ -491,6 +491,7 @@ class KISClient:
         *,
         exchange: str,
         volume_range: str = '0',
+        currency_division: str = '0',
         max_pages: int = 10,
     ) -> dict[str, Any]:
         return await self._fetch_overseas_ranking(
@@ -499,6 +500,7 @@ class KISClient:
             params={
                 'EXCD': to_kis_price_exchange(exchange),
                 'VOL_RANG': volume_range,
+                'CURR_GB': currency_division,
             },
             max_pages=max_pages,
         )

@@ -2,6 +2,7 @@ import unittest
 from datetime import date, timedelta
 from unittest.mock import patch
 
+from app.brokers.kis.provider import kis_client
 from app.us_equities.price_collection_service import USPriceCollectionService, build_ranked_prefilter
 
 
@@ -44,6 +45,11 @@ class FakeKISClient:
 
 
 class USPriceCollectionServiceTests(unittest.IsolatedAsyncioTestCase):
+    def test_reuses_process_wide_kis_client_by_default(self):
+        service = USPriceCollectionService()
+
+        self.assertIs(service._kis_client, kis_client)
+
     def test_prefilter_combines_rankings_and_deduplicates(self):
         symbols = [_symbol('AAPL', 1), _symbol('MSFT', 2), _symbol('NVDA', 3)]
         payloads = [
@@ -74,6 +80,26 @@ class USPriceCollectionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['counts']['price_selected'], 2)
         self.assertEqual(set(result['selected_symbols']), {'AAPL', 'MSFT'})
         self.assertEqual({call[1] for call in client.daily_calls}, {'AAPL', 'MSFT'})
+
+    async def test_collect_can_bound_prefilter_for_a_canary_run(self):
+        client = FakeKISClient()
+        service = USPriceCollectionService(
+            kis_client=client,
+            symbol_loader=lambda: [_symbol('AAPL', 1), _symbol('MSFT', 2)],
+        )
+        with (
+            patch('app.us_equities.price_collection_service.settings.us_equity_history_max_pages', 1),
+            patch('app.us_equities.price_collection_service.settings.us_equity_history_request_pause_seconds', 0),
+            patch('app.us_equities.price_collection_service.settings.us_equity_price_prefilter_cap', 600),
+        ):
+            result = await service.collect_and_screen(
+                market_date=date(2026, 8, 19),
+                persist=False,
+                prefilter_cap=1,
+            )
+
+        self.assertEqual(result['counts']['ranking_prefilter'], 1)
+        self.assertEqual({call[1] for call in client.daily_calls}, {'AAPL'})
 
 
 if __name__ == '__main__':
