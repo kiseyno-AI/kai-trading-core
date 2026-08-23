@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from contextlib import contextmanager
 from datetime import date, datetime
 from typing import Any, Sequence
@@ -8,6 +9,9 @@ from sqlalchemy import func, select, text
 
 from app.db import engine, session_scope
 from app.db_models import DailyActionSummary, DailyPriceBar, DailyTechnicalSnapshot, DailyTrendingRank, EODCollectionRun, Symbol
+
+
+logger = logging.getLogger(__name__)
 
 
 def _parse_trade_date(value: str) -> date:
@@ -292,7 +296,13 @@ def advisory_eod_collection_lock(*, market: str, trade_date: str, source: str):
         ('KRX', 'kis'): 10_002,
     }.get((market, source), 19_999)
 
-    with engine.connect() as connection:
+    # PostgreSQL session-level advisory locks survive transaction boundaries.
+    # Run the lock statements in AUTOCOMMIT so this dedicated connection does
+    # not sit idle in a transaction while the (potentially multi-hour) EOD job
+    # is doing work on other connections. Otherwise PostgreSQL can terminate
+    # it via idle_in_transaction_session_timeout before the unlock statement.
+    with engine.connect() as raw_connection:
+        connection = raw_connection.execution_options(isolation_level='AUTOCOMMIT')
         acquired = bool(
             connection.execute(
                 text('SELECT pg_try_advisory_lock(:source_key, :trade_key)'),
@@ -306,13 +316,23 @@ def advisory_eod_collection_lock(*, market: str, trade_date: str, source: str):
             yield acquired
         finally:
             if acquired:
-                connection.execute(
-                    text('SELECT pg_advisory_unlock(:source_key, :trade_key)'),
-                    {
-                        'source_key': source_key,
-                        'trade_key': trade_key,
-                    },
-                )
+                try:
+                    connection.execute(
+                        text('SELECT pg_advisory_unlock(:source_key, :trade_key)'),
+                        {
+                            'source_key': source_key,
+                            'trade_key': trade_key,
+                        },
+                    )
+                except Exception:
+                    # Closing the dedicated PostgreSQL session releases any
+                    # remaining session-level advisory lock. Do not replace a
+                    # pipeline result/error with a cleanup-only failure.
+                    logger.warning(
+                        'Failed to explicitly release EOD advisory lock; '
+                        'closing the dedicated connection will release it.',
+                        exc_info=True,
+                    )
 
 
 def load_recent_daily_price_trade_dates(
