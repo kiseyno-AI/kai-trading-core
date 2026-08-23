@@ -1,15 +1,61 @@
 import unittest
+from unittest.mock import MagicMock, patch
 
 from sqlalchemy import delete
 
 from app.db import session_scope
 from app.db_models import EODCollectionRun
 from app.repositories.eod_run_repository import (
+    advisory_eod_collection_lock,
     complete_eod_collection_run,
     create_eod_collection_run,
     list_eod_collection_runs,
     load_most_complete_eod_collection_run,
 )
+
+
+class AdvisoryEODCollectionLockTests(unittest.TestCase):
+    @patch('app.repositories.eod_run_repository.engine')
+    def test_uses_autocommit_connection_for_long_running_session_lock(self, engine):
+        raw_connection = MagicMock()
+        connection = MagicMock()
+        engine.connect.return_value.__enter__.return_value = raw_connection
+        raw_connection.execution_options.return_value = connection
+        connection.execute.return_value.scalar.return_value = True
+
+        with advisory_eod_collection_lock(
+            market='KRX',
+            trade_date='2026-08-21',
+            source='pykrx',
+        ) as acquired:
+            self.assertTrue(acquired)
+
+        raw_connection.execution_options.assert_called_once_with(
+            isolation_level='AUTOCOMMIT'
+        )
+        self.assertEqual(connection.execute.call_count, 2)
+        acquire_params = connection.execute.call_args_list[0].args[1]
+        release_params = connection.execute.call_args_list[1].args[1]
+        self.assertEqual(acquire_params, {'source_key': 10_001, 'trade_key': 20_260_821})
+        self.assertEqual(release_params, acquire_params)
+
+    @patch('app.repositories.eod_run_repository.engine')
+    def test_unlock_failure_does_not_replace_completed_pipeline_result(self, engine):
+        raw_connection = MagicMock()
+        connection = MagicMock()
+        engine.connect.return_value.__enter__.return_value = raw_connection
+        raw_connection.execution_options.return_value = connection
+        connection.execute.return_value.scalar.return_value = True
+        connection.execute.side_effect = [MagicMock(scalar=lambda: True), RuntimeError('closed')]
+
+        with advisory_eod_collection_lock(
+            market='KRX',
+            trade_date='2026-08-21',
+            source='pykrx',
+        ) as acquired:
+            self.assertTrue(acquired)
+
+        engine.connect.return_value.__exit__.assert_called_once_with(None, None, None)
 
 
 class EODRunRepositoryTests(unittest.TestCase):
