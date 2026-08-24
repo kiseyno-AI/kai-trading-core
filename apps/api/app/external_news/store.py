@@ -4,6 +4,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Any, Sequence
 
 from sqlalchemy import desc, or_, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.db import session_scope
 from app.db_models import ExternalNewsItem, Symbol
@@ -100,6 +101,30 @@ def _get_symbol(session, symbol_code: str) -> Symbol | None:
     return session.execute(select(Symbol).where(Symbol.symbol == symbol_code)).scalar_one_or_none()
 
 
+def _find_existing_news_item(session, item: ProviderNewsItem) -> ExternalNewsItem | None:
+    if item.provider_item_id:
+        existing = session.execute(
+            select(ExternalNewsItem).where(
+                ExternalNewsItem.provider == item.provider,
+                ExternalNewsItem.provider_item_id == item.provider_item_id,
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            return existing
+    return session.execute(
+        select(ExternalNewsItem).where(
+            ExternalNewsItem.provider == item.provider,
+            ExternalNewsItem.url == item.url,
+        )
+    ).scalar_one_or_none()
+
+
+def _build_external_news_insert_statement(values: dict[str, Any]):
+    # No conflict target is intentional: either the provider/url or the
+    # provider/provider_item_id uniqueness contract may identify a replay.
+    return pg_insert(ExternalNewsItem).values(**values).on_conflict_do_nothing().returning(ExternalNewsItem.id)
+
+
 def persist_external_news_items(*, symbol: str, items: Sequence[ProviderNewsItem], source: str | None = None) -> dict[str, Any]:
     now = _utcnow()
     inserted = 0
@@ -111,34 +136,31 @@ def persist_external_news_items(*, symbol: str, items: Sequence[ProviderNewsItem
             return {'inserted': 0, 'updated': 0, 'skipped': len(items), 'reason': 'symbol_not_found'}
 
         for item in deduped_items:
-            dedupe_conditions = [ExternalNewsItem.url == item.url]
-            if item.provider_item_id:
-                dedupe_conditions.append(ExternalNewsItem.provider_item_id == item.provider_item_id)
-            stmt = (
-                select(ExternalNewsItem)
-                .where(ExternalNewsItem.provider == item.provider)
-                .where(or_(*dedupe_conditions))
-            )
-            existing = session.execute(stmt).scalar_one_or_none()
             payload = _payload_with_classification(item)
-            if existing is None:
-                session.add(
-                    ExternalNewsItem(
-                        symbol_id=symbol_row.id,
-                        provider=item.provider,
-                        provider_item_id=item.provider_item_id,
-                        source=source or item.provider,
-                        title=item.title,
-                        description=item.description,
-                        url=item.url,
-                        source_url=item.source_url,
-                        published_at=item.published_at,
-                        collected_at=now,
-                        payload=payload,
-                    )
-                )
+            values = {
+                'symbol_id': symbol_row.id,
+                'provider': item.provider,
+                'provider_item_id': item.provider_item_id,
+                'source': source or item.provider,
+                'title': item.title,
+                'description': item.description,
+                'url': item.url,
+                'source_url': item.source_url,
+                'published_at': item.published_at,
+                'collected_at': now,
+                'payload': payload,
+            }
+            inserted_id = session.execute(
+                _build_external_news_insert_statement(values)
+            ).scalar_one_or_none()
+            if inserted_id is not None:
                 inserted += 1
                 continue
+            # ON CONFLICT waits for a concurrent writer, if any. This lookup is
+            # therefore safe for both sequential replays and collection races.
+            existing = _find_existing_news_item(session, item)
+            if existing is None:
+                raise RuntimeError('External news conflict row could not be reloaded after idempotent insert.')
             existing.symbol_id = symbol_row.id
             existing.provider_item_id = existing.provider_item_id or item.provider_item_id
             existing.source = source or item.provider
