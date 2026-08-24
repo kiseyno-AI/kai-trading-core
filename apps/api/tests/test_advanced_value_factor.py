@@ -5,6 +5,7 @@ from unittest.mock import patch
 from uuid import uuid4
 
 from sqlalchemy import delete, select, text
+from sqlalchemy.exc import OperationalError
 
 from app.db import engine, session_scope
 from app.db_models import (
@@ -763,6 +764,52 @@ class _FakeFundamentalsLoaderSession:
 
 
 class DailyAdvancedValueFactorFundamentalsLoaderTests(unittest.TestCase):
+    def test_snapshot_loader_retries_statement_timeout_with_smaller_chunks(self) -> None:
+        service = DailyAdvancedValueFactorService()
+        timeout = OperationalError(
+            'snapshot query',
+            {},
+            RuntimeError('canceling statement due to statement timeout'),
+        )
+        left_rows = [{'snapshot_id': 1}]
+        right_rows = [{'snapshot_id': 2}]
+
+        with patch.object(
+            service,
+            '_query_latest_annual_snapshot_chunk',
+            side_effect=[timeout, left_rows, right_rows],
+        ) as loader:
+            result = service._load_latest_annual_snapshot_chunk_with_retry(
+                market_date=date(2026, 4, 24),
+                symbols=['000001', '000002', '000003', '000004'],
+            )
+
+        self.assertEqual(result, [*left_rows, *right_rows])
+        self.assertEqual(loader.call_count, 3)
+        self.assertEqual(loader.call_args_list[1].kwargs['symbols'], ['000001', '000002'])
+        self.assertEqual(loader.call_args_list[2].kwargs['symbols'], ['000003', '000004'])
+
+    def test_snapshot_loader_does_not_retry_unrelated_database_error(self) -> None:
+        service = DailyAdvancedValueFactorService()
+        database_error = OperationalError(
+            'snapshot query',
+            {},
+            RuntimeError('database connection failed'),
+        )
+
+        with patch.object(
+            service,
+            '_query_latest_annual_snapshot_chunk',
+            side_effect=database_error,
+        ) as loader:
+            with self.assertRaises(OperationalError):
+                service._load_latest_annual_snapshot_chunk_with_retry(
+                    market_date=date(2026, 4, 24),
+                    symbols=['000001', '000002'],
+                )
+
+        loader.assert_called_once()
+
     def test_load_latest_annual_fundamentals_loads_highlights_for_large_universe_without_rows(self) -> None:
         service = DailyAdvancedValueFactorService()
         symbols = [f'TAVH{index:04d}' for index in range(501)]

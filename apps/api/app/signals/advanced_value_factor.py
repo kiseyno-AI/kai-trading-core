@@ -3,10 +3,12 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date
+import logging
 import re
 from typing import Any, Sequence
 
 from sqlalchemy import func, or_, select, text
+from sqlalchemy.exc import OperationalError
 
 from app.db import session_scope
 from app.db_models import (
@@ -25,9 +27,13 @@ from app.market_data_store import (
 
 ADVANCED_VALUE_FACTOR_VERSION = 'advanced_value_v1'
 ADVANCED_VALUE_FACTOR_SOURCE = ADVANCED_VALUE_FACTOR_VERSION
-ADVANCED_VALUE_FUNDAMENTALS_SNAPSHOT_CHUNK_SIZE = 100
+logger = logging.getLogger(__name__)
+
+
+ADVANCED_VALUE_FUNDAMENTALS_SNAPSHOT_CHUNK_SIZE = 25
 ADVANCED_VALUE_FUNDAMENTALS_ROW_CHUNK_SIZE = 100
 ADVANCED_VALUE_FUNDAMENTALS_ROW_FALLBACK_MAX_SNAPSHOTS = 500
+ADVANCED_VALUE_FUNDAMENTALS_STATEMENT_TIMEOUT_SECONDS = 180
 ADVANCED_VALUE_FUNDAMENTALS_FS_DIV = 'CFS'
 ADVANCED_VALUE_FUNDAMENTALS_REPORT_CODE = '11011'
 ADVANCED_VALUE_FUNDAMENTALS_PERIOD_TYPE = 'annual'
@@ -924,53 +930,25 @@ class DailyAdvancedValueFactorService:
             return {}
 
         normalized_symbols = list(dict.fromkeys(symbols))
-        with session_scope() as session:
-            session.execute(text("SET LOCAL statement_timeout = '60s'"))
-            snapshot_rows = []
-            for start in range(0, len(normalized_symbols), ADVANCED_VALUE_FUNDAMENTALS_SNAPSHOT_CHUNK_SIZE):
-                symbol_chunk = normalized_symbols[start:start + ADVANCED_VALUE_FUNDAMENTALS_SNAPSHOT_CHUNK_SIZE]
-                latest_rank = func.row_number().over(
-                    partition_by=DartFundamentalsSnapshot.stock_code,
-                    order_by=(
-                        DartFundamentalsSnapshot.business_year.desc(),
-                        DartDisclosureEvent.receipt_date.desc().nullslast(),
-                        DartFundamentalsSnapshot.id.desc(),
-                    ),
-                ).label('row_rank')
-                latest_snapshot_subquery = (
-                    select(
-                        DartFundamentalsSnapshot.id.label('snapshot_id'),
-                        DartFundamentalsSnapshot.stock_code.label('stock_code'),
-                        DartFundamentalsSnapshot.corp_name.label('corp_name'),
-                        DartFundamentalsSnapshot.business_year.label('business_year'),
-                        DartFundamentalsSnapshot.report_code.label('report_code'),
-                        DartFundamentalsSnapshot.fs_div.label('fs_div'),
-                        DartFundamentalsSnapshot.period_type.label('period_type'),
-                        DartFundamentalsSnapshot.currency.label('currency'),
-                        DartFundamentalsSnapshot.captured_at.label('captured_at'),
-                        DartFundamentalsSnapshot.rcept_no.label('rcept_no'),
-                        DartDisclosureEvent.receipt_date.label('receipt_date'),
-                        latest_rank,
-                    )
-                    .join(DartDisclosureEvent, DartDisclosureEvent.id == DartFundamentalsSnapshot.disclosure_event_id)
-                    .where(
-                        DartFundamentalsSnapshot.stock_code.in_(symbol_chunk),
-                        DartFundamentalsSnapshot.fs_div == ADVANCED_VALUE_FUNDAMENTALS_FS_DIV,
-                        DartFundamentalsSnapshot.report_code == ADVANCED_VALUE_FUNDAMENTALS_REPORT_CODE,
-                        DartFundamentalsSnapshot.period_type == ADVANCED_VALUE_FUNDAMENTALS_PERIOD_TYPE,
-                        DartFundamentalsSnapshot.business_year <= market_date.year,
-                        DartDisclosureEvent.receipt_date <= market_date,
-                    )
-                    .subquery()
+        snapshot_rows = []
+        for start in range(0, len(normalized_symbols), ADVANCED_VALUE_FUNDAMENTALS_SNAPSHOT_CHUNK_SIZE):
+            symbol_chunk = normalized_symbols[start:start + ADVANCED_VALUE_FUNDAMENTALS_SNAPSHOT_CHUNK_SIZE]
+            snapshot_rows.extend(
+                self._load_latest_annual_snapshot_chunk_with_retry(
+                    market_date=market_date,
+                    symbols=symbol_chunk,
                 )
-                snapshot_rows.extend(
-                    session.execute(
-                        select(latest_snapshot_subquery).where(latest_snapshot_subquery.c.row_rank == 1)
-                    ).mappings().all()
-                )
-            if not snapshot_rows:
-                return {}
+            )
+        if not snapshot_rows:
+            return {}
 
+        with session_scope() as session:
+            session.execute(
+                text(
+                    f"SET LOCAL statement_timeout = "
+                    f"'{ADVANCED_VALUE_FUNDAMENTALS_STATEMENT_TIMEOUT_SECONDS}s'"
+                )
+            )
             snapshot_metadata_by_id: dict[int, dict[str, Any]] = {}
             snapshot_id_by_symbol: dict[str, int] = {}
             for row in snapshot_rows:
@@ -1040,6 +1018,98 @@ class DailyAdvancedValueFactorService:
                     statement_rows=rows_by_snapshot.get(snapshot_id, []),
                 )
             return result
+
+    def _load_latest_annual_snapshot_chunk_with_retry(
+        self,
+        *,
+        market_date: date,
+        symbols: Sequence[str],
+    ) -> list[Any]:
+        try:
+            return self._query_latest_annual_snapshot_chunk(
+                market_date=market_date,
+                symbols=symbols,
+            )
+        except OperationalError as exc:
+            if not self._is_statement_timeout_error(exc) or len(symbols) <= 1:
+                raise
+            midpoint = max(1, len(symbols) // 2)
+            logger.warning(
+                'Annual fundamentals snapshot chunk timed out; retrying smaller chunks.',
+                extra={
+                    'symbol_count': len(symbols),
+                    'left_count': midpoint,
+                    'right_count': len(symbols) - midpoint,
+                },
+            )
+            return [
+                *self._load_latest_annual_snapshot_chunk_with_retry(
+                    market_date=market_date,
+                    symbols=symbols[:midpoint],
+                ),
+                *self._load_latest_annual_snapshot_chunk_with_retry(
+                    market_date=market_date,
+                    symbols=symbols[midpoint:],
+                ),
+            ]
+
+    @staticmethod
+    def _is_statement_timeout_error(exc: OperationalError) -> bool:
+        sqlstate = getattr(getattr(exc, 'orig', None), 'sqlstate', None)
+        return sqlstate == '57014' or 'statement timeout' in str(exc).lower()
+
+    @staticmethod
+    def _query_latest_annual_snapshot_chunk(
+        *,
+        market_date: date,
+        symbols: Sequence[str],
+    ) -> list[Any]:
+        latest_rank = func.row_number().over(
+            partition_by=DartFundamentalsSnapshot.stock_code,
+            order_by=(
+                DartFundamentalsSnapshot.business_year.desc(),
+                DartDisclosureEvent.receipt_date.desc().nullslast(),
+                DartFundamentalsSnapshot.id.desc(),
+            ),
+        ).label('row_rank')
+        latest_snapshot_subquery = (
+            select(
+                DartFundamentalsSnapshot.id.label('snapshot_id'),
+                DartFundamentalsSnapshot.stock_code.label('stock_code'),
+                DartFundamentalsSnapshot.corp_name.label('corp_name'),
+                DartFundamentalsSnapshot.business_year.label('business_year'),
+                DartFundamentalsSnapshot.report_code.label('report_code'),
+                DartFundamentalsSnapshot.fs_div.label('fs_div'),
+                DartFundamentalsSnapshot.period_type.label('period_type'),
+                DartFundamentalsSnapshot.currency.label('currency'),
+                DartFundamentalsSnapshot.captured_at.label('captured_at'),
+                DartFundamentalsSnapshot.rcept_no.label('rcept_no'),
+                DartDisclosureEvent.receipt_date.label('receipt_date'),
+                latest_rank,
+            )
+            .join(DartDisclosureEvent, DartDisclosureEvent.id == DartFundamentalsSnapshot.disclosure_event_id)
+            .where(
+                DartFundamentalsSnapshot.stock_code.in_(symbols),
+                DartFundamentalsSnapshot.fs_div == ADVANCED_VALUE_FUNDAMENTALS_FS_DIV,
+                DartFundamentalsSnapshot.report_code == ADVANCED_VALUE_FUNDAMENTALS_REPORT_CODE,
+                DartFundamentalsSnapshot.period_type == ADVANCED_VALUE_FUNDAMENTALS_PERIOD_TYPE,
+                DartFundamentalsSnapshot.business_year <= market_date.year,
+                DartDisclosureEvent.receipt_date <= market_date,
+            )
+            .subquery()
+        )
+        with session_scope() as session:
+            session.execute(
+                text(
+                    f"SET LOCAL statement_timeout = "
+                    f"'{ADVANCED_VALUE_FUNDAMENTALS_STATEMENT_TIMEOUT_SECONDS}s'"
+                )
+            )
+            return list(
+                session.execute(
+                    select(latest_snapshot_subquery).where(latest_snapshot_subquery.c.row_rank == 1)
+                ).mappings().all()
+            )
 
     def _build_symbol_result(
         self,
