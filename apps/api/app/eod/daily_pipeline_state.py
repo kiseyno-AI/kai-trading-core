@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime, timezone
 from typing import Any, Mapping, Sequence
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from app.db import session_scope
 from app.db_models import DailyPipelineRun, DailyPipelineStageRun
