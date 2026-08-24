@@ -6,13 +6,14 @@ import unittest
 from unittest.mock import patch
 
 import httpx
+from sqlalchemy.dialects import postgresql
 
 from app.core.settings import settings
 from app.external_news.classifier import classify_external_news_item
 from app.external_news.provider import NaverNewsSearchProvider
 from app.external_news.service import ExternalNewsService
 from app.external_news.provider import ExternalNewsItem
-from app.external_news.store import _dedupe_provider_news_items
+from app.external_news.store import _build_external_news_insert_statement, _dedupe_provider_news_items
 from app.agent_context.read_service import (
     _build_decider_disclosures_news_quality_context,
     _build_external_news_freshness_provenance,
@@ -106,6 +107,29 @@ def test_dedupe_provider_news_items_skips_duplicate_provider_ids_and_urls() -> N
 
     assert [item.title for item in deduped] == ['first', 'second']
     assert skipped == 2
+
+
+def test_external_news_insert_is_idempotent_for_all_unique_conflicts() -> None:
+    statement = _build_external_news_insert_statement(
+        {
+            'symbol_id': 1,
+            'provider': 'naver_news_search',
+            'provider_item_id': 'item-1',
+            'source': 'naver_news_search',
+            'title': 'title',
+            'description': None,
+            'url': 'https://example.test/news/1',
+            'source_url': None,
+            'published_at': None,
+            'collected_at': datetime(2026, 5, 8, tzinfo=timezone.utc),
+            'payload': {},
+        }
+    )
+
+    compiled = str(statement.compile(dialect=postgresql.dialect()))
+
+    assert 'ON CONFLICT DO NOTHING' in compiled
+    assert 'ON CONSTRAINT' not in compiled
 
 
 class ExternalNewsServiceTests(unittest.IsolatedAsyncioTestCase):
