@@ -137,6 +137,19 @@ class _FakePipelineRunStateService:
         return {**self.runs[-1], **kwargs}
 
 
+class _FakeDeduplicatedRecoveryRunStateService(_FakePipelineRunStateService):
+    def start_run(self, **kwargs):
+        return {
+            'id': 315,
+            'market_date': kwargs['market_date'],
+            'trigger': 'monitor_stale_continuation',
+            'status': 'completed',
+            'stages': {'signal_decider_evaluations': {'status': 'completed'}},
+            'deduplicated': True,
+            'deduplication_reason': 'recovery_already_completed',
+        }
+
+
 class _FakeSkippedPykrxStageRunner:
     def __init__(self) -> None:
         self.calls: list[dict] = []
@@ -214,6 +227,7 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         )
         self.assertIn('unified_value_factors', payload['stage_order'])
         self.assertIn('quality_factors', payload['stage_order'])
+
         unified_value_stage = next(
             stage
             for stage in payload['stages']
@@ -309,6 +323,25 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         self.assertEqual(details['duration_seconds'], 361.123)
         self.assertTrue(details['slow_stage'])
         self.assertEqual(details['slow_stage_threshold_ms'], 300000)
+
+    def test_monitor_recovery_returns_existing_run_without_executing_stages(self) -> None:
+        pykrx_runner = _FakePykrxStageRunner()
+        service = DailyPipelineStageService(
+            pykrx_service=pykrx_runner,
+            run_state_service=_FakeDeduplicatedRecoveryRunStateService(),
+        )
+
+        result = service.run(
+            market_date='2026-08-21',
+            stages=['price_collection'],
+            trigger='monitor_stale_continuation',
+            force=True,
+        )
+
+        self.assertFalse(result['triggered'])
+        self.assertEqual(result['reason'], 'recovery_already_completed')
+        self.assertEqual(result['pipeline_run_id'], 315)
+        self.assertEqual(pykrx_runner.calls, [])
 
     def test_run_reorders_requested_subset_and_splits_feedback_stages(self) -> None:
         pykrx_runner = _FakePykrxStageRunner()

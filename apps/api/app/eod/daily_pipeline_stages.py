@@ -537,6 +537,18 @@ class DailyPipelineStageService:
             },
         )
         pipeline_run_id = int(pipeline_run['id'])
+        if pipeline_run.get('deduplicated'):
+            return {
+                'triggered': False,
+                'reason': pipeline_run.get('deduplication_reason') or 'duplicate_recovery',
+                'pipeline_run_id': pipeline_run_id,
+                'pipeline_run': pipeline_run,
+                'market_date': resolved_market_date,
+                'requested_stages': requested_stages,
+                'resolved_stages': resolved_stages,
+                'status': pipeline_run.get('status'),
+                'stages': pipeline_run.get('stages') or {},
+            }
 
         pykrx_requested = [stage_id for stage_id in resolved_stages if stage_id in PYKRX_PIPELINE_STAGE_ORDER]
         if 'price_collection' in pykrx_requested:
