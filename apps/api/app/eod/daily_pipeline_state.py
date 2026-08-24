@@ -155,6 +155,43 @@ class DailyPipelineRunStateService:
             **dict(run_metadata or {}),
         }
         with session_scope() as session:
+            if str(trigger or '').strip() == 'monitor_stale_continuation':
+                # Serialize recovery admission per market date. A second monitor
+                # request can otherwise wait behind the first multi-hour run and
+                # create a duplicate as soon as that run completes.
+                session.execute(
+                    text('SELECT pg_advisory_xact_lock(:source_key, :trade_key)'),
+                    {
+                        'source_key': 20_001,
+                        'trade_key': int(normalized_market_date.strftime('%Y%m%d')),
+                    },
+                )
+                existing = session.execute(
+                    select(DailyPipelineRun)
+                    .where(
+                        DailyPipelineRun.market_date == normalized_market_date,
+                        DailyPipelineRun.trigger == 'monitor_stale_continuation',
+                        DailyPipelineRun.status.in_((*ACTIVE_DAILY_PIPELINE_STATUSES, 'completed')),
+                    )
+                    .order_by(DailyPipelineRun.started_at.desc(), DailyPipelineRun.id.desc())
+                    .limit(1)
+                ).scalar_one_or_none()
+                if existing is not None:
+                    stage_rows = list(
+                        session.execute(
+                            select(DailyPipelineStageRun)
+                            .where(DailyPipelineStageRun.pipeline_run_id == existing.id)
+                            .order_by(DailyPipelineStageRun.id.asc())
+                        ).scalars()
+                    )
+                    payload = self._serialize_run(existing, stage_rows)
+                    payload['deduplicated'] = True
+                    payload['deduplication_reason'] = (
+                        'recovery_already_completed'
+                        if existing.status == 'completed'
+                        else 'recovery_already_active'
+                    )
+                    return payload
             row = DailyPipelineRun(
                 market_date=normalized_market_date,
                 trigger=str(trigger or 'manual'),
