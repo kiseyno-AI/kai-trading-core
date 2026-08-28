@@ -1129,7 +1129,11 @@ class DailyPipelineStageService:
                     reuse_existing=reuse_existing_feedback,
                     progress_callback=progress_callback,
                 ),
-                force=force,
+                # A forced pipeline recovery must bypass stale prerequisite
+                # gates, but it must not silently turn an idempotent resume
+                # into a full model recompute when reuse was requested.
+                force=force and not reuse_existing_feedback,
+                bypass_prerequisite_gate=force,
             )
         if stage_id == 'next_open_execution_plan':
             from app.orders.next_open_execution import signal_decider_next_open_execution_service

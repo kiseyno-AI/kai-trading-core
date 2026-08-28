@@ -60,8 +60,20 @@ class _FakeFeedbackRetryService:
     def __init__(self) -> None:
         self.calls: list[dict] = []
 
-    def run_retry_cycles(self, *, config, force: bool = False):
-        self.calls.append({'config': config, 'force': force})
+    def run_retry_cycles(
+        self,
+        *,
+        config,
+        force: bool = False,
+        bypass_prerequisite_gate: bool = False,
+    ):
+        self.calls.append(
+            {
+                'config': config,
+                'force': force,
+                'bypass_prerequisite_gate': bypass_prerequisite_gate,
+            }
+        )
         if config.progress_callback is not None:
             config.progress_callback(
                 status='running',
@@ -614,6 +626,23 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         self.assertEqual(progress_events[0]['current_step'], 'role_started')
         self.assertEqual(progress_events[0]['processed'], 1)
         self.assertEqual(progress_events[0]['source_run_ids']['agent_feedback_run_id'], 'fake-feedback-run')
+
+    def test_forced_feedback_recovery_reuses_existing_rows(self) -> None:
+        feedback_retry_service = _FakeFeedbackRetryService()
+        service = DailyPipelineStageService(feedback_retry_service=feedback_retry_service)
+
+        result = service.run(
+            market_date='2026-04-14',
+            stages=['agent_feedback_summaries'],
+            force=True,
+            reuse_existing_feedback=True,
+        )
+
+        self.assertEqual(result['status'], 'completed')
+        call = feedback_retry_service.calls[0]
+        self.assertFalse(call['force'])
+        self.assertTrue(call['bypass_prerequisite_gate'])
+        self.assertTrue(call['config'].reuse_existing)
 
     def test_run_rejects_unknown_stage(self) -> None:
         service = DailyPipelineStageService()
