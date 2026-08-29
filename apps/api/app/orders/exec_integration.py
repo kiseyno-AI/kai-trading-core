@@ -2083,6 +2083,9 @@ class SignalDeciderExecIntegrationService:
         activity_coverage = self._build_runtime_daily_board_activity_coverage(
             items=items,
             runtime=runtime_read_model,
+            runtime_activity_applicable=(
+                market_date == generated_at.astimezone(MARKET_TIME_ZONE).date()
+            ),
         )
         payload = {
             'request': {
@@ -5015,8 +5018,13 @@ class SignalDeciderExecIntegrationService:
         *,
         items: Sequence[dict[str, Any]],
         runtime: dict[str, Any],
+        runtime_activity_applicable: bool = True,
     ) -> dict[str, Any]:
-        exec_activity_detected = cls._exec_runtime_activity_detected(runtime=runtime)
+        exec_activity_detected = (
+            cls._exec_runtime_activity_detected(runtime=runtime)
+            if runtime_activity_applicable
+            else None
+        )
         if items:
             status = 'available'
             status_reason = 'core_read_model_items_available'
@@ -5042,41 +5050,82 @@ class SignalDeciderExecIntegrationService:
         if payload is None:
             return None
 
-        counts = payload.get('counts') if isinstance(payload.get('counts'), dict) else {}
+        explicit_inactivity_detected = False
+        invalid_activity_summary_detected = False
+
+        counts_value = payload.get('counts')
+        counts = counts_value if isinstance(counts_value, dict) else {}
+        if 'counts' in payload and not isinstance(counts_value, dict):
+            invalid_activity_summary_detected = True
         for field_name in ('open_orders', 'active_execution_jobs'):
+            if field_name not in counts:
+                continue
             try:
-                if int(counts.get(field_name) or 0) > 0:
+                count = int(counts[field_name])
+                if count > 0:
                     return True
             except (TypeError, ValueError):
-                return True
+                invalid_activity_summary_detected = True
+                continue
+            explicit_inactivity_detected = True
 
-        symbols = payload.get('symbols') if isinstance(payload.get('symbols'), dict) else {}
+        symbols_value = payload.get('symbols')
+        symbols = symbols_value if isinstance(symbols_value, dict) else {}
+        if 'symbols' in payload and not isinstance(symbols_value, dict):
+            invalid_activity_summary_detected = True
         for field_name in ('monitored', 'scheduled_today', 'filled_today', 'failed_today', 'positions'):
+            if field_name not in symbols:
+                continue
             value = symbols.get(field_name)
-            if isinstance(value, (list, tuple, set)) and value:
+            if not isinstance(value, (list, tuple, set)):
+                invalid_activity_summary_detected = True
+                continue
+            if value:
                 return True
+            explicit_inactivity_detected = True
 
-        filled_counts = symbols.get('filled_today_counts') if isinstance(symbols.get('filled_today_counts'), dict) else {}
+        filled_counts_value = symbols.get('filled_today_counts')
+        filled_counts = filled_counts_value if isinstance(filled_counts_value, dict) else {}
+        if 'filled_today_counts' in symbols and not isinstance(filled_counts_value, dict):
+            invalid_activity_summary_detected = True
         for value in filled_counts.values():
             if not isinstance(value, dict):
+                invalid_activity_summary_detected = True
                 continue
             for field_name in ('symbols', 'fills', 'quantity'):
+                if field_name not in value:
+                    continue
                 try:
-                    if float(value.get(field_name) or 0) > 0:
+                    count = float(value[field_name])
+                    if count > 0:
                         return True
                 except (TypeError, ValueError):
-                    return True
+                    invalid_activity_summary_detected = True
+                    continue
+                explicit_inactivity_detected = True
 
         autonomous_monitoring = _extract_field(payload, 'liveness', 'autonomous', 'monitoring')
         if isinstance(autonomous_monitoring, dict):
-            last_cycle = (
-                autonomous_monitoring.get('last_cycle')
-                if isinstance(autonomous_monitoring.get('last_cycle'), dict)
-                else {}
-            )
-            if last_cycle.get('monitored_symbols') or last_cycle.get('items'):
-                return True
-        return False
+            last_cycle_value = autonomous_monitoring.get('last_cycle')
+            last_cycle = last_cycle_value if isinstance(last_cycle_value, dict) else {}
+            if 'last_cycle' in autonomous_monitoring and not isinstance(last_cycle_value, dict):
+                invalid_activity_summary_detected = True
+            for field_name in ('monitored_symbols', 'items'):
+                if field_name not in last_cycle:
+                    continue
+                value = last_cycle[field_name]
+                if not isinstance(value, (list, tuple, set)):
+                    invalid_activity_summary_detected = True
+                    continue
+                if value:
+                    return True
+                explicit_inactivity_detected = True
+
+        if invalid_activity_summary_detected:
+            return None
+        if explicit_inactivity_detected:
+            return False
+        return None
 
     @classmethod
     def _iter_exec_agent_payloads(cls, item: dict[str, Any]) -> Iterable[dict[str, Any]]:

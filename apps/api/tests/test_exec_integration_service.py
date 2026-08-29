@@ -347,6 +347,54 @@ class ExecIntegrationDashboardCacheTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first['items'], [{'symbol': '005930'}])
         self.assertEqual(second['freshness']['served_from_cache'], True)
 
+    async def test_historical_daily_board_ignores_unscoped_current_runtime_activity(self) -> None:
+        service = SignalDeciderExecIntegrationService(client=FakeExecClient())
+        overview = {
+            'integration': {
+                'mode': 'dispatch',
+                'enabled': True,
+                'delegate_execution': True,
+                'runtime_mode': 'live',
+                'issues': [],
+            },
+            'runtime': {
+                'status': 'ok',
+                'payload': {
+                    'mode': 'live',
+                    'ready': True,
+                    'counts': {'open_orders': 1, 'active_execution_jobs': 0},
+                },
+                'error': None,
+            },
+            'items': [],
+        }
+
+        with (
+            patch.object(
+                service,
+                '_load_dashboard_read_model_overview',
+                new=AsyncMock(return_value=overview),
+            ),
+            patch(
+                'app.orders.exec_integration._utcnow',
+                return_value=datetime(2026, 8, 29, 1, 0, tzinfo=timezone.utc),
+            ),
+        ):
+            board = await service.get_runtime_daily_board(
+                market_date=date(2026, 8, 28),
+                refresh=False,
+                trigger='test',
+            )
+
+        self.assertEqual(board['items'], [])
+        self.assertEqual(board['activity_coverage']['status'], 'unavailable')
+        self.assertEqual(
+            board['activity_coverage']['status_reason'],
+            'runtime_read_model_unavailable',
+        )
+        self.assertIsNone(board['activity_coverage']['exec_activity_detected'])
+        self.assertEqual(board['freshness']['status'], 'unavailable')
+
 
 class ExecRuntimeReadbackNormalizationTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -440,6 +488,17 @@ class ExecRuntimeReadbackNormalizationTests(unittest.TestCase):
             },
         )
 
+    def test_exec_runtime_activity_is_unknown_when_activity_summaries_are_omitted(self) -> None:
+        runtime = {
+            'status': 'ok',
+            'payload': self._current_exec_payload(),
+            'error': None,
+        }
+
+        result = self.service._exec_runtime_activity_detected(runtime=runtime)
+
+        self.assertIsNone(result)
+
     def test_daily_board_distinguishes_no_activity_from_unavailable_exec_activity(self) -> None:
         refresh_state = {
             'requested': False,
@@ -471,9 +530,13 @@ class ExecRuntimeReadbackNormalizationTests(unittest.TestCase):
                 served_from_cache=False,
             )
 
-        unavailable = build(active_payload)
-        no_activity = build(no_activity_payload)
-        unloaded = build(None)
+        with patch(
+            'app.orders.exec_integration._utcnow',
+            return_value=datetime(2026, 8, 29, 1, 0, tzinfo=timezone.utc),
+        ):
+            unavailable = build(active_payload)
+            no_activity = build(no_activity_payload)
+            unloaded = build(None)
 
         self.assertEqual(unavailable['items'], [])
         self.assertEqual(unavailable['activity_coverage']['status'], 'unavailable')
