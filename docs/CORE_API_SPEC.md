@@ -1514,7 +1514,10 @@ Web is a display-only consumer:
 - Dashboard read models use `execution_runtime_dashboard_read_model_v1` in `freshness.schema_version`.
 - Today buy/sell facts use `execution_runtime_today_activity_v1`.
 - Runtime status values are `ready`, `degraded`, `offline`, `paused`, and `kill_switched`.
+- Runtime liveness accepts both legacy monitoring fields and current Exec `liveness.autonomous.monitoring`; a running monitor with a parseable heartbeat is exposed as `monitoring_alive=true` with its `last_heartbeat_at`.
+- Runtime `pnl_coverage` reports per-period `available` or `unavailable` status and a `status_reason`; Core preserves Exec P/L dictionaries and does not synthesize missing FIFO P/L.
 - Daily-board row statuses are `planned`, `accepted`, `scheduled`, `submitted`, `partial`, `filled`, `cancelled`, and `failed`.
+- Daily-board `activity_coverage` values are `available`, `no_activity`, and `unavailable`. `exec_activity_not_materialized` prevents an empty Core row set from being presented as no activity when Exec runtime summaries show current orders, jobs, fills, positions, or monitored symbols.
 - Monitored-symbol states are `watching_target_stop`, `watching_fill`, `reconciling`, and `idle`.
 - Freshness states are `fresh`, `stale`, `partial`, `refreshing`, and `unavailable`.
 

@@ -39,6 +39,8 @@ ExecutionBoardStatus = Literal[
 ]
 ExecutionMonitoringState = Literal['watching_target_stop', 'watching_fill', 'reconciling', 'idle']
 ExecutionActivityStatus = Literal['available', 'partial', 'unavailable', 'none']
+ExecutionPnlCoverageStatus = Literal['available', 'unavailable']
+ExecutionDailyBoardActivityCoverageStatus = Literal['available', 'no_activity', 'unavailable']
 ExecutionDispatchItemSide = Literal['buy', 'sell']
 PortfolioSyncStatus = Literal['synced', 'stale', 'unavailable', 'not_configured']
 
@@ -62,6 +64,12 @@ class _ContractModel(BaseModel):
     model_config = ConfigDict(extra='allow')
 
 
+class ExecutionPnlCoveragePayload(_ContractModel):
+    status: ExecutionPnlCoverageStatus
+    status_reason: str
+    source: str
+
+
 class ExecutionRuntimeStatusPayload(_ContractModel):
     status: ExecutionRuntimeStatus
     mode: str
@@ -77,6 +85,7 @@ class ExecutionRuntimeStatusPayload(_ContractModel):
     daily_pnl: dict[str, Any] | None = None
     weekly_pnl: dict[str, Any] | None = None
     monthly_pnl: dict[str, Any] | None = None
+    pnl_coverage: dict[str, ExecutionPnlCoveragePayload] | None = None
     actionable_alerts: dict[str, Any] | None = None
     issues: list[dict[str, Any]] = Field(default_factory=list)
     core_integration_mode: str | None = None
@@ -214,11 +223,19 @@ class ExecutionDailyBoardRowPayload(ExecutionRuntimeExecCardPayload):
     realtime_subscription_reason: str | None = None
 
 
+class ExecutionDailyBoardActivityCoveragePayload(_ContractModel):
+    status: ExecutionDailyBoardActivityCoverageStatus
+    status_reason: str
+    exec_activity_detected: bool | None = None
+    source: str
+
+
 class ExecutionDailyBoardPayload(_ContractModel):
     request: dict[str, Any]
     runtime: ExecutionRuntimeStatusPayload
     market_date: str
     summary: dict[str, Any]
+    activity_coverage: ExecutionDailyBoardActivityCoveragePayload | None = None
     freshness: ExecutionDashboardFreshnessPayload
     refresh: ExecutionDashboardRefreshPayload
     items: list[ExecutionDailyBoardRowPayload]

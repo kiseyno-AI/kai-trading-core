@@ -347,6 +347,212 @@ class ExecIntegrationDashboardCacheTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first['items'], [{'symbol': '005930'}])
         self.assertEqual(second['freshness']['served_from_cache'], True)
 
+    async def test_historical_daily_board_ignores_unscoped_current_runtime_activity(self) -> None:
+        service = SignalDeciderExecIntegrationService(client=FakeExecClient())
+        overview = {
+            'integration': {
+                'mode': 'dispatch',
+                'enabled': True,
+                'delegate_execution': True,
+                'runtime_mode': 'live',
+                'issues': [],
+            },
+            'runtime': {
+                'status': 'ok',
+                'payload': {
+                    'mode': 'live',
+                    'ready': True,
+                    'counts': {'open_orders': 1, 'active_execution_jobs': 0},
+                },
+                'error': None,
+            },
+            'items': [],
+        }
+
+        with (
+            patch.object(
+                service,
+                '_load_dashboard_read_model_overview',
+                new=AsyncMock(return_value=overview),
+            ),
+            patch(
+                'app.orders.exec_integration._utcnow',
+                return_value=datetime(2026, 8, 29, 1, 0, tzinfo=timezone.utc),
+            ),
+        ):
+            board = await service.get_runtime_daily_board(
+                market_date=date(2026, 8, 28),
+                refresh=False,
+                trigger='test',
+            )
+
+        self.assertEqual(board['items'], [])
+        self.assertEqual(board['activity_coverage']['status'], 'unavailable')
+        self.assertEqual(
+            board['activity_coverage']['status_reason'],
+            'runtime_read_model_unavailable',
+        )
+        self.assertIsNone(board['activity_coverage']['exec_activity_detected'])
+        self.assertEqual(board['freshness']['status'], 'unavailable')
+
+
+class ExecRuntimeReadbackNormalizationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.service = SignalDeciderExecIntegrationService(client=FakeExecClient())
+        self.integration = {
+            'mode': 'dispatch',
+            'enabled': True,
+            'delegate_execution': True,
+            'runtime_mode': 'live',
+            'issues': [],
+        }
+
+    @staticmethod
+    def _current_exec_payload() -> dict:
+        return {
+            'mode': 'live',
+            'ready': True,
+            'safety': {
+                'paused': False,
+                'kill_switch_enabled': False,
+                'automation_enabled': True,
+            },
+            'liveness': {
+                'monitoring': {
+                    'status': 'degraded',
+                    'last_heartbeat_at': '2026-08-29T00:06:53+00:00',
+                },
+                'autonomous': {
+                    'enabled': True,
+                    'monitoring': {
+                        'worker_name': 'monitoring_dispatch_loop',
+                        'status': 'running',
+                        'poll_interval_seconds': 5,
+                        'last_heartbeat_at': '2026-08-29T00:06:53+00:00',
+                        'last_success_at': '2026-08-29T00:06:53+00:00',
+                    },
+                }
+            },
+            'readiness': {'reasons': []},
+        }
+
+    def test_normalizes_current_exec_autonomous_monitoring_liveness(self) -> None:
+        result = self.service._build_dashboard_runtime_status(
+            integration=self.integration,
+            runtime={'status': 'ok', 'payload': self._current_exec_payload(), 'error': None},
+        )
+
+        self.assertEqual(result['status'], 'ready')
+        self.assertTrue(result['monitoring_alive'])
+        self.assertEqual(result['last_heartbeat_at'], '2026-08-29T00:06:53+00:00')
+
+    def test_exposes_missing_pnl_coverage_reasons(self) -> None:
+        result = self.service._build_dashboard_runtime_status(
+            integration=self.integration,
+            runtime={'status': 'ok', 'payload': self._current_exec_payload(), 'error': None},
+        )
+
+        self.assertIsNone(result['daily_pnl'])
+        self.assertIsNone(result['weekly_pnl'])
+        self.assertIsNone(result['monthly_pnl'])
+        self.assertEqual(
+            result['pnl_coverage'],
+            {
+                period: {
+                    'status': 'unavailable',
+                    'status_reason': 'not_provided_by_exec',
+                    'source': 'exec_runtime_status',
+                }
+                for period in ('daily', 'weekly', 'monthly')
+            },
+        )
+
+    def test_exposes_upstream_pnl_not_computable_reason(self) -> None:
+        payload = self._current_exec_payload()
+        payload['daily_pnl'] = {
+            'daily_realized_pnl': None,
+            'status_reason': 'fill_coverage_incomplete',
+        }
+
+        result = self.service._build_dashboard_runtime_status(
+            integration=self.integration,
+            runtime={'status': 'ok', 'payload': payload, 'error': None},
+        )
+
+        self.assertEqual(
+            result['pnl_coverage']['daily'],
+            {
+                'status': 'unavailable',
+                'status_reason': 'fill_coverage_incomplete',
+                'source': 'exec_runtime_status',
+            },
+        )
+
+    def test_exec_runtime_activity_is_unknown_when_activity_summaries_are_omitted(self) -> None:
+        runtime = {
+            'status': 'ok',
+            'payload': self._current_exec_payload(),
+            'error': None,
+        }
+
+        result = self.service._exec_runtime_activity_detected(runtime=runtime)
+
+        self.assertIsNone(result)
+
+    def test_daily_board_distinguishes_no_activity_from_unavailable_exec_activity(self) -> None:
+        refresh_state = {
+            'requested': False,
+            'status': 'not_requested',
+            'source': 'exec_readback',
+        }
+        active_payload = self._current_exec_payload()
+        active_payload['symbols'] = {'filled_today': ['005930']}
+        no_activity_payload = self._current_exec_payload()
+        no_activity_payload['symbols'] = {
+            'monitored': [],
+            'scheduled_today': [],
+            'filled_today': [],
+            'failed_today': [],
+            'positions': [],
+        }
+        no_activity_payload['counts'] = {'open_orders': 0, 'active_execution_jobs': 0}
+
+        def build(payload: dict | None) -> dict:
+            return self.service._build_runtime_daily_board_payload(
+                market_date=date(2026, 8, 29),
+                refresh=False,
+                overview={
+                    'integration': self.integration,
+                    'runtime': {'status': 'ok', 'payload': payload, 'error': None},
+                    'items': [],
+                },
+                refresh_state=refresh_state,
+                served_from_cache=False,
+            )
+
+        with patch(
+            'app.orders.exec_integration._utcnow',
+            return_value=datetime(2026, 8, 29, 1, 0, tzinfo=timezone.utc),
+        ):
+            unavailable = build(active_payload)
+            no_activity = build(no_activity_payload)
+            unloaded = build(None)
+
+        self.assertEqual(unavailable['items'], [])
+        self.assertEqual(unavailable['activity_coverage']['status'], 'unavailable')
+        self.assertEqual(unavailable['activity_coverage']['status_reason'], 'exec_activity_not_materialized')
+        self.assertTrue(unavailable['activity_coverage']['exec_activity_detected'])
+        self.assertEqual(unavailable['freshness']['status'], 'unavailable')
+        self.assertEqual(no_activity['items'], [])
+        self.assertEqual(no_activity['activity_coverage']['status'], 'no_activity')
+        self.assertEqual(no_activity['activity_coverage']['status_reason'], 'no_exec_activity')
+        self.assertFalse(no_activity['activity_coverage']['exec_activity_detected'])
+        self.assertEqual(no_activity['freshness']['status'], 'fresh')
+        self.assertEqual(unloaded['activity_coverage']['status'], 'unavailable')
+        self.assertEqual(unloaded['activity_coverage']['status_reason'], 'runtime_read_model_unavailable')
+        self.assertIsNone(unloaded['activity_coverage']['exec_activity_detected'])
+        self.assertEqual(unloaded['freshness']['status'], 'unavailable')
+
 
 class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
     @classmethod
