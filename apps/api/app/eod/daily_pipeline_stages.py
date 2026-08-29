@@ -487,6 +487,23 @@ class DailyPipelineStageService:
             'stages': [STAGE_DEFINITIONS[stage_id].to_dict() for stage_id in DAILY_STAGE_ORDER],
         }
 
+    def validate_run_request(
+        self,
+        *,
+        market_date: str | date | None,
+        stages: Sequence[str] | None,
+        resume_from_stage: str | None,
+    ) -> dict[str, Any]:
+        requested_stages = self._resolve_requested_stages_for_resume(
+            requested_stages=list(stages or DEFAULT_DAILY_STAGE_ORDER),
+            resume_from_stage=resume_from_stage,
+        )
+        return {
+            'market_date': self._normalize_market_date(market_date),
+            'requested_stages': requested_stages,
+            'resolved_stages': self._resolve_stage_ids(requested_stages),
+        }
+
     def run(
         self,
         *,
@@ -508,12 +525,14 @@ class DailyPipelineStageService:
         resume_from_stage: str | None = None,
         trigger: str = 'stage_orchestrator',
     ) -> dict[str, Any]:
-        requested_stages = self._resolve_requested_stages_for_resume(
-            requested_stages=list(stages or DEFAULT_DAILY_STAGE_ORDER),
+        validated_request = self.validate_run_request(
+            market_date=market_date,
+            stages=stages,
             resume_from_stage=resume_from_stage,
         )
-        resolved_stages = self._resolve_stage_ids(requested_stages)
-        resolved_market_date = self._normalize_market_date(market_date)
+        requested_stages = validated_request['requested_stages']
+        resolved_stages = validated_request['resolved_stages']
+        resolved_market_date = validated_request['market_date']
         resolved_symbols = self._normalize_symbols(symbols)
         resolved_markets = self._normalize_markets(markets)
         resolved_fs_div = (fs_div or settings.dart_fundamentals_default_fs_div).strip().upper()

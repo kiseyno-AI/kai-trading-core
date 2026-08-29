@@ -774,7 +774,7 @@ class PykrxBackfillService:
                 chain_fundamentals_followup=True,
                 track_daily_pipeline=True,
             )
-            result['triggered'] = True
+            result.setdefault('triggered', True)
             _log_pykrx_fetch(
                 'run_daily_pipeline_if_due',
                 result['status'],

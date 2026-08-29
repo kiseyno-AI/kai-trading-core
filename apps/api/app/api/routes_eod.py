@@ -151,6 +151,11 @@ async def run_eod_pipeline(payload: EODPipelineRunRequest, background_tasks: Bac
         )
         background = bool(request_kwargs.pop('background', False))
         if background:
+            validated_request = daily_pipeline_stage_service.validate_run_request(
+                market_date=request_kwargs.get('market_date'),
+                stages=request_kwargs.get('stages'),
+                resume_from_stage=request_kwargs.get('resume_from_stage'),
+            )
             background_tasks.add_task(
                 daily_pipeline_stage_service.run,
                 trigger='manual_api',
@@ -160,8 +165,8 @@ async def run_eod_pipeline(payload: EODPipelineRunRequest, background_tasks: Bac
                 status_code=202,
                 content={
                     'status': 'accepted',
-                    'market_date': request_kwargs.get('market_date'),
-                    'requested_stages': request_kwargs.get('stages'),
+                    'market_date': validated_request['market_date'],
+                    'requested_stages': validated_request['requested_stages'],
                     'background': True,
                 },
             )

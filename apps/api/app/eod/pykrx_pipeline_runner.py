@@ -303,22 +303,24 @@ class _OfficialDailyPipelineTracker:
         trigger: str,
         requested_stages: Sequence[str],
         resolved_stages: Sequence[str],
-        eod_run_id: int,
+        eod_run_id: int | None,
         run_metadata: dict[str, Any],
-    ) -> None:
+    ) -> dict[str, Any] | None:
         if not self.enabled or self.service is None:
-            return
+            return None
         try:
+            tracking_metadata = {
+                'entrypoint': 'PYKRX_BACKFILL_SERVICE.run_daily_pipeline_if_due',
+                **run_metadata,
+            }
+            if eod_run_id is not None:
+                tracking_metadata['eod_collection_run_id'] = eod_run_id
             run = self.service.start_run(
                 market_date=market_date,
                 trigger=trigger,
                 requested_stages=requested_stages,
                 resolved_stages=resolved_stages,
-                run_metadata={
-                    'entrypoint': 'PYKRX_BACKFILL_SERVICE.run_daily_pipeline_if_due',
-                    'eod_collection_run_id': eod_run_id,
-                    **run_metadata,
-                },
+                run_metadata=tracking_metadata,
             )
             if run.get('deduplicated'):
                 self.enabled = False
@@ -330,10 +332,11 @@ class _OfficialDailyPipelineTracker:
                     existing_pipeline_run_id=run.get('id'),
                     reason=run.get('deduplication_reason'),
                 )
-                return
+                return run
             self.pipeline_run_id = int(run['id'])
             self.market_date = market_date
             self.eod_run_id = eod_run_id
+            return run
         except Exception as exc:  # pragma: no cover - defensive production guard
             self.enabled = False
             logger.warning('daily pipeline tracker start failed for auto EOD run %s: %s', eod_run_id, exc)
@@ -345,6 +348,7 @@ class _OfficialDailyPipelineTracker:
                 error_type=type(exc).__name__,
                 error_message=str(exc),
             )
+            return None
 
     def update_stage(
         self,
@@ -879,14 +883,6 @@ def run_market_data_pipeline(
         current_symbol=first_symbol,
         extra={'bars_upserted': 0},
     )
-    run_id = dependencies.create_eod_collection_run(
-        market='KRX',
-        trade_date=latest_trade_date,
-        symbols_total=len(symbols),
-        trigger=trigger,
-        source='pykrx',
-        run_metadata=run_metadata,
-    )
     tracked_stages = _resolve_auto_daily_tracked_stages(
         selected_stages=selected_stages,
         chain_fundamentals_followup=chain_fundamentals_followup,
@@ -895,12 +891,12 @@ def run_market_data_pipeline(
         service=dependencies.daily_pipeline_run_state_service if track_daily_pipeline else None,
         log_fetch=dependencies.log_fetch,
     )
-    daily_pipeline_tracker.start(
+    pipeline_admission = daily_pipeline_tracker.start(
         market_date=latest_trade_date,
         trigger=trigger,
         requested_stages=tracked_stages,
         resolved_stages=tracked_stages,
-        eod_run_id=run_id,
+        eod_run_id=None,
         run_metadata={
             'mode': mode,
             'trigger': trigger,
@@ -910,6 +906,34 @@ def run_market_data_pipeline(
             'retry': retry_context,
         },
     )
+    if pipeline_admission and pipeline_admission.get('deduplicated'):
+        return {
+            'triggered': False,
+            'reason': pipeline_admission.get('deduplication_reason') or 'overlapping_run_already_active',
+            'source': 'pykrx',
+            'status': 'skipped',
+            'selected_stages': list(selected_stages or PYKRX_DAILY_STAGE_ORDER),
+            'markets': list(markets),
+            'start_date': normalized_start,
+            'requested_end_date': normalized_end,
+            'latest_available_trade_date': latest_trade_date,
+            'pipeline_run_id': pipeline_admission.get('id'),
+            'pipeline_run': pipeline_admission,
+        }
+
+    try:
+        run_id = dependencies.create_eod_collection_run(
+            market='KRX',
+            trade_date=latest_trade_date,
+            symbols_total=len(symbols),
+            trigger=trigger,
+            source='pykrx',
+            run_metadata=run_metadata,
+        )
+    except Exception as exc:
+        daily_pipeline_tracker.finish_run(status='failed', error_message=str(exc))
+        raise
+    daily_pipeline_tracker.eod_run_id = run_id
 
     symbols_succeeded = 0
     symbols_failed = 0
