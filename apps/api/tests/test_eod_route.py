@@ -1054,7 +1054,17 @@ class FakeDailyPipelineStageService:
             ],
         }
 
+    def validate_run_request(self, **kwargs):
+        from app.eod.daily_pipeline_stages import DailyPipelineStageService
+
+        return DailyPipelineStageService().validate_run_request(**kwargs)
+
     def run(self, **kwargs):
+        self.validate_run_request(
+            market_date=kwargs.get('market_date'),
+            stages=kwargs.get('stages'),
+            resume_from_stage=kwargs.get('resume_from_stage'),
+        )
         self.run_args = kwargs
         return {
             'market_date': kwargs.get('market_date') or '2026-04-21',
@@ -1169,7 +1179,17 @@ class EODRouteTests(unittest.TestCase):
             routes_eod.eod_pipeline_status_service = original_service
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(fake_service.read_args, {'market_date': '2026-04-21', 'fs_div': 'OFS'})
+        self.assertEqual(
+            fake_service.read_args,
+            {
+                'market_date': '2026-04-21',
+                'fs_div': 'OFS',
+                'include_feedback_context': False,
+                'include_feedback_stage': False,
+                'include_pykrx_enrichment_coverage': False,
+                'include_row_count_diagnostics': False,
+            },
+        )
         payload = response.json()
         self.assertEqual(payload['status'], 'running')
         self.assertEqual(payload['stages']['price_collection']['source_run_ids']['eod_run_id'], 101)
@@ -1228,6 +1248,63 @@ class EODRouteTests(unittest.TestCase):
         self.assertEqual(fake_service.run_args['feedback_max_cycles'], 4)
         self.assertFalse(fake_service.run_args['reuse_existing_feedback'])
         self.assertEqual(response.json()['status'], 'completed')
+
+    def test_run_eod_pipeline_route_accepts_background_execution(self):
+        fake_service = FakeDailyPipelineStageService()
+        original_service = routes_eod.daily_pipeline_stage_service
+        routes_eod.daily_pipeline_stage_service = fake_service
+        try:
+            client = TestClient(self.app)
+            response = client.post(
+                '/eod/pipeline/run',
+                json={
+                    'market_date': '2026-08-28',
+                    'stages': ['signal_decider'],
+                    'background': True,
+                    'reuse_existing_feedback': True,
+                },
+            )
+        finally:
+            routes_eod.daily_pipeline_stage_service = original_service
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.json()['status'], 'accepted')
+        self.assertTrue(response.json()['background'])
+        self.assertEqual(fake_service.run_args['market_date'], '2026-08-28')
+        self.assertNotIn('background', fake_service.run_args)
+
+    def test_run_eod_pipeline_route_validates_background_input_before_accepting(self):
+        original_service = routes_eod.daily_pipeline_stage_service
+        try:
+            for invalid_payload in (
+                {
+                    'market_date': 'not-a-date',
+                    'stages': ['signal_decider'],
+                },
+                {
+                    'market_date': '2026-08-28',
+                    'stages': ['unknown_stage'],
+                },
+            ):
+                with self.subTest(invalid_payload=invalid_payload):
+                    synchronous_service = FakeDailyPipelineStageService()
+                    routes_eod.daily_pipeline_stage_service = synchronous_service
+                    client = TestClient(self.app)
+                    synchronous_response = client.post('/eod/pipeline/run', json=invalid_payload)
+
+                    background_service = FakeDailyPipelineStageService()
+                    routes_eod.daily_pipeline_stage_service = background_service
+                    background_response = client.post(
+                        '/eod/pipeline/run',
+                        json={**invalid_payload, 'background': True},
+                    )
+
+                    self.assertEqual(synchronous_response.status_code, 400)
+                    self.assertEqual(background_response.status_code, 400)
+                    self.assertEqual(background_response.json(), synchronous_response.json())
+                    self.assertIsNone(background_service.run_args)
+        finally:
+            routes_eod.daily_pipeline_stage_service = original_service
 
     def test_collect_pykrx_enrichment_route_calls_service(self):
         fake_service = FakePykrxEnrichmentService()

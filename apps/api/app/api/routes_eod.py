@@ -1,6 +1,7 @@
 import asyncio
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Query
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from app.core.settings import settings
@@ -54,6 +55,7 @@ class EODPipelineRunRequest(BaseModel):
     symbols: list[str] | None = None
     markets: list[str] | None = None
     force: bool = False
+    bypass_prerequisite_gate: bool = False
     refresh_universe: bool | None = None
     fs_div: str | None = None
     symbol_limit: int | None = Field(default=None, ge=1)
@@ -64,6 +66,7 @@ class EODPipelineRunRequest(BaseModel):
     feedback_outer_batch_size: int = Field(default=20, ge=1)
     reuse_existing_feedback: bool = True
     resume_from_stage: str | None = None
+    background: bool = False
 
 
 @router.get('/status')
@@ -139,13 +142,34 @@ async def get_eod_pipeline_stages() -> dict:
 
 
 @router.post('/pipeline/run')
-async def run_eod_pipeline(payload: EODPipelineRunRequest) -> dict:
+async def run_eod_pipeline(payload: EODPipelineRunRequest, background_tasks: BackgroundTasks) -> dict:
     try:
         request_kwargs = (
             payload.model_dump(exclude_none=True)
             if hasattr(payload, 'model_dump')
             else payload.dict(exclude_none=True)
         )
+        background = bool(request_kwargs.pop('background', False))
+        if background:
+            validated_request = daily_pipeline_stage_service.validate_run_request(
+                market_date=request_kwargs.get('market_date'),
+                stages=request_kwargs.get('stages'),
+                resume_from_stage=request_kwargs.get('resume_from_stage'),
+            )
+            background_tasks.add_task(
+                daily_pipeline_stage_service.run,
+                trigger='manual_api',
+                **request_kwargs,
+            )
+            return JSONResponse(
+                status_code=202,
+                content={
+                    'status': 'accepted',
+                    'market_date': validated_request['market_date'],
+                    'requested_stages': validated_request['requested_stages'],
+                    'background': True,
+                },
+            )
         return await asyncio.to_thread(
             daily_pipeline_stage_service.run,
             trigger='manual_api',

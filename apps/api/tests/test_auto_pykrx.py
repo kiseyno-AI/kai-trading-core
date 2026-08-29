@@ -128,6 +128,20 @@ class _FakeDailyPipelineRunStateService:
         return kwargs
 
 
+class _FakeDeduplicatingDailyPipelineRunStateService(_FakeDailyPipelineRunStateService):
+    def start_run(self, **kwargs):
+        self.start_runs.append(kwargs)
+        return {
+            'id': 744,
+            'market_date': kwargs['market_date'],
+            'trigger': 'manual_api',
+            'status': 'running',
+            'deduplicated': True,
+            'deduplication_reason': 'overlapping_run_already_active',
+            'stages': {'signal_decider': {'status': 'running'}},
+        }
+
+
 class PykrxBackfillServiceTests(TestCase):
     def setUp(self) -> None:
         self.next_open_plan_patcher = patch(
@@ -493,6 +507,42 @@ class PykrxBackfillServiceTests(TestCase):
         self.assertTrue(result['triggered'])
         self.assertEqual(result['run_id'], 9)
         run_collection.assert_called_once()
+
+    def test_run_daily_pipeline_stops_before_collection_when_admission_is_deduplicated(self) -> None:
+        service = PykrxBackfillService()
+        run_state_service = _FakeDeduplicatingDailyPipelineRunStateService()
+
+        with (
+            patch.object(service, 'resolve_latest_trade_date', return_value='2026-04-03'),
+            patch.object(
+                service,
+                'load_active_universe',
+                return_value=[PykrxSymbol(symbol='005930', market='KOSPI', name_ko='Samsung Electronics')],
+            ),
+            patch('app.eod.pykrx_backfill.advisory_eod_collection_lock', return_value=_lock()),
+            patch('app.eod.pykrx_backfill.load_latest_eod_collection_run', return_value=None),
+            patch('app.eod.pykrx_backfill.daily_pipeline_run_state_service', run_state_service),
+            patch('app.eod.pykrx_backfill.create_eod_collection_run') as create_run,
+            patch('app.eod.pykrx_backfill._get_market_ohlcv_by_date') as collect_prices,
+            patch(
+                'app.eod.pykrx_backfill.dart_fundamentals_capture_service.run_daily_incremental_refresh'
+            ) as fundamentals_followup,
+        ):
+            result = service.run_daily_pipeline_if_due(
+                market_date='2026-04-03',
+                trigger='auto_close_scheduler',
+                refresh_universe=False,
+            )
+
+        self.assertFalse(result['triggered'])
+        self.assertEqual(result['status'], 'skipped')
+        self.assertEqual(result['reason'], 'overlapping_run_already_active')
+        self.assertEqual(result['pipeline_run_id'], 744)
+        create_run.assert_not_called()
+        collect_prices.assert_not_called()
+        fundamentals_followup.assert_not_called()
+        self.assertEqual(run_state_service.stage_updates, [])
+        self.assertEqual(run_state_service.finish_runs, [])
 
     def test_run_daily_pipeline_marks_stale_running_row_failed_and_retries(self) -> None:
         service = PykrxBackfillService()

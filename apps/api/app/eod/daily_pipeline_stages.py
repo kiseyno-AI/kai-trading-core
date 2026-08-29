@@ -487,6 +487,23 @@ class DailyPipelineStageService:
             'stages': [STAGE_DEFINITIONS[stage_id].to_dict() for stage_id in DAILY_STAGE_ORDER],
         }
 
+    def validate_run_request(
+        self,
+        *,
+        market_date: str | date | None,
+        stages: Sequence[str] | None,
+        resume_from_stage: str | None,
+    ) -> dict[str, Any]:
+        requested_stages = self._resolve_requested_stages_for_resume(
+            requested_stages=list(stages or DEFAULT_DAILY_STAGE_ORDER),
+            resume_from_stage=resume_from_stage,
+        )
+        return {
+            'market_date': self._normalize_market_date(market_date),
+            'requested_stages': requested_stages,
+            'resolved_stages': self._resolve_stage_ids(requested_stages),
+        }
+
     def run(
         self,
         *,
@@ -495,6 +512,7 @@ class DailyPipelineStageService:
         symbols: Sequence[str] | None = None,
         markets: Sequence[str] | None = None,
         force: bool = False,
+        bypass_prerequisite_gate: bool = False,
         refresh_universe: bool | None = None,
         fs_div: str | None = None,
         symbol_limit: int | None = None,
@@ -507,12 +525,14 @@ class DailyPipelineStageService:
         resume_from_stage: str | None = None,
         trigger: str = 'stage_orchestrator',
     ) -> dict[str, Any]:
-        requested_stages = self._resolve_requested_stages_for_resume(
-            requested_stages=list(stages or DEFAULT_DAILY_STAGE_ORDER),
+        validated_request = self.validate_run_request(
+            market_date=market_date,
+            stages=stages,
             resume_from_stage=resume_from_stage,
         )
-        resolved_stages = self._resolve_stage_ids(requested_stages)
-        resolved_market_date = self._normalize_market_date(market_date)
+        requested_stages = validated_request['requested_stages']
+        resolved_stages = validated_request['resolved_stages']
+        resolved_market_date = validated_request['market_date']
         resolved_symbols = self._normalize_symbols(symbols)
         resolved_markets = self._normalize_markets(markets)
         resolved_fs_div = (fs_div or settings.dart_fundamentals_default_fs_div).strip().upper()
@@ -534,6 +554,9 @@ class DailyPipelineStageService:
                 'symbol_limit': symbol_limit,
                 'symbol_offset': symbol_offset,
                 'capture_limit': capture_limit,
+                'reuse_existing_feedback': reuse_existing_feedback,
+                'feedback_force_recompute': bool(force and not reuse_existing_feedback),
+                'bypass_prerequisite_gate': bypass_prerequisite_gate,
             },
         )
         pipeline_run_id = int(pipeline_run['id'])
@@ -592,6 +615,29 @@ class DailyPipelineStageService:
                 market_date=resolved_market_date,
                 symbols=resolved_symbols,
             )
+            incomplete_dependencies = [
+                dependency
+                for dependency in STAGE_DEFINITIONS[stage_id].depends_on
+                if dependency in resolved_stages
+                and str((stage_outcomes.get(dependency) or {}).get('status') or '').lower() != 'completed'
+            ]
+            if incomplete_dependencies and stage_id != 'next_open_execution_plan':
+                stage_result = {
+                    'triggered': False,
+                    'status': 'blocked',
+                    'reason': 'declared_dependencies_incomplete',
+                    'market_date': resolved_market_date,
+                    'incomplete_dependencies': incomplete_dependencies,
+                }
+                stage_outcomes[stage_id] = self._build_stage_outcome(stage_id, stage_result)
+                self._finish_tracked_stage(
+                    pipeline_run_id=pipeline_run_id,
+                    stage_id=stage_id,
+                    market_date=resolved_market_date,
+                    outcome=stage_outcomes[stage_id],
+                    result=stage_result,
+                )
+                continue
             if stage_id == 'next_open_execution_plan':
                 decider_outcome = stage_outcomes.get('signal_decider')
                 decider_status = str((decider_outcome or {}).get('status') or '').strip().lower()
@@ -619,6 +665,7 @@ class DailyPipelineStageService:
                     symbols=resolved_symbols,
                     markets=resolved_markets,
                     force=force,
+                    bypass_prerequisite_gate=bypass_prerequisite_gate,
                     fs_div=resolved_fs_div,
                     symbol_limit=symbol_limit,
                     symbol_offset=symbol_offset,
@@ -942,6 +989,7 @@ class DailyPipelineStageService:
         symbols: list[str] | None,
         markets: list[str],
         force: bool,
+        bypass_prerequisite_gate: bool,
         fs_div: str,
         symbol_limit: int | None,
         symbol_offset: int,
@@ -1103,7 +1151,7 @@ class DailyPipelineStageService:
                 market_date=market_date,
                 fs_div=fs_div,
             )
-            if not force and not prerequisites['ready']:
+            if not bypass_prerequisite_gate and not prerequisites['ready']:
                 return self._build_prerequisite_gate_result(
                     stage_id=stage_id,
                     market_date=market_date,
@@ -1133,7 +1181,7 @@ class DailyPipelineStageService:
                 # gates, but it must not silently turn an idempotent resume
                 # into a full model recompute when reuse was requested.
                 force=force and not reuse_existing_feedback,
-                bypass_prerequisite_gate=force,
+                bypass_prerequisite_gate=bypass_prerequisite_gate,
             )
         if stage_id == 'next_open_execution_plan':
             from app.orders.next_open_execution import signal_decider_next_open_execution_service
@@ -1149,7 +1197,7 @@ class DailyPipelineStageService:
                 market_date=market_date,
                 fs_div=fs_div,
             )
-            if not force and not prerequisites['ready']:
+            if not bypass_prerequisite_gate and not prerequisites['ready']:
                 return self._build_prerequisite_gate_result(
                     stage_id=stage_id,
                     market_date=market_date,

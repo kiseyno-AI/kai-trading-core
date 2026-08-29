@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Mapping, Sequence
 
 from sqlalchemy import select, text
 
+from app.core.settings import settings
 from app.db import session_scope
 from app.db_models import DailyPipelineRun, DailyPipelineStageRun
 
@@ -33,6 +34,14 @@ def _iso(value: Any) -> Any:
     if isinstance(value, date):
         return value.isoformat()
     return value
+
+
+def _as_utc_datetime(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 def _normalize_market_date(value: str | date) -> date:
@@ -155,17 +164,109 @@ class DailyPipelineRunStateService:
             **dict(run_metadata or {}),
         }
         with session_scope() as session:
-            if str(trigger or '').strip() == 'monitor_stale_continuation':
-                # Serialize recovery admission per market date. A second monitor
-                # request can otherwise wait behind the first multi-hour run and
-                # create a duplicate as soon as that run completes.
+            # Serialize admission for every entry point. HTTP clients can time
+            # out while the worker thread continues, so limiting this guard to
+            # monitor-triggered runs still permits duplicate manual/API runs.
+            session.execute(
+                text('SELECT pg_advisory_xact_lock(:source_key, :trade_key)'),
+                {
+                    'source_key': 20_001,
+                    'trade_key': int(normalized_market_date.strftime('%Y%m%d')),
+                },
+            )
+            active_rows = list(
                 session.execute(
-                    text('SELECT pg_advisory_xact_lock(:source_key, :trade_key)'),
-                    {
-                        'source_key': 20_001,
-                        'trade_key': int(normalized_market_date.strftime('%Y%m%d')),
-                    },
+                    select(DailyPipelineRun)
+                    .where(
+                        DailyPipelineRun.market_date == normalized_market_date,
+                        DailyPipelineRun.status.in_(ACTIVE_DAILY_PIPELINE_STATUSES),
+                    )
+                    .order_by(DailyPipelineRun.started_at.desc(), DailyPipelineRun.id.desc())
+                    .with_for_update()
+                ).scalars()
+            )
+            stale_after_minutes = max(1, int(settings.eod_auto_pykrx_stale_run_minutes or 30))
+            stale_cutoff = now - timedelta(minutes=stale_after_minutes)
+            current_active_rows: list[DailyPipelineRun] = []
+            for active_row in active_rows:
+                last_activity_at = _as_utc_datetime(active_row.updated_at or active_row.started_at)
+                if last_activity_at is None or last_activity_at > stale_cutoff:
+                    current_active_rows.append(active_row)
+                    continue
+
+                reason = (
+                    f'Marked abandoned after {stale_after_minutes} minutes without daily pipeline activity.'
                 )
+                stale_metadata = dict(active_row.run_metadata or {})
+                stale_metadata.update(
+                    {
+                        'abandoned_reason': 'stale_activity_timeout',
+                        'abandoned_at': now.isoformat(),
+                        'last_activity_at': last_activity_at.isoformat(),
+                        'stale_after_minutes': stale_after_minutes,
+                        'resumable': True,
+                    }
+                )
+                active_row.status = 'abandoned'
+                active_row.error_message = reason
+                active_row.completed_at = now
+                active_row.updated_at = now
+                active_row.run_metadata = stale_metadata
+
+                running_stage_rows = list(
+                    session.execute(
+                        select(DailyPipelineStageRun)
+                        .where(
+                            DailyPipelineStageRun.pipeline_run_id == active_row.id,
+                            DailyPipelineStageRun.status.in_(ACTIVE_DAILY_PIPELINE_STATUSES),
+                        )
+                        .with_for_update()
+                    ).scalars()
+                )
+                for stage_row in running_stage_rows:
+                    details = dict(stage_row.details or {})
+                    details.update(
+                        {
+                            'abandoned_reason': 'stale_activity_timeout',
+                            'abandoned_at': now.isoformat(),
+                            'last_activity_at': last_activity_at.isoformat(),
+                            'stale_after_minutes': stale_after_minutes,
+                            'resumable': True,
+                        }
+                    )
+                    stage_row.status = 'abandoned'
+                    stage_row.error_message = reason
+                    stage_row.current_step = 'stale_run_abandoned'
+                    stage_row.current_activity = reason
+                    stage_row.completed_at = now
+                    stage_row.updated_at = now
+                    stage_row.details = details
+
+            requested_stage_set = set(metadata['resolved_stages'])
+            existing_active = next(
+                (
+                    row
+                    for row in current_active_rows
+                    if requested_stage_set.intersection(
+                        set((row.run_metadata or {}).get('resolved_stages') or [])
+                    )
+                ),
+                None,
+            )
+            if existing_active is not None:
+                stage_rows = list(
+                    session.execute(
+                        select(DailyPipelineStageRun)
+                        .where(DailyPipelineStageRun.pipeline_run_id == existing_active.id)
+                        .order_by(DailyPipelineStageRun.id.asc())
+                    ).scalars()
+                )
+                payload = self._serialize_run(existing_active, stage_rows)
+                payload['deduplicated'] = True
+                payload['deduplication_reason'] = 'overlapping_run_already_active'
+                return payload
+
+            if str(trigger or '').strip() == 'monitor_stale_continuation':
                 existing = session.execute(
                     select(DailyPipelineRun)
                     .where(
@@ -268,9 +369,17 @@ class DailyPipelineRunStateService:
         normalized_status = str(status or 'running')
         terminal = normalized_status in TERMINAL_DAILY_PIPELINE_STATUSES
         with session_scope() as session:
-            run_row = session.get(DailyPipelineRun, int(pipeline_run_id))
+            run_row = session.execute(
+                select(DailyPipelineRun)
+                .where(DailyPipelineRun.id == int(pipeline_run_id))
+                .with_for_update()
+            ).scalar_one_or_none()
             if run_row is None:
                 raise ValueError(f'daily pipeline run not found: {pipeline_run_id}')
+            if run_row.status not in ACTIVE_DAILY_PIPELINE_STATUSES:
+                raise ValueError(
+                    f'daily pipeline run is not active: {pipeline_run_id} ({run_row.status})'
+                )
             row = session.execute(
                 select(DailyPipelineStageRun).where(
                     DailyPipelineStageRun.pipeline_run_id == int(pipeline_run_id),
@@ -373,9 +482,17 @@ class DailyPipelineRunStateService:
     ) -> dict[str, Any]:
         now = _utcnow()
         with session_scope() as session:
-            row = session.get(DailyPipelineRun, int(pipeline_run_id))
+            row = session.execute(
+                select(DailyPipelineRun)
+                .where(DailyPipelineRun.id == int(pipeline_run_id))
+                .with_for_update()
+            ).scalar_one_or_none()
             if row is None:
                 raise ValueError(f'daily pipeline run not found: {pipeline_run_id}')
+            if row.status not in ACTIVE_DAILY_PIPELINE_STATUSES:
+                raise ValueError(
+                    f'daily pipeline run is not active: {pipeline_run_id} ({row.status})'
+                )
             metadata = dict(row.run_metadata or {})
             if run_metadata:
                 metadata.update(dict(run_metadata))
