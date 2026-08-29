@@ -1169,7 +1169,17 @@ class EODRouteTests(unittest.TestCase):
             routes_eod.eod_pipeline_status_service = original_service
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(fake_service.read_args, {'market_date': '2026-04-21', 'fs_div': 'OFS'})
+        self.assertEqual(
+            fake_service.read_args,
+            {
+                'market_date': '2026-04-21',
+                'fs_div': 'OFS',
+                'include_feedback_context': False,
+                'include_feedback_stage': False,
+                'include_pykrx_enrichment_coverage': False,
+                'include_row_count_diagnostics': False,
+            },
+        )
         payload = response.json()
         self.assertEqual(payload['status'], 'running')
         self.assertEqual(payload['stages']['price_collection']['source_run_ids']['eod_run_id'], 101)
@@ -1228,6 +1238,30 @@ class EODRouteTests(unittest.TestCase):
         self.assertEqual(fake_service.run_args['feedback_max_cycles'], 4)
         self.assertFalse(fake_service.run_args['reuse_existing_feedback'])
         self.assertEqual(response.json()['status'], 'completed')
+
+    def test_run_eod_pipeline_route_accepts_background_execution(self):
+        fake_service = FakeDailyPipelineStageService()
+        original_service = routes_eod.daily_pipeline_stage_service
+        routes_eod.daily_pipeline_stage_service = fake_service
+        try:
+            client = TestClient(self.app)
+            response = client.post(
+                '/eod/pipeline/run',
+                json={
+                    'market_date': '2026-08-28',
+                    'stages': ['signal_decider'],
+                    'background': True,
+                    'reuse_existing_feedback': True,
+                },
+            )
+        finally:
+            routes_eod.daily_pipeline_stage_service = original_service
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.json()['status'], 'accepted')
+        self.assertTrue(response.json()['background'])
+        self.assertEqual(fake_service.run_args['market_date'], '2026-08-28')
+        self.assertNotIn('background', fake_service.run_args)
 
     def test_collect_pykrx_enrichment_route_calls_service(self):
         fake_service = FakePykrxEnrichmentService()

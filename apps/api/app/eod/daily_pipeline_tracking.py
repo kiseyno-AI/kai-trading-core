@@ -76,6 +76,13 @@ async def run_tracked_market_risk_filter(
         },
     )
     pipeline_run_id = int(pipeline_run['id'])
+    if pipeline_run.get('deduplicated'):
+        return {
+            'triggered': False,
+            'reason': pipeline_run.get('deduplication_reason') or 'overlapping_run_already_active',
+            'pipeline_run_id': pipeline_run_id,
+            'pipeline_run': pipeline_run,
+        }
     resolved_run_state_service.start_stage(
         pipeline_run_id=pipeline_run_id,
         stage_id=stage_id,

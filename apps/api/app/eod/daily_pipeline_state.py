@@ -155,17 +155,51 @@ class DailyPipelineRunStateService:
             **dict(run_metadata or {}),
         }
         with session_scope() as session:
-            if str(trigger or '').strip() == 'monitor_stale_continuation':
-                # Serialize recovery admission per market date. A second monitor
-                # request can otherwise wait behind the first multi-hour run and
-                # create a duplicate as soon as that run completes.
+            # Serialize admission for every entry point. HTTP clients can time
+            # out while the worker thread continues, so limiting this guard to
+            # monitor-triggered runs still permits duplicate manual/API runs.
+            session.execute(
+                text('SELECT pg_advisory_xact_lock(:source_key, :trade_key)'),
+                {
+                    'source_key': 20_001,
+                    'trade_key': int(normalized_market_date.strftime('%Y%m%d')),
+                },
+            )
+            active_rows = list(
                 session.execute(
-                    text('SELECT pg_advisory_xact_lock(:source_key, :trade_key)'),
-                    {
-                        'source_key': 20_001,
-                        'trade_key': int(normalized_market_date.strftime('%Y%m%d')),
-                    },
+                    select(DailyPipelineRun)
+                    .where(
+                        DailyPipelineRun.market_date == normalized_market_date,
+                        DailyPipelineRun.status.in_(ACTIVE_DAILY_PIPELINE_STATUSES),
+                    )
+                    .order_by(DailyPipelineRun.started_at.desc(), DailyPipelineRun.id.desc())
+                ).scalars()
+            )
+            requested_stage_set = set(metadata['resolved_stages'])
+            existing_active = next(
+                (
+                    row
+                    for row in active_rows
+                    if requested_stage_set.intersection(
+                        set((row.run_metadata or {}).get('resolved_stages') or [])
+                    )
+                ),
+                None,
+            )
+            if existing_active is not None:
+                stage_rows = list(
+                    session.execute(
+                        select(DailyPipelineStageRun)
+                        .where(DailyPipelineStageRun.pipeline_run_id == existing_active.id)
+                        .order_by(DailyPipelineStageRun.id.asc())
+                    ).scalars()
                 )
+                payload = self._serialize_run(existing_active, stage_rows)
+                payload['deduplicated'] = True
+                payload['deduplication_reason'] = 'overlapping_run_already_active'
+                return payload
+
+            if str(trigger or '').strip() == 'monitor_stale_continuation':
                 existing = session.execute(
                     select(DailyPipelineRun)
                     .where(

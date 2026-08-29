@@ -320,6 +320,17 @@ class _OfficialDailyPipelineTracker:
                     **run_metadata,
                 },
             )
+            if run.get('deduplicated'):
+                self.enabled = False
+                self.log_fetch(
+                    'daily_pipeline_tracking',
+                    'deduplicated',
+                    stage='start_run',
+                    run_id=eod_run_id,
+                    existing_pipeline_run_id=run.get('id'),
+                    reason=run.get('deduplication_reason'),
+                )
+                return
             self.pipeline_run_id = int(run['id'])
             self.market_date = market_date
             self.eod_run_id = eod_run_id

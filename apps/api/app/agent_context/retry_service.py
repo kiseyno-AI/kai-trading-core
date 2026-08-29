@@ -1127,7 +1127,9 @@ class AgentFeedbackRetryService:
                                     market_date=config.market_date,
                                     symbols=dispatch_chunk,
                                     roles=[role],
-                                    reuse_existing=False,
+                                    reuse_existing=(
+                                        config.reuse_existing and not effective_force_recompute
+                                    ),
                                     force=force,
                                     force_recompute=effective_force_recompute,
                                     auto_scope=requested_symbols is None,

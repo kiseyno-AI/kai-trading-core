@@ -26,7 +26,9 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
         stages_result = MagicMock()
         stages_result.scalars.return_value = []
         session = MagicMock()
-        session.execute.side_effect = [MagicMock(), existing_result, stages_result]
+        active_result = MagicMock()
+        active_result.scalars.return_value = []
+        session.execute.side_effect = [MagicMock(), active_result, existing_result, stages_result]
         session_context = MagicMock()
         session_context.__enter__.return_value = session
 
@@ -49,6 +51,43 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
         )
         self.assertTrue(result['deduplicated'])
         self.assertEqual(result['deduplication_reason'], 'recovery_already_completed')
+
+    def test_manual_api_deduplicates_overlapping_active_run(self) -> None:
+        now = datetime(2026, 8, 29, tzinfo=timezone.utc)
+        existing_run = SimpleNamespace(
+            id=341,
+            market_date=date(2026, 8, 28),
+            trigger='manual_api',
+            status='running',
+            current_stage='agent_feedback_summaries',
+            started_at=now,
+            updated_at=now,
+            completed_at=None,
+            error_message=None,
+            run_metadata={
+                'resolved_stages': ['agent_feedback_summaries', 'signal_decider'],
+            },
+        )
+        active_result = MagicMock()
+        active_result.scalars.return_value = [existing_run]
+        stages_result = MagicMock()
+        stages_result.scalars.return_value = []
+        session = MagicMock()
+        session.execute.side_effect = [MagicMock(), active_result, stages_result]
+        session_context = MagicMock()
+        session_context.__enter__.return_value = session
+
+        with patch('app.eod.daily_pipeline_state.session_scope', return_value=session_context):
+            result = DailyPipelineRunStateService().start_run(
+                market_date='2026-08-28',
+                trigger='manual_api',
+                requested_stages=['signal_decider'],
+                resolved_stages=['signal_decider'],
+            )
+
+        self.assertTrue(result['deduplicated'])
+        self.assertEqual(result['id'], 341)
+        self.assertEqual(result['deduplication_reason'], 'overlapping_run_already_active')
 
 
 if __name__ == '__main__':

@@ -7,7 +7,7 @@ Lists the canonical daily stage catalog and runs an explicit subset of those sta
 
 The default operator sequence now includes `pykrx_enrichment` immediately after `price_collection`, then the factor/scoring stages after `fundamentals_daily_refresh` and `piotroski_filter`: `momentum_factors`, `value_factors`, `low_risk_factors`, `beta_factors`, `advanced_value_factors`, `unified_value_factors`, `quality_factors`, and `composite_factors`. It then runs `external_news_collect`, `external_news_enrich`, and `macro_context_refresh` before agent feedback dispatch.
 
-`POST /eod/pipeline/run` accepts a stage subset, preserves canonical ordering, creates a durable `daily_pipeline_runs` row plus per-stage `daily_pipeline_stage_runs`, and delegates execution to the reusable stage operations. Callers should include any prerequisites they need; the catalog response exposes `depends_on` for inspectability. `resume_from_stage` narrows the run to that stage and later canonical stages so operators can restart at `market_risk_filter` without rerunning upstream price or technical outputs.
+`POST /eod/pipeline/run` accepts a stage subset, preserves canonical ordering, creates a durable `daily_pipeline_runs` row plus per-stage `daily_pipeline_stage_runs`, and delegates execution to the reusable stage operations. Callers should include any prerequisites they need; declared dependencies included in the same run are enforced and block downstream stages when an upstream stage does not complete. `resume_from_stage` narrows the run to that stage and later canonical stages so operators can restart at `market_risk_filter` without rerunning upstream price or technical outputs. Set `background=true` for long-running recovery work; the route returns `202 Accepted` immediately and the durable pipeline status endpoints expose subsequent progress. Admission is serialized per market date and overlapping active stage sets are deduplicated across API, manual, and monitor triggers. `force` controls stage recomputation, while the separate recovery-only `bypass_prerequisite_gate` flag bypasses prerequisite inspection without forcing completed feedback artifacts to be recomputed.
 
 ## Example catalog request
 ```http
@@ -24,10 +24,23 @@ Content-Type: application/json
   "stages": ["signal_decider_evaluations", "signal_decider", "technical_snapshots", "price_collection", "agent_feedback_summaries"],
   "symbols": ["005930", "000660"],
   "markets": ["KOSPI", "KOSDAQ"],
-  "force": true,
+  "force": false,
+  "bypass_prerequisite_gate": true,
   "fs_div": "CFS",
   "capture_limit": 100,
-  "resume_from_stage": "technical_snapshots"
+  "resume_from_stage": "technical_snapshots",
+  "background": true
+}
+```
+
+## Example background response
+
+```json
+{
+  "status": "accepted",
+  "market_date": "2026-04-21",
+  "requested_stages": ["technical_snapshots", "agent_feedback_summaries"],
+  "background": true
 }
 ```
 
