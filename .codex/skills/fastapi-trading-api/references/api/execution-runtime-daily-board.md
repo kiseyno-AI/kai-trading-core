@@ -1,7 +1,9 @@
 # GET /execution/runtime/daily-board
 
 ## Summary
-Read the same-day execution board from core. The route is dashboard-safe and cache-first: it returns the best local read model immediately from persisted Core planning/readback state and a short in-process snapshot cache. `refresh=true` schedules a bounded, debounced background exec refresh instead of blocking the HTTP request. Consumers should use `freshness` and `refresh` to label stale, partial, or refreshing data honestly.
+Read the same-day execution board from core. The route is dashboard-safe and cache-first: it returns the best local read model immediately from persisted Core planning/readback state and a short in-process snapshot cache. `refresh=true` schedules a bounded, debounced background exec refresh instead of blocking the HTTP request. Consumers should use `freshness`, `refresh`, and `activity_coverage` to label stale, partial, unavailable, or genuinely inactive data honestly.
+
+`activity_coverage.status=no_activity` means Core has a current Exec runtime payload and found no current activity. `activity_coverage.status=unavailable` means Core cannot make that claim: the runtime read model is unavailable, or Exec reports activity that is not materialized in Core rows. In the latter case `status_reason=exec_activity_not_materialized`, `exec_activity_detected=true`, and `freshness.status=unavailable`; an empty `items` array must not be rendered as an empty trading day.
 
 Each row includes compact `today_activity` facts for the requested `market_date`. Use these side-aware fields for Today bought/sold sections instead of inferring from lifecycle `intent` or aggregate `status`. Buy/sell quantities are counted only from timestamped compact execution/readback facts for the selected date; side facts without timestamps are marked unavailable rather than guessed. Short-term rows also expose raw tactical action, generic action, handoff intent, and approval/monitoring state at the top level.
 
@@ -24,6 +26,12 @@ GET /execution/runtime/daily-board?market_date=2026-04-30&refresh=true
   "runtime": {
     "status": "ready",
     "mode": "mock"
+  },
+  "activity_coverage": {
+    "status": "available",
+    "status_reason": "core_read_model_items_available",
+    "exec_activity_detected": true,
+    "source": "exec_runtime_status"
   },
   "freshness": {
     "schema_version": "execution_runtime_dashboard_read_model_v1",

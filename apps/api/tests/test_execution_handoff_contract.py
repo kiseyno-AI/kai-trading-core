@@ -78,6 +78,14 @@ class ExecutionHandoffContractTests(unittest.TestCase):
             'last_heartbeat_at': '2026-04-30T00:05:00+00:00',
             'open_order_count': 1,
             'active_execution_job_count': 1,
+            'pnl_coverage': {
+                period: {
+                    'status': 'available',
+                    'status_reason': 'provided_by_exec',
+                    'source': 'exec_runtime_status',
+                }
+                for period in ('daily', 'weekly', 'monthly')
+            },
             'issues': [] if status == 'ready' else [{'code': status, 'message': status, 'retryable': False}],
             'core_integration_mode': 'dispatch',
             'delegate_execution': True,
@@ -462,11 +470,19 @@ class ExecutionHandoffContractTests(unittest.TestCase):
                     'cancelled': 0,
                     'failed': 0,
                 },
+                'activity_coverage': {
+                    'status': 'available',
+                    'status_reason': 'core_read_model_items_available',
+                    'exec_activity_detected': True,
+                    'source': 'exec_runtime_status',
+                },
                 'freshness': self._freshness(),
                 'refresh': self._refresh(),
                 'items': [row],
             }
         )
+        self.assertEqual(board['activity_coverage']['status'], 'available')
+        self.assertEqual(board['runtime']['pnl_coverage']['daily']['status'], 'available')
         monitored = serialize_execution_monitored_symbols_payload(
             {
                 'request': {'market_date': '2026-04-30', 'refresh': False},
@@ -519,7 +535,10 @@ class ExecutionHandoffContractTests(unittest.TestCase):
             }
         )
 
-        self.assertEqual(set(board), {'request', 'runtime', 'market_date', 'summary', 'freshness', 'refresh', 'items'})
+        self.assertEqual(
+            set(board),
+            {'request', 'runtime', 'market_date', 'summary', 'activity_coverage', 'freshness', 'refresh', 'items'},
+        )
         self.assertEqual(board['freshness']['schema_version'], EXECUTION_RUNTIME_DASHBOARD_READ_MODEL_SCHEMA_VERSION)
         self.assertEqual(board['items'][0]['today_activity']['schema_version'], EXECUTION_RUNTIME_TODAY_ACTIVITY_SCHEMA_VERSION)
         self.assertEqual(board['items'][0]['status'], 'filled')

@@ -2063,9 +2063,13 @@ class SignalDeciderExecIntegrationService:
         generated_at = _utcnow()
         overview_items = overview.get('items') or []
         symbol_metadata_map = self._load_symbol_metadata_map(item.get('symbol') for item in overview_items)
+        runtime_read_model = self._resolve_dashboard_runtime_read_model(
+            overview=overview,
+            overview_items=overview_items,
+        )
         runtime = self._build_dashboard_runtime_status(
             integration=overview['integration'],
-            runtime=self._resolve_dashboard_runtime_read_model(overview=overview, overview_items=overview_items),
+            runtime=runtime_read_model,
         )
         items = [
             self._build_runtime_board_item(
@@ -2076,6 +2080,10 @@ class SignalDeciderExecIntegrationService:
             )
             for item in overview_items
         ]
+        activity_coverage = self._build_runtime_daily_board_activity_coverage(
+            items=items,
+            runtime=runtime_read_model,
+        )
         payload = {
             'request': {
                 'market_date': market_date.isoformat(),
@@ -2084,6 +2092,7 @@ class SignalDeciderExecIntegrationService:
             'runtime': runtime,
             'market_date': market_date.isoformat(),
             'summary': self._build_runtime_daily_board_summary(items=items),
+            'activity_coverage': activity_coverage,
             'freshness': self._build_dashboard_freshness(
                 endpoint=DASHBOARD_ENDPOINT_DAILY_BOARD,
                 market_date=market_date,
@@ -2093,6 +2102,7 @@ class SignalDeciderExecIntegrationService:
                 overview_items=overview_items,
                 output_item_count=len(items),
                 refresh_state=refresh_state,
+                read_model_availability_status=activity_coverage['status'],
             ),
             'refresh': refresh_state,
             'items': items,
@@ -2682,6 +2692,8 @@ class SignalDeciderExecIntegrationService:
         refreshing = self._dashboard_refresh_in_flight(refresh_state)
         if refreshing:
             status = DASHBOARD_FRESHNESS_STATUS_REFRESHING
+        elif freshness.get('status') == DASHBOARD_FRESHNESS_STATUS_UNAVAILABLE:
+            status = DASHBOARD_FRESHNESS_STATUS_UNAVAILABLE
         elif stale_by_cache or freshness.get('is_stale'):
             status = DASHBOARD_FRESHNESS_STATUS_STALE
         elif freshness.get('is_partial'):
@@ -2714,6 +2726,7 @@ class SignalDeciderExecIntegrationService:
         overview_items: Sequence[dict[str, Any]],
         output_item_count: int,
         refresh_state: dict[str, Any],
+        read_model_availability_status: str | None = None,
     ) -> dict[str, Any]:
         last_readback_synced_at = _latest_iso_timestamp(
             (item.get('remote_state') or {}).get('last_synced_at')
@@ -2739,6 +2752,7 @@ class SignalDeciderExecIntegrationService:
             stale_by_readback=stale_by_readback,
             runtime_status=runtime_status,
             refresh_state=refresh_state,
+            read_model_availability_status=read_model_availability_status,
         )
         return serialize_execution_dashboard_freshness_payload({
             'schema_version': DASHBOARD_READ_MODEL_SCHEMA_VERSION,
@@ -2751,7 +2765,10 @@ class SignalDeciderExecIntegrationService:
             'cached_at': generated_at.isoformat(),
             'cache_age_seconds': 0,
             'cache_ttl_seconds': self.dashboard_cache_ttl_seconds,
-            'is_stale': bool(stale_by_readback or status == DASHBOARD_FRESHNESS_STATUS_STALE),
+            'is_stale': bool(
+                stale_by_readback
+                or status in {DASHBOARD_FRESHNESS_STATUS_STALE, DASHBOARD_FRESHNESS_STATUS_UNAVAILABLE}
+            ),
             'is_partial': bool(readback_missing_count > 0 or status == DASHBOARD_FRESHNESS_STATUS_PARTIAL),
             'refreshing': self._dashboard_refresh_in_flight(refresh_state),
             'last_readback_synced_at': last_readback_synced_at,
@@ -2772,9 +2789,12 @@ class SignalDeciderExecIntegrationService:
         stale_by_readback: bool,
         runtime_status: str,
         refresh_state: dict[str, Any],
+        read_model_availability_status: str | None = None,
     ) -> str:
         if self._dashboard_refresh_in_flight(refresh_state):
             return DASHBOARD_FRESHNESS_STATUS_REFRESHING
+        if read_model_availability_status == 'unavailable':
+            return DASHBOARD_FRESHNESS_STATUS_UNAVAILABLE
         if output_item_count == 0 and overview_item_count == 0:
             return DASHBOARD_FRESHNESS_STATUS_FRESH
         if runtime_status in {UI_RUNTIME_STATUS_OFFLINE, UI_RUNTIME_STATUS_DEGRADED} and readback_synced_count == 0:
@@ -4783,11 +4803,20 @@ class SignalDeciderExecIntegrationService:
         counts = payload.get('counts') if isinstance(payload.get('counts'), dict) else {}
         readiness = payload.get('readiness') if isinstance(payload.get('readiness'), dict) else {}
         monitoring = payload.get('monitoring') if isinstance(payload.get('monitoring'), dict) else {}
+        liveness = payload.get('liveness') if isinstance(payload.get('liveness'), dict) else {}
+        liveness_monitoring = (
+            liveness.get('monitoring') if isinstance(liveness.get('monitoring'), dict) else {}
+        )
+        autonomous = liveness.get('autonomous') if isinstance(liveness.get('autonomous'), dict) else {}
+        autonomous_monitoring = (
+            autonomous.get('monitoring') if isinstance(autonomous.get('monitoring'), dict) else {}
+        )
         symbols = payload.get('symbols') if isinstance(payload.get('symbols'), dict) else None
         daily_pnl = payload.get('daily_pnl') if isinstance(payload.get('daily_pnl'), dict) else None
         weekly_pnl = payload.get('weekly_pnl') if isinstance(payload.get('weekly_pnl'), dict) else None
         monthly_pnl = payload.get('monthly_pnl') if isinstance(payload.get('monthly_pnl'), dict) else None
         actionable_alerts = payload.get('actionable_alerts') if isinstance(payload.get('actionable_alerts'), dict) else None
+        pnl_coverage = self._build_runtime_pnl_coverage(runtime=runtime, payload=payload)
 
         paused = _normalize_bool(
             _coalesce_text(
@@ -4827,20 +4856,38 @@ class SignalDeciderExecIntegrationService:
                 monitoring.get('alive'),
                 monitoring.get('running'),
                 monitoring.get('ready'),
+                liveness_monitoring.get('alive'),
+                liveness_monitoring.get('running'),
+                autonomous_monitoring.get('alive'),
+                autonomous_monitoring.get('running'),
                 payload.get('monitoring_alive'),
                 _extract_field(payload, 'health', 'monitoring_alive'),
             )
         )
-        if monitoring_alive is None:
-            monitoring_alive = bool(ready and runtime.get('status') == REMOTE_FETCH_STATUS_OK)
-
+        monitoring_status = _coalesce_text(
+            autonomous_monitoring.get('status'),
+            monitoring.get('status'),
+            liveness_monitoring.get('status'),
+            lowercase=True,
+        )
         last_heartbeat_at = _coalesce_text(
             monitoring.get('last_heartbeat_at'),
             monitoring.get('last_seen_at'),
+            autonomous_monitoring.get('last_heartbeat_at'),
+            autonomous_monitoring.get('last_seen_at'),
+            liveness_monitoring.get('last_heartbeat_at'),
+            liveness_monitoring.get('last_seen_at'),
             payload.get('last_heartbeat_at'),
             payload.get('monitoring_last_heartbeat_at'),
             _extract_field(payload, 'health', 'last_heartbeat_at'),
         )
+        if monitoring_alive is None:
+            if monitoring_status == 'running':
+                monitoring_alive = _parse_iso_datetime(last_heartbeat_at) is not None
+            elif monitoring_status in {'disabled', 'idle', 'not_started', 'error', 'degraded'}:
+                monitoring_alive = False
+            else:
+                monitoring_alive = bool(ready and runtime.get('status') == REMOTE_FETCH_STATUS_OK)
 
         open_order_count = self._coerce_integer(
             counts.get('open_orders'),
@@ -4903,11 +4950,133 @@ class SignalDeciderExecIntegrationService:
             'daily_pnl': daily_pnl,
             'weekly_pnl': weekly_pnl,
             'monthly_pnl': monthly_pnl,
+            'pnl_coverage': pnl_coverage,
             'actionable_alerts': actionable_alerts,
             'issues': issues,
             'core_integration_mode': integration.get('mode'),
             'delegate_execution': bool(integration.get('delegate_execution')),
         })
+
+    @staticmethod
+    def _build_runtime_pnl_coverage(
+        *,
+        runtime: dict[str, Any],
+        payload: dict[str, Any],
+    ) -> dict[str, dict[str, str]]:
+        runtime_status = _normalize_optional_text(runtime.get('status'), lowercase=True)
+        if not payload:
+            if runtime_status in {REMOTE_FETCH_STATUS_DISABLED, REMOTE_FETCH_STATUS_NOT_CONFIGURED}:
+                status_reason = 'runtime_not_configured'
+            elif runtime_status == REMOTE_FETCH_STATUS_OK:
+                status_reason = 'runtime_payload_not_loaded'
+            else:
+                status_reason = 'runtime_unavailable'
+            return {
+                period: {
+                    'status': 'unavailable',
+                    'status_reason': status_reason,
+                    'source': 'exec_runtime_status',
+                }
+                for period in ('daily', 'weekly', 'monthly')
+            }
+
+        coverage: dict[str, dict[str, str]] = {}
+        for period, field_name, value_field in (
+            ('daily', 'daily_pnl', 'daily_realized_pnl'),
+            ('weekly', 'weekly_pnl', 'weekly_realized_pnl'),
+            ('monthly', 'monthly_pnl', 'monthly_realized_pnl'),
+        ):
+            value = payload.get(field_name)
+            if field_name not in payload:
+                status = 'unavailable'
+                status_reason = 'not_provided_by_exec'
+            elif not isinstance(value, dict):
+                status = 'unavailable'
+                status_reason = 'invalid_exec_payload'
+            elif value.get(value_field) is None:
+                status = 'unavailable'
+                status_reason = (
+                    _normalize_optional_text(value.get('status_reason'), lowercase=True)
+                    or 'not_computable_by_exec'
+                )
+            else:
+                status = 'available'
+                status_reason = 'provided_by_exec'
+            coverage[period] = {
+                'status': status,
+                'status_reason': status_reason,
+                'source': 'exec_runtime_status',
+            }
+        return coverage
+
+    @classmethod
+    def _build_runtime_daily_board_activity_coverage(
+        cls,
+        *,
+        items: Sequence[dict[str, Any]],
+        runtime: dict[str, Any],
+    ) -> dict[str, Any]:
+        exec_activity_detected = cls._exec_runtime_activity_detected(runtime=runtime)
+        if items:
+            status = 'available'
+            status_reason = 'core_read_model_items_available'
+        elif exec_activity_detected is True:
+            status = 'unavailable'
+            status_reason = 'exec_activity_not_materialized'
+        elif exec_activity_detected is False:
+            status = 'no_activity'
+            status_reason = 'no_exec_activity'
+        else:
+            status = 'unavailable'
+            status_reason = 'runtime_read_model_unavailable'
+        return {
+            'status': status,
+            'status_reason': status_reason,
+            'exec_activity_detected': exec_activity_detected,
+            'source': 'exec_runtime_status',
+        }
+
+    @staticmethod
+    def _exec_runtime_activity_detected(*, runtime: dict[str, Any]) -> bool | None:
+        payload = runtime.get('payload') if isinstance(runtime.get('payload'), dict) else None
+        if payload is None:
+            return None
+
+        counts = payload.get('counts') if isinstance(payload.get('counts'), dict) else {}
+        for field_name in ('open_orders', 'active_execution_jobs'):
+            try:
+                if int(counts.get(field_name) or 0) > 0:
+                    return True
+            except (TypeError, ValueError):
+                return True
+
+        symbols = payload.get('symbols') if isinstance(payload.get('symbols'), dict) else {}
+        for field_name in ('monitored', 'scheduled_today', 'filled_today', 'failed_today', 'positions'):
+            value = symbols.get(field_name)
+            if isinstance(value, (list, tuple, set)) and value:
+                return True
+
+        filled_counts = symbols.get('filled_today_counts') if isinstance(symbols.get('filled_today_counts'), dict) else {}
+        for value in filled_counts.values():
+            if not isinstance(value, dict):
+                continue
+            for field_name in ('symbols', 'fills', 'quantity'):
+                try:
+                    if float(value.get(field_name) or 0) > 0:
+                        return True
+                except (TypeError, ValueError):
+                    return True
+
+        autonomous_monitoring = _extract_field(payload, 'liveness', 'autonomous', 'monitoring')
+        if isinstance(autonomous_monitoring, dict):
+            last_cycle = (
+                autonomous_monitoring.get('last_cycle')
+                if isinstance(autonomous_monitoring.get('last_cycle'), dict)
+                else {}
+            )
+            if last_cycle.get('monitored_symbols') or last_cycle.get('items'):
+                return True
+        return False
 
     @classmethod
     def _iter_exec_agent_payloads(cls, item: dict[str, Any]) -> Iterable[dict[str, Any]]:
