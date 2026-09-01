@@ -26,3 +26,12 @@ def test_iter_bulk_upsert_chunks_resolves_default_at_call_time(monkeypatch) -> N
     chunks = _iter_bulk_upsert_chunks([{'value': value} for value in range(5)])
 
     assert [len(chunk) for chunk in chunks] == [2, 2, 1]
+
+
+def test_default_bulk_upsert_chunk_stays_small_for_json_heavy_rows() -> None:
+    items = [{'value': value} for value in range(25)]
+
+    chunks = _iter_bulk_upsert_chunks(items)
+
+    assert loop_service.SIGNAL_DECIDER_BULK_UPSERT_CHUNK_SIZE == 10
+    assert [len(chunk) for chunk in chunks] == [10, 10, 5]

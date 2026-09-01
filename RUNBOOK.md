@@ -133,6 +133,11 @@ Connections are pre-pinged, recycled after
 connections can expire cleanly. Size `DB_POOL_SIZE + DB_MAX_OVERFLOW` against
 the total number of API/worker processes, not one process in isolation.
 
+JSON-heavy signal-decider realized-outcome, evaluation, and calendar-review
+upserts are committed in chunks of 10 rows. Keep these transactions small so
+locks, statement memory, and checked-out connections are released between
+chunks while the daily pipeline is active.
+
 Check logs for long checkout warnings before increasing capacity. A long-held
 transaction or upstream call inside a database session will otherwise consume
 any larger pool too. `DB_POOL_WATCHDOG_CANCEL_ENABLED` remains off by default;
