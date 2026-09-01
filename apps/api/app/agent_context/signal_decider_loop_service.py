@@ -36,10 +36,10 @@ DEFAULT_SIGNAL_DECIDER_POLICY_CREATED_BY = 'system:bootstrap'
 DEFAULT_SIGNAL_DECIDER_POLICY_ACTIVATION_MODE = 'manual_only'
 DEFAULT_POLICY_CANDIDATE_STATUS = 'generated'
 DEFAULT_SIGNAL_DECIDER_EVALUATION_LOOKBACK_DAYS = 30
-# Keep multi-row INSERT/UPSERT calls small because signal-decider rows contain
-# large JSON payloads and maintain several indexes. This also stays well below
-# PostgreSQL/psycopg's 65,535-parameter limit.
-SIGNAL_DECIDER_BULK_UPSERT_CHUNK_SIZE = 50
+# Keep each transaction deliberately small because signal-decider rows contain
+# large JSON payloads and maintain several indexes. Every chunk is committed by
+# its own session_scope, releasing locks and memory before the next write.
+SIGNAL_DECIDER_BULK_UPSERT_CHUNK_SIZE = 10
 
 
 def session_scope():
