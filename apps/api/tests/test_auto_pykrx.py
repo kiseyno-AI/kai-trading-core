@@ -2008,6 +2008,38 @@ class PykrxBackfillServiceTests(TestCase):
             },
         )
 
+    def test_auto_daily_skips_retry_for_minor_symbol_gap(self) -> None:
+        service = PykrxBackfillService()
+
+        with (
+            patch.object(service, 'resolve_latest_trade_date', return_value='2026-04-03'),
+            patch('app.eod.pykrx_backfill.advisory_eod_collection_lock', return_value=_lock()),
+            patch(
+                'app.eod.pykrx_backfill.load_latest_eod_collection_run',
+                return_value={
+                    'id': 7,
+                    'status': 'completed_with_errors',
+                    'symbols_total': 3552,
+                    'symbols_failed': 4,
+                    'run_metadata': {'failed_symbols': ['082640', '489010', '096610', '471050']},
+                },
+            ),
+            patch('app.eod.pykrx_backfill.count_eod_collection_runs') as count_runs,
+            patch.object(service, '_run_market_data_pipeline') as run_collection,
+        ):
+            result = service.run_daily_pipeline_if_due(
+                market_date='2026-04-03',
+                trigger='auto_close_scheduler',
+            )
+
+        self.assertFalse(result['triggered'])
+        self.assertEqual(result['reason'], 'already_completed_with_minor_symbol_gaps')
+        self.assertEqual(result['minor_symbol_gap']['symbols_failed'], 4)
+        self.assertEqual(result['minor_symbol_gap']['symbols_total'], 3552)
+        self.assertEqual(result['minor_symbol_gap']['missing_ratio'], 0.001126)
+        count_runs.assert_not_called()
+        run_collection.assert_not_called()
+
     def test_auto_daily_retry_stops_after_five_auto_runs(self) -> None:
         service = PykrxBackfillService()
 
@@ -2037,19 +2069,23 @@ class PykrxBackfillServiceTests(TestCase):
         self.assertEqual(result['auto_retry']['max_attempts'], 5)
         run_collection.assert_not_called()
 
-    def test_manual_daily_retry_keeps_full_collection_behavior(self) -> None:
+    def test_manual_daily_triggers_retry_minor_symbol_gaps_with_full_collection(self) -> None:
         service = PykrxBackfillService()
 
         with (
             patch.object(service, 'resolve_latest_trade_date', return_value='2026-04-03'),
-            patch('app.eod.pykrx_backfill.advisory_eod_collection_lock', return_value=_lock()),
+            patch(
+                'app.eod.pykrx_backfill.advisory_eod_collection_lock',
+                side_effect=[_lock(), _lock()],
+            ),
             patch(
                 'app.eod.pykrx_backfill.load_latest_eod_collection_run',
                 return_value={
                     'id': 7,
-                    'status': 'failed',
-                    'symbols_failed': 2,
-                    'run_metadata': {'failed_symbols': ['000660', '005930']},
+                    'status': 'completed_with_errors',
+                    'symbols_total': 3552,
+                    'symbols_failed': 4,
+                    'run_metadata': {'failed_symbols': ['082640', '489010', '096610', '471050']},
                 },
             ),
             patch('app.eod.pykrx_backfill.count_eod_collection_runs') as count_runs,
@@ -2063,17 +2099,18 @@ class PykrxBackfillServiceTests(TestCase):
                 },
             ) as run_collection,
         ):
-            result = service.run_daily_pipeline_if_due(
-                market_date='2026-04-03',
-                trigger='manual_daily_api',
-            )
+            results = [
+                service.run_daily_pipeline_if_due(market_date='2026-04-03', trigger=trigger)
+                for trigger in ('manual_daily_api', 'internal_ops_cli')
+            ]
 
-        self.assertTrue(result['triggered'])
+        self.assertTrue(all(result['triggered'] for result in results))
         count_runs.assert_not_called()
-        kwargs = run_collection.call_args.kwargs
-        self.assertIsNone(kwargs['symbols_override'])
-        self.assertIsNone(kwargs['retry_context'])
-        self.assertTrue(kwargs['refresh_universe'])
+        self.assertEqual(run_collection.call_count, 2)
+        for call in run_collection.call_args_list:
+            self.assertIsNone(call.kwargs['symbols_override'])
+            self.assertIsNone(call.kwargs['retry_context'])
+            self.assertTrue(call.kwargs['refresh_universe'])
 
     def test_run_market_data_pipeline_logs_per_symbol_failures(self) -> None:
         service = PykrxBackfillService()

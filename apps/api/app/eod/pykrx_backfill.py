@@ -74,6 +74,7 @@ _PYKRX_REQUEST_TIMEOUT_LOCK = threading.RLock()
 DEFAULT_START_DATE = '19560101'
 DEFAULT_MARKETS = ('KOSPI', 'KOSDAQ', 'KONEX')
 MAX_AUTO_PYKRX_DAILY_RUNS_PER_TRADE_DATE = 5
+MAX_NON_BLOCKING_DAILY_SYMBOL_MISSING_RATIO = 0.10
 RETRYABLE_DAILY_STATUSES = {'completed_with_errors', 'failed'}
 PYKRX_STAGE_SEQUENCE = (
     'price_collection',
@@ -718,6 +719,33 @@ class PykrxBackfillService:
                         latest_available_trade_date=latest_trade_date,
                         existing_run=latest_run,
                     )
+                    _log_pykrx_fetch('run_daily_pipeline_if_due', 'skipped', **result)
+                    return result
+                latest_total = int(latest_run.get('symbols_total') or 0)
+                latest_missing_ratio = (
+                    latest_failed / latest_total
+                    if latest_total > 0
+                    else None
+                )
+                if (
+                    _is_auto_daily_trigger(trigger)
+                    and latest_status == 'completed_with_errors'
+                    and latest_failed > 0
+                    and latest_missing_ratio is not None
+                    and latest_missing_ratio < MAX_NON_BLOCKING_DAILY_SYMBOL_MISSING_RATIO
+                ):
+                    result = build_daily_skip_result(
+                        reason='already_completed_with_minor_symbol_gaps',
+                        market_date=market_date_iso,
+                        latest_available_trade_date=latest_trade_date,
+                        existing_run=latest_run,
+                    )
+                    result['minor_symbol_gap'] = {
+                        'symbols_total': latest_total,
+                        'symbols_failed': latest_failed,
+                        'missing_ratio': round(latest_missing_ratio, 6),
+                        'max_non_blocking_missing_ratio': MAX_NON_BLOCKING_DAILY_SYMBOL_MISSING_RATIO,
+                    }
                     _log_pykrx_fetch('run_daily_pipeline_if_due', 'skipped', **result)
                     return result
                 if _is_auto_daily_trigger(trigger) and self._is_retryable_daily_run(latest_run):
