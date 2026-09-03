@@ -2008,6 +2008,38 @@ class PykrxBackfillServiceTests(TestCase):
             },
         )
 
+    def test_auto_daily_skips_retry_for_minor_symbol_gap(self) -> None:
+        service = PykrxBackfillService()
+
+        with (
+            patch.object(service, 'resolve_latest_trade_date', return_value='2026-04-03'),
+            patch('app.eod.pykrx_backfill.advisory_eod_collection_lock', return_value=_lock()),
+            patch(
+                'app.eod.pykrx_backfill.load_latest_eod_collection_run',
+                return_value={
+                    'id': 7,
+                    'status': 'completed_with_errors',
+                    'symbols_total': 3552,
+                    'symbols_failed': 4,
+                    'run_metadata': {'failed_symbols': ['082640', '489010', '096610', '471050']},
+                },
+            ),
+            patch('app.eod.pykrx_backfill.count_eod_collection_runs') as count_runs,
+            patch.object(service, '_run_market_data_pipeline') as run_collection,
+        ):
+            result = service.run_daily_pipeline_if_due(
+                market_date='2026-04-03',
+                trigger='auto_close_scheduler',
+            )
+
+        self.assertFalse(result['triggered'])
+        self.assertEqual(result['reason'], 'already_completed_with_minor_symbol_gaps')
+        self.assertEqual(result['minor_symbol_gap']['symbols_failed'], 4)
+        self.assertEqual(result['minor_symbol_gap']['symbols_total'], 3552)
+        self.assertEqual(result['minor_symbol_gap']['missing_ratio'], 0.001126)
+        count_runs.assert_not_called()
+        run_collection.assert_not_called()
+
     def test_auto_daily_retry_stops_after_five_auto_runs(self) -> None:
         service = PykrxBackfillService()
 
