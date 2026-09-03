@@ -728,7 +728,8 @@ class PykrxBackfillService:
                     else None
                 )
                 if (
-                    latest_status == 'completed_with_errors'
+                    _is_auto_daily_trigger(trigger)
+                    and latest_status == 'completed_with_errors'
                     and latest_failed > 0
                     and latest_missing_ratio is not None
                     and latest_missing_ratio < MAX_NON_BLOCKING_DAILY_SYMBOL_MISSING_RATIO
