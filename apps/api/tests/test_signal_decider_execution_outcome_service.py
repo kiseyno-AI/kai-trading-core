@@ -18,6 +18,7 @@ from app.db_models import (
     SignalDeciderDecisionSnapshot,
     SignalDeciderExecutionPlanItem,
 )
+from app.orders.exec_payload_slimming import compact_exec_readback
 from app.orders.signal_decider_execution_outcomes import signal_decider_execution_outcome_service
 from app.orders.store import append_broker_order_event, upsert_broker_order, upsert_order_request
 
@@ -761,6 +762,93 @@ class SignalDeciderExecutionOutcomeServiceTests(unittest.TestCase):
         self.assertEqual(item['closed_quantity'], '5.00000000')
         self.assertEqual(item['open_quantity'], '0.00000000')
         self.assertEqual(item['diagnostics']['entry']['order_status'], 'filled')
+
+    def test_exec_readback_stays_unresolved_with_omitted_active_entry_link(self) -> None:
+        snapshot_id = self._seed_snapshot()
+        entry_plan_item_id = self._seed_plan_item(
+            execution_window='next_open',
+            snapshot_id=snapshot_id,
+            planned_side='buy',
+            client_order_id='SDNO-20260430-005930-OMITTED-ENTRY',
+            order_request_id=None,
+            broker_order_row_id=None,
+            execution_status='submitted',
+            traceability_payload={'target_price': 54000, 'stop_loss_price': 47000},
+        )
+        self._attach_partial_exec_full_order_readback_submission(entry_plan_item_id=entry_plan_item_id)
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, entry_plan_item_id)
+            self.assertIsNotNone(row)
+            submission_payload = deepcopy(row.submission_payload)
+            exec_dispatch = submission_payload['exec_dispatch']
+            exec_dispatch['item_links'].append(
+                {
+                    'core_item_key': f'core-plan-{entry_plan_item_id}:next_open_buy:omitted',
+                    'intent': 'next_open_buy',
+                    'side': 'buy',
+                    'symbol': self.symbol,
+                    'exec_plan_item_id': 'exec-entry-item-omitted',
+                    'remote_status': 'partial_fill',
+                }
+            )
+            raw_readback = deepcopy(exec_dispatch['readback'])
+            raw_readback['orders']['items'].extend(
+                {
+                    'id': f'exec-sell-order-cancelled-{index}',
+                    'side': 'sell',
+                    'status': 'cancelled',
+                    'quantity': '0',
+                    'filled_quantity': '0',
+                    'remaining_quantity': '0',
+                }
+                for index in range(8)
+            )
+            raw_readback['orders']['items'].append(
+                {
+                    'id': 'exec-buy-order-partial-omitted',
+                    'execution_plan_item_id': 'exec-entry-item-omitted',
+                    'side': 'buy',
+                    'status': 'partial_fill',
+                    'quantity': '2',
+                    'filled_quantity': '1',
+                    'remaining_quantity': '1',
+                }
+            )
+            raw_readback['orders']['count'] = len(raw_readback['orders']['items'])
+            exec_dispatch['readback'] = compact_exec_readback(raw_readback)
+            self.assertEqual(exec_dispatch['readback']['orders']['items_omitted_count'], 1)
+            row.submission_payload = submission_payload
+
+        payload = signal_decider_execution_outcome_service.list_outcomes(
+            snapshot_id=snapshot_id,
+            refresh=True,
+        )
+
+        self.assertEqual(payload['summary']['closed_count'], 0)
+        self.assertEqual(payload['summary']['unresolved_count'], 1)
+        item = payload['items'][0]
+        self.assertEqual(item['lifecycle_status'], 'unresolved')
+        self.assertEqual(item['exit_reason'], 'unresolved')
+        self.assertEqual(item['entry_filled_quantity'], '5.00000000')
+        self.assertEqual(item['closed_quantity'], '5.00000000')
+        self.assertEqual(item['open_quantity'], '0.00000000')
+        self.assertEqual(item['diagnostics']['entry']['order_status'], 'filled')
+
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, entry_plan_item_id)
+            self.assertIsNotNone(row)
+            submission_payload = deepcopy(row.submission_payload)
+            submission_payload['exec_dispatch']['item_links'][-1]['remote_status'] = 'accepted'
+            row.submission_payload = submission_payload
+
+        accepted_payload = signal_decider_execution_outcome_service.list_outcomes(
+            snapshot_id=snapshot_id,
+            refresh=True,
+        )
+
+        self.assertEqual(accepted_payload['summary']['closed_count'], 0)
+        self.assertEqual(accepted_payload['summary']['unresolved_count'], 1)
+        self.assertEqual(accepted_payload['items'][0]['lifecycle_status'], 'unresolved')
 
     def test_list_outcomes_refresh_persists_short_term_exec_readback_fills(self) -> None:
         snapshot_id = self._seed_snapshot(agent_name='short-term-decider')

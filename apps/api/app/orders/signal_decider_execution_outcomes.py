@@ -1358,18 +1358,16 @@ class SignalDeciderExecutionOutcomeService:
         order_facts: Sequence[dict[str, Any]],
         item_links: Sequence[dict[str, Any]],
     ) -> bool:
-        if order_facts:
-            return all(
-                self._has_terminal_order_evidence(
-                    status=order_fact.get('status'),
-                    requested_quantity=order_fact.get('requested_quantity'),
-                    filled_quantity=order_fact.get('quantity'),
-                    remaining_quantity=order_fact.get('remaining_quantity'),
-                )
-                for order_fact in order_facts
+        terminal_evidence = [
+            self._has_terminal_order_evidence(
+                status=order_fact.get('status'),
+                requested_quantity=order_fact.get('requested_quantity'),
+                filled_quantity=order_fact.get('quantity'),
+                remaining_quantity=order_fact.get('remaining_quantity'),
             )
+            for order_fact in order_facts
+        ]
 
-        matching_statuses: list[str | None] = []
         for link in item_links:
             link_side = self._normalize_readback_side(link.get('side'))
             intent = _normalize_optional_text(link.get('intent'), lowercase=True)
@@ -1383,10 +1381,8 @@ class SignalDeciderExecutionOutcomeService:
             status = self._normalize_readback_order_status(
                 link.get('remote_status') or link.get('status')
             )
-            matching_statuses.append(status)
-        return bool(matching_statuses) and all(
-            status in TERMINAL_ORDER_STATUSES for status in matching_statuses
-        )
+            terminal_evidence.append(status in TERMINAL_ORDER_STATUSES)
+        return bool(terminal_evidence) and all(terminal_evidence)
 
     def _has_terminal_order_evidence(
         self,
