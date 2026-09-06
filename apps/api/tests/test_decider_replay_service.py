@@ -395,6 +395,58 @@ class DeciderReplayServiceTests(unittest.TestCase):
         self.assertEqual(result['examples'][0]['symbol'], '005960')
         self.assertEqual(repository.wait_conflict_calls[0]['gate_mode'], 'hard_block')
 
+    def test_wait_conflict_downsize_tradeoffs_use_removed_quantity_share(self) -> None:
+        downsized_loss_gate = {
+            **_alignment_gate('wait_conflict_block', 'downsize_probe'),
+            'requested_quantity': 10,
+            'final_quantity': 2,
+        }
+        downsized_winner_gate = {
+            **_alignment_gate('wait_conflict_block', 'downsize_probe'),
+            'requested_quantity': 5,
+            'final_quantity': 1,
+        }
+        result = DeciderReplayService(
+            repository=FakeDeciderReplayRepository(
+                [],
+                wait_conflict_trades=[
+                    _trade(
+                        snapshot_id=110,
+                        symbol='005930',
+                        gross_pnl_krw=-10_000,
+                        trigger_price_drift_pct=None,
+                        market_date='2026-07-01',
+                        outcome_source='actual_short_term_execution_outcome',
+                        alignment_gate=downsized_loss_gate,
+                    ),
+                    _trade(
+                        snapshot_id=111,
+                        symbol='000660',
+                        gross_pnl_krw=5_000,
+                        trigger_price_drift_pct=None,
+                        market_date='2026-07-02',
+                        outcome_source='actual_short_term_execution_outcome',
+                        alignment_gate=downsized_winner_gate,
+                    ),
+                ],
+            )
+        ).replay_wait_conflict_gate(
+            market_date_from='2026-06-29',
+            market_date_to='2026-07-03',
+            gate_mode='downsize_probe',
+        )
+
+        self.assertEqual(result['summary']['baseline_realized_pnl_krw'], -5_000)
+        self.assertEqual(result['summary']['counterfactual_realized_pnl_krw'], -1_000)
+        self.assertEqual(result['summary']['net_pnl_delta_krw'], 4_000)
+        self.assertEqual(result['summary']['skipped_losses'], 1)
+        self.assertEqual(result['summary']['skipped_losses_avoided_krw'], 8_000)
+        self.assertEqual(result['summary']['skipped_winners'], 1)
+        self.assertEqual(result['summary']['skipped_winners_gross_pnl_krw'], 4_000)
+        self.assertTrue(
+            result['promotion_readiness']['checks']['avoided_losses_exceed_skipped_winners']
+        )
+
     def test_wait_conflict_gate_replay_returns_empty_data_reason(self) -> None:
         service = DeciderReplayService(repository=FakeDeciderReplayRepository([]))
 
@@ -419,6 +471,34 @@ class DeciderReplayServiceTests(unittest.TestCase):
         self.assertEqual(len(result['weeks']), 4)
         self.assertEqual(repository.wait_conflict_calls[0]['market_date_from'], date(2026, 8, 10))
         self.assertEqual(repository.wait_conflict_calls[0]['market_date_to'], date(2026, 9, 4))
+
+    def test_wait_conflict_gate_excludes_empty_weeks_from_promotion_count(self) -> None:
+        concentrated_conflicts = [
+            _trade(
+                snapshot_id=120 + index,
+                symbol=f'{index:06d}',
+                gross_pnl_krw=-1_000,
+                trigger_price_drift_pct=None,
+                market_date='2026-08-10',
+                outcome_source='actual_short_term_execution_outcome',
+                alignment_gate=_alignment_gate('wait_conflict_block', 'block'),
+            )
+            for index in range(20)
+        ]
+        result = DeciderReplayService(
+            repository=FakeDeciderReplayRepository(
+                [],
+                wait_conflict_trades=concentrated_conflicts,
+            )
+        ).replay_wait_conflict_gate(
+            market_date_from='2026-08-10',
+            market_date_to='2026-09-04',
+        )
+
+        self.assertEqual(result['summary']['resolved_wait_conflict_count'], 20)
+        self.assertTrue(result['promotion_readiness']['checks']['resolved_wait_conflicts_met'])
+        self.assertEqual(result['summary']['completed_week_count'], 1)
+        self.assertFalse(result['promotion_readiness']['checks']['completed_weeks_met'])
 
     def test_wait_conflict_gate_separates_unresolved_open_candidates(self) -> None:
         open_trade = _trade(

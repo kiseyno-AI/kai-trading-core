@@ -158,6 +158,58 @@ def test_preopen_plan_refreshes_when_same_snapshot_row_was_updated() -> None:
     ) is False
 
 
+def test_preopen_plan_ignores_current_gate_settings_only_for_terminal_rows() -> None:
+    snapshot = SimpleNamespace(
+        id=8,
+        symbol='035420',
+        agent_name='short-term-decider',
+        response_payload={'tactical_action': 'watch_for_trigger'},
+        updated_at=None,
+    )
+    target = NextOpenAccountTarget(
+        label='Main',
+        account_reference='KIS:12345678-01',
+        budget_krw=Decimal('1000000'),
+    )
+
+    def row(execution_status: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            account_reference=target.account_reference,
+            symbol=snapshot.symbol,
+            decision_agent_name='short-term-decider',
+            decision_snapshot_id=snapshot.id,
+            execution_status=execution_status,
+            validation_payload={
+                'alignment_gate': {
+                    'enforcement_mode': 'report_only',
+                    'probe_quantity': 1,
+                }
+            },
+            updated_at=None,
+        )
+
+    with (
+        patch.object(settings, 'signal_decider_wait_conflict_gate_mode', 'downsize_probe'),
+        patch.object(settings, 'signal_decider_wait_conflict_probe_quantity', 3),
+    ):
+        for terminal_status in (
+            EXECUTION_STATUS_SUBMITTED,
+            EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING,
+        ):
+            assert _preopen_plan_covers_latest_snapshots(
+                existing_rows=[row(terminal_status)],
+                snapshots=[snapshot],
+                account_targets=[target],
+            ) is True, terminal_status
+
+        for active_status in ('planned', EXECUTION_STATUS_DRY_RUN, 'submit_failed'):
+            assert _preopen_plan_covers_latest_snapshots(
+                existing_rows=[row(active_status)],
+                snapshots=[snapshot],
+                account_targets=[target],
+            ) is False, active_status
+
+
 class FakeOrderService:
     def __init__(self) -> None:
         self.calls: list[dict] = []

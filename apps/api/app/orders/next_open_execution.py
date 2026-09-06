@@ -914,7 +914,10 @@ def _preopen_plan_covers_latest_snapshots(
         row = existing_by_key.get(key)
         if row is None or int(row.decision_snapshot_id) != int(snapshot.id):
             return False
-        if _snapshot_agent_name(snapshot) == SHORT_TERM_DECIDER_AGENT_NAME:
+        if (
+            _snapshot_agent_name(snapshot) == SHORT_TERM_DECIDER_AGENT_NAME
+            and not _is_dispatch_terminal_status(row.execution_status)
+        ):
             validation = _row_validation_payload(row)
             alignment_gate = (
                 validation.get('alignment_gate')

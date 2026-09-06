@@ -1466,25 +1466,30 @@ class DeciderReplayService:
                 == SIGNAL_DECIDER_ALIGNMENT_WAIT_CONFLICT_OVERRIDE
                 and (_trade_alignment_gate(trade).get('override') or {}).get('allowed') is True
             ]
-            blocked_resolved = [trade for trade in blocked if trade.outcome_resolved]
+            def retained_quantity_ratio(trade: DeciderReplayTrade) -> Decimal:
+                gate = _trade_alignment_gate(trade)
+                action = gate.get('alignment_gate_action')
+                if action == ALIGNMENT_GATE_ACTION_BLOCK:
+                    return Decimal('0')
+                if action != ALIGNMENT_GATE_ACTION_DOWNSIZE_PROBE:
+                    return Decimal('1')
+                requested = _safe_decimal(gate.get('requested_quantity'))
+                final = _safe_decimal(gate.get('final_quantity'))
+                if requested is None or requested <= 0 or final is None:
+                    return Decimal('1')
+                return min(max(final / requested, Decimal('0')), Decimal('1'))
+
             candidate_resolved: list[DeciderReplayTrade] = []
             for trade in resolved:
-                if trade in blocked:
+                retained_ratio = retained_quantity_ratio(trade)
+                if retained_ratio == 0:
                     continue
-                if trade in downsized:
-                    gate = _trade_alignment_gate(trade)
-                    requested = _safe_decimal(gate.get('requested_quantity'))
-                    final = _safe_decimal(gate.get('final_quantity'))
-                    ratio = (
-                        min(max(final / requested, Decimal('0')), Decimal('1'))
-                        if requested is not None and requested > 0 and final is not None
-                        else Decimal('0')
-                    )
+                if retained_ratio < 1:
                     candidate_resolved.append(
                         replace(
                             trade,
-                            baseline_gross_pnl_krw=trade.baseline_gross_pnl_krw * ratio,
-                            baseline_notional_krw=trade.baseline_notional_krw * ratio,
+                            baseline_gross_pnl_krw=trade.baseline_gross_pnl_krw * retained_ratio,
+                            baseline_notional_krw=trade.baseline_notional_krw * retained_ratio,
                         )
                     )
                 else:
@@ -1502,14 +1507,13 @@ class DeciderReplayService:
             net_delta = _safe_decimal_or_zero(candidate['estimated_net_pnl_krw']) - _safe_decimal_or_zero(
                 baseline['estimated_net_pnl_krw']
             )
-            skipped_loss_pnl = sum(
-                (trade.baseline_gross_pnl_krw for trade in blocked_resolved if trade.baseline_gross_pnl_krw < 0),
-                Decimal('0'),
-            )
-            skipped_winner_pnl = sum(
-                (trade.baseline_gross_pnl_krw for trade in blocked_resolved if trade.baseline_gross_pnl_krw > 0),
-                Decimal('0'),
-            )
+            removed_pnl: list[Decimal] = []
+            for trade in resolved:
+                removed_ratio = Decimal('1') - retained_quantity_ratio(trade)
+                if removed_ratio > 0:
+                    removed_pnl.append(trade.baseline_gross_pnl_krw * removed_ratio)
+            skipped_loss_pnl = sum((pnl for pnl in removed_pnl if pnl < 0), Decimal('0'))
+            skipped_winner_pnl = sum((pnl for pnl in removed_pnl if pnl > 0), Decimal('0'))
             missing_alignment = [
                 trade
                 for trade in scope
@@ -1529,8 +1533,8 @@ class DeciderReplayService:
                 ),
                 'unresolved_open_candidate_count': len(unresolved),
                 'missing_alignment_evidence_count': len(missing_alignment),
-                'skipped_losses': sum(1 for trade in blocked_resolved if trade.baseline_gross_pnl_krw < 0),
-                'skipped_winners': sum(1 for trade in blocked_resolved if trade.baseline_gross_pnl_krw > 0),
+                'skipped_losses': sum(1 for pnl in removed_pnl if pnl < 0),
+                'skipped_winners': sum(1 for pnl in removed_pnl if pnl > 0),
                 'skipped_losses_gross_pnl_krw': _to_json_number(_round_money(skipped_loss_pnl)),
                 'skipped_losses_avoided_krw': _to_json_number(_round_money(-skipped_loss_pnl)),
                 'skipped_winners_gross_pnl_krw': _to_json_number(_round_money(skipped_winner_pnl)),
@@ -1580,7 +1584,12 @@ class DeciderReplayService:
                 }
             )
         completed_week_count = sum(
-            1 for start, end in week_windows if start.weekday() == 0 and end.weekday() == 4 and (end - start).days == 4
+            1
+            for (start, end), week in zip(week_windows, weeks)
+            if start.weekday() == 0
+            and end.weekday() == 4
+            and (end - start).days == 4
+            and week['summary']['baseline_trade_count'] > 0
         )
         wait_conflict_trades = [
             trade

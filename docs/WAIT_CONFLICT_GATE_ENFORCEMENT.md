@@ -23,13 +23,13 @@ python3.11 -m app.internal.ops agent-short-term-wait-conflict-replay \
 
 Use `--as-of-date-kst YYYY-MM-DD` for a reproducible rolling window. An explicit `--market-date-from` and `--market-date-to` pair is also supported. The rolling form always covers at least four completed Monday-Friday KST weeks.
 
-The report uses only persisted short-term entry fills and their actual execution outcomes. It reports resolved skipped losses, resolved skipped winners, baseline and counterfactual realized P/L, net P/L delta, missing alignment evidence, and unresolved/open filled candidates separately. Unresolved candidates receive no synthetic P/L.
+The report uses only persisted short-term entry fills and their actual execution outcomes. It reports resolved skipped losses, resolved skipped winners, baseline and counterfactual realized P/L, net P/L delta, missing alignment evidence, and unresolved/open filled candidates separately. For `downsize_probe`, skipped-loss and skipped-winner P/L is weighted by the removed quantity share; requests already at or below the probe add no removed-exposure evidence. Unresolved candidates receive no synthetic P/L.
 
 ## Promotion threshold
 
 The report exposes these checks under `promotion_readiness`:
 
-- at least 4 completed trading weeks;
+- at least 4 completed Monday-Friday windows that each contain resolved replay evidence;
 - at least 20 resolved WAIT-conflict outcomes;
 - positive net realized P/L delta;
 - avoided losses greater than skipped-winner P/L;
