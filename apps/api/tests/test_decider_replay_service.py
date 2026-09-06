@@ -158,6 +158,7 @@ def _actual_wait_conflict_trade(
     closed_quantity: int,
     open_quantity: int,
     realized_pnl_krw: int,
+    lifecycle_status: str | None = None,
     gate_mode: str = 'hard_block',
     probe_quantity: int = 1,
 ) -> DeciderReplayTrade:
@@ -183,7 +184,7 @@ def _actual_wait_conflict_trade(
     outcome = SignalDeciderActualExecutionOutcome(
         id=702,
         target_trade_date=date(2026, 9, 2),
-        lifecycle_status='closed' if open_quantity == 0 else 'partially_closed',
+        lifecycle_status=lifecycle_status or ('closed' if open_quantity == 0 else 'partially_closed'),
         entry_filled_quantity=Decimal('10'),
         entry_average_fill_price=Decimal('10000'),
         closed_quantity=Decimal(closed_quantity),
@@ -681,6 +682,33 @@ class DeciderReplayServiceTests(unittest.TestCase):
         self.assertEqual(result['summary']['unresolved_wait_conflict_count'], 1)
         self.assertEqual(result['summary']['unresolved_open_candidate_count'], 1)
         self.assertEqual(result['unresolved_open_candidates'][0]['symbol'], '004690')
+        self.assertIsNone(result['unresolved_open_candidates'][0]['realized_pnl_krw'])
+        self.assertFalse(result['promotion_readiness']['checks']['resolved_wait_conflicts_met'])
+
+    def test_fully_sold_active_partial_entry_stays_out_of_resolved_replay_metrics(self) -> None:
+        partial_entry_trade = _actual_wait_conflict_trade(
+            closed_quantity=5,
+            open_quantity=0,
+            realized_pnl_krw=20000,
+            lifecycle_status='unresolved',
+        )
+
+        result = DeciderReplayService(
+            repository=FakeDeciderReplayRepository([], wait_conflict_trades=[partial_entry_trade])
+        ).replay_wait_conflict_gate(
+            market_date_from='2026-08-31',
+            market_date_to='2026-09-04',
+        )
+
+        self.assertFalse(partial_entry_trade.outcome_resolved)
+        self.assertFalse(partial_entry_trade.point_in_time['realized_outcome_available'])
+        self.assertEqual(result['summary']['baseline_trade_count'], 0)
+        self.assertEqual(result['summary']['candidate_trade_count'], 0)
+        self.assertEqual(result['summary']['baseline_realized_pnl_krw'], 0)
+        self.assertEqual(result['summary']['counterfactual_realized_pnl_krw'], 0)
+        self.assertEqual(result['summary']['resolved_wait_conflict_count'], 0)
+        self.assertEqual(result['summary']['unresolved_wait_conflict_count'], 1)
+        self.assertEqual(result['summary']['unresolved_open_candidate_count'], 1)
         self.assertIsNone(result['unresolved_open_candidates'][0]['realized_pnl_krw'])
         self.assertFalse(result['promotion_readiness']['checks']['resolved_wait_conflicts_met'])
 

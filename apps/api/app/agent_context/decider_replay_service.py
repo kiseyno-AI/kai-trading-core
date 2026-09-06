@@ -565,7 +565,8 @@ def _actual_short_term_outcome_to_wait_conflict_trade(
     closed_quantity = _safe_decimal(outcome.closed_quantity)
     open_quantity = _safe_decimal(outcome.open_quantity)
     outcome_resolved = bool(
-        (closed_quantity or Decimal('0')) > Decimal('0')
+        outcome.lifecycle_status == 'closed'
+        and (closed_quantity or Decimal('0')) > Decimal('0')
         and open_quantity == Decimal('0')
         and (gross_pnl is not None or realized_return is not None)
     )
