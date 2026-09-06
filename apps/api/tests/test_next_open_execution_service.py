@@ -118,6 +118,12 @@ def test_preopen_plan_detects_unrouted_short_term_watch_feedback() -> None:
         decision_agent_name='short-term-decider',
         decision_snapshot_id=7,
         execution_status='planned',
+        validation_payload={
+            'alignment_gate': {
+                'enforcement_mode': settings.signal_decider_wait_conflict_gate_mode,
+                'probe_quantity': settings.signal_decider_wait_conflict_probe_quantity,
+            }
+        },
     )
 
     assert _preopen_plan_covers_latest_snapshots(
@@ -243,6 +249,7 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             'signal_decider_next_open_block_on_specialist_disagreement': settings.signal_decider_next_open_block_on_specialist_disagreement,
             'signal_decider_next_open_require_target_and_stop': settings.signal_decider_next_open_require_target_and_stop,
             'signal_decider_wait_conflict_gate_mode': settings.signal_decider_wait_conflict_gate_mode,
+            'signal_decider_wait_conflict_probe_quantity': settings.signal_decider_wait_conflict_probe_quantity,
             'signal_decider_exec_integration_mode': settings.signal_decider_exec_integration_mode,
         }
         settings.signal_decider_next_open_account_targets = f'Main={self.account_reference}@1500000'
@@ -255,6 +262,7 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         settings.signal_decider_next_open_block_on_specialist_disagreement = True
         settings.signal_decider_next_open_require_target_and_stop = True
         settings.signal_decider_wait_conflict_gate_mode = 'report_only'
+        settings.signal_decider_wait_conflict_probe_quantity = 1
         settings.signal_decider_exec_integration_mode = 'disabled'
         self.enrichment_preflight_patcher = patch(
             'app.orders.next_open_execution.inspect_pykrx_enrichment_preflight',
@@ -1132,6 +1140,8 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(short_item['alignment_signal_decider_decision_snapshot_id'], signal_snapshot_id)
         self.assertEqual(short_item['validation']['signal_decider_alignment'], 'wait_conflict_block')
         self.assertEqual(short_item['traceability']['signal_decider_alignment'], 'wait_conflict_block')
+        self.assertEqual(short_item['final_enforcement_decision'], 'allowed_report_only')
+        self.assertEqual(short_item['requested_quantity'], short_item['final_quantity'])
         warning_codes = {warning['code'] for warning in short_item['validation']['warnings']}
         block_codes = {reason['code'] for reason in short_item['validation']['blocking_reasons']}
         self.assertIn('signal_decider_wait_conflict_gate_report_only', warning_codes)
@@ -1140,6 +1150,7 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['summary']['short_term_wait_conflict_override_count'], 0)
 
     def test_refresh_plan_items_allows_wait_conflict_override_for_strong_watch_setup(self) -> None:
+        settings.signal_decider_wait_conflict_gate_mode = 'hard_block'
         signal_snapshot_id = self._seed_snapshot(symbol='005930', next_day_open_action='wait')
         self._seed_short_term_snapshot(
             symbol='005930',
@@ -1167,10 +1178,56 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(short_item['alignment_gate_action'], 'allow_by_override')
         self.assertEqual(short_item['alignment_signal_decider_decision_snapshot_id'], signal_snapshot_id)
         self.assertTrue(short_item['alignment_gate']['override']['allowed'])
+        self.assertEqual(short_item['final_enforcement_decision'], 'allowed_by_override')
+        self.assertEqual(short_item['requested_quantity'], short_item['final_quantity'])
         warning_codes = {warning['code'] for warning in short_item['validation']['warnings']}
         self.assertIn('signal_decider_wait_conflict_override', warning_codes)
         self.assertEqual(result['summary']['short_term_wait_conflict_block_count'], 0)
         self.assertEqual(result['summary']['short_term_wait_conflict_override_count'], 1)
+
+    def test_refresh_plan_items_hard_blocks_wait_conflict(self) -> None:
+        settings.signal_decider_wait_conflict_gate_mode = 'hard_block'
+        self._seed_snapshot(symbol='005930', next_day_open_action='wait')
+        self._seed_short_term_snapshot(symbol='005930')
+        service = self._service(state='PREOPEN', server_time='2026-04-30T08:40:00+09:00')
+
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[{'trade_date': '2026-04-29', 'close_price': 50000}],
+        ):
+            result = service.refresh_plan_items(target_trade_date=self.target_trade_date, trigger='test')
+
+        item = next(item for item in result['items'] if item['decision_agent_name'] == 'short-term-decider')
+        self.assertEqual(item['eligibility_status'], ELIGIBILITY_BLOCKED)
+        self.assertEqual(item['final_enforcement_decision'], 'blocked')
+        self.assertGreater(item['requested_quantity'], 0)
+        self.assertEqual(item['final_quantity'], 0)
+        self.assertEqual(Decimal(item['planned_quantity']), Decimal('0'))
+        self.assertIn(
+            'signal_decider_wait_conflict_gate',
+            {reason['code'] for reason in item['validation']['blocking_reasons']},
+        )
+
+    def test_refresh_plan_items_downsizes_wait_conflict_to_configured_probe(self) -> None:
+        settings.signal_decider_wait_conflict_gate_mode = 'downsize_probe'
+        settings.signal_decider_wait_conflict_probe_quantity = 2
+        self._seed_snapshot(symbol='005930', next_day_open_action='wait')
+        self._seed_short_term_snapshot(symbol='005930')
+        service = self._service(state='PREOPEN', server_time='2026-04-30T08:40:00+09:00')
+
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[{'trade_date': '2026-04-29', 'close_price': 50000}],
+        ):
+            result = service.refresh_plan_items(target_trade_date=self.target_trade_date, trigger='test')
+
+        item = next(item for item in result['items'] if item['decision_agent_name'] == 'short-term-decider')
+        self.assertEqual(item['eligibility_status'], ELIGIBILITY_ELIGIBLE)
+        self.assertEqual(item['alignment_gate_action'], 'downsize_probe')
+        self.assertEqual(item['final_enforcement_decision'], 'downsized')
+        self.assertGreater(item['requested_quantity'], 2)
+        self.assertEqual(item['final_quantity'], 2)
+        self.assertEqual(Decimal(item['planned_quantity']), Decimal('2'))
 
     def test_refresh_plan_items_marks_short_term_buy_aligned_with_signal_buy(self) -> None:
         signal_snapshot_id = self._seed_snapshot(symbol='005930', next_day_open_action='buy')

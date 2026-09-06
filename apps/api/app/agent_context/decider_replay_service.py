@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import date, datetime
+from dataclasses import dataclass, replace
+from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import json
 from typing import Any, Sequence
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
 
@@ -19,10 +20,12 @@ from app.db_models import (
 )
 from app.orders.signal_decider_alignment_gate import (
     ALIGNMENT_GATE_ACTION_BLOCK,
+    ALIGNMENT_GATE_ACTION_DOWNSIZE_PROBE,
+    ALIGNMENT_GATE_ACTION_REPORT_ONLY_BLOCK,
     SIGNAL_DECIDER_ALIGNMENT_WAIT_CONFLICT_BLOCK,
     SIGNAL_DECIDER_ALIGNMENT_WAIT_CONFLICT_OVERRIDE,
-    build_signal_decider_alignment_context,
-    build_signal_decider_alignment_gate,
+    apply_alignment_quantity_enforcement,
+    normalize_alignment_gate_mode,
 )
 
 
@@ -36,8 +39,7 @@ SUPPORTED_REPLAY_AGENT_NAMES: tuple[str, ...] = (
 DEFAULT_REPLAY_HORIZON_DAYS = 5
 DEFAULT_REPLAY_NOTIONAL_KRW = Decimal('1000000')
 DEFAULT_TOP_EXAMPLES_LIMIT = 10
-DEFAULT_WAIT_CONFLICT_REPLAY_MARKET_DATE_FROM = date(2026, 6, 29)
-DEFAULT_WAIT_CONFLICT_REPLAY_MARKET_DATE_TO = date(2026, 7, 3)
+DEFAULT_WAIT_CONFLICT_COMPLETED_WEEKS = 4
 
 
 @dataclass(frozen=True)
@@ -62,6 +64,11 @@ class DeciderReplayTrade:
     point_in_time: dict[str, Any]
     decision_timestamp: datetime | None = None
     alignment_gate: dict[str, Any] | None = None
+    outcome_resolved: bool = True
+    lifecycle_status: str | None = None
+    entry_filled_quantity: Decimal | None = None
+    closed_quantity: Decimal | None = None
+    open_quantity: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -80,6 +87,79 @@ def _normalize_market_date(value: str | date) -> date:
     if isinstance(value, date):
         return value
     return date.fromisoformat(str(value))
+
+
+def _completed_week_windows(
+    *,
+    as_of_date_kst: str | date | None,
+    completed_weeks: int,
+) -> list[tuple[date, date]]:
+    as_of = (
+        _normalize_market_date(as_of_date_kst)
+        if as_of_date_kst is not None
+        else datetime.now(ZoneInfo('Asia/Seoul')).date()
+    )
+    week_count = max(DEFAULT_WAIT_CONFLICT_COMPLETED_WEEKS, int(completed_weeks))
+    current_monday = as_of - timedelta(days=as_of.weekday())
+    latest_completed_friday = (
+        current_monday + timedelta(days=4)
+        if as_of.weekday() >= 5
+        else current_monday - timedelta(days=3)
+    )
+    windows: list[tuple[date, date]] = []
+    for offset in reversed(range(week_count)):
+        week_end = latest_completed_friday - timedelta(weeks=offset)
+        windows.append((week_end - timedelta(days=4), week_end))
+    return windows
+
+
+def _explicit_week_windows(market_date_from: date, market_date_to: date) -> list[tuple[date, date]]:
+    cursor = market_date_from - timedelta(days=market_date_from.weekday())
+    windows: list[tuple[date, date]] = []
+    while cursor <= market_date_to:
+        start = max(cursor, market_date_from)
+        end = min(cursor + timedelta(days=4), market_date_to)
+        if start <= end:
+            windows.append((start, end))
+        cursor += timedelta(weeks=1)
+    return windows
+
+
+def _candidate_action_for_mode(mode: str) -> str:
+    resolved_mode = normalize_alignment_gate_mode(mode)
+    if resolved_mode == 'hard_block':
+        return ALIGNMENT_GATE_ACTION_BLOCK
+    if resolved_mode == 'downsize_probe':
+        return ALIGNMENT_GATE_ACTION_DOWNSIZE_PROBE
+    return ALIGNMENT_GATE_ACTION_REPORT_ONLY_BLOCK
+
+
+def _replay_alignment_gate(
+    persisted_gate: dict[str, Any] | None,
+    *,
+    gate_mode: str,
+) -> dict[str, Any]:
+    if not isinstance(persisted_gate, dict) or not persisted_gate:
+        return {
+            'schema_version': 'signal_decider_alignment_gate_v1',
+            'enforcement_mode': normalize_alignment_gate_mode(gate_mode),
+            'signal_decider_alignment': 'missing_alignment_evidence',
+            'alignment_gate_action': _candidate_action_for_mode(gate_mode),
+            'alignment_gate_reason': 'Persisted point-in-time alignment evidence is missing.',
+            'override': {'allowed': False, 'reason': 'missing_alignment_evidence'},
+            'evidence_status': 'missing',
+        }
+    gate = dict(persisted_gate)
+    gate['enforcement_mode'] = normalize_alignment_gate_mode(gate_mode)
+    gate['evidence_status'] = 'persisted'
+    alignment = str(gate.get('signal_decider_alignment') or '').strip().lower()
+    override = gate.get('override') if isinstance(gate.get('override'), dict) else {}
+    valid_override = alignment == SIGNAL_DECIDER_ALIGNMENT_WAIT_CONFLICT_OVERRIDE and override.get('allowed') is True
+    if valid_override:
+        gate['alignment_gate_action'] = 'allow_by_override'
+    elif alignment != 'aligned':
+        gate['alignment_gate_action'] = _candidate_action_for_mode(gate_mode)
+    return gate
 
 
 def _normalize_agent_name(value: str) -> str:
@@ -421,26 +501,21 @@ def _actual_short_term_outcome_to_wait_conflict_trade(
     snapshot: SignalDeciderDecisionSnapshot,
     plan_row: SignalDeciderExecutionPlanItem,
     outcome: SignalDeciderActualExecutionOutcome,
-    signal_decider_context: dict[str, Any] | None,
     cost_assumptions: DeciderReplayCostAssumptions,
     gate_mode: str,
 ) -> DeciderReplayTrade:
     validation = plan_row.validation_payload if isinstance(plan_row.validation_payload, dict) else {}
     traceability = plan_row.traceability_payload if isinstance(plan_row.traceability_payload, dict) else {}
-    short_term = validation.get('short_term') if isinstance(validation.get('short_term'), dict) else {}
-    response_payload = snapshot.response_payload if isinstance(snapshot.response_payload, dict) else {}
-    tactical_action = (
-        traceability.get('tactical_action')
-        or short_term.get('tactical_action')
-        or response_payload.get('tactical_action')
+    persisted_gate = (
+        validation.get('alignment_gate')
+        if isinstance(validation.get('alignment_gate'), dict)
+        else traceability.get('alignment_gate')
+        if isinstance(traceability.get('alignment_gate'), dict)
+        else None
     )
-    alignment_gate = build_signal_decider_alignment_gate(
-        signal_decider_context=signal_decider_context,
-        short_term_entry_quality=validation.get('short_term_entry_quality')
-        if isinstance(validation.get('short_term_entry_quality'), dict)
-        else None,
-        tactical_action=str(tactical_action).strip().lower() if tactical_action is not None else None,
-        mode=gate_mode,
+    alignment_gate = _replay_alignment_gate(
+        persisted_gate,
+        gate_mode=gate_mode,
     )
     entry_notional = _safe_decimal(outcome.entry_notional_krw)
     if entry_notional is None:
@@ -452,6 +527,18 @@ def _actual_short_term_outcome_to_wait_conflict_trade(
     realized_return = _to_float(outcome.realized_return_pct)
     if gross_pnl is None and realized_return is not None:
         gross_pnl = Decimal(str(realized_return)) * notional
+    entry_filled_quantity = _safe_decimal(outcome.entry_filled_quantity)
+    alignment_gate = apply_alignment_quantity_enforcement(
+        alignment_gate,
+        requested_quantity=entry_filled_quantity,
+        probe_quantity=alignment_gate.get('probe_quantity') or 1,
+    )
+    closed_quantity = _safe_decimal(outcome.closed_quantity)
+    open_quantity = _safe_decimal(outcome.open_quantity)
+    outcome_resolved = bool(
+        (closed_quantity or Decimal('0')) > Decimal('0')
+        and (gross_pnl is not None or realized_return is not None)
+    )
     point_in_time = _build_point_in_time_context(snapshot)
     point_in_time.update(
         {
@@ -460,6 +547,11 @@ def _actual_short_term_outcome_to_wait_conflict_trade(
             'target_trade_date': outcome.target_trade_date.isoformat(),
             'entry_plan_item_id': plan_row.id,
             'actual_execution_outcome_id': outcome.id,
+            'lifecycle_status': outcome.lifecycle_status,
+            'entry_filled_quantity': _to_json_number(entry_filled_quantity),
+            'closed_quantity': _to_json_number(closed_quantity),
+            'open_quantity': _to_json_number(open_quantity),
+            'realized_outcome_available': outcome_resolved,
             'signal_decider_alignment': alignment_gate.get('signal_decider_alignment'),
             'alignment_gate_action': alignment_gate.get('alignment_gate_action'),
             'alignment_gate_reason': alignment_gate.get('alignment_gate_reason'),
@@ -476,13 +568,18 @@ def _actual_short_term_outcome_to_wait_conflict_trade(
         symbol=snapshot.symbol,
         market_date=plan_row.source_market_date,
         policy_version=snapshot.policy_version,
-        baseline_gross_pnl_krw=gross_pnl or Decimal('0'),
+        baseline_gross_pnl_krw=gross_pnl if gross_pnl is not None else Decimal('0'),
         baseline_return_pct=realized_return,
         baseline_notional_krw=notional,
         outcome_source='actual_short_term_execution_outcome',
         point_in_time=point_in_time,
         decision_timestamp=snapshot.feedback_received_at or snapshot.created_at,
         alignment_gate=alignment_gate,
+        outcome_resolved=outcome_resolved,
+        lifecycle_status=outcome.lifecycle_status,
+        entry_filled_quantity=entry_filled_quantity,
+        closed_quantity=closed_quantity,
+        open_quantity=open_quantity,
     )
 
 
@@ -704,6 +801,7 @@ class DeciderReplayRepository:
                     SignalDeciderExecutionPlanItem.decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME,
                     SignalDeciderExecutionPlanItem.source_market_date >= market_date_from,
                     SignalDeciderExecutionPlanItem.source_market_date <= market_date_to,
+                    SignalDeciderActualExecutionOutcome.entry_filled_quantity > 0,
                 )
                 .order_by(
                     SignalDeciderExecutionPlanItem.source_market_date.asc(),
@@ -714,47 +812,17 @@ class DeciderReplayRepository:
             )
             if symbols:
                 stmt = stmt.where(SignalDeciderActualExecutionOutcome.symbol.in_(list(symbols)))
-            rows = [
-                row
-                for row in session.execute(stmt).all()
-                if row[0].realized_pnl_krw is not None or row[0].realized_return_pct is not None
-            ]
+            rows = list(session.execute(stmt).all())
             if not rows:
                 return []
 
-            source_dates = sorted({row[1].source_market_date for row in rows})
-            signal_symbols = sorted({row[0].symbol for row in rows})
-            signal_stmt = (
-                select(SignalDeciderDecisionSnapshot)
-                .where(
-                    SignalDeciderDecisionSnapshot.agent_name == SIGNAL_DECIDER_AGENT_NAME,
-                    SignalDeciderDecisionSnapshot.market_date.in_(source_dates),
-                    SignalDeciderDecisionSnapshot.symbol.in_(signal_symbols),
-                )
-                .order_by(
-                    SignalDeciderDecisionSnapshot.market_date.asc(),
-                    SignalDeciderDecisionSnapshot.symbol.asc(),
-                    SignalDeciderDecisionSnapshot.feedback_received_at.desc(),
-                    SignalDeciderDecisionSnapshot.created_at.desc(),
-                    SignalDeciderDecisionSnapshot.id.desc(),
-                )
-            )
-            signal_by_context: dict[tuple[date, str], dict[str, Any]] = {}
-            for signal_row in session.execute(signal_stmt).scalars().all():
-                key = (signal_row.market_date, signal_row.symbol)
-                if key in signal_by_context:
-                    continue
-                signal_by_context[key] = build_signal_decider_alignment_context(signal_row) or {}
-
             trades: list[DeciderReplayTrade] = []
             for outcome, plan_row, snapshot in rows:
-                signal_context = signal_by_context.get((plan_row.source_market_date, outcome.symbol))
                 trades.append(
                     _actual_short_term_outcome_to_wait_conflict_trade(
                         snapshot=snapshot,
                         plan_row=plan_row,
                         outcome=outcome,
-                        signal_decider_context=signal_context,
                         cost_assumptions=cost_assumptions,
                         gate_mode=gate_mode,
                     )
@@ -1109,11 +1177,40 @@ def _wait_conflict_reason(trade: DeciderReplayTrade) -> list[str]:
     return [reason] if reason else ['signal_decider_wait_conflict_gate']
 
 
+def _unresolved_wait_conflict_example(trade: DeciderReplayTrade) -> dict[str, Any]:
+    gate = _trade_alignment_gate(trade)
+    return {
+        'snapshot_id': trade.snapshot_id,
+        'replay_trade_id': trade.replay_trade_id,
+        'entry_plan_item_id': trade.point_in_time.get('entry_plan_item_id'),
+        'actual_execution_outcome_id': trade.point_in_time.get('actual_execution_outcome_id'),
+        'source_market_date': trade.point_in_time.get('source_market_date') or trade.market_date.isoformat(),
+        'target_trade_date': trade.point_in_time.get('target_trade_date'),
+        'symbol': trade.symbol,
+        'lifecycle_status': trade.lifecycle_status,
+        'entry_filled_quantity': _to_json_number(trade.entry_filled_quantity),
+        'closed_quantity': _to_json_number(trade.closed_quantity),
+        'open_quantity': _to_json_number(trade.open_quantity),
+        'realized_pnl_krw': (
+            _to_json_number(_round_money(trade.baseline_gross_pnl_krw))
+            if trade.outcome_resolved
+            else None
+        ),
+        'signal_decider_alignment': gate.get('signal_decider_alignment'),
+        'alignment_gate_action': gate.get('alignment_gate_action'),
+        'alignment_evidence_status': gate.get('evidence_status'),
+        'reason': gate.get('alignment_gate_reason'),
+    }
+
+
 def _build_wait_conflict_markdown_summary(
     *,
     request: dict[str, Any],
     summary: dict[str, Any],
     examples: Sequence[dict[str, Any]],
+    weeks: Sequence[dict[str, Any]],
+    unresolved_open_candidates: Sequence[dict[str, Any]],
+    promotion_readiness: dict[str, Any],
 ) -> str:
     lines = [
         '# Short-term WAIT-conflict gate replay',
@@ -1129,12 +1226,51 @@ def _build_wait_conflict_markdown_summary(
         f'- Skipped winners: {summary["skipped_winners"]}',
         f'- Gross P/L delta KRW: {summary["gross_pnl_delta_krw"]}',
         f'- Estimated net P/L delta KRW: {summary["estimated_net_pnl_delta_krw"]}',
+        f'- Unresolved/open candidates: {summary["unresolved_open_candidate_count"]}',
+        f'- Missing alignment evidence: {summary["missing_alignment_evidence_count"]}',
+        f'- Promotion ready: {str(bool(promotion_readiness.get("ready"))).lower()}',
+        '',
+        '## Completed-week evidence',
+        '',
+        '| week | resolved | unresolved/open | skipped losses | skipped winners | net delta KRW |',
+        '| --- | ---: | ---: | ---: | ---: | ---: |',
     ]
+    for week in weeks:
+        week_summary = week['summary']
+        lines.append(
+            '| {start}..{end} | {resolved} | {unresolved} | {losses} | {winners} | {delta} |'.format(
+                start=week['week_start'],
+                end=week['week_end'],
+                resolved=week_summary['baseline_trade_count'],
+                unresolved=week_summary['unresolved_open_candidate_count'],
+                losses=week_summary['skipped_losses'],
+                winners=week_summary['skipped_winners'],
+                delta=week_summary['estimated_net_pnl_delta_krw'],
+            )
+        )
     if summary.get('empty_data_reason'):
         lines.append(f'- Empty-data reason: {summary["empty_data_reason"]}')
-    lines.extend(['', '## Blocked examples'])
+    lines.extend(['', '## Unresolved/open candidates'])
+    if not unresolved_open_candidates:
+        lines.append('No unresolved or open filled candidates.')
+    else:
+        lines.append('| source date | execution date | symbol | lifecycle | closed qty | open qty | alignment |')
+        lines.append('| --- | --- | --- | --- | ---: | ---: | --- |')
+        for candidate in unresolved_open_candidates:
+            lines.append(
+                '| {source} | {target} | {symbol} | {lifecycle} | {closed} | {open_qty} | {alignment} |'.format(
+                    source=candidate.get('source_market_date'),
+                    target=candidate.get('target_trade_date') or '',
+                    symbol=candidate.get('symbol'),
+                    lifecycle=candidate.get('lifecycle_status') or 'unresolved',
+                    closed=candidate.get('closed_quantity'),
+                    open_qty=candidate.get('open_quantity'),
+                    alignment=candidate.get('signal_decider_alignment') or 'missing_alignment_evidence',
+                )
+            )
+    lines.extend(['', '## Blocked candidate examples'])
     if not examples:
-        lines.append('No blocked WAIT-conflict examples.')
+        lines.append('No blocked candidate examples.')
         return '\n'.join(lines)
     lines.append('| source date | execution date | symbol | reason | gross pnl KRW | return |')
     lines.append('| --- | --- | --- | --- | ---: | ---: |')
@@ -1264,8 +1400,10 @@ class DeciderReplayService:
     def replay_wait_conflict_gate(
         self,
         *,
-        market_date_from: str | date = DEFAULT_WAIT_CONFLICT_REPLAY_MARKET_DATE_FROM,
-        market_date_to: str | date = DEFAULT_WAIT_CONFLICT_REPLAY_MARKET_DATE_TO,
+        market_date_from: str | date | None = None,
+        market_date_to: str | date | None = None,
+        completed_weeks: int = DEFAULT_WAIT_CONFLICT_COMPLETED_WEEKS,
+        as_of_date_kst: str | date | None = None,
         symbols: Sequence[str] | str | None = None,
         fee_bps: Decimal | float | int | str = Decimal('0'),
         slippage_bps: Decimal | float | int | str = Decimal('0'),
@@ -1273,10 +1411,23 @@ class DeciderReplayService:
         gate_mode: str = 'hard_block',
         top_examples_limit: int = DEFAULT_TOP_EXAMPLES_LIMIT,
     ) -> dict[str, Any]:
-        normalized_from = _normalize_market_date(market_date_from)
-        normalized_to = _normalize_market_date(market_date_to)
+        if (market_date_from is None) != (market_date_to is None):
+            raise ValueError('market_date_from and market_date_to must be provided together')
+        if market_date_from is None:
+            week_windows = _completed_week_windows(
+                as_of_date_kst=as_of_date_kst,
+                completed_weeks=completed_weeks,
+            )
+            normalized_from, normalized_to = week_windows[0][0], week_windows[-1][1]
+            window_mode = 'rolling_completed_weeks'
+        else:
+            normalized_from = _normalize_market_date(market_date_from)
+            normalized_to = _normalize_market_date(market_date_to)
+            week_windows = _explicit_week_windows(normalized_from, normalized_to)
+            window_mode = 'explicit_source_date_range'
         if normalized_from > normalized_to:
             raise ValueError('market_date_from must be on or before market_date_to')
+        resolved_gate_mode = normalize_alignment_gate_mode(gate_mode)
         normalized_symbols = _normalize_symbols(symbols)
         resolved_costs = DeciderReplayCostAssumptions(
             fee_bps=_normalize_non_negative_decimal(fee_bps, name='fee_bps'),
@@ -1291,29 +1442,113 @@ class DeciderReplayService:
             market_date_to=normalized_to,
             symbols=normalized_symbols or None,
             cost_assumptions=resolved_costs,
-            gate_mode=gate_mode,
+            gate_mode=resolved_gate_mode,
         )
 
-        blocked = [
-            trade
-            for trade in trades
-            if _trade_alignment_gate(trade).get('signal_decider_alignment')
-            == SIGNAL_DECIDER_ALIGNMENT_WAIT_CONFLICT_BLOCK
-            and _trade_alignment_gate(trade).get('alignment_gate_action') == ALIGNMENT_GATE_ACTION_BLOCK
-        ]
-        allowed_by_override = [
-            trade
-            for trade in trades
-            if _trade_alignment_gate(trade).get('signal_decider_alignment')
-            == SIGNAL_DECIDER_ALIGNMENT_WAIT_CONFLICT_OVERRIDE
-        ]
-        kept = [trade for trade in trades if trade not in blocked]
-        baseline = _metric_block(trades, cost_assumptions=resolved_costs)
-        candidate = _metric_block(kept, cost_assumptions=resolved_costs)
-        gross_delta = _safe_decimal_or_zero(candidate['gross_pnl_krw']) - _safe_decimal_or_zero(baseline['gross_pnl_krw'])
-        net_delta = _safe_decimal_or_zero(candidate['estimated_net_pnl_krw']) - _safe_decimal_or_zero(
-            baseline['estimated_net_pnl_krw']
-        )
+        def summarize(scope: Sequence[DeciderReplayTrade]) -> dict[str, Any]:
+            resolved = [trade for trade in scope if trade.outcome_resolved]
+            blocked = [
+                trade
+                for trade in scope
+                if _trade_alignment_gate(trade).get('alignment_gate_action') == ALIGNMENT_GATE_ACTION_BLOCK
+            ]
+            downsized = [
+                trade
+                for trade in scope
+                if _trade_alignment_gate(trade).get('alignment_gate_action')
+                == ALIGNMENT_GATE_ACTION_DOWNSIZE_PROBE
+            ]
+            allowed_by_override = [
+                trade
+                for trade in scope
+                if _trade_alignment_gate(trade).get('signal_decider_alignment')
+                == SIGNAL_DECIDER_ALIGNMENT_WAIT_CONFLICT_OVERRIDE
+                and (_trade_alignment_gate(trade).get('override') or {}).get('allowed') is True
+            ]
+            blocked_resolved = [trade for trade in blocked if trade.outcome_resolved]
+            candidate_resolved: list[DeciderReplayTrade] = []
+            for trade in resolved:
+                if trade in blocked:
+                    continue
+                if trade in downsized:
+                    gate = _trade_alignment_gate(trade)
+                    requested = _safe_decimal(gate.get('requested_quantity'))
+                    final = _safe_decimal(gate.get('final_quantity'))
+                    ratio = (
+                        min(max(final / requested, Decimal('0')), Decimal('1'))
+                        if requested is not None and requested > 0 and final is not None
+                        else Decimal('0')
+                    )
+                    candidate_resolved.append(
+                        replace(
+                            trade,
+                            baseline_gross_pnl_krw=trade.baseline_gross_pnl_krw * ratio,
+                            baseline_notional_krw=trade.baseline_notional_krw * ratio,
+                        )
+                    )
+                else:
+                    candidate_resolved.append(trade)
+            unresolved = [
+                trade
+                for trade in scope
+                if not trade.outcome_resolved or (trade.open_quantity or Decimal('0')) > Decimal('0')
+            ]
+            baseline = _metric_block(resolved, cost_assumptions=resolved_costs)
+            candidate = _metric_block(candidate_resolved, cost_assumptions=resolved_costs)
+            gross_delta = _safe_decimal_or_zero(candidate['gross_pnl_krw']) - _safe_decimal_or_zero(
+                baseline['gross_pnl_krw']
+            )
+            net_delta = _safe_decimal_or_zero(candidate['estimated_net_pnl_krw']) - _safe_decimal_or_zero(
+                baseline['estimated_net_pnl_krw']
+            )
+            skipped_loss_pnl = sum(
+                (trade.baseline_gross_pnl_krw for trade in blocked_resolved if trade.baseline_gross_pnl_krw < 0),
+                Decimal('0'),
+            )
+            skipped_winner_pnl = sum(
+                (trade.baseline_gross_pnl_krw for trade in blocked_resolved if trade.baseline_gross_pnl_krw > 0),
+                Decimal('0'),
+            )
+            missing_alignment = [
+                trade
+                for trade in scope
+                if _trade_alignment_gate(trade).get('evidence_status') == 'missing'
+                or _trade_alignment_gate(trade).get('signal_decider_alignment') == 'missing_alignment_evidence'
+            ]
+            return {
+                'actual_filled_candidate_count': len(scope),
+                'baseline_trade_count': baseline['trade_count'],
+                'candidate_trade_count': candidate['trade_count'],
+                'blocked_candidate_count': len(blocked),
+                'downsized_candidate_count': len(downsized),
+                'allowed_by_override_count': len(allowed_by_override),
+                'allowed_non_conflict_count': max(
+                    len(scope) - len(blocked) - len(downsized) - len(allowed_by_override),
+                    0,
+                ),
+                'unresolved_open_candidate_count': len(unresolved),
+                'missing_alignment_evidence_count': len(missing_alignment),
+                'skipped_losses': sum(1 for trade in blocked_resolved if trade.baseline_gross_pnl_krw < 0),
+                'skipped_winners': sum(1 for trade in blocked_resolved if trade.baseline_gross_pnl_krw > 0),
+                'skipped_losses_gross_pnl_krw': _to_json_number(_round_money(skipped_loss_pnl)),
+                'skipped_losses_avoided_krw': _to_json_number(_round_money(-skipped_loss_pnl)),
+                'skipped_winners_gross_pnl_krw': _to_json_number(_round_money(skipped_winner_pnl)),
+                'gross_pnl_delta_krw': _to_json_number(_round_money(gross_delta)),
+                'estimated_net_pnl_delta_krw': _to_json_number(_round_money(net_delta)),
+                'baseline_realized_pnl_krw': baseline['gross_pnl_krw'],
+                'counterfactual_realized_pnl_krw': candidate['gross_pnl_krw'],
+                'net_pnl_delta_krw': _to_json_number(_round_money(gross_delta)),
+                'baseline': baseline,
+                'candidate': candidate,
+                'outcome_sources': _count_by_key(scope, key='outcome_source'),
+                'alignment_counts': _count_alignment(scope),
+                '_blocked': blocked,
+                '_unresolved': unresolved,
+            }
+
+        summary = summarize(trades)
+        blocked = summary.pop('_blocked')
+        unresolved = summary.pop('_unresolved')
         examples = _sort_examples(
             [
                 _example_from_trade(
@@ -1322,15 +1557,105 @@ class DeciderReplayService:
                     cost_assumptions=resolved_costs,
                 )
                 for trade in blocked
+                if trade.outcome_resolved
             ]
         )[:resolved_top_examples_limit]
+        unresolved_open_candidates = [
+            _unresolved_wait_conflict_example(trade)
+            for trade in sorted(unresolved, key=lambda item: (item.market_date, item.symbol, item.replay_trade_id))
+        ]
+        weeks: list[dict[str, Any]] = []
+        for week_start, week_end in week_windows:
+            week_summary = summarize(
+                [trade for trade in trades if week_start <= trade.market_date <= week_end]
+            )
+            week_summary.pop('_blocked')
+            week_summary.pop('_unresolved')
+            weeks.append(
+                {
+                    'week_start': week_start.isoformat(),
+                    'week_end': week_end.isoformat(),
+                    'summary': week_summary,
+                }
+            )
+        completed_week_count = sum(
+            1 for start, end in week_windows if start.weekday() == 0 and end.weekday() == 4 and (end - start).days == 4
+        )
+        wait_conflict_trades = [
+            trade
+            for trade in trades
+            if _trade_alignment_gate(trade).get('signal_decider_alignment')
+            == SIGNAL_DECIDER_ALIGNMENT_WAIT_CONFLICT_BLOCK
+        ]
+        resolved_wait_conflict_count = sum(1 for trade in wait_conflict_trades if trade.outcome_resolved)
+        unresolved_wait_conflict_count = sum(
+            1
+            for trade in wait_conflict_trades
+            if not trade.outcome_resolved or (trade.open_quantity or Decimal('0')) > Decimal('0')
+        )
+        wait_conflict_total = len(wait_conflict_trades)
+        unresolved_ratio = (
+            Decimal(unresolved_wait_conflict_count) / Decimal(wait_conflict_total)
+            if wait_conflict_total > 0
+            else None
+        )
+        promotion_thresholds = {
+            'minimum_completed_weeks': DEFAULT_WAIT_CONFLICT_COMPLETED_WEEKS,
+            'minimum_resolved_wait_conflicts': 20,
+            'require_positive_net_pnl_delta': True,
+            'require_avoided_losses_exceed_skipped_winners': True,
+            'maximum_unresolved_ratio': 0.25,
+            'manual_approval_required': True,
+        }
+        promotion_checks = {
+            'completed_weeks_met': completed_week_count >= promotion_thresholds['minimum_completed_weeks'],
+            'resolved_wait_conflicts_met': (
+                resolved_wait_conflict_count >= promotion_thresholds['minimum_resolved_wait_conflicts']
+            ),
+            'positive_net_pnl_delta': Decimal(str(summary['net_pnl_delta_krw'])) > 0,
+            'avoided_losses_exceed_skipped_winners': Decimal(
+                str(summary['skipped_losses_avoided_krw'])
+            ) > Decimal(str(summary['skipped_winners_gross_pnl_krw'])),
+            'unresolved_ratio_within_limit': (
+                unresolved_ratio is not None
+                and unresolved_ratio <= Decimal(str(promotion_thresholds['maximum_unresolved_ratio']))
+            ),
+        }
+        evidence_threshold_met = all(promotion_checks.values())
+        promotion_readiness = {
+            'ready': False,
+            'ready_for_manual_approval': evidence_threshold_met,
+            'manual_approval_recorded': False,
+            'automatic_activation': False,
+            'thresholds': promotion_thresholds,
+            'checks': promotion_checks,
+            'unresolved_ratio': _to_ratio_number(float(unresolved_ratio)) if unresolved_ratio is not None else None,
+        }
+        summary['completed_week_count'] = completed_week_count
+        summary['resolved_wait_conflict_count'] = resolved_wait_conflict_count
+        summary['unresolved_wait_conflict_count'] = unresolved_wait_conflict_count
+        summary['empty_data_reason'] = (
+            'no_actual_short_term_entry_fills_in_range'
+            if not trades
+            else 'no_resolved_actual_short_term_execution_outcomes_in_range'
+            if summary['baseline_trade_count'] == 0
+            else None
+        )
         request = {
             'market_date_from': normalized_from.isoformat(),
             'market_date_to': normalized_to.isoformat(),
             'agent_name': SHORT_TERM_DECIDER_AGENT_NAME,
             'symbols': normalized_symbols,
-            'candidate_gate_mode': gate_mode,
+            'candidate_gate_mode': resolved_gate_mode,
+            'window_mode': window_mode,
+            'as_of_date_kst': (
+                _normalize_market_date(as_of_date_kst).isoformat()
+                if as_of_date_kst is not None
+                else None
+            ),
+            'completed_weeks': completed_week_count,
             'baseline_source': 'actual_short_term_execution_outcomes',
+            'actual_outcomes_only': True,
             'date_window_basis': 'source_market_date',
             'cost_assumptions': {
                 'fee_bps': _to_json_number(resolved_costs.fee_bps, places='0.000001'),
@@ -1339,41 +1664,29 @@ class DeciderReplayService:
             },
             'top_examples_limit': resolved_top_examples_limit,
         }
-        summary = {
-            'baseline_trade_count': baseline['trade_count'],
-            'candidate_trade_count': candidate['trade_count'],
-            'blocked_candidate_count': len(blocked),
-            'allowed_by_override_count': len(allowed_by_override),
-            'allowed_non_conflict_count': max(len(kept) - len(allowed_by_override), 0),
-            'skipped_losses': sum(1 for trade in blocked if trade.baseline_gross_pnl_krw < 0),
-            'skipped_winners': sum(1 for trade in blocked if trade.baseline_gross_pnl_krw > 0),
-            'skipped_losses_gross_pnl_krw': _to_json_number(
-                _round_money(sum((trade.baseline_gross_pnl_krw for trade in blocked if trade.baseline_gross_pnl_krw < 0), Decimal('0')))
-            ),
-            'skipped_winners_gross_pnl_krw': _to_json_number(
-                _round_money(sum((trade.baseline_gross_pnl_krw for trade in blocked if trade.baseline_gross_pnl_krw > 0), Decimal('0')))
-            ),
-            'gross_pnl_delta_krw': _to_json_number(_round_money(gross_delta)),
-            'estimated_net_pnl_delta_krw': _to_json_number(_round_money(net_delta)),
-            'baseline': baseline,
-            'candidate': candidate,
-            'outcome_sources': _count_by_key(trades, key='outcome_source'),
-            'alignment_counts': _count_alignment(trades),
-            'empty_data_reason': (
-                'no_actual_short_term_execution_outcomes_in_range'
-                if not trades
-                else None
-            ),
+        evidence = {
+            'actual_entry_fill_required': True,
+            'synthetic_outcomes_used': False,
+            'realized_candidate_count': summary['baseline_trade_count'],
+            'unresolved_open_candidate_count': summary['unresolved_open_candidate_count'],
+            'missing_alignment_evidence_count': summary['missing_alignment_evidence_count'],
         }
         markdown_summary = _build_wait_conflict_markdown_summary(
             request=request,
             summary=summary,
             examples=examples,
+            weeks=weeks,
+            unresolved_open_candidates=unresolved_open_candidates,
+            promotion_readiness=promotion_readiness,
         )
         return {
             'schema_version': WAIT_CONFLICT_GATE_REPLAY_SCHEMA_VERSION,
             'request': request,
             'summary': summary,
+            'evidence': evidence,
+            'weeks': weeks,
+            'unresolved_open_candidates': unresolved_open_candidates,
+            'promotion_readiness': promotion_readiness,
             'examples': examples,
             'markdown_summary': markdown_summary,
         }

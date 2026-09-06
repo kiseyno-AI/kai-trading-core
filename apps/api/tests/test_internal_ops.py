@@ -295,11 +295,33 @@ class InternalOpsTests(unittest.TestCase):
         self.assertEqual(result, payload)
         self.assertEqual(replay.call_args.kwargs['market_date_from'], '2026-06-29')
         self.assertEqual(replay.call_args.kwargs['market_date_to'], '2026-07-03')
+        self.assertEqual(replay.call_args.kwargs['completed_weeks'], 4)
+        self.assertIsNone(replay.call_args.kwargs['as_of_date_kst'])
         self.assertEqual(replay.call_args.kwargs['symbols'], ['005960', '013580'])
         self.assertEqual(replay.call_args.kwargs['fee_bps'], '1')
         self.assertEqual(replay.call_args.kwargs['slippage_bps'], '2')
         self.assertEqual(replay.call_args.kwargs['gate_mode'], 'hard_block')
         self.assertEqual(replay.call_args.kwargs['top_examples_limit'], 4)
+
+    def test_replay_short_term_wait_conflict_gate_supports_reproducible_rolling_window(self) -> None:
+        with (
+            patch('app.internal.ops.bootstrap_runtime'),
+            patch(
+                'app.internal.ops.decider_replay_service.replay_wait_conflict_gate',
+                return_value={'schema_version': 'short_term_wait_conflict_gate_replay_v1'},
+            ) as replay,
+        ):
+            ops.replay_short_term_wait_conflict_gate(
+                completed_weeks=6,
+                as_of_date_kst='2026-09-06',
+                gate_mode='downsize_probe',
+            )
+
+        self.assertIsNone(replay.call_args.kwargs['market_date_from'])
+        self.assertIsNone(replay.call_args.kwargs['market_date_to'])
+        self.assertEqual(replay.call_args.kwargs['completed_weeks'], 6)
+        self.assertEqual(replay.call_args.kwargs['as_of_date_kst'], '2026-09-06')
+        self.assertEqual(replay.call_args.kwargs['gate_mode'], 'downsize_probe')
 
     def test_compute_trending_ranks_uses_direct_store_call(self) -> None:
         with (

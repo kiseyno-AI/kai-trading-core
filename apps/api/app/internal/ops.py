@@ -503,8 +503,10 @@ def replay_decider_candidate_rules(
 
 def replay_short_term_wait_conflict_gate(
     *,
-    market_date_from: str = '2026-06-29',
-    market_date_to: str = '2026-07-03',
+    market_date_from: str | None = None,
+    market_date_to: str | None = None,
+    completed_weeks: int = 4,
+    as_of_date_kst: str | None = None,
     symbols: str | None = None,
     fee_bps: str | float | int = 0,
     slippage_bps: str | float | int = 0,
@@ -517,6 +519,8 @@ def replay_short_term_wait_conflict_gate(
     return decider_replay_service.replay_wait_conflict_gate(
         market_date_from=market_date_from,
         market_date_to=market_date_to,
+        completed_weeks=completed_weeks,
+        as_of_date_kst=as_of_date_kst,
         symbols=parsed_symbols,
         fee_bps=fee_bps,
         slippage_bps=slippage_bps,
@@ -1249,8 +1253,10 @@ def _build_parser() -> argparse.ArgumentParser:
         epilog=(
             'Example:\n'
             '  python3.11 -m app.internal.ops agent-short-term-wait-conflict-replay \\\n'
-            '    --market-date-from 2026-06-29 --market-date-to 2026-07-03 \\\n'
+            '    --completed-weeks 4 --as-of-date-kst 2026-09-06 \\\n'
             '    --output-format markdown\n\n'
+            'By default, the window is the last four completed Monday-Friday KST trading weeks. '
+            'An explicit --market-date-from/--market-date-to pair overrides the rolling window. '
             'The market-date window is the short-term decision/source market date, not the next-open '
             'target execution date. '
             'This report uses actual short-term execution outcome rows only. It does not fall back to synthetic '
@@ -1259,13 +1265,21 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     wait_conflict_replay_parser.add_argument(
         '--market-date-from',
-        default='2026-06-29',
-        help='Inclusive source decision market date lower bound',
+        help='Inclusive source decision market date lower bound; requires --market-date-to',
     )
     wait_conflict_replay_parser.add_argument(
         '--market-date-to',
-        default='2026-07-03',
-        help='Inclusive source decision market date upper bound',
+        help='Inclusive source decision market date upper bound; requires --market-date-from',
+    )
+    wait_conflict_replay_parser.add_argument(
+        '--completed-weeks',
+        type=int,
+        default=4,
+        help='Rolling completed Monday-Friday KST weeks; minimum and default is 4',
+    )
+    wait_conflict_replay_parser.add_argument(
+        '--as-of-date-kst',
+        help='Optional reproducible KST as-of date for rolling-window resolution',
     )
     wait_conflict_replay_parser.add_argument('--symbols', help='Optional comma-separated symbol list')
     wait_conflict_replay_parser.add_argument('--fee-bps', default='0', help='Per-side fee in basis points')
@@ -1277,7 +1291,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     wait_conflict_replay_parser.add_argument(
         '--gate-mode',
-        choices=('hard_block', 'report_only'),
+        choices=('hard_block', 'downsize_probe', 'report_only'),
         default='hard_block',
         help='Candidate gate mode for replay comparison only; this does not alter live runtime settings',
     )
@@ -1568,6 +1582,8 @@ def main(argv: Iterable[str] | None = None) -> int:
         payload = replay_short_term_wait_conflict_gate(
             market_date_from=args.market_date_from,
             market_date_to=args.market_date_to,
+            completed_weeks=args.completed_weeks,
+            as_of_date_kst=args.as_of_date_kst,
             symbols=args.symbols,
             fee_bps=args.fee_bps,
             slippage_bps=args.slippage_bps,

@@ -1902,11 +1902,16 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         short_plan_item_id = self._seed_short_term_plan_item(snapshot_id=short_snapshot_id)
         alignment_gate = {
             'schema_version': 'signal_decider_alignment_gate_v1',
+            'enforcement_mode': 'report_only',
             'signal_decider_alignment': 'wait_conflict_block',
             'alignment_gate_action': 'report_only_block_candidate',
             'alignment_gate_reason': 'Signal-decider is WAIT for the same symbol/date context.',
             'signal_decider_decision_snapshot_id': 991,
             'decision_snapshot_id': 991,
+            'enforcement_decision': 'allowed_report_only',
+            'requested_quantity': 29,
+            'final_quantity': 29,
+            'probe_quantity': 1,
         }
         with session_scope() as session:
             row = session.get(SignalDeciderExecutionPlanItem, short_plan_item_id)
@@ -1970,6 +1975,9 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(short_entry['risk_context']['generic_action'], 'buy')
         self.assertEqual(short_entry['risk_context']['signal_decider_alignment'], 'wait_conflict_block')
         self.assertEqual(short_entry['risk_context']['alignment_gate_action'], 'report_only_block_candidate')
+        self.assertEqual(short_entry['risk_context']['final_enforcement_decision'], 'allowed_report_only')
+        self.assertEqual(short_entry['risk_context']['requested_quantity'], '29')
+        self.assertEqual(short_entry['risk_context']['final_quantity'], '29')
         self.assertEqual(short_entry['risk_context']['alignment_signal_decider_decision_snapshot_id'], 991)
         self.assertEqual(short_entry['risk_context']['entry_execution_mode'], 'pending_trigger_limit')
         self.assertTrue(short_entry['risk_context']['monitoring_candidate'])
@@ -1987,6 +1995,9 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(short_entry['risk_context']['conviction_score_10'], 6.5)
         self.assertEqual(short_entry['risk_context']['decision_run_id'], 'short-run-1')
         self.assertEqual(short_entry['quantity_policy']['type'], 'exec_agent_sized')
+        self.assertEqual(short_entry['quantity_policy']['final_enforcement_decision'], 'allowed_report_only')
+        self.assertEqual(short_entry['quantity_policy']['requested_quantity'], '29')
+        self.assertEqual(short_entry['quantity_policy']['final_quantity'], '29')
         self.assertEqual(Decimal(str(short_entry['quantity_policy']['budget_krw'])), Decimal('1500000'))
         self.assertEqual(short_entry['quantity_policy']['allocation_mode'], 'specified')
         self.assertEqual(short_entry['quantity_policy']['account_reference'], self.account_reference)
@@ -2024,9 +2035,13 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(handoff['traceability']['handoff_intent'], 'intraday_watch_buy')
         self.assertEqual(handoff['traceability']['signal_decider_alignment'], 'wait_conflict_block')
         self.assertEqual(handoff['traceability']['alignment_gate_action'], 'report_only_block_candidate')
+        self.assertEqual(handoff['traceability']['final_enforcement_decision'], 'allowed_report_only')
+        self.assertEqual(handoff['traceability']['requested_quantity'], 29)
+        self.assertEqual(handoff['traceability']['final_quantity'], 29)
         self.assertEqual(handoff['decider_output']['generic_action'], 'buy')
         self.assertEqual(handoff['decider_output']['handoff_intent'], 'intraday_watch_buy')
         self.assertEqual(handoff['decider_output']['signal_decider_alignment'], 'wait_conflict_block')
+        self.assertEqual(handoff['decider_output']['final_enforcement_decision'], 'allowed_report_only')
         self.assertEqual(handoff['traceability']['core_plan_item_id'], short_entry['risk_context']['core_plan_item_id'])
         self.assertEqual(handoff['decider_input_context']['request_payload'], decider_request_payload)
         self.assertEqual(handoff['decider_input_context']['input_feature_snapshot_payload'], decider_input_features)
@@ -2067,6 +2082,62 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         signal_item = next(item for item in result['items'] if item['decision_agent_name'] == 'signal-decider')
         self.assertEqual(signal_item['execution_status'], EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING)
         self.assertEqual(result['summary']['delegated_for_exec_agent_sizing_count'], 2)
+
+    async def test_dispatch_next_open_plan_binds_core_downsize_quantity(self) -> None:
+        short_snapshot_id = self._seed_short_term_snapshot()
+        short_plan_item_id = self._seed_short_term_plan_item(snapshot_id=short_snapshot_id)
+        alignment_gate = {
+            'schema_version': 'signal_decider_alignment_gate_v1',
+            'enforcement_mode': 'downsize_probe',
+            'signal_decider_alignment': 'wait_conflict_block',
+            'alignment_gate_action': 'downsize_probe',
+            'alignment_gate_reason': 'WAIT conflict reduced to a deterministic probe.',
+            'signal_decider_decision_snapshot_id': 991,
+            'override': {'allowed': False},
+            'enforcement_decision': 'downsized',
+            'requested_quantity': 29,
+            'final_quantity': 2,
+            'probe_quantity': 2,
+        }
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, short_plan_item_id)
+            row.validation_payload = {
+                **(row.validation_payload or {}),
+                'alignment_gate': alignment_gate,
+                'final_enforcement_decision': 'downsized',
+                'requested_quantity': 29,
+                'final_quantity': 2,
+            }
+            row.traceability_payload = {
+                **(row.traceability_payload or {}),
+                'alignment_gate': alignment_gate,
+                'final_enforcement_decision': 'downsized',
+                'requested_quantity': 29,
+                'final_quantity': 2,
+            }
+
+        await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=False,
+            dry_run=False,
+            force=True,
+            trigger='test',
+        )
+
+        short_payload = next(
+            payload
+            for payload in self.client.post_calls
+            if payload['metadata']['decision_agent_name'] == 'short-term-decider'
+        )
+        entry = next(item for item in short_payload['items'] if item['intent'] == EXEC_INTENT_INTRADAY_WATCH_BUY)
+        self.assertEqual(entry['quantity_policy']['type'], 'fixed_quantity')
+        self.assertEqual(entry['quantity_policy']['quantity'], '2')
+        self.assertEqual(entry['quantity_policy']['enforcement_source'], 'core_wait_conflict_alignment_gate')
+        self.assertEqual(entry['quantity_policy']['requested_quantity'], '29')
+        self.assertEqual(entry['quantity_policy']['final_quantity'], '2')
+        self.assertEqual(entry['risk_context']['final_enforcement_decision'], 'downsized')
+        self.assertEqual(entry['risk_context']['requested_quantity'], '29')
+        self.assertEqual(entry['risk_context']['final_quantity'], '2')
 
     async def test_readback_promotes_blocked_planned_short_term_watch_to_delegated(self) -> None:
         overview, short_item, short_plan_item_id = await self._readback_stale_short_term_watch(

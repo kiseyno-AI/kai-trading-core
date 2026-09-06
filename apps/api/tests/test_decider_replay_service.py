@@ -1,6 +1,8 @@
 from contextlib import contextmanager
 from datetime import date, datetime, timezone
 from decimal import Decimal
+import json
+from pathlib import Path
 import unittest
 from unittest.mock import patch
 
@@ -12,6 +14,7 @@ from app.agent_context.decider_replay_service import (
     DeciderReplayRepository,
     DeciderReplayService,
     DeciderReplayTrade,
+    _replay_alignment_gate,
 )
 from app.agent_context.roles import SHORT_TERM_DECIDER_AGENT_NAME
 from app.db_models import (
@@ -58,12 +61,17 @@ def _trade(
     *,
     snapshot_id: int,
     symbol: str,
-    gross_pnl_krw: int,
+    gross_pnl_krw: int | float,
     trigger_price_drift_pct: float | None,
     confidence_score_10: float = 7.0,
     market_date: str = '2026-06-16',
     alignment_gate: dict | None = None,
     outcome_source: str = 'decider_post_decision_evaluation',
+    outcome_resolved: bool = True,
+    lifecycle_status: str | None = None,
+    entry_filled_quantity: int = 10,
+    closed_quantity: int | None = 10,
+    open_quantity: int | None = 0,
 ) -> DeciderReplayTrade:
     gross = Decimal(str(gross_pnl_krw))
     return DeciderReplayTrade(
@@ -95,6 +103,11 @@ def _trade(
         },
         decision_timestamp=datetime(2026, 6, 16, 6, 0, tzinfo=timezone.utc),
         alignment_gate=alignment_gate,
+        outcome_resolved=outcome_resolved,
+        lifecycle_status=lifecycle_status,
+        entry_filled_quantity=Decimal(entry_filled_quantity),
+        closed_quantity=Decimal(closed_quantity) if closed_quantity is not None else None,
+        open_quantity=Decimal(open_quantity) if open_quantity is not None else None,
     )
 
 
@@ -121,10 +134,28 @@ def _alignment_gate(alignment: str, action: str) -> dict:
         'alignment_gate_action': action,
         'alignment_gate_reason': f'{alignment} test reason',
         'signal_decider_decision_snapshot_id': 900,
+        'override': {'allowed': alignment == 'wait_conflict_override'},
     }
 
 
 class DeciderReplayServiceTests(unittest.TestCase):
+    def test_replay_reinterprets_persisted_gate_without_recomputing_context(self) -> None:
+        persisted = _alignment_gate('wait_conflict_block', 'report_only_block_candidate')
+
+        hard_block = _replay_alignment_gate(persisted, gate_mode='hard_block')
+        downsize = _replay_alignment_gate(persisted, gate_mode='downsize_probe')
+        override = _replay_alignment_gate(
+            _alignment_gate('wait_conflict_override', 'allow_by_override'),
+            gate_mode='hard_block',
+        )
+        missing = _replay_alignment_gate(None, gate_mode='hard_block')
+
+        self.assertEqual(hard_block['alignment_gate_action'], 'block')
+        self.assertEqual(downsize['alignment_gate_action'], 'downsize_probe')
+        self.assertEqual(override['alignment_gate_action'], 'allow_by_override')
+        self.assertEqual(missing['signal_decider_alignment'], 'missing_alignment_evidence')
+        self.assertEqual(missing['alignment_gate_action'], 'block')
+
     def test_rule_skips_losing_buy_and_reports_avoided_loser(self) -> None:
         repository = FakeDeciderReplayRepository(
             [
@@ -327,8 +358,99 @@ class DeciderReplayServiceTests(unittest.TestCase):
         )
 
         self.assertEqual(result['summary']['baseline_trade_count'], 0)
-        self.assertEqual(result['summary']['empty_data_reason'], 'no_actual_short_term_execution_outcomes_in_range')
+        self.assertEqual(result['summary']['empty_data_reason'], 'no_actual_short_term_entry_fills_in_range')
         self.assertIn('actual short-term execution outcomes only', result['markdown_summary'])
+
+    def test_wait_conflict_gate_rolling_window_covers_four_completed_weeks(self) -> None:
+        repository = FakeDeciderReplayRepository([])
+        result = DeciderReplayService(repository=repository).replay_wait_conflict_gate(
+            as_of_date_kst='2026-09-06',
+        )
+
+        self.assertEqual(result['request']['market_date_from'], '2026-08-10')
+        self.assertEqual(result['request']['market_date_to'], '2026-09-04')
+        self.assertEqual(result['request']['window_mode'], 'rolling_completed_weeks')
+        self.assertEqual(len(result['weeks']), 4)
+        self.assertEqual(repository.wait_conflict_calls[0]['market_date_from'], date(2026, 8, 10))
+        self.assertEqual(repository.wait_conflict_calls[0]['market_date_to'], date(2026, 9, 4))
+
+    def test_wait_conflict_gate_separates_unresolved_open_candidates(self) -> None:
+        open_trade = _trade(
+            snapshot_id=200,
+            symbol='003550',
+            gross_pnl_krw=0,
+            trigger_price_drift_pct=None,
+            market_date='2026-09-01',
+            outcome_source='actual_short_term_execution_outcome',
+            alignment_gate=_alignment_gate('wait_conflict_block', 'block'),
+            outcome_resolved=False,
+            lifecycle_status='open',
+            closed_quantity=0,
+            open_quantity=8,
+        )
+        result = DeciderReplayService(
+            repository=FakeDeciderReplayRepository([], wait_conflict_trades=[open_trade])
+        ).replay_wait_conflict_gate(
+            market_date_from='2026-08-31',
+            market_date_to='2026-09-04',
+        )
+
+        self.assertEqual(result['summary']['baseline_trade_count'], 0)
+        self.assertEqual(result['summary']['unresolved_open_candidate_count'], 1)
+        self.assertEqual(result['unresolved_open_candidates'][0]['symbol'], '003550')
+        self.assertIsNone(result['unresolved_open_candidates'][0]['realized_pnl_krw'])
+
+    def test_issue_547_week_regression_matches_reported_counterfactual(self) -> None:
+        fixture_path = Path(__file__).parent / 'fixtures' / 'wait_conflict_week_2026-08-31.json'
+        fixture = json.loads(fixture_path.read_text())
+        conflicts = [
+            _trade(
+                snapshot_id=300 + index,
+                symbol=row['symbol'],
+                gross_pnl_krw=row['realized_pnl_krw'],
+                trigger_price_drift_pct=None,
+                market_date='2026-09-04',
+                outcome_source='actual_short_term_execution_outcome',
+                alignment_gate=_alignment_gate('wait_conflict_block', 'block'),
+            )
+            for index, row in enumerate(fixture['resolved_wait_conflicts'])
+        ]
+        non_blocked_balance = _trade(
+            snapshot_id=399,
+            symbol='__NON_BLOCKED_REALIZED__',
+            gross_pnl_krw=fixture['expected']['counterfactual_realized_pnl_krw'],
+            trigger_price_drift_pct=None,
+            market_date='2026-09-04',
+            outcome_source='actual_short_term_execution_outcome',
+            alignment_gate=_alignment_gate('aligned', 'allow'),
+        )
+        result = DeciderReplayService(
+            repository=FakeDeciderReplayRepository(
+                [],
+                wait_conflict_trades=[*conflicts, non_blocked_balance],
+            )
+        ).replay_wait_conflict_gate(
+            market_date_from=fixture['window_kst']['market_date_from'],
+            market_date_to=fixture['window_kst']['market_date_to'],
+        )
+
+        expected = fixture['expected']
+        self.assertEqual(result['summary']['skipped_losses'], expected['skipped_losses'])
+        self.assertEqual(
+            result['summary']['skipped_losses_avoided_krw'],
+            expected['skipped_losses_avoided_krw'],
+        )
+        self.assertEqual(result['summary']['skipped_winners'], expected['skipped_winners'])
+        self.assertEqual(
+            result['summary']['skipped_winners_gross_pnl_krw'],
+            expected['skipped_winners_gross_pnl_krw'],
+        )
+        self.assertEqual(result['summary']['baseline_realized_pnl_krw'], expected['baseline_realized_pnl_krw'])
+        self.assertEqual(
+            result['summary']['counterfactual_realized_pnl_krw'],
+            expected['counterfactual_realized_pnl_krw'],
+        )
+        self.assertEqual(result['summary']['net_pnl_delta_krw'], expected['net_pnl_delta_krw'])
 
 
 class DeciderReplayRepositoryTests(unittest.TestCase):

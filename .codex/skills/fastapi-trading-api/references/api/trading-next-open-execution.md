@@ -9,7 +9,7 @@ For dispatch-mode buy candidates, core sends sizing context as a candidate contr
 
 Short-term validation now preserves the decider request's `pre_decider_enrichment_context` in both `validation.pre_decider_enrichment_context` and `validation.short_term.pre_decider_enrichment_context`. Operators can inspect the quote/orderbook snapshot status, raw-vs-estimated trading value provenance, investor/short-selling flow, and sector-peer context that were available before dispatch validation.
 
-Short-term validation and traceability also preserve signal-decider alignment audit fields. Same-symbol `WAIT` conflicts are classified as `wait_conflict_block` or `wait_conflict_override`; the default live mode is report-only, so `alignment_gate_action="report_only_block_candidate"` records the candidate gate without vetoing the row. The linked signal-decider snapshot id is exposed as `alignment_signal_decider_decision_snapshot_id`.
+Short-term validation and traceability also preserve signal-decider alignment audit fields. Same-symbol `WAIT` conflicts are classified as `wait_conflict_block` or `wait_conflict_override`; the default live mode is report-only, while explicit `hard_block` and `downsize_probe` modes enforce zero or a deterministic probe quantity. Missing/stale context follows the same conservative action instead of being silently approved. The response exposes `final_enforcement_decision`, `requested_quantity`, `final_quantity`, and `alignment_signal_decider_decision_snapshot_id`.
 
 Validation now also preserves `decision_input_quality_context` for both `signal-decider` and `short-term-decider` rows. This reusable quality-provenance envelope separates data quality, market/setup edge, execution feasibility, and final buy-quality judgment. Stale or fallback quote snapshots and missing raw source turnover appear as hard blocks or major discounts in the envelope; empty news remains neutral secondary context. The envelope is informational in core-local validation and is passed to exec for account-aware sizing/risk decisions in dispatch mode.
 
@@ -155,6 +155,9 @@ Content-Type: application/json
       "alignment_gate_action": "report_only_block_candidate",
       "alignment_gate_reason": "Signal-decider is WAIT for the same symbol/date context and the short-term setup did not pass the stronger override threshold.",
       "alignment_signal_decider_decision_snapshot_id": 144,
+      "final_enforcement_decision": "allowed_report_only",
+      "requested_quantity": 30,
+      "final_quantity": 30,
       "blocker_reason": null,
       "data_quality_warnings": [],
       "planned_order_type": "limit",

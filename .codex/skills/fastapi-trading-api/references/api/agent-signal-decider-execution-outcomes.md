@@ -1,7 +1,7 @@
 # GET /agent-context/signal-decider/execution-outcomes
 
 ## Summary
-Reads dedicated actual execution outcomes for `signal-decider` driven trades. These rows stay separate from synthetic bar-based evaluation outcomes and link the decision snapshot to next-open entry execution, linked intraday auto-sell exits, stored broker orders, exec-runtime readback fills, fill events, and realized execution metrics.
+Reads dedicated actual execution outcomes for `signal-decider` and `short-term-decider` next-open plan trades. These rows stay separate from synthetic bar-based evaluation outcomes and link the decision snapshot to next-open entry execution, linked intraday auto-sell exits, stored broker orders, exec-runtime readback fills, fill events, and realized execution metrics. Short-term outcomes feed the WAIT-conflict weekly replay; unresolved/open entries remain explicit and receive no synthetic P/L.
 
 Rows are materialized from persisted core data only. Use `refresh=true` on this read for a bounded filtered refresh, or run the internal one-shot backfill command from `apps/api`:
 

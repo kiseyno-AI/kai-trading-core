@@ -72,13 +72,13 @@ class SignalDeciderExecutionOutcomeServiceTests(unittest.TestCase):
                 )
             )
 
-    def _seed_snapshot(self) -> int:
+    def _seed_snapshot(self, *, agent_name: str = 'signal-decider') -> int:
         with session_scope() as session:
             row = SignalDeciderDecisionSnapshot(
                 feedback_id=None,
                 market_date=self.market_date,
                 symbol=self.symbol,
-                agent_name='signal-decider',
+                agent_name=agent_name,
                 agent_version='test-agent',
                 decision_run_id=f'run-{self.symbol}',
                 feedback_received_at=datetime(2026, 4, 29, 6, 0, tzinfo=timezone.utc),
@@ -205,6 +205,7 @@ class SignalDeciderExecutionOutcomeServiceTests(unittest.TestCase):
         order_request_id: int | None,
         broker_order_row_id: int | None,
         execution_status: str,
+        decision_agent_name: str = 'signal-decider',
         validation_payload: dict | None = None,
         traceability_payload: dict | None = None,
         submission_payload: dict | None = None,
@@ -212,6 +213,7 @@ class SignalDeciderExecutionOutcomeServiceTests(unittest.TestCase):
         with session_scope() as session:
             row = SignalDeciderExecutionPlanItem(
                 execution_window=execution_window,
+                decision_agent_name=decision_agent_name,
                 decision_snapshot_id=snapshot_id,
                 order_request_id=order_request_id,
                 broker_order_row_id=broker_order_row_id,
@@ -568,6 +570,31 @@ class SignalDeciderExecutionOutcomeServiceTests(unittest.TestCase):
             ).scalar_one()
             self.assertEqual(row.exit_reason, 'target_hit')
             self.assertEqual(row.realized_pnl_krw, Decimal('20000.00'))
+
+    def test_list_outcomes_refresh_persists_short_term_exec_readback_fills(self) -> None:
+        snapshot_id = self._seed_snapshot(agent_name='short-term-decider')
+        entry_plan_item_id = self._seed_plan_item(
+            execution_window='next_open',
+            snapshot_id=snapshot_id,
+            planned_side='buy',
+            client_order_id='STDE-20260430-005930-DISPATCH',
+            order_request_id=None,
+            broker_order_row_id=None,
+            execution_status='submitted',
+            decision_agent_name='short-term-decider',
+            traceability_payload={'target_price': 54000, 'stop_loss_price': 47000},
+        )
+        self._attach_closed_exec_readback_submission(entry_plan_item_id=entry_plan_item_id)
+
+        payload = signal_decider_execution_outcome_service.list_outcomes(
+            snapshot_id=snapshot_id,
+            refresh=True,
+        )
+
+        self.assertEqual(payload['summary']['count'], 1)
+        self.assertEqual(payload['summary']['closed_count'], 1)
+        self.assertEqual(payload['items'][0]['entry_plan_item_id'], entry_plan_item_id)
+        self.assertEqual(payload['items'][0]['realized_pnl_krw'], '20000.00')
 
     def test_list_outcomes_reconciles_capped_execution_readback_with_order_totals(self) -> None:
         snapshot_id = self._seed_snapshot()

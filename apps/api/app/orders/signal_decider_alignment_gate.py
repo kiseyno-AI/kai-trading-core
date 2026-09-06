@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from decimal import Decimal, InvalidOperation
+from datetime import date, datetime
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from typing import Any
 
 
@@ -8,24 +9,27 @@ ALIGNMENT_GATE_SCHEMA_VERSION = 'signal_decider_alignment_gate_v1'
 ALIGNMENT_GATE_MODE_DISABLED = 'disabled'
 ALIGNMENT_GATE_MODE_REPORT_ONLY = 'report_only'
 ALIGNMENT_GATE_MODE_HARD_BLOCK = 'hard_block'
+ALIGNMENT_GATE_MODE_DOWNSIZE_PROBE = 'downsize_probe'
 VALID_ALIGNMENT_GATE_MODES = {
     ALIGNMENT_GATE_MODE_DISABLED,
     ALIGNMENT_GATE_MODE_REPORT_ONLY,
     ALIGNMENT_GATE_MODE_HARD_BLOCK,
+    ALIGNMENT_GATE_MODE_DOWNSIZE_PROBE,
 }
 
 SIGNAL_DECIDER_ALIGNMENT_ALIGNED = 'aligned'
 SIGNAL_DECIDER_ALIGNMENT_NO_CONTEXT = 'no_signal_decider_context'
+SIGNAL_DECIDER_ALIGNMENT_STALE_CONTEXT = 'stale_signal_decider_context'
 SIGNAL_DECIDER_ALIGNMENT_WAIT_CONFLICT_BLOCK = 'wait_conflict_block'
 SIGNAL_DECIDER_ALIGNMENT_WAIT_CONFLICT_OVERRIDE = 'wait_conflict_override'
 SIGNAL_DECIDER_ALIGNMENT_REJECT_CONFLICT_BLOCK = 'reject_conflict_block'
 SIGNAL_DECIDER_ALIGNMENT_CONFLICT = 'signal_decider_conflict'
 
 ALIGNMENT_GATE_ACTION_ALLOW = 'allow'
-ALIGNMENT_GATE_ACTION_ALLOW_NO_CONTEXT = 'allow_no_signal_decider_context'
 ALIGNMENT_GATE_ACTION_ALLOW_BY_OVERRIDE = 'allow_by_override'
 ALIGNMENT_GATE_ACTION_REPORT_ONLY_BLOCK = 'report_only_block_candidate'
 ALIGNMENT_GATE_ACTION_BLOCK = 'block'
+ALIGNMENT_GATE_ACTION_DOWNSIZE_PROBE = 'downsize_probe'
 ALIGNMENT_GATE_ACTION_DISABLED = 'disabled'
 
 STRONG_OVERRIDE_BUY_QUALITY_SCORE = Decimal('70')
@@ -37,10 +41,14 @@ MIN_OVERRIDE_RAW_TRADING_VALUE_KRW = Decimal('3000000000')
 
 def normalize_alignment_gate_mode(value: Any) -> str:
     normalized = str(value or '').strip().lower()
+    if normalized in {'probe', 'downsize'}:
+        return ALIGNMENT_GATE_MODE_DOWNSIZE_PROBE
     return normalized if normalized in VALID_ALIGNMENT_GATE_MODES else ALIGNMENT_GATE_MODE_REPORT_ONLY
 
 
 def _block_action_for_mode(mode: str) -> str:
+    if mode == ALIGNMENT_GATE_MODE_DOWNSIZE_PROBE:
+        return ALIGNMENT_GATE_ACTION_DOWNSIZE_PROBE
     return (
         ALIGNMENT_GATE_ACTION_BLOCK
         if mode == ALIGNMENT_GATE_MODE_HARD_BLOCK
@@ -111,7 +119,18 @@ def build_signal_decider_alignment_context(signal_decider_snapshot: Any) -> dict
     )
     response_payload = _signal_decider_snapshot_field(signal_decider_snapshot, 'response_payload')
     return {
-        'action': str(action or 'wait').strip().lower(),
+        'action': str(action).strip().lower() if action is not None else None,
+        'market_date': _date_text(_signal_decider_snapshot_field(signal_decider_snapshot, 'market_date')),
+        'feedback_received_at': (
+            _signal_decider_snapshot_field(signal_decider_snapshot, 'feedback_received_at').isoformat()
+            if isinstance(_signal_decider_snapshot_field(signal_decider_snapshot, 'feedback_received_at'), datetime)
+            else None
+        ),
+        'created_at': (
+            _signal_decider_snapshot_field(signal_decider_snapshot, 'created_at').isoformat()
+            if isinstance(_signal_decider_snapshot_field(signal_decider_snapshot, 'created_at'), datetime)
+            else None
+        ),
         'decision_snapshot_id': _signal_decider_snapshot_field(signal_decider_snapshot, 'id'),
         'policy_version': _signal_decider_snapshot_field(signal_decider_snapshot, 'policy_version'),
         'confidence_score_10': _json_safe(_signal_decider_snapshot_field(signal_decider_snapshot, 'confidence_score_10')),
@@ -126,6 +145,103 @@ def build_signal_decider_alignment_context(signal_decider_snapshot: Any) -> dict
         ),
         'response_payload': _json_safe(response_payload) if isinstance(response_payload, dict) else {},
     }
+
+
+def _date_text(value: Any) -> str | None:
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    text = str(value or '').strip()
+    if not text:
+        return None
+    try:
+        return date.fromisoformat(text[:10]).isoformat()
+    except ValueError:
+        return None
+
+
+def _context_status(
+    context: dict[str, Any],
+    *,
+    expected_market_date: date | str | None,
+) -> tuple[str, str | None]:
+    signal_action = str(context.get('action') or '').strip().lower()
+    if not signal_action:
+        return 'missing', 'missing_signal_decider_action'
+    explicit_status = str(context.get('context_status') or context.get('freshness_status') or '').strip().lower()
+    if explicit_status in {'missing', 'unavailable', 'error'}:
+        return 'missing', f'signal_decider_context_{explicit_status}'
+    if explicit_status in {'stale', 'expired'}:
+        return 'stale', f'signal_decider_context_{explicit_status}'
+    expected_date_text = _date_text(expected_market_date)
+    context_date_text = _date_text(context.get('market_date'))
+    if expected_date_text is not None and context_date_text is None:
+        return 'missing', 'missing_signal_decider_context_market_date'
+    if expected_date_text is not None and context_date_text != expected_date_text:
+        return 'stale', 'signal_decider_context_market_date_mismatch'
+    return 'fresh', None
+
+
+def apply_alignment_quantity_enforcement(
+    alignment_gate: dict[str, Any],
+    *,
+    requested_quantity: Any,
+    probe_quantity: Any = 1,
+) -> dict[str, Any]:
+    """Attach the final, auditable quantity decision to an alignment gate."""
+
+    gate = dict(alignment_gate)
+    requested = _to_decimal(requested_quantity)
+    if requested is not None:
+        requested = max(requested.to_integral_value(rounding=ROUND_DOWN), Decimal('0'))
+    probe = _to_decimal(probe_quantity)
+    if probe is None or probe < Decimal('1'):
+        probe = Decimal('1')
+    probe = probe.to_integral_value(rounding=ROUND_DOWN)
+    action = str(gate.get('alignment_gate_action') or '').strip().lower()
+
+    if action == ALIGNMENT_GATE_ACTION_BLOCK:
+        decision = 'blocked'
+        final = Decimal('0')
+    elif action == ALIGNMENT_GATE_ACTION_DOWNSIZE_PROBE:
+        if requested is None or requested < Decimal('1'):
+            decision = 'blocked'
+            final = Decimal('0')
+            gate['alignment_gate_action'] = ALIGNMENT_GATE_ACTION_BLOCK
+            gate['alignment_gate_reason'] = (
+                f"{gate.get('alignment_gate_reason') or 'Alignment conflict.'} "
+                'Probe enforcement requires a positive deterministic requested quantity.'
+            )
+            gate['enforcement_error'] = 'requested_quantity_unavailable_for_probe'
+        else:
+            decision = 'downsized'
+            final = min(requested, probe)
+    elif action == ALIGNMENT_GATE_ACTION_ALLOW_BY_OVERRIDE:
+        decision = 'allowed_by_override'
+        final = requested
+    elif action == ALIGNMENT_GATE_ACTION_REPORT_ONLY_BLOCK:
+        decision = 'allowed_report_only'
+        final = requested
+    elif action == ALIGNMENT_GATE_ACTION_ALLOW:
+        decision = 'allowed'
+        final = requested
+    else:
+        decision = 'not_enforced'
+        final = requested
+
+    gate.update(
+        {
+            'enforcement_decision': decision,
+            'requested_quantity': _json_safe_decimal(requested),
+            'final_quantity': _json_safe_decimal(final),
+            'probe_quantity': _json_safe_decimal(probe),
+            'quantity_reduction': _json_safe_decimal(
+                requested - final if requested is not None and final is not None else None
+            ),
+        }
+    )
+    return gate
 
 
 def _override_evidence(short_term_entry_quality: dict[str, Any] | None) -> dict[str, Any]:
@@ -152,8 +268,8 @@ def _override_evidence(short_term_entry_quality: dict[str, Any] | None) -> dict[
             and volume_percentile >= STRONG_OVERRIDE_VOLUME_PERCENTILE
         ),
         'liquidity_floor_ok': (
-            raw_trading_value_krw is None
-            or raw_trading_value_krw >= MIN_OVERRIDE_RAW_TRADING_VALUE_KRW
+            raw_trading_value_krw is not None
+            and raw_trading_value_krw >= MIN_OVERRIDE_RAW_TRADING_VALUE_KRW
         ),
     }
     allowed = all(checks.values())
@@ -186,6 +302,7 @@ def build_signal_decider_alignment_gate(
     short_term_entry_quality: dict[str, Any] | None,
     tactical_action: str | None,
     mode: str = ALIGNMENT_GATE_MODE_REPORT_ONLY,
+    expected_market_date: date | str | None = None,
 ) -> dict[str, Any]:
     resolved_mode = normalize_alignment_gate_mode(mode)
     if resolved_mode == ALIGNMENT_GATE_MODE_DISABLED:
@@ -203,6 +320,10 @@ def build_signal_decider_alignment_gate(
 
     context = signal_decider_context if isinstance(signal_decider_context, dict) else {}
     signal_action = str(context.get('action') or '').strip().lower()
+    context_status, context_status_reason = _context_status(
+        context,
+        expected_market_date=expected_market_date,
+    )
     signal_snapshot_id = context.get('decision_snapshot_id')
     override = _override_evidence(short_term_entry_quality)
     base = {
@@ -211,6 +332,10 @@ def build_signal_decider_alignment_gate(
         'decision_snapshot_id': signal_snapshot_id,
         'signal_decider_decision_snapshot_id': signal_snapshot_id,
         'signal_decider_action': signal_action or None,
+        'expected_market_date': _date_text(expected_market_date),
+        'signal_decider_context_market_date': _date_text(context.get('market_date')),
+        'signal_decider_context_status': context_status,
+        'signal_decider_context_status_reason': context_status_reason,
         'signal_decider_policy_version': context.get('policy_version'),
         'signal_decider_confidence_score_10': context.get('confidence_score_10'),
         'signal_decider_conviction_score_10': context.get('conviction_score_10'),
@@ -223,12 +348,24 @@ def build_signal_decider_alignment_gate(
         'override': override,
     }
 
-    if not signal_action:
+    if context_status == 'missing':
         return {
             **base,
             'signal_decider_alignment': SIGNAL_DECIDER_ALIGNMENT_NO_CONTEXT,
-            'alignment_gate_action': ALIGNMENT_GATE_ACTION_ALLOW_NO_CONTEXT,
-            'alignment_gate_reason': 'No same-symbol signal-decider context was available for this short-term candidate.',
+            'alignment_gate_action': _block_action_for_mode(resolved_mode),
+            'alignment_gate_reason': (
+                'No current same-symbol signal-decider context was available; the candidate is not silently approved.'
+            ),
+        }
+    if context_status == 'stale':
+        return {
+            **base,
+            'signal_decider_alignment': SIGNAL_DECIDER_ALIGNMENT_STALE_CONTEXT,
+            'alignment_gate_action': _block_action_for_mode(resolved_mode),
+            'alignment_gate_reason': (
+                'Same-symbol signal-decider context is stale for the source market date; the candidate is not '
+                'silently approved.'
+            ),
         }
     if signal_action == 'buy':
         return {

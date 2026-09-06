@@ -3078,6 +3078,26 @@ class SignalDeciderExecIntegrationService:
             if isinstance(validation.get('alignment_gate'), dict)
             else None
         )
+        final_enforcement_decision = (
+            alignment_gate.get('enforcement_decision')
+            if isinstance(alignment_gate, dict)
+            else traceability.get('final_enforcement_decision')
+            or validation.get('final_enforcement_decision')
+        )
+        requested_quantity = (
+            alignment_gate.get('requested_quantity')
+            if isinstance(alignment_gate, dict)
+            else traceability.get('requested_quantity')
+            if traceability.get('requested_quantity') is not None
+            else validation.get('requested_quantity')
+        )
+        final_quantity = (
+            alignment_gate.get('final_quantity')
+            if isinstance(alignment_gate, dict)
+            else traceability.get('final_quantity')
+            if traceability.get('final_quantity') is not None
+            else validation.get('final_quantity')
+        )
         return serialize_exec_agent_decider_handoff_payload(
             _json_safe(
                 {
@@ -3110,6 +3130,9 @@ class SignalDeciderExecIntegrationService:
                         )
                         or validation.get('alignment_signal_decider_decision_snapshot_id'),
                         'alignment_gate': alignment_gate,
+                        'final_enforcement_decision': final_enforcement_decision,
+                        'requested_quantity': requested_quantity,
+                        'final_quantity': final_quantity,
                         'decision_traceability': decision_traceability,
                     },
                     'decider_input_context': {
@@ -3136,6 +3159,9 @@ class SignalDeciderExecIntegrationService:
                         'alignment_gate_reason': traceability.get('alignment_gate_reason')
                         or validation.get('alignment_gate_reason'),
                         'alignment_gate': alignment_gate,
+                        'final_enforcement_decision': final_enforcement_decision,
+                        'requested_quantity': requested_quantity,
+                        'final_quantity': final_quantity,
                         'entry_price_basis': snapshot.entry_price_basis
                         if snapshot is not None
                         else traceability.get('entry_price_basis'),
@@ -3333,6 +3359,24 @@ class SignalDeciderExecIntegrationService:
                 if isinstance(validation.get('alignment_gate'), dict)
                 else None
             )
+            final_enforcement_decision = (
+                alignment_gate.get('enforcement_decision')
+                if isinstance(alignment_gate, dict)
+                else traceability.get('final_enforcement_decision')
+                or validation.get('final_enforcement_decision')
+            )
+            requested_enforcement_quantity = (
+                _safe_decimal(alignment_gate.get('requested_quantity'))
+                if isinstance(alignment_gate, dict)
+                else _safe_decimal(traceability.get('requested_quantity'))
+                or _safe_decimal(validation.get('requested_quantity'))
+            )
+            final_enforcement_quantity = (
+                _safe_decimal(alignment_gate.get('final_quantity'))
+                if isinstance(alignment_gate, dict)
+                else _safe_decimal(traceability.get('final_quantity'))
+                or _safe_decimal(validation.get('final_quantity'))
+            )
             max_holding_close_policy = (
                 {
                     'enabled': True,
@@ -3390,6 +3434,9 @@ class SignalDeciderExecIntegrationService:
                 )
                 or validation.get('alignment_signal_decider_decision_snapshot_id'),
                 'alignment_gate': alignment_gate,
+                'final_enforcement_decision': final_enforcement_decision,
+                'requested_quantity': _decimal_to_text(requested_enforcement_quantity),
+                'final_quantity': _decimal_to_text(final_enforcement_quantity),
                 'handoff_active': bool(traceability.get('handoff_active')) if is_short_term else True,
                 'original_watch_trigger_price': trigger_price,
                 'original_watch_chase_limit_price': chase_limit_price,
@@ -3412,7 +3459,24 @@ class SignalDeciderExecIntegrationService:
                 'decision_input_quality_context': decision_input_quality_context,
                 'execution_feasibility_context': execution_feasibility_context,
             }
-            if uses_exec_agent_sizing:
+            enforced_probe = bool(
+                is_short_term
+                and final_enforcement_decision == 'downsized'
+                and final_enforcement_quantity is not None
+                and final_enforcement_quantity > Decimal('0')
+            )
+            if enforced_probe:
+                quantity_policy = {
+                    'type': 'fixed_quantity',
+                    'quantity': _decimal_to_text(final_enforcement_quantity),
+                    'budget_krw': _decimal_to_text(_safe_decimal(row.allocation_budget_krw)),
+                    'estimated_reference_price': row.estimated_reference_price,
+                    'estimated_notional_krw': _decimal_to_text(_safe_decimal(row.estimated_notional_krw)),
+                    'pricing_note': 'Core-enforced deterministic WAIT-conflict probe quantity.',
+                    'enforcement_source': 'core_wait_conflict_alignment_gate',
+                    'market_regime_sizing': market_regime_sizing_policy,
+                }
+            elif uses_exec_agent_sizing:
                 if row_decision_agent_name == SIGNAL_DECIDER_AGENT_NAME:
                     estimated_notional_krw = None
                     pricing_note = 'Sizing for signal-decider dispatch is delegated to exec-agent.'
@@ -3448,6 +3512,9 @@ class SignalDeciderExecIntegrationService:
                 }
             quantity_policy.update(
                 {
+                    'final_enforcement_decision': final_enforcement_decision,
+                    'requested_quantity': _decimal_to_text(requested_enforcement_quantity),
+                    'final_quantity': _decimal_to_text(final_enforcement_quantity),
                     'market_regime': market_regime_sizing_policy['market_regime'],
                     'quantity_multiplier': market_regime_sizing_policy['quantity_multiplier'],
                     'quantity_multiplier_cap': market_regime_sizing_policy['quantity_multiplier_cap'],

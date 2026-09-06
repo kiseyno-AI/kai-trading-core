@@ -1,5 +1,5 @@
 from decimal import Decimal
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -107,7 +107,13 @@ class Settings(BaseSettings):
     signal_decider_next_open_block_on_data_warnings: bool = True
     signal_decider_next_open_block_on_specialist_disagreement: bool = True
     signal_decider_next_open_require_target_and_stop: bool = True
-    signal_decider_wait_conflict_gate_mode: str = 'report_only'
+    signal_decider_wait_conflict_gate_mode: Literal[
+        'disabled',
+        'report_only',
+        'hard_block',
+        'downsize_probe',
+    ] = 'report_only'
+    signal_decider_wait_conflict_probe_quantity: int = Field(default=1, ge=1, le=100)
     signal_decider_exec_integration_mode: str = 'disabled'
     signal_decider_exec_base_url: str = 'http://127.0.0.1:8010'
     signal_decider_exec_bearer_token: Optional[str] = None
