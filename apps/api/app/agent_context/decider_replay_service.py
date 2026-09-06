@@ -1663,7 +1663,7 @@ class DeciderReplayService:
                 if as_of_date_kst is not None
                 else None
             ),
-            'completed_weeks': completed_week_count,
+            'completed_weeks': len(week_windows),
             'baseline_source': 'actual_short_term_execution_outcomes',
             'actual_outcomes_only': True,
             'date_window_basis': 'source_market_date',

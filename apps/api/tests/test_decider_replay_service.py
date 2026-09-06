@@ -509,6 +509,8 @@ class DeciderReplayServiceTests(unittest.TestCase):
         self.assertEqual(result['request']['market_date_from'], '2026-08-10')
         self.assertEqual(result['request']['market_date_to'], '2026-09-04')
         self.assertEqual(result['request']['window_mode'], 'rolling_completed_weeks')
+        self.assertEqual(result['request']['completed_weeks'], 4)
+        self.assertEqual(result['summary']['completed_week_count'], 0)
         self.assertEqual(len(result['weeks']), 4)
         self.assertEqual(repository.wait_conflict_calls[0]['market_date_from'], date(2026, 8, 10))
         self.assertEqual(repository.wait_conflict_calls[0]['market_date_to'], date(2026, 9, 4))
@@ -532,12 +534,13 @@ class DeciderReplayServiceTests(unittest.TestCase):
                 wait_conflict_trades=concentrated_conflicts,
             )
         ).replay_wait_conflict_gate(
-            market_date_from='2026-08-10',
-            market_date_to='2026-09-04',
+            completed_weeks=6,
+            as_of_date_kst='2026-09-06',
         )
 
         self.assertEqual(result['summary']['resolved_wait_conflict_count'], 20)
         self.assertTrue(result['promotion_readiness']['checks']['resolved_wait_conflicts_met'])
+        self.assertEqual(result['request']['completed_weeks'], 6)
         self.assertEqual(result['summary']['completed_week_count'], 1)
         self.assertFalse(result['promotion_readiness']['checks']['completed_weeks_met'])
 
