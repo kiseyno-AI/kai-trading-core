@@ -23,7 +23,7 @@ python3.11 -m app.internal.ops agent-short-term-wait-conflict-replay \
 
 Use `--as-of-date-kst YYYY-MM-DD` for a reproducible rolling window. An explicit `--market-date-from` and `--market-date-to` pair is also supported. The rolling form always covers at least four completed Monday-Friday KST weeks.
 
-The report uses only persisted short-term entry fills and their actual execution outcomes. It reports resolved skipped losses, resolved skipped winners, baseline and counterfactual realized P/L, net P/L delta, missing alignment evidence, and unresolved/open filled candidates separately. For `downsize_probe`, skipped-loss and skipped-winner P/L is weighted by the removed quantity share; requests already at or below the probe add no removed-exposure evidence. Unresolved candidates receive no synthetic P/L.
+The report uses only persisted short-term entry fills and their actual execution outcomes. It reports resolved skipped losses, resolved skipped winners, baseline and counterfactual realized P/L, gross P/L delta, cost-adjusted estimated net P/L delta, missing alignment evidence, and unresolved/open filled candidates separately. For `downsize_probe`, skipped-loss and skipped-winner P/L is weighted by the removed quantity share; requests already at or below the probe add no removed-exposure evidence. Unresolved candidates receive no synthetic P/L.
 
 ## Promotion threshold
 
@@ -31,7 +31,7 @@ The report exposes these checks under `promotion_readiness`:
 
 - at least 4 completed Monday-Friday windows that each contain resolved replay evidence;
 - at least 20 resolved WAIT-conflict outcomes;
-- positive net realized P/L delta;
+- positive cost-adjusted estimated net P/L delta, including any supplied fee and slippage assumptions;
 - avoided losses greater than skipped-winner P/L;
 - unresolved WAIT-conflict ratio no greater than 25%;
 - manual approval for any live configuration change.
@@ -58,7 +58,7 @@ Reported unresolved/open examples were `003550`, `035810`, `027710`, and later `
 
 ## Replay limitations
 
-- Core can replay only outcomes synchronized into `signal_decider_actual_execution_outcomes`; missing readback remains missing evidence.
+- Core synchronizes the affected outcome rows after persisting Exec readback. Readback that has not yet been collected remains missing evidence.
 - Exec readback payloads are compact and may cap execution rows. Core reconciles against attributed order totals when present, but this is not an account-wide FIFO ledger.
 - The issue-week fixture preserves the bounded external Exec result, including its FIFO attribution. Core's normal rolling report uses plan-attributed fills and aggregate average fill prices.
 - Source-date attribution uses the persisted Core plan alignment gate. Legacy rows without that evidence are identified and treated conservatively.

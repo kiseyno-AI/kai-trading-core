@@ -67,6 +67,7 @@ from app.orders.next_open_execution import (
     signal_decider_next_open_execution_service,
 )
 from app.orders.portfolio_summary_service import portfolio_summary_service
+from app.orders.signal_decider_execution_outcomes import signal_decider_execution_outcome_service
 from app.quotes.display_prices import (
     DISPLAY_FALLBACK_SOURCES,
     build_display_price_fields,
@@ -4402,6 +4403,9 @@ class SignalDeciderExecIntegrationService:
                 }
                 row.submission_payload = slim_signal_decider_exec_submission_payload(submission).payload
             session.flush()
+        signal_decider_execution_outcome_service.sync_entry_plan_items(
+            entry_plan_item_ids=row_ids,
+        )
 
     @staticmethod
     def _match_remote_orders(

@@ -8,12 +8,14 @@ from uuid import uuid4
 
 from sqlalchemy import delete, select
 
+from app.agent_context.decider_replay_service import DeciderReplayCostAssumptions, DeciderReplayRepository
 from app.core.settings import settings
 from app.db import engine, session_scope
 from app.db_models import (
     AgentContextFeedback,
     BrokerOrder,
     OrderRequest,
+    SignalDeciderActualExecutionOutcome,
     SignalDeciderDecisionSnapshot,
     SignalDeciderExecutionPlanItem,
     Symbol,
@@ -562,6 +564,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         BrokerOrder.__table__.create(bind=engine, checkfirst=True)
         SignalDeciderDecisionSnapshot.__table__.create(bind=engine, checkfirst=True)
         SignalDeciderExecutionPlanItem.__table__.create(bind=engine, checkfirst=True)
+        SignalDeciderActualExecutionOutcome.__table__.create(bind=engine, checkfirst=True)
         Symbol.__table__.create(bind=engine, checkfirst=True)
 
     def setUp(self) -> None:
@@ -627,6 +630,11 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         for key, value in self.original_settings.items():
             setattr(settings, key, value)
         with session_scope() as session:
+            session.execute(
+                delete(SignalDeciderActualExecutionOutcome).where(
+                    SignalDeciderActualExecutionOutcome.account_reference == self.account_reference
+                )
+            )
             session.execute(
                 delete(SignalDeciderExecutionPlanItem).where(
                     SignalDeciderExecutionPlanItem.account_reference == self.account_reference
@@ -2581,7 +2589,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             readback = row.submission_payload['exec_dispatch']['readback']
             self.assertEqual(readback['positions']['count'], 0)
 
-    async def test_exec_overview_refresh_persists_short_term_readback(self) -> None:
+    async def test_exec_overview_refresh_syncs_short_term_outcome_before_replay_selection(self) -> None:
         with session_scope() as session:
             session.execute(
                 delete(
@@ -2647,6 +2655,18 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             3,
         )
         self.assertEqual(overview['items'][0]['remote_state']['orders'], self.client.order_response['items'])
+
+        replay_trades = DeciderReplayRepository().list_wait_conflict_gate_trades(
+            market_date_from=self.market_date,
+            market_date_to=self.market_date,
+            symbols=[self.symbol],
+            cost_assumptions=DeciderReplayCostAssumptions(),
+            gate_mode='hard_block',
+        )
+
+        self.assertEqual(len(replay_trades), 1)
+        self.assertEqual(replay_trades[0].symbol, self.symbol)
+        self.assertEqual(replay_trades[0].entry_filled_quantity, Decimal('5'))
 
     async def test_dashboard_runtime_status_normalizes_exec_runtime_payload(self) -> None:
         self.client.runtime_response = {

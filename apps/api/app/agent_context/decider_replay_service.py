@@ -1233,7 +1233,7 @@ def _build_wait_conflict_markdown_summary(
         '',
         '## Completed-week evidence',
         '',
-        '| week | resolved | unresolved/open | skipped losses | skipped winners | net delta KRW |',
+        '| week | resolved | unresolved/open | skipped losses | skipped winners | estimated net delta KRW |',
         '| --- | ---: | ---: | ---: | ---: | ---: |',
     ]
     for week in weeks:
@@ -1542,7 +1542,7 @@ class DeciderReplayService:
                 'estimated_net_pnl_delta_krw': _to_json_number(_round_money(net_delta)),
                 'baseline_realized_pnl_krw': baseline['gross_pnl_krw'],
                 'counterfactual_realized_pnl_krw': candidate['gross_pnl_krw'],
-                'net_pnl_delta_krw': _to_json_number(_round_money(gross_delta)),
+                'net_pnl_delta_krw': _to_json_number(_round_money(net_delta)),
                 'baseline': baseline,
                 'candidate': candidate,
                 'outcome_sources': _count_by_key(scope, key='outcome_source'),
@@ -1622,7 +1622,7 @@ class DeciderReplayService:
             'resolved_wait_conflicts_met': (
                 resolved_wait_conflict_count >= promotion_thresholds['minimum_resolved_wait_conflicts']
             ),
-            'positive_net_pnl_delta': Decimal(str(summary['net_pnl_delta_krw'])) > 0,
+            'positive_net_pnl_delta': Decimal(str(summary['estimated_net_pnl_delta_krw'])) > 0,
             'avoided_losses_exceed_skipped_winners': Decimal(
                 str(summary['skipped_losses_avoided_krw'])
             ) > Decimal(str(summary['skipped_winners_gross_pnl_krw'])),

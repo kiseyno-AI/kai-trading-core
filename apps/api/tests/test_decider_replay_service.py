@@ -447,6 +447,47 @@ class DeciderReplayServiceTests(unittest.TestCase):
             result['promotion_readiness']['checks']['avoided_losses_exceed_skipped_winners']
         )
 
+    def test_wait_conflict_promotion_uses_estimated_net_delta_when_costs_reverse_gross(self) -> None:
+        blocked_loss = _trade(
+            snapshot_id=112,
+            symbol='005930',
+            gross_pnl_krw=-100,
+            trigger_price_drift_pct=None,
+            market_date='2026-07-01',
+            outcome_source='actual_short_term_execution_outcome',
+            alignment_gate=_alignment_gate('wait_conflict_block', 'block'),
+        )
+
+        def metric_block(trades, *, cost_assumptions):
+            self.assertGreater(cost_assumptions.fee_bps + cost_assumptions.slippage_bps, 0)
+            has_baseline_trade = bool(trades)
+            return {
+                'trade_count': len(trades),
+                'gross_pnl_krw': -100 if has_baseline_trade else 0,
+                'estimated_net_pnl_krw': 100 if has_baseline_trade else 0,
+                'win_rate': 0 if has_baseline_trade else None,
+                'average_return_pct': -0.0001 if has_baseline_trade else None,
+                'max_drawdown_proxy_krw': None,
+            }
+
+        with patch('app.agent_context.decider_replay_service._metric_block', side_effect=metric_block):
+            result = DeciderReplayService(
+                repository=FakeDeciderReplayRepository([], wait_conflict_trades=[blocked_loss])
+            ).replay_wait_conflict_gate(
+                market_date_from='2026-06-29',
+                market_date_to='2026-07-03',
+                fee_bps=10,
+                slippage_bps=5,
+            )
+
+        self.assertGreater(result['summary']['gross_pnl_delta_krw'], 0)
+        self.assertLessEqual(result['summary']['estimated_net_pnl_delta_krw'], 0)
+        self.assertEqual(
+            result['summary']['net_pnl_delta_krw'],
+            result['summary']['estimated_net_pnl_delta_krw'],
+        )
+        self.assertFalse(result['promotion_readiness']['checks']['positive_net_pnl_delta'])
+
     def test_wait_conflict_gate_replay_returns_empty_data_reason(self) -> None:
         service = DeciderReplayService(repository=FakeDeciderReplayRepository([]))
 
