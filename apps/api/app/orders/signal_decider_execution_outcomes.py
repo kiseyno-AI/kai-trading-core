@@ -7,7 +7,7 @@ from typing import Any, Sequence
 
 from sqlalchemy import inspect, select
 
-from app.agent_context.roles import SIGNAL_DECIDER_AGENT_NAME
+from app.agent_context.roles import SHORT_TERM_DECIDER_AGENT_NAME, SIGNAL_DECIDER_AGENT_NAME
 from app.db import session_scope
 from app.db_models import (
     BrokerOrder,
@@ -61,6 +61,12 @@ ACTIVE_ORDER_STATUSES = {
 FILLED_ORDER_STATUSES = {
     BrokerOrderStatus.PARTIAL_FILL.value,
     BrokerOrderStatus.FILLED.value,
+}
+TERMINAL_ORDER_STATUSES = {
+    BrokerOrderStatus.CANCELED.value,
+    BrokerOrderStatus.FILLED.value,
+    BrokerOrderStatus.REJECTED.value,
+    BrokerOrderStatus.REPLACED.value,
 }
 REMOTE_ACTIVE_STATUS_ALIASES = {
     'accepted',
@@ -260,7 +266,9 @@ class SignalDeciderExecutionOutcomeService:
                 .where(
                     SignalDeciderExecutionPlanItem.id.in_(normalized_ids),
                     SignalDeciderExecutionPlanItem.execution_window == EXECUTION_WINDOW_NEXT_OPEN,
-                    SignalDeciderExecutionPlanItem.decision_agent_name == SIGNAL_DECIDER_AGENT_NAME,
+                    SignalDeciderExecutionPlanItem.decision_agent_name.in_(
+                        [SIGNAL_DECIDER_AGENT_NAME, SHORT_TERM_DECIDER_AGENT_NAME]
+                    ),
                 )
                 .order_by(
                     SignalDeciderExecutionPlanItem.target_trade_date.desc(),
@@ -533,7 +541,9 @@ class SignalDeciderExecutionOutcomeService:
                 select(SignalDeciderExecutionPlanItem)
                 .where(
                     SignalDeciderExecutionPlanItem.execution_window == EXECUTION_WINDOW_NEXT_OPEN,
-                    SignalDeciderExecutionPlanItem.decision_agent_name == SIGNAL_DECIDER_AGENT_NAME,
+                    SignalDeciderExecutionPlanItem.decision_agent_name.in_(
+                        [SIGNAL_DECIDER_AGENT_NAME, SHORT_TERM_DECIDER_AGENT_NAME]
+                    ),
                 )
                 .order_by(
                     SignalDeciderExecutionPlanItem.target_trade_date.desc(),
@@ -941,6 +951,7 @@ class SignalDeciderExecutionOutcomeService:
         latest_broker_order_row_id: int | None = None
         latest_client_order_id: str | None = None
         latest_broker_order_id: str | None = None
+        has_terminal_order_evidence = False
         client_order_ids: list[str] = []
         broker_order_ids: list[str] = []
         order_request_ids: list[int] = []
@@ -1011,6 +1022,18 @@ class SignalDeciderExecutionOutcomeService:
                 latest_broker_order_row_id = int(order_row.id) if order_row is not None else None
                 latest_client_order_id = client_order_id
                 latest_broker_order_id = broker_order_id
+                has_terminal_order_evidence = self._has_terminal_order_evidence(
+                    status=latest_order_status,
+                    requested_quantity=(
+                        order_row.requested_quantity
+                        if order_row is not None
+                        else request_row.requested_quantity
+                        if request_row is not None
+                        else None
+                    ),
+                    filled_quantity=order_filled_quantity,
+                    remaining_quantity=(order_row.remaining_quantity if order_row is not None else None),
+                )
 
         average_fill_price = (
             weighted_price_notional / filled_quantity_total
@@ -1035,6 +1058,7 @@ class SignalDeciderExecutionOutcomeService:
             'broker_order_row_ids': broker_order_row_ids,
             'fill_event_ids': fill_event_ids,
             'pair_count': len(pairs),
+            'has_terminal_order_evidence': has_terminal_order_evidence,
         }
 
     def _aggregate_exec_readback_side(
@@ -1157,6 +1181,11 @@ class SignalDeciderExecutionOutcomeService:
                     average_fill_price = fallback_weighted_price_notional / fallback_quantity_total
         if latest_order_status is None and filled_quantity_total > Decimal('0'):
             latest_order_status = BrokerOrderStatus.FILLED.value
+        has_terminal_order_evidence = self._readback_has_terminal_order_evidence(
+            side=side,
+            order_facts=order_facts,
+            item_links=item_links,
+        )
         return {
             'filled_quantity': filled_quantity_total,
             'average_fill_price': average_fill_price,
@@ -1176,6 +1205,7 @@ class SignalDeciderExecutionOutcomeService:
             'fill_event_ids': [],
             'pair_count': len(selected_facts),
             'metric_source': 'exec_readback' if selected_facts else None,
+            'has_terminal_order_evidence': has_terminal_order_evidence,
             'readback': {
                 'last_synced_at': readback.get('last_synced_at') if isinstance(readback, dict) else None,
                 'source': readback_source,
@@ -1277,12 +1307,15 @@ class SignalDeciderExecutionOutcomeService:
         filled_at = self._readback_fill_timestamp(payload=payload, source=source)
         submitted_at = self._readback_submitted_timestamp(payload=payload)
         return {
+            'source': source,
             'quantity': quantity,
             'price': self._readback_fill_price(payload=payload),
             'filled_at': filled_at,
             'submitted_at': submitted_at,
             'sort_at': filled_at or submitted_at or _parse_datetime(payload.get('updated_at')) or datetime(1970, 1, 1, tzinfo=timezone.utc),
             'status': status,
+            'requested_quantity': _safe_decimal(payload.get('requested_quantity') or payload.get('quantity')),
+            'remaining_quantity': _safe_decimal(payload.get('remaining_quantity')),
             'client_order_id': _normalize_optional_text(payload.get('client_order_id')),
             'broker_order_id': self._readback_broker_order_id(payload=payload),
             'execution_id': _normalize_optional_text(
@@ -1317,6 +1350,62 @@ class SignalDeciderExecutionOutcomeService:
         if intent in {EXEC_INTENT_TARGET_SELL, EXEC_INTENT_STOP_SELL}:
             return 'sell'
         return None
+
+    def _readback_has_terminal_order_evidence(
+        self,
+        *,
+        side: str,
+        order_facts: Sequence[dict[str, Any]],
+        item_links: Sequence[dict[str, Any]],
+    ) -> bool:
+        terminal_evidence = [
+            self._has_terminal_order_evidence(
+                status=order_fact.get('status'),
+                requested_quantity=order_fact.get('requested_quantity'),
+                filled_quantity=order_fact.get('quantity'),
+                remaining_quantity=order_fact.get('remaining_quantity'),
+            )
+            for order_fact in order_facts
+        ]
+
+        for link in item_links:
+            link_side = self._normalize_readback_side(link.get('side'))
+            intent = _normalize_optional_text(link.get('intent'), lowercase=True)
+            if link_side is None:
+                if intent in {EXEC_INTENT_NEXT_OPEN_BUY, EXEC_INTENT_INTRADAY_WATCH_BUY}:
+                    link_side = 'buy'
+                elif intent in {EXEC_INTENT_TARGET_SELL, EXEC_INTENT_STOP_SELL}:
+                    link_side = 'sell'
+            if link_side != side:
+                continue
+            status = self._normalize_readback_order_status(
+                link.get('remote_status') or link.get('status')
+            )
+            terminal_evidence.append(status in TERMINAL_ORDER_STATUSES)
+        return bool(terminal_evidence) and all(terminal_evidence)
+
+    def _has_terminal_order_evidence(
+        self,
+        *,
+        status: Any,
+        requested_quantity: Any,
+        filled_quantity: Any,
+        remaining_quantity: Any,
+    ) -> bool:
+        normalized_status = _normalize_optional_text(status, lowercase=True)
+        if normalized_status in TERMINAL_ORDER_STATUSES:
+            return True
+        remaining = _safe_decimal(remaining_quantity)
+        if remaining is not None:
+            return remaining <= Decimal('0')
+        requested = _safe_decimal(requested_quantity)
+        filled = _safe_decimal(filled_quantity)
+        return bool(
+            requested is not None
+            and requested > Decimal('0')
+            and filled is not None
+            and filled >= requested
+        )
 
     def _readback_order_link_by_broker_order_id(
         self,
@@ -1642,6 +1731,8 @@ class SignalDeciderExecutionOutcomeService:
             return LIFECYCLE_UNRESOLVED, EXIT_REASON_UNRESOLVED
 
         if closed_quantity >= entry_filled_quantity and entry_filled_quantity > Decimal('0'):
+            if not entry_metrics.get('has_terminal_order_evidence'):
+                return LIFECYCLE_UNRESOLVED, EXIT_REASON_UNRESOLVED
             if exit_trigger_rule == EXIT_REASON_TARGET_HIT:
                 return LIFECYCLE_CLOSED, EXIT_REASON_TARGET_HIT
             if exit_trigger_rule == EXIT_REASON_STOP_LOSS_HIT:

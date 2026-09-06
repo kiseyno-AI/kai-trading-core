@@ -1,0 +1,40 @@
+{
+  "schema_version": "wait_conflict_week_regression_v1",
+  "source": "issue_547_bounded_live_exec_weekly_artifact",
+  "window_kst": {
+    "market_date_from": "2026-08-31",
+    "market_date_to": "2026-09-04"
+  },
+  "filled_buy_count": 19,
+  "alignment_counts": {
+    "wait_conflict_block": 16,
+    "allow_by_override": 2,
+    "legacy_missing_alignment": 1
+  },
+  "resolved_wait_conflicts": [
+    {"symbol": "123890", "realized_pnl_krw": -14960},
+    {"symbol": "072710", "realized_pnl_krw": -10000},
+    {"symbol": "092230", "realized_pnl_krw": -3100},
+    {"symbol": "002310", "realized_pnl_krw": -1530},
+    {"symbol": "055550", "realized_pnl_krw": -1000},
+    {"symbol": "030190", "realized_pnl_krw": -1890},
+    {"symbol": "036630", "realized_pnl_krw": -1683},
+    {"symbol": "004000", "realized_pnl_krw": 25000},
+    {"symbol": "004690", "realized_pnl_krw": 400}
+  ],
+  "reported_unresolved_open_examples": ["003550", "035810", "027710", "004690"],
+  "expected": {
+    "skipped_losses": 7,
+    "skipped_losses_avoided_krw": 34163,
+    "skipped_winners": 2,
+    "skipped_winners_gross_pnl_krw": 25400,
+    "baseline_realized_pnl_krw": -41851.12,
+    "counterfactual_realized_pnl_krw": -33088.12,
+    "net_pnl_delta_krw": 8763
+  },
+  "limitations": [
+    "The resolved P/L came from the bounded live Exec artifact described in issue 547.",
+    "The unresolved symbol list contains the examples reported by the issue and is not substituted with synthetic P/L.",
+    "The aggregate non-blocked realized balance is used only to reconcile the reported weekly baseline."
+  ]
+}

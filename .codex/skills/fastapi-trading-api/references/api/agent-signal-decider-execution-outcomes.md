@@ -1,9 +1,11 @@
 # GET /agent-context/signal-decider/execution-outcomes
 
 ## Summary
-Reads dedicated actual execution outcomes for `signal-decider` driven trades. These rows stay separate from synthetic bar-based evaluation outcomes and link the decision snapshot to next-open entry execution, linked intraday auto-sell exits, stored broker orders, exec-runtime readback fills, fill events, and realized execution metrics.
+Reads dedicated actual execution outcomes for `signal-decider` and `short-term-decider` next-open plan trades. These rows stay separate from synthetic bar-based evaluation outcomes and link the decision snapshot to next-open entry execution, linked intraday auto-sell exits, stored broker orders, exec-runtime readback fills, fill events, and realized execution metrics. Short-term outcomes feed the WAIT-conflict weekly replay; unresolved/open entries remain explicit and receive no synthetic P/L.
 
-Rows are materialized from persisted core data only. Use `refresh=true` on this read for a bounded filtered refresh, or run the internal one-shot backfill command from `apps/api`:
+Rows are materialized from persisted core data only. Exec readback persistence synchronizes the affected outcome rows immediately so replay selection sees newly persisted fills. Use `refresh=true` on this read for a bounded filtered refresh, or run the internal one-shot backfill command from `apps/api`:
+
+An outcome is closed only when terminal entry-order state or explicit zero remaining entry quantity proves that the entry cannot fill again. If an active partial entry's currently filled shares have all been sold, the provisional P/L remains visible on an unresolved outcome and is excluded from resolved replay and promotion metrics.
 
 ```bash
 python3.11 -m app.internal.ops agent-signal-decider-execution-outcomes-backfill --market-date-from 2026-06-29 --market-date-to 2026-07-03

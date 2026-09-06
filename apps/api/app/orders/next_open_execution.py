@@ -19,9 +19,13 @@ from app.agent_context.roles import SHORT_TERM_DECIDER_AGENT_NAME, SIGNAL_DECIDE
 from app.agent_context.run_state_service import agent_context_feedback_run_state_service
 from app.orders.signal_decider_alignment_gate import (
     ALIGNMENT_GATE_ACTION_BLOCK,
+    ALIGNMENT_GATE_ACTION_DOWNSIZE_PROBE,
     ALIGNMENT_GATE_ACTION_REPORT_ONLY_BLOCK,
+    SIGNAL_DECIDER_ALIGNMENT_NO_CONTEXT,
+    SIGNAL_DECIDER_ALIGNMENT_STALE_CONTEXT,
     SIGNAL_DECIDER_ALIGNMENT_WAIT_CONFLICT_BLOCK,
     SIGNAL_DECIDER_ALIGNMENT_WAIT_CONFLICT_OVERRIDE,
+    apply_alignment_quantity_enforcement,
     build_signal_decider_alignment_context,
     build_signal_decider_alignment_gate,
 )
@@ -910,6 +914,22 @@ def _preopen_plan_covers_latest_snapshots(
         row = existing_by_key.get(key)
         if row is None or int(row.decision_snapshot_id) != int(snapshot.id):
             return False
+        if (
+            _snapshot_agent_name(snapshot) == SHORT_TERM_DECIDER_AGENT_NAME
+            and not _is_dispatch_terminal_status(row.execution_status)
+        ):
+            validation = _row_validation_payload(row)
+            alignment_gate = (
+                validation.get('alignment_gate')
+                if isinstance(validation.get('alignment_gate'), dict)
+                else {}
+            )
+            if alignment_gate.get('enforcement_mode') != settings.signal_decider_wait_conflict_gate_mode:
+                return False
+            if int(alignment_gate.get('probe_quantity') or 0) != int(
+                settings.signal_decider_wait_conflict_probe_quantity
+            ):
+                return False
         snapshot_updated_at = _normalized_utc_datetime(getattr(snapshot, 'updated_at', None))
         row_updated_at = _normalized_utc_datetime(getattr(row, 'updated_at', None))
         if snapshot_updated_at is not None and row_updated_at is not None and snapshot_updated_at > row_updated_at:
@@ -1123,6 +1143,7 @@ class SignalDeciderNextOpenExecutionService:
             target_trade_date=resolved_target_date,
             account_reference=None,
             include_payloads=False,
+            include_validation_payload=True,
         )
         agent_context_completeness = self._build_agent_context_completeness_context(
             source_market_date=source_market_date,
@@ -2014,6 +2035,7 @@ class SignalDeciderNextOpenExecutionService:
         target_trade_date: date,
         account_reference: str | None,
         include_payloads: bool = True,
+        include_validation_payload: bool = False,
     ) -> list[SignalDeciderExecutionPlanItem]:
         with session_scope() as session:
             stmt = (
@@ -2031,11 +2053,13 @@ class SignalDeciderNextOpenExecutionService:
                 )
             )
             if not include_payloads:
-                stmt = stmt.options(
-                    defer(SignalDeciderExecutionPlanItem.validation_payload),
+                deferred_payloads = [
                     defer(SignalDeciderExecutionPlanItem.traceability_payload),
                     defer(SignalDeciderExecutionPlanItem.submission_payload),
-                )
+                ]
+                if not include_validation_payload:
+                    deferred_payloads.append(defer(SignalDeciderExecutionPlanItem.validation_payload))
+                stmt = stmt.options(*deferred_payloads)
             if account_reference:
                 stmt = stmt.where(SignalDeciderExecutionPlanItem.account_reference == account_reference)
             rows = session.execute(stmt).scalars().all()
@@ -2288,32 +2312,8 @@ class SignalDeciderNextOpenExecutionService:
                 short_term_entry_quality=entry_quality_snapshot,
                 tactical_action=short_term_tactical_action,
                 mode=settings.signal_decider_wait_conflict_gate_mode,
+                expected_market_date=snapshot.market_date,
             )
-            if alignment_gate_payload.get('signal_decider_alignment') == SIGNAL_DECIDER_ALIGNMENT_WAIT_CONFLICT_BLOCK:
-                if alignment_gate_payload.get('alignment_gate_action') == ALIGNMENT_GATE_ACTION_BLOCK:
-                    blocking_reasons.append(
-                        _reason(
-                            'signal_decider_wait_conflict_gate',
-                            alignment_gate_payload.get('alignment_gate_reason')
-                            or 'Signal-decider WAIT conflicts with this short-term buy candidate.',
-                        )
-                    )
-                elif alignment_gate_payload.get('alignment_gate_action') == ALIGNMENT_GATE_ACTION_REPORT_ONLY_BLOCK:
-                    warnings.append(
-                        _reason(
-                            'signal_decider_wait_conflict_gate_report_only',
-                            alignment_gate_payload.get('alignment_gate_reason')
-                            or 'Signal-decider WAIT conflicts with this short-term buy candidate.',
-                        )
-                    )
-            elif alignment_gate_payload.get('signal_decider_alignment') == SIGNAL_DECIDER_ALIGNMENT_WAIT_CONFLICT_OVERRIDE:
-                warnings.append(
-                    _reason(
-                        'signal_decider_wait_conflict_override',
-                        alignment_gate_payload.get('alignment_gate_reason')
-                        or 'Signal-decider WAIT conflict was allowed by the short-term override threshold.',
-                    )
-                )
             trigger_price = _to_decimal(response_payload.get('trigger_price'))
             chase_limit_price = _to_decimal(response_payload.get('chase_limit_price'))
             target_price = _to_decimal(
@@ -2452,6 +2452,74 @@ class SignalDeciderNextOpenExecutionService:
                     )
             pricing_note = 'Configured budget rail is used for local quantity preview only.'
 
+        if decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME and alignment_gate_payload is not None:
+            requested_quantity = planned_quantity
+            if (
+                requested_quantity is None
+                and target.account_reference == UNSPECIFIED_ROUTE_ACCOUNT_REFERENCE
+                and not settings.signal_decider_next_open_account_targets.strip()
+                and alignment_gate_payload.get('alignment_gate_action') == ALIGNMENT_GATE_ACTION_DOWNSIZE_PROBE
+            ):
+                requested_quantity = settings.signal_decider_wait_conflict_probe_quantity
+            alignment_gate_payload = apply_alignment_quantity_enforcement(
+                alignment_gate_payload,
+                requested_quantity=requested_quantity,
+                probe_quantity=settings.signal_decider_wait_conflict_probe_quantity,
+            )
+            alignment = alignment_gate_payload.get('signal_decider_alignment')
+            action = alignment_gate_payload.get('alignment_gate_action')
+            reason_text = (
+                alignment_gate_payload.get('alignment_gate_reason')
+                or 'Signal-decider alignment could not approve this short-term buy candidate.'
+            )
+            unavailable_context = alignment in {
+                SIGNAL_DECIDER_ALIGNMENT_NO_CONTEXT,
+                SIGNAL_DECIDER_ALIGNMENT_STALE_CONTEXT,
+            }
+            if action == ALIGNMENT_GATE_ACTION_BLOCK:
+                blocking_reasons.append(
+                    _reason(
+                        'signal_decider_context_unavailable_gate'
+                        if unavailable_context
+                        else 'signal_decider_wait_conflict_gate',
+                        reason_text,
+                    )
+                )
+                planned_quantity = Decimal('0')
+                estimated_notional = Decimal('0')
+            elif action == ALIGNMENT_GATE_ACTION_DOWNSIZE_PROBE:
+                warnings.append(
+                    _reason(
+                        'signal_decider_context_unavailable_gate_downsized'
+                        if unavailable_context
+                        else 'signal_decider_wait_conflict_gate_downsized',
+                        reason_text,
+                    )
+                )
+                planned_quantity = _to_decimal(alignment_gate_payload.get('final_quantity'))
+                estimated_notional = (
+                    planned_quantity * Decimal(str(estimated_reference_price))
+                    if planned_quantity is not None and estimated_reference_price is not None
+                    else None
+                )
+                pricing_note = 'Core enforced a deterministic WAIT-conflict probe quantity before exec handoff.'
+            elif action == ALIGNMENT_GATE_ACTION_REPORT_ONLY_BLOCK:
+                warnings.append(
+                    _reason(
+                        'signal_decider_context_unavailable_gate_report_only'
+                        if unavailable_context
+                        else 'signal_decider_wait_conflict_gate_report_only',
+                        reason_text,
+                    )
+                )
+            elif alignment == SIGNAL_DECIDER_ALIGNMENT_WAIT_CONFLICT_OVERRIDE:
+                warnings.append(
+                    _reason(
+                        'signal_decider_wait_conflict_override',
+                        reason_text,
+                    )
+                )
+
         performance_gate: dict[str, Any] = {'status': 'not_applicable'}
         if decision_agent_name == SIGNAL_DECIDER_AGENT_NAME:
             performance_gate = evaluate_next_open_performance_gate(
@@ -2537,6 +2605,16 @@ class SignalDeciderNextOpenExecutionService:
                 'estimated_reference_price_basis': estimated_reference_price_basis,
                 'planned_quantity': _decimal_to_text(planned_quantity),
                 'estimated_notional_krw': _decimal_to_text(estimated_notional),
+                'requested_quantity': (
+                    alignment_gate_payload.get('requested_quantity')
+                    if alignment_gate_payload is not None
+                    else _decimal_to_text(planned_quantity)
+                ),
+                'final_quantity': (
+                    alignment_gate_payload.get('final_quantity')
+                    if alignment_gate_payload is not None
+                    else _decimal_to_text(planned_quantity)
+                ),
             },
             'performance_gate': performance_gate,
             'agent_context_completeness': agent_context_completeness_payload,
@@ -2604,6 +2682,9 @@ class SignalDeciderNextOpenExecutionService:
                 validation_payload['signal_decider_alignment'] = alignment_gate_payload.get('signal_decider_alignment')
                 validation_payload['alignment_gate_action'] = alignment_gate_payload.get('alignment_gate_action')
                 validation_payload['alignment_gate_reason'] = alignment_gate_payload.get('alignment_gate_reason')
+                validation_payload['final_enforcement_decision'] = alignment_gate_payload.get('enforcement_decision')
+                validation_payload['requested_quantity'] = alignment_gate_payload.get('requested_quantity')
+                validation_payload['final_quantity'] = alignment_gate_payload.get('final_quantity')
                 validation_payload['alignment_signal_decider_decision_snapshot_id'] = alignment_gate_payload.get(
                     'signal_decider_decision_snapshot_id'
                 )
@@ -2614,6 +2695,13 @@ class SignalDeciderNextOpenExecutionService:
                 validation_payload['short_term']['alignment_gate_action'] = alignment_gate_payload.get(
                     'alignment_gate_action'
                 )
+                validation_payload['short_term']['final_enforcement_decision'] = alignment_gate_payload.get(
+                    'enforcement_decision'
+                )
+                validation_payload['short_term']['requested_quantity'] = alignment_gate_payload.get(
+                    'requested_quantity'
+                )
+                validation_payload['short_term']['final_quantity'] = alignment_gate_payload.get('final_quantity')
         return validation_payload, {
             'estimated_reference_price': estimated_reference_price,
             'planned_quantity': planned_quantity,
@@ -2774,6 +2862,9 @@ class SignalDeciderNextOpenExecutionService:
                     'signal_decider_alignment': validation_payload.get('signal_decider_alignment'),
                     'alignment_gate_action': validation_payload.get('alignment_gate_action'),
                     'alignment_gate_reason': validation_payload.get('alignment_gate_reason'),
+                    'final_enforcement_decision': validation_payload.get('final_enforcement_decision'),
+                    'requested_quantity': validation_payload.get('requested_quantity'),
+                    'final_quantity': validation_payload.get('final_quantity'),
                     'alignment_signal_decider_decision_snapshot_id': validation_payload.get(
                         'alignment_signal_decider_decision_snapshot_id'
                     ),
@@ -3023,6 +3114,14 @@ class SignalDeciderNextOpenExecutionService:
             or validation.get('alignment_gate_action'),
             'alignment_gate_reason': traceability.get('alignment_gate_reason')
             or validation.get('alignment_gate_reason'),
+            'final_enforcement_decision': traceability.get('final_enforcement_decision')
+            or validation.get('final_enforcement_decision'),
+            'requested_quantity': traceability.get('requested_quantity')
+            if traceability.get('requested_quantity') is not None
+            else validation.get('requested_quantity'),
+            'final_quantity': traceability.get('final_quantity')
+            if traceability.get('final_quantity') is not None
+            else validation.get('final_quantity'),
             'alignment_signal_decider_decision_snapshot_id': traceability.get(
                 'alignment_signal_decider_decision_snapshot_id'
             )
