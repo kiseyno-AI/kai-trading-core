@@ -15,6 +15,7 @@ from app.agent_context.decider_replay_service import (
     DeciderReplayService,
     DeciderReplayTrade,
     _actual_short_term_outcome_to_wait_conflict_trade,
+    _build_wait_conflict_markdown_summary,
     _replay_alignment_gate,
 )
 from app.agent_context.roles import SHORT_TERM_DECIDER_AGENT_NAME
@@ -129,13 +130,26 @@ def _stale_watch_rule() -> dict:
 
 
 def _alignment_gate(alignment: str, action: str) -> dict:
+    override = {'allowed': False}
+    if alignment == 'wait_conflict_override':
+        override = {
+            'allowed': True,
+            'metrics': {
+                'buy_quality_score': 76,
+                'return_percentile': 0.82,
+                'volume_percentile': 0.68,
+                'reward_risk_ratio': 2.5,
+                'raw_trading_value_krw': 9_000_000_000,
+                'continuation_setup_detected': True,
+            },
+        }
     return {
         'schema_version': 'signal_decider_alignment_gate_v1',
         'signal_decider_alignment': alignment,
         'alignment_gate_action': action,
         'alignment_gate_reason': f'{alignment} test reason',
         'signal_decider_decision_snapshot_id': 900,
-        'override': {'allowed': alignment == 'wait_conflict_override'},
+        'override': override,
     }
 
 
@@ -204,6 +218,55 @@ class DeciderReplayServiceTests(unittest.TestCase):
         self.assertEqual(override['alignment_gate_action'], 'allow_by_override')
         self.assertEqual(missing['signal_decider_alignment'], 'missing_alignment_evidence')
         self.assertEqual(missing['alignment_gate_action'], 'block')
+
+    def test_replay_rejects_legacy_override_without_current_liquidity_evidence(self) -> None:
+        persisted = _alignment_gate('wait_conflict_override', 'allow_by_override')
+        persisted['override']['metrics'].pop('raw_trading_value_krw')
+
+        for gate_mode, expected_action in (
+            ('hard_block', 'block'),
+            ('downsize_probe', 'downsize_probe'),
+        ):
+            with self.subTest(gate_mode=gate_mode):
+                replayed = _replay_alignment_gate(persisted, gate_mode=gate_mode)
+
+                self.assertEqual(replayed['signal_decider_alignment'], 'wait_conflict_block')
+                self.assertEqual(replayed['alignment_gate_action'], expected_action)
+                self.assertFalse(replayed['override']['allowed'])
+                self.assertIn('liquidity_floor_ok', replayed['override']['failed_checks'])
+
+    def test_wait_conflict_markdown_distinguishes_manual_approval_from_activation(self) -> None:
+        markdown = _build_wait_conflict_markdown_summary(
+            request={
+                'market_date_from': '2026-08-03',
+                'market_date_to': '2026-08-28',
+                'date_window_basis': 'source_market_date',
+                'candidate_gate_mode': 'hard_block',
+                'probe_quantity': 1,
+            },
+            summary={
+                'baseline_trade_count': 20,
+                'candidate_trade_count': 12,
+                'blocked_candidate_count': 8,
+                'allowed_by_override_count': 0,
+                'skipped_losses': 6,
+                'skipped_winners': 2,
+                'gross_pnl_delta_krw': 500_000,
+                'estimated_net_pnl_delta_krw': 450_000,
+                'unresolved_open_candidate_count': 0,
+                'missing_alignment_evidence_count': 0,
+            },
+            examples=[],
+            weeks=[],
+            unresolved_open_candidates=[],
+            promotion_readiness={
+                'ready_for_manual_approval': True,
+                'ready': False,
+            },
+        )
+
+        self.assertIn('- Manual approval may now be requested: true', markdown)
+        self.assertIn('- Final activation ready: false', markdown)
 
     def test_rule_skips_losing_buy_and_reports_avoided_loser(self) -> None:
         repository = FakeDeciderReplayRepository(

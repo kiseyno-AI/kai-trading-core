@@ -25,6 +25,7 @@ from app.orders.signal_decider_alignment_gate import (
     SIGNAL_DECIDER_ALIGNMENT_WAIT_CONFLICT_BLOCK,
     SIGNAL_DECIDER_ALIGNMENT_WAIT_CONFLICT_OVERRIDE,
     apply_alignment_quantity_enforcement,
+    build_alignment_override_evidence,
     normalize_alignment_gate_mode,
 )
 
@@ -156,6 +157,18 @@ def _replay_alignment_gate(
     gate['evidence_status'] = 'persisted'
     alignment = str(gate.get('signal_decider_alignment') or '').strip().lower()
     override = gate.get('override') if isinstance(gate.get('override'), dict) else {}
+    if alignment == SIGNAL_DECIDER_ALIGNMENT_WAIT_CONFLICT_OVERRIDE:
+        override = build_alignment_override_evidence(
+            override.get('metrics') if isinstance(override.get('metrics'), dict) else None
+        )
+        gate['override'] = override
+        if not override['allowed']:
+            gate['persisted_signal_decider_alignment'] = alignment
+            alignment = SIGNAL_DECIDER_ALIGNMENT_WAIT_CONFLICT_BLOCK
+            gate['signal_decider_alignment'] = alignment
+            gate['alignment_gate_reason'] = (
+                'Persisted WAIT-conflict override evidence does not satisfy the current stronger override threshold.'
+            )
     valid_override = alignment == SIGNAL_DECIDER_ALIGNMENT_WAIT_CONFLICT_OVERRIDE and override.get('allowed') is True
     if valid_override:
         gate['alignment_gate_action'] = 'allow_by_override'
@@ -1249,7 +1262,9 @@ def _build_wait_conflict_markdown_summary(
         f'- Estimated net P/L delta KRW: {summary["estimated_net_pnl_delta_krw"]}',
         f'- Unresolved/open candidates: {summary["unresolved_open_candidate_count"]}',
         f'- Missing alignment evidence: {summary["missing_alignment_evidence_count"]}',
-        f'- Promotion ready: {str(bool(promotion_readiness.get("ready"))).lower()}',
+        '- Manual approval may now be requested: '
+        f'{str(bool(promotion_readiness.get("ready_for_manual_approval"))).lower()}',
+        f'- Final activation ready: {str(bool(promotion_readiness.get("ready"))).lower()}',
         '',
         '## Completed-week evidence',
         '',

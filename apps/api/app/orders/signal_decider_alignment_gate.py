@@ -244,7 +244,9 @@ def apply_alignment_quantity_enforcement(
     return gate
 
 
-def _override_evidence(short_term_entry_quality: dict[str, Any] | None) -> dict[str, Any]:
+def build_alignment_override_evidence(
+    short_term_entry_quality: dict[str, Any] | None,
+) -> dict[str, Any]:
     quality = short_term_entry_quality if isinstance(short_term_entry_quality, dict) else {}
     buy_quality_score = _to_decimal(quality.get('buy_quality_score'))
     return_percentile = _as_unit_percentile(quality.get('return_percentile'))
@@ -325,7 +327,7 @@ def build_signal_decider_alignment_gate(
         expected_market_date=expected_market_date,
     )
     signal_snapshot_id = context.get('decision_snapshot_id')
-    override = _override_evidence(short_term_entry_quality)
+    override = build_alignment_override_evidence(short_term_entry_quality)
     base = {
         'schema_version': ALIGNMENT_GATE_SCHEMA_VERSION,
         'enforcement_mode': resolved_mode,
