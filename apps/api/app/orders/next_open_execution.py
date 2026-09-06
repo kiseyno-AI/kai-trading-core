@@ -2451,6 +2451,13 @@ class SignalDeciderNextOpenExecutionService:
 
         if decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME and alignment_gate_payload is not None:
             requested_quantity = planned_quantity
+            if (
+                requested_quantity is None
+                and target.account_reference == UNSPECIFIED_ROUTE_ACCOUNT_REFERENCE
+                and not settings.signal_decider_next_open_account_targets.strip()
+                and alignment_gate_payload.get('alignment_gate_action') == ALIGNMENT_GATE_ACTION_DOWNSIZE_PROBE
+            ):
+                requested_quantity = settings.signal_decider_wait_conflict_probe_quantity
             alignment_gate_payload = apply_alignment_quantity_enforcement(
                 alignment_gate_payload,
                 requested_quantity=requested_quantity,

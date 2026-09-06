@@ -3,7 +3,7 @@ from decimal import Decimal
 import json
 from types import SimpleNamespace
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
 from sqlalchemy import delete
@@ -23,6 +23,10 @@ from app.market.session import (
     KisKrxTradingCalendarProvider,
     reset_krx_calendar_provider,
     set_krx_calendar_provider,
+)
+from app.orders.exec_integration import (
+    EXEC_INTENT_INTRADAY_WATCH_BUY,
+    SignalDeciderExecIntegrationService,
 )
 from app.orders.next_open_execution import (
     EXECUTION_STATUS_DRY_RUN,
@@ -1438,6 +1442,79 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(item['traceability']['allocation_budget_krw'], '0')
         self.assertIsNone(item['planned_quantity'])
         self.assertEqual(item['eligibility_status'], ELIGIBILITY_ELIGIBLE)
+
+    async def test_unspecified_route_wait_conflict_dispatches_configured_probe_quantity(self) -> None:
+        settings.signal_decider_wait_conflict_gate_mode = 'downsize_probe'
+        settings.signal_decider_wait_conflict_probe_quantity = 2
+        settings.signal_decider_exec_integration_mode = 'dispatch'
+        self._seed_snapshot(symbol='005930', next_day_open_action='wait')
+        self._seed_short_term_snapshot(symbol='005930')
+        settings.signal_decider_next_open_account_targets = ''
+        service = self._service(state='PREOPEN', server_time='2026-04-30T08:40:00+09:00')
+
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[{'trade_date': '2026-04-29', 'close_price': 50000}],
+        ):
+            result = service.refresh_plan_items(target_trade_date=self.target_trade_date, trigger='test')
+
+        self.assertEqual(result['summary']['items_total'], 1)
+        self.assertEqual(result['summary']['eligible_count'], 1)
+        self.assertEqual(result['summary']['blocked_count'], 0)
+        item = result['items'][0]
+        self.assertEqual(item['decision_agent_name'], 'short-term-decider')
+        self.assertEqual(item['account_reference'], 'KIS:00000000-00')
+        self.assertEqual(item['account_label'], 'UNSPECIFIED_ROUTE')
+        self.assertEqual(item['traceability']['allocation_mode'], 'unspecified_route')
+        self.assertEqual(item['traceability']['allocation_budget_krw'], '0')
+        self.assertEqual(item['eligibility_status'], ELIGIBILITY_ELIGIBLE)
+        self.assertEqual(item['alignment_gate_action'], 'downsize_probe')
+        self.assertEqual(item['final_enforcement_decision'], 'downsized')
+        self.assertEqual(item['requested_quantity'], 2)
+        self.assertEqual(item['final_quantity'], 2)
+        self.assertEqual(Decimal(item['planned_quantity']), Decimal('2'))
+
+        dispatched_payloads = []
+
+        async def capture_dispatch(payload):
+            dispatched_payloads.append(payload)
+            return {
+                'accepted_item_count': len(payload['items']),
+                'rejected_item_count': 0,
+                'items': [
+                    {
+                        'core_item_key': dispatched_item['core_item_key'],
+                        'execution_plan_id': payload['plan_id'],
+                        'execution_plan_item_id': f'exec-item-{index}',
+                        'status': 'accepted',
+                    }
+                    for index, dispatched_item in enumerate(payload['items'], start=1)
+                ],
+            }
+
+        exec_client = AsyncMock()
+        exec_client.post_execution_plan.side_effect = capture_dispatch
+        dispatch_result = await SignalDeciderExecIntegrationService(client=exec_client).dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            account_reference='KIS:00000000-00',
+            refresh_plan=False,
+            dry_run=False,
+            force=True,
+            trigger='test',
+        )
+
+        self.assertTrue(dispatch_result['summary']['triggered'])
+        self.assertEqual(len(dispatched_payloads), 1)
+        self.assertEqual(dispatched_payloads[0]['metadata']['account_label'], 'UNSPECIFIED_ROUTE')
+        entry = next(
+            dispatched_item
+            for dispatched_item in dispatched_payloads[0]['items']
+            if dispatched_item['intent'] == EXEC_INTENT_INTRADAY_WATCH_BUY
+        )
+        self.assertEqual(entry['quantity_policy']['type'], 'fixed_quantity')
+        self.assertEqual(entry['quantity_policy']['quantity'], '2')
+        self.assertEqual(entry['quantity_policy']['enforcement_source'], 'core_wait_conflict_alignment_gate')
+        self.assertEqual(entry['quantity_policy']['final_quantity'], '2')
 
     def test_refresh_plan_items_blocks_short_term_rows_with_invalid_account_targets(self) -> None:
         self._seed_short_term_snapshot(symbol='005930')
