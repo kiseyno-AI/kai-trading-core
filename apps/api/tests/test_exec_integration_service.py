@@ -2662,6 +2662,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             symbols=[self.symbol],
             cost_assumptions=DeciderReplayCostAssumptions(),
             gate_mode='hard_block',
+            probe_quantity=1,
         )
 
         self.assertEqual(len(replay_trades), 1)

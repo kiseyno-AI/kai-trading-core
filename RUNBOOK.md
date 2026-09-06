@@ -234,8 +234,8 @@ Useful limited-scope runs:
 - Internal explicit stage run path: `python3.11 -m app.internal.ops eod-pipeline-run --market-date 2026-04-03 --stages price_collection,technical_snapshots --symbols 005930`
 - Manual signal-decider evaluation refresh over the recent window: `python3.11 -m app.internal.ops agent-signal-decider-evaluations-compute --market-date 2026-04-30 --symbols 005930 --horizons 1,3,5,10`
 - Manual signal-decider evaluation coverage repair over an explicit range: `python3.11 -m app.internal.ops agent-signal-decider-evaluations-repair --market-date-from 2026-04-01 --market-date-to 2026-04-30 --horizons 1,3,5,10 --primary-horizons 5`
-- Manual rolling short-term WAIT-conflict gate replay: `python3.11 -m app.internal.ops agent-short-term-wait-conflict-replay --completed-weeks 4 --output-format markdown`
-- Reproducible issue-547 rolling window: `python3.11 -m app.internal.ops agent-short-term-wait-conflict-replay --completed-weeks 4 --as-of-date-kst 2026-09-06 --output-format markdown`
+- Manual rolling short-term WAIT-conflict probe replay: `python3.11 -m app.internal.ops agent-short-term-wait-conflict-replay --completed-weeks 4 --gate-mode downsize_probe --probe-quantity 3 --output-format markdown`
+- Reproducible issue-547 rolling window: `python3.11 -m app.internal.ops agent-short-term-wait-conflict-replay --completed-weeks 4 --as-of-date-kst 2026-09-06 --gate-mode downsize_probe --probe-quantity 3 --output-format markdown`
 - Manual technical snapshot rerun after EOD: `python3.11 -m app.eod.technical_snapshots --market-date 2026-04-07`
 - Manual action summary rerun after EOD: `python3.11 -m app.eod.action_summaries --market-date 2026-04-07`
 - Manual low-risk factor rerun from stored bars: `python3.11 -m app.internal.ops eod-low-risk-factors-compute --market-date 2026-04-23`
@@ -300,7 +300,7 @@ Internal ops commands from `apps/api`:
 - `python3.11 -m app.internal.ops agent-signal-decider-evaluations-compute --market-date 2026-04-30 --horizons 1,3,5,10`
 - `python3.11 -m app.internal.ops agent-signal-decider-evaluations-repair --market-date-from 2026-04-01 --market-date-to 2026-04-30 --horizons 1,3,5,10 --primary-horizons 5`
 - `python3.11 -m app.internal.ops agent-signal-decider-execution-outcomes-backfill --market-date-from 2026-06-29 --market-date-to 2026-07-03`
-- `python3.11 -m app.internal.ops agent-short-term-wait-conflict-replay --completed-weeks 4 --output-format markdown`
+- `python3.11 -m app.internal.ops agent-short-term-wait-conflict-replay --completed-weeks 4 --gate-mode downsize_probe --probe-quantity 3 --output-format markdown`
 - `python3.11 -m app.internal.ops agent-signal-decider-calendar-refresh --market-date 2026-04-30 --lookback-days 30 --horizons 1,3,5,10 --primary-horizons 1,3,5,10`
 - Offline decider rule replay before activation: `python3.11 -m app.internal.ops agent-decider-replay --market-date-from 2026-06-15 --market-date-to 2026-06-19 --agent-name short-term-decider --rule-config-json '{"rules":[{"name":"stale_watch_trigger_drift","predicates":[{"type":"trigger_price_drift","max_below_trigger_pct":0.03}]}]}' --fee-bps 0 --slippage-bps 0 --output-format markdown`
   - The replay command accepts `--rule-config-json` or `--rule-config-path`, optional `--symbols`, `--horizon-days`, `--fee-bps`, and `--slippage-bps`.

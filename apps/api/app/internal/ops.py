@@ -512,6 +512,7 @@ def replay_short_term_wait_conflict_gate(
     slippage_bps: str | float | int = 0,
     notional_krw: str | float | int = 1_000_000,
     gate_mode: str = 'hard_block',
+    probe_quantity: int = 1,
     top_examples_limit: int = 10,
 ) -> dict[str, Any]:
     bootstrap_runtime()
@@ -526,6 +527,7 @@ def replay_short_term_wait_conflict_gate(
         slippage_bps=slippage_bps,
         notional_krw=notional_krw,
         gate_mode=gate_mode,
+        probe_quantity=probe_quantity,
         top_examples_limit=top_examples_limit,
     )
 
@@ -1254,6 +1256,7 @@ def _build_parser() -> argparse.ArgumentParser:
             'Example:\n'
             '  python3.11 -m app.internal.ops agent-short-term-wait-conflict-replay \\\n'
             '    --completed-weeks 4 --as-of-date-kst 2026-09-06 \\\n'
+            '    --gate-mode downsize_probe --probe-quantity 3 \\\n'
             '    --output-format markdown\n\n'
             'By default, the window is the last four completed Monday-Friday KST trading weeks. '
             'An explicit --market-date-from/--market-date-to pair overrides the rolling window. '
@@ -1294,6 +1297,12 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=('hard_block', 'downsize_probe', 'report_only'),
         default='hard_block',
         help='Candidate gate mode for replay comparison only; this does not alter live runtime settings',
+    )
+    wait_conflict_replay_parser.add_argument(
+        '--probe-quantity',
+        type=int,
+        default=1,
+        help='One replay-level probe quantity applied to every historical trade; valid range is 1 through 100',
     )
     wait_conflict_replay_parser.add_argument('--top-examples-limit', type=int, default=10)
     wait_conflict_replay_parser.add_argument(
@@ -1589,6 +1598,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             slippage_bps=args.slippage_bps,
             notional_krw=args.notional_krw,
             gate_mode=args.gate_mode,
+            probe_quantity=args.probe_quantity,
             top_examples_limit=args.top_examples_limit,
         )
     elif args.command == 'agent-feedback-symbol-cleanup-smoke':

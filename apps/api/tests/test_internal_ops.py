@@ -288,6 +288,7 @@ class InternalOpsTests(unittest.TestCase):
                 slippage_bps='2',
                 notional_krw='1000000',
                 gate_mode='hard_block',
+                probe_quantity=3,
                 top_examples_limit=4,
             )
 
@@ -301,6 +302,7 @@ class InternalOpsTests(unittest.TestCase):
         self.assertEqual(replay.call_args.kwargs['fee_bps'], '1')
         self.assertEqual(replay.call_args.kwargs['slippage_bps'], '2')
         self.assertEqual(replay.call_args.kwargs['gate_mode'], 'hard_block')
+        self.assertEqual(replay.call_args.kwargs['probe_quantity'], 3)
         self.assertEqual(replay.call_args.kwargs['top_examples_limit'], 4)
 
     def test_replay_short_term_wait_conflict_gate_supports_reproducible_rolling_window(self) -> None:
@@ -315,6 +317,7 @@ class InternalOpsTests(unittest.TestCase):
                 completed_weeks=6,
                 as_of_date_kst='2026-09-06',
                 gate_mode='downsize_probe',
+                probe_quantity=7,
             )
 
         self.assertIsNone(replay.call_args.kwargs['market_date_from'])
@@ -322,6 +325,32 @@ class InternalOpsTests(unittest.TestCase):
         self.assertEqual(replay.call_args.kwargs['completed_weeks'], 6)
         self.assertEqual(replay.call_args.kwargs['as_of_date_kst'], '2026-09-06')
         self.assertEqual(replay.call_args.kwargs['gate_mode'], 'downsize_probe')
+        self.assertEqual(replay.call_args.kwargs['probe_quantity'], 7)
+
+    def test_cli_wait_conflict_replay_forwards_requested_probe_quantity(self) -> None:
+        payload = {'schema_version': 'short_term_wait_conflict_gate_replay_v1'}
+        stdout = io.StringIO()
+        with (
+            patch(
+                'app.internal.ops.replay_short_term_wait_conflict_gate',
+                return_value=payload,
+            ) as replay,
+            redirect_stdout(stdout),
+        ):
+            exit_code = ops.main(
+                [
+                    'agent-short-term-wait-conflict-replay',
+                    '--gate-mode',
+                    'downsize_probe',
+                    '--probe-quantity',
+                    '9',
+                ]
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(json.loads(stdout.getvalue()), payload)
+        self.assertEqual(replay.call_args.kwargs['gate_mode'], 'downsize_probe')
+        self.assertEqual(replay.call_args.kwargs['probe_quantity'], 9)
 
     def test_compute_trending_ranks_uses_direct_store_call(self) -> None:
         with (

@@ -18,12 +18,14 @@ From `apps/api`, run:
 ```bash
 python3.11 -m app.internal.ops agent-short-term-wait-conflict-replay \
   --completed-weeks 4 \
+  --gate-mode downsize_probe \
+  --probe-quantity 3 \
   --output-format markdown
 ```
 
 Use `--as-of-date-kst YYYY-MM-DD` for a reproducible rolling window. An explicit `--market-date-from` and `--market-date-to` pair is also supported. The rolling form always covers at least four completed Monday-Friday KST weeks.
 
-The report uses only persisted short-term entry fills and their actual execution outcomes. It reports resolved skipped losses, resolved skipped winners, baseline and counterfactual realized P/L, gross P/L delta, cost-adjusted estimated net P/L delta, missing alignment evidence, and unresolved/open filled candidates separately. For `downsize_probe`, skipped-loss and skipped-winner P/L is weighted by the removed quantity share; requests already at or below the probe add no removed-exposure evidence. Unresolved candidates receive no synthetic P/L.
+The report uses only persisted short-term entry fills and their actual execution outcomes. It reports resolved skipped losses, resolved skipped winners, baseline and counterfactual realized P/L, gross P/L delta, cost-adjusted estimated net P/L delta, missing alignment evidence, and unresolved/open filled candidates separately. `--probe-quantity` accepts an integer from 1 through 100 and defaults to 1. For `downsize_probe`, that one replay-level quantity is applied uniformly to every historical trade, overriding persisted probe settings and supplying the modeled quantity for legacy rows. Skipped-loss and skipped-winner P/L is weighted by the removed quantity share; requests already at or below the requested replay probe add no removed-exposure evidence. Unresolved candidates receive no synthetic P/L.
 
 ## Promotion threshold
 

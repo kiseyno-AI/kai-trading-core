@@ -40,6 +40,8 @@ DEFAULT_REPLAY_HORIZON_DAYS = 5
 DEFAULT_REPLAY_NOTIONAL_KRW = Decimal('1000000')
 DEFAULT_TOP_EXAMPLES_LIMIT = 10
 DEFAULT_WAIT_CONFLICT_COMPLETED_WEEKS = 4
+MIN_WAIT_CONFLICT_PROBE_QUANTITY = 1
+MAX_WAIT_CONFLICT_PROBE_QUANTITY = 100
 
 
 @dataclass(frozen=True)
@@ -209,6 +211,19 @@ def _normalize_non_negative_decimal(value: Any, *, name: str) -> Decimal:
     if resolved < 0:
         raise ValueError(f'{name} must be >= 0')
     return resolved
+
+
+def _normalize_probe_quantity(value: Any) -> int:
+    resolved = _safe_decimal(value)
+    if (
+        resolved is None
+        or not resolved.is_finite()
+        or resolved != resolved.to_integral_value()
+        or resolved < MIN_WAIT_CONFLICT_PROBE_QUANTITY
+        or resolved > MAX_WAIT_CONFLICT_PROBE_QUANTITY
+    ):
+        raise ValueError('probe_quantity must be an integer from 1 through 100')
+    return int(resolved)
 
 
 def _to_float(value: Any) -> float | None:
@@ -503,6 +518,7 @@ def _actual_short_term_outcome_to_wait_conflict_trade(
     outcome: SignalDeciderActualExecutionOutcome,
     cost_assumptions: DeciderReplayCostAssumptions,
     gate_mode: str,
+    probe_quantity: int,
 ) -> DeciderReplayTrade:
     validation = plan_row.validation_payload if isinstance(plan_row.validation_payload, dict) else {}
     traceability = plan_row.traceability_payload if isinstance(plan_row.traceability_payload, dict) else {}
@@ -531,7 +547,7 @@ def _actual_short_term_outcome_to_wait_conflict_trade(
     alignment_gate = apply_alignment_quantity_enforcement(
         alignment_gate,
         requested_quantity=entry_filled_quantity,
-        probe_quantity=alignment_gate.get('probe_quantity') or 1,
+        probe_quantity=probe_quantity,
     )
     closed_quantity = _safe_decimal(outcome.closed_quantity)
     open_quantity = _safe_decimal(outcome.open_quantity)
@@ -781,6 +797,7 @@ class DeciderReplayRepository:
         symbols: Sequence[str] | None,
         cost_assumptions: DeciderReplayCostAssumptions,
         gate_mode: str,
+        probe_quantity: int,
     ) -> list[DeciderReplayTrade]:
         with session_scope() as session:
             stmt = (
@@ -826,6 +843,7 @@ class DeciderReplayRepository:
                         outcome=outcome,
                         cost_assumptions=cost_assumptions,
                         gate_mode=gate_mode,
+                        probe_quantity=probe_quantity,
                     )
                 )
             return sorted(trades, key=lambda item: (item.market_date, item.symbol, item.replay_trade_id))
@@ -1219,6 +1237,8 @@ def _build_wait_conflict_markdown_summary(
         f'- Source decision window: {request["market_date_from"]}..{request["market_date_to"]}',
         f'- Date window basis: {request["date_window_basis"]}',
         '- Baseline source: actual short-term execution outcomes only',
+        f'- Candidate gate mode: {request["candidate_gate_mode"]}',
+        f'- Replay probe quantity: {request["probe_quantity"]}',
         f'- Baseline trades: {summary["baseline_trade_count"]}',
         f'- Candidate trades: {summary["candidate_trade_count"]}',
         f'- Blocked candidates: {summary["blocked_candidate_count"]}',
@@ -1410,6 +1430,7 @@ class DeciderReplayService:
         slippage_bps: Decimal | float | int | str = Decimal('0'),
         notional_krw: Decimal | float | int | str = DEFAULT_REPLAY_NOTIONAL_KRW,
         gate_mode: str = 'hard_block',
+        probe_quantity: Decimal | float | int | str = MIN_WAIT_CONFLICT_PROBE_QUANTITY,
         top_examples_limit: int = DEFAULT_TOP_EXAMPLES_LIMIT,
     ) -> dict[str, Any]:
         if (market_date_from is None) != (market_date_to is None):
@@ -1429,6 +1450,7 @@ class DeciderReplayService:
         if normalized_from > normalized_to:
             raise ValueError('market_date_from must be on or before market_date_to')
         resolved_gate_mode = normalize_alignment_gate_mode(gate_mode)
+        resolved_probe_quantity = _normalize_probe_quantity(probe_quantity)
         normalized_symbols = _normalize_symbols(symbols)
         resolved_costs = DeciderReplayCostAssumptions(
             fee_bps=_normalize_non_negative_decimal(fee_bps, name='fee_bps'),
@@ -1444,6 +1466,7 @@ class DeciderReplayService:
             symbols=normalized_symbols or None,
             cost_assumptions=resolved_costs,
             gate_mode=resolved_gate_mode,
+            probe_quantity=resolved_probe_quantity,
         )
 
         def summarize(scope: Sequence[DeciderReplayTrade]) -> dict[str, Any]:
@@ -1657,6 +1680,7 @@ class DeciderReplayService:
             'agent_name': SHORT_TERM_DECIDER_AGENT_NAME,
             'symbols': normalized_symbols,
             'candidate_gate_mode': resolved_gate_mode,
+            'probe_quantity': resolved_probe_quantity,
             'window_mode': window_mode,
             'as_of_date_kst': (
                 _normalize_market_date(as_of_date_kst).isoformat()
